@@ -133,6 +133,19 @@ _QUOTE_WORD_RE = re.compile(
 _QUOTE_APOSTROPHES = str.maketrans(
     {"\u2018": "'", "\u2019": "'", "\u02bc": "'"}
 )
+_CAPTION_INCOMPLETE_END_RE = re.compile(
+    r"\b(?:(?:and|but|or)(?:\s+(?:now|so|then))?|as|because|by|for|from|"
+    r"if|in|into|of|on|since|than|that|to|until|when|where|which|while|"
+    r"with)\s*[.!?]?[\"')\]]*$",
+    re.IGNORECASE,
+)
+_CAPTION_FRESH_UNIT_ONSET_RE = re.compile(
+    r"^\s*(?:(?:all\s+right|alright|okay|ok|so)\s*[,;:]?\s+)?(?:"
+    r"(?:now|next)\b|the\s+(?:following|next)\s+(?:example|exercise|lesson|"
+    r"problem|section|step|teaching\s+unit|topic)\b|"
+    r"let(?:['’]?s|\s+us)\s+(?:begin|consider|look|move|solve|start|try|work)\b)",
+    re.IGNORECASE,
+)
 _NO_SPACE_SCRIPT_NAME_MARKERS = (
     "BOPOMOFO",
     "CJK",
@@ -525,7 +538,7 @@ def _boundary_evidence_grade(
     if (
         not isinstance(context, dict)
         or str(context.get("selection_contract_version") or "").strip()
-        != "quality_silence_v22"
+        != "quality_silence_v23"
     ):
         return 0
     if (
@@ -582,6 +595,8 @@ def _overlapping_caption_end_handoff(
     selected_speech_units = _caption_speech_units(
         str(selected.get("text") or "")
     )
+    selected_text = str(selected.get("text") or "").strip()
+    following_text = str(following.get("text") or "").strip()
     minimum_selected_span = max(
         PARTIAL_CUE_MATERIALITY_SEC,
         selected_speech_units / MAX_PLAUSIBLE_CAPTION_WORDS_PER_SEC,
@@ -594,6 +609,8 @@ def _overlapping_caption_end_handoff(
         or not selected_speech_units
         or next_onset < selected_start + minimum_selected_span
         or next_onset + SPEECH_OWNERSHIP_EPSILON_SEC >= display_end
+        or _CAPTION_INCOMPLETE_END_RE.search(selected_text)
+        or not _CAPTION_FRESH_UNIT_ONSET_RE.match(following_text)
     ):
         return None
     return next_onset, {
@@ -1378,11 +1395,43 @@ def _transcript_aligned_result(
         return acoustic
     required_start, required_end = speech_bounds
     semantic_start, semantic_end = search_limits
+    overlap_handoff = projection_diagnostics.get(
+        "caption_overlap_end_handoff"
+    )
+    overlap_fallback_end: float | None = None
+    if (
+        not isinstance(projection_diagnostics.get("end"), dict)
+        and isinstance(overlap_handoff, dict)
+        and overlap_handoff.get("mode") == "next_cue_onset_two_sided_quiet"
+    ):
+        try:
+            next_onset = float(overlap_handoff["next_cue_onset_sec"])
+            display_end = float(overlap_handoff["display_end_sec"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            pass
+        else:
+            if (
+                math.isfinite(next_onset)
+                and math.isfinite(display_end)
+                and abs(next_onset - required_end)
+                <= SPEECH_OWNERSHIP_EPSILON_SEC
+                and display_end > next_onset
+            ):
+                # A rolling-caption onset is only an acoustic cut candidate.
+                # Without verified quiet at that handoff, retain the complete
+                # selected cue instead of treating its neighbor's onset as a
+                # transcript-authoritative speech boundary.
+                overlap_fallback_end = display_end
+                semantic_end = max(semantic_end, display_end)
     final_start = required_start
     final_end = (
-        semantic_end
-        if isinstance(projection_diagnostics.get("end"), dict)
-        else required_end
+        overlap_fallback_end
+        if overlap_fallback_end is not None
+        else (
+            semantic_end
+            if isinstance(projection_diagnostics.get("end"), dict)
+            else required_end
+        )
     )
     if (
         not all(
@@ -2018,7 +2067,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v22",
+            selection_contract_version="quality_silence_v23",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -4338,7 +4387,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v22",
+                    selection_contract_version="quality_silence_v23",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,

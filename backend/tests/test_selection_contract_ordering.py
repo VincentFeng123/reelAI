@@ -223,7 +223,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
 
     def test_persisted_selection_metadata_decodes_intent_role_and_coverage(self) -> None:
         metadata = self.service._selection_metadata({
-            "selection_contract_version": "quality_silence_v22",
+            "selection_contract_version": "quality_silence_v23",
             "intent_role": "supporting",
             "intent_coverage": 0.5,
         })
@@ -618,7 +618,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ).fetchone()
             context = json.loads(row[0])
             context.update({
-                "selection_contract_version": "quality_silence_v22",
+                "selection_contract_version": "quality_silence_v23",
                 "self_contained": True,
                 "topic_evidence_quote": (
                     "Chemical bonding explains how atoms share or transfer electrons"
@@ -671,7 +671,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             return {
                 "reel_id": reel_id,
                 "difficulty": difficulty,
-                "selection_contract_version": "quality_silence_v22",
+                "selection_contract_version": "quality_silence_v23",
             }
 
         easy = item("easy", 0.15)
@@ -699,6 +699,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             "quality_silence_v3",
             "quality_silence_v9",
             "quality_silence_v19",
+            "quality_silence_v22",
         ):
             reel_id = f"historical-{version}"
             with self.subTest(version=version):
@@ -815,7 +816,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         ).fetchone()
         context = json.loads(row[0])
         context.update({
-            "selection_contract_version": "quality_silence_v22",
+            "selection_contract_version": "quality_silence_v23",
             "topic_relevance": 0.93,
             "self_contained": True,
             "topic_evidence_quote": (
@@ -860,7 +861,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         for result in (fresh, cached):
             self.assertEqual(len(result), 1)
             self.assertEqual(
-                result[0]["selection_contract_version"], "quality_silence_v22"
+                result[0]["selection_contract_version"], "quality_silence_v23"
             )
             self.assertAlmostEqual(result[0]["relevance_score"], 0.93)
             self.assertAlmostEqual(result[0]["topic_relevance"], 0.93)
@@ -1179,7 +1180,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ).fetchone()
             context = json.loads(row[0])
             context.update({
-                "selection_contract_version": "quality_silence_v22",
+                "selection_contract_version": "quality_silence_v23",
                 "self_contained": True,
                 "topic_evidence_quote": (
                     "Chemical bonding explains how atoms share or transfer electrons"

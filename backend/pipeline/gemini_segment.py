@@ -388,7 +388,8 @@ _TERMINAL_EXPLICIT_INCOMPLETE_CLAUSE_RE = re.compile(
     re.IGNORECASE,
 )
 _TERMINAL_COORDINATING_CONJUNCTION_RE = re.compile(
-    r"\b(?:and|but|or)\s*[.!?]?[\"')\]]*$",
+    r"(?<!\bnow\s)\b(?:and|but|or)(?:\s+(?:now|so|then))?"
+    r"\s*[.!?]?[\"')\]]*$",
     re.IGNORECASE,
 )
 _TERMINAL_REQUIRED_COMPLEMENT_RE = re.compile(
@@ -525,6 +526,65 @@ _OPENING_DEMONSTRATIVE_REFERENCE_RE = re.compile(
 _OPENING_BARE_RELATIONAL_PREDICATE_RE = re.compile(
     r"^\s*(?:is|are|was|were)\s+(?:equal|equivalent|proportional|related|"
     r"similar|connected|dependent)\b",
+    re.IGNORECASE,
+)
+_OPENING_DEPENDENT_PREPOSITION_FRAGMENT_RE = re.compile(
+    r"^\s*(?:in\s+terms\s+of|relative\s+to|with\s+respect\s+to)\b"
+    r"[^,;:.!?]{1,120}\b(?:and|but|so|then)\s+"
+    r"(?:i|he|it|she|that|these|they|this|those|we|you)"
+    r"(?:['’](?:d|ll|m|re|s|ve)|\s+(?:am|are|can|could|did|do|does|had|"
+    r"has|have|is|may|might|must|should|was|were|will|would))\b",
+    re.IGNORECASE,
+)
+_OPENING_SUBJECTLESS_PREDICATE_RE = re.compile(
+    r"^\s*(?:(?:is|are|was|were)\b|"
+    r"(?:can|could|may|might|must|should|will|would)\s+"
+    r"(?:(?:also|just|really|simply|still)\s+)*"
+    r"(?:be|cancel|differentiate|divide|multiply|replace|treat|use|view|write)\b)",
+    re.IGNORECASE,
+)
+_OPENING_MATH_CONTINUATION_RE = re.compile(
+    r"^\s*(?:times\b|respect\s+to\b|"
+    r"[-+]?\d+(?:\.\d+)?[a-z]?\s+(?:but|plus|minus|times|over|squared|cubed)\b|"
+    r"[a-z]\s+(?:plus|minus|times|over|squared|cubed|raised\s+to)\b)",
+    re.IGNORECASE,
+)
+_NEXT_DEPENDENT_COMPLEMENT_RE = re.compile(
+    r"^\s*(?:of\b(?!\s+course\b)|with\s+respect\s+to\b|respect\s+to\b|"
+    r"squared\b|cubed\b|raised\s+to\b|"
+    r"which\s+(?:are|equals?|gives?|is|means?|shows?)\b)",
+    re.IGNORECASE,
+)
+_OPENING_INDEPENDENT_OF_FRAME_RE = re.compile(
+    r"^\s*of\s+(?:all\s+)?(?:the\s+)?(?:available|following|possible|"
+    r"remaining|several|these|those|various)\b",
+    re.IGNORECASE,
+)
+_TERMINAL_OF_COMPLEMENT_HEAD_RE = re.compile(
+    r"\b(?:amount|atoms?|average|basis|cause|cells?|coefficient|cosine|"
+    r"definition|degree|derivative|determinant|dimension|effect|example|"
+    r"function|grams?|group|integral|kind|limit|logarithm|measure|moles?|"
+    r"molecules?|number|part|percentage?|probability|product|ratio|rate|"
+    r"root|sine|sum|tangent|type|value)\s*$",
+    re.IGNORECASE,
+)
+_NEXT_SYMBOL_LABEL_CONTINUATION_RE = re.compile(
+    r"^\s*[a-z][a-z0-9_]*\s+(?:equals?\b|is\b|that(?:['’]?s|\s+is)\b)",
+    re.IGNORECASE,
+)
+_TRAILING_VISUAL_POINTER_RE = re.compile(
+    r"\b(?:this|that)\s+right\s+over\s+(?:here|there)\b[^.!?]*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_EMBEDDED_IDENTITY_RE = re.compile(
+    r"\b(?:that|which)\s+(?:equals?|is)\s+(?:exactly\s+)?what\s+"
+    r"[a-z0-9][a-z0-9_+\-^ ]{0,80}\s+(?:equals?|is)\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_REQUIRED_VISUAL_COMPLEMENT_RE = re.compile(
+    r"\b(?:by|through)\s+(?:(?:[a-z][a-z'’-]*ly)\s+){0,2}"
+    r"[a-z][a-z'’-]*ing(?:\s+(?:all|both|each|either|just|only|the|"
+    r"these|this|those|two))?\s*$",
     re.IGNORECASE,
 )
 _OPENING_COMPLETE_ORDINAL_SUBJECT_RE = re.compile(
@@ -2234,6 +2294,7 @@ def _cue_opens_mid_thought_at(
         _DANGLING_TAIL_PREFIX_RE.search(opening_text)
         or _OPENING_DEMONSTRATIVE_REFERENCE_RE.match(opening_text)
         or _OPENING_BARE_RELATIONAL_PREDICATE_RE.match(opening_text)
+        or _OPENING_DEPENDENT_PREPOSITION_FRAGMENT_RE.match(opening_text)
         or _OPENING_CONTEXTUAL_REFORMULATION_RE.match(opening_text)
         or _opening_contextual_example_needs_context(opening_text)
         or _OPENING_AGENDA_RE.match(opening_text)
@@ -2247,6 +2308,19 @@ def _cue_opens_mid_thought_at(
         return True
     if index > 0:
         previous_text = str(segments[index - 1].get("text") or "")
+        rolling_context_tokens = _toks(" ".join(
+            str(segments[line].get("text") or "")
+            for line in range(max(0, index - 2), index)
+        ))
+        opening_tokens = _toks(opening_text)
+        rolling_overlap = any(
+            rolling_context_tokens[-width:] == opening_tokens[:width]
+            for width in range(
+                min(12, len(rolling_context_tokens), len(opening_tokens)),
+                2,
+                -1,
+            )
+        )
         if (
             _cue_has_explicit_dangling_end(
                 previous_text,
@@ -2263,6 +2337,65 @@ def _cue_opens_mid_thought_at(
         from .sentences import classify_terminator
 
         opening_words = _toks(text)
+        subjectless_predicate = _OPENING_SUBJECTLESS_PREDICATE_RE.match(
+            opening_text
+        )
+        following_text = (
+            str(segments[index + 1].get("text") or "").strip()
+            if index + 1 < len(segments)
+            else ""
+        )
+        question_words = _toks(opening_text)
+        answer_words = _toks(following_text)
+        subject_index = 1
+        if (
+            len(question_words) > subject_index
+            and question_words[subject_index] in {"a", "an", "the"}
+        ):
+            subject_index += 1
+        question_subject = (
+            question_words[subject_index]
+            if len(question_words) > subject_index
+            else ""
+        )
+        question_predicate_index = subject_index + 1
+        answer_subject = ""
+        if answer_words:
+            answer_subject_index = (
+                1 if answer_words[0] in {"a", "an", "the"} else 0
+            )
+            if len(answer_words) > answer_subject_index:
+                answer_subject = answer_words[answer_subject_index]
+        grounded_declarative_answer = bool(
+            question_subject
+            and answer_subject == question_subject
+            and len(question_words) > question_predicate_index
+            and question_words[question_predicate_index]
+            not in {"by", "for", "from", "of", "to", "with"}
+        )
+        independent_auxiliary_question = bool(
+            subjectless_predicate
+            and _cue_begins_standalone_question(opening_text)
+            and not _cue_has_explicit_dangling_end(opening_text, "")
+            and (
+                "?" in opening_text
+                or re.match(r"^\s*(?:no|yes)\b", following_text, re.IGNORECASE)
+                or grounded_declarative_answer
+            )
+        )
+        if (
+            not classify_terminator(previous_text)
+            and "?" not in opening_text
+            and (
+                rolling_overlap
+                or (
+                    subjectless_predicate
+                    and not independent_auxiliary_question
+                )
+                or _OPENING_MATH_CONTINUATION_RE.match(opening_text)
+            )
+        ):
+            return True
         if (
             opening_words
             and opening_words[0] in {
@@ -2376,7 +2509,43 @@ def _cue_has_weak_end(
     from .sentences import Sentence, classify_terminator
 
     raw_text = str(text or "").strip()
+    visual_pointer = _TRAILING_VISUAL_POINTER_RE.search(raw_text)
+    if visual_pointer is not None:
+        retained = raw_text[:visual_pointer.start()].rstrip(" ,;:—-")
+        if (
+            len(_toks(retained)) >= 5
+            and not _terminal_content_is_explicitly_incomplete(retained)
+            and not _cue_has_explicit_dangling_end(retained, "")
+            and not _TERMINAL_REQUIRED_VISUAL_COMPLEMENT_RE.search(retained)
+        ):
+            return False
     if _cue_has_explicit_dangling_end(raw_text, next_text):
+        return True
+    if _TERMINAL_COORDINATING_CONJUNCTION_RE.search(raw_text):
+        return True
+    dependent_complement = _NEXT_DEPENDENT_COMPLEMENT_RE.match(
+        str(next_text or "")
+    )
+    if dependent_complement is not None and not classify_terminator(raw_text):
+        next_opening = dependent_complement.group(0).strip().casefold()
+        if (
+            not next_opening.startswith("of")
+            or (
+                _OPENING_INDEPENDENT_OF_FRAME_RE.match(str(next_text or ""))
+                is None
+                and _TERMINAL_OF_COMPLEMENT_HEAD_RE.search(raw_text)
+            )
+        ):
+            return True
+    if (
+        _NEXT_SYMBOL_LABEL_CONTINUATION_RE.match(str(next_text or ""))
+        and re.search(
+            r"\b(?:answer|derivative|expression|formula|function|result|"
+            r"solution|value|variable)\s*$",
+            raw_text,
+            re.IGNORECASE,
+        )
+    ):
         return True
     if _NEXT_SAME_UNIT_CONTINUATION_RE.match(str(next_text or "")):
         return True
@@ -3630,6 +3799,7 @@ def _opening_clause_is_standalone(text: str) -> bool:
         or _NEXT_EXAMPLE_FRAMING_RE.fullmatch(opening_clause)
         or _OPENING_LIST_TAIL_RE.match(opening_clause)
         or _OPENING_PREPOSITIONAL_TAG_RE.match(opening_clause)
+        or _OPENING_DEPENDENT_PREPOSITION_FRAGMENT_RE.match(opening_clause)
         or _opening_is_dependent_question_tail(opening_clause)
         or (
             _OPENING_NOMINAL_INFINITIVE_RE.match(opening_clause)
@@ -4023,6 +4193,23 @@ def _trailing_edge_noise_start(
                 and not _TERMINAL_DANGLING_PREDICATE_HEAD_RE.search(complete_prefix)
             ):
                 return right
+    visual_pointer = _TRAILING_VISUAL_POINTER_RE.search(raw_text)
+    if visual_pointer is not None:
+        prefix = raw_text[:visual_pointer.start()].rstrip(" ,;:—-")
+        embedded_identity = bool(_TERMINAL_EMBEDDED_IDENTITY_RE.search(prefix))
+        if (
+            len(_toks(prefix)) >= 5
+            and (
+                embedded_identity
+                or (
+                    not _terminal_content_is_explicitly_incomplete(prefix)
+                    and not _cue_has_explicit_dangling_end(prefix, "")
+                    and not _TERMINAL_DANGLING_PREDICATE_HEAD_RE.search(prefix)
+                    and not _TERMINAL_REQUIRED_VISUAL_COMPLEMENT_RE.search(prefix)
+                )
+            )
+        ):
+            return visual_pointer.start()
     return None
 
 
@@ -5756,6 +5943,7 @@ def _clip_requires_visual_context(
     text: str,
     *,
     learning_objective: str = "",
+    speech_blocks: list[str] | None = None,
 ) -> bool:
     raw_text = str(text or "")
     if (
@@ -5766,15 +5954,62 @@ def _clip_requires_visual_context(
         return False
     prior_parts: list[str] = []
     records: list[tuple[str, bool]] = []
-    for left, right in _sentence_character_spans(raw_text):
-        sentence = raw_text[left:right].strip()
-        requires_visual = _sentence_requires_visual_context(
-            sentence,
-            prior_text=" ".join(prior_parts),
-        )
-        records.append((sentence, requires_visual))
-        if sentence:
-            prior_parts.append(sentence)
+    raw_sentence_spans = _sentence_character_spans(raw_text)
+    max_raw_sentence_words = max(
+        (
+            len(_toks(raw_text[left:right]))
+            for left, right in raw_sentence_spans
+        ),
+        default=0,
+    )
+    # Preserve reconstructed logical sentences for ordinary clips. Only fall
+    # back to caption-sized speech blocks when missing punctuation would make
+    # one runaway sentence hide an internal return to verbal teaching.
+    using_speech_blocks = bool(
+        speech_blocks and max_raw_sentence_words > 120
+    )
+    blocks = list(speech_blocks or []) if using_speech_blocks else [raw_text]
+    cross_block_visual_indexes: set[int] = set()
+    if using_speech_blocks:
+        individually_visual = [
+            _sentence_requires_visual_context(
+                block,
+                prior_text=" ".join(blocks[:index]),
+            )
+            for index, block in enumerate(blocks)
+        ]
+        # Caption boundaries can split a short signal such as "as you can / see".
+        # Scan only two- and three-cue windows whose individual cues were clean;
+        # this preserves a narrow internal visual aside instead of making its
+        # neighboring verbal teaching visual as well.
+        for width in (2, 3):
+            for left in range(0, len(blocks) - width + 1):
+                indexes = range(left, left + width)
+                if any(
+                    individually_visual[index]
+                    or index in cross_block_visual_indexes
+                    for index in indexes
+                ):
+                    continue
+                joined = " ".join(blocks[index] for index in indexes)
+                if _sentence_requires_visual_context(
+                    joined,
+                    prior_text=" ".join(blocks[:left]),
+                ):
+                    cross_block_visual_indexes.update(indexes)
+    for block_index, block in enumerate(blocks):
+        for left, right in _sentence_character_spans(block):
+            sentence = block[left:right].strip()
+            requires_visual = bool(
+                block_index in cross_block_visual_indexes
+                or _sentence_requires_visual_context(
+                    sentence,
+                    prior_text=" ".join(prior_parts),
+                )
+            )
+            records.append((sentence, requires_visual))
+            if sentence:
+                prior_parts.append(sentence)
     visual_indexes = [
         index for index, (_sentence, visual) in enumerate(records) if visual
     ]
@@ -6725,12 +6960,35 @@ def _plan_to_report(
                         "recovered_same_cue_sentence_start"
                     )
                 else:
-                    recovered_forward = _recover_start_forward_across_cues(
-                        segments,
-                        a,
-                        b,
-                        evidence_quote=evidence_quote_for_section,
-                        learning_objective=objective_for_section,
+                    backward_context_available = False
+                    opening_requires_prior_cue = bool(
+                        _OPENING_DEPENDENT_PREPOSITION_FRAGMENT_RE.match(start_text)
+                        or _OPENING_SUBJECTLESS_PREDICATE_RE.match(start_text)
+                        or _OPENING_MATH_CONTINUATION_RE.match(start_text)
+                    )
+                    if (
+                        a > 0
+                        and (semantic_min_start is None or a > semantic_min_start)
+                        and opening_requires_prior_cue
+                    ):
+                        try:
+                            backward_context_available = (
+                                float(segments[a].get("start", 0.0))
+                                - float(segments[a - 1].get("end", 0.0))
+                                < _SECTION_RESET_GAP_S
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            backward_context_available = False
+                    recovered_forward = (
+                        None
+                        if backward_context_available
+                        else _recover_start_forward_across_cues(
+                            segments,
+                            a,
+                            b,
+                            evidence_quote=evidence_quote_for_section,
+                            learning_objective=objective_for_section,
+                        )
                     )
                     if (
                         recovered_forward is not None
@@ -6872,11 +7130,28 @@ def _plan_to_report(
                 end_text[:preliminary_end_spans[0][1]]
             )
         )
+        from .sentences import classify_terminator
+
+        preceding_cue_is_closed = bool(
+            a <= 0
+            or classify_terminator(
+                str(segments[a - 1].get("text") or "")
+            )
+        )
         projected_start_is_standalone = bool(
             len(preliminary_start_spans) == 1
             and _projected_start_is_standalone(
                 start_text,
                 preliminary_start_spans[0],
+            )
+            and (
+                preliminary_start_spans[0][0] > 0
+                or preceding_cue_is_closed
+                or not _cue_opens_mid_thought_at(
+                    segments,
+                    a,
+                    ignore_caption_case=ignore_caption_case,
+                )
             )
         )
         projected_end_is_complete = bool(
@@ -7273,9 +7548,22 @@ def _plan_to_report(
             boundary_fallback_reasons.append(
                 f"retained_{same_cue_filler_reason}"
             )
+        visual_speech_blocks: list[str] = []
+        for segment in segments[a:b + 1]:
+            cue_id = str(segment.get("cue_id") or "")
+            cue_text = str(segment.get("text") or "")
+            semantic_span = semantic_spans_by_cue.get(cue_id)
+            if (
+                isinstance(semantic_span, tuple)
+                and len(semantic_span) == 2
+            ):
+                cue_text = cue_text[semantic_span[0]:semantic_span[1]]
+            if cue_text.strip():
+                visual_speech_blocks.append(cue_text.strip())
         if _clip_requires_visual_context(
             clip_text,
             learning_objective=objective_for_section,
+            speech_blocks=visual_speech_blocks,
         ):
             report.rejected_reasons.append(f"{prefix}:requires_visual_context")
             continue

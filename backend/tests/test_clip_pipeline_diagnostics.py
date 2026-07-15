@@ -2318,6 +2318,122 @@ def test_rolling_display_end_uses_only_a_two_sided_next_onset_handoff() -> None:
     assert plan == (0.0, 8.0, False, True, False, True)
 
 
+def test_unverified_rolling_overlap_falls_back_to_complete_selected_cue(
+    monkeypatch,
+) -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:unverified-overlap",
+        "duration": 20.0,
+        "segments": [
+            {
+                "cue_id": "selected",
+                "start": 0.0,
+                "end": 10.0,
+                "text": (
+                    "Photosynthesis converts light into stored chemical energy "
+                    "for growing cells."
+                ),
+            },
+            {
+                "cue_id": "next",
+                "start": 8.0,
+                "end": 20.0,
+                "text": "The next topic begins with cellular respiration.",
+            },
+        ],
+    }
+    clip = _quality_clip(
+        cue_id="selected",
+        start=0.0,
+        end=10.0,
+        kind="educational",
+        quote=(
+            "Photosynthesis converts light into stored chemical energy for "
+            "growing cells."
+        ),
+    )
+    verify_audio = mock.Mock(
+        return_value=pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "unavailable",
+            0.0,
+            8.0,
+            {"stage": "end", "reason": "end_silence_not_found"},
+        )
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify_audio,
+    )
+    prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+        "ready",
+        source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a",
+            duration_sec=20.0,
+        ),
+    )
+
+    verified = pipeline_module._verified_direct_adapter_clips(
+        source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        engine_out={"clips": [clip], "transcript": transcript},
+        should_cancel=None,
+        prepared_audio=prepared,
+        exact_topic="photosynthesis",
+    )
+
+    assert verify_audio.call_args.args[2] == 8.0
+    assert len(verified) == 1
+    assert (verified[0]["start"], verified[0]["end"]) == (0.0, 10.0)
+    boundary = verified[0]["search_context"]["boundary_diagnostics"]
+    assert boundary["acoustic_verified"] is False
+    assert boundary["transcript"]["final_range"] == [0.0, 10.0]
+
+
+def test_rolling_caption_continuation_never_shortens_required_speech() -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:continued-overlap",
+        "duration": 20.0,
+        "segments": [
+            {
+                "cue_id": "selected",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "This fraction-like cancellation can help with intuition and then",
+            },
+            {
+                "cue_id": "next",
+                "start": 8.0,
+                "end": 20.0,
+                "text": "what you're left with is the derivative of the whole function.",
+            },
+        ],
+    }
+    clip = {
+        "cue_ids": ["selected"],
+        "start": 0.0,
+        "end": 10.0,
+        "start_quote": "This fraction-like cancellation",
+        "end_quote": "help with intuition and then",
+    }
+    caption = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert caption is not None
+
+    bounds, projection, error = pipeline_module._projected_speech_bounds(
+        transcript,
+        clip,
+        caption,
+        None,
+    )
+
+    assert error is None
+    assert bounds == (0.0, 10.0)
+    assert projection == {}
+
+
 def test_native_lexical_end_wins_over_rolling_display_overlap() -> None:
     transcript = {
         "source": "supadata",
@@ -2823,7 +2939,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
 ) -> None:
     strict_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v22",
+        "selection_contract_version": "quality_silence_v23",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -2833,7 +2949,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
     }
     transcript_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v22",
+        "selection_contract_version": "quality_silence_v23",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -2896,7 +3012,7 @@ def test_failed_boundary_storage_does_not_consume_ready_material_cap(
     deferred.append({
         "search_context_json": json.dumps({
             "surface_eligible": True,
-            "selection_contract_version": "quality_silence_v22",
+            "selection_contract_version": "quality_silence_v23",
             "speech_corridor_verified": True,
             "boundary_status": "verified",
             "boundary_diagnostics": {
@@ -3654,7 +3770,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v22"
+        assert context["selection_contract_version"] == "quality_silence_v23"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"

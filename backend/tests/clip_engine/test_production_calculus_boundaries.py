@@ -1039,6 +1039,20 @@ def test_internal_visual_aside_does_not_erase_later_verbal_teaching() -> None:
     ]
 
 
+def test_runaway_caption_scan_detects_visual_signal_split_across_cues() -> None:
+    blocks = [
+        " ".join(["background"] * 65),
+        "as you can",
+        "see the half R ligature shape must be recognized visually",
+        " ".join(["explanation"] * 65),
+    ]
+    assert gemini_segment._clip_requires_visual_context(
+        " ".join(blocks),
+        learning_objective="Recognize the half R ligature shape",
+        speech_blocks=blocks,
+    )
+
+
 def test_terminal_future_preview_is_trimmed_after_a_complete_explanation() -> None:
     segments = [
         _cue(
@@ -2119,6 +2133,349 @@ def test_procedural_numerator_step_stays_with_its_problem_and_answer() -> None:
         "factor-step",
         "limit-answer",
     ]
+
+
+def test_live_style_fraction_intuition_recovers_setup_and_formal_conclusion() -> None:
+    segments = [
+        _cue(
+            "live:0",
+            0.0,
+            7.0,
+            "The quotient rule differentiates a ratio, and that completes the previous lesson.",
+        ),
+        _cue(
+            "live:1",
+            7.0,
+            15.0,
+            "For h of x equals sine of x squared, the chain rule differentiates a composite function.",
+        ),
+        _cue("live:2", 15.0, 19.0, "so the derivative of h"),
+        _cue(
+            "live:3",
+            19.0,
+            25.0,
+            "with respect to x and this is where the notation can build intuition",
+        ),
+        _cue(
+            "live:4",
+            25.0,
+            33.0,
+            "A quick aside: the notation resembles a fraction even though it is not literally one.",
+        ),
+        _cue(
+            "live:5",
+            33.0,
+            40.0,
+            "The intermediate differential appears to cancel, which encodes composition.",
+        ),
+        _cue(
+            "live:6",
+            40.0,
+            46.0,
+            "This cancellation can help build intuition and then",
+        ),
+        _cue(
+            "live:7",
+            46.0,
+            54.0,
+            "the formal rule multiplies the derivative of sine by the derivative of x squared.",
+        ),
+        _cue(
+            "live:8",
+            54.0,
+            61.0,
+            "Now let us move on to the product rule.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="fraction-intuition",
+        start_line=3,
+        end_line=6,
+        start_quote="with respect to x and this",
+        end_quote="help build intuition and then",
+        evidence="intermediate differential appears to cancel which encodes composition",
+        objective="Explain why fraction-like differential cancellation conveys chain-rule composition",
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == [f"live:{index}" for index in range(1, 8)]
+    assert clip["_clip_text"].startswith("For h of x equals sine")
+    assert clip["_clip_text"].endswith("derivative of x squared.")
+    assert "A quick aside" in clip["_clip_text"]
+    assert "quotient rule" not in clip["_clip_text"].casefold()
+    assert "product rule" not in clip["_clip_text"].casefold()
+
+
+def test_dependent_preposition_and_terminal_then_are_not_complete_edges() -> None:
+    assert not gemini_segment._opening_clause_is_standalone(
+        "with respect to x and this is where the notation helps"
+    )
+    assert gemini_segment._opening_clause_is_standalone(
+        "With respect to x, the derivative of x squared is two x."
+    )
+    assert gemini_segment._opening_clause_is_standalone(
+        "By applying the chain rule, we multiply the outer and inner derivatives."
+    )
+    assert gemini_segment._terminal_content_is_explicitly_incomplete(
+        "This cancellation can help build intuition and then"
+    )
+    assert not gemini_segment._terminal_content_is_explicitly_incomplete(
+        "Differentiate the outside and then multiply by the inner derivative."
+    )
+
+
+def test_independent_of_onset_does_not_complete_the_previous_caption_cue() -> None:
+    for current, following in (
+        (
+            "The derivative of x squared is two x",
+            "Of course integration reverses differentiation and is our next topic",
+        ),
+        (
+            "The derivative of x squared is two x, which is one complete example",
+            "Of the available methods substitution belongs to the next topic",
+        ),
+    ):
+        segments = [
+            _cue("derivative", 0.0, 8.0, current),
+            _cue("integration", 8.0, 16.0, following),
+        ]
+        proposal = _proposal(
+            candidate_id="x-squared-derivative",
+            start_line=0,
+            end_line=0,
+            start_quote="The derivative of x squared",
+            end_quote=(
+                "complete example" if current.endswith("complete example") else "is two x"
+            ),
+            evidence="derivative of x squared",
+            objective="Differentiate x squared",
+        )
+
+        report = _report(segments, proposal, topic="derivative of x squared")
+
+        assert report.rejected_reasons == []
+        assert report.clips[0]["cue_ids"] == ["derivative"]
+
+
+def test_independent_preposition_and_auxiliary_question_keep_clean_openings() -> None:
+    assert gemini_segment._opening_clause_is_standalone(
+        "With respect to x and y, the function is symmetric."
+    )
+    coordinated = (
+        "With respect to x and this parameter, the function is symmetric and stable."
+    )
+    assert gemini_segment._opening_clause_is_standalone(coordinated)
+    coordinated_report = _report(
+        [
+            _cue("prior", 0.0, 5.0, "The previous lesson covered limits."),
+            _cue(
+                "symmetric",
+                5.0,
+                12.0,
+                coordinated + " Its mixed partials agree.",
+            ),
+        ],
+        _proposal(
+            candidate_id="symmetric-function",
+            start_line=1,
+            end_line=1,
+            start_quote="With respect to x and this parameter",
+            end_quote="mixed partials agree",
+            evidence="function is symmetric and stable Its mixed partials agree",
+            objective="Explain symmetry with respect to two parameters",
+        ),
+        topic="symmetric functions",
+    )
+    assert coordinated_report.rejected_reasons == []
+    assert coordinated_report.clips[0]["cue_ids"] == ["symmetric"]
+
+    question_report = _report(
+        [
+            _cue("prior", 0.0, 5.0, "the previous lesson covered elements"),
+            _cue("question", 5.0, 10.0, "Is oxygen a metal"),
+            _cue(
+                "answer",
+                10.0,
+                16.0,
+                "Oxygen is classified as a nonmetal under standard conditions.",
+            ),
+        ],
+        _proposal(
+            candidate_id="oxygen-classification",
+            start_line=1,
+            end_line=2,
+            start_quote="Is oxygen a metal",
+            end_quote="standard conditions",
+            evidence="oxygen is classified as a nonmetal under standard conditions",
+            objective="Classify oxygen as a nonmetal",
+        ),
+        topic="oxygen classification",
+    )
+    assert question_report.rejected_reasons == []
+    assert question_report.clips[0]["cue_ids"] == ["question", "answer"]
+
+
+def test_visual_pointer_is_not_trimmed_after_a_required_gerund_complement() -> None:
+    text = (
+        "Chain rule intuition comes from the final derivative by comparing both "
+        "this right over here with that right over there."
+    )
+    assert gemini_segment._trailing_edge_noise_start(text) is None
+    report = _report(
+        [_cue("visual-comparison", 0.0, 10.0, text)],
+        _proposal(
+            candidate_id="visual-comparison",
+            start_line=0,
+            end_line=0,
+            start_quote="Chain rule intuition",
+            end_quote="that right over there",
+            evidence="Chain rule intuition comes from the final derivative",
+            objective="Explain chain rule intuition from the final derivative",
+        ),
+        topic="chain rule intuition",
+    )
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:requires_visual_context"]
+
+
+def test_now_and_then_idiom_is_a_complete_educational_ending() -> None:
+    text = "Intermittent symptoms can appear now and then."
+    assert not gemini_segment._terminal_content_is_explicitly_incomplete(text)
+    report = _report(
+        [_cue("intermittent", 0.0, 10.0, text)],
+        _proposal(
+            candidate_id="intermittent-symptoms",
+            start_line=0,
+            end_line=0,
+            start_quote="Intermittent symptoms",
+            end_quote="now and then",
+            evidence="Intermittent symptoms can appear now and then",
+            objective="Explain that intermittent symptoms recur occasionally",
+        ),
+        topic="intermittent symptoms",
+    )
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["intermittent"]
+
+
+def test_exact_live_rolling_chain_rule_clip_recovers_the_complete_thought() -> None:
+    raw_cues = [
+        ("36", 76.4, 79.2, "now, what, i, want, to, do, is, a little, bit, of"),
+        ("37", 77.6, 81.52, "a thought experiment"),
+        ("38", 79.2, 83.6, "a little bit of a thought experiment if"),
+        ("39", 81.52, 85.28, "i were to ask you what is the derivative"),
+        ("40", 83.6, 87.759, "with respect to x if i were to supply"),
+        ("41", 85.28, 89.759, "the derivative operator to"),
+        ("42", 87.759, 92.159, "x squared with respect to x what do i"),
+        ("43", 89.759, 94.56, "get well this gives me 2x we've seen"),
+        ("44", 92.159, 95.92, "that many many many many times now what"),
+        ("45", 94.56, 99.92, "if i were to take the derivative with respect to a"),
+        ("46", 97.439, 102.64, "of a squared well it's the exact same"),
+        ("47", 99.92, 105.6, "thing i just swapped an a for the x's"),
+        ("48", 102.64, 107.2, "this is still going to be equal to 2a"),
+        ("49", 105.6, 109.119, "now i will do something that might be a"),
+        ("50", 107.2, 112.24, "little bit more bizarre what if i were"),
+        ("51", 109.119, 115.68, "to take the derivative with respect to"),
+        ("52", 112.24, 119.04, "sine of x with respect to sine of x of"),
+        ("53", 116.88, 123.92, "of sine of x sine of x squared"),
+        ("54", 121.6, 125.52, "well wherever i had the x's up here or"),
+        ("55", 123.92, 128.08, "the a's over here i just replace it with"),
+        ("56", 125.52, 130.72, "a sine of x so this is just going to be"),
+        ("57", 128.08, 131.92, "2 times the thing that i had so whatever"),
+        ("58", 130.72, 133.84, "i'm taking the derivative with respect"),
+        ("59", 131.92, 135.84, "to here with respect to x here with"),
+        ("60", 133.84, 138.16, "respect to a here's with respect to sine"),
+        ("61", 135.84, 144.08, "of x so it's going to be 2 times sine of x"),
+        ("62", 141.68, 147.12, "now so the chain rule tells us that this"),
+        ("63", 144.08, 149.84, "derivative is going to be the derivative"),
+        ("64", 147.12, 151.76, "of our whole function with respect"),
+        ("65", 149.84, 156.56, "or the derivative of this outer function x squared"),
+        ("66", 153.36, 159.44, "the derivative of x squared"),
+        ("67", 156.56, 161.84, "the derivative of this outer function"),
+        ("68", 159.44, 164.959, "with respect to sine of x"),
+        ("69", 161.84, 167.84, "so that's going to be 2 sine of x 2"),
+        ("70", 166.08, 169.92, "sine of x so we could view it as the"),
+        ("71", 167.84, 172.319, "derivative of the outer function with"),
+        ("72", 169.92, 173.84, "respect to the inner 2 sine of x we"),
+        ("73", 172.319, 175.36, "could just treat sine of x like it's"),
+        ("74", 173.84, 177.04, "kind of an x and it would have been just"),
+        ("75", 175.36, 178.56, "2x but instead it's a sine of x so we"),
+        ("76", 177.04, 182.48, "say 2 sine of x times"),
+        ("77", 179.92, 185.04, "times the derivative we do this in green"),
+        ("78", 182.48, 186.64, "times the derivative of sine of x with"),
+        ("79", 185.04, 189.28, "respect to x"),
+        ("80", 186.64, 190.8, "times the derivative of sine of x with"),
+        ("81", 189.28, 192.08, "respect to x well that's more"),
+        ("82", 190.8, 194.48, "straightforward a little bit more"),
+        ("83", 192.08, 196.48, "intuitive the derivative of sine of x"),
+        ("84", 194.48, 201.519, "with respect to x we've seen multiple times"),
+        ("85", 197.44, 203.36, "is cosine of x so times cosine of x and"),
+        ("86", 201.519, 204.959, "so there we've applied the chain rule it"),
+        ("87", 203.36, 207.519, "was the derivative of the outer function"),
+        ("88", 204.959, 209.04, "with respect to the inner so derivative"),
+        ("89", 207.519, 211.84, "of sine of x squared with respect to"),
+        ("90", 209.04, 213.44, "sine of x is 2 sine of x and then we"),
+        ("91", 211.84, 216.959, "multiply that times the derivative of sine of x"),
+        ("92", 214.64, 218.72, "with respect to x"),
+        ("93", 216.959, 221.84, "so let me make it clear this right over here"),
+        ("94", 219.599, 223.36, "is the derivative we're taking the"),
+        ("95", 221.84, 226.959, "derivative of we're taking the derivative of sine"),
+        ("96", 225.519, 230.879, "of x squared so let me make it clear that's"),
+        ("97", 229.04, 233.2, "what we're taking the derivative of with"),
+        ("98", 230.879, 236.0, "respect to sine of x"),
+        ("99", 233.2, 238.64, "with respect to sine of x and then we're"),
+        ("100", 236.0, 242.48, "multiplying that times the derivative of"),
+        ("101", 238.64, 245.12, "sine of x the derivative of sine"),
+        ("102", 242.48, 247.76, "of x with respect to"),
+        ("103", 245.12, 249.599, "with respect to x and this is where it"),
+        ("104", 247.76, 252.48, "start might start making a little bit of intuition"),
+        ("105", 251.04, 254.72, "you can't really treat these"),
+        ("106", 252.48, 258.32, "differentials this d whatever this dx"),
+        ("107", 254.72, 259.84, "this d sine of x as as a as a as a"),
+        ("108", 258.32, 261.44, "number and you really can't this"),
+        ("109", 259.84, 262.88, "notation makes it look like a fraction"),
+        ("110", 261.44, 264.32, "because intuitively that's what we're"),
+        ("111", 262.88, 266.479, "doing but if you were to treat them like"),
+        ("112", 264.32, 268.24, "fractions then you could think about"),
+        ("113", 266.479, 269.68, "canceling that and that and once again"),
+        ("114", 268.24, 271.199, "this isn't a rigorous thing to do but it"),
+        ("115", 269.68, 273.36, "can help with the intuition and then"),
+        ("116", 271.199, 275.759, "what you're left with is the derivative"),
+        ("117", 273.36, 278.639, "of this whole sine of x squared with"),
+        ("118", 275.759, 280.88, "respect to x so you're left with"),
+        ("119", 278.639, 282.96, "you're left with the derivative"),
+        ("120", 280.88, 285.44, "of essentially our original function sine of x"),
+        ("121", 284.32, 290.639, "squared with respect to x with respect to x"),
+        ("122", 288.24, 294.08, "which is exactly what dhdx is this right over here"),
+        ("123", 291.759, 298.479, "this right over here is our original function"),
+        ("124", 295.36, 300.56, "h that's our original function h so it"),
+        ("125", 298.479, 302.08, "might seem a little bit daunting now"),
+    ]
+    segments = _youtube_cues(raw_cues)
+    proposal = _proposal(
+        candidate_id="live-fraction-intuition",
+        start_line=67,
+        end_line=79,
+        start_quote="with respect to x and this",
+        end_quote="help with the intuition and then",
+        evidence="if you were to treat them like fractions then you could think about canceling",
+        objective="Use fraction-like cancellation of differentials to conceptualize the chain rule logic",
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"][0] == "YNstP0ESndU:cue:36"
+    assert clip["cue_ids"][-1] == "YNstP0ESndU:cue:122"
+    assert clip["_clip_text"].startswith("now, what, i, want, to, do")
+    assert clip["_clip_text"].endswith("which is exactly what dhdx is")
+    assert not clip["_clip_text"].startswith("with respect to x")
+    assert not clip["_clip_text"].endswith("and then")
+    assert "next video" not in clip["_clip_text"].casefold()
 
 
 def test_live_coarse_captions_isolate_sine_six_x_worked_unit() -> None:
