@@ -2469,13 +2469,43 @@ def test_exact_live_rolling_chain_rule_clip_recovers_the_complete_thought() -> N
 
     assert report.rejected_reasons == []
     [clip] = report.clips
-    assert clip["cue_ids"][0] == "YNstP0ESndU:cue:36"
+    assert clip["cue_ids"][0] == "YNstP0ESndU:cue:38"
     assert clip["cue_ids"][-1] == "YNstP0ESndU:cue:122"
-    assert clip["_clip_text"].startswith("now, what, i, want, to, do")
+    assert clip["_clip_text"].startswith("if i were to ask you")
     assert clip["_clip_text"].endswith("which is exactly what dhdx is")
+    assert "what, i, want, to, do" not in clip["_clip_text"]
+    assert "thought experiment" not in clip["_clip_text"]
     assert not clip["_clip_text"].startswith("with respect to x")
     assert not clip["_clip_text"].endswith("and then")
     assert "next video" not in clip["_clip_text"].casefold()
+
+    worked_proposal = _proposal(
+        candidate_id="live-sine-squared-chain-rule",
+        start_line=0,
+        end_line=len(segments) - 1,
+        start_quote="now what i want to do",
+        end_quote="might seem a little bit daunting now",
+        evidence="so there we've applied the chain rule it was the derivative",
+        objective="Apply the chain rule to differentiate sine squared of x",
+    )
+    worked_report = _report(
+        segments,
+        worked_proposal,
+        topic="chain rule worked example",
+    )
+
+    assert worked_report.rejected_reasons == []
+    [worked_clip] = worked_report.clips
+    assert worked_clip["cue_ids"][0] == "YNstP0ESndU:cue:38"
+    assert worked_clip["cue_ids"][-1] == "YNstP0ESndU:cue:103"
+    worked_text = worked_clip["_clip_text"].casefold()
+    assert worked_text.startswith("if i were to ask you what is the derivative")
+    assert "x squared with respect to x" in worked_text
+    assert "a squared well it's the exact same" in worked_text
+    assert "so there we've applied the chain rule" in worked_text
+    assert "thought experiment" not in worked_text
+    assert "differentials" not in worked_text
+    assert "fraction" not in worked_text
 
 
 def test_live_coarse_captions_isolate_sine_six_x_worked_unit() -> None:
@@ -3782,3 +3812,88 @@ def test_preposition_fronted_question_is_a_valid_independent_opening() -> None:
 
     assert report.rejected_reasons == []
     assert report.clips[0]["cue_ids"][0] == "question"
+
+
+def test_pedagogical_meta_frame_trims_punctuated_and_asr_openings() -> None:
+    assert gemini_segment._leading_pedagogical_meta_quote(
+        "A thought experiment. Suppose the input doubles."
+    ) == "Suppose the input doubles"
+    assert gemini_segment._leading_pedagogical_meta_quote(
+        "a little bit of a thought experiment if"
+    ) == "if"
+
+
+def test_lens_handoff_requires_completion_and_never_creates_new_side_start() -> None:
+    segments = [
+        _cue(
+            "completed",
+            0.0,
+            6.0,
+            "Therefore we have solved the worked example and found the result.",
+        ),
+        _cue(
+            "handoff",
+            6.0,
+            11.0,
+            "And this is where the intuition for differential calculus comes in.",
+        ),
+        _cue(
+            "notation",
+            11.0,
+            17.0,
+            "Differential notation writes the derivative as dy over dx.",
+        ),
+        _cue(
+            "meaning",
+            17.0,
+            23.0,
+            "The notation represents how y changes with respect to x.",
+        ),
+    ]
+    evidence = "Differential notation writes the derivative as dy over dx"
+
+    [old_side_transition] = gemini_segment._candidate_topic_transitions(
+        segments,
+        0,
+        len(segments) - 1,
+        evidence_quote="we have solved the worked example and found the result",
+        learning_objective="Solve the worked example",
+    )
+    assert old_side_transition.navigation_line == 1
+    assert old_side_transition.navigation_left == 0
+
+    assert gemini_segment._candidate_topic_transitions(
+        segments,
+        0,
+        len(segments) - 1,
+        evidence_quote=evidence,
+        learning_objective="Explain differential notation",
+    ) == []
+
+    incomplete_segments = [dict(segment) for segment in segments]
+    incomplete_segments[0]["text"] = (
+        "The worked example still needs its final multiplication step."
+    )
+    assert gemini_segment._candidate_topic_transitions(
+        incomplete_segments,
+        0,
+        len(incomplete_segments) - 1,
+        evidence_quote="worked example still needs its final multiplication step",
+        learning_objective="Solve the worked example",
+    ) == []
+
+    proposal = _proposal(
+        candidate_id="differential-notation-after-lens-handoff",
+        start_line=2,
+        end_line=3,
+        start_quote="Differential notation writes the derivative",
+        end_quote="with respect to x",
+        evidence=evidence,
+        objective="Explain differential notation",
+    )
+    report = _report(segments, proposal, topic="differential notation")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"][0] == "notation"
+    assert gemini_segment._opening_clause_is_standalone(clip["_clip_text"])

@@ -133,6 +133,30 @@ _STRUCTURAL_FILLER_RE = re.compile(
     r"we(?:['’]ve| have) already (?:done|covered|finished)\b.{0,80}))",
     re.IGNORECASE,
 )
+_PEDAGOGICAL_META_FRAME_ONLY_RE = re.compile(
+    r"(?:(?:all right|alright|okay|ok|so|now)\s+)*(?:"
+    r"what\s+(?:i|we)\s+(?:want|would\s+like|(?:am|are)\s+going|intend)\s+"
+    r"to\s+do(?:\s+(?:here|now|next))?(?:\s+is)?"
+    r"(?:\s+a\s+little\s+bit\s+of)?|"
+    r"(?:a\s+little\s+bit\s+of\s+)?(?:a\s+)?thought\s+experiment)",
+    re.IGNORECASE,
+)
+_LEADING_PEDAGOGICAL_META_RE = re.compile(
+    r"^\s*(?:(?:all right|alright|okay|ok|so|now)\s*[,;:]?\s+)*(?:"
+    r"what\s+(?:i|we)\s+(?:want|would\s+like|(?:am|are)\s+going|intend)\s+"
+    r"to\s+do(?:\s+(?:here|now|next))?\s+is\s+"
+    r"(?:(?:a\s+little\s+bit\s+of\s+)?(?:a\s+)?thought\s+experiment"
+    r"[\s,;:.!?—\-\"'’”\)\]]+)?|"
+    r"(?:a\s+little\s+bit\s+of\s+)?(?:a\s+)?thought\s+experiment"
+    r"[\s,;:.!?—\-\"'’”\)\]]+)",
+    re.IGNORECASE,
+)
+_PEDAGOGICAL_META_TEACHING_ONSET_RE = re.compile(
+    r"^\s*(?:ask|calculate|compare|consider|define|derive|determine|differentiate|"
+    r"evaluate|explain|find|if|imagine|let(?:['’]?s|\s+us)|prove|show|solve|"
+    r"suppose|take|try|what\s+if)\b",
+    re.IGNORECASE,
+)
 _INTERNAL_INTERRUPTION_MARKER_RE = re.compile(
     r"\b(?:today'?s sponsor|sponsored by|administrative (?:note|announcement)|"
     r"course (?:administration|logistics)|(?:a\s+)?(?:quick|brief|short) "
@@ -490,6 +514,21 @@ _HARD_TOPIC_RESET_RE = re.compile(
     r"\s+(?P<subject>[^.!?,;:]{1,100})",
     re.IGNORECASE,
 )
+_PEDAGOGICAL_LENS_HANDOFF_RE = re.compile(
+    r"(?<!\w)(?P<navigation>(?:(?:and|but|now|so)\s+)?"
+    r"(?:this|that)\s+is\s+(?:where|when)\b"
+    r"(?:\s+[a-z][\w'’-]*){0,14}\s+"
+    r"(?:caveat|intuition|intuitive|interpretation|meaning|notation|"
+    r"perspective|subtlety|warning))\b",
+    re.IGNORECASE,
+)
+_PEDAGOGICAL_UNIT_COMPLETION_RE = re.compile(
+    r"\b(?:so\s+there|therefore|thus|hence)\s+"
+    r"(?:i|we|you)(?:['’]ve|\s+have)?\s+"
+    r"(?:applied|completed|demonstrated|derived|established|evaluated|found|"
+    r"proved|shown|solved|worked\s+out)\b",
+    re.IGNORECASE,
+)
 _SAME_UNIT_RESET_SUBJECT_RE = re.compile(
     r"^(?:(?:the|a|an|this)\s+)?(?:(?:next|second|third|final)\s+)?"
     r"(?:step|part|case|example|stage|piece|proof|derivation|calculation|"
@@ -777,6 +816,10 @@ _WORKED_UNIT_NONQUESTION_WH_CONTINUATION_RE = re.compile(
     r"^\s*(?:"
     r"which\s+(?:in\s+turn\b|is\s+(?:how|what|when|where|why)\b|means?\b)|"
     r"who\s+in\s+turn\b|"
+    r"what\s+(?:i|we)\s+(?:want|would\s+like|(?:am|are)\s+going|intend)\s+"
+    r"to\s+(?:do|explain|show)\b|"
+    r"what\s+(?:i|we|you)(?:['’]re|\s+are)\s+"
+    r"(?:[a-z][\w'’-]*ing|left\s+with)\b|"
     r"what\s+(?:this|that)\s+(?:[a-z][\w'’-]*\s+){0,3}is\b|"
     r"(?:when|where)\s+(?:it|that|this|these|those|we|you)\b)",
     re.IGNORECASE,
@@ -786,6 +829,11 @@ _WORKED_UNIT_UNRESOLVED_METHOD_REFERENCE_RE = re.compile(
     r"(?:this|that|these|those)\s+"
     r"(?P<head>approach|formula|idea|method|principle|relationship|result|"
     r"rule|step|technique)\b",
+    re.IGNORECASE,
+)
+_WORKED_UNIT_UNRESOLVED_ANALOGY_REFERENCE_RE = re.compile(
+    r"\b(?:it(?:['’]s|\s+is)\s+)?(?:the\s+)?exact(?:ly)?\s+same\s+"
+    r"(?:idea|method|operation|process|steps?|thing|way)\b",
     re.IGNORECASE,
 )
 _WORKED_UNIT_WH_PREVIOUS_LICENSE_RE = re.compile(
@@ -3269,9 +3317,11 @@ def _sentence_character_spans(text: str) -> tuple[tuple[int, int], ...]:
 
 def _cue_is_only_structural_filler(text: str) -> bool:
     raw_text = str(text or "")
+    normalized_text = " ".join(_toks(raw_text))
     if (
         _literal_structural_filler_only(raw_text)
         or _NEXT_EXAMPLE_FRAMING_RE.fullmatch(raw_text)
+        or _PEDAGOGICAL_META_FRAME_ONLY_RE.fullmatch(normalized_text)
     ):
         return True
     sentences = [
@@ -3583,6 +3633,9 @@ def _expanded_context_edge_quote(
     """Choose an exact edge quote after safely removable filler-only sentences."""
     raw_text = str(text or "")
     if want == "start":
+        meta_replacement = _leading_pedagogical_meta_quote(raw_text)
+        if meta_replacement:
+            return meta_replacement, None
         example_replacement = _leading_example_framing_quote(raw_text)
         if example_replacement:
             return example_replacement, None
@@ -3754,6 +3807,19 @@ def _replace_structural_edge_quote(
 
     if want == "start":
         selected_tail = text[quote_span[0]:]
+        meta_replacement = _leading_pedagogical_meta_quote(selected_tail)
+        if meta_replacement:
+            replacement_span, projected, replacement_error = _semantic_edge_quote(
+                text,
+                meta_replacement,
+                want="start",
+            )
+            if (
+                replacement_error is None
+                and replacement_span is not None
+                and projected
+            ):
+                return meta_replacement, True, None
         example_replacement = _leading_example_framing_quote(selected_tail)
         if example_replacement:
             replacement_span, projected, replacement_error = _semantic_edge_quote(
@@ -3889,6 +3955,20 @@ def _opening_clause_is_standalone(text: str) -> bool:
     ):
         return True
     return not _cue_opens_mid_thought(opening_clause, ignore_caption_case=True)
+
+
+def _leading_pedagogical_meta_quote(text: str) -> str:
+    """Skip generic lesson framing while retaining its concrete premise."""
+    raw_text = str(text or "")
+    framing = _LEADING_PEDAGOGICAL_META_RE.match(raw_text)
+    if framing is None:
+        return ""
+    retained = raw_text[framing.end():].lstrip(
+        " \t\r\n,;:.!?—-\"'’”)]"
+    )
+    if not _PEDAGOGICAL_META_TEACHING_ONSET_RE.match(retained):
+        return ""
+    return _exact_boundary_quote(retained, want="start")
 
 
 def _leading_example_framing_quote(text: str) -> str:
@@ -4907,10 +4987,14 @@ def _worked_unit_onsets_in_cue(
 
     def add(navigation_left: int, new_side_left: int) -> None:
         fragment = raw_text[new_side_left:]
+        normalized_fragment = " ".join(_toks(fragment))
         if (
             _WORKED_UNIT_DISCOURSE_CONTINUATION_RE.match(fragment)
             or _WORKED_UNIT_ANAPHORIC_CONTINUATION_RE.match(fragment)
             or _WORKED_UNIT_NONQUESTION_WH_CONTINUATION_RE.match(fragment)
+            or _WORKED_UNIT_NONQUESTION_WH_CONTINUATION_RE.match(
+                normalized_fragment
+            )
             or _WORKED_UNIT_PROCEDURAL_STEP_RE.match(fragment)
             or _WORKED_UNIT_PROCEDURAL_QUESTION_RE.match(fragment)
         ):
@@ -5129,6 +5213,17 @@ def _worked_unit_target_needs_prior_explanation(
         if right > left:
             parts.append(text[left:right])
     target_text = " ".join(parts)
+    analogy_reference = _WORKED_UNIT_UNRESOLVED_ANALOGY_REFERENCE_RE.search(
+        target_text
+    )
+    if (
+        analogy_reference is not None
+        and len(_toks(target_text[:analogy_reference.start()])) <= 40
+    ):
+        # A new-looking prompt that immediately says it is "the same" depends
+        # on the comparison just before it. Keep that premise instead of
+        # isolating an anaphoric unit.
+        return True
     generic_modifiers = {
         "a", "an", "our", "that", "the", "these", "this", "those", "your",
     }
@@ -5425,6 +5520,61 @@ def _worked_unit_transitions(
     return transitions
 
 
+def _pedagogical_lens_transitions(
+    segments: list[dict],
+    start_line: int,
+    end_line: int,
+) -> list[_TopicTransition]:
+    """Find explicit completed-unit handoffs usable as old-side endings."""
+    transitions: list[_TopicTransition] = []
+    for navigation_line in range(start_line, end_line + 1):
+        window_end = min(end_line, navigation_line + 3)
+        parts = [
+            str(segments[line].get("text") or "")
+            for line in range(navigation_line, window_end + 1)
+        ]
+        joined = " ".join(parts)
+        first_cue_end = len(parts[0])
+        for handoff in _PEDAGOGICAL_LENS_HANDOFF_RE.finditer(joined):
+            navigation_left = handoff.start("navigation")
+            if navigation_left >= first_cue_end:
+                continue
+            body_word = _WORD_RE.search(joined, handoff.end())
+            if (
+                body_word is None
+                or len(_content_tokens(joined[body_word.start():])) < 4
+            ):
+                continue
+            transition = _TopicTransition(
+                navigation_line=navigation_line,
+                navigation_left=navigation_left,
+                new_side_line=navigation_line,
+                new_side_left=navigation_left,
+            )
+            recent_start = max(start_line, navigation_line - 24)
+            recent_parts = [
+                str(segments[line].get("text") or "")
+                for line in range(recent_start, navigation_line)
+            ]
+            recent_parts.append(
+                str(segments[navigation_line].get("text") or "")[
+                    :navigation_left
+                ]
+            )
+            recent_prefix = " ".join(recent_parts)
+            if not (
+                _worked_unit_prefix_is_complete(
+                    segments,
+                    recent_start,
+                    transition,
+                )
+                or _PEDAGOGICAL_UNIT_COMPLETION_RE.search(recent_prefix)
+            ):
+                continue
+            transitions.append(transition)
+    return transitions
+
+
 _DESCRIBED_UNIT_SUBJECT_RE = re.compile(
     r"^\s*(?:another|one\s+more|the\s+next|a\s+(?:different|new))\s+"
     r"(?:(?:brief|concrete|quick|short|simple|worked)\s+)*"
@@ -5478,7 +5628,16 @@ def _candidate_topic_transitions(
         _WORKED_UNIT_POSSIBLE_ONSET_RE.search(dotted_text)
         or _WORKED_UNIT_POSSIBLE_ONSET_RE.search(joined_text)
     )
-    if not has_hard_reset and not has_worked_unit_onset:
+    detected_lens_transitions = _pedagogical_lens_transitions(
+        segments,
+        start_line,
+        end_line,
+    )
+    if (
+        not has_hard_reset
+        and not has_worked_unit_onset
+        and not detected_lens_transitions
+    ):
         return []
     evidence_location = _unique_evidence_location(
         segments,
@@ -5493,6 +5652,14 @@ def _candidate_topic_transitions(
         for line in range(start_line, end_line + 1)
     }
     transitions: list[_TopicTransition] = []
+    if evidence_location is not None:
+        evidence_end = evidence_location[2], evidence_location[3]
+        transitions.extend(
+            transition
+            for transition in detected_lens_transitions
+            if (transition.navigation_line, transition.navigation_left)
+            > evidence_end
+        )
     for line in range(start_line, end_line + 1):
         text = str(segments[line].get("text") or "")
         sentence_spans = _sentence_character_spans(text)
@@ -7740,8 +7907,16 @@ def _plan_to_report(
             start_quote = trimmed_quote or _exact_boundary_quote(
                 start_text, want="start"
             )
+        start_text = str(segments[a].get("text") or "")
+        meta_start_quote = _leading_pedagogical_meta_quote(start_text)
+        if meta_start_quote:
+            start_quote = meta_start_quote
+            quote_repaired = True
+            boundary_fallback_reasons.append(
+                "trimmed_opening_pedagogical_meta"
+            )
         start_span, start_projected, edge_error = _semantic_edge_quote(
-            str(segments[a].get("text") or ""), start_quote, want="start"
+            start_text, start_quote, want="start"
         )
         if edge_error:
             start_quote = _exact_boundary_quote(

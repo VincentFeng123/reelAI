@@ -2039,6 +2039,77 @@ def test_first_occurrence_projection_handles_a_repeated_formula_operand() -> Non
     assert ambiguous_error == "end_caption_interpolation_unavailable"
 
 
+def test_selected_caption_snapshot_clamps_every_overlapping_cue_to_lexical_end() -> None:
+    transcript = {
+        "segments": [
+            {
+                "cue_id": "setup",
+                "start": 284.32,
+                "end": 290.639,
+                "text": "squared with respect to x with respect to x",
+            },
+            {
+                "cue_id": "answer-next",
+                "start": 288.24,
+                "end": 294.08,
+                "text": "which is exactly what dhdx is this right over here",
+            },
+        ],
+    }
+    clip = {
+        "cue_ids": ["setup", "answer-next"],
+        "edge_projection": {
+            "end": {
+                "cue_id": "answer-next",
+                "quote": "which is exactly what dhdx is",
+            },
+        },
+    }
+
+    cues = pipeline_module._selected_caption_cues(
+        transcript,
+        clip,
+        boundary_bounds=(284.32, 290.351),
+    )
+
+    assert [cue["end"] for cue in cues] == [290.351, 290.351]
+    assert cues[-1]["text"] == "which is exactly what dhdx is"
+
+    context = {
+        "selection_contract_version": "quality_silence_v28",
+        "boundary_status": "context_aligned",
+        "speech_corridor_verified": True,
+        "selection_caption_cues": [
+            {
+                "cue_id": "opening",
+                "start": 76.4,
+                "end": 82.0,
+                "text": "Suppose x squared equals a squared",
+            },
+            *cues,
+        ],
+        "boundary_diagnostics": {
+            "method": "transcript_context",
+            "context_aligned": True,
+            "acoustic_verified": False,
+            "transcript": {
+                "context_aligned": True,
+                "stage": "analyze",
+                "reason": "start_silence_not_found",
+                "required_speech_range": [76.4, 290.351],
+                "semantic_range": [76.4, 290.351],
+                "final_range": [76.4, 290.351],
+            },
+        },
+    }
+
+    assert pipeline_module.clip_engine_silence.persisted_boundary_is_usable(
+        context,
+        t_start=76.4,
+        t_end=290.351,
+    ) is True
+
+
 def test_start_projection_clamps_rolling_cue_and_preserves_end_handoff() -> None:
     transcript = {
         "source": "supadata",
@@ -3043,7 +3114,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
 ) -> None:
     strict_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v27",
+        "selection_contract_version": "quality_silence_v28",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -3053,7 +3124,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
     }
     transcript_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v27",
+        "selection_contract_version": "quality_silence_v28",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -3116,7 +3187,7 @@ def test_failed_boundary_storage_does_not_consume_ready_material_cap(
     deferred.append({
         "search_context_json": json.dumps({
             "surface_eligible": True,
-            "selection_contract_version": "quality_silence_v27",
+            "selection_contract_version": "quality_silence_v28",
             "speech_corridor_verified": True,
             "boundary_status": "verified",
             "boundary_diagnostics": {
@@ -3874,7 +3945,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v27"
+        assert context["selection_contract_version"] == "quality_silence_v28"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"

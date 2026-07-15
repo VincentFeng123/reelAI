@@ -814,7 +814,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
             )
 
         self.assertEqual(len(reels), 1)
-        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v27")
+        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v28")
         self.assertEqual(reels[0].t_start, 12.001)
         self.assertEqual(reels[0].t_end, 433.012)
         self.assertGreater(reels[0].t_end - reels[0].t_start, 180.0)
@@ -877,7 +877,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
 
         self.assertEqual(len(beginner_feed), 1)
         self.assertEqual(
-            beginner_feed[0]["selection_contract_version"], "quality_silence_v27"
+            beginner_feed[0]["selection_contract_version"], "quality_silence_v28"
         )
         self.assertIsInstance(beginner_feed[0]["t_start"], float)
         self.assertIsInstance(beginner_feed[0]["t_end"], float)
@@ -1228,6 +1228,51 @@ class IngestTopicProgressTests(unittest.TestCase):
         def clip_and_filter(video, *_args):
             if video["id"] == "empty-video":
                 return video, [], {"transcript": {}}
+            time.sleep(0.05)
+            return video, [{"title": "useful", "score": 1.0}], {"transcript": {}}
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(pipeline_module, "INGEST_TOPIC_VIDEO_TIMEOUT_SEC", 0.3),
+            mock.patch.object(pipeline_module, "INGEST_TOPIC_STRAGGLER_GRACE_SEC", 0.01),
+            mock.patch.object(pipeline, "_clip_and_filter", side_effect=clip_and_filter),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (kwargs["v"]["id"], mock.sentinel.metadata),
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=2,
+                max_reels=8,
+            )
+
+        self.assertEqual(reels, ["useful-video"])
+
+    def test_non_surfaceable_prerequisite_does_not_start_straggler_grace(self) -> None:
+        pipeline = self._pipeline()
+        videos = [self._video("blocked-video"), self._video("useful-video")]
+
+        def clip_and_filter(video, *_args):
+            if video["id"] == "blocked-video":
+                return video, [{
+                    "title": "dependent lesson",
+                    "score": 1.0,
+                    "prerequisite_ids": ["missing-prerequisite"],
+                    "search_context": {"surface_eligible": True},
+                }], {"transcript": {}}
             time.sleep(0.05)
             return video, [{"title": "useful", "score": 1.0}], {"transcript": {}}
 

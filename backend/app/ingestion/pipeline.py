@@ -538,7 +538,7 @@ def _boundary_evidence_grade(
     if (
         not isinstance(context, dict)
         or str(context.get("selection_contract_version") or "").strip()
-        != "quality_silence_v27"
+        != "quality_silence_v28"
     ):
         return 0
     if (
@@ -1118,10 +1118,13 @@ def _selected_caption_cues(
         cue_start = float(segment["start"])
         cue_end = float(segment["end"])
         if boundary_bounds is not None:
-            if isinstance(start_marker, dict):
-                cue_start = float(boundary_bounds[0])
-            if isinstance(end_marker, dict):
-                cue_end = float(boundary_bounds[1])
+            # Rolling captions overlap.  A lexical cut inside the final cue can
+            # therefore precede the raw end of an earlier selected cue.  Clamp
+            # every snapshot row to the authoritative clip range so the stored
+            # cue timeline remains monotonic and cannot make an otherwise valid
+            # transcript-aligned boundary fail closed during streaming/replay.
+            cue_start = max(cue_start, float(boundary_bounds[0]))
+            cue_end = min(cue_end, float(boundary_bounds[1]))
         cues.append({
             "cue_id": cue_id,
             "start": cue_start,
@@ -2089,7 +2092,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v27",
+            selection_contract_version="quality_silence_v28",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -4080,7 +4083,6 @@ class IngestionPipeline:
                     if retrieval_profile == "bootstrap":
                         persist_bootstrap_sources()
                     else:
-                        stored_before = stored_count
                         persisted = persist_result(
                             result,
                             limit=max(0, inventory_cap - persisted_count),
@@ -4088,7 +4090,7 @@ class IngestionPipeline:
                         reels_by_video[index] = persisted
                         persisted_count += len(persisted)
                         if (
-                            (persisted or stored_count > stored_before)
+                            persisted
                             and straggler_deadline is None
                             and retrieval_profile == "deep"
                         ):
@@ -4409,7 +4411,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v27",
+                    selection_contract_version="quality_silence_v28",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,
