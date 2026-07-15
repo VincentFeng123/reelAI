@@ -742,7 +742,7 @@ def test_production_flash_has_a_bounded_latency_tail():
     assert G._FLASH_BOUNDARY_TIMEOUT_S < G._TOTAL_DEADLINE_S
 
 
-def test_production_flash_selector_allows_one_bounded_transport_retry(monkeypatch):
+def test_production_flash_selector_fails_over_without_retrying_primary(monkeypatch):
     dispatched = []
 
     def call_model(*args, **kwargs):
@@ -762,8 +762,8 @@ def test_production_flash_selector_allows_one_bounded_transport_retry(monkeypatc
 
     assert len(dispatched) == 1
     assert dispatched[0]["operation"] == "flash_boundary_selector"
-    assert dispatched[0]["max_retries"] == 1
-    assert dispatched[0]["retry_status_codes"] == frozenset({503})
+    assert dispatched[0]["max_retries"] == 0
+    assert dispatched[0]["retry_status_codes"] is None
     assert dispatched[0]["failover_model"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
 
 

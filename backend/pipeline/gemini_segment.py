@@ -859,7 +859,8 @@ _WORKED_UNIT_CLOSING_TAIL_RE = re.compile(
     r"that(?:['’]s|\s+is)\s+all\s+(?:i|we|you)\s+need\s+to\s+do\s+"
     r"for\s+(?:this|the)\s+(?:calculation|case|derivation|example|exercise|"
     r"problem|proof)|"
-    r"(?:which|that)\s+(?:complete|finish)(?:d|es)?\s+(?:this|the)\s+"
+    r"(?:which|that)\s+(?:complete(?:d|s)?|finish(?:ed|es)?)\s+(?:this|the)\s+"
+    r"(?:(?:first|second|third|next|final)\s+)?"
     r"(?:calculation|case|derivation|example|exercise|problem|proof)|"
     r"(?:the\s+)?final\s+(?:answer|result|solution)\s+for\s+(?:this|the)\s+"
     r"(?:calculation|case|derivation|example|exercise|problem|proof))\b",
@@ -4879,6 +4880,20 @@ def _cross_cue_grounded_action_onset(
     return None
 
 
+def _hard_topic_reset_crosses_cue_boundary(text: str, next_text: str) -> bool:
+    """Recognize a new-unit framing phrase split by a coarse caption cue."""
+    raw_text = str(text or "")
+    following_text = str(next_text or "")
+    if not raw_text.strip() or not following_text.strip():
+        return False
+    joined = f"{raw_text} {following_text}"
+    split = len(raw_text) + 1
+    return any(
+        reset.start() < split < reset.end()
+        for reset in _HARD_TOPIC_RESET_RE.finditer(joined)
+    )
+
+
 def _worked_unit_onsets_in_cue(
     text: str,
     *,
@@ -5068,6 +5083,7 @@ def _worked_unit_prefix_is_complete(
     prefix = " ".join(parts)
     return bool(
         _SPLIT_CAPTION_COMPLETION_SIGNAL_RE.search(prefix)
+        or _WORKED_UNIT_CLOSING_TAIL_RE.search(prefix)
         or re.search(
             r"\b(?:final\s+answer|fully\s+simplified|"
             r"(?:answer|result|solution)\s+(?:is|equals?)|"
@@ -6917,10 +6933,30 @@ def _plan_to_report(
             )
             evidence_text = str(segments[evidence_start_line].get("text") or "")
             first_evidence_word = _WORD_RE.search(evidence_text)
+            evidence_leadin_tokens = _toks(evidence_text[:evidence_left])
+            evidence_is_at_early_structural_onset = bool(
+                first_evidence_word is not None
+                and (
+                    evidence_left == first_evidence_word.start()
+                    or (
+                        1 <= len(evidence_leadin_tokens) <= 3
+                        and set(evidence_leadin_tokens)
+                        <= _WORKED_UNIT_STRUCTURAL_PROMPT_TOKENS
+                    )
+                )
+            )
             previous_text = str(segments[a - 1].get("text") or "")
             previous_cross_cue_onset = _cross_cue_grounded_action_onset(
                 previous_text,
                 evidence_text,
+            )
+            previous_cross_cue_reset = _hard_topic_reset_crosses_cue_boundary(
+                previous_text,
+                evidence_text,
+            )
+            previous_unit_is_complete = bool(
+                _SPLIT_CAPTION_COMPLETION_SIGNAL_RE.search(previous_text)
+                or _WORKED_UNIT_CLOSING_TAIL_RE.search(previous_text)
             )
             try:
                 previous_gap = (
@@ -6931,13 +6967,14 @@ def _plan_to_report(
                 previous_gap = float("inf")
             if (
                 evidence_start_line == a
-                and first_evidence_word is not None
-                and evidence_left == first_evidence_word.start()
+                and evidence_is_at_early_structural_onset
                 and math.isfinite(previous_gap)
                 and previous_gap < _SECTION_RESET_GAP_S
                 and (
                     _cue_has_explicit_dangling_end(previous_text, evidence_text)
                     or previous_cross_cue_onset is not None
+                    or previous_cross_cue_reset
+                    or previous_unit_is_complete
                 )
             ):
                 # Gemini often cites the first cue containing the grounded
@@ -8350,7 +8387,7 @@ def _flash_failover_reason(
     statuses = tuple(item.get("provider_status_code") for item in history)
     if (
         retries == 0
-        and statuses in {(500,), (502,), (504,)}
+        and statuses in {(500,), (502,), (503,), (504,)}
         and telemetry.get("provider_status_code") == statuses[-1]
         and history[0].get("retryable") is True
     ):
@@ -8842,13 +8879,11 @@ def _run_selection_profile(
         cancelled=cancelled,
         budget_reserve=settings.get("_segment_budget_reserve"),
         budget_reconcile=settings.get("_segment_budget_reconcile"),
-        # Healthy sources still use one physical request. The active Flash
-        # selector gets one deadline-aware retry so a brief provider-capacity
-        # failure cannot discard an otherwise usable source.
-        max_retries=1 if profile == FLASH_SPLIT_PROFILE else 0,
-        retry_status_codes=(
-            frozenset({503}) if profile == FLASH_SPLIT_PROFILE else None
-        ),
+        # Healthy sources still use one physical request. If the quality-first
+        # model is overloaded, fail over immediately instead of paying for a
+        # second slow 503 before trying the cost-efficient fallback.
+        max_retries=0,
+        retry_status_codes=None,
         failover_model=(
             config.SEGMENT_FLASH_FALLBACK_MODEL
             if profile == FLASH_SPLIT_PROFILE

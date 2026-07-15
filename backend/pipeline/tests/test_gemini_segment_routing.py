@@ -766,7 +766,7 @@ def test_dispatched_transport_failure_preserves_call_identity(monkeypatch):
     assert telemetry["model"] == G.config.SEGMENT_FLASH_MODEL
 
 
-def test_production_selector_retries_one_503_with_one_reservation(monkeypatch):
+def test_production_selector_fails_over_one_503_with_one_reservation(monkeypatch):
     models = _install_model_sequence(
         monkeypatch,
         _HTTPStatusError(503),
@@ -787,9 +787,10 @@ def test_production_selector_retries_one_503_with_one_reservation(monkeypatch):
     )
 
     assert len(models.calls) == 2
-    assert {call["model"] for call in models.calls} == {
-        G.config.SEGMENT_FLASH_MODEL
-    }
+    assert [call["model"] for call in models.calls] == [
+        G.config.SEGMENT_FLASH_MODEL,
+        G.config.SEGMENT_FLASH_FALLBACK_MODEL,
+    ]
     assert len(reservations) == 1
     assert result.calls[0]["retries"] == 1
     assert result.calls[0]["error_history"] == ({
@@ -797,6 +798,7 @@ def test_production_selector_retries_one_503_with_one_reservation(monkeypatch):
         "provider_status_code": 503,
         "retryable": True,
     },)
+    assert result.calls[0]["failover_reason"] == "primary_transient_5xx_failover"
     assert result.calls[0]["dispatched"] is True
     assert result.calls[0]["reserved_cost_usd"] == 0.25
     assert result.error is None
@@ -804,23 +806,22 @@ def test_production_selector_retries_one_503_with_one_reservation(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("primary_statuses", "failover_reason"),
+    ("primary_status", "failover_reason"),
     [
-        ((503, 503), "primary_503_retry_exhausted"),
-        ((503, 504), "primary_503_retry_exhausted"),
-        ((500,), "primary_transient_5xx_failover"),
-        ((502,), "primary_transient_5xx_failover"),
-        ((504,), "primary_transient_5xx_failover"),
+        (500, "primary_transient_5xx_failover"),
+        (502, "primary_transient_5xx_failover"),
+        (503, "primary_transient_5xx_failover"),
+        (504, "primary_transient_5xx_failover"),
     ],
 )
 def test_production_selector_failover_reuses_one_reservation(
     monkeypatch,
-    primary_statuses,
+    primary_status,
     failover_reason,
 ):
     models = _install_model_sequence(
         monkeypatch,
-        *(_HTTPStatusError(status) for status in primary_statuses),
+        _HTTPStatusError(primary_status),
         _empty_selector_response(),
     )
     context = GenerationContext("fast", generation_id="selector-failover")
@@ -847,7 +848,7 @@ def test_production_selector_failover_reuses_one_reservation(
     )
 
     assert [call["model"] for call in models.calls] == [
-        *([G.config.SEGMENT_FLASH_MODEL] * len(primary_statuses)),
+        G.config.SEGMENT_FLASH_MODEL,
         G.config.SEGMENT_FLASH_FALLBACK_MODEL,
     ]
     assert len(reservations) == 1
@@ -855,8 +856,9 @@ def test_production_selector_failover_reuses_one_reservation(
     assert reconciliations[0]["model_used"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
     call = result.calls[0]
     assert call["model"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
-    assert call["retries"] == len(primary_statuses)
-    assert len(call["error_history"]) == len(primary_statuses)
+    assert call["retries"] == 1
+    assert len(call["error_history"]) == 1
+    assert call["error_history"][0]["provider_status_code"] == primary_status
     assert call["failover_from_model"] == G.config.SEGMENT_FLASH_MODEL
     assert call["failover_model"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
     assert call["failover_reason"] == failover_reason
@@ -872,9 +874,9 @@ def test_production_selector_failover_reuses_one_reservation(
 @pytest.mark.parametrize(
     "primary_errors",
     [
-        (_HTTPStatusError(503), _HTTPStatusError(400)),
-        (_HTTPStatusError(503), _HTTPStatusError(408)),
-        (_HTTPStatusError(503), _HTTPStatusError(429)),
+        (_HTTPStatusError(400),),
+        (_HTTPStatusError(408),),
+        (_HTTPStatusError(429),),
         (RuntimeError("status 504"),),
     ],
 )
@@ -1012,7 +1014,6 @@ def test_production_selector_does_not_retry_failed_lite_failover(monkeypatch):
         monkeypatch,
         _HTTPStatusError(503),
         _HTTPStatusError(503),
-        _HTTPStatusError(503),
     )
 
     result = G.run_segment_profile(
@@ -1025,13 +1026,12 @@ def test_production_selector_does_not_retry_failed_lite_failover(monkeypatch):
 
     assert [call["model"] for call in models.calls] == [
         G.config.SEGMENT_FLASH_MODEL,
-        G.config.SEGMENT_FLASH_MODEL,
         G.config.SEGMENT_FLASH_FALLBACK_MODEL,
     ]
     call = result.calls[0]
     assert call["model"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
-    assert call["retries"] == 2
-    assert len(call["error_history"]) == 3
+    assert call["retries"] == 1
+    assert len(call["error_history"]) == 2
     assert call["quality_degraded"] is True
     assert result.error is not None
 
@@ -1100,7 +1100,7 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
     (G.FLASH_SINGLE_PROFILE,
          ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash", 0)),
     (G.FLASH_SPLIT_PROFILE,
-         ("low", 6_000, 20.0, "flash_boundary_selector", "gemini-3.5-flash", 1)),
+         ("low", 6_000, 20.0, "flash_boundary_selector", "gemini-3.5-flash", 0)),
     (G.PRO_BOUNDARY_PROFILE,
          ("high", 6_000, 90.0, "pro_fallback", "gemini-3.1-pro-preview", 0)),
     ],
@@ -1138,9 +1138,7 @@ def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, ex
         if profile == G.FLASH_SPLIT_PROFILE
         else None
     )
-    assert captured["retry_status_codes"] == (
-        frozenset({503}) if profile == G.FLASH_SPLIT_PROFILE else None
-    )
+    assert captured["retry_status_codes"] is None
 
 
 def test_flash_boundary_profile_accepts_bootstrap_low_thinking_override(monkeypatch):

@@ -156,6 +156,122 @@ def test_selector_reconciles_actual_usage_before_conversion(
     )
 
 
+def test_flash_profile_fast_fails_primary_transport_errors(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    empty_plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": "photosynthesis",
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": "photosynthesis",
+                "requirement": "Teach photosynthesis",
+            }],
+        },
+        topics=[],
+    )
+
+    def fake_call_model(*_args, **kwargs):
+        captured.update(kwargs)
+        return empty_plan, {
+            "model": "gemini-3.5-flash",
+            "prompt_tokens": 10,
+            "candidate_tokens": 10,
+            "total_tokens": 20,
+        }
+
+    monkeypatch.setattr(gemini_segment, "_call_model", fake_call_model)
+    gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Plants convert light into stored chemical energy.",
+            }],
+            "words": [],
+        },
+        {},
+        gemini_segment.PRODUCTION_FLASH_PROFILE,
+        topic="photosynthesis",
+    )
+
+    assert captured["max_retries"] == 0
+    assert captured["retry_status_codes"] is None
+
+
+def test_flash_selector_fails_over_immediately_after_one_503(monkeypatch) -> None:
+    models: list[str] = []
+
+    def fake_generate(*_args, **kwargs):
+        model = str(kwargs["model"])
+        models.append(model)
+        assert kwargs["max_retries"] == 0
+        if model == "gemini-3.5-flash":
+            raise gemini_client.GeminiTransportError(
+                "provider overloaded",
+                gemini_client.GeminiCallTelemetry(
+                    model=model,
+                    operation="flash_boundary_selector",
+                    prompt_version="flash_split_v1",
+                    thinking_level="low",
+                    latency_ms=5.0,
+                    retries=0,
+                    finish_reason=None,
+                    prompt_tokens=None,
+                    candidate_tokens=None,
+                    thought_tokens=None,
+                    total_tokens=None,
+                    provider_error_type="ServerError",
+                    provider_status_code=503,
+                    retryable=True,
+                    error_history=({
+                        "provider_error_type": "ServerError",
+                        "provider_status_code": 503,
+                        "retryable": True,
+                    },),
+                ),
+            )
+        return SimpleNamespace(
+            text=(
+                '{"request_intent":{"exact_request":"photosynthesis",'
+                '"constraints":[{"constraint_id":"subject","kind":"subject",'
+                '"source_phrase":"photosynthesis","requirement":'
+                '"Teach photosynthesis"}]},"topics":[]}'
+            ),
+            telemetry={
+                "model": model,
+                "prompt_tokens": 100,
+                "candidate_tokens": 10,
+                "thought_tokens": 5,
+                "total_tokens": 115,
+                "retries": 0,
+            },
+        )
+
+    monkeypatch.setattr(gemini_client, "generate_json_v3", fake_generate)
+
+    parsed, telemetry = gemini_segment._call_model(
+        "system",
+        "user",
+        gemini_segment._CompactBoundaryPlan,
+        model="gemini-3.5-flash",
+        thinking_level="low",
+        max_output_tokens=6_000,
+        timeout_s=10.0,
+        deadline_monotonic=time.monotonic() + 10.0,
+        operation="flash_boundary_selector",
+        prompt_version="flash_split_v1",
+        cancelled=None,
+        max_retries=0,
+        failover_model="gemini-3.1-flash-lite",
+    )
+
+    assert parsed.topics == []
+    assert models == ["gemini-3.5-flash", "gemini-3.1-flash-lite"]
+    assert telemetry["retries"] == 1
+    assert telemetry["failover_reason"] == "primary_transient_5xx_failover"
+
+
 def test_selector_releases_non_dispatched_failure_reservation(
     monkeypatch,
 ) -> None:

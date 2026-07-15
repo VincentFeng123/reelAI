@@ -2663,6 +2663,97 @@ def test_live_coarse_captions_isolate_sine_six_x_worked_unit() -> None:
     )
 
 
+def test_sine_candidate_starting_at_target_cue_recovers_split_example_prompt() -> None:
+    segments = [
+        _cue(
+            "HaHsqDjWMLU:cue:4",
+            120.92,
+            165.92,
+            "power so that's the final answer fully simplified now let's work on some "
+            "more examples find the derivative of x^2 - 3x raised to the 5th power so "
+            "first let's bring down to five so it's going to be five and then keep the "
+            "inside function the same and then subtract the exponent by 1 so this is "
+            "four and then multiply by the derivative of the inside the derivative of "
+            "x^2 - 3x is 2x - 3 and so that's the answer once you get used to the "
+            "process it's not that bad here's another example that you can",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:5",
+            159.959,
+            185.44,
+            "try find the derivative of s of 6X the derivative of the outside part of "
+            "the function s is cosine and you got to keep the inside function the same "
+            "then you multiply by the derivative of the inside function the derivative "
+            "of 6X is 6 so the answer is simply 6 cosine",
+        ),
+        _cue("HaHsqDjWMLU:cue:6", 189.519, 189.995, "6X"),
+    ]
+    proposal = _proposal(
+        candidate_id="production-sine-six-x",
+        start_line=1,
+        end_line=2,
+        start_quote="try find the derivative of s of 6X",
+        end_quote="6X",
+        evidence="find the derivative of s of 6X the derivative of the outside part",
+        objective="Apply the chain rule to find the derivative of sin(6x).",
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].casefold().startswith(
+        "find the derivative of s of 6x"
+    )
+    assert clip["_clip_text"].endswith("6X")
+    assert "x^2 - 3x" not in clip["_clip_text"]
+    assert clip["cue_ids"] == [
+        "HaHsqDjWMLU:cue:5",
+        "HaHsqDjWMLU:cue:6",
+    ]
+
+
+def test_completed_prior_unit_allows_universal_one_cue_prompt_recovery() -> None:
+    prior_endings = (
+        "The final answer is four. As another example you can",
+        "The final answer is four. For our next problem you can",
+        "The final answer is four. Example three asks you to",
+        "The final answer is four. Let's do one more and",
+        "That completes the second example. As another example you can",
+    )
+    for prior_ending in prior_endings:
+        segments = [
+            _cue("prior-example", 0.0, 20.0, prior_ending),
+            _cue(
+                "target-example",
+                19.8,
+                35.0,
+                "try find the derivative of sine of six x. The outside derivative "
+                "is cosine, and the inner derivative is six, so the final answer is "
+                "six cosine of six x.",
+            ),
+        ]
+        proposal = _proposal(
+            candidate_id="universal-split-prompt",
+            start_line=1,
+            end_line=1,
+            start_quote="try find the derivative of sine of six x",
+            end_quote="six cosine of six x",
+            evidence="find the derivative of sine of six x",
+            objective="Apply the chain rule to differentiate sine of six x.",
+        )
+
+        report = _report(segments, proposal, topic="chain rule worked example")
+
+        assert report.rejected_reasons == [], prior_ending
+        [clip] = report.clips
+        assert clip["_clip_text"].casefold().startswith(
+            "find the derivative of sine of six x"
+        ), prior_ending
+        assert "final answer is four" not in clip["_clip_text"].casefold(), prior_ending
+        assert clip["cue_ids"] == ["target-example"], prior_ending
+
+
 def test_live_coarse_captions_isolate_first_power_example_and_complete_answer() -> None:
     segments = [
         _cue(
