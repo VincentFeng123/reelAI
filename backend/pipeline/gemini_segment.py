@@ -739,10 +739,12 @@ _WORKED_UNIT_EVIDENCE_PROMPT_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _WORKED_UNIT_STRUCTURAL_PROMPT_TOKENS = frozenset({
-    "a", "an", "and", "are", "asked", "as", "do", "for", "here's",
-    "i", "if", "let", "let's", "like", "more", "need", "new", "next",
-    "now", "one", "on", "please", "say", "so", "some", "suppose", "the",
-    "to", "try", "us", "use", "want", "we", "work", "would", "you",
+    "a", "an", "and", "are", "asked", "as", "can", "could", "do",
+    "example", "examples", "exercise", "exercises", "for", "here's", "i",
+    "if", "let", "let's", "like", "more", "need", "new", "next", "now",
+    "one", "on", "please", "problem", "problems", "say", "so", "some",
+    "suppose", "the", "to", "try", "us", "use", "want", "we", "work",
+    "would", "you",
 })
 _WORKED_UNIT_WH_ONSET_RE = re.compile(
     r"^\s*(?:(?:now|next)\s*[,;:]?\s+)?"
@@ -3470,7 +3472,11 @@ def _proposal_evidence_anchor(
             " ".join(str(item.evidence_quote or "").split())
             for item in ordered
         )
-    candidates = list(dict.fromkeys(quote for quote in candidates if quote))
+    candidates = list(dict.fromkeys(
+        _trim_structural_evidence_prompt(quote)
+        for quote in candidates
+        if quote
+    ))
     for quote in candidates:
         location = _unique_evidence_location(
             segments,
@@ -3481,6 +3487,23 @@ def _proposal_evidence_anchor(
         if location is not None:
             return quote, location
     return (candidates[0], None) if candidates else ("", None)
+
+
+def _trim_structural_evidence_prompt(quote: str) -> str:
+    """Drop only proven prompt glue before a grounded teaching action."""
+    source = " ".join(str(quote or "").split())
+    for action in _WORKED_UNIT_ACTION_TOKEN_RE.finditer(source):
+        prefix_tokens = _toks(source[:action.start()])
+        suffix = source[action.start():].strip()
+        suffix_count = len(_toks(suffix))
+        if (
+            prefix_tokens
+            and set(prefix_tokens) <= _WORKED_UNIT_STRUCTURAL_PROMPT_TOKENS
+            and 5 <= suffix_count <= 16
+        ):
+            return suffix
+        break
+    return source
 
 
 def _literal_source_quote(
@@ -7767,6 +7790,7 @@ def _plan_to_report(
                 quote = " ".join(
                     str(getattr(evidence, "evidence_quote", "") or "").split()
                 )
+                quote = _trim_structural_evidence_prompt(quote)
                 if (
                     not constraint_id
                     or constraint_id not in intent_constraint_ids

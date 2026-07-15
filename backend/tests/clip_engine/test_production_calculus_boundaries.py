@@ -2559,13 +2559,13 @@ def test_live_coarse_captions_isolate_sine_six_x_worked_unit() -> None:
     proposal = _proposal(
         candidate_id="ex3",
         start_line=0,
-        end_line=6,
+        end_line=5,
         start_quote="let's move on to the chain",
-        end_quote="6X",
-        evidence="find the derivative of s of 6X",
+        end_quote="6 cosine",
+        evidence="try find the derivative of s of 6X the derivative of",
         objective=(
-            "Differentiate a trigonometric function with a linear inside function "
-            "using the chain rule."
+            "Show how to differentiate a sine function with a linear inner "
+            "function using the chain rule."
         ),
     )
 
@@ -2586,6 +2586,81 @@ def test_live_coarse_captions_isolate_sine_six_x_worked_unit() -> None:
         "cue_id": "HaHsqDjWMLU:cue:6",
         "quote": "6X",
     }
+
+    compact_plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": "chain rule worked example",
+            "constraints": [
+                {
+                    "constraint_id": "topic_01",
+                    "kind": "subject",
+                    "source_phrase": "chain rule",
+                    "requirement": "Teach the chain rule",
+                },
+                {
+                    "constraint_id": "task_01",
+                    "kind": "format",
+                    "source_phrase": "worked example",
+                    "requirement": "Work through an example",
+                },
+            ],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="chain_rule_trig_example",
+            start_line=0,
+            end_line=5,
+            start_quote="let's move on to the chain",
+            end_quote="6 cosine",
+            title="Chain Rule Worked Example for Trigonometric Functions",
+            learning_objective=(
+                "Show how to differentiate a sine function with a linear inner "
+                "function using the chain rule."
+            ),
+            facet="Worked Example",
+            informativeness=0.9,
+            topic_relevance=1.0,
+            educational_importance=0.9,
+            difficulty=0.45,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[
+                {
+                    "constraint_id": "topic_01",
+                    "evidence_quote": (
+                        "derivative of s of 6X the derivative of the outside"
+                    ),
+                },
+                {
+                    "constraint_id": "task_01",
+                    "evidence_quote": (
+                        "try find the derivative of s of 6X the derivative of"
+                    ),
+                },
+            ],
+        )],
+    )
+    compact_report = gemini_segment._plan_to_report(
+        compact_plan,
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="chain rule worked example",
+    )
+
+    assert compact_report.rejected_reasons == []
+    [compact_clip] = compact_report.clips
+    assert compact_clip["_clip_text"].casefold().startswith(
+        "find the derivative of s of 6x"
+    )
+    assert compact_clip["topic_evidence_quote"].casefold().startswith(
+        "find the derivative of s of 6x"
+    )
+    assert compact_clip["intent_evidence"][1]["evidence_quote"].casefold().startswith(
+        "find the derivative of s of 6x"
+    )
 
 
 def test_live_coarse_captions_isolate_first_power_example_and_complete_answer() -> None:
