@@ -109,6 +109,9 @@ def _wire_segment_runtime(
         reserve = getattr(context, "reserve_gemini_call", None)
         if callable(reserve):
             settings.setdefault("_segment_budget_reserve", reserve)
+        reconcile = getattr(context, "reconcile_gemini_call", None)
+        if callable(reconcile):
+            settings.setdefault("_segment_budget_reconcile", reconcile)
         fallback_gate = getattr(context, "allow_pro_fallback", None)
         if callable(fallback_gate):
             def gated_fallback(*, accepted_count: int, video_id: str = "") -> bool:

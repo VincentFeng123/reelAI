@@ -725,7 +725,7 @@ def test_production_flash_is_compact_exhaustive_boundary_first():
         "never omit a substantive grounded unit solely because its boundary is uncertain"
         in prompt
     )
-    assert G._BOUNDARY_OUTPUT_TOKENS == 8_192
+    assert G._BOUNDARY_OUTPUT_TOKENS == 6_000
     assert "scan the whole transcript from first to last" in prompt
     assert "every distinct" in prompt
     assert "return every distinct qualifying moment" in prompt
@@ -791,7 +791,10 @@ def test_compound_topic_allows_grounded_related_facets():
         "shared vocabulary, a loose analogy, or general systems thinking alone"
         in user.casefold()
     )
-    assert "genuinely needed to understand or apply the exact requested topic" in user.casefold()
+    assert (
+        "clear educational connection to the exact requested topic" in user.casefold()
+    )
+    assert "even if it is not strictly required background" in user.casefold()
 
 
 def test_budget_is_reserved_once_and_default_call_allows_one_transient_retry(monkeypatch):
@@ -825,12 +828,16 @@ def test_budget_is_reserved_once_and_default_call_allows_one_transient_retry(mon
 
     assert parsed.topics == []
     assert order == ["reserve", "dispatch"]
+    deadline_monotonic = payload.pop("deadline_monotonic")
+    assert isinstance(deadline_monotonic, float)
+    assert deadline_monotonic > time.monotonic()
     assert payload == {
         "operation": "flash_boundary_selector",
         "model": "gemini-3.5-flash",
         "max_output_tokens": 4096,
         "prompt_text": "system\n\nuser",
         "estimated_input_tokens": 1_004,
+        "cancelled": None,
     }
 
 

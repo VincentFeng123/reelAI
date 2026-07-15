@@ -153,10 +153,16 @@ class GenerationBudget:
         }
         self._passes = 0
         self._no_growth_passes = 0
+        # Lifetime worst-case reservations remain a diagnostic. Admission uses
+        # actual committed spend plus only the calls that are still in flight.
         self._gemini_reserved_cost_usd = 0.0
+        self._gemini_committed_cost_usd = 0.0
+        self._gemini_inflight: dict[int, float] = {}
+        self._next_gemini_reservation_id = 1
         self._flash_selector_calls = 0
         self._pro_fallback_calls = 0
         self._lock = threading.Lock()
+        self._gemini_condition = threading.Condition(self._lock)
 
     @classmethod
     def for_mode(cls, mode: str) -> "GenerationBudget":
@@ -204,7 +210,9 @@ class GenerationBudget:
         model: str,
         operation: str,
         estimated_cost_usd: float,
-    ) -> None:
+        deadline_monotonic: float | None = None,
+        cancelled: Callable[[], bool] | object | None = None,
+    ) -> int:
         """Reserve a real Gemini dispatch, including nested selector fallbacks."""
         normalized_model = str(model or "").casefold()
         normalized_operation = str(operation or "").casefold()
@@ -220,49 +228,133 @@ class GenerationBudget:
             }
         )
         reservation = max(0.0, float(estimated_cost_usd))
-        with self._lock:
-            if is_pro:
+        cost_limit = self._GEMINI_COST_LIMIT_USD[self.mode]
+
+        def cancellation_requested() -> bool:
+            if callable(cancelled):
+                return bool(cancelled())
+            if cancelled is None:
+                return False
+            is_set = getattr(cancelled, "is_set", None)
+            return bool(is_set()) if callable(is_set) else bool(cancelled)
+
+        while True:
+            # Cancellation may touch external state, so never invoke it while
+            # holding the budget lock needed by settlement and diagnostics.
+            if cancellation_requested():
                 raise ProviderBudgetExceededError(
-                    "Gemini Pro is disabled for generation.",
+                    "Gemini cost reservation cancelled.",
                     provider="gemini",
                     operation=operation,
                 )
             if (
-                is_pro_fallback
-                and self._pro_fallback_calls >= self._PRO_FALLBACK_CALL_LIMIT
+                deadline_monotonic is not None
+                and float(deadline_monotonic) <= time.monotonic()
             ):
                 raise ProviderBudgetExceededError(
-                    "Gemini Pro fallback is disabled.",
+                    "Gemini cost reservation deadline exceeded.",
                     provider="gemini",
                     operation=operation,
                 )
-            if (
-                is_flash_selector
-                and self._flash_selector_calls >= self._FLASH_SELECTOR_LIMIT[self.mode]
-            ):
-                raise ProviderBudgetExceededError(
-                    "Gemini transcript selector budget exhausted "
-                    f"({self._FLASH_SELECTOR_LIMIT[self.mode]} maximum).",
-                    provider="gemini",
-                    operation=operation,
+
+            with self._gemini_condition:
+                if is_pro:
+                    raise ProviderBudgetExceededError(
+                        "Gemini Pro is disabled for generation.",
+                        provider="gemini",
+                        operation=operation,
+                    )
+                if (
+                    is_pro_fallback
+                    and self._pro_fallback_calls >= self._PRO_FALLBACK_CALL_LIMIT
+                ):
+                    raise ProviderBudgetExceededError(
+                        "Gemini Pro fallback is disabled.",
+                        provider="gemini",
+                        operation=operation,
+                    )
+                if (
+                    is_flash_selector
+                    and self._flash_selector_calls
+                    >= self._FLASH_SELECTOR_LIMIT[self.mode]
+                ):
+                    raise ProviderBudgetExceededError(
+                        "Gemini transcript selector budget exhausted "
+                        f"({self._FLASH_SELECTOR_LIMIT[self.mode]} maximum).",
+                        provider="gemini",
+                        operation=operation,
+                    )
+                inflight_cost = sum(self._gemini_inflight.values())
+                exposure = self._gemini_committed_cost_usd + inflight_cost
+                if exposure + reservation <= cost_limit + 1e-9:
+                    reservation_id = self._next_gemini_reservation_id
+                    self._next_gemini_reservation_id += 1
+                    self._gemini_inflight[reservation_id] = reservation
+                    self._gemini_reserved_cost_usd += reservation
+                    if is_pro_fallback:
+                        self._pro_fallback_calls += 1
+                    if is_flash_selector:
+                        self._flash_selector_calls += 1
+                    return reservation_id
+
+                # Settling in-flight work cannot reduce already committed
+                # spend, so this request can never fit within the job ceiling.
+                if self._gemini_committed_cost_usd + reservation > cost_limit + 1e-9:
+                    raise ProviderBudgetExceededError(
+                        f"Gemini job cost budget exhausted (${cost_limit:.2f} maximum).",
+                        provider="gemini",
+                        operation=operation,
+                        detail=(
+                            f"committed=${self._gemini_committed_cost_usd:.6f}, "
+                            f"inflight=${inflight_cost:.6f}, requested=${reservation:.6f}"
+                        ),
+                    )
+                if not self._gemini_inflight or deadline_monotonic is None:
+                    raise ProviderBudgetExceededError(
+                        f"Gemini job cost budget exhausted (${cost_limit:.2f} maximum).",
+                        provider="gemini",
+                        operation=operation,
+                        detail=(
+                            f"committed=${self._gemini_committed_cost_usd:.6f}, "
+                            f"inflight=${inflight_cost:.6f}, requested=${reservation:.6f}"
+                        ),
+                    )
+                remaining = float(deadline_monotonic) - time.monotonic()
+                if remaining <= 0:
+                    continue
+                self._gemini_condition.wait(timeout=min(0.05, remaining))
+
+    def reconcile_gemini(
+        self,
+        reservation_id: int | None,
+        *,
+        actual_cost_usd: float | None,
+    ) -> bool:
+        """Replace one in-flight worst case with actual cost; unknown billing keeps it."""
+        with self._gemini_condition:
+            if reservation_id is None:
+                if actual_cost_usd is not None:
+                    self._gemini_committed_cost_usd += max(
+                        0.0, float(actual_cost_usd)
+                    )
+                return False
+            reserved = self._gemini_inflight.pop(int(reservation_id), None)
+            if reserved is None:
+                return False
+            committed = (
+                reserved
+                if actual_cost_usd is None
+                else max(0.0, float(actual_cost_usd))
+            )
+            self._gemini_committed_cost_usd += committed
+            if committed > reserved + 1e-9:
+                logger.warning(
+                    "Gemini actual cost exceeded reservation: actual=$%.6f reserved=$%.6f",
+                    committed,
+                    reserved,
                 )
-            next_cost = self._gemini_reserved_cost_usd + reservation
-            cost_limit = self._GEMINI_COST_LIMIT_USD[self.mode]
-            if next_cost > cost_limit + 1e-9:
-                raise ProviderBudgetExceededError(
-                    f"Gemini job cost budget exhausted (${cost_limit:.2f} maximum).",
-                    provider="gemini",
-                    operation=operation,
-                    detail=(
-                        f"reserved=${self._gemini_reserved_cost_usd:.6f}, "
-                        f"requested=${reservation:.6f}"
-                    ),
-                )
-            self._gemini_reserved_cost_usd = next_cost
-            if is_pro_fallback:
-                self._pro_fallback_calls += 1
-            if is_flash_selector:
-                self._flash_selector_calls += 1
+            self._gemini_condition.notify_all()
+            return True
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -281,6 +373,15 @@ class GenerationBudget:
                 "gemini": {
                     "cost_limit_usd": self._GEMINI_COST_LIMIT_USD[self.mode],
                     "reserved_cost_usd": round(self._gemini_reserved_cost_usd, 8),
+                    "committed_cost_usd": round(self._gemini_committed_cost_usd, 8),
+                    "inflight_reserved_cost_usd": round(
+                        sum(self._gemini_inflight.values()), 8
+                    ),
+                    "cost_exposure_usd": round(
+                        self._gemini_committed_cost_usd
+                        + sum(self._gemini_inflight.values()),
+                        8,
+                    ),
                     "flash_selector_calls": self._flash_selector_calls,
                     "flash_selector_limit": self._FLASH_SELECTOR_LIMIT[self.mode],
                     # Keep the older names as compatibility aliases. These
@@ -380,6 +481,8 @@ class GenerationContext:
         max_output_tokens: int,
         prompt_text: str = "",
         estimated_input_tokens: int | None = None,
+        deadline_monotonic: float | None = None,
+        cancelled: Callable[[], bool] | object | None = None,
     ) -> dict[str, int | float]:
         """Reserve worst-case billed tokens before a Gemini request is dispatched."""
         prompt_tokens = (
@@ -392,16 +495,93 @@ class GenerationContext:
         estimated_cost = (
             prompt_tokens * input_rate + output_tokens * output_rate
         ) / 1_000_000.0
-        self.budget.reserve_gemini(
+        reservation_id = self.budget.reserve_gemini(
             model=model,
             operation=operation,
             estimated_cost_usd=estimated_cost,
+            deadline_monotonic=deadline_monotonic,
+            cancelled=cancelled,
         )
         return {
+            "gemini_reservation_id": reservation_id,
             "reserved_input_tokens": prompt_tokens,
             "reserved_output_tokens": output_tokens,
             "reserved_cost_usd": estimated_cost,
         }
+
+    def reconcile_gemini_call(
+        self,
+        *,
+        model_used: str,
+        usage: Any = None,
+        dispatched: bool | None = None,
+    ) -> bool:
+        """Settle one reservation as soon as provider telemetry is available."""
+        raw_id = _usage_field(usage, "gemini_reservation_id")
+        try:
+            reservation_id = int(raw_id) if raw_id is not None else None
+        except (TypeError, ValueError, OverflowError):
+            reservation_id = None
+        input_tokens = _usage_value(
+            usage,
+            "prompt_tokens",
+            "prompt_token_count",
+            "promptTokenCount",
+            "input_tokens",
+        )
+        candidate_tokens = _usage_value(
+            usage,
+            "candidate_tokens",
+            "candidates_token_count",
+            "candidatesTokenCount",
+        )
+        thought_tokens = _usage_value(
+            usage,
+            "thought_tokens",
+            "thoughts_token_count",
+            "thoughtsTokenCount",
+        )
+        output_tokens = (
+            candidate_tokens + thought_tokens
+            if candidate_tokens or thought_tokens
+            else _usage_value(usage, "output_tokens")
+        )
+        cached_tokens = min(
+            input_tokens,
+            _usage_value(
+                usage,
+                "cached_tokens",
+                "cached_content_token_count",
+                "cachedContentTokenCount",
+            ),
+        )
+        # A total without the input/output split cannot be priced correctly;
+        # retain the full reservation rather than reopening the budget at $0.
+        usage_known = bool(input_tokens or output_tokens)
+        dispatched_value = (
+            bool(_usage_field(usage, "dispatched"))
+            if dispatched is None
+            else bool(dispatched)
+        )
+        actual_cost: float | None
+        if usage_known:
+            input_rate, cached_input_rate, output_rate = _gemini_token_rates(
+                model_used
+            )
+            actual_cost = (
+                (input_tokens - cached_tokens) * input_rate
+                + cached_tokens * cached_input_rate
+                + output_tokens * output_rate
+            ) / 1_000_000.0
+        elif dispatched_value:
+            # A dispatched call with missing token telemetry may still be billed.
+            actual_cost = None
+        else:
+            actual_cost = 0.0
+        return self.budget.reconcile_gemini(
+            reservation_id,
+            actual_cost_usd=actual_cost,
+        )
 
     def configure_pro_fallback_gate(self, expected_initial_results: int) -> None:
         """Set the first-wave size before its concurrent selectors are started."""
@@ -695,6 +875,7 @@ class GenerationContext:
             "finish_reason",
             "prompt_version",
             "thinking_level",
+            "gemini_reservation_id",
             "reserved_input_tokens",
             "reserved_output_tokens",
             "reserved_cost_usd",
@@ -708,25 +889,38 @@ class GenerationContext:
             value = _usage_field(usage, field_name)
             if value is not None:
                 record_metadata[field_name] = value
-        self.record(
-            ProviderUsageRecord(
-                provider="gemini",
-                operation=operation,
-                attempt=max(1, int(attempt)),
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                status_code=status_code,
-                billable_requests=(
-                    1 if status_code is not None and 200 <= status_code < 300 else 0
-                ),
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                total_tokens=total_tokens or input_tokens + output_tokens,
-                model_used=model_used,
-                quality_degraded=quality_degraded,
-                error_code=error_code,
-                metadata=record_metadata,
-            )
+        record = ProviderUsageRecord(
+            provider="gemini",
+            operation=operation,
+            attempt=max(1, int(attempt)),
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            status_code=status_code,
+            billable_requests=(
+                1 if status_code is not None and 200 <= status_code < 300 else 0
+            ),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens or input_tokens + output_tokens,
+            model_used=model_used,
+            quality_degraded=quality_degraded,
+            error_code=error_code,
+            metadata=record_metadata,
         )
+        self.reconcile_gemini_call(
+            model_used=model_used,
+            usage={
+                **record_metadata,
+                "input_tokens": record.input_tokens,
+                "output_tokens": record.output_tokens,
+                "total_tokens": record.total_tokens,
+            },
+            dispatched=(
+                bool(record_metadata.get("dispatched"))
+                if "dispatched" in record_metadata
+                else status_code is not None
+            ),
+        )
+        self.record(record)
 
     def usage(self) -> list[dict[str, Any]]:
         with self._lock:

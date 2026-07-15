@@ -814,7 +814,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
             )
 
         self.assertEqual(len(reels), 1)
-        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v16")
+        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v17")
         self.assertEqual(reels[0].t_start, 12.001)
         self.assertEqual(reels[0].t_end, 433.012)
         self.assertGreater(reels[0].t_end - reels[0].t_start, 180.0)
@@ -877,7 +877,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
 
         self.assertEqual(len(beginner_feed), 1)
         self.assertEqual(
-            beginner_feed[0]["selection_contract_version"], "quality_silence_v16"
+            beginner_feed[0]["selection_contract_version"], "quality_silence_v17"
         )
         self.assertIsInstance(beginner_feed[0]["t_start"], float)
         self.assertIsInstance(beginner_feed[0]["t_end"], float)
@@ -1216,7 +1216,7 @@ class IngestTopicProgressTests(unittest.TestCase):
             )
             elapsed = time.monotonic() - started
 
-        self.assertEqual(reels, [])
+        self.assertEqual(reels, ["deferred-video"])
         self.assertEqual(stored, ["deferred-video"])
         self.assertLess(elapsed, 0.3)
         self.assertTrue(slow_cancelled.wait(0.1))

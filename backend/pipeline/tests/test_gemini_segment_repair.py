@@ -1468,7 +1468,10 @@ def test_plan_keeps_live_biology_cue_when_only_opening_boundary_is_weak() -> Non
     )
 
     assert len(report.clips) == 1
-    assert "unresolved_weak_start" in report.clips[0]["_boundary_fallback_reasons"]
+    clip = report.clips[0]
+    assert clip["_clip_text"] == "Viruses complicate the definition of life"
+    assert "recovered_same_cue_sentence_start" in clip["_boundary_fallback_reasons"]
+    assert "trimmed_trailing_edge_noise" in clip["_boundary_fallback_reasons"]
 
 
 def test_plan_keeps_unpunctuated_biology_cue_when_information_is_grounded() -> None:
@@ -1795,7 +1798,7 @@ def test_dirty_edges_use_only_the_one_low_thinking_selector_call(monkeypatch):
     assert schema is G._CompactBoundaryPlan
     assert kwargs["model"] == G.config.SEGMENT_FLASH_MODEL
     assert kwargs["thinking_level"] == "low"
-    assert kwargs["max_output_tokens"] == 8_192
+    assert kwargs["max_output_tokens"] == 6_000
     assert kwargs["timeout_s"] == 28.0
     assert kwargs["max_retries"] == 0
     assert kwargs["operation"] == "flash_boundary_selector"

@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 import pytest
 
@@ -255,6 +257,7 @@ def test_flash_lite_expansion_uses_its_lower_reservation_and_usage_rates() -> No
         quality_degraded=False,
         stage="expansion",
         usage={
+            **reservation,
             "prompt_tokens": 1_000,
             "candidate_tokens": 100,
             "cached_content_token_count": 400,
@@ -271,6 +274,229 @@ def test_flash_lite_expansion_uses_its_lower_reservation_and_usage_rates() -> No
     assert context.usage_payload()["summary"]["cached_tokens"] == 400
     assert context.usage_payload()["by_stage"]["expansion"]["cached_tokens"] == 400
 
+
+@pytest.mark.parametrize(
+    ("mode", "selector_count"),
+    [("fast", 2), ("slow", 3)],
+)
+def test_all_planned_source_selectors_fit_concurrently_at_production_cap(
+    mode: str,
+    selector_count: int,
+) -> None:
+    context = GenerationContext(mode, generation_id=f"job-reconcile-{mode}")
+
+    def reserve():
+        return context.reserve_gemini_call(
+            operation="flash_boundary_selector",
+            model="gemini-3.5-flash",
+            estimated_input_tokens=30_000,
+            max_output_tokens=6_000,
+            deadline_monotonic=time.monotonic() + 2.0,
+        )
+
+    with ThreadPoolExecutor(max_workers=selector_count) as executor:
+        reservations = [
+            future.result(timeout=0.5)
+            for future in [executor.submit(reserve) for _ in range(selector_count)]
+        ]
+
+    for reservation in reservations:
+        context.record_gemini(
+            attempt=1,
+            model_used="gemini-3.5-flash",
+            quality_degraded=False,
+            usage={
+                **reservation,
+                "prompt_tokens": 5_000,
+                "candidate_tokens": 500,
+                "thought_tokens": 100,
+                "total_tokens": 5_600,
+                "dispatched": True,
+            },
+        )
+
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["flash_selector_calls"] == selector_count
+    assert budget["inflight_reserved_cost_usd"] == 0.0
+    assert budget["committed_cost_usd"] == pytest.approx(
+        selector_count * 0.0129
+    )
+    assert budget["cost_exposure_usd"] <= budget["cost_limit_usd"]
+
+
+def test_unknown_dispatched_usage_keeps_full_reservation_fail_closed() -> None:
+    context = GenerationContext("fast", generation_id="job-unknown-billing")
+    reservation = context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=30_000,
+        max_output_tokens=8_192,
+    )
+    context.record_gemini(
+        attempt=1,
+        model_used="gemini-3.5-flash",
+        quality_degraded=False,
+        usage={**reservation, "dispatched": True},
+        status_code=None,
+        error_code="provider_usage_missing",
+    )
+
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["committed_cost_usd"] == pytest.approx(
+        reservation["reserved_cost_usd"]
+    )
+    assert budget["inflight_reserved_cost_usd"] == 0.0
+    with pytest.raises(ProviderBudgetExceededError, match="cost budget"):
+        context.reserve_gemini_call(
+            operation="flash_boundary_selector",
+            model="gemini-3.5-flash",
+            estimated_input_tokens=30_000,
+            max_output_tokens=8_192,
+        )
+
+
+def test_total_only_dispatched_usage_keeps_full_reservation_fail_closed() -> None:
+    context = GenerationContext("fast", generation_id="job-total-only-billing")
+    reservation = context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=30_000,
+        max_output_tokens=8_192,
+    )
+
+    context.record_gemini(
+        attempt=1,
+        model_used="gemini-3.5-flash",
+        quality_degraded=False,
+        usage={
+            **reservation,
+            "total_tokens": 10_000,
+            "dispatched": True,
+        },
+    )
+
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["committed_cost_usd"] == pytest.approx(
+        reservation["reserved_cost_usd"]
+    )
+    assert budget["inflight_reserved_cost_usd"] == 0.0
+
+
+def test_non_dispatched_reservation_releases_capacity_idempotently() -> None:
+    context = GenerationContext("fast", generation_id="job-not-dispatched")
+    reservation = context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=30_000,
+        max_output_tokens=8_192,
+    )
+
+    assert context.reconcile_gemini_call(
+        model_used="gemini-3.5-flash",
+        usage={**reservation, "dispatched": False},
+        dispatched=False,
+    ) is True
+    assert context.reconcile_gemini_call(
+        model_used="gemini-3.5-flash",
+        usage={**reservation, "dispatched": False},
+        dispatched=False,
+    ) is False
+
+    replacement = context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=30_000,
+        max_output_tokens=8_192,
+    )
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["flash_selector_calls"] == 2
+    assert budget["committed_cost_usd"] == 0.0
+    assert budget["inflight_reserved_cost_usd"] == pytest.approx(
+        replacement["reserved_cost_usd"]
+    )
+
+
+def test_blocked_cost_reservation_is_bounded_by_deadline_and_cancellation() -> None:
+    context = GenerationContext("fast", generation_id="job-bounded-wait")
+    context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=30_000,
+        max_output_tokens=8_192,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ProviderBudgetExceededError, match="deadline"):
+        context.reserve_gemini_call(
+            operation="flash_boundary_selector",
+            model="gemini-3.5-flash",
+            estimated_input_tokens=30_000,
+            max_output_tokens=8_192,
+            deadline_monotonic=time.monotonic() + 0.05,
+        )
+    assert 0.04 <= time.monotonic() - started < 0.5
+    assert context.budget.snapshot()["gemini"]["flash_selector_calls"] == 1
+
+    with pytest.raises(ProviderBudgetExceededError, match="cancelled"):
+        context.reserve_gemini_call(
+            operation="flash_boundary_selector",
+            model="gemini-3.5-flash",
+            estimated_input_tokens=30_000,
+            max_output_tokens=8_192,
+            deadline_monotonic=time.monotonic() + 1.0,
+            cancelled=lambda: True,
+        )
+    assert context.budget.snapshot()["gemini"]["flash_selector_calls"] == 1
+
+
+def test_deadline_and_cancellation_are_checked_before_admission() -> None:
+    expired = GenerationContext("fast", generation_id="job-expired-before-admit")
+    with pytest.raises(ProviderBudgetExceededError, match="deadline"):
+        expired.reserve_gemini_call(
+            operation="flash_boundary_selector",
+            model="gemini-3.5-flash",
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
+            deadline_monotonic=time.monotonic() - 1.0,
+        )
+    assert expired.budget.snapshot()["gemini"]["flash_selector_calls"] == 0
+
+    cancelled = GenerationContext("fast", generation_id="job-cancel-before-admit")
+    with pytest.raises(ProviderBudgetExceededError, match="cancelled"):
+        cancelled.reserve_gemini_call(
+            operation="flash_boundary_selector",
+            model="gemini-3.5-flash",
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
+            deadline_monotonic=time.monotonic() + 1.0,
+            cancelled=lambda: True,
+        )
+    assert cancelled.budget.snapshot()["gemini"]["flash_selector_calls"] == 0
+
+
+def test_committed_cost_that_can_never_fit_fails_without_waiting() -> None:
+    budget = GenerationContext("fast", generation_id="job-impossible-wait").budget
+    committed = budget.reserve_gemini(
+        model="gemini-3.1-flash-lite",
+        operation="query_expansion",
+        estimated_cost_usd=0.19,
+    )
+    budget.reconcile_gemini(committed, actual_cost_usd=0.19)
+    budget.reserve_gemini(
+        model="gemini-3.1-flash-lite",
+        operation="query_expansion",
+        estimated_cost_usd=0.001,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ProviderBudgetExceededError, match="cost budget"):
+        budget.reserve_gemini(
+            model="gemini-3.1-flash-lite",
+            operation="query_expansion",
+            estimated_cost_usd=0.02,
+            deadline_monotonic=time.monotonic() + 1.0,
+        )
+    assert time.monotonic() - started < 0.1
 
 @pytest.mark.parametrize("mode", ["fast", "slow"])
 def test_pro_dispatch_is_disabled_for_every_generation_mode(mode: str) -> None:

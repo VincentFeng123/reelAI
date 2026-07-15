@@ -281,7 +281,7 @@ def test_forty_realistic_boundary_candidates_fit_bounded_output_reservation():
 
     estimated_tokens = (len(payload) + 3) // 4
     assert estimated_tokens < G._BOUNDARY_OUTPUT_TOKENS
-    assert estimated_tokens + 2_048 < G._BOUNDARY_OUTPUT_TOKENS
+    assert estimated_tokens + 1_024 < G._BOUNDARY_OUTPUT_TOKENS
 
 
 def test_complete_teaching_survives_a_long_internal_structural_aside():
@@ -563,7 +563,7 @@ def test_brief_internal_channel_bump_does_not_discard_complete_teaching():
     assert "Welcome to Biology Pro Tips" in report.clips[0]["_clip_text"]
 
 
-def test_production_biology_fragment_keeps_expanded_context_at_source_edge():
+def test_production_biology_fragment_rebinds_to_grounded_cell_unit():
     raw_cues = [
         (74.120, 77.600, "Ok, so enzymes make life possible by speeding up chemical reactions,"),
         (77.600, 83.760, "but what even is…life? Scientists don't really seem to agree, but obviously a cat is different"),
@@ -621,9 +621,14 @@ def test_production_biology_fragment_keeps_expanded_context_at_source_edge():
     )
 
     assert len(report.clips) == 1
-    assert report.clips[0]["cue_ids"][0] == "3tisOnOkwzo:cue:15"
-    assert report.clips[0]["cue_ids"][-1] == "3tisOnOkwzo:cue:24"
-    assert "unresolved_weak_start" in report.clips[0]["_boundary_fallback_reasons"]
+    clip = report.clips[0]
+    assert clip["cue_ids"][0] == "3tisOnOkwzo:cue:19"
+    assert clip["cue_ids"][-1] == "3tisOnOkwzo:cue:25"
+    assert clip["_clip_text"].startswith("every living thing on earth is made of cells")
+    assert clip["_clip_text"].endswith("plants and animals.")
+    assert "enzymes make life possible" not in clip["_clip_text"]
+    assert "recovered_forward_sentence_start" in clip["_boundary_fallback_reasons"]
+    assert "completed_forward_sentence" in clip["_boundary_fallback_reasons"]
 
 
 def test_visual_ligature_instruction_is_rejected_without_frame_analysis():

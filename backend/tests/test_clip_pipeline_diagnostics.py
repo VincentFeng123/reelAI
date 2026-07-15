@@ -2785,7 +2785,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
 ) -> None:
     strict_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v16",
+        "selection_contract_version": "quality_silence_v17",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -2795,7 +2795,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
     }
     transcript_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v16",
+        "selection_contract_version": "quality_silence_v17",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -2858,7 +2858,7 @@ def test_failed_boundary_storage_does_not_consume_ready_material_cap(
     deferred.append({
         "search_context_json": json.dumps({
             "surface_eligible": True,
-            "selection_contract_version": "quality_silence_v16",
+            "selection_contract_version": "quality_silence_v17",
             "speech_corridor_verified": True,
             "boundary_status": "verified",
             "boundary_diagnostics": {
@@ -3274,6 +3274,197 @@ def test_candidate_plan_prioritizes_level_eligible_then_difficulty(
     ] == expected_deferred
 
 
+def test_all_deferred_source_streams_nearest_valid_level_immediately(
+    monkeypatch,
+) -> None:
+    engine_out = {
+        "clips": [
+            _quality_clip(
+                candidate_id="intermediate-python",
+                score=0.9,
+                difficulty=0.45,
+            )
+        ],
+        "transcript": _transcript(),
+        "notes": "",
+    }
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: _discovery(),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_clip",
+        lambda *_args, **_kwargs: engine_out,
+    )
+    stored: list[dict] = []
+    pipeline = _pipeline()
+
+    def persist(*, clip, **_kwargs):
+        stored.append(clip)
+        return "nearest-level-reel", mock.sentinel.metadata
+
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+    emitted: list[str] = []
+    context = GenerationContext("fast")
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=context,
+        retrieval_profile="deep",
+        knowledge_level="beginner",
+        max_videos=1,
+        max_reels=1,
+        max_persisted_reels=1,
+        on_reel_created=emitted.append,
+    )
+
+    assert reels == ["nearest-level-reel"]
+    assert emitted == ["nearest-level-reel"]
+    assert stored[0]["search_context"]["deferred_level"] is True
+    assert stored[0]["search_context"]["surface_reason"] == "level_mismatch"
+    assert stored[0]["search_context"]["surface_eligible"] is False
+    assert context.counters()["stored_clips"] == 1
+    assert context.counters()["deferred_clips"] == 1
+    assert context.counters()["level_deferred_clips"] == 1
+    assert context.counters()["persisted_clips"] == 1
+
+
+def test_all_deferred_source_streams_only_the_nearest_difficulty_bin(
+    monkeypatch,
+) -> None:
+    transcript = _transcript()
+    transcript["segments"].append({
+        "cue_id": "advanced-python",
+        "start": 20.0,
+        "end": 30.0,
+        "text": "Python metaclasses customize class construction through advanced hooks.",
+    })
+    transcript["duration"] = 30.0
+    engine_out = {
+        "clips": [
+            _quality_clip(
+                candidate_id="intermediate-python",
+                score=0.9,
+                difficulty=0.45,
+            ),
+            _quality_clip(
+                cue_id="advanced-python",
+                start=20.0,
+                end=30.0,
+                quote=transcript["segments"][-1]["text"],
+                candidate_id="advanced-python",
+                score=0.95,
+                difficulty=0.85,
+            ),
+        ],
+        "transcript": transcript,
+        "notes": "",
+    }
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: _discovery(),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_clip",
+        lambda *_args, **_kwargs: engine_out,
+    )
+    pipeline = _pipeline()
+
+    def persist(*, clip, **_kwargs):
+        return clip["selection_candidate_id"], mock.sentinel.metadata
+
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+    emitted: list[str] = []
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext("fast"),
+        retrieval_profile="deep",
+        knowledge_level="beginner",
+        max_videos=1,
+        max_reels=2,
+        max_persisted_reels=2,
+        on_reel_created=emitted.append,
+    )
+
+    assert reels == ["dQw4w9WgXcQ::intermediate-python"]
+    assert emitted == ["dQw4w9WgXcQ::intermediate-python"]
+
+
+def test_current_level_candidate_suppresses_provisional_deferred_fallback(
+    monkeypatch,
+) -> None:
+    transcript = _transcript()
+    transcript["segments"].append({
+        "cue_id": "advanced-python",
+        "start": 20.0,
+        "end": 30.0,
+        "text": "Python metaclasses customize class construction through advanced hooks.",
+    })
+    transcript["duration"] = 30.0
+    engine_out = {
+        "clips": [
+            _quality_clip(candidate_id="beginner-python", score=0.8, difficulty=0.2),
+            _quality_clip(
+                cue_id="advanced-python",
+                start=20.0,
+                end=30.0,
+                quote=transcript["segments"][-1]["text"],
+                candidate_id="advanced-python",
+                score=0.95,
+                difficulty=0.85,
+            ),
+        ],
+        "transcript": transcript,
+        "notes": "",
+    }
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: _discovery(),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_clip",
+        lambda *_args, **_kwargs: engine_out,
+    )
+    stored: list[str] = []
+    pipeline = _pipeline()
+
+    def persist(*, clip, **_kwargs):
+        candidate_id = str(clip["selection_candidate_id"]).split("::")[-1]
+        stored.append(candidate_id)
+        return f"reel-{candidate_id}", mock.sentinel.metadata
+
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+    emitted: list[str] = []
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext("fast"),
+        retrieval_profile="deep",
+        knowledge_level="beginner",
+        max_videos=1,
+        max_reels=2,
+        max_persisted_reels=2,
+        on_reel_created=emitted.append,
+    )
+
+    assert stored == ["beginner-python", "advanced-python"]
+    assert reels == ["reel-beginner-python"]
+    assert emitted == ["reel-beginner-python"]
+
+
 def test_candidate_plan_prioritizes_primary_intent_only_within_difficulty_stage(
     monkeypatch,
 ) -> None:
@@ -3425,7 +3616,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v16"
+        assert context["selection_contract_version"] == "quality_silence_v17"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"

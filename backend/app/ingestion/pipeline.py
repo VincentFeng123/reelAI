@@ -524,7 +524,7 @@ def _boundary_evidence_grade(
     if (
         not isinstance(context, dict)
         or str(context.get("selection_contract_version") or "").strip()
-        != "quality_silence_v16"
+        != "quality_silence_v17"
     ):
         return 0
     if (
@@ -1999,7 +1999,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v16",
+            selection_contract_version="quality_silence_v17",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -3265,6 +3265,8 @@ class IngestionPipeline:
             nonlocal stored_count
             v, kept, engine_out = result
             persisted_by_index: dict[int, ReelOutWithAttribution] = {}
+            level_deferred_by_index: dict[int, ReelOutWithAttribution] = {}
+            level_deferred_stage_by_index: dict[int, int] = {}
             callback_indices: set[int] = set()
             if persistence_cap is not None and stored_count >= persistence_cap:
                 return []
@@ -3791,6 +3793,17 @@ class IngestionPipeline:
                             generation_context.increment_counter(
                                 "level_deferred_clips"
                             )
+                    if search_context.get("surface_reason") == "level_mismatch":
+                        level_deferred_by_index[candidate_index] = reel
+                        try:
+                            difficulty = max(
+                                0.0, min(1.0, float(clip.get("difficulty", 0.5)))
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            difficulty = 0.5
+                        level_deferred_stage_by_index[candidate_index] = (
+                            0 if difficulty < 0.34 else 1 if difficulty < 0.67 else 2
+                        )
                     continue
                 candidate_id = str(clip.get("selection_candidate_id") or "").strip()
                 if candidate_id:
@@ -3808,18 +3821,39 @@ class IngestionPipeline:
                     on_reel_created(reel)
                     callback_indices.add(candidate_index)
 
-            selected_indices = sorted(persisted_by_index)
+            selected_reels = persisted_by_index
+            selected_indices = sorted(selected_reels)
+            if not selected_indices and level_deferred_by_index:
+                # Difficulty is an ordering preference, not a reason to make a
+                # valid source appear empty. Stream the nearest already-ranked
+                # level only when this source has no current-level candidate;
+                # the final inventory remains authoritative across sources.
+                target_stage = {
+                    "beginner": 0,
+                    "intermediate": 1,
+                    "advanced": 2,
+                }.get(str(v.get("_knowledge_level") or "").strip().lower(), 0)
+                nearest_stage = min(
+                    set(level_deferred_stage_by_index.values()),
+                    key=lambda stage: (abs(stage - target_stage), stage),
+                )
+                selected_reels = {
+                    candidate_index: reel
+                    for candidate_index, reel in level_deferred_by_index.items()
+                    if level_deferred_stage_by_index[candidate_index] == nearest_stage
+                }
+                selected_indices = sorted(selected_reels)
             if surface_limit is not None:
                 selected_indices = selected_indices[:surface_limit]
             if on_reel_created is not None:
                 for candidate_index in selected_indices:
                     if candidate_index not in callback_indices:
-                        on_reel_created(persisted_by_index[candidate_index])
+                        on_reel_created(selected_reels[candidate_index])
             if generation_context is not None:
                 generation_context.increment_counter(
                     "persisted_clips", len(selected_indices)
                 )
-            return [persisted_by_index[index] for index in selected_indices]
+            return [selected_reels[index] for index in selected_indices]
 
         reels_by_video: dict[int, list[ReelOutWithAttribution]] = {}
         completed_results: dict[
@@ -4285,7 +4319,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v16",
+                    selection_contract_version="quality_silence_v17",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,

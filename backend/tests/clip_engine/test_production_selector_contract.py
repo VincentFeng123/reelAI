@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import time
+from types import SimpleNamespace
+
 import pytest
 
+from backend import gemini_client
+from backend.app.clip_engine.provider_runtime import GenerationContext
 from backend.pipeline import gemini_segment
 
 
@@ -63,6 +68,454 @@ def test_single_call_boundary_schema_caps_exhaustive_output_before_truncation() 
             *forty,
             _proposal().model_copy(update={"candidate_id": "candidate-40"}),
         ])
+
+
+def test_selector_contract_allows_short_exact_edges_without_padding() -> None:
+    system, user = gemini_segment._boundary_prompts(
+        "[0] 00:00 Plants convert light into stored chemical energy.",
+        1,
+        "photosynthesis",
+    )
+
+    assert "shortest unique 1-12" in system
+    assert "one-word quote" in user
+    assert "never pad" in user
+    assert "4-8" not in f"{system}\n{user}"
+
+
+def test_selector_reconciles_actual_usage_before_conversion(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("fast", generation_id="selector-reconcile")
+    monkeypatch.setattr(
+        gemini_client,
+        "generate_json_v3",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            text='{"topics":[]}',
+            telemetry={
+                "model": "gemini-3.5-flash",
+                "prompt_tokens": 2_000,
+                "candidate_tokens": 20,
+                "thought_tokens": 10,
+                "total_tokens": 2_030,
+            },
+        ),
+    )
+
+    parsed, telemetry = gemini_segment._call_model(
+        "system",
+        "user",
+        gemini_segment._CompactBoundaryPlan,
+        model="gemini-3.5-flash",
+        thinking_level="low",
+        max_output_tokens=8_192,
+        timeout_s=5.0,
+        deadline_monotonic=time.monotonic() + 2.0,
+        operation="flash_boundary_selector",
+        prompt_version="test-selector",
+        cancelled=None,
+        budget_reserve=context.reserve_gemini_call,
+        budget_reconcile=context.reconcile_gemini_call,
+        max_retries=0,
+    )
+
+    assert parsed.topics == []
+    assert isinstance(telemetry["gemini_reservation_id"], int)
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["inflight_reserved_cost_usd"] == 0.0
+    assert budget["committed_cost_usd"] == pytest.approx(
+        (2_000 * 1.5 + 30 * 9.0) / 1_000_000.0
+    )
+
+
+def test_selector_releases_non_dispatched_failure_reservation(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("fast", generation_id="selector-not-dispatched")
+
+    def fail_before_dispatch(*_args, **_kwargs):
+        error = RuntimeError("provider capacity unavailable")
+        error.telemetry = {
+            "model": "gemini-3.5-flash",
+            "dispatched": False,
+        }
+        raise error
+
+    monkeypatch.setattr(gemini_client, "generate_json_v3", fail_before_dispatch)
+
+    with pytest.raises(gemini_segment._ModelCallError) as caught:
+        gemini_segment._call_model(
+            "system",
+            "user",
+            gemini_segment._CompactBoundaryPlan,
+            model="gemini-3.5-flash",
+            thinking_level="low",
+            max_output_tokens=6_000,
+            timeout_s=5.0,
+            deadline_monotonic=time.monotonic() + 2.0,
+            operation="flash_boundary_selector",
+            prompt_version="test-selector",
+            cancelled=None,
+            budget_reserve=context.reserve_gemini_call,
+            budget_reconcile=context.reconcile_gemini_call,
+            max_retries=0,
+        )
+
+    telemetry = caught.value.telemetry
+    assert telemetry["dispatched"] is False
+    assert context.budget.snapshot()["gemini"]["inflight_reserved_cost_usd"] == 0.0
+    assert context.budget.snapshot()["gemini"]["committed_cost_usd"] == 0.0
+
+    # The later usage-recording path reconciles the same reservation again.
+    context.record_gemini(
+        attempt=1,
+        model_used="gemini-3.5-flash",
+        quality_degraded=False,
+        usage=telemetry,
+        status_code=None,
+        error_code="model_call_failed",
+    )
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["inflight_reserved_cost_usd"] == 0.0
+    assert budget["committed_cost_usd"] == 0.0
+
+
+def test_short_end_quote_stops_before_same_cue_outro() -> None:
+    text = (
+        "Studying photosynthesis explains how plants convert light into stored chemical "
+        "energy. Thanks for watching and don't forget to subscribe."
+    )
+    proposal = _proposal().model_copy(update={
+        "start_quote": "Studying photosynthesis explains",
+        "end_quote": "energy",
+        "topic_evidence_quote": (
+            "photosynthesis explains how plants convert light into stored chemical energy"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "short-edge", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].endswith("chemical energy")
+    assert "Thanks for watching" not in report.clips[0]["_clip_text"]
+
+
+def test_inline_next_topic_tail_is_trimmed_at_the_complete_claim() -> None:
+    text = (
+        "Carbon dioxide and water are converted into glucose, and the plant releases "
+        "oxygen during photosynthesis now let's talk about chloroplast structure."
+    )
+    proposal = _proposal().model_copy(update={
+        "start_quote": "Carbon dioxide and water are converted",
+        "end_quote": "oxygen during photosynthesis now let's",
+        "topic_evidence_quote": (
+            "the plant releases oxygen during photosynthesis"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "mixed-tail", "start": 0.0, "end": 14.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].endswith(
+        "the plant releases oxygen during photosynthesis"
+    )
+    assert "now let's" not in report.clips[0]["_clip_text"].casefold()
+
+
+def test_edge_navigation_never_manufactures_an_incomplete_ending() -> None:
+    text = (
+        "Photosynthesis converts light into chemical energy. The most important "
+        "point is now let's discuss respiration."
+    )
+    proposal = _proposal().model_copy(update={
+        "start_quote": "Photosynthesis converts light",
+        "end_quote": "now let's discuss respiration",
+        "topic_evidence_quote": (
+            "Photosynthesis converts light into chemical energy"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "incomplete-tail", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].rstrip(".") == (
+        "Photosynthesis converts light into chemical energy"
+    )
+
+
+def test_repeated_one_word_end_uses_the_authoritative_last_occurrence() -> None:
+    text = "Photosynthesis stores energy in glucose. Now let's talk about energy."
+    proposal = _proposal().model_copy(update={
+        "start_quote": "Photosynthesis",
+        "end_quote": "energy",
+        "topic_evidence_quote": "Photosynthesis stores energy in glucose",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "repeated-edge", "start": 0.0, "end": 10.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].rstrip(" .!?") == (
+        "Photosynthesis stores energy in glucose"
+    )
+
+
+def test_split_list_completes_before_following_navigation() -> None:
+    segments = [
+        {
+            "cue_id": "list-a",
+            "start": 0.0,
+            "end": 7.0,
+            "text": "The products include sugars such as glucose, NADP plus",
+        },
+        {
+            "cue_id": "list-b",
+            "start": 7.0,
+            "end": 13.0,
+            "text": "ADP and P so let's begin our discussion of chloroplast structure.",
+        },
+    ]
+    proposal = _proposal().model_copy(update={
+        "start_quote": "The products include sugars",
+        "end_quote": "sugars such as glucose NADP plus",
+        "topic_evidence_quote": (
+            "The products include sugars such as glucose NADP plus"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis products",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["list-a", "list-b"]
+    assert report.clips[0]["_clip_text"].endswith("NADP plus ADP and P")
+    assert "begin our discussion" not in report.clips[0]["_clip_text"]
+
+
+def test_contextual_notation_leadin_recovers_the_next_complete_setup() -> None:
+    segments = [
+        {
+            "cue_id": "notation-transition",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "Now, there's other notations.",
+        },
+        {
+            "cue_id": "function-setup",
+            "start": 4.0,
+            "end": 10.0,
+            "text": "If this curve is described as y is equal to f of x.",
+        },
+        {
+            "cue_id": "derivative-notation",
+            "start": 10.0,
+            "end": 18.0,
+            "text": "Then dy over dx at that input is written as f prime of x.",
+        },
+    ]
+    proposal = _proposal(end_line=2).model_copy(update={
+        "candidate_id": "lagrange-notation",
+        "start_quote": "Now there's other notations",
+        "end_quote": "written as f prime of x",
+        "title": "Lagrange derivative notation",
+        "learning_objective": "Explain how f prime denotes a derivative",
+        "facet": "derivative notation",
+        "topic_evidence_quote": "dy over dx at that input is written as f prime",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="derivative notation",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["function-setup", "derivative-notation"]
+    assert report.clips[0]["_clip_text"].startswith("If this curve is described")
+    assert "other notations" not in report.clips[0]["_clip_text"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Usually, cells generate ATP by oxidative phosphorylation.",
+        "Normally, the derivative of a constant is zero.",
+        "Another way to state the chain rule is to multiply outer and inner derivatives.",
+    ],
+)
+def test_complete_frequency_or_alternative_fact_is_standalone(text: str) -> None:
+    assert gemini_segment._opening_clause_is_standalone(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        (
+            "Ability to convert sunlight, carbon dioxide, and water into glucose and "
+            "oxygen. This is photosynthesis."
+        ),
+        (
+            "Process to turn light into chemical energy. It is called photosynthesis."
+        ),
+        (
+            "For FTL communication, right? One proposed scheme has Bob change a "
+            "measurement setting."
+        ),
+        (
+            "The ability to convert sunlight into food. Photosynthesis stores light "
+            "energy as glucose."
+        ),
+        (
+            "An ability to convert sunlight into food. Photosynthesis stores light "
+            "energy as glucose."
+        ),
+        (
+            "The process to turn light into food. Photosynthesis stores light energy "
+            "as glucose."
+        ),
+        (
+            "In that case, right? Photosynthesis stores light energy as glucose."
+        ),
+    ],
+)
+def test_later_sentence_does_not_make_a_fragmentary_opening_standalone(
+    text: str,
+) -> None:
+    assert not gemini_segment._opening_clause_is_standalone(text)
+
+
+def test_named_category_makes_another_example_cold_viewer_complete() -> None:
+    assert gemini_segment._opening_clause_is_standalone(
+        "Another example of renewable energy is wind power, which converts moving air "
+        "into electricity."
+    )
+
+
+def test_standalone_frequency_fact_does_not_import_a_previous_topic() -> None:
+    segments = [
+        {
+            "cue_id": "limits",
+            "start": 0.0,
+            "end": 7.0,
+            "text": "Limits describe the value a function approaches near an input.",
+        },
+        {
+            "cue_id": "constant",
+            "start": 7.0,
+            "end": 14.0,
+            "text": "Normally, the derivative of a constant is zero.",
+        },
+    ]
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "constant-derivative",
+        "start_line": 1,
+        "end_line": 1,
+        "start_quote": "Normally the derivative of a constant",
+        "end_quote": "derivative of a constant is zero",
+        "title": "Derivative of a constant",
+        "learning_objective": "Explain why a constant has zero derivative",
+        "facet": "derivative",
+        "topic_evidence_quote": "the derivative of a constant is zero",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="derivative of a constant",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["constant"]
+
+
+def test_same_cue_recovery_keeps_the_earliest_required_worked_setup() -> None:
+    text = (
+        "Now, there's another example. Let f of x equal x squared. "
+        "Using the power rule, f prime of x equals two x."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "power-rule",
+        "start_quote": "Now there's another example",
+        "end_quote": "f prime of x equals two x",
+        "title": "Power rule",
+        "learning_objective": "Differentiate f of x equals x squared through the answer",
+        "facet": "worked example",
+        "topic_evidence_quote": "Using the power rule f prime of x equals two x",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "worked", "start": 0.0, "end": 14.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="power rule worked example",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("Let f of x equal x squared")
+
+
+def test_opening_joke_and_navigation_are_trimmed_before_teaching() -> None:
+    text = (
+        "Another example, my friends, of unintelligent design. Back to the cycle! "
+        "Ribulose bisphosphate gets a carbon dioxide molecule added during carbon fixation."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "calvin-cycle-fixation",
+        "start_quote": "Another example my friends of unintelligent design",
+        "end_quote": "molecule added during carbon fixation",
+        "title": "Carbon fixation in the Calvin cycle",
+        "learning_objective": "Explain the first carbon-fixation step of the Calvin cycle",
+        "facet": "Calvin cycle carbon fixation",
+        "topic_evidence_quote": (
+            "Ribulose bisphosphate gets a carbon dioxide molecule added during carbon fixation"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "calvin", "start": 0.0, "end": 13.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="Calvin cycle",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("Ribulose bisphosphate")
+    assert "unintelligent design" not in report.clips[0]["_clip_text"]
+    assert "Back to the cycle" not in report.clips[0]["_clip_text"]
 
 
 def test_compact_selector_aliases_preserve_canonical_fields_and_supporting_rank() -> None:
@@ -1339,6 +1792,283 @@ def test_same_cue_topic_transition_still_removes_the_previous_objective() -> Non
     assert "move on to derivatives" not in clip["_clip_text"]
 
 
+def test_transition_cue_drops_old_topic_prefix_before_new_evidence() -> None:
+    segments = [
+        {
+            "cue_id": "mixed",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "The limit equals two, which completes the limits problem. "
+                "Now let's move on to derivatives."
+            ),
+        },
+        {
+            "cue_id": "derivative",
+            "start": 8.0,
+            "end": 16.0,
+            "text": (
+                "A derivative measures the instantaneous rate of change of a function."
+            ),
+        },
+    ]
+    proposal = _proposal(end_line=1).model_copy(update={
+        "candidate_id": "derivative-only",
+        "start_quote": "The limit equals two",
+        "end_quote": "rate of change of a function",
+        "title": "Derivative definition",
+        "learning_objective": "Explain derivatives as instantaneous rates of change",
+        "facet": "derivatives",
+        "topic_evidence_quote": (
+            "A derivative measures the instantaneous rate of change"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="calculus",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["derivative"]
+    assert report.clips[0]["_clip_text"] == (
+        "A derivative measures the instantaneous rate of change of a function."
+    )
+
+
+def test_transition_cue_keeps_answer_prefix_before_next_topic() -> None:
+    segments = [
+        {
+            "cue_id": "setup",
+            "start": 0.0,
+            "end": 8.0,
+            "text": "We apply the power rule to x squared.",
+        },
+        {
+            "cue_id": "answer-transition",
+            "start": 8.0,
+            "end": 18.0,
+            "text": (
+                "Therefore the derivative is two x. Now let's move on to integrals."
+            ),
+        },
+    ]
+    proposal = _proposal(end_line=1).model_copy(update={
+        "candidate_id": "power-rule-answer",
+        "start_quote": "We apply the power rule",
+        "end_quote": "move on to integrals",
+        "title": "Power rule answer",
+        "learning_objective": "Differentiate x squared through its final answer",
+        "facet": "worked example",
+        "topic_evidence_quote": "We apply the power rule to x squared",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="power rule worked example",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["setup", "answer-transition"]
+    assert report.clips[0]["_clip_text"].rstrip(".").endswith(
+        "Therefore the derivative is two x"
+    )
+    assert "integrals" not in report.clips[0]["_clip_text"]
+
+
+def test_next_navigation_in_one_cue_drops_the_previous_topic() -> None:
+    text = (
+        "Photosynthesis releases oxygen. Next we'll discuss chloroplast structure. "
+        "Chloroplasts contain thylakoid membranes for the light reactions."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "chloroplast-structure",
+        "start_quote": "Photosynthesis releases oxygen",
+        "end_quote": "membranes for the light reactions",
+        "title": "Chloroplast structure",
+        "learning_objective": "Explain how thylakoid membranes support light reactions",
+        "facet": "chloroplast structure",
+        "topic_evidence_quote": (
+            "Chloroplasts contain thylakoid membranes for the light reactions"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "mixed", "start": 0.0, "end": 18.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="chloroplast structure",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("Chloroplasts contain")
+    assert "Photosynthesis releases" not in report.clips[0]["_clip_text"]
+
+
+@pytest.mark.parametrize(
+    "navigation",
+    [
+        "Now let us discuss derivatives.",
+        "Now let's cover derivatives.",
+        "Now let us talk about derivatives.",
+    ],
+)
+def test_named_topic_navigation_cue_drops_the_previous_topic(
+    navigation: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "limits",
+            "start": 0.0,
+            "end": 6.0,
+            "text": "Limits describe values approached by functions.",
+        },
+        {"cue_id": "navigation", "start": 6.0, "end": 9.0, "text": navigation},
+        {
+            "cue_id": "derivatives",
+            "start": 9.0,
+            "end": 16.0,
+            "text": "Derivatives measure instantaneous rates of change.",
+        },
+    ]
+    proposal = _proposal(end_line=2).model_copy(update={
+        "candidate_id": "derivatives",
+        "start_quote": "Limits describe values",
+        "end_quote": "instantaneous rates of change",
+        "title": "Derivative definition",
+        "learning_objective": "Explain derivatives as rates of change",
+        "facet": "derivatives",
+        "topic_evidence_quote": "Derivatives measure instantaneous rates of change",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="derivatives",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["derivatives"]
+
+
+def test_named_reset_overrides_one_shared_token_before_the_transition() -> None:
+    text = (
+        "Photosynthesis converts light into glucose. Now let us discuss respiration. "
+        "Respiration breaks glucose down to release energy."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "respiration",
+        "start_quote": "Photosynthesis converts light",
+        "end_quote": "glucose down to release energy",
+        "title": "Cellular respiration",
+        "learning_objective": "Explain how respiration releases energy from glucose",
+        "facet": "respiration",
+        "topic_evidence_quote": "Respiration breaks glucose down to release energy",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "mixed", "start": 0.0, "end": 18.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="cellular respiration",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("Respiration breaks glucose")
+
+
+def test_relational_word_overlap_does_not_merge_a_named_adjacent_topic() -> None:
+    text = (
+        "Photosynthesis converts light into glucose. Now let us discuss respiration. "
+        "Respiration breaks glucose down to release energy."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "photosynthesis",
+        "start_quote": "Photosynthesis converts light",
+        "end_quote": "glucose down to release energy",
+        "title": "Photosynthesis produces glucose",
+        "learning_objective": "Explain how photosynthesis produces glucose",
+        "facet": "photosynthesis",
+        "topic_evidence_quote": "Photosynthesis converts light into glucose",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "mixed", "start": 0.0, "end": 18.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"] == (
+        "Photosynthesis converts light into glucose."
+    )
+
+
+def test_teaching_inside_a_reset_sentence_starts_at_the_named_subject() -> None:
+    text = (
+        "A limit describes approach. Now let us move on to derivatives, which measure "
+        "instantaneous change."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "derivatives",
+        "start_quote": "A limit describes approach",
+        "end_quote": "which measure instantaneous change",
+        "title": "Derivative definition",
+        "learning_objective": "Explain derivatives",
+        "facet": "derivatives",
+        "topic_evidence_quote": "derivatives which measure instantaneous change",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "mixed", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="derivatives",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("derivatives, which measure")
+    assert "limit describes" not in report.clips[0]["_clip_text"]
+
+
+def test_next_navigation_tail_does_not_leave_the_word_next() -> None:
+    text = "The derivative of x squared is two x. Next we'll discuss integrals."
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "derivative-answer",
+        "start_quote": "The derivative of x squared",
+        "end_quote": "we'll discuss integrals",
+        "title": "Derivative of x squared",
+        "learning_objective": "Differentiate x squared",
+        "facet": "derivative",
+        "topic_evidence_quote": "The derivative of x squared is two x",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "tail", "start": 0.0, "end": 10.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="derivative of x squared",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].rstrip(" .!?").endswith("two x")
+    assert not report.clips[0]["_clip_text"].endswith("Next")
+
+
 def test_relational_objective_may_span_an_explicit_topic_transition() -> None:
     text = (
         "A limit describes the value a function approaches. Now let's move on to "
@@ -1370,6 +2100,160 @@ def test_relational_objective_may_span_an_explicit_topic_transition() -> None:
     [clip] = report.clips
     assert "A limit describes" in clip["_clip_text"]
     assert "A derivative is defined by a limit" in clip["_clip_text"]
+
+
+@pytest.mark.parametrize(
+    "objective",
+    [
+        "Explain why the derivative definition uses limits",
+        "Explain derivatives in terms of limits",
+        "Explain the connection between limits and derivatives",
+        "Show how taking a limit yields the derivative",
+        "Derive the derivative from limits",
+        "Explain the difference quotient limit that produces a derivative",
+    ],
+)
+def test_relational_objective_must_anchor_both_sides_of_the_actual_reset(
+    objective: str,
+) -> None:
+    text = (
+        "A limit describes the value approached by a function. Now let us move on to "
+        "derivatives. A derivative is defined as the limit of difference quotients."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "limits-and-derivatives",
+        "start_quote": "A limit describes the value",
+        "end_quote": "the limit of difference quotients",
+        "title": "Limits in the derivative definition",
+        "learning_objective": objective,
+        "facet": "limits and derivatives",
+        "topic_evidence_quote": "A derivative is defined as the limit of difference quotients",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "relationship", "start": 0.0, "end": 20.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="limits and derivatives",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("A limit describes")
+    assert report.clips[0]["_clip_text"].rstrip(" .!?").endswith(
+        "difference quotients"
+    )
+
+
+@pytest.mark.parametrize(
+    "objective",
+    [
+        "Explain how derivatives affect velocity",
+        "Explain derivatives in terms of velocity",
+        "Explain the connection between derivatives and velocity",
+        "Derive velocity change from the derivative",
+    ],
+)
+def test_relation_to_a_third_concept_does_not_bridge_an_unrelated_reset(
+    objective: str,
+) -> None:
+    text = (
+        "Limits describe values approached by functions. Now let us move on to "
+        "derivatives. Derivatives affect velocity by measuring its rate of change."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "derivative-velocity",
+        "start_quote": "Limits describe values",
+        "end_quote": "measuring its rate of change",
+        "title": "Derivatives and velocity",
+        "learning_objective": objective,
+        "facet": "derivative application",
+        "topic_evidence_quote": "Derivatives affect velocity by measuring its rate of change",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "mixed", "start": 0.0, "end": 18.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="derivatives and velocity",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("Derivatives affect velocity")
+    assert "Limits describe" not in report.clips[0]["_clip_text"]
+
+
+@pytest.mark.parametrize(
+    ("segments", "objective", "evidence", "expected_start", "expected_end"),
+    [
+        (
+            [
+                "To approximate the integral, divide the interval into subintervals.",
+                "Now let's cover the interval with rectangles.",
+                "Adding their areas gives the Riemann sum approximation.",
+            ],
+            "Approximate the integral by covering its subintervals with rectangles",
+            "divide the interval into subintervals",
+            "To approximate the integral",
+            "Riemann sum approximation.",
+        ),
+        (
+            [
+                "We need to integrate over the circular region.",
+                "Now let's switch to polar coordinates.",
+                "The Jacobian contributes r and the integral simplifies.",
+            ],
+            "Solve the circular-region integral using polar coordinates",
+            "The Jacobian contributes r and the integral simplifies",
+            "We need to integrate",
+            "integral simplifies.",
+        ),
+        (
+            [
+                "The equation couples x and y.",
+                "Now let's turn to new variables u and v.",
+                "Substitution separates the equation and gives the solution.",
+            ],
+            "Solve the coupled equation using new variables u and v",
+            "Substitution separates the equation and gives the solution",
+            "The equation couples",
+            "gives the solution.",
+        ),
+    ],
+)
+def test_method_navigation_inside_one_objective_preserves_the_complete_arc(
+    segments: list[str],
+    objective: str,
+    evidence: str,
+    expected_start: str,
+    expected_end: str,
+) -> None:
+    cues = [
+        {"cue_id": f"cue-{index}", "start": index * 6.0, "end": (index + 1) * 6.0, "text": text}
+        for index, text in enumerate(segments)
+    ]
+    proposal = _proposal(end_line=2).model_copy(update={
+        "candidate_id": "complete-method",
+        "start_quote": " ".join(segments[0].split()[:5]),
+        "end_quote": " ".join(segments[-1].split()[-5:]),
+        "title": "Complete method",
+        "learning_objective": objective,
+        "facet": "worked method",
+        "topic_evidence_quote": evidence,
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        cues,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic=objective,
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith(expected_start)
+    assert report.clips[0]["_clip_text"].endswith(expected_end)
 
 
 @pytest.mark.parametrize(
@@ -2047,6 +2931,220 @@ def test_navigation_inside_one_worked_arc_does_not_delete_required_setup(
     assert report.rejected_reasons == []
     assert report.clips[0]["cue_ids"] == ["setup", "navigation", "answer"]
     assert report.clips[0]["_clip_text"].startswith("The quadratic formula begins")
+
+
+@pytest.mark.parametrize(
+    ("text", "topic", "objective", "evidence", "expected_end"),
+    [
+        (
+            "The chain rule differentiates the outer function first. Let's look at "
+            "the second step: multiply by the inner derivative, giving six x squared "
+            "as the final answer.",
+            "chain rule worked example",
+            "Apply both chain rule steps through the final answer",
+            "The chain rule differentiates the outer function first",
+            "six x squared as the final answer",
+        ),
+        (
+            "Quantum entanglement creates correlated measurement outcomes. This is one "
+            "of the problems with faster-than-light communication: each local outcome "
+            "is random, so no controllable message is sent.",
+            "entanglement FTL misconception",
+            "Explain why entanglement cannot send a controllable message",
+            "Quantum entanglement creates correlated measurement outcomes",
+            "no controllable message is sent",
+        ),
+    ],
+)
+def test_internal_teaching_is_not_treated_as_terminal_noise(
+    text: str,
+    topic: str,
+    objective: str,
+    evidence: str,
+    expected_end: str,
+) -> None:
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "complete-arc",
+        "start_quote": " ".join(text.split()[:4]),
+        "end_quote": expected_end,
+        "title": "Complete teaching arc",
+        "learning_objective": objective,
+        "facet": "worked explanation",
+        "topic_evidence_quote": evidence,
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "arc", "start": 0.0, "end": 25.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic=topic,
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].rstrip(" .!?").endswith(expected_end)
+
+
+def test_next_same_unit_step_is_not_proof_current_setup_is_complete() -> None:
+    segments = [
+        {
+            "cue_id": "setup",
+            "start": 0.0,
+            "end": 6.0,
+            "text": "We differentiate the outer function first",
+        },
+        {
+            "cue_id": "answer",
+            "start": 6.0,
+            "end": 14.0,
+            "text": (
+                "Now let's look at the second step: multiply by the inner derivative "
+                "to get six x squared."
+            ),
+        },
+    ]
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "chain-rule-answer",
+        "start_quote": "We differentiate the outer function",
+        "end_quote": "differentiate the outer function first",
+        "title": "Chain rule example",
+        "learning_objective": "Apply both chain rule steps through the answer",
+        "facet": "worked example",
+        "topic_evidence_quote": "We differentiate the outer function first",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="chain rule worked example",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["setup", "answer"]
+    assert report.clips[0]["_clip_text"].endswith("six x squared.")
+
+
+def test_back_to_navigation_does_not_delete_worked_example_setup() -> None:
+    text = (
+        "Take sine of x squared. Back to the calculation! Multiplying the outer "
+        "and inner derivatives gives two x cosine of x squared as the final result."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "chain-rule-worked",
+        "start_quote": "Take sine of x squared",
+        "end_quote": "x squared as the final result",
+        "title": "Chain rule",
+        "learning_objective": "Apply the chain rule through the final derivative",
+        "facet": "worked example",
+        "topic_evidence_quote": (
+            "Multiplying the outer and inner derivatives gives two x cosine"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "worked", "start": 0.0, "end": 20.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="chain rule worked example",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("Take sine of x squared")
+
+
+@pytest.mark.parametrize(
+    ("text", "objective", "evidence", "expected_end"),
+    [
+        (
+            "For sine of x squared, we use the chain rule. Now let us discuss how "
+            "the rule applies. Differentiate sine, then multiply by two x to get "
+            "the answer.",
+            "Solve sine of x squared with the chain rule",
+            "sine of x squared we use the chain rule",
+            "two x to get the answer.",
+        ),
+        (
+            "The second derivative value is negative here. Now let us discuss why it "
+            "is negative. Differentiating twice gives a negative value, so the graph "
+            "is concave down.",
+            "Explain why the second derivative is negative and implies concavity",
+            "The second derivative value is negative here",
+            "graph is concave down.",
+        ),
+    ],
+)
+def test_how_or_why_navigation_keeps_required_reasoning_and_answer(
+    text: str,
+    objective: str,
+    evidence: str,
+    expected_end: str,
+) -> None:
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "complete-reasoning",
+        "start_quote": " ".join(text.split()[:5]),
+        "end_quote": " ".join(text.split()[-5:]),
+        "title": "Complete reasoning",
+        "learning_objective": objective,
+        "facet": "worked explanation",
+        "topic_evidence_quote": evidence,
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "reasoning", "start": 0.0, "end": 24.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic=(
+            "chain rule worked example"
+            if "sine of x squared" in text
+            else "second derivative"
+        ),
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].endswith(expected_end)
+
+
+def test_distinct_topic_before_navigation_is_not_imported_as_list_completion() -> None:
+    segments = [
+        {
+            "cue_id": "derivative",
+            "start": 0.0,
+            "end": 6.0,
+            "text": "A derivative measures instantaneous change",
+        },
+        {
+            "cue_id": "integral-next",
+            "start": 6.0,
+            "end": 14.0,
+            "text": (
+                "An integral accumulates area under a curve so let us move on to sequences."
+            ),
+        },
+    ]
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "derivative",
+        "start_quote": "A derivative measures instantaneous",
+        "end_quote": "derivative measures instantaneous change",
+        "title": "Derivative",
+        "learning_objective": "Define a derivative as instantaneous change",
+        "facet": "derivative",
+        "topic_evidence_quote": "A derivative measures instantaneous change",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="derivative",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["derivative"]
 
 
 def test_difference_keyword_does_not_disable_a_real_topic_reset() -> None:

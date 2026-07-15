@@ -805,12 +805,12 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
          ("high", 24_576, 90.0, "pro_authoritative", "gemini-3.1-pro-preview")),
         (G.CORRECTED_PRO_PROFILE,
          ("high", 24_576, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
-        (G.FLASH_SINGLE_PROFILE,
+    (G.FLASH_SINGLE_PROFILE,
          ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash")),
-        (G.FLASH_SPLIT_PROFILE,
-         ("low", 8_192, 28.0, "flash_boundary_selector", "gemini-3.5-flash")),
-        (G.PRO_BOUNDARY_PROFILE,
-         ("high", 8_192, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
+    (G.FLASH_SPLIT_PROFILE,
+         ("low", 6_000, 28.0, "flash_boundary_selector", "gemini-3.5-flash")),
+    (G.PRO_BOUNDARY_PROFILE,
+         ("high", 6_000, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
     ],
 )
 def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, expected):
@@ -861,7 +861,7 @@ def test_flash_boundary_profile_accepts_bootstrap_low_thinking_override(monkeypa
     )
 
     assert captured["thinking_level"] == "low"
-    assert captured["max_output_tokens"] == 8_192
+    assert captured["max_output_tokens"] == 6_000
 
 
 def test_boundary_profile_keeps_grounded_clip_with_bad_edge_quote(monkeypatch):
