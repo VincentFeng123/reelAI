@@ -107,7 +107,17 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
         transcript, {"_knowledge_level": "advanced"},
     )
 
+    original_primary = segment_cache.pipeline_config.SEGMENT_FLASH_MODEL
     monkeypatch.setattr(segment_cache.pipeline_config, "SEGMENT_FLASH_MODEL", "new-model")
+    assert _key(transcript) != baseline
+    monkeypatch.setattr(
+        segment_cache.pipeline_config, "SEGMENT_FLASH_MODEL", original_primary,
+    )
+    monkeypatch.setattr(
+        segment_cache.pipeline_config,
+        "SEGMENT_FLASH_FALLBACK_MODEL",
+        "new-fallback-model",
+    )
     assert _key(transcript) != baseline
 
 

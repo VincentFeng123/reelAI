@@ -153,7 +153,10 @@ def _wire_segment_runtime(
             stage=_segment_usage_stage(event.get("operation")),
             attempt=max(1, int(event.get("retries") or 0) + 1),
             model_used=str(event.get("model") or ""),
-            quality_degraded=str(event.get("operation") or "").startswith("pro_fallback"),
+            quality_degraded=(
+                bool(event.get("quality_degraded"))
+                or str(event.get("operation") or "").startswith("pro_fallback")
+            ),
             usage=event,
             status_code=200 if has_provider_response else None,
             error_code="" if has_provider_response else "model_call_failed",

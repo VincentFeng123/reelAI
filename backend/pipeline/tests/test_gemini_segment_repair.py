@@ -1801,6 +1801,7 @@ def test_dirty_edges_use_only_the_one_low_thinking_selector_call(monkeypatch):
     assert kwargs["max_output_tokens"] == 6_000
     assert kwargs["timeout_s"] == 28.0
     assert kwargs["max_retries"] == 1
+    assert kwargs["failover_model"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
     assert kwargs["operation"] == "flash_boundary_selector"
     assert kwargs["prompt_version"] == G.FLASH_SPLIT_PROFILE
     assert kwargs["budget_reserve"] is reserve

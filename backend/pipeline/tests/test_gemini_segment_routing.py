@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from backend import gemini_client as GC
+from backend.app.clip_engine.provider_runtime import GenerationContext
 from backend.pipeline import gemini_segment as G
 
 
@@ -54,6 +55,62 @@ def _empty_plan(schema: type, *, topic: str = ""):
             topics=[],
         )
     return schema(topics=[])
+
+
+def _empty_selector_response(topic: str = "calculus") -> SimpleNamespace:
+    return SimpleNamespace(
+        text=json.dumps({
+            "request_intent": {
+                "exact_request": topic,
+                "constraints": [{
+                    "constraint_id": "subject",
+                    "kind": "subject",
+                    "source_phrase": topic,
+                    "requirement": f"Teach {topic}",
+                }],
+            },
+            "topics": [],
+        }),
+        candidates=[],
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=120,
+            candidates_token_count=10,
+            thoughts_token_count=0,
+            total_token_count=130,
+            cached_content_token_count=0,
+        ),
+    )
+
+
+class _HTTPStatusError(RuntimeError):
+    def __init__(self, status_code: int):
+        super().__init__(f"status {status_code}")
+        self.status_code = status_code
+
+
+class _ModelSequence:
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = []
+
+    def generate_content(self, **kwargs):
+        self.calls.append(kwargs)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def _install_model_sequence(monkeypatch, *outcomes) -> _ModelSequence:
+    models = _ModelSequence(*outcomes)
+    monkeypatch.setattr(
+        GC,
+        "get_client",
+        lambda: type("Client", (), {"models": models})(),
+    )
+    monkeypatch.setattr(GC.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(GC.random, "uniform", lambda lower, _upper: lower)
+    return models
 
 
 def _clip(**overrides) -> dict:
@@ -710,48 +767,11 @@ def test_dispatched_transport_failure_preserves_call_identity(monkeypatch):
 
 
 def test_production_selector_retries_one_503_with_one_reservation(monkeypatch):
-    class TransientHTTPError(RuntimeError):
-        status_code = 503
-
-    class Models:
-        def __init__(self):
-            self.calls = []
-
-        def generate_content(self, **kwargs):
-            self.calls.append(kwargs)
-            if len(self.calls) == 1:
-                raise TransientHTTPError("status 503")
-            return SimpleNamespace(
-                text=json.dumps({
-                    "request_intent": {
-                        "exact_request": "calculus",
-                        "constraints": [{
-                            "constraint_id": "subject",
-                            "kind": "subject",
-                            "source_phrase": "calculus",
-                            "requirement": "Teach calculus",
-                        }],
-                    },
-                    "topics": [],
-                }),
-                candidates=[],
-                usage_metadata=SimpleNamespace(
-                    prompt_token_count=120,
-                    candidates_token_count=10,
-                    thoughts_token_count=0,
-                    total_token_count=130,
-                    cached_content_token_count=0,
-                ),
-            )
-
-    models = Models()
-    monkeypatch.setattr(
-        GC,
-        "get_client",
-        lambda: type("Client", (), {"models": models})(),
+    models = _install_model_sequence(
+        monkeypatch,
+        _HTTPStatusError(503),
+        _empty_selector_response(),
     )
-    monkeypatch.setattr(GC.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(GC.random, "uniform", lambda lower, _upper: lower)
     reservations = []
 
     def reserve(**kwargs):
@@ -773,7 +793,7 @@ def test_production_selector_retries_one_503_with_one_reservation(monkeypatch):
     assert len(reservations) == 1
     assert result.calls[0]["retries"] == 1
     assert result.calls[0]["error_history"] == ({
-        "provider_error_type": "TransientHTTPError",
+        "provider_error_type": "_HTTPStatusError",
         "provider_status_code": 503,
         "retryable": True,
     },)
@@ -781,6 +801,149 @@ def test_production_selector_retries_one_503_with_one_reservation(monkeypatch):
     assert result.calls[0]["reserved_cost_usd"] == 0.25
     assert result.error is None
     assert result.classification_reasons == ["zero_valid_candidates"]
+
+
+def test_production_selector_fails_over_after_two_503s_under_one_reservation(
+    monkeypatch,
+):
+    models = _install_model_sequence(
+        monkeypatch,
+        _HTTPStatusError(503),
+        _HTTPStatusError(503),
+        _empty_selector_response(),
+    )
+    context = GenerationContext("fast", generation_id="selector-failover")
+    reservations = []
+    reconciliations = []
+
+    def reserve(**kwargs):
+        reservations.append(kwargs)
+        return context.reserve_gemini_call(**kwargs)
+
+    def reconcile(**kwargs):
+        reconciliations.append(kwargs)
+        return context.reconcile_gemini_call(**kwargs)
+
+    result = G.run_segment_profile(
+        _transcript(),
+        {
+            "_segment_budget_reserve": reserve,
+            "_segment_budget_reconcile": reconcile,
+        },
+        G.PRODUCTION_FLASH_PROFILE,
+        topic="calculus",
+        deadline_monotonic=time.monotonic() + 10,
+    )
+
+    assert [call["model"] for call in models.calls] == [
+        G.config.SEGMENT_FLASH_MODEL,
+        G.config.SEGMENT_FLASH_MODEL,
+        G.config.SEGMENT_FLASH_FALLBACK_MODEL,
+    ]
+    assert len(reservations) == 1
+    assert len(reconciliations) == 1
+    assert reconciliations[0]["model_used"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
+    call = result.calls[0]
+    assert call["model"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
+    assert call["retries"] == 2
+    assert len(call["error_history"]) == 2
+    assert call["failover_from_model"] == G.config.SEGMENT_FLASH_MODEL
+    assert call["failover_model"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
+    assert call["failover_reason"] == "primary_503_retry_exhausted"
+    assert call["quality_degraded"] is True
+    assert isinstance(call["gemini_reservation_id"], int)
+    assert result.error is None
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["flash_selector_calls"] == 1
+    assert budget["inflight_reserved_cost_usd"] == 0.0
+    assert budget["committed_cost_usd"] == pytest.approx(0.000045)
+
+
+def test_flash_failover_requires_time_and_no_cancellation(monkeypatch):
+    transport_error = type("GeminiTransportError", (RuntimeError,), {})()
+    telemetry = {
+        "provider_status_code": 503,
+        "retryable": True,
+        "retries": 1,
+        "dispatched": True,
+        "error_history": ({
+            "provider_error_type": "ServerError",
+            "provider_status_code": 503,
+            "retryable": True,
+        }, {
+            "provider_error_type": "ServerError",
+            "provider_status_code": 503,
+            "retryable": True,
+        }),
+    }
+    monkeypatch.setattr(G.config, "SEGMENT_FLASH_MODEL", "gemini-3.5-flash")
+    monkeypatch.setattr(G.time, "monotonic", lambda: 100.0)
+    common = {
+        "primary_exception": transport_error,
+        "primary_model": "gemini-3.5-flash",
+        "failover_model": "gemini-3.1-flash-lite",
+        "operation": "flash_boundary_selector",
+    }
+
+    assert G._eligible_flash_failover(
+        telemetry,
+        **common,
+        deadline_monotonic=106.0,
+        cancelled=None,
+    )
+    assert not G._eligible_flash_failover(
+        telemetry,
+        **common,
+        deadline_monotonic=104.999,
+        cancelled=None,
+    )
+    assert not G._eligible_flash_failover(
+        telemetry,
+        **common,
+        deadline_monotonic=106.0,
+        cancelled=lambda: True,
+    )
+    assert not G._eligible_flash_failover(
+        {**telemetry, "provider_status_code": 500},
+        **common,
+        deadline_monotonic=106.0,
+        cancelled=None,
+    )
+    assert not G._eligible_flash_failover(
+        telemetry,
+        **{**common, "failover_model": "gemini-3.1-pro-preview"},
+        deadline_monotonic=106.0,
+        cancelled=None,
+    )
+
+
+def test_production_selector_does_not_retry_failed_lite_failover(monkeypatch):
+    models = _install_model_sequence(
+        monkeypatch,
+        _HTTPStatusError(503),
+        _HTTPStatusError(503),
+        _HTTPStatusError(503),
+    )
+
+    result = G.run_segment_profile(
+        _transcript(),
+        {},
+        G.PRODUCTION_FLASH_PROFILE,
+        topic="calculus",
+        deadline_monotonic=time.monotonic() + 10,
+    )
+
+    assert [call["model"] for call in models.calls] == [
+        G.config.SEGMENT_FLASH_MODEL,
+        G.config.SEGMENT_FLASH_MODEL,
+        G.config.SEGMENT_FLASH_FALLBACK_MODEL,
+    ]
+    call = result.calls[0]
+    assert call["model"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
+    assert call["retries"] == 2
+    assert len(call["error_history"]) == 3
+    assert call["quality_degraded"] is True
+    assert result.error is not None
 
 
 def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
@@ -879,6 +1042,11 @@ def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, ex
         operation,
         expected_model,
         max_retries,
+    )
+    assert captured["failover_model"] == (
+        G.config.SEGMENT_FLASH_FALLBACK_MODEL
+        if profile == G.FLASH_SPLIT_PROFILE
+        else None
     )
 
 
@@ -1287,6 +1455,15 @@ def test_preview_flash_cost_uses_current_input_and_output_rates():
         "candidate_tokens": 100_000,
         "thought_tokens": 50_000,
     }) == pytest.approx(0.95)
+
+
+def test_flash_lite_failover_cost_uses_its_lower_rates():
+    assert G._model_cost({
+        "model": "gemini-3.1-flash-lite",
+        "prompt_tokens": 1_000_000,
+        "candidate_tokens": 100_000,
+        "thought_tokens": 50_000,
+    }) == pytest.approx(0.475)
 
 
 def test_cancelled_worker_never_publishes_late_boundary_or_done_progress(monkeypatch):

@@ -72,6 +72,11 @@ SEGMENT_ROUTING_MODE = (
 SEGMENT_FLASH_MODEL = (
     os.environ.get("SEGMENT_FLASH_MODEL", "").strip() or "gemini-3.5-flash"
 )
+# Used once only when the active Flash selector exhausts its bounded HTTP 503
+# retry. An explicitly empty value disables the emergency failover.
+SEGMENT_FLASH_FALLBACK_MODEL = os.environ.get(
+    "SEGMENT_FLASH_FALLBACK_MODEL", "gemini-3.1-flash-lite",
+).strip()
 # SEGMENT_MODEL was the original Pro-only selector model. Keep it as the
 # highest-precedence migration override so existing deployments do not change models.
 _legacy_segment_model = os.environ.get("SEGMENT_MODEL", "").strip()

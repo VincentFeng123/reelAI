@@ -398,6 +398,35 @@ def test_boundary_repair_usage_is_recorded_in_repair_stage():
     assert usage["counters"]["boundary_repairs"] == 1
 
 
+def test_flash_lite_failover_usage_preserves_attempts_and_degraded_status():
+    context = GenerationContext("fast")
+    settings = {"generation_context": context}
+    run._wire_segment_runtime(settings, "video")
+
+    settings["_segment_telemetry"]({
+        "event": "model_call",
+        "operation": "flash_boundary_selector",
+        "model": "gemini-3.1-flash-lite",
+        "prompt_tokens": 1_000,
+        "candidate_tokens": 100,
+        "thought_tokens": 20,
+        "total_tokens": 1_120,
+        "retries": 2,
+        "quality_degraded": True,
+        "failover_from_model": "gemini-3.5-flash",
+        "failover_model": "gemini-3.1-flash-lite",
+        "failover_reason": "primary_503_retry_exhausted",
+    })
+
+    usage = context.usage()[0]
+    assert usage["attempt"] == 3
+    assert usage["model_used"] == "gemini-3.1-flash-lite"
+    assert usage["quality_degraded"] is True
+    assert usage["metadata"]["failover_from_model"] == "gemini-3.5-flash"
+    assert usage["metadata"]["failover_model"] == "gemini-3.1-flash-lite"
+    assert usage["metadata"]["failover_reason"] == "primary_503_retry_exhausted"
+
+
 def test_shadow_routing_bypasses_segment_cache(monkeypatch):
     transcript = {
         "segments": [{"start": 0.0, "end": 5.0, "text": "hello world"}],

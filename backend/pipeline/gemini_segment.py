@@ -888,6 +888,7 @@ _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
 _PRICING_VERSION = "gemini-standard-2026-07-11"
 _PRICING_PER_MILLION = {
     "flash": {"input": 1.50, "output": 9.00},
+    "flash_lite": {"input": 0.25, "output": 1.50},
     "flash_preview": {"input": 0.50, "output": 3.00},
     "pro": {"input": 2.00, "output": 12.00},
 }
@@ -6768,6 +6769,86 @@ def _acquire_selector_slot(
             return slot
 
 
+def _telemetry_error_history(telemetry: dict) -> tuple[dict, ...]:
+    raw = telemetry.get("error_history")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(dict(item) for item in raw if isinstance(item, dict))
+
+
+def _eligible_flash_failover(
+    telemetry: dict,
+    *,
+    primary_exception: Exception,
+    primary_model: str,
+    failover_model: str | None,
+    operation: str,
+    deadline_monotonic: float,
+    cancelled: CancelledCb,
+) -> bool:
+    primary = str(primary_model or "").strip().casefold()
+    failover = str(failover_model or "").strip().casefold()
+    history = _telemetry_error_history(telemetry)
+    try:
+        retries = int(telemetry.get("retries") or 0)
+    except (TypeError, ValueError, OverflowError):
+        retries = 0
+    return bool(
+        operation == "flash_boundary_selector"
+        and type(primary_exception).__name__ == "GeminiTransportError"
+        and primary == str(config.SEGMENT_FLASH_MODEL).strip().casefold()
+        and primary == "gemini-3.5-flash"
+        and primary != failover
+        and re.fullmatch(r"gemini-3(?:\.\d+)?-flash-lite", failover) is not None
+        and telemetry.get("provider_status_code") == 503
+        and telemetry.get("retryable") is True
+        and telemetry.get("dispatched", True) is not False
+        and retries == 1
+        and len(history) == 2
+        and all(
+            item.get("provider_status_code") == 503
+            and item.get("retryable") is True
+            for item in history
+        )
+        and not _cancel_requested(cancelled)
+        and float(deadline_monotonic) - time.monotonic() >= 5.0
+    )
+
+
+def _merge_failover_telemetry(
+    primary: dict,
+    failover: dict,
+    *,
+    primary_model: str,
+    failover_model: str,
+    started: float,
+) -> dict:
+    merged = dict(failover)
+    try:
+        primary_retries = int(primary.get("retries") or 0)
+    except (TypeError, ValueError, OverflowError):
+        primary_retries = 0
+    try:
+        failover_retries = int(failover.get("retries") or 0)
+    except (TypeError, ValueError, OverflowError):
+        failover_retries = 0
+    merged.update({
+        "model": str(failover.get("model") or failover_model),
+        "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+        "retries": primary_retries + 1 + failover_retries,
+        "error_history": (
+            _telemetry_error_history(primary)
+            + _telemetry_error_history(failover)
+        ),
+        "failover_from_model": str(primary_model),
+        "failover_model": str(failover_model),
+        "failover_reason": "primary_503_retry_exhausted",
+        "quality_degraded": True,
+        "dispatched": True,
+    })
+    return merged
+
+
 def _call_model(
     system: str,
     user: str,
@@ -6784,6 +6865,7 @@ def _call_model(
     budget_reserve: Optional[Callable[..., object]] = None,
     budget_reconcile: Optional[Callable[..., object]] = None,
     max_retries: int = 1,
+    failover_model: str | None = None,
 ) -> tuple[BaseModel, dict]:
     from ..gemini_client import generate_json_v3
 
@@ -6813,23 +6895,75 @@ def _call_model(
             )
             if isinstance(reserved, dict):
                 reservation = dict(reserved)
+        call_started = time.perf_counter()
+        successful_telemetry: dict | None = None
+        failure_telemetry_override: dict | None = None
         try:
-            result = generate_json_v3(
-                system,
-                user,
-                schema,
-                model=model,
-                thinking_level=thinking_level,
-                max_output_tokens=max_output_tokens,
-                timeout_s=timeout_s,
-                deadline_monotonic=deadline_monotonic,
-                operation=operation,
-                prompt_version=prompt_version,
-                max_retries=max_retries,
-                cancelled=cancelled,
-            )
+            try:
+                result = generate_json_v3(
+                    system,
+                    user,
+                    schema,
+                    model=model,
+                    thinking_level=thinking_level,
+                    max_output_tokens=max_output_tokens,
+                    timeout_s=timeout_s,
+                    deadline_monotonic=deadline_monotonic,
+                    operation=operation,
+                    prompt_version=prompt_version,
+                    max_retries=max_retries,
+                    cancelled=cancelled,
+                )
+            except Exception as primary_exc:
+                primary_telemetry = _telemetry_dict(
+                    getattr(primary_exc, "telemetry", None)
+                )
+                if not _eligible_flash_failover(
+                    primary_telemetry,
+                    primary_exception=primary_exc,
+                    primary_model=model,
+                    failover_model=failover_model,
+                    operation=operation,
+                    deadline_monotonic=deadline_monotonic,
+                    cancelled=cancelled,
+                ):
+                    raise
+                try:
+                    result = generate_json_v3(
+                        system,
+                        user,
+                        schema,
+                        model=str(failover_model),
+                        thinking_level=thinking_level,
+                        max_output_tokens=max_output_tokens,
+                        timeout_s=timeout_s,
+                        deadline_monotonic=deadline_monotonic,
+                        operation=operation,
+                        prompt_version=prompt_version,
+                        max_retries=0,
+                        cancelled=cancelled,
+                    )
+                except Exception as failover_exc:
+                    failure_telemetry_override = _merge_failover_telemetry(
+                        primary_telemetry,
+                        _telemetry_dict(getattr(failover_exc, "telemetry", None)),
+                        primary_model=model,
+                        failover_model=str(failover_model),
+                        started=call_started,
+                    )
+                    raise
+                successful_telemetry = _merge_failover_telemetry(
+                    primary_telemetry,
+                    _telemetry_dict(result.telemetry),
+                    primary_model=model,
+                    failover_model=str(failover_model),
+                    started=call_started,
+                )
         except Exception as exc:
-            provider_telemetry = _telemetry_dict(getattr(exc, "telemetry", None))
+            provider_telemetry = (
+                failure_telemetry_override
+                or _telemetry_dict(getattr(exc, "telemetry", None))
+            )
             provider_dispatched = provider_telemetry.get("dispatched", True)
             dispatched = (
                 provider_dispatched
@@ -6861,7 +6995,7 @@ def _call_model(
                 f"{type(exc).__name__}: Gemini model call failed",
                 failure_telemetry,
             ) from exc
-        telemetry = _telemetry_dict(result.telemetry)
+        telemetry = successful_telemetry or _telemetry_dict(result.telemetry)
         for key, value in reservation.items():
             telemetry.setdefault(key, value)
         telemetry.setdefault("dispatched", True)
@@ -6897,7 +7031,9 @@ def _exception_telemetry(exc: Exception) -> dict:
 
 def _model_cost(call: dict) -> float:
     model = str(call.get("model") or "").lower()
-    if "gemini-3-flash" in model and "gemini-3.5-flash" not in model:
+    if "flash-lite" in model:
+        tier = "flash_lite"
+    elif "gemini-3-flash" in model and "gemini-3.5-flash" not in model:
         tier = "flash_preview"
     else:
         tier = "flash" if "flash" in model else "pro"
@@ -7152,6 +7288,11 @@ def _run_selection_profile(
         # selector gets one deadline-aware retry so a brief provider-capacity
         # failure cannot discard an otherwise usable source.
         max_retries=1 if profile == FLASH_SPLIT_PROFILE else 0,
+        failover_model=(
+            config.SEGMENT_FLASH_FALLBACK_MODEL
+            if profile == FLASH_SPLIT_PROFILE
+            else None
+        ),
     )
     require_enrichment = profile in {CORRECTED_PRO_PROFILE, FLASH_SINGLE_PROFILE}
     conversion_settings = dict(settings)

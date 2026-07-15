@@ -885,6 +885,9 @@ class GenerationContext:
             "provider_status_code",
             "retryable",
             "error_history",
+            "failover_from_model",
+            "failover_model",
+            "failover_reason",
         ):
             value = _usage_field(usage, field_name)
             if value is not None:

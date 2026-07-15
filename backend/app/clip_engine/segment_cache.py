@@ -122,6 +122,7 @@ def segment_cache_key(
             _canonical_json(transcript_payload).encode("utf-8")
         ).hexdigest(),
         "flash_model": pipeline_config.SEGMENT_FLASH_MODEL,
+        "flash_fallback_model": pipeline_config.SEGMENT_FLASH_FALLBACK_MODEL,
         "segmenter_source_sha256": _segmenter_source_signature(),
         "settings": _relevant_settings(settings),
     }

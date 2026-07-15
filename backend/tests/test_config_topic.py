@@ -28,6 +28,7 @@ def test_authoring_model_is_flash_topic_model_is_pro():
 def test_segment_router_defaults_to_flash_first_with_pro_fallback():
     assert config.SEGMENT_ROUTING_MODE == "hybrid"
     assert config.SEGMENT_FLASH_MODEL == "gemini-3.5-flash"
+    assert config.SEGMENT_FLASH_FALLBACK_MODEL == "gemini-3.1-flash-lite"
     assert config.SEGMENT_PRO_MODEL == "gemini-3.1-pro-preview"
     assert config.SEGMENT_MODEL == config.SEGMENT_PRO_MODEL
     assert config.SEGMENT_HYBRID_PERCENT == 100.0
@@ -35,8 +36,9 @@ def test_segment_router_defaults_to_flash_first_with_pro_fallback():
 
 def _reload_segment_config(monkeypatch, **values):
     keys = {
-        "SEGMENT_ROUTING_MODE", "SEGMENT_FLASH_MODEL", "SEGMENT_PRO_MODEL",
-        "SEGMENT_MODEL", "SEGMENT_HYBRID_PERCENT",
+        "SEGMENT_ROUTING_MODE", "SEGMENT_FLASH_MODEL",
+        "SEGMENT_FLASH_FALLBACK_MODEL", "SEGMENT_PRO_MODEL", "SEGMENT_MODEL",
+        "SEGMENT_HYBRID_PERCENT",
     }
     with monkeypatch.context() as patch:
         patch.setattr(dotenv, "load_dotenv", lambda *args, **kwargs: False)
@@ -48,6 +50,7 @@ def _reload_segment_config(monkeypatch, **values):
         result = {
             "mode": loaded.SEGMENT_ROUTING_MODE,
             "flash": loaded.SEGMENT_FLASH_MODEL,
+            "flash_fallback": loaded.SEGMENT_FLASH_FALLBACK_MODEL,
             "pro": loaded.SEGMENT_PRO_MODEL,
             "legacy": loaded.SEGMENT_MODEL,
             "percent": loaded.SEGMENT_HYBRID_PERCENT,
@@ -66,6 +69,7 @@ def test_segment_router_rejects_invalid_values_and_clamps_percent(monkeypatch):
     assert invalid == {
         "mode": "pro_only",
         "flash": "gemini-3.5-flash",
+        "flash_fallback": "gemini-3.1-flash-lite",
         "pro": "gemini-3.1-pro-preview",
         "legacy": "gemini-3.1-pro-preview",
         "percent": 0.0,
@@ -90,3 +94,14 @@ def test_legacy_pro_override_wins_then_explicit_pro_model_is_fallback(monkeypatc
         monkeypatch, SEGMENT_PRO_MODEL="gemini-3.1-pro-explicit",
     )
     assert explicit["pro"] == explicit["legacy"] == "gemini-3.1-pro-explicit"
+
+
+def test_segment_flash_failover_model_is_configurable_and_can_be_disabled(monkeypatch):
+    assert _reload_segment_config(
+        monkeypatch,
+        SEGMENT_FLASH_FALLBACK_MODEL="gemini-3.2-flash-lite",
+    )["flash_fallback"] == "gemini-3.2-flash-lite"
+    assert _reload_segment_config(
+        monkeypatch,
+        SEGMENT_FLASH_FALLBACK_MODEL="",
+    )["flash_fallback"] == ""

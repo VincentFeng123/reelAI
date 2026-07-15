@@ -763,6 +763,7 @@ def test_production_flash_selector_allows_one_bounded_transport_retry(monkeypatc
     assert len(dispatched) == 1
     assert dispatched[0]["operation"] == "flash_boundary_selector"
     assert dispatched[0]["max_retries"] == 1
+    assert dispatched[0]["failover_model"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
 
 
 def test_production_flash_has_no_requested_duration_contract():
