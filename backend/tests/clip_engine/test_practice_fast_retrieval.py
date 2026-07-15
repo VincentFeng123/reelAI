@@ -1384,26 +1384,26 @@ def test_analysis_prefix_does_not_promote_a_distant_channel_result():
     assert [video["id"] for video in selected[:2]] == ["ranked-0", "ranked-1"]
 
 
-def test_analysis_prefix_defers_multi_hour_courses_when_focused_sources_exist():
+def test_analysis_prefix_prefers_known_short_calculus_sources():
     ranked = [
         {
-            "id": "full-course",
+            "id": "four-minute-overview",
             "channel": "Open College",
-            "duration": 42_828,
+            "duration": 4 * 60,
             "literal_match": False,
             "matched_families": ["calculus"],
         },
         {
-            "id": "focused-limits",
-            "channel": "Open College",
-            "duration": 5_246,
+            "id": "thirty-six-minute-lesson",
+            "channel": "Calculus Classroom",
+            "duration": 36 * 60,
             "literal_match": False,
             "matched_families": ["limits"],
         },
         {
-            "id": "focused-derivatives",
+            "id": "five-minute-derivatives",
             "channel": "Math Lessons",
-            "duration": 2_400,
+            "duration": 5 * 60,
             "literal_match": False,
             "matched_families": ["derivatives"],
         },
@@ -1417,10 +1417,64 @@ def test_analysis_prefix_defers_multi_hour_courses_when_focused_sources_exist():
     )
 
     assert [video["id"] for video in selected] == [
-        "focused-limits",
-        "focused-derivatives",
-        "full-course",
+        "four-minute-overview",
+        "five-minute-derivatives",
+        "thirty-six-minute-lesson",
     ]
+
+
+def test_analysis_prefix_prefers_short_sources_when_every_match_is_literal():
+    ranked = [
+        {
+            "id": "literal-full-course",
+            "duration": 4 * 60 * 60,
+            "literal_match": True,
+        },
+        {
+            "id": "literal-five-minute-overview",
+            "duration": 5 * 60,
+            "literal_match": True,
+        },
+        {
+            "id": "literal-eight-minute-lesson",
+            "duration": 8 * 60,
+            "literal_match": True,
+        },
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=3,
+        excluded=set(),
+        analysis_prefix=2,
+    )
+
+    assert [video["id"] for video in selected] == [
+        "literal-five-minute-overview",
+        "literal-eight-minute-lesson",
+        "literal-full-course",
+    ]
+
+
+def test_analysis_prefix_does_not_promote_distant_short_results():
+    ranked = [
+        {
+            "id": f"ranked-{index}",
+            "duration": duration,
+            "literal_match": False,
+            "matched_families": [f"facet-{index}"],
+        }
+        for index, duration in enumerate((1_900, 2_100, 2_700, 3_300, 120, 180))
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=6,
+        excluded=set(),
+        analysis_prefix=2,
+    )
+
+    assert [video["id"] for video in selected[:2]] == ["ranked-0", "ranked-1"]
 
 
 def test_multi_hour_source_remains_available_without_enough_focused_sources():
@@ -1433,7 +1487,7 @@ def test_multi_hour_source_remains_available_without_enough_focused_sources():
         },
         {
             "id": "focused-limits",
-            "duration": 5_246,
+            "duration": 5 * 60,
             "literal_match": False,
             "matched_families": ["limits"],
         },
@@ -1452,6 +1506,72 @@ def test_multi_hour_source_remains_available_without_enough_focused_sources():
     ]
 
 
+def test_unknown_duration_is_deferred_when_known_short_sources_fill_prefix():
+    ranked = [
+        {
+            "id": "unknown-duration",
+            "channel": "Unknown Channel",
+            "literal_match": False,
+            "matched_families": ["calculus"],
+        },
+        {
+            "id": "focused-limits",
+            "channel": "Limits Lab",
+            "duration": 6 * 60,
+            "literal_match": False,
+            "matched_families": ["limits"],
+        },
+        {
+            "id": "focused-derivatives",
+            "channel": "Derivative Desk",
+            "duration": 8 * 60,
+            "literal_match": False,
+            "matched_families": ["derivatives"],
+        },
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=3,
+        excluded=set(),
+        analysis_prefix=2,
+    )
+
+    assert [video["id"] for video in selected] == [
+        "focused-limits",
+        "focused-derivatives",
+        "unknown-duration",
+    ]
+
+
+def test_unknown_duration_remains_available_without_enough_known_short_sources():
+    ranked = [
+        {
+            "id": "unknown-duration",
+            "literal_match": False,
+            "matched_families": ["calculus"],
+        },
+        {
+            "id": "focused-limits",
+            "duration": 6 * 60,
+            "literal_match": False,
+            "matched_families": ["limits"],
+        },
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=2,
+        excluded=set(),
+        analysis_prefix=2,
+    )
+
+    assert [video["id"] for video in selected] == [
+        "unknown-duration",
+        "focused-limits",
+    ]
+
+
 def test_multi_hour_source_remains_in_oversampled_discovery_pool():
     ranked = [
         {
@@ -1463,7 +1583,7 @@ def test_multi_hour_source_remains_in_oversampled_discovery_pool():
         *[
             {
                 "id": f"focused-{index}",
-                "duration": 1_800 + index,
+                "duration": 5 * 60 + index,
                 "literal_match": False,
                 "matched_families": [f"facet-{index}"],
             }

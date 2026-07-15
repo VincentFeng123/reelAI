@@ -843,7 +843,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertEqual(len(feed), 2)
         self.assertTrue(all(
-            reel.get("selection_contract_version") == "quality_silence_v17"
+            reel.get("selection_contract_version") == "quality_silence_v18"
             for reel in feed
         ))
 

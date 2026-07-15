@@ -42,7 +42,7 @@ _LONG_TOPIC_RELATION = re.compile(
     r"\b(?:work together|interact|combine|to maintain|to preserve|to pass|across)\b",
     re.IGNORECASE,
 )
-_FOCUSED_ANALYSIS_SOURCE_MAX_SEC = 2 * 60 * 60
+_FOCUSED_ANALYSIS_SOURCE_MAX_SEC = 30 * 60
 
 
 def _difficulty_bootstrap_query(topic: str, level: str | None) -> str:
@@ -167,16 +167,21 @@ def _select_ranked_candidates(
         max(0, int(limit)),
         max(1, int(analysis_prefix if analysis_prefix is not None else limit)),
     )
+    # Speed is a preference within a credible relevance band, not permission
+    # to promote arbitrarily weak short results over the top-ranked sources.
+    focus_window = eligible[:max(prefix_limit, prefix_limit * 2)]
     focused = []
-    for video in eligible:
+    for video in focus_window:
         try:
             duration = float(video.get("duration") or 0.0)
         except (TypeError, ValueError, OverflowError):
             duration = 0.0
-        if 0.0 < duration <= _FOCUSED_ANALYSIS_SOURCE_MAX_SEC or duration <= 0.0:
+        if 0.0 < duration <= _FOCUSED_ANALYSIS_SOURCE_MAX_SEC:
             focused.append(video)
     analysis_pool = focused if len(focused) >= prefix_limit else eligible
-    if limit <= 1 or (len(eligible) <= limit and prefix_limit >= limit):
+    if limit <= 1:
+        return analysis_pool[:limit]
+    if len(eligible) <= limit and prefix_limit >= limit:
         return eligible[:limit]
 
     non_literal = [
@@ -185,7 +190,14 @@ def _select_ranked_candidates(
         if not video.get("literal_match")
     ]
     if not non_literal:
-        return eligible[:limit]
+        selected = list(analysis_pool[:prefix_limit])
+        selected_ids = {str(video.get("id") or "") for video in selected}
+        for video in eligible:
+            if len(selected) >= limit:
+                break
+            if str(video.get("id") or "") not in selected_ids:
+                selected.append(video)
+        return selected[:limit]
 
     reserve = min(2, max(1, prefix_limit // 3))
     selected = analysis_pool[: max(0, prefix_limit - reserve)]

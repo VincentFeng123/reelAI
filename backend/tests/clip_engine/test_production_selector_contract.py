@@ -1285,6 +1285,47 @@ def test_same_cue_leading_welcome_is_trimmed_from_model_start_quote() -> None:
     assert "Welcome" not in clip["_clip_text"]
 
 
+def test_same_cue_leading_example_frame_is_trimmed_without_losing_internal_example() -> None:
+    text = (
+        "Here is another quick example. Chlorophyll absorbs blue and red light for "
+        "photosynthesis. For example, accessory pigments can transfer captured energy "
+        "to chlorophyll."
+    )
+    proposal = _proposal().model_copy(update={
+        "start_quote": "Here is another quick example Chlorophyll absorbs blue",
+        "end_quote": "transfer captured energy to chlorophyll",
+        "topic_evidence_quote": (
+            "Chlorophyll absorbs blue and red light for photosynthesis"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "cue-0", "start": 0.0, "end": 18.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_quote"] == "Chlorophyll absorbs blue and red light"
+    assert clip["edge_projection"]["start"] == {
+        "required": True,
+        "cue_id": "cue-0",
+        "quote": "Chlorophyll absorbs blue and red light",
+    }
+    assert clip["_clip_text"].startswith("Chlorophyll absorbs")
+    assert "For example, accessory pigments" in clip["_clip_text"]
+    assert "another quick example" not in clip["_clip_text"]
+
+
+def test_leading_example_frame_does_not_hide_an_unresolved_setup_reference() -> None:
+    text = "Here is another example. If we apply it here, we get the answer."
+
+    assert gemini_segment._leading_example_framing_quote(text) == ""
+
+
 def test_trailing_preview_repair_fails_closed_on_incomplete_teaching_prefix() -> None:
     text = "Cells use chlorophyll because. But we'll talk more about that next time."
     proposal = _proposal().model_copy(update={
@@ -1900,7 +1941,9 @@ def test_demonstrative_calculus_opening_expands_to_its_cold_viewer_setup() -> No
 
     assert report.rejected_reasons == []
     assert report.clips[0]["cue_ids"][0] == "calculus-context:0"
-    assert report.clips[0]["_clip_text"].startswith("Here is another quick example")
+    assert report.clips[0]["start_quote"].startswith("If I want")
+    assert report.clips[0]["_clip_text"].startswith("If I want")
+    assert "Here is another quick example" not in report.clips[0]["_clip_text"]
 
 
 def test_complete_answer_trims_a_dangling_final_phrase_instead_of_rejecting() -> None:

@@ -498,6 +498,19 @@ _OPENING_TOPIC_ANNOUNCEMENT_PREFIX_RE = re.compile(
     r"(?:to\s+you\s+)?about\s+is\s+",
     re.IGNORECASE,
 )
+_OPENING_EXAMPLE_FRAMING_SENTENCE_RE = re.compile(
+    r"^\s*(?:"
+    r"here(?:['’]s|\s+is)\s+|"
+    r"let(?:['’]?s|\s+us)\s+(?:consider|look\s+at|try|walk\s+through|"
+    r"work\s+through)\s+|"
+    r"(?:now\s*[,;:]?\s+)?(?:consider|try)\s+"
+    r")"
+    r"(?:(?:an?|(?:yet\s+)?another|one\s+more|the\s+(?:following|next)|"
+    r"a\s+(?:new|second))\s+)"
+    r"(?:(?:brief|concrete|quick|short|simple|worked)\s+)*"
+    r"(?:case|example|problem)(?:\s+(?:for\s+us|here|now))?\s*[.!?]+\s*$",
+    re.IGNORECASE,
+)
 _OPENING_EDGE_META_SENTENCE_RE = re.compile(
     r"^\s*before\s+(?:i|we)\s+(?:continue|go\s+on|move\s+forward)\b"
     r"[^.!?]*[.!?]",
@@ -535,6 +548,11 @@ _OPENING_COMPARATIVE_LEADIN_RE = re.compile(
 )
 _OPENING_RECOVERABLE_SETUP_RE = re.compile(
     r"^\s*(?:if|suppose|assume|assuming|given|consider)\b",
+    re.IGNORECASE,
+)
+_OPENING_SETUP_BACK_REFERENCE_RE = re.compile(
+    r"\b(?:it|this|that|these|those|they|here|there|again|above|earlier|"
+    r"previous|same)\b",
     re.IGNORECASE,
 )
 _NON_STANDALONE_MARKER_SUFFIX_RE = re.compile(
@@ -2553,6 +2571,10 @@ def _expanded_context_edge_quote(
 ) -> tuple[str, str | None]:
     """Choose an exact edge quote after safely removable filler-only sentences."""
     raw_text = str(text or "")
+    if want == "start":
+        example_replacement = _leading_example_framing_quote(raw_text)
+        if example_replacement:
+            return example_replacement, None
     sentence_spans = _sentence_character_spans(raw_text)
     if not sentence_spans:
         return "", "empty_expanded_context_edge"
@@ -2721,6 +2743,19 @@ def _replace_structural_edge_quote(
 
     if want == "start":
         selected_tail = text[quote_span[0]:]
+        example_replacement = _leading_example_framing_quote(selected_tail)
+        if example_replacement:
+            replacement_span, projected, replacement_error = _semantic_edge_quote(
+                text,
+                example_replacement,
+                want="start",
+            )
+            if (
+                replacement_error is None
+                and replacement_span is not None
+                and projected
+            ):
+                return example_replacement, True, None
         removable_prefixes = (
             _OPENING_TOPIC_ANNOUNCEMENT_PREFIX_RE.match(selected_tail),
             _OPENING_DEPENDENT_LEADIN_RE.match(selected_tail),
@@ -2834,6 +2869,32 @@ def _opening_clause_is_standalone(text: str) -> bool:
     ):
         return True
     return not _cue_opens_mid_thought(opening_clause, ignore_caption_case=True)
+
+
+def _leading_example_framing_quote(text: str) -> str:
+    """Skip a sentence-only example label when teaching starts in the same cue."""
+    raw_text = str(text or "")
+    sentence_spans = _sentence_character_spans(raw_text)
+    if len(sentence_spans) < 2:
+        return ""
+    first_left, first_right = sentence_spans[0]
+    if not _OPENING_EXAMPLE_FRAMING_SENTENCE_RE.fullmatch(
+        raw_text[first_left:first_right]
+    ):
+        return ""
+    retained = raw_text[first_right:].lstrip()
+    if len(_toks(retained)) < 4:
+        return ""
+    complete_setup = bool(
+        _OPENING_RECOVERABLE_SETUP_RE.match(retained)
+        and len(_toks(retained)) >= 5
+        and not _OPENING_SETUP_BACK_REFERENCE_RE.search(
+            retained[:_sentence_character_spans(retained)[0][1]]
+        )
+    )
+    if not (_opening_clause_is_standalone(retained) or complete_setup):
+        return ""
+    return _exact_boundary_quote(retained, want="start")
 
 
 def _projected_start_is_standalone(
