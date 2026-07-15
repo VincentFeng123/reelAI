@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import math
 import random
-import re
 import threading
 import time
 from collections.abc import Mapping
@@ -191,7 +190,7 @@ def _call_telemetry(*, model: str, operation: str, prompt_version: str,
 
 
 def _gemini_status_code(error: Exception) -> int | None:
-    """Extract an HTTP status without relying on provider error prose."""
+    """Extract a typed HTTP status without relying on provider error prose."""
     response = getattr(error, "response", None)
     for raw_status in (
         getattr(error, "status_code", None),
@@ -203,16 +202,7 @@ def _gemini_status_code(error: Exception) -> int | None:
             return int(status)
         except (TypeError, ValueError):
             continue
-
-    message = str(error)
-    match = re.match(r"\s*(\d{3})\b", message)
-    if match is None:
-        match = re.search(
-            r"\b(?:http(?:\s+status)?|status|code)\s*[:=]?\s*(\d{3})\b",
-            message,
-            re.IGNORECASE,
-        )
-    return int(match.group(1)) if match is not None else None
+    return None
 
 
 def _transient_gemini_error(error: Exception) -> bool:
@@ -355,16 +345,19 @@ def generate_json_v3(
     operation: str,
     prompt_version: str,
     max_retries: int = 1,
+    retry_status_codes: frozenset[int] | set[int] | None = None,
     cancelled=None,
     media_resolution=None,
 ) -> GenerationResult:
     """Run one Gemini 3 structured call with bounded transport behavior.
 
     SDK retries are disabled so ``max_retries`` is the application-controlled
-    retry ceiling. A second retry is permitted only after an HTTP 503;
-    non-503 failures remain capped at one retry. ``deadline_monotonic`` is an
-    absolute ``time.monotonic()`` deadline shared by the caller's complete
-    workflow. Cancellation is cooperative between in-flight HTTP requests.
+    retry ceiling. ``retry_status_codes`` optionally narrows typed HTTP retries
+    for latency-sensitive callers; the default preserves the general transient
+    policy. A second retry is permitted only after an HTTP 503; non-503 failures
+    remain capped at one retry. ``deadline_monotonic`` is an absolute
+    ``time.monotonic()`` deadline shared by the caller's complete workflow.
+    Cancellation is cooperative between in-flight HTTP requests.
     """
     mdl = str(model or "").strip()
     level = str(thinking_level or "").strip().lower()
@@ -381,6 +374,21 @@ def generate_json_v3(
     if (isinstance(max_retries, bool) or not isinstance(max_retries, int)
             or max_retries not in (0, 1, 2)):
         raise ValueError("max_retries must be 0, 1, or 2")
+    if retry_status_codes is None:
+        allowed_retry_statuses = None
+    elif (
+        not isinstance(retry_status_codes, (set, frozenset))
+        or not retry_status_codes
+        or any(
+            isinstance(status, bool)
+            or not isinstance(status, int)
+            or status not in _TRANSIENT_STATUS_CODES
+            for status in retry_status_codes
+        )
+    ):
+        raise ValueError("retry_status_codes must contain transient HTTP statuses")
+    else:
+        allowed_retry_statuses = frozenset(retry_status_codes)
 
     started = time.perf_counter()
     operation_deadline = (
@@ -463,11 +471,18 @@ def generate_json_v3(
             # The production selector may request one extra attempt for a
             # short-lived Gemini capacity spike. Other transient failures keep
             # the original one-retry ceiling so quota and latency cannot grow.
-            retry_limit = (
-                max_retries
-                if _gemini_status_code(error) == 503
-                else min(max_retries, 1)
-            )
+            status_code = _gemini_status_code(error)
+            if (
+                allowed_retry_statuses is not None
+                and status_code not in allowed_retry_statuses
+            ):
+                retry_limit = 0
+            else:
+                retry_limit = (
+                    max_retries
+                    if status_code == 503
+                    else min(max_retries, 1)
+                )
             if not retryable or attempt >= retry_limit:
                 raise GeminiTransportError(str(error), telemetry) from error
 

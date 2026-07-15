@@ -202,6 +202,69 @@ def test_gemini3_retries_one_transient_error_with_short_jitter(
                for call in fake.models.calls)
 
 
+def test_gemini3_retry_status_policy_still_retries_allowed_503(monkeypatch):
+    fake = _FakeClient(_HTTPError(503), _FakeResponse())
+    monkeypatch.setattr(gc.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(gc.random, "uniform", lambda lower, _upper: lower)
+
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        max_retries=1,
+        retry_status_codes=frozenset({503}),
+    )
+
+    assert len(fake.models.calls) == 2
+    assert result.telemetry.retries == 1
+
+
+@pytest.mark.parametrize("status_code", [408, 429, 500, 502, 504])
+def test_gemini3_retry_status_policy_declines_other_transient_statuses(
+    monkeypatch,
+    status_code,
+):
+    fake = _FakeClient(_HTTPError(status_code), _FakeResponse())
+
+    with pytest.raises(gc.GeminiTransportError) as caught:
+        _call_v3(
+            monkeypatch,
+            fake,
+            max_retries=1,
+            retry_status_codes=frozenset({503}),
+        )
+
+    assert len(fake.models.calls) == 1
+    assert caught.value.telemetry.retryable is True
+    assert caught.value.telemetry.provider_status_code == status_code
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("status 503"),
+        RuntimeError("HTTP status 504"),
+        _RemoteProtocolError("unexpected EOF"),
+    ],
+)
+def test_gemini3_retry_status_policy_declines_statusless_failures(
+    monkeypatch,
+    error,
+):
+    fake = _FakeClient(error, _FakeResponse())
+
+    with pytest.raises(gc.GeminiTransportError) as caught:
+        _call_v3(
+            monkeypatch,
+            fake,
+            max_retries=1,
+            retry_status_codes=frozenset({503}),
+        )
+
+    assert len(fake.models.calls) == 1
+    assert caught.value.telemetry.retryable is True
+    assert caught.value.telemetry.provider_status_code is None
+
+
 def test_gemini3_honors_retry_after_over_jitter(monkeypatch):
     fake = _FakeClient(_HTTPError(429, retry_after="2.5"), _FakeResponse())
     sleeps = []
@@ -729,5 +792,23 @@ def test_dedicated_gemini3_api_rejects_invalid_retry_counts(monkeypatch, max_ret
             thinking_level="medium", max_output_tokens=100, timeout_s=45,
             deadline_monotonic=None, operation="op", prompt_version="v1",
             max_retries=max_retries,
+        )
+    assert fake.models.calls == []
+
+
+@pytest.mark.parametrize(
+    "retry_status_codes",
+    [set(), {400}, {True}, [503]],
+)
+def test_dedicated_gemini3_api_rejects_invalid_retry_status_policies(
+    monkeypatch,
+    retry_status_codes,
+):
+    fake = _FakeClient(_FakeResponse())
+    with pytest.raises(ValueError, match="retry_status_codes"):
+        _call_v3(
+            monkeypatch,
+            fake,
+            retry_status_codes=retry_status_codes,
         )
     assert fake.models.calls == []

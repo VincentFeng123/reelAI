@@ -862,7 +862,7 @@ SEGMENT_PROFILES = (
 
 _TOTAL_DEADLINE_S = 36.0
 _FLASH_SINGLE_TIMEOUT_S = 45.0
-_FLASH_BOUNDARY_TIMEOUT_S = 28.0
+_FLASH_BOUNDARY_TIMEOUT_S = 20.0
 _FLASH_REPAIR_TIMEOUT_S = 20.0
 _FLASH_ENRICH_TIMEOUT_S = 25.0
 _PRO_TIMEOUT_S = 90.0
@@ -6776,7 +6776,7 @@ def _telemetry_error_history(telemetry: dict) -> tuple[dict, ...]:
     return tuple(dict(item) for item in raw if isinstance(item, dict))
 
 
-def _eligible_flash_failover(
+def _flash_failover_reason(
     telemetry: dict,
     *,
     primary_exception: Exception,
@@ -6785,34 +6785,52 @@ def _eligible_flash_failover(
     operation: str,
     deadline_monotonic: float,
     cancelled: CancelledCb,
-) -> bool:
+) -> str | None:
     primary = str(primary_model or "").strip().casefold()
     failover = str(failover_model or "").strip().casefold()
+    primary_leaf = primary.rsplit("/", 1)[-1]
+    failover_leaf = failover.rsplit("/", 1)[-1]
+    configured_primary_leaf = (
+        str(config.SEGMENT_FLASH_MODEL).strip().casefold().rsplit("/", 1)[-1]
+    )
     history = _telemetry_error_history(telemetry)
     try:
         retries = int(telemetry.get("retries") or 0)
     except (TypeError, ValueError, OverflowError):
         retries = 0
-    return bool(
+    if not (
         operation == "flash_boundary_selector"
         and type(primary_exception).__name__ == "GeminiTransportError"
-        and primary == str(config.SEGMENT_FLASH_MODEL).strip().casefold()
-        and primary == "gemini-3.5-flash"
-        and primary != failover
-        and re.fullmatch(r"gemini-3(?:\.\d+)?-flash-lite", failover) is not None
-        and telemetry.get("provider_status_code") == 503
+        and primary_leaf == configured_primary_leaf
+        and primary_leaf == "gemini-3.5-flash"
+        and primary_leaf != failover_leaf
+        and re.fullmatch(
+            r"gemini-3(?:\.\d+)?-flash-lite", failover_leaf
+        ) is not None
         and telemetry.get("retryable") is True
         and telemetry.get("dispatched", True) is not False
-        and retries == 1
-        and len(history) == 2
-        and all(
-            item.get("provider_status_code") == 503
-            and item.get("retryable") is True
-            for item in history
-        )
         and not _cancel_requested(cancelled)
         and float(deadline_monotonic) - time.monotonic() >= 5.0
-    )
+    ):
+        return None
+    statuses = tuple(item.get("provider_status_code") for item in history)
+    if (
+        retries == 0
+        and statuses in {(500,), (502,), (504,)}
+        and telemetry.get("provider_status_code") == statuses[-1]
+        and history[0].get("retryable") is True
+    ):
+        return "primary_transient_5xx_failover"
+    if (
+        retries == 1
+        and len(statuses) == 2
+        and statuses[0] == 503
+        and statuses[1] in {500, 502, 503, 504}
+        and telemetry.get("provider_status_code") == statuses[-1]
+        and all(item.get("retryable") is True for item in history)
+    ):
+        return "primary_503_retry_exhausted"
+    return None
 
 
 def _merge_failover_telemetry(
@@ -6821,6 +6839,7 @@ def _merge_failover_telemetry(
     *,
     primary_model: str,
     failover_model: str,
+    failover_reason: str,
     started: float,
 ) -> dict:
     merged = dict(failover)
@@ -6842,7 +6861,7 @@ def _merge_failover_telemetry(
         ),
         "failover_from_model": str(primary_model),
         "failover_model": str(failover_model),
-        "failover_reason": "primary_503_retry_exhausted",
+        "failover_reason": failover_reason,
         "quality_degraded": True,
         "dispatched": True,
     })
@@ -6865,6 +6884,7 @@ def _call_model(
     budget_reserve: Optional[Callable[..., object]] = None,
     budget_reconcile: Optional[Callable[..., object]] = None,
     max_retries: int = 1,
+    retry_status_codes: frozenset[int] | set[int] | None = None,
     failover_model: str | None = None,
 ) -> tuple[BaseModel, dict]:
     from ..gemini_client import generate_json_v3
@@ -6912,13 +6932,14 @@ def _call_model(
                     operation=operation,
                     prompt_version=prompt_version,
                     max_retries=max_retries,
+                    retry_status_codes=retry_status_codes,
                     cancelled=cancelled,
                 )
             except Exception as primary_exc:
                 primary_telemetry = _telemetry_dict(
                     getattr(primary_exc, "telemetry", None)
                 )
-                if not _eligible_flash_failover(
+                failover_reason = _flash_failover_reason(
                     primary_telemetry,
                     primary_exception=primary_exc,
                     primary_model=model,
@@ -6926,7 +6947,8 @@ def _call_model(
                     operation=operation,
                     deadline_monotonic=deadline_monotonic,
                     cancelled=cancelled,
-                ):
+                )
+                if failover_reason is None:
                     raise
                 try:
                     result = generate_json_v3(
@@ -6949,6 +6971,7 @@ def _call_model(
                         _telemetry_dict(getattr(failover_exc, "telemetry", None)),
                         primary_model=model,
                         failover_model=str(failover_model),
+                        failover_reason=failover_reason,
                         started=call_started,
                     )
                     raise
@@ -6957,6 +6980,7 @@ def _call_model(
                     _telemetry_dict(result.telemetry),
                     primary_model=model,
                     failover_model=str(failover_model),
+                    failover_reason=failover_reason,
                     started=call_started,
                 )
         except Exception as exc:
@@ -7288,6 +7312,9 @@ def _run_selection_profile(
         # selector gets one deadline-aware retry so a brief provider-capacity
         # failure cannot discard an otherwise usable source.
         max_retries=1 if profile == FLASH_SPLIT_PROFILE else 0,
+        retry_status_codes=(
+            frozenset({503}) if profile == FLASH_SPLIT_PROFILE else None
+        ),
         failover_model=(
             config.SEGMENT_FLASH_FALLBACK_MODEL
             if profile == FLASH_SPLIT_PROFILE
