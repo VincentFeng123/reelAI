@@ -2507,6 +2507,54 @@ def test_exact_live_rolling_chain_rule_clip_recovers_the_complete_thought() -> N
     assert "differentials" not in worked_text
     assert "fraction" not in worked_text
 
+    line_by_cue_id = {
+        str(cue_id): line
+        for line, (cue_id, _start, _end, _text) in enumerate(raw_cues)
+    }
+    split_restatement_proposal = _proposal(
+        candidate_id="live-chain-rule-split-restatement",
+        start_line=line_by_cue_id["38"],
+        end_line=line_by_cue_id["86"],
+        start_quote="if i were to ask you what is the derivative",
+        end_quote="so there we've applied the chain rule it",
+        evidence="so there we've applied the chain rule",
+        objective="Apply the chain rule to differentiate sine squared of x",
+    )
+    split_restatement_report = _report(
+        segments,
+        split_restatement_proposal,
+        topic="chain rule worked example",
+    )
+
+    assert split_restatement_report.rejected_reasons == []
+    [split_restatement_clip] = split_restatement_report.clips
+    assert split_restatement_clip["cue_ids"][-1] == "YNstP0ESndU:cue:92"
+    assert split_restatement_clip["_clip_text"].endswith("with respect to x")
+    assert "so let me make it clear" not in split_restatement_clip["_clip_text"]
+
+
+def test_pronoun_tail_continuation_is_question_and_agreement_aware() -> None:
+    assert gemini_segment._cue_has_explicit_dangling_end(
+        "so there we've applied the chain rule it",
+        "was the derivative of the outer function",
+    )
+    assert gemini_segment._cue_has_explicit_dangling_end(
+        "the explanation says I",
+        "am applying the chain rule",
+    )
+    assert not gemini_segment._cue_has_explicit_dangling_end(
+        "The chain rule derivation verifies it.",
+        "Was a second example needed?",
+    )
+    assert not gemini_segment._cue_has_explicit_dangling_end(
+        "The chain rule derivation verifies it",
+        "Was a second example needed?",
+    )
+    assert not gemini_segment._cue_has_explicit_dangling_end(
+        "The caption ends with we",
+        "is a different lesson",
+    )
+
 
 def test_live_coarse_captions_isolate_sine_six_x_worked_unit() -> None:
     segments = [

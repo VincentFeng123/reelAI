@@ -344,6 +344,10 @@ _TERMINAL_INCOMPLETE_SUBJECT_RE = re.compile(
     r"[.!?]?\s*$",
     re.IGNORECASE,
 )
+_TERMINAL_UNPUNCTUATED_SUBJECT_PRONOUN_RE = re.compile(
+    r"\b(?P<pronoun>i|we|you|he|she|it|they|this|that)\s*$",
+    re.IGNORECASE,
+)
 _TERMINAL_BARE_SUBJECT_RE = re.compile(
     r"\b(?:and|as|because|but|if|or|since|so|that|though|unless|until|when|"
     r"where|which|while|who)"
@@ -639,6 +643,25 @@ _NOMINAL_PREDICATE_CONTINUATION_RE = re.compile(
     r"might|must|does|do|did)\b",
     re.IGNORECASE,
 )
+_PRONOUN_PREDICATE_CONTINUATION_RE = re.compile(
+    r"^\s*(?P<auxiliary>am|is|are|was|were|has|have|had|can|could|will|"
+    r"would|should|shall|may|might|must|does|do|did)\b",
+    re.IGNORECASE,
+)
+_MODAL_AUXILIARIES = frozenset({
+    "can", "could", "may", "might", "must", "shall", "should", "will", "would",
+})
+_SUBJECT_PRONOUN_AUXILIARIES = {
+    "i": _MODAL_AUXILIARIES | {"am", "was", "have", "had", "do", "did"},
+    "we": _MODAL_AUXILIARIES | {"are", "were", "have", "had", "do", "did"},
+    "you": _MODAL_AUXILIARIES | {"are", "were", "have", "had", "do", "did"},
+    "they": _MODAL_AUXILIARIES | {"are", "were", "have", "had", "do", "did"},
+    "he": _MODAL_AUXILIARIES | {"is", "was", "has", "had", "does", "did"},
+    "she": _MODAL_AUXILIARIES | {"is", "was", "has", "had", "does", "did"},
+    "it": _MODAL_AUXILIARIES | {"is", "was", "has", "had", "does", "did"},
+    "this": _MODAL_AUXILIARIES | {"is", "was", "has", "had", "does", "did"},
+    "that": _MODAL_AUXILIARIES | {"is", "was", "has", "had", "does", "did"},
+}
 _OPENING_DEPENDENT_LEADIN_RE = re.compile(
     r"^\s*(?:but\s+)?then\b[^.!?]{0,120}?\bwhen\s+",
     re.IGNORECASE,
@@ -2739,6 +2762,23 @@ def _cue_has_explicit_dangling_end(text: str, next_text: str) -> bool:
         _TERMINAL_NOMINAL_SUBJECT_RE.search(raw_text)
         and _NOMINAL_PREDICATE_CONTINUATION_RE.match(str(next_text or ""))
     )
+    pronoun_subject = _TERMINAL_UNPUNCTUATED_SUBJECT_PRONOUN_RE.search(raw_text)
+    pronoun_predicate = _PRONOUN_PREDICATE_CONTINUATION_RE.match(
+        str(next_text or "")
+    )
+    next_is_explicit_question = bool(
+        "?" in str(next_text or "")
+        and _cue_begins_standalone_question(str(next_text or ""))
+    )
+    pronoun_subject_continues = bool(
+        pronoun_subject
+        and pronoun_predicate
+        and not next_is_explicit_question
+        and pronoun_predicate.group("auxiliary").casefold()
+        in _SUBJECT_PRONOUN_AUXILIARIES[
+            pronoun_subject.group("pronoun").casefold()
+        ]
+    )
     return bool(
         _TERMINAL_CALLBACK_RE.search(raw_text)
         or _TERMINAL_DANGLING_TRANSITION_RE.search(raw_text)
@@ -2746,6 +2786,7 @@ def _cue_has_explicit_dangling_end(text: str, next_text: str) -> bool:
         or _TERMINAL_INCOMPLETE_SUBJECT_RE.search(raw_text)
         or _TERMINAL_BARE_SUBJECT_RE.search(raw_text)
         or nominal_subject_continues
+        or pronoun_subject_continues
         or _TERMINAL_DANGLING_ARTICLE_RE.search(raw_text)
         or _TERMINAL_DANGLING_LINK_RE.search(raw_text)
         or (
