@@ -733,6 +733,17 @@ _WORKED_UNIT_ACTION_TOKEN_RE = re.compile(
     r"find|identify|prove|show|solve)\b",
     re.IGNORECASE,
 )
+_WORKED_UNIT_EVIDENCE_PROMPT_PREFIX_RE = re.compile(
+    r"\b(?:example|exercise|problem)s?\b"
+    r"(?P<glue>[^.!?]{0,120})\s*$",
+    re.IGNORECASE,
+)
+_WORKED_UNIT_STRUCTURAL_PROMPT_TOKENS = frozenset({
+    "a", "an", "and", "are", "asked", "as", "do", "for", "here's",
+    "i", "if", "let", "let's", "like", "more", "need", "new", "next",
+    "now", "one", "on", "please", "say", "so", "some", "suppose", "the",
+    "to", "try", "us", "use", "want", "we", "work", "would", "you",
+})
 _WORKED_UNIT_WH_ONSET_RE = re.compile(
     r"^\s*(?:(?:now|next)\s*[,;:]?\s+)?"
     r"(?:how|what|when|where|which|who|why)\b",
@@ -811,6 +822,7 @@ _WORKED_UNIT_PROCEDURAL_STEP_RE = re.compile(
 _WORKED_UNIT_PROCEDURAL_QUESTION_RE = re.compile(
     r"^\s*(?:(?:now|so)\s*[,;:]?\s+)?(?:"
     r"what\s+(?:do|does|should)\s+(?:i|we)\s+do\b|"
+    r"what\s+(?:i|we)\s+can\s+do\s+(?:here\s+)?is\b|"
     r"what\s+(?:is|would\s+be)\s+(?:our|the)\s+next\s+step\b|"
     r"what\s+remains\b|how\s+do\s+(?:i|we)\s+(?:continue|finish|proceed)\b)",
     re.IGNORECASE,
@@ -852,10 +864,14 @@ _SPLIT_CAPTION_ONSET_MARKER_RE = re.compile(
 )
 _SPLIT_CAPTION_NEW_UNIT_FRAMING_RE = re.compile(
     r"(?<!\w)(?:(?:all\s+right|alright|okay|ok|so)\s*[,;:]?\s+)*"
-    r"(?:now\s+)?let(?:['’]?s|\s+us)\s+"
+    r"(?:now\s+)?let(?:['’]?s|\s+us)\s+(?:"
+    r"(?:use|take)\s+(?:an?|this)\s+"
+    r"(?:(?:brief|concrete|quick|short|simple|worked)\s+)*"
+    r"(?:calculation|case|derivation|example|exercise|problem|proof)|"
     r"(?:do|go\s+through|look\s+at|try|work\s+on|work\s+through)\s+"
-    r"(?:(?:some|a)\s+)?(?:more|another|next|new)\s+"
-    r"(?:calculation|case|derivation|example|exercise|problem|proof)s?\b",
+    r"(?:some\s+more|one\s+more|more|the\s+next|another|next|"
+    r"a\s+(?:different|new)|new)\s+"
+    r"(?:calculation|case|derivation|example|exercise|problem|proof)s?)\b",
     re.IGNORECASE,
 )
 _OPENING_PREPOSITIONAL_TAG_RE = re.compile(
@@ -3491,6 +3507,7 @@ def _semantic_edge_quote(
     quote: str,
     *,
     want: str,
+    occurrence: str | None = None,
 ) -> tuple[tuple[int, int] | None, bool, str | None]:
     """Ground one semantic edge without inventing a timestamp.
 
@@ -3502,7 +3519,12 @@ def _semantic_edge_quote(
     spans = _quote_character_spans(text, quote)
     if not word_matches or not spans:
         return None, False, "ungrounded_boundary_quote"
-    span = spans[0] if want == "start" else spans[-1]
+    if occurrence == "first":
+        span = spans[0]
+    elif occurrence == "last":
+        span = spans[-1]
+    else:
+        span = spans[0] if want == "start" else spans[-1]
     quote_matches = list(_WORD_RE.finditer(str(quote or "")))
     if quote_matches:
         left, right = span
@@ -3518,7 +3540,7 @@ def _semantic_edge_quote(
         if want == "start"
         else _WORD_RE.search(text[span[1]:])
     )
-    if projected and len(spans) != 1:
+    if projected and len(spans) != 1 and occurrence not in {"first", "last"}:
         return None, True, f"ambiguous_{want}_quote"
     return span, projected, None
 
@@ -4350,7 +4372,7 @@ def _complete_split_caption_tail(
     proposal_index: int,
     ignore_caption_case: bool,
     anchor_text: str = "",
-) -> tuple[int, str] | None:
+) -> tuple[int, str, str | None] | None:
     """Project a short answer suffix that precedes the next teaching unit.
 
     Transcript providers may split a formula or concluding phrase at an
@@ -4391,8 +4413,6 @@ def _complete_split_caption_tail(
         next_text,
         ignore_caption_case=ignore_caption_case,
     )
-    if not has_explicit_closure and not has_weak_end:
-        return None
 
     onset_candidates: list[int] = []
     noise_start = _trailing_edge_noise_start(
@@ -4434,7 +4454,18 @@ def _complete_split_caption_tail(
                 onset_candidates.append(onset)
                 break
 
-    max_prefix_words = 12 if has_explicit_closure else 5
+    has_completion_prefix = any(
+        onset > 0
+        and 1 <= len(_toks(next_text[:onset])) <= 12
+        and _SPLIT_CAPTION_COMPLETION_SIGNAL_RE.search(
+            f"{selected_tail} {next_text[:onset]}"
+        )
+        for onset in onset_candidates
+    )
+    if not has_explicit_closure and not has_weak_end and not has_completion_prefix:
+        return None
+
+    max_prefix_words = 12 if has_explicit_closure or has_completion_prefix else 5
     for onset in sorted(set(onset_candidates)):
         if onset <= 0 or not _WORD_RE.search(next_text[onset:]):
             continue
@@ -4463,11 +4494,20 @@ def _complete_split_caption_tail(
                 prefix_matches[-width].start():prefix_matches[-1].end()
             ]
             spans = _quote_character_spans(next_text, quote)
-            if len(spans) != 1:
+            target_span = (
+                prefix_matches[-width].start(),
+                prefix_matches[-1].end(),
+            )
+            if target_span not in spans:
                 continue
-            span = spans[0]
+            occurrence = None
+            if len(spans) != 1:
+                if spans[0] != target_span:
+                    continue
+                occurrence = "first"
+            span = target_span
             if _WORD_RE.search(next_text[span[1]:]):
-                return next_line, quote
+                return next_line, quote, occurrence
     return None
 
 
@@ -4763,6 +4803,15 @@ class _TopicTransition:
     worked_unit: bool = False
 
 
+def _worked_unit_prompt_prefix_is_structural(prefix: str) -> bool:
+    match = _WORKED_UNIT_EVIDENCE_PROMPT_PREFIX_RE.search(prefix)
+    return bool(
+        match is not None
+        and set(_toks(match.group("glue")))
+        <= _WORKED_UNIT_STRUCTURAL_PROMPT_TOKENS
+    )
+
+
 def _worked_unit_onsets_in_cue(
     text: str,
     *,
@@ -4796,10 +4845,19 @@ def _worked_unit_onsets_in_cue(
             raw_text,
             framing.end(),
         )
+        intervening_text = (
+            raw_text[framing.end():following_action.start()]
+            if following_action is not None
+            else ""
+        )
+        intervening_words = _toks(intervening_text)
+        intervening_tokens = set(intervening_words)
         new_side = (
             following_action.start()
             if following_action is not None
-            and len(_toks(raw_text[framing.end():following_action.start()])) <= 12
+            and len(intervening_words) <= 12
+            and intervening_tokens <= _WORKED_UNIT_STRUCTURAL_PROMPT_TOKENS
+            and _LOCAL_EXPLICIT_PROBLEM_RE.search(intervening_text) is None
             else framing.start()
         )
         add(framing.start(), new_side)
@@ -4823,6 +4881,32 @@ def _worked_unit_onsets_in_cue(
     # unrelated reasoning verb elsewhere in the solution.
     for action in _WORKED_UNIT_ACTION_TOKEN_RE.finditer(raw_text):
         action_left = action.start()
+        sentence_left = max(
+            raw_text.rfind(marker, 0, action_left)
+            for marker in ".!?"
+        ) + 1
+        local_prefix = raw_text[sentence_left:action_left]
+        completion_signals = list(
+            _SPLIT_CAPTION_COMPLETION_SIGNAL_RE.finditer(local_prefix)
+        )
+        active_prefix = (
+            local_prefix[completion_signals[-1].end():]
+            if completion_signals
+            else local_prefix
+        )
+        evidence_starts_here = any(
+            evidence_left == action_left and evidence_right > action_left
+            for evidence_left, evidence_right in evidence_spans
+        )
+        framed_evidence_prompt = bool(
+            evidence_starts_here
+            and _worked_unit_prompt_prefix_is_structural(
+                raw_text[max(0, action_left - 160):action_left]
+            )
+            and _LOCAL_EXPLICIT_PROBLEM_RE.search(active_prefix) is None
+        )
+        if _LOCAL_EXPLICIT_PROBLEM_RE.search(active_prefix) is not None:
+            continue
         previous_words = list(_WORD_RE.finditer(raw_text[:action_left]))
         previous_word = (
             previous_words[-1].group(0).casefold()
@@ -4832,7 +4916,7 @@ def _worked_unit_onsets_in_cue(
         if previous_word in {
             "and", "by", "can", "could", "first", "i", "must", "should",
             "then", "to", "we", "will", "would", "you",
-        }:
+        } and not framed_evidence_prompt:
             continue
         evidence_anchored = any(
             action_left <= evidence_left
@@ -4841,11 +4925,6 @@ def _worked_unit_onsets_in_cue(
             for evidence_left, evidence_right in evidence_spans
         )
         prefix = raw_text[:action_left]
-        sentence_left = max(
-            raw_text.rfind(marker, 0, action_left)
-            for marker in ".!?"
-        ) + 1
-        local_prefix = raw_text[sentence_left:action_left]
         if not (
             evidence_anchored
             or len(_toks(local_prefix)) <= 12
@@ -5186,8 +5265,36 @@ def _worked_unit_transitions(
         if (item.navigation_line, item.navigation_left)
         <= (evidence_start_line, evidence_left)
     ]
+    only_target_is_explicit_example = False
+    only_target_is_grounded_prompt = False
+    if len(prior_or_target) == 1:
+        only_target = prior_or_target[0]
+        only_target_cue_text = str(
+            segments[only_target.navigation_line].get("text") or ""
+        )
+        only_target_text = only_target_cue_text[only_target.navigation_left:]
+        only_target_is_explicit_example = bool(
+            _SPLIT_CAPTION_NEW_UNIT_FRAMING_RE.match(only_target_text)
+        )
+        only_target_is_grounded_prompt = bool(
+            (only_target.new_side_line, only_target.new_side_left)
+            == (evidence_start_line, evidence_left)
+            and _WORKED_UNIT_TARGET_PROMPT_RE.match(
+                str(segments[only_target.new_side_line].get("text") or "")[
+                    only_target.new_side_left:
+                ]
+            )
+            and _worked_unit_prompt_prefix_is_structural(
+                str(segments[only_target.new_side_line].get("text") or "")[
+                    max(0, only_target.new_side_left - 160):
+                    only_target.new_side_left
+                ]
+            )
+        )
     if (
         len(prior_or_target) == 1
+        and not only_target_is_explicit_example
+        and not only_target_is_grounded_prompt
         and not _worked_unit_prefix_is_complete(
             segments,
             start_line,
@@ -5621,7 +5728,11 @@ def _single_objective_intra_cue_quotes(
                 f"{previous_text} {raw_prefix}".split()[-48:]
             )
             if (
-                _SPLIT_CAPTION_COMPLETION_SIGNAL_RE.search(combined_tail)
+                (
+                    _SPLIT_CAPTION_COMPLETION_SIGNAL_RE.search(combined_tail)
+                    or _last_safe_complete_prefix(combined_tail)
+                    == combined_tail.rstrip(" ,;:—-")
+                )
                 and not _terminal_content_is_explicitly_incomplete(combined_tail)
             ):
                 retained = raw_prefix
@@ -5671,6 +5782,21 @@ def _completed_unit_end_before_transition(
         matches = list(_WORKED_UNIT_CLOSING_TAIL_RE.finditer(selected))
         for closing in reversed(matches):
             if line == evidence_end_line and closing.end() <= evidence_right:
+                continue
+            trailing_parts = [selected[closing.end():]]
+            for later_line in range(line + 1, transition.navigation_line + 1):
+                later_text = str(segments[later_line].get("text") or "")
+                later_right = (
+                    transition.navigation_left
+                    if later_line == transition.navigation_line
+                    else len(later_text)
+                )
+                trailing_parts.append(later_text[:later_right])
+            trailing_text = " ".join(trailing_parts).strip(" ,;:—-")
+            if (
+                _WORD_RE.search(trailing_text)
+                and not _cue_is_only_structural_filler(trailing_text)
+            ):
                 continue
             retained = selected[:closing.end()].rstrip(" ,;:—-")
             if len(_toks(retained)) < 5:
@@ -6566,6 +6692,7 @@ def _plan_to_report(
         trimmed_visual_end_suffix = False
         completed_forward_sentence = False
         completed_split_caption_tail = False
+        end_quote_occurrence: str | None = None
         start_recovered_forward = False
         trimmed_terminal_meta_suffix = False
         boundary_fallback_reasons: list[str] = []
@@ -6689,6 +6816,24 @@ def _plan_to_report(
             evidence_quote=evidence_quote_for_section,
             learning_objective=objective_for_section,
         )
+        completion_transitions = topic_transitions_for_section
+        if b + 1 < n:
+            try:
+                adjacent_completion_cue = (
+                    float(segments[b + 1].get("start", 0.0))
+                    - float(segments[b].get("end", 0.0))
+                    < _SECTION_RESET_GAP_S
+                )
+            except (TypeError, ValueError, OverflowError):
+                adjacent_completion_cue = False
+            if adjacent_completion_cue:
+                completion_transitions = _candidate_topic_transitions(
+                    segments,
+                    a,
+                    b + 1,
+                    evidence_quote=evidence_quote_for_section,
+                    learning_objective=objective_for_section,
+                )
         if _evidence_crosses_topic_transition(
             evidence_location=evidence_location_for_section,
             transitions=topic_transitions_for_section,
@@ -6708,7 +6853,7 @@ def _plan_to_report(
             else _completed_unit_end_before_transition(
                 segments,
                 evidence_location=evidence_location_for_section,
-                transitions=topic_transitions_for_section,
+                transitions=completion_transitions,
             )
         )
         section_start, section_end = _single_objective_section_bounds(
@@ -6720,6 +6865,11 @@ def _plan_to_report(
         )
         if completed_end_override is not None:
             section_end, intra_end_quote = completed_end_override
+            if section_end > b:
+                completed_split_caption_tail = True
+                boundary_fallback_reasons.append(
+                    "completed_split_caption_tail"
+                )
         semantic_min_start: int | None = None
         semantic_max_end: int | None = None
         if evidence_location_for_section is not None:
@@ -7094,7 +7244,11 @@ def _plan_to_report(
             trimmed_terminal_meta_suffix = True
             quote_repaired = True
             boundary_fallback_reasons.append("trimmed_terminal_meta_suffix")
-        if not trimmed_visual_end_suffix and not trimmed_terminal_meta_suffix:
+        if (
+            not trimmed_visual_end_suffix
+            and not trimmed_terminal_meta_suffix
+            and not completed_split_caption_tail
+        ):
             split_caption_completion = _complete_split_caption_tail(
                 segments,
                 b,
@@ -7107,7 +7261,7 @@ def _plan_to_report(
                 ),
             )
             if split_caption_completion is not None:
-                b, end_quote = split_caption_completion
+                b, end_quote, end_quote_occurrence = split_caption_completion
                 end_text = str(segments[b].get("text") or "").strip()
                 repaired_end_edge = True
                 fallback_end_edge = False
@@ -7123,6 +7277,10 @@ def _plan_to_report(
         closure_segments = segments
         preliminary_start_spans = _quote_character_spans(start_text, start_quote)
         preliminary_end_spans = _quote_character_spans(end_text, end_quote)
+        if end_quote_occurrence == "first" and preliminary_end_spans:
+            preliminary_end_spans = [preliminary_end_spans[0]]
+        elif end_quote_occurrence == "last" and preliminary_end_spans:
+            preliminary_end_spans = [preliminary_end_spans[-1]]
         projected_end_needs_continuation = bool(
             len(preliminary_end_spans) == 1
             and b + 1 < len(segments)
@@ -7478,19 +7636,26 @@ def _plan_to_report(
             end_quote = trimmed_quote or _exact_boundary_quote(
                 end_text, want="end"
             )
-        end_quote, final_edge_noise_trimmed = _trim_end_quote_before_edge_noise(
-            str(segments[b].get("text") or ""),
-            end_quote,
-            evidence_quote=evidence_quote_for_section,
-            learning_objective=objective_for_section,
-        )
+        if end_quote_occurrence is None:
+            end_quote, final_edge_noise_trimmed = _trim_end_quote_before_edge_noise(
+                str(segments[b].get("text") or ""),
+                end_quote,
+                evidence_quote=evidence_quote_for_section,
+                learning_objective=objective_for_section,
+            )
+        else:
+            final_edge_noise_trimmed = False
         if final_edge_noise_trimmed:
             quote_repaired = True
             boundary_fallback_reasons.append("trimmed_trailing_edge_noise")
         end_span, end_projected, edge_error = _semantic_edge_quote(
-            str(segments[b].get("text") or ""), end_quote, want="end"
+            str(segments[b].get("text") or ""),
+            end_quote,
+            want="end",
+            occurrence=end_quote_occurrence,
         )
         if edge_error:
+            end_quote_occurrence = None
             end_quote = _exact_boundary_quote(
                 str(segments[b].get("text") or ""), want="end"
             )
@@ -7695,6 +7860,8 @@ def _plan_to_report(
                 "cue_id": cue_ids[-1],
                 "quote": end_quote,
             }
+            if end_quote_occurrence is not None:
+                edge_projection["end"]["occurrence"] = end_quote_occurrence
         clip_id = f"clip-{index + 1:03d}-{a}-{b}"
         clip = {
             "start": start,

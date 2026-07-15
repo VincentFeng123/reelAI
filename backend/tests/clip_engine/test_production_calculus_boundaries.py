@@ -2588,6 +2588,569 @@ def test_live_coarse_captions_isolate_sine_six_x_worked_unit() -> None:
     }
 
 
+def test_live_coarse_captions_isolate_first_power_example_and_complete_answer() -> None:
+    segments = [
+        _cue(
+            "HaHsqDjWMLU:cue:0",
+            0.919,
+            34.879,
+            "let's move on to the chain rule we're going to cover a lot of examples "
+            "the first Formula you need to be familiar with is the derivative of the "
+            "composite function f of g ofx a composite function is one where you have "
+            "one function inside of another notice that g is inside of f which makes "
+            "it a composite function so the first thing you need to do is differentiate "
+            "the outside portion of the function that is f and you need to keep the "
+            "inside the same and then multiply it by the derivative",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:1",
+            32.8,
+            69.159,
+            "of the inside that's the main idea behind the chain rule if you follow "
+            "this process you're going to get the answer right so let's say for example "
+            "if we have a function U raised to the N where U is another function in "
+            "terms of X using the chain Rule and the power rule combined it's going to "
+            "be n * U you have to keep that the same raised to the N minus one times "
+            "the derivative of what's on the inside that's the general power rule "
+            "formula with the chain rule combine so never forget to",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:2",
+            64.92,
+            77.119,
+            "multiply by the derivative of the inside function so let's use an "
+            "example let's say if we want to find the",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:3",
+            78.28,
+            124.6,
+            "derivative of 5x + 3 raised to the 4th power so the first thing we're "
+            "going to do is we're going to move the constant I mean the exponent to "
+            "the front so it's going to be four and then keep the inside stuff the "
+            "same * 5x + 3 subtract the exponent by 1 4 - 1 is 3 and then multiply by "
+            "the derivative of the inside the inside function is four it's 5x + 3 the "
+            "derivative of 5x + 3 is just 5 and so that's the answer we can multiply "
+            "four and 5 that's going to give us 20 so it's 20 * 5x + 3 ra the thir",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:4",
+            120.92,
+            165.92,
+            "power so that's the final answer fully simplified now let's work on some "
+            "more examples find the derivative of x^2 - 3x raised to the 5th power so "
+            "first let's bring down to five so it's going to be five and then keep the "
+            "inside function the same and then subtract the exponent by 1 so this is "
+            "four and then multiply by the derivative of the inside the derivative of "
+            "x^2 - 3x is 2x - 3 and so that's the answer",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="example-power-rule-chain",
+        start_line=0,
+        end_line=3,
+        start_quote="let's move on to the chain",
+        end_quote="20 * 5x + 3 ra the thir",
+        evidence="find the derivative of 5x + 3 raised to the 4th power",
+        objective=(
+            "Apply the chain rule in combination with the power rule to "
+            "differentiate a polynomial function."
+        ),
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].casefold().startswith(
+        "find the derivative of 5x + 3 raised to the 4th power"
+    )
+    assert clip["_clip_text"].casefold().endswith(
+        "power so that's the final answer fully simplified"
+    )
+    assert "going to cover" not in clip["_clip_text"].casefold()
+    assert "x^2 - 3x" not in clip["_clip_text"]
+    assert clip["edge_projection"]["start"]["cue_id"] == "HaHsqDjWMLU:cue:2"
+    assert clip["edge_projection"]["end"]["cue_id"] == "HaHsqDjWMLU:cue:4"
+
+
+def test_grounded_want_to_find_prompt_does_not_retain_the_prior_rule() -> None:
+    segments = [
+        _cue(
+            "rule",
+            0.0,
+            12.0,
+            "The general chain rule multiplies the outer derivative by the inner derivative.",
+        ),
+        _cue(
+            "prompt-head",
+            12.0,
+            18.0,
+            "For example, suppose we want to find the",
+        ),
+        _cue(
+            "worked-answer",
+            18.0,
+            30.0,
+            "derivative of three x plus one squared. Bring down the exponent, keep "
+            "the inside, and multiply by three, so the answer is six times three x "
+            "plus one.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="generic-want-to-find-example",
+        start_line=0,
+        end_line=2,
+        start_quote="The general chain rule multiplies",
+        end_quote="six times three x plus one",
+        evidence="find the derivative of three x plus one squared",
+        objective="Differentiate three x plus one squared with the chain rule",
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith(
+        "find the derivative of three x plus one squared"
+    )
+    assert "general chain rule" not in clip["_clip_text"].casefold()
+
+
+def test_grounded_action_keeps_its_same_sentence_problem_setup() -> None:
+    segments = [
+        _cue(
+            "prior",
+            0.0,
+            8.0,
+            "The previous example is complete, and its final answer is four.",
+        ),
+        _cue(
+            "equation",
+            8.0,
+            22.0,
+            "Given the equation x plus three equals five, we need to solve for x. "
+            "Subtract three from both sides, so x equals two, which is the solution.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="same-sentence-equation-setup",
+        start_line=0,
+        end_line=1,
+        start_quote="Given the equation x plus three equals five",
+        end_quote="x equals two, which is the solution",
+        evidence="solve for x",
+        objective="Solve the equation x plus three equals five for x",
+    )
+
+    report = _report(segments, proposal, topic="solve a linear equation")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith(
+        "Given the equation x plus three equals five"
+    )
+    assert not clip["_clip_text"].startswith("solve for x")
+    assert "previous example" not in clip["_clip_text"].casefold()
+
+
+def test_example_label_does_not_erase_the_equation_before_the_action() -> None:
+    text = (
+        "In this example, the equation is x plus three equals five, so solve "
+        "for x. Subtract three, so x equals two. That is the final answer."
+    )
+    proposal = _proposal(
+        candidate_id="labeled-equation-setup",
+        start_line=0,
+        end_line=0,
+        start_quote="In this example, the equation is x plus three equals five",
+        end_quote="That is the final answer",
+        evidence="solve for x",
+        objective="Solve x plus three equals five for x",
+    )
+
+    report = _report(
+        [_cue("labeled-equation", 0.0, 18.0, text)],
+        proposal,
+        topic="solve a linear equation",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith(
+        "In this example, the equation is x plus three equals five"
+    )
+    assert not clip["_clip_text"].startswith("solve for x")
+
+
+def test_use_example_framing_does_not_erase_the_problem_setup() -> None:
+    text = (
+        "Let's use an example: let x plus three equal five, and solve for x. "
+        "Subtract three, so x equals two. That's the final answer."
+    )
+    proposal = _proposal(
+        candidate_id="use-example-equation-setup",
+        start_line=0,
+        end_line=0,
+        start_quote="Let's use an example: let x plus three equal five",
+        end_quote="That's the final answer",
+        evidence="solve for x",
+        objective="Solve x plus three equals five for x",
+    )
+
+    report = _report(
+        [_cue("use-example-equation", 0.0, 18.0, text)],
+        proposal,
+        topic="solve a linear equation",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith(
+        "Let's use an example: let x plus three equal five"
+    )
+    assert not clip["_clip_text"].startswith("solve for x")
+
+
+def test_plain_more_examples_transition_does_not_leak_the_next_unit() -> None:
+    text = (
+        "Photosynthesis converts light into chemical energy. That is the key "
+        "result. Let's do more examples carbon fixation stores energy in sugars."
+    )
+    proposal = _proposal(
+        candidate_id="plain-more-examples-transition",
+        start_line=0,
+        end_line=0,
+        start_quote="Photosynthesis converts light into chemical energy",
+        end_quote="carbon fixation stores energy in sugars",
+        evidence="Photosynthesis converts light into chemical energy",
+        objective="Explain the energy conversion performed by photosynthesis",
+    )
+
+    report = _report(
+        [_cue("mixed-biology-units", 0.0, 16.0, text)],
+        proposal,
+        topic="photosynthesis energy conversion",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].endswith("That is the key result")
+    assert "carbon fixation" not in clip["_clip_text"].casefold()
+
+
+def test_completed_problem_resets_setup_guard_inside_one_unpunctuated_cue() -> None:
+    text = (
+        "given x squared find its derivative use the power rule and the final "
+        "answer is two x find the derivative of x cubed use the power rule and "
+        "the final answer is three x squared"
+    )
+    segments = [_cue("two-power-rule-problems", 0.0, 24.0, text)]
+    first_proposal = _proposal(
+        candidate_id="first-power-rule-problem",
+        start_line=0,
+        end_line=0,
+        start_quote="given x squared",
+        end_quote="three x squared",
+        evidence="find its derivative",
+        objective="Find the derivative of x squared with the power rule",
+    )
+    second_proposal = _proposal(
+        candidate_id="second-power-rule-problem",
+        start_line=0,
+        end_line=0,
+        start_quote="given x squared",
+        end_quote="three x squared",
+        evidence="find the derivative of x cubed",
+        objective="Find the derivative of x cubed with the power rule",
+    )
+
+    first_report = _report(
+        segments,
+        first_proposal,
+        topic="power rule worked examples",
+    )
+    second_report = _report(
+        segments,
+        second_proposal,
+        topic="power rule worked examples",
+    )
+
+    assert first_report.rejected_reasons == []
+    [first_clip] = first_report.clips
+    assert first_clip["_clip_text"].startswith("given x squared")
+    assert first_clip["_clip_text"].endswith("final answer is two x")
+    assert "x cubed" not in first_clip["_clip_text"]
+
+    assert second_report.rejected_reasons == []
+    [second_clip] = second_report.clips
+    assert second_clip["_clip_text"].startswith("find the derivative of x cubed")
+    assert second_clip["_clip_text"].endswith("final answer is three x squared")
+    assert "x squared find its derivative" not in second_clip["_clip_text"]
+
+
+def test_live_coarse_captions_complete_formula_operand_before_next_problem() -> None:
+    segments = [
+        _cue(
+            "HaHsqDjWMLU:cue:8",
+            259.0,
+            308.28,
+            "Cub as you can see it's not that bad here's another problem what is the "
+            "derivative of secant 4X the derivative of secant 4X is going to be "
+            "secant tangent that's the derivative of secant now the inside function "
+            "has to remain the same for secant and tangent next we need to "
+            "differentiate 4X so it's just going to be time4 and so that's the "
+            "solution what is the derivative of Ln X raised to the 7th power try that "
+            "problem so this is going to be S keep the inside part the same and then",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:9",
+            304.8,
+            323.56,
+            "subtract the exponent by one so 7 - 1 is 6 now we got to multiply by "
+            "the derivative of the inside function the derivative of Ln X is simply "
+            "1 /x so the final answer is 7 Ln X raised to 6 power /",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:10",
+            328.08,
+            376.72,
+            "X What is the dtive of theun of XB - 7 take a minute and work on that "
+            "example the first thing I would do is rewrite it so this is the same as X "
+            "Cub - 7 raised to the 12 and so that's going to be equal to2 we got to "
+            "bring the exponent to the front keep the inside function the same and then "
+            "subtract the exponent by one 1 12 - 1 which is 12 - 2 2 that's a half and "
+            "then we got to multiply by the derivative of the inside the derivative of "
+            "x Cub - 7 is simply 3x^2 so we could bring this back to the",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="example-ln-chain",
+        start_line=0,
+        end_line=1,
+        start_quote="what is the derivative of Ln",
+        end_quote="Ln X raised to 6 power /",
+        evidence="what is the derivative of Ln X raised to the 7th power",
+        objective=(
+            "Differentiate a natural logarithm function raised to a power using "
+            "the chain rule."
+        ),
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].casefold().startswith(
+        "what is the derivative of ln x raised to the 7th power"
+    )
+    assert clip["_clip_text"].rstrip().endswith("7 Ln X raised to 6 power / X")
+    assert "dtive of theun" not in clip["_clip_text"]
+    assert clip["edge_projection"]["end"] == {
+        "required": True,
+        "cue_id": "HaHsqDjWMLU:cue:10",
+        "quote": "X",
+        "occurrence": "first",
+    }
+
+
+def test_live_coarse_captions_isolate_product_chain_problem_and_solution() -> None:
+    segments = [
+        _cue(
+            "HaHsqDjWMLU:cue:19",
+            626.44,
+            664.279,
+            "can combine terms you can multiply five and three to get 15 what is the "
+            "derivative of cosine raised to the 7th power of s of secant x^2 so try "
+            "that problem so first let's rewrite it as cosine of s of secant x^2 and "
+            "let's put the seven and it's exponent position so let's use the power rule",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:20",
+            667.12,
+            718.56,
+            "same and then subtract the exponent by one so this is going to be six "
+            "now let's find the derivative of cosine let's work our way towards the "
+            "inside the derivative of cosine is negative sign and the stuff inside of "
+            "that is s secant X2 so now we got to find the derivative of s the "
+            "derivative of s is cosine and the stuff inside of s is secant x^2 so now "
+            "we got to find the derivative of secant so that's secant tangent so it's "
+            "going to be secant x^2 tangent x^2 and the derivative of x^2 is",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:21",
+            716.079,
+            759.199,
+            "2x so whenever you have multiple composite functions just work your way "
+            "from the outside towards the inside and everything is multiplied by each "
+            "other and then when you're done simply collect terms so we have a seven "
+            "a 2X and a negative so you can move that to the front and write it as "
+            "-4x if you want to here's the next problem find the derivative of x Cub "
+            "* 4x + 5 raised to the 4th power so what we have here is a product rule "
+            "we could say that this is f and this is",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:22",
+            755.519,
+            787.68,
+            "G and for G we have to use the quotient rule I mean not the quotient rule "
+            "but the chain rule so using the product rule we need to differentiate the "
+            "first part F the derivative of the first part is 3x^2 and we need to keep "
+            "the second part the same so we just have to rewrite G plus now we need to "
+            "keep the first part the same now for the second part we need to use the "
+            "chain room so let's bring the four to the front let's keep the inside "
+            "stuff the same and subtract the four by",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:23",
+            785.12,
+            827.639,
+            "one then multiply by the derivative of the inside function which is 4x + "
+            "5 the derivative of that is four so now let's simplify so the first part "
+            "we don't really need to change anything we can just leave it like this now "
+            "for the second part we can multiply four and four that's 16 so this is 16 "
+            "x Cub * 4x + 5 raised to the thir power you can leave your answer like "
+            "this or if you want to you can take out the GCF we can take out an x s and "
+            "we could take out three 4x+ 5S or",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:24",
+            823.48,
+            855.079,
+            "basically 4x + 5 to the third power so this is gone we took three of these "
+            "one is left over and we have a a three left so this is going to be a 3 * "
+            "4x + 5 and this is gone we took out all three of these well there's an X "
+            "left over and it's 16 so plus 16 x because we took out an X squ now what "
+            "we can do is basically simplify what we have",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:25",
+            856.839,
+            920.36,
+            "here so this is x^2 4x + 5 to the 3 power and let's distribute the three "
+            "so 3 * 4X is 12x 3 * 5 is 15 + 16x now let's add 12x and 16x so the "
+            "final answer is x^2 * 4x + 5 to the 3 power and then 28x + 15 so that's "
+            "the solution let's try one more example let's find the derivative of "
+            "2x - 3 / 4 + 5x X raised to the 4th power",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:26",
+            917.44,
+            967.56,
+            "one next we need to multiply by derivative of the inside so that's when "
+            "we have to use a quotient rule so f is 2x - 3 and G is 4 + 5x frime is "
+            "2 G Prime is 4 and the formula for the quotient rule is g f Prime minus "
+            "FG Prime over G squared so as you can see this is a long",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="example-product-chain",
+        start_line=0,
+        end_line=5,
+        start_quote="can combine terms you can multiply",
+        end_quote="we took out an X squ",
+        evidence="find the derivative of x Cub * 4x + 5 raised to the 4th power",
+        objective=(
+            "Combine the product rule and chain rule to find the derivative of a "
+            "function involving multiplication."
+        ),
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].casefold().startswith(
+        "find the derivative of x cub * 4x + 5 raised to the 4th power"
+    )
+    assert clip["_clip_text"].casefold().endswith("so that's the solution")
+    assert "cosine raised to the 7th" not in clip["_clip_text"]
+    assert "let's try one more example" not in clip["_clip_text"].casefold()
+    assert clip["edge_projection"]["start"]["cue_id"] == "HaHsqDjWMLU:cue:21"
+    assert clip["edge_projection"]["end"]["cue_id"] == "HaHsqDjWMLU:cue:25"
+
+
+def test_completion_lookahead_does_not_drop_reasoning_after_an_early_result() -> None:
+    segments = [
+        _cue(
+            "partial-result",
+            0.0,
+            8.0,
+            "Find the derivative of sine x squared. The inner derivative is two x, "
+            "and that is the result of differentiating the inside.",
+        ),
+        _cue(
+            "complete-result",
+            8.0,
+            16.0,
+            "Now multiply by cosine x squared, so the complete derivative equals "
+            "two x cosine x squared.",
+        ),
+        _cue(
+            "next-problem",
+            16.0,
+            24.0,
+            "Let's try another example: find the derivative of tangent x squared.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="complete-sine-chain-example",
+        start_line=0,
+        end_line=1,
+        start_quote="Find the derivative of sine x squared",
+        end_quote="two x cosine x squared",
+        evidence="Find the derivative of sine x squared",
+        objective="Differentiate sine x squared with the chain rule",
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert "multiply by cosine x squared" in clip["_clip_text"].casefold()
+    assert clip["_clip_text"].casefold().endswith("two x cosine x squared.")
+    assert "tangent" not in clip["_clip_text"].casefold()
+
+
+def test_completion_lookahead_preserves_a_substantive_post_answer_qualifier() -> None:
+    segments = [
+        _cue(
+            "answer",
+            0.0,
+            7.0,
+            "Substitution gives four, so that is the final answer.",
+        ),
+        _cue(
+            "qualifier",
+            7.0,
+            14.0,
+            "For some cases the denominator is zero, so direct substitution is undefined.",
+        ),
+        _cue(
+            "next-problem",
+            14.0,
+            21.0,
+            "Let's try another example and factor a different rational expression.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="answer-with-domain-qualifier",
+        start_line=0,
+        end_line=1,
+        start_quote="Substitution gives four",
+        end_quote="direct substitution is undefined",
+        evidence="Substitution gives four so that is the final answer",
+        objective="Explain direct substitution and its zero-denominator limitation",
+    )
+
+    report = _report(segments, proposal, topic="calculus limits")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert "denominator is zero" in clip["_clip_text"].casefold()
+    assert "different rational expression" not in clip["_clip_text"].casefold()
+
+
 def test_live_compact_selector_evidence_isolates_rational_worked_unit() -> None:
     segments = [
         _cue(
@@ -2714,10 +3277,14 @@ def test_live_compact_selector_evidence_isolates_rational_worked_unit() -> None:
     assert "3x^2 / 2" not in clip["_clip_text"]
     assert "trig function inside another trig function" not in clip["_clip_text"]
     assert 374.319 <= clip["start"] < 428.72
-    assert 426.12 < clip["end"] < 471.039
     assert clip["edge_projection"]["start"]["cue_id"] == (
         "HaHsqDjWMLU:cue:11"
     )
+    assert clip["edge_projection"]["end"] == {
+        "required": True,
+        "cue_id": "HaHsqDjWMLU:cue:14",
+        "quote": "derivative",
+    }
 
 
 def test_split_answer_prefix_stops_before_following_bare_problem() -> None:

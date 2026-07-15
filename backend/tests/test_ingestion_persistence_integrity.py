@@ -40,7 +40,7 @@ def _strict_boundary_context(
     return {
         "selection_candidate_id": candidate_id,
         "surface_eligible": surface,
-        "selection_contract_version": "quality_silence_v23",
+        "selection_contract_version": "quality_silence_v24",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -65,7 +65,7 @@ def _transcript_boundary_context(
     return {
         "selection_candidate_id": candidate_id,
         "surface_eligible": surface,
-        "selection_contract_version": "quality_silence_v23",
+        "selection_contract_version": "quality_silence_v24",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -431,7 +431,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "search_context": {
                     "selection_candidate_id": candidate_id,
                     "surface_eligible": True,
-                    "selection_contract_version": "quality_silence_v23",
+                    "selection_contract_version": "quality_silence_v24",
                     "speech_corridor_verified": True,
                     "boundary_status": "verified",
                     "boundary_diagnostics": {
@@ -592,7 +592,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
         stale_context = _strict_boundary_context(
             candidate_id, start=9.8, end=20.2, surface=True
         )
-        stale_context["selection_contract_version"] = "quality_silence_v12"
+        stale_context["selection_contract_version"] = "quality_silence_v23"
         stale = self._persist_boundary_candidate(
             pipeline=pipeline,
             adapter=adapter,
@@ -626,7 +626,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
             )
         context = json.loads(row["search_context_json"])
         self.assertEqual(
-            context["selection_contract_version"], "quality_silence_v23"
+            context["selection_contract_version"], "quality_silence_v24"
         )
         self.assertEqual(context["boundary_status"], "context_aligned")
 

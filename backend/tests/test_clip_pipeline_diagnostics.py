@@ -1935,6 +1935,110 @@ def test_projected_one_token_answer_end_advances_past_its_caption_onset() -> Non
     assert projection["end"]["excluded_neighbor_onset_sec"] > bounds[1]
 
 
+def test_first_occurrence_projection_handles_a_repeated_formula_operand() -> None:
+    text = "X What is the derivative of X squared when X is positive"
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:repeated-prefix-operand",
+        "duration": 12.0,
+        "segments": [
+            {"cue_id": "answer-next", "start": 0.0, "end": 12.0, "text": text}
+        ],
+    }
+    clip = _quality_clip(
+        cue_id="answer-next",
+        start=0.0,
+        end=12.0,
+        quote="X",
+        edge_projection={
+            "end": {
+                "cue_id": "answer-next",
+                "quote": "X",
+                "occurrence": "first",
+            }
+        },
+    )
+    caption = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert caption is not None
+
+    without_words = pipeline_module.clip_engine_silence.AudioPreparationResult(
+        "ready",
+        source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a"
+        ),
+    )
+    interpolated_bounds, interpolated, interpolated_error = (
+        pipeline_module._projected_speech_bounds(
+            transcript,
+            clip,
+            caption,
+            without_words,
+        )
+    )
+
+    lexical_words = tuple(
+        pipeline_module.clip_engine_silence.lexical_timing.LexicalWord(word, onset)
+        for word, onset in (
+            ("x", 0.5),
+            ("what", 1.0),
+            ("is", 1.5),
+            ("the", 2.0),
+            ("derivative", 2.5),
+            ("of", 3.0),
+            ("x", 3.5),
+            ("squared", 4.0),
+            ("when", 4.5),
+            ("x", 5.0),
+            ("is", 5.5),
+            ("positive", 6.0),
+        )
+    )
+    with_words = pipeline_module.clip_engine_silence.AudioPreparationResult(
+        "ready",
+        source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a",
+            lexical_words=lexical_words,
+        ),
+    )
+    lexical_bounds, lexical, lexical_error = pipeline_module._projected_speech_bounds(
+        transcript,
+        clip,
+        caption,
+        with_words,
+    )
+    cues = pipeline_module._selected_caption_cues(
+        transcript,
+        clip,
+        boundary_bounds=(0.0, lexical_bounds[1]),
+    )
+
+    assert interpolated_error is None
+    assert interpolated_bounds[1] < 1.1
+    assert interpolated["end"]["mode"] == "caption_token_interpolation"
+    assert lexical_error is None
+    assert lexical_bounds[1] < 1.0
+    assert lexical["end"]["excluded_neighbor_onset_sec"] == 1.0
+    assert cues[0]["text"] == "X"
+
+    ambiguous_clip = dict(clip)
+    ambiguous_clip["edge_projection"] = {
+        "end": {"cue_id": "answer-next", "quote": "X"}
+    }
+    ambiguous_caption = pipeline_module._supadata_boundary_diagnostics(
+        transcript,
+        ambiguous_clip,
+    )
+    assert ambiguous_caption is not None
+    _bounds, _projection, ambiguous_error = pipeline_module._projected_speech_bounds(
+        transcript,
+        ambiguous_clip,
+        ambiguous_caption,
+        without_words,
+    )
+    assert ambiguous_error == "end_caption_interpolation_unavailable"
+
+
 def test_start_projection_clamps_rolling_cue_and_preserves_end_handoff() -> None:
     transcript = {
         "source": "supadata",
@@ -2939,7 +3043,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
 ) -> None:
     strict_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v23",
+        "selection_contract_version": "quality_silence_v24",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -2949,7 +3053,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
     }
     transcript_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v23",
+        "selection_contract_version": "quality_silence_v24",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -3012,7 +3116,7 @@ def test_failed_boundary_storage_does_not_consume_ready_material_cap(
     deferred.append({
         "search_context_json": json.dumps({
             "surface_eligible": True,
-            "selection_contract_version": "quality_silence_v23",
+            "selection_contract_version": "quality_silence_v24",
             "speech_corridor_verified": True,
             "boundary_status": "verified",
             "boundary_diagnostics": {
@@ -3770,7 +3874,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v23"
+        assert context["selection_contract_version"] == "quality_silence_v24"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"

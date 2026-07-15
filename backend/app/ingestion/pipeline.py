@@ -538,7 +538,7 @@ def _boundary_evidence_grade(
     if (
         not isinstance(context, dict)
         or str(context.get("selection_contract_version") or "").strip()
-        != "quality_silence_v23"
+        != "quality_silence_v24"
     ):
         return 0
     if (
@@ -649,6 +649,7 @@ def _interpolated_caption_edge_anchor(
     edge: str,
     cue_start_sec: float,
     cue_end_sec: float,
+    occurrence: str | None = None,
 ) -> tuple[float, float] | None:
     """Estimate one uniquely grounded edge inside a timestamped caption cue.
 
@@ -658,16 +659,25 @@ def _interpolated_caption_edge_anchor(
     """
     matches = list(_QUOTE_WORD_RE.finditer(str(cue_text or "")))
     spans = _quote_character_spans(cue_text, quote)
+    selected_span = (
+        spans[0]
+        if occurrence == "first" and spans
+        else (
+            spans[-1]
+            if occurrence == "last" and spans
+            else (spans[0] if len(spans) == 1 else None)
+        )
+    )
     if (
         edge not in {"start", "end"}
-        or len(spans) != 1
+        or selected_span is None
         or len(matches) < 2
         or not math.isfinite(cue_start_sec)
         or not math.isfinite(cue_end_sec)
         or cue_end_sec <= cue_start_sec
     ):
         return None
-    span_start, span_end = spans[0]
+    span_start, span_end = selected_span
     selected = [
         index
         for index, match in enumerate(matches)
@@ -789,6 +799,8 @@ def _projected_speech_bounds(
                     edge=edge,
                     cue_start_sec=cue_start,
                     cue_end_sec=cue_end,
+                    occurrence=str(marker.get("occurrence") or "").strip()
+                    or None,
                 )
                 if anchor is None:
                     return fallback, {}, f"{edge}_caption_interpolation_unavailable"
@@ -957,6 +969,12 @@ def _projected_speech_bounds(
             edge=edge,
             cue_start_sec=context_start,
             cue_end_sec=context_end,
+            occurrence=(
+                str(marker.get("occurrence") or "").strip()
+                if is_projected
+                else None
+            )
+            or None,
         )
         if anchor is None:
             if is_projected:
@@ -1085,14 +1103,18 @@ def _selected_caption_cues(
             spans = _quote_character_spans(
                 text, str(start_marker.get("quote") or "")
             )
-            if len(spans) == 1:
-                text_start = spans[0][0]
+            occurrence = str(start_marker.get("occurrence") or "").strip()
+            if spans and (len(spans) == 1 or occurrence in {"first", "last"}):
+                span = spans[-1] if occurrence == "last" else spans[0]
+                text_start = span[0]
         if isinstance(end_marker, dict) and str(end_marker.get("cue_id") or "") == cue_id:
             spans = _quote_character_spans(
                 text, str(end_marker.get("quote") or "")
             )
-            if len(spans) == 1:
-                text_end = spans[0][1]
+            occurrence = str(end_marker.get("occurrence") or "").strip()
+            if spans and (len(spans) == 1 or occurrence in {"first", "last"}):
+                span = spans[-1] if occurrence == "last" else spans[0]
+                text_end = span[1]
         cue_start = float(segment["start"])
         cue_end = float(segment["end"])
         if boundary_bounds is not None:
@@ -2067,7 +2089,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v23",
+            selection_contract_version="quality_silence_v24",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -4387,7 +4409,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v23",
+                    selection_contract_version="quality_silence_v24",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,

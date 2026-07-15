@@ -493,6 +493,7 @@ def align_edge_anchor(
     edge: Edge,
     cue_start_sec: float,
     cue_end_sec: float,
+    occurrence: Literal["first", "last"] | None = None,
 ) -> EdgeAnchor | None:
     """Align a uniquely quoted partial edge to explicit lexical onsets.
 
@@ -513,9 +514,13 @@ def align_edge_anchor(
     cue_tokens = _tokens(cue_text)
     quote_tokens = _tokens(quote)
     quote_matches = _sequence_matches(cue_tokens, quote_tokens)
-    if len(quote_matches) != 1:
+    if not quote_matches or (
+        len(quote_matches) != 1 and occurrence not in {"first", "last"}
+    ):
         return None
-    quote_start_index = quote_matches[0]
+    quote_start_index = (
+        quote_matches[0] if occurrence != "last" else quote_matches[-1]
+    )
     quote_end_index = quote_start_index + len(quote_tokens)
     if edge == "start" and quote_start_index == 0:
         return None
@@ -536,8 +541,14 @@ def align_edge_anchor(
     timed.sort(key=lambda word: word.onset_sec)
     timed_tokens = [_tokens(word.text)[0] for word in timed]
     timed_quote_matches = _sequence_matches(timed_tokens, quote_tokens)
-    if len(timed_quote_matches) == 1:
-        timed_quote_start = timed_quote_matches[0]
+    if timed_quote_matches and (
+        len(timed_quote_matches) == 1 or occurrence in {"first", "last"}
+    ):
+        timed_quote_start = (
+            timed_quote_matches[0]
+            if occurrence != "last"
+            else timed_quote_matches[-1]
+        )
         timed_quote_end = timed_quote_start + len(quote_tokens)
     elif timed_quote_matches:
         return None
