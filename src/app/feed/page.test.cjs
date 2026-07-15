@@ -82,11 +82,15 @@ test("generation finals cannot reconcile after their search scope is invalidated
 
   function visit(node) {
     if (
-      ts.isExpressionStatement(node)
-      && ts.isCallExpression(node.expression)
-      && node.expression.expression.getText(sourceFile) === "reconcileGeneratedReels"
+      ts.isCallExpression(node)
+      && node.expression.getText(sourceFile) === "reconcileGeneratedReels"
+      && node.arguments[2]?.getText(sourceFile) === "{ preserveUnmatchedUnseen: true }"
     ) {
-      finalReconciliations.push(node);
+      let statement = node;
+      while (statement.parent && !ts.isBlock(statement.parent)) {
+        statement = statement.parent;
+      }
+      finalReconciliations.push({ call: node, statement });
     }
     ts.forEachChild(node, visit);
   }
@@ -94,15 +98,15 @@ test("generation finals cannot reconcile after their search scope is invalidated
   visit(sourceFile);
   assert.equal(finalReconciliations.length, 2, "every generation path must remain covered");
   for (const reconciliation of finalReconciliations) {
-    const reconciliationCall = reconciliation.expression;
+    const reconciliationCall = reconciliation.call;
     assert.equal(
       reconciliationCall.arguments[2]?.getText(sourceFile),
       "{ preserveUnmatchedUnseen: true }",
       "stream settlement must explicitly retain unmatched provisional rows",
     );
-    const block = reconciliation.parent;
+    const block = reconciliation.statement.parent;
     assert.ok(ts.isBlock(block), "final reconciliation must remain in a guarded block");
-    const reconciliationIndex = block.statements.indexOf(reconciliation);
+    const reconciliationIndex = block.statements.indexOf(reconciliation.statement);
     const guard = block.statements[reconciliationIndex - 1];
     assert.ok(guard && ts.isIfStatement(guard), "final reconciliation must immediately follow a scope guard");
     assert.equal(
@@ -180,6 +184,7 @@ test("feed-owned jobs start the shared stream immediately and only once per mate
       return { reels: rows, addedReels: rows, addedCount: rows.length, updatedCount: 0 };
     },
     markRecoveryProgress: () => {},
+    clearPendingTailAdvance: () => {},
     reconcileGeneratedReels: (...args) => reconciled.push(args),
     isRequestInterruptedError: () => false,
     console,
@@ -284,7 +289,11 @@ test("feed-owned final inventory reconciles when no candidate event arrived", as
       throw new Error("no provisional candidate should be required");
     },
     markRecoveryProgress: () => {},
-    reconcileGeneratedReels: (...args) => reconciled.push(args),
+    clearPendingTailAdvance: () => {},
+    reconcileGeneratedReels: (...args) => {
+      reconciled.push(args);
+      return { reels: args[1], addedReels: args[1], addedCount: args[1].length, updatedCount: 0 };
+    },
     isRequestInterruptedError: () => false,
     console: { warn: () => {} },
   });
@@ -303,6 +312,51 @@ test("feed-owned final inventory reconciles when no candidate event arrived", as
   assert.equal(isGeneratingRef.current, false);
 });
 
+test("a recovered generation stream failure clears pending tail advance", async () => {
+  const consumers = new Map();
+  const isGeneratingRef = { current: false };
+  let clearedTailAdvance = 0;
+  const callback = compileUseCallback("consumeFeedGenerationJob", {
+    claimGenerationConsumer: (materialId, jobId) => {
+      const token = Symbol(jobId);
+      consumers.set(materialId, token);
+      isGeneratingRef.current = true;
+      return token;
+    },
+    releaseGenerationConsumer: (materialId, token) => {
+      if (consumers.get(materialId) === token) {
+        consumers.delete(materialId);
+      }
+      isGeneratingRef.current = consumers.size > 0;
+    },
+    isGeneratingRef,
+    clearPendingTailAdvance: () => {
+      clearedTailAdvance += 1;
+    },
+    GENERATION_STREAM_IDLE_TIMEOUT_MS: 35_000,
+    generateReelsStream: async () => {
+      throw new Error("generation stream idle timeout");
+    },
+    isSearchScopeActive: () => true,
+    isRequestInterruptedError: () => false,
+    noteGenerationTerminal: () => {},
+    appendGeneratedReels: () => ({ reels: [], addedReels: [], addedCount: 0, updatedCount: 0 }),
+    markRecoveryProgress: () => {},
+    reconcileGeneratedReels: () => ({ reels: [], addedReels: [], addedCount: 0, updatedCount: 0 }),
+    console: { warn: () => {} },
+  });
+
+  await callback(
+    "material-a",
+    { generation_job_id: "recovered-job", generation_job_status: "running" },
+    { key: "material", seq: 1, controller: new AbortController() },
+  );
+
+  assert.equal(consumers.size, 0);
+  assert.equal(isGeneratingRef.current, false);
+  assert.equal(clearedTailAdvance, 1);
+});
+
 test("failed empty generation reattaches through the authoritative feed", async () => {
   const searchScope = { key: "material", seq: 1, controller: new AbortController() };
   const isGeneratingRef = { current: false };
@@ -311,6 +365,7 @@ test("failed empty generation reattaches through the authoritative feed", async 
   const generationConsumerByMaterialRef = { current: new Map() };
   const loadCalls = [];
   const surfacedErrors = [];
+  let clearedTailAdvance = 0;
   let generationProgress = null;
 
   const callback = compileUseCallback("requestMore", {
@@ -367,6 +422,9 @@ test("failed empty generation reattaches through the authoritative feed", async 
       return { addedCount: 0, exhausted: false };
     },
     markRecoveryProgress: () => {},
+    clearPendingTailAdvance: () => {
+      clearedTailAdvance += 1;
+    },
     isTransportError: () => true,
     noteFeedTransportFailure: (error) => surfacedErrors.push(error),
     noteFeedFailure: (error) => surfacedErrors.push(error),
@@ -389,6 +447,7 @@ test("failed empty generation reattaches through the authoritative feed", async 
   assert.deepEqual(surfacedErrors, [], "the recovered durable job must retain the loading state");
   assert.equal(isGeneratingRef.current, true);
   assert.equal(generationProgress, null, "the recovered consumer owns loading state after reattachment");
+  assert.equal(clearedTailAdvance, 0, "an attached durable job must retain pending tail advance");
 });
 
 test("a direct completed-cache response settles without a stream terminal event", async () => {
@@ -437,6 +496,7 @@ test("a direct completed-cache response settles without a stream terminal event"
     materialId: "material-a",
     mergeReelBatchesByDifficulty: (batches) => batches.flat(),
     markRecoveryProgress: () => {},
+    clearPendingTailAdvance: () => {},
     clearRecoveredTransportError: () => {},
     setRecoveryPhase: () => {},
     finishActiveRecoveryRequest: () => {},
@@ -698,11 +758,35 @@ test("a restored feed reconciles durable inventory with its restored mode and a 
   assert.ok(hydrationStart >= 0 && hydrationEnd > hydrationStart);
   const hydrationText = source.slice(hydrationStart, hydrationEnd);
   assert.match(hydrationText, /setBootstrappingFirstReels\(true\);/);
-  assert.match(hydrationText, /autofill: false,/);
+  assert.match(hydrationText, /autofill: true,/);
   assert.match(hydrationText, /generationMode: restoredGenerationMode/);
-  assert.match(hydrationText, /setCanRequestMore\(restoredSession\.canRequestMore\)/);
+  assert.doesNotMatch(hydrationText, /setCanRequestMore\(restoredSession\.canRequestMore\)/);
+  assert.match(hydrationText, /current backend response[\s\S]*?setCanRequestMore\(true\)/);
   assert.match(hydrationText, /hydratedMaterialIdRef\.current === materialId/);
   assert.match(hydrationText, /isSearchScopeActive\(restoredSearchScope\)/);
+});
+
+test("a current backend job re-enables a stale snapshot search scope", () => {
+  const generationJobByMaterialRef = { current: new Map() };
+  const canRequestMoreWrites = [];
+  const callback = compileUseCallback("rememberFeedGenerationJob", {
+    generationJobByMaterialRef,
+    setCanRequestMore: (value) => canRequestMoreWrites.push(value),
+    noteGenerationTerminal: () => {
+      throw new Error("an active job is not terminal");
+    },
+  });
+
+  callback("material-a", {
+    generation_job_id: "fresh-job",
+    generation_job_status: "running",
+  });
+
+  assert.deepEqual(canRequestMoreWrites, [true]);
+  assert.deepEqual(generationJobByMaterialRef.current.get("material-a"), {
+    jobId: "fresh-job",
+    status: "running",
+  });
 });
 
 test("bootstrap consumes duplicate persisted pages before considering generation", async () => {
@@ -797,10 +881,17 @@ test("bootstrap never treats an existing partial inventory as a quota to fill", 
 test("persisted paging never autofills and generation waits for the user-driven tail", async () => {
   const pageLoads = [];
   let generationRequests = 0;
+  const searchScope = { key: "material", seq: 1, controller: new AbortController() };
   const shared = {
     isIngestMaterial: false,
     isFetchingRef: { current: false },
-    loadPage: (targetPage, options) => pageLoads.push({ targetPage, options }),
+    loadPage: async (targetPage, options) => {
+      pageLoads.push({ targetPage, options });
+      return { addedCount: 1, exhausted: false };
+    },
+    activeSearchScopeRef: { current: searchScope },
+    isSearchScopeActive: (scope) => scope === searchScope,
+    clearPendingTailAdvance: () => {},
     page: 1,
     reelsRef: { current: [{ reel_id: "a" }, { reel_id: "b" }, { reel_id: "c" }] },
     canRequestMore: true,
@@ -971,6 +1062,83 @@ test("terminal tail gestures and autoplay never show a false search spinner", ()
   assert.equal(loadAttempts, 0);
   assert.deepEqual(pendingStates, [false, false]);
   assert.equal(shared.pendingAutoplayAdvanceRef.current, false);
+});
+
+test("a failed tail request clears its pending auto-advance spinner", () => {
+  const requestMoreStart = source.indexOf("const requestMore = useCallback(");
+  const requestMoreEnd = source.indexOf("\n\n  useEffect(() => {", requestMoreStart);
+  assert.ok(requestMoreStart >= 0 && requestMoreEnd > requestMoreStart);
+  const callbackText = source.slice(requestMoreStart, requestMoreEnd);
+  assert.match(
+    callbackText,
+    /if \(generated\.length === 0\)[\s\S]*?clearPendingTailAdvance\(\);[\s\S]*?return \[\];/,
+  );
+  assert.match(
+    callbackText,
+    /catch \(e\)[\s\S]*?clearPendingTailAdvance\(\);[\s\S]*?return \[\];/,
+  );
+});
+
+test("an already-running failed page fetch clears a later pending tail gesture", async () => {
+  const searchScope = { key: "material", seq: 1, controller: new AbortController() };
+  const isFetchingRef = { current: false };
+  const isGeneratingRef = { current: false };
+  const pendingAutoplayAdvanceRef = { current: false };
+  let fetchStarted;
+  const didStartFetch = new Promise((resolve) => {
+    fetchStarted = resolve;
+  });
+  let rejectFetch;
+  let clearedTailAdvance = 0;
+  const callback = compileUseCallback("loadPage", {
+    getFeedMaterialIds: () => ["material-a"],
+    settingsScopeReady: true,
+    isFetchingRef,
+    activeSearchScopeRef: { current: searchScope },
+    feedPagesExhausted: false,
+    reelsRef: { current: [{ reel_id: "existing" }] },
+    setRecoveryPhase: () => {},
+    armActiveRecoveryRequest: () => {},
+    getFeedTuningSettings: () => ({
+      minRelevance: 0.75,
+      creativeCommonsOnly: false,
+      preferredVideoDuration: "any",
+    }),
+    generationMode: "fast",
+    adaptiveExcludeReelIdsRef: { current: [] },
+    PAGE_SIZE: 5,
+    readyReservoirTarget: () => 8,
+    fetchFeed: () => new Promise((resolve, reject) => {
+      void resolve;
+      rejectFetch = reject;
+      fetchStarted();
+    }),
+    isSearchScopeActive: (scope) => scope === searchScope,
+    markRecoveryProgress: () => {},
+    markPagedFeedExhausted: () => {},
+    isTransportError: () => false,
+    noteFeedTransportFailure: () => {},
+    noteFeedFailure: () => {},
+    materialId: "material-a",
+    finishActiveRecoveryRequest: () => {},
+    setLoading: () => {},
+    pendingAutoplayAdvanceRef,
+    isGeneratingRef,
+    clearPendingTailAdvance: () => {
+      clearedTailAdvance += 1;
+      pendingAutoplayAdvanceRef.current = false;
+    },
+  });
+
+  const loadPromise = callback(2, { autofill: false });
+  await didStartFetch;
+  assert.equal(isFetchingRef.current, true);
+  pendingAutoplayAdvanceRef.current = true;
+  rejectFetch(new Error("feed page failed"));
+  await loadPromise;
+
+  assert.equal(isFetchingRef.current, false);
+  assert.equal(clearedTailAdvance, 1);
 });
 
 test("progress copy reports stages instead of a fabricated requested total", () => {
