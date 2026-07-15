@@ -4514,6 +4514,133 @@ def _projected_end_is_complete(
     )
 
 
+def _trim_repeated_rolling_caption_tail(
+    segments: list[dict],
+    end_line: int,
+    end_quote: str,
+) -> tuple[str, str | None] | None:
+    """Stop before an unfinished verbatim restatement split across captions."""
+    next_line = end_line + 1
+    if end_line <= 0 or next_line >= len(segments):
+        return None
+    current_text = str(segments[end_line].get("text") or "")
+    next_text = str(segments[next_line].get("text") or "")
+    current_span, projected, error = _semantic_edge_quote(
+        current_text,
+        end_quote,
+        want="end",
+    )
+    if (
+        error
+        or current_span is None
+        or projected
+        or _WORD_RE.search(current_text[current_span[1]:])
+        or not next_text.strip()
+    ):
+        return None
+    try:
+        current_end = float(segments[end_line].get("end"))
+        next_start = float(segments[next_line].get("start"))
+    except (TypeError, ValueError):
+        return None
+    if (
+        not math.isfinite(current_end)
+        or not math.isfinite(next_start)
+        or next_start - current_end >= _SECTION_RESET_GAP_S
+    ):
+        return None
+
+    contraction_expansions = {
+        "i'm": ("i", "am"),
+        "you're": ("you", "are"),
+        "we're": ("we", "are"),
+        "they're": ("they", "are"),
+        "can't": ("can", "not"),
+        "won't": ("will", "not"),
+        "don't": ("do", "not"),
+        "doesn't": ("does", "not"),
+        "didn't": ("did", "not"),
+        "isn't": ("is", "not"),
+        "aren't": ("are", "not"),
+        "wasn't": ("was", "not"),
+        "weren't": ("were", "not"),
+        "haven't": ("have", "not"),
+        "hasn't": ("has", "not"),
+        "hadn't": ("had", "not"),
+    }
+
+    def records(text: str, line: int) -> list[tuple[str, int, int, int]]:
+        result: list[tuple[str, int, int, int]] = []
+        for match in _WORD_RE.finditer(text):
+            [token] = _toks(match.group(0))
+            for normalized in contraction_expansions.get(token, (token,)):
+                result.append((normalized, line, match.start(), match.end()))
+        return result
+
+    context_records: list[tuple[str, int, int, int]] = []
+    for line in range(max(0, end_line - 2), end_line + 1):
+        context_records.extend(
+            records(str(segments[line].get("text") or ""), line)
+        )
+    next_words = list(_WORD_RE.finditer(next_text))
+    clause_signals = {
+        "am", "are", "can", "could", "did", "do", "does", "had", "has",
+        "have", "is", "may", "might", "must", "shall", "should", "was",
+        "were", "will", "would",
+    }
+    for prefix_width in range(1, min(5, len(next_words)) + 1):
+        next_prefix_end = next_words[prefix_width - 1].end()
+        combined = [
+            *context_records,
+            *records(next_text[:next_prefix_end], next_line),
+        ]
+        combined_tokens = [item[0] for item in combined]
+        for width in range(min(18, len(combined) // 2), 5, -1):
+            suffix_start = len(combined) - width
+            repeated = combined_tokens[suffix_start:]
+            if combined[suffix_start][1] != end_line:
+                continue
+            if not (
+                set(repeated).intersection(clause_signals)
+                or any(
+                    len(token) > 4 and token.endswith(("ed", "ing"))
+                    for token in repeated
+                )
+            ):
+                continue
+            # Only remove an immediate restart. Matching an older clause across
+            # substantive intervening teaching would discard valid middle content.
+            earlier_start = suffix_start - width
+            if earlier_start < 0:
+                continue
+            if combined_tokens[earlier_start:suffix_start] != repeated:
+                continue
+            earlier_last = combined[suffix_start - 1]
+            if earlier_last[1] != end_line:
+                continue
+            boundary_right = earlier_last[3]
+            if boundary_right >= current_span[1]:
+                continue
+            prefix = current_text[:boundary_right].rstrip(" ,;:—-")
+            quote = _exact_boundary_quote(prefix, want="end")
+            target_span = _quote_character_span(prefix, quote)
+            if target_span is None:
+                continue
+            spans = _quote_character_spans(current_text, quote)
+            if target_span not in spans:
+                continue
+            occurrence = None
+            if len(spans) != 1:
+                if spans[0] == target_span:
+                    occurrence = "first"
+                elif spans[-1] == target_span:
+                    occurrence = "last"
+                else:
+                    continue
+            return quote, occurrence
+    return None
+
+
 def _complete_split_caption_tail(
     segments: list[dict],
     end_line: int,
@@ -7022,6 +7149,7 @@ def _plan_to_report(
         trimmed_visual_end_suffix = False
         completed_forward_sentence = False
         completed_split_caption_tail = False
+        trimmed_repeated_caption_tail = False
         end_quote_occurrence: str | None = None
         start_recovered_forward = False
         trimmed_terminal_meta_suffix = False
@@ -7631,10 +7759,27 @@ def _plan_to_report(
             trimmed_terminal_meta_suffix = True
             quote_repaired = True
             boundary_fallback_reasons.append("trimmed_terminal_meta_suffix")
+        if not trimmed_visual_end_suffix and not trimmed_terminal_meta_suffix:
+            repeated_caption_trim = _trim_repeated_rolling_caption_tail(
+                segments,
+                b,
+                end_quote,
+            )
+            if repeated_caption_trim is not None:
+                end_quote, end_quote_occurrence = repeated_caption_trim
+                repaired_end_edge = True
+                fallback_end_edge = False
+                intra_end_boundary = True
+                trimmed_repeated_caption_tail = True
+                quote_repaired = True
+                boundary_fallback_reasons.append(
+                    "trimmed_repeated_caption_tail"
+                )
         if (
             not trimmed_visual_end_suffix
             and not trimmed_terminal_meta_suffix
             and not completed_split_caption_tail
+            and not trimmed_repeated_caption_tail
         ):
             split_caption_completion = _complete_split_caption_tail(
                 segments,
@@ -7708,6 +7853,7 @@ def _plan_to_report(
         projected_end_is_complete = bool(
             trimmed_terminal_meta_suffix
             or completed_split_caption_tail
+            or trimmed_repeated_caption_tail
             or (
                 not projected_end_needs_continuation
                 and len(preliminary_end_spans) == 1

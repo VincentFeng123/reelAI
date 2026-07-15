@@ -204,6 +204,166 @@ def test_live_chain_rule_candidate_is_rebounded_instead_of_rejected() -> None:
     assert "thought experiment" not in clip["_clip_text"]
 
 
+def _live_chain_rule_setup_segments() -> list[dict]:
+    """Exact cue 0-30 slice from the 129-cue production Supadata artifact."""
+    rows = [
+        (0.56, 4.64, "what we're going to go over in this"),
+        (2.0, 6.08, "video is one of the core principles in"),
+        (4.64, 7.52, "calculus and you're going to use it any"),
+        (6.08, 10.08, "time you take the derivative of anything"),
+        (7.52, 11.84, "even reasonably complex and it's called"),
+        (10.08, 13.28, "the chain rule and when you're first"),
+        (11.84, 14.96, "exposed to it it can seem a little"),
+        (13.28, 16.56, "daunting and a little bit convoluted but"),
+        (14.96, 17.84, "as you see more and more examples it'll"),
+        (16.56, 19.92, "start to make sense and hopefully it'll"),
+        (17.84, 21.76, "even start to seem a little bit simple"),
+        (19.92, 23.92, "and intuitive over time"),
+        (21.76, 26.4, "so let's say that i had a function"),
+        (23.92, 28.8, "let's, say, i have, a, function, h, of, x"),
+        (26.4, 31.199, "and it is equal to"),
+        (28.8, 33.12, "just for example i let's say it's equal"),
+        (31.199, 37.92, "to sine of x let's say it's equal to sine of x"),
+        (36.16, 39.84, "squared now i could have written that i"),
+        (37.92, 41.28, "could have written it like this sine"),
+        (39.84, 43.36, "squared, of, x, but, it'll, be, a little, bit"),
+        (41.28, 45.52, "clearer using using that type of"),
+        (43.36, 47.92, "notation so let me make it so i have h"),
+        (45.52, 49.68, "of x and what i'm curious about is what"),
+        (47.92, 52.399, "is h prime of x"),
+        (49.68, 54.239, "so i want to know h prime of x which"),
+        (52.399, 57.199, "another way of writing it is the derivative of h"),
+        (55.6, 58.399, "with respect to x these are just"),
+        (57.199, 60.16, "different notations"),
+        (58.399, 62.64, "and to do this i'm going to use the"),
+        (60.16, 65.36, "chain rule i am going to use the chain"),
+        (62.64, 67.76, "rule the chain rule comes into play"),
+    ]
+    return [
+        {
+            "cue_id": f"0T0QrHO56qg:cue:{index}",
+            "start": start,
+            "end": end,
+            "text": text,
+        }
+        for index, (start, end, text) in enumerate(rows)
+    ]
+
+
+def test_live_chain_rule_setup_trims_split_repeated_caption_tail() -> None:
+    segments = _live_chain_rule_setup_segments()
+    proposal = G._BoundaryTopic(
+        candidate_id="chain_rule_definition_problem",
+        start_line=12,
+        end_line=29,
+        start_quote="so let's say that i had a function",
+        end_quote="am going to use the chain",
+        title="Setting Up a Composite Function Derivative Problem",
+        learning_objective=(
+            "Identify the notation and goal of finding the derivative of a "
+            "composite function like sin(x)^2."
+        ),
+        facet="Problem Setup",
+        reason=(
+            "Identify the notation and goal of finding the derivative of a "
+            "composite function like sin(x)^2."
+        ),
+        informativeness=0.9,
+        topic_relevance=1.0,
+        educational_importance=0.8,
+        difficulty=0.3,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        topic_evidence_quote=(
+            "what i'm curious about is what is h prime of x"
+        ),
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+        uncertainty="low",
+        uncertainty_reasons=[],
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="chain rule",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_start_line"] == 12
+    assert clip["_end_line"] == 29
+    assert clip["_clip_text"].endswith("going to use the chain rule")
+    assert "i am going to use the chain" not in clip["_clip_text"]
+    assert "comes into play" not in clip["_clip_text"]
+    assert clip["end_quote"] == "chain rule"
+    assert "trimmed_repeated_caption_tail" in clip["_boundary_fallback_reasons"]
+    assert clip["edge_projection"]["end"] == {
+        "required": True,
+        "cue_id": "0T0QrHO56qg:cue:29",
+        "quote": "chain rule",
+    }
+
+    from backend.app.ingestion import pipeline as ingestion_pipeline
+
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:live-chain-rule-setup",
+        "duration": segments[-1]["end"],
+        "segments": segments,
+    }
+    caption = ingestion_pipeline._supadata_boundary_diagnostics(
+        transcript,
+        clip,
+    )
+    assert caption is not None
+    bounds, projection, error = ingestion_pipeline._projected_speech_bounds(
+        transcript,
+        clip,
+        caption,
+        None,
+    )
+
+    assert error is None
+    assert bounds[1] == pytest.approx(60.438, abs=0.001)
+    assert bounds[1] < 62.64
+    assert projection["end"]["excluded_neighbor_onset_sec"] == 60.711
+
+
+def test_repeated_compound_noun_without_a_repeated_clause_is_not_trimmed() -> None:
+    segments = [
+        {"cue_id": "cue-0", "start": 0.0, "end": 3.0,
+         "text": "We label the very high energy"},
+        {"cue_id": "cue-1", "start": 3.0, "end": 6.0,
+         "text": "particle collision model the very high energy particle"},
+        {"cue_id": "cue-2", "start": 6.0, "end": 9.0,
+         "text": "collision model predicts detector response"},
+    ]
+
+    assert G._trim_repeated_rolling_caption_tail(segments, 1, "particle") is None
+
+
+def test_repeated_clause_with_substantive_middle_content_is_not_trimmed() -> None:
+    segments = [
+        {"cue_id": "cue-0", "start": 0.0, "end": 3.0,
+         "text": "We will use the"},
+        {"cue_id": "cue-1", "start": 3.0, "end": 9.0,
+         "text": (
+             "chain rule because it composes derivatives clearly and we will "
+             "use the chain"
+         )},
+        {"cue_id": "cue-2", "start": 9.0, "end": 12.0,
+         "text": "rule for the worked example"},
+    ]
+
+    assert G._trim_repeated_rolling_caption_tail(segments, 1, "the chain") is None
+
+
 def test_boundary_only_end_uncertainty_is_diagnostic_not_a_rejection() -> None:
     segments = [{
         "cue_id": "cue-0",

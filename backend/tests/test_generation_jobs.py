@@ -314,6 +314,7 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
         "quality_silence_v27",
         "quality_silence_v28",
         "quality_silence_v29",
+        "quality_silence_v30",
     ],
 )
 def test_request_key_version_invalidates_stale_inventory(
@@ -332,7 +333,7 @@ def test_request_key_version_invalidates_stale_inventory(
         "target_clip_duration_min_sec": 20,
         "target_clip_duration_max_sec": 55,
     }
-    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v30"
+    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v31"
     verified_key = jobs.build_request_key(**params)
     monkeypatch.setattr(jobs, "REQUEST_SCHEMA_VERSION", stale_version)
 
