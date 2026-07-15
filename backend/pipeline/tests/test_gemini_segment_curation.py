@@ -1377,6 +1377,159 @@ def test_adjacent_facets_inside_one_coarse_cue_remain_distinct():
     assert report.clips[1]["_clip_text"].startswith("ATP hydrolysis releases energy")
 
 
+@pytest.mark.parametrize(
+    (
+        "current_text",
+        "next_text",
+        "start_quote",
+        "end_quote",
+        "evidence_quote",
+        "expected_ending",
+        "excluded",
+    ),
+    [
+        (
+            "We apply the outer derivative and multiply by the inner derivative. "
+            "The final answer is 20 times 5x plus 3 raised to the thir",
+            "power so that's the final answer fully simplified now let's work on "
+            "some more examples beginning with x squared.",
+            "We apply the outer derivative",
+            "plus 3 raised to the thir",
+            "multiply by the inner derivative The final answer",
+            "the thir power so that's the final answer fully simplified",
+            "now let's work on",
+        ),
+        (
+            "We multiply by the inner derivative. The answer is simply 6 cosine",
+            "6X now what is the derivative of cosine x2? We use the chain rule.",
+            "We multiply by the inner derivative",
+            "answer is simply 6 cosine",
+            "multiply by the inner derivative The answer is simply",
+            "answer is simply 6 cosine 6X",
+            "what is the derivative of cosine x2",
+        ),
+        (
+            "Applying the chain rule gives the final answer is negative 2X sin",
+            "X2 find the derivative of tangent x cubed in the next problem.",
+            "Applying the chain rule",
+            "final answer is negative 2X sin",
+            "Applying the chain rule gives the final answer",
+            "final answer is negative 2X sin X2",
+            "find the derivative of tangent",
+        ),
+    ],
+)
+def test_split_caption_answer_tail_stops_before_the_next_learning_unit(
+    current_text: str,
+    next_text: str,
+    start_quote: str,
+    end_quote: str,
+    evidence_quote: str,
+    expected_ending: str,
+    excluded: str,
+):
+    segments = [
+        {"cue_id": "answer", "start": 0.0, "end": 12.0, "text": current_text},
+        {"cue_id": "next-unit", "start": 11.7, "end": 24.0, "text": next_text},
+    ]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote=start_quote,
+            end_quote=end_quote,
+            topic_evidence_quote=evidence_quote,
+        )]),
+        segments,
+        [],
+        {},
+        topic="chain rule worked examples",
+    )
+
+    assert len(report.clips) == 1
+    clip = report.clips[0]
+    assert clip["cue_ids"] == ["answer", "next-unit"]
+    assert clip["_clip_text"].endswith(expected_ending)
+    assert excluded not in clip["_clip_text"]
+    assert clip["edge_projection"]["end"]["cue_id"] == "next-unit"
+    assert "completed_split_caption_tail" in clip["_boundary_fallback_reasons"]
+
+
+@pytest.mark.parametrize("next_start", [12.0, 20.0])
+def test_split_caption_tail_does_not_import_an_unmarked_or_distant_section(
+    next_start: float,
+):
+    segments = [
+        {
+            "cue_id": "derivative",
+            "start": 0.0,
+            "end": 12.0,
+            "text": "A derivative measures instantaneous change in a function.",
+        },
+        {
+            "cue_id": "integral",
+            "start": next_start,
+            "end": next_start + 8.0,
+            "text": "An integral accumulates a quantity across an interval.",
+        },
+    ]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="A derivative measures instantaneous change",
+            end_quote="instantaneous change in a function",
+            topic_evidence_quote="A derivative measures instantaneous change in a function",
+        )]),
+        segments,
+        [],
+        {},
+        topic="derivatives",
+    )
+
+    assert len(report.clips) == 1
+    assert report.clips[0]["cue_ids"] == ["derivative"]
+    assert "integral" not in report.clips[0]["_clip_text"].casefold()
+
+
+def test_split_caption_tail_does_not_stop_inside_a_split_predicate():
+    segments = [
+        {
+            "cue_id": "subject",
+            "start": 0.0,
+            "end": 6.0,
+            "text": "One of the most fascinating aspects of calculus",
+        },
+        {
+            "cue_id": "predicate",
+            "start": 6.0,
+            "end": 13.0,
+            "text": "is how limits, derivatives, and integrals relate to one another.",
+        },
+    ]
+    current = _topic(
+        0,
+        0,
+        candidate_id="relationship-setup",
+        end_quote="most fascinating aspects of calculus",
+    )
+    next_facet = _topic(
+        1,
+        1,
+        candidate_id="relationship-predicate",
+        start_quote="how limits derivatives and integrals relate",
+    )
+
+    assert G._complete_split_caption_tail(
+        segments,
+        0,
+        current.end_quote,
+        proposals=[current, next_facet],
+        proposal_index=0,
+        ignore_caption_case=True,
+    ) is None
+
+
 def test_optional_example_setup_after_a_complete_conclusion_is_excluded():
     text = (
         "The arithmetic mean equals the sum divided by the count, so the value is four. "

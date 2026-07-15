@@ -658,6 +658,25 @@ _PEDAGOGICAL_SETUP_ONSET_RE = re.compile(
     r"(?:how|what|when|where|which|why)\b)",
     re.IGNORECASE,
 )
+_SPLIT_CAPTION_COMPLETION_SIGNAL_RE = re.compile(
+    r"\b(?:(?:the\s+)?(?:answer|result|solution)\s+(?:is|equals?)|"
+    r"(?:final|simplified)\s+(?:answer|result|solution)|"
+    r"fully\s+simplified|that(?:['’]s|\s+is)\s+the\s+final\s+answer)\b",
+    re.IGNORECASE,
+)
+_SPLIT_CAPTION_ONSET_MARKER_RE = re.compile(
+    r"(?<!\w)(?:(?:all\s+right|alright|okay|ok|so|now|next)"
+    r"\s*[,;:]?\s+)+$",
+    re.IGNORECASE,
+)
+_SPLIT_CAPTION_NEW_UNIT_FRAMING_RE = re.compile(
+    r"(?<!\w)(?:(?:all\s+right|alright|okay|ok|so)\s*[,;:]?\s+)*"
+    r"(?:now\s+)?let(?:['’]?s|\s+us)\s+"
+    r"(?:do|go\s+through|look\s+at|try|work\s+on|work\s+through)\s+"
+    r"(?:(?:some|a)\s+)?(?:more|another|next|new)\s+"
+    r"(?:calculation|case|derivation|example|exercise|problem|proof)s?\b",
+    re.IGNORECASE,
+)
 _OPENING_PREPOSITIONAL_TAG_RE = re.compile(
     r"^\s*(?:for|by|during|from|in|into|of|onto|to|with|without)\b"
     r"[^.!?]{0,160}\b(?:right|correct)\s*\?\s*$",
@@ -3933,6 +3952,136 @@ def _projected_end_is_complete(
     )
 
 
+def _complete_split_caption_tail(
+    segments: list[dict],
+    end_line: int,
+    end_quote: str,
+    *,
+    proposals: list[object],
+    proposal_index: int,
+    ignore_caption_case: bool,
+    anchor_text: str = "",
+) -> tuple[int, str] | None:
+    """Project a short answer suffix that precedes the next teaching unit.
+
+    Transcript providers may split a formula or concluding phrase at an
+    arbitrary character boundary.  Import only the immediate next-cue prefix,
+    and only when a grounded new-unit onset gives that prefix a safe stop.
+    """
+    next_line = end_line + 1
+    if next_line >= len(segments):
+        return None
+    current_text = str(segments[end_line].get("text") or "")
+    next_text = str(segments[next_line].get("text") or "")
+    if not current_text.strip() or not next_text.strip():
+        return None
+    try:
+        current_end = float(segments[end_line].get("end"))
+        next_start = float(segments[next_line].get("start"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(current_end) or not math.isfinite(next_start):
+        return None
+    if next_start - current_end >= _SECTION_RESET_GAP_S:
+        return None
+
+    current_span, current_projected, current_error = _semantic_edge_quote(
+        current_text,
+        end_quote,
+        want="end",
+    )
+    if current_error or current_span is None or current_projected:
+        return None
+    selected_current = current_text[:current_span[1]].rstrip()
+    selected_tail = " ".join(selected_current.split()[-32:])
+    has_explicit_closure = bool(
+        _SPLIT_CAPTION_COMPLETION_SIGNAL_RE.search(selected_tail)
+    )
+    has_weak_end = _cue_has_weak_end(
+        selected_current,
+        next_text,
+        ignore_caption_case=ignore_caption_case,
+    )
+    if not has_explicit_closure and not has_weak_end:
+        return None
+
+    onset_candidates: list[int] = []
+    noise_start = _trailing_edge_noise_start(
+        next_text,
+        anchor_text=anchor_text,
+    )
+    if noise_start is not None:
+        onset_candidates.append(noise_start)
+    onset_candidates.extend(
+        match.start() for match in _HARD_TOPIC_RESET_RE.finditer(next_text)
+    )
+    onset_candidates.extend(
+        match.start()
+        for match in _SPLIT_CAPTION_NEW_UNIT_FRAMING_RE.finditer(next_text)
+    )
+
+    for other_index, proposal in enumerate(proposals):
+        if other_index == proposal_index:
+            continue
+        if getattr(proposal, "start_line", None) != next_line:
+            continue
+        proposal_quote = str(getattr(proposal, "start_quote", "") or "").strip()
+        proposal_spans = _quote_character_spans(next_text, proposal_quote)
+        if len(proposal_spans) != 1:
+            continue
+        onset = proposal_spans[0][0]
+        marker = _SPLIT_CAPTION_ONSET_MARKER_RE.search(next_text[:onset])
+        onset_candidates.append(marker.start() if marker is not None else onset)
+
+    # Bare questions and imperatives are safe only immediately after a short
+    # continuation prefix.  This avoids treating reasoning such as "we find"
+    # inside a worked solution as the start of another unit.
+    if has_explicit_closure:
+        for word in _WORD_RE.finditer(next_text):
+            onset = word.start()
+            if len(_toks(next_text[:onset])) > 3:
+                break
+            if _PEDAGOGICAL_SETUP_ONSET_RE.match(next_text[onset:]):
+                onset_candidates.append(onset)
+                break
+
+    max_prefix_words = 12 if has_explicit_closure else 5
+    for onset in sorted(set(onset_candidates)):
+        if onset <= 0 or not _WORD_RE.search(next_text[onset:]):
+            continue
+        prefix = next_text[:onset].rstrip(" ,;:—-")
+        prefix_matches = list(_WORD_RE.finditer(prefix))
+        if not 1 <= len(prefix_matches) <= max_prefix_words:
+            continue
+        if _cue_is_only_structural_filler(prefix):
+            continue
+        completed_text = f"{selected_current} {prefix}"
+        if (
+            _terminal_content_is_explicitly_incomplete(completed_text)
+            or _TERMINAL_DANGLING_PREDICATE_HEAD_RE.search(completed_text)
+            or _cue_has_explicit_dangling_end(
+                completed_text,
+                next_text[onset:],
+            )
+        ):
+            continue
+
+        # Start with the normal six-word edge quote and lengthen only when the
+        # normalized occurrence would be ambiguous inside this coarse cue.
+        initial_width = min(6, len(prefix_matches))
+        for width in range(initial_width, min(12, len(prefix_matches)) + 1):
+            quote = prefix[
+                prefix_matches[-width].start():prefix_matches[-1].end()
+            ]
+            spans = _quote_character_spans(next_text, quote)
+            if len(spans) != 1:
+                continue
+            span = spans[0]
+            if _WORD_RE.search(next_text[span[1]:]):
+                return next_line, quote
+    return None
+
+
 def _recover_projected_start_within_cue(
     text: str,
     quote_span: tuple[int, int],
@@ -5439,6 +5588,7 @@ def _plan_to_report(
         trimmed_incomplete_end_suffix = False
         trimmed_visual_end_suffix = False
         completed_forward_sentence = False
+        completed_split_caption_tail = False
         start_recovered_forward = False
         trimmed_terminal_meta_suffix = False
         boundary_fallback_reasons: list[str] = []
@@ -5914,6 +6064,28 @@ def _plan_to_report(
             trimmed_terminal_meta_suffix = True
             quote_repaired = True
             boundary_fallback_reasons.append("trimmed_terminal_meta_suffix")
+        if not trimmed_visual_end_suffix and not trimmed_terminal_meta_suffix:
+            split_caption_completion = _complete_split_caption_tail(
+                segments,
+                b,
+                end_quote,
+                proposals=list(plan.topics),
+                proposal_index=index,
+                ignore_caption_case=ignore_caption_case,
+                anchor_text=(
+                    f"{evidence_quote_for_section} {objective_for_section}"
+                ),
+            )
+            if split_caption_completion is not None:
+                b, end_quote = split_caption_completion
+                end_text = str(segments[b].get("text") or "").strip()
+                repaired_end_edge = True
+                fallback_end_edge = False
+                completed_split_caption_tail = True
+                quote_repaired = True
+                boundary_fallback_reasons.append(
+                    "completed_split_caption_tail"
+                )
         quote_repaired = quote_repaired or repaired_start_edge or repaired_end_edge
 
         # Run discourse closure against the teaching slice the model selected, not
@@ -5937,6 +6109,7 @@ def _plan_to_report(
         )
         projected_end_is_complete = bool(
             trimmed_terminal_meta_suffix
+            or completed_split_caption_tail
             or (
                 not projected_end_needs_continuation
                 and len(preliminary_end_spans) == 1
@@ -6219,6 +6392,7 @@ def _plan_to_report(
             and not trimmed_visual_end_suffix
             and not trimmed_terminal_meta_suffix
             and not completed_forward_sentence
+            and not completed_split_caption_tail
         ):
             expanded_end_text = str(segments[b].get("text") or "")
             following_end_text = (

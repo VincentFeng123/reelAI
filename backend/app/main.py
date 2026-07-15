@@ -352,7 +352,7 @@ assessment_service = AssessmentService()
 MAX_REELS_PER_MATERIAL = 300
 GENERATION_OUTPUT_CEILINGS = {"fast": 8, "slow": 12}
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v20"
+SELECTION_CONTRACT_VERSION = "quality_silence_v21"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -2649,8 +2649,15 @@ def _usable_boundary_reel_ids(conn, reel_ids: list[str]) -> set[str]:
             surface_eligible = surface_eligible.strip().lower() in {
                 "1", "true", "yes", "on",
             }
-        if surface_eligible is True and _search_context_has_usable_boundary(
-            context, t_start=row.get("t_start"), t_end=row.get("t_end")
+        surface_reason = (
+            str(context.get("surface_reason") or "").strip().lower()
+            if isinstance(context, dict)
+            else ""
+        )
+        if (surface_eligible is True or surface_reason == "level_mismatch") and (
+            _search_context_has_usable_boundary(
+                context, t_start=row.get("t_start"), t_end=row.get("t_end")
+            )
         ):
             usable.add(str(row.get("id") or ""))
     return usable
