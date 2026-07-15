@@ -87,6 +87,14 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
     }
 
 
+def test_practice_fast_expansion_requests_focused_sources() -> None:
+    prompt = " ".join(expand._PRACTICE_FAST_SYSTEM.casefold().split())
+
+    assert "prefer focused teaching videos" in prompt
+    assert "never query for a full course" in prompt
+    assert "unless the user explicitly requests that format" in prompt
+
+
 def test_practice_fast_expansion_keeps_only_queries_preserving_every_intent_constraint(
     monkeypatch,
 ):
@@ -343,10 +351,11 @@ def test_practice_fast_expansion_stores_success_for_reuse(monkeypatch):
 
 def test_practice_fast_expansion_cache_outlives_segment_ttl_and_expires(monkeypatch):
     cached_row = {
-        "response_json": (
-            '{"version":5,"corrected":"Physics",'
-            '"queries":["physics lecture","mechanics","waves"]}'
-        ),
+        "response_json": json.dumps({
+            "version": expand.PRACTICE_FAST_EXPAND_CACHE_VERSION,
+            "corrected": "Physics",
+            "queries": ["physics lecture", "mechanics", "waves"],
+        }),
         "created_at": (
             datetime.now(timezone.utc)
             - timedelta(seconds=segment_cache.SEGMENT_CACHE_TTL_SEC - 60)
@@ -1373,6 +1382,108 @@ def test_analysis_prefix_does_not_promote_a_distant_channel_result():
     )
 
     assert [video["id"] for video in selected[:2]] == ["ranked-0", "ranked-1"]
+
+
+def test_analysis_prefix_defers_multi_hour_courses_when_focused_sources_exist():
+    ranked = [
+        {
+            "id": "full-course",
+            "channel": "Open College",
+            "duration": 42_828,
+            "literal_match": False,
+            "matched_families": ["calculus"],
+        },
+        {
+            "id": "focused-limits",
+            "channel": "Open College",
+            "duration": 5_246,
+            "literal_match": False,
+            "matched_families": ["limits"],
+        },
+        {
+            "id": "focused-derivatives",
+            "channel": "Math Lessons",
+            "duration": 2_400,
+            "literal_match": False,
+            "matched_families": ["derivatives"],
+        },
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=3,
+        excluded=set(),
+        analysis_prefix=2,
+    )
+
+    assert [video["id"] for video in selected] == [
+        "focused-limits",
+        "focused-derivatives",
+        "full-course",
+    ]
+
+
+def test_multi_hour_source_remains_available_without_enough_focused_sources():
+    ranked = [
+        {
+            "id": "full-course",
+            "duration": 42_828,
+            "literal_match": False,
+            "matched_families": ["calculus"],
+        },
+        {
+            "id": "focused-limits",
+            "duration": 5_246,
+            "literal_match": False,
+            "matched_families": ["limits"],
+        },
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=2,
+        excluded=set(),
+        analysis_prefix=2,
+    )
+
+    assert [video["id"] for video in selected] == [
+        "full-course",
+        "focused-limits",
+    ]
+
+
+def test_multi_hour_source_remains_in_oversampled_discovery_pool():
+    ranked = [
+        {
+            "id": "full-course",
+            "duration": 42_828,
+            "literal_match": False,
+            "matched_families": ["calculus"],
+        },
+        *[
+            {
+                "id": f"focused-{index}",
+                "duration": 1_800 + index,
+                "literal_match": False,
+                "matched_families": [f"facet-{index}"],
+            }
+            for index in range(5)
+        ],
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=4,
+        excluded=set(),
+        analysis_prefix=2,
+    )
+
+    assert [video["id"] for video in selected] == [
+        "focused-0",
+        "focused-1",
+        "full-course",
+        "focused-2",
+    ]
 
 
 def test_search_all_runs_requested_prefix_concurrently(monkeypatch):

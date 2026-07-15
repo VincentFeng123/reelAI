@@ -560,8 +560,10 @@ _UNCONDITIONAL_TRAILING_EDGE_NOISE_PATTERN = (
     r"(?:chapter|lesson|section|video))\b|"
     r"(?:there\s+(?:are|is)\s+(?:many|some|several)\s+"
     r"(?:(?:other|more)\s+)?examples?\s*[,;:]?\s*(?:so\s+)?)?"
-    r"(?:i(?:['’]ll|\s+will)?\s+leave\s+[^.!?\n]{0,80}?\s+as\s+|"
-    r"as\s+|for\s+)(?:an?\s+)?exercise\b|"
+    r"(?:(?:i|we)(?:['’]ll|\s+will)?\s+leave\s+[^.!?\n]{0,80}?\s+as\s+"
+    r"(?:an?\s+)?exercise\b|as\s+an?\s+exercise(?:\s*[,;:]|\s+"
+    r"(?:(?:to\s+)?(?:calculate|derive|determine|differentiate|find|prove|"
+    r"show|solve|try|work|write))\b))|"
     r"for\s+homework\b"
     r")"
 )
@@ -2026,9 +2028,14 @@ def _trim_trailing_incomplete_suffix(
             return end_line if forward_setup else None
         previous_text = str(segments[previous_line].get("text") or "").strip()
         if unconditional_edge_noise or version_edge_noise:
+            retained_prefix = _cue_clip_text(
+                segments,
+                start_line,
+                previous_line,
+            )
             return (
                 previous_line
-                if _last_safe_complete_prefix(previous_text)
+                if _last_safe_complete_prefix(retained_prefix)
                 else None
             )
         if (

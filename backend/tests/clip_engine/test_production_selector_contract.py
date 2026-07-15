@@ -1167,6 +1167,73 @@ def test_same_unit_future_step_is_not_unconditional_trailing_noise() -> None:
     assert gemini_segment._unconditional_trailing_edge_noise_start(text) is None
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "As exercise intensity increases, heart rate rises.",
+        "For exercise physiology, derivatives quantify the rate of change.",
+        "As an exercise physiologist, I use derivatives to measure change.",
+        "As an exercise in symmetry, this proof reveals the invariant.",
+    ],
+)
+def test_substantive_exercise_phrase_is_not_an_assignment(text: str) -> None:
+    assert (
+        gemini_segment._unconditional_trailing_edge_noise_start(
+            text,
+            require_edge_prefix=True,
+        )
+        is None
+    )
+
+
+def test_explicit_assignment_opening_is_trailing_noise() -> None:
+    assert (
+        gemini_segment._unconditional_trailing_edge_noise_start(
+            "As an exercise, differentiate x squared.",
+            require_edge_prefix=True,
+        )
+        == 0
+    )
+
+
+def test_short_complete_conclusion_survives_a_trailing_assignment_cue() -> None:
+    segments = [
+        {
+            "cue_id": "constant-explanation",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "The derivative of a constant vanishes because its output "
+                "never changes."
+            ),
+        },
+        {
+            "cue_id": "constant-conclusion",
+            "start": 8.0,
+            "end": 9.0,
+            "text": "Thus zero.",
+        },
+        {
+            "cue_id": "next-exercise",
+            "start": 9.0,
+            "end": 14.0,
+            "text": "As an exercise, differentiate x squared.",
+        },
+    ]
+
+    trimmed_end = gemini_segment._trim_trailing_incomplete_suffix(
+        segments,
+        0,
+        2,
+        protected_quote=(
+            "derivative of a constant vanishes because its output"
+        ),
+        learning_objective="Explain why the derivative of a constant is zero",
+    )
+
+    assert trimmed_end == 1
+
+
 def test_requested_formula_version_comparison_keeps_both_versions() -> None:
     text = (
         "The indefinite integration by parts identity is integral u d v equals "

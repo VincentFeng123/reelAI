@@ -42,6 +42,7 @@ _LONG_TOPIC_RELATION = re.compile(
     r"\b(?:work together|interact|combine|to maintain|to preserve|to pass|across)\b",
     re.IGNORECASE,
 )
+_FOCUSED_ANALYSIS_SOURCE_MAX_SEC = 2 * 60 * 60
 
 
 def _difficulty_bootstrap_query(topic: str, level: str | None) -> str:
@@ -166,19 +167,28 @@ def _select_ranked_candidates(
         max(0, int(limit)),
         max(1, int(analysis_prefix if analysis_prefix is not None else limit)),
     )
+    focused = []
+    for video in eligible:
+        try:
+            duration = float(video.get("duration") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            duration = 0.0
+        if 0.0 < duration <= _FOCUSED_ANALYSIS_SOURCE_MAX_SEC or duration <= 0.0:
+            focused.append(video)
+    analysis_pool = focused if len(focused) >= prefix_limit else eligible
     if limit <= 1 or (len(eligible) <= limit and prefix_limit >= limit):
         return eligible[:limit]
 
     non_literal = [
         video
-        for video in eligible
+        for video in analysis_pool
         if not video.get("literal_match")
     ]
     if not non_literal:
         return eligible[:limit]
 
     reserve = min(2, max(1, prefix_limit // 3))
-    selected = eligible[: max(0, prefix_limit - reserve)]
+    selected = analysis_pool[: max(0, prefix_limit - reserve)]
     selected_ids = {str(video.get("id") or "") for video in selected}
     selected_families = {
         str(family)
@@ -226,6 +236,13 @@ def _select_ranked_candidates(
         selected_families.update(families)
         if len(selected) >= prefix_limit:
             break
+    for video in analysis_pool:
+        video_id = str(video.get("id") or "")
+        if len(selected) >= prefix_limit:
+            break
+        if video_id not in selected_ids:
+            selected.append(video)
+            selected_ids.add(video_id)
     for video in eligible:
         video_id = str(video.get("id") or "")
         if len(selected) >= limit:

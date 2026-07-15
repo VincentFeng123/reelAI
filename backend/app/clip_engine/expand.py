@@ -43,7 +43,7 @@ PRACTICE_FAST_EXPAND_MODEL = "gemini-3.1-flash-lite"
 # Gemini rejects manually configured deadlines below ten seconds.
 PRACTICE_FAST_EXPAND_TIMEOUT_MS = 10_000
 PRACTICE_FAST_EXPAND_OUTPUT_TOKENS = 1_024
-PRACTICE_FAST_EXPAND_CACHE_VERSION = 5
+PRACTICE_FAST_EXPAND_CACHE_VERSION = 6
 # An expansion can be nearly one segment-cache lifetime old when it discovers a
 # newly analyzed source. Keeping it for two lifetimes guarantees that source's
 # subsequent valid segment-cache lifetime never triggers another expansion call.
@@ -96,6 +96,8 @@ Do this:
 5. In the optimized query list, prioritize substantive spoken lessons, lectures, or worked
    explanations with natural pauses and little or no background music. Avoid Shorts, reaction
    videos, compilations, montages, and explanations that only work when unseen visuals are shown.
+   Prefer focused teaching videos. Never query for a full course, complete course, marathon,
+   playlist, or lecture series unless the user explicitly requests that format.
 6. Before writing queries, decompose the exact request into atomic mandatory intent constraints.
    Give every named subject, requested operation or task, requested relationship, scope qualifier,
    and requested outcome its own constraint. Copy the exact words that introduced each constraint
