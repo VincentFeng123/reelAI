@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from backend import config as backend_config
 from backend.app.clip_engine import config as clip_engine_config
 from backend.app.clip_engine.errors import ProviderBudgetExceededError
 from backend.app.clip_engine.provider_cache import (
@@ -19,6 +20,7 @@ from backend.app.clip_engine.provider_runtime import (
     GenerationContext,
     bounded_retry_after,
 )
+from backend.pipeline import gemini_segment
 
 VIDEO_ID = "dQw4w9WgXcQ"
 
@@ -197,14 +199,14 @@ def test_generation_context_enforces_actual_gemini_call_and_cost_budgets() -> No
     slow_budget = slow_flash.budget.snapshot()["gemini"]
     assert slow_budget["flash_selector_calls"] == 3
     assert slow_budget["flash_selector_limit"] == 3
-    assert slow_budget["cost_limit_usd"] == pytest.approx(0.19)
+    assert slow_budget["cost_limit_usd"] == pytest.approx(0.30)
 
 
 @pytest.mark.parametrize(
     ("mode", "selector_count", "cost_limit"),
-    [("fast", 2, 0.13), ("slow", 3, 0.19)],
+    [("fast", 2, 0.20), ("slow", 3, 0.30)],
 )
-def test_job_cost_budget_fits_expansion_and_realistic_long_transcript_selectors(
+def test_job_cost_budget_fits_expansion_and_typical_whole_transcript_selectors(
     mode: str,
     selector_count: int,
     cost_limit: float,
@@ -219,16 +221,19 @@ def test_job_cost_budget_fits_expansion_and_realistic_long_transcript_selectors(
     for _ in range(selector_count):
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
-            model="gemini-3-flash-preview",
-            estimated_input_tokens=40_000,
-            max_output_tokens=10_240,
+            model=backend_config.SEGMENT_FLASH_MODEL,
+            estimated_input_tokens=16_500,
+            max_output_tokens=gemini_segment._BOUNDARY_OUTPUT_TOKENS,
         )
 
     budget = context.budget.snapshot()["gemini"]
     expected_reserved_cost = (
         1_000 * 0.25
         + 1_024 * 1.5
-        + selector_count * (40_000 * 0.5 + 10_240 * 3.0)
+        + selector_count * (
+            16_500 * 1.5
+            + gemini_segment._BOUNDARY_OUTPUT_TOKENS * 9.0
+        )
     ) / 1_000_000.0
     assert budget["flash_selector_calls"] == selector_count
     assert budget["reserved_cost_usd"] == pytest.approx(expected_reserved_cost)
@@ -322,7 +327,7 @@ def test_generation_usage_payload_aggregates_stage_tokens_cost_and_fallbacks() -
         "request_failure:RuntimeError": 1,
     }
     assert payload["by_stage"]["selection"]["calls"] == 1
-    assert payload["budget"]["gemini"]["cost_limit_usd"] == 0.13
+    assert payload["budget"]["gemini"]["cost_limit_usd"] == 0.20
 
 
 def test_generation_usage_counts_selector_retries_as_physical_attempts_once() -> None:

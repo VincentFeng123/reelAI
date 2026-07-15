@@ -70,7 +70,7 @@ SEGMENT_ROUTING_MODE = (
     else "pro_only"
 )
 SEGMENT_FLASH_MODEL = (
-    os.environ.get("SEGMENT_FLASH_MODEL", "").strip() or "gemini-3-flash-preview"
+    os.environ.get("SEGMENT_FLASH_MODEL", "").strip() or "gemini-3.5-flash"
 )
 # SEGMENT_MODEL was the original Pro-only selector model. Keep it as the
 # highest-precedence migration override so existing deployments do not change models.

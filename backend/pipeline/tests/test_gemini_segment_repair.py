@@ -46,34 +46,6 @@ def _topic(start: int, end: int, *, title: str) -> G._BoundaryTopic:
     )
 
 
-def _intent_selector(
-    topic: str,
-    topics: list[G._BoundaryTopic],
-) -> G._IntentBoundaryPlan:
-    return G._IntentBoundaryPlan(
-        request_intent={
-            "exact_request": topic,
-            "constraints": [{
-                "constraint_id": "subject",
-                "kind": "subject",
-                "source_phrase": topic,
-                "requirement": "Teach the exact requested subject",
-            }],
-        },
-        topics=[
-            G._IntentBoundaryTopic.model_validate({
-                **item.model_dump(mode="python"),
-                "intent_role": "primary",
-                "intent_evidence": [{
-                    "constraint_id": "subject",
-                    "evidence_quote": item.topic_evidence_quote,
-                }],
-            })
-            for item in topics
-        ],
-    )
-
-
 def _transcript() -> dict:
     texts = [
         "A complete setup introduces the equation.",
@@ -1255,7 +1227,7 @@ def test_complete_teaching_before_incomplete_edge_suffix_is_recovered() -> None:
 
     assert report.rejected_reasons == []
     [clip] = report.clips
-    assert clip["_clip_text"].endswith("which repeats the cycle")
+    assert clip["_clip_text"].endswith("which repeats the cycle.")
     assert "brain" not in clip["_clip_text"]
     assert "trimmed_incomplete_end_suffix" in clip["_boundary_fallback_reasons"]
 
@@ -1792,7 +1764,7 @@ def test_complete_cannot_explanation_is_not_mistaken_for_a_forward_setup() -> No
 
 def test_dirty_edges_use_only_the_one_low_thinking_selector_call(monkeypatch):
     transcript = _transcript()
-    selector = _intent_selector("equations", [
+    selector = G._BoundaryPlan(topics=[
         _topic(3, 4, title="equation"),
         _topic(9, 10, title="equilibrium"),
         _topic(13, 13, title="stoichiometry"),
@@ -1803,7 +1775,7 @@ def test_dirty_edges_use_only_the_one_low_thinking_selector_call(monkeypatch):
 
     def fake_call(system, user, schema, **kwargs):
         calls.append((system, user, schema, kwargs))
-        assert schema is G._IntentBoundaryPlan
+        assert schema is G._CompactBoundaryPlan
         return selector, {"operation": kwargs["operation"]}
 
     monkeypatch.setattr(G, "_call_model", fake_call)
@@ -1820,10 +1792,10 @@ def test_dirty_edges_use_only_the_one_low_thinking_selector_call(monkeypatch):
 
     assert len(calls) == 1
     _system, selector_user, schema, kwargs = calls[0]
-    assert schema is G._IntentBoundaryPlan
+    assert schema is G._CompactBoundaryPlan
     assert kwargs["model"] == G.config.SEGMENT_FLASH_MODEL
     assert kwargs["thinking_level"] == "low"
-    assert kwargs["max_output_tokens"] == 10_240
+    assert kwargs["max_output_tokens"] == 8_192
     assert kwargs["timeout_s"] == 28.0
     assert kwargs["max_retries"] == 0
     assert kwargs["operation"] == "flash_boundary_selector"
@@ -1849,7 +1821,7 @@ def test_dirty_edges_use_only_the_one_low_thinking_selector_call(monkeypatch):
 
 def test_no_boundary_repair_is_attempted_after_selector_validation(monkeypatch):
     transcript = _transcript()
-    selector = _intent_selector("stoichiometry", [
+    selector = G._BoundaryPlan(topics=[
         _topic(3, 4, title="equation"),
         _topic(13, 13, title="stoichiometry"),
     ])
@@ -1858,7 +1830,7 @@ def test_no_boundary_repair_is_attempted_after_selector_validation(monkeypatch):
     def fake_call(system, user, schema, **kwargs):
         nonlocal calls
         calls += 1
-        if schema is G._IntentBoundaryPlan:
+        if schema is G._CompactBoundaryPlan:
             return selector, {"operation": kwargs["operation"]}
         raise RuntimeError("repair unavailable")
 
@@ -1881,13 +1853,13 @@ def test_no_boundary_repair_is_attempted_after_selector_validation(monkeypatch):
 
 def test_candidates_are_validated_independently_without_model_repair(monkeypatch):
     transcript = _transcript()
-    selector = _intent_selector("equations", [
+    selector = G._BoundaryPlan(topics=[
         _topic(3, 4, title="equation"),
         _topic(9, 10, title="equilibrium"),
         _topic(13, 13, title="stoichiometry"),
     ])
     def fake_call(system, user, schema, **kwargs):
-        assert schema is G._IntentBoundaryPlan
+        assert schema is G._CompactBoundaryPlan
         return selector, {"operation": kwargs["operation"]}
 
     monkeypatch.setattr(G, "_call_model", fake_call)
@@ -1907,7 +1879,7 @@ def test_candidates_are_validated_independently_without_model_repair(monkeypatch
 
 def test_clean_fast_path_never_dispatches_boundary_repair(monkeypatch):
     transcript = _transcript()
-    selector = _intent_selector("chemistry", [
+    selector = G._BoundaryPlan(topics=[
         _topic(13, 13, title="stoichiometry"),
     ])
     calls = []
@@ -1925,6 +1897,6 @@ def test_clean_fast_path_never_dispatches_boundary_repair(monkeypatch):
         deadline_monotonic=time.monotonic() + 10,
     )
 
-    assert calls == [G._IntentBoundaryPlan]
+    assert calls == [G._CompactBoundaryPlan]
     assert result.classification == "green"
     assert result.accepted_count == 1

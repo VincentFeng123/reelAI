@@ -19,6 +19,7 @@ def test_provider_schemas_avoid_unsupported_additional_properties():
     for schema in (
         G._Plan,
         G._BoundaryPlan,
+        G._CompactBoundaryPlan,
         G._IntentBoundaryPlan,
         G._BoundaryRepairPlan,
         G._EnrichmentPlan,
@@ -595,7 +596,7 @@ def test_schema_failure_preserves_successful_call_usage_telemetry(monkeypatch):
 def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
     monkeypatch,
 ):
-    valid = G._IntentBoundaryTopic(
+    valid = G._CompactBoundaryTopic(
         candidate_id="candidate-alpha",
         start_line=0,
         end_line=0,
@@ -604,7 +605,6 @@ def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
         title="Alpha lesson",
         learning_objective="Understand the complete alpha lesson.",
         facet="alpha",
-        reason="Complete grounded teaching.",
         informativeness=0.9,
         topic_relevance=0.9,
         educational_importance=0.9,
@@ -615,16 +615,9 @@ def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
         topic_evidence_quote="Alpha lesson defines the concept completely",
         self_contained=True,
         is_standalone=True,
-        prerequisite_candidate_ids=[],
-        uncertainty="low",
-        uncertainty_reasons=[],
         intent_role="primary",
-        intent_evidence=[{
-            "constraint_id": "subject",
-            "evidence_quote": "Alpha lesson defines the concept completely",
-        }],
-    ).model_dump(mode="json")
-    malformed = {**valid, "candidate_id": "candidate-bad", "topic_relevance": "high"}
+    ).model_dump(mode="json", by_alias=True)
+    malformed = {**valid, "id": "candidate-bad", "rel": "high"}
     telemetry = GC.GeminiCallTelemetry(
         model=G.config.SEGMENT_FLASH_MODEL,
         operation="flash_boundary_selector",
@@ -643,15 +636,6 @@ def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
         "generate_json_v3",
         lambda *args, **kwargs: GC.GenerationResult(
             json.dumps({
-                "request_intent": {
-                    "exact_request": "alpha lesson",
-                    "constraints": [{
-                        "constraint_id": "subject",
-                        "kind": "subject",
-                        "source_phrase": "alpha lesson",
-                        "requirement": "Teach the alpha lesson",
-                    }],
-                },
                 "topics": [malformed, valid],
             }),
             telemetry,
@@ -680,7 +664,7 @@ def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
     assert result.proposed_count == 2
     assert result.classification == "green"
     assert result.rejection_reasons == [
-        "proposal_0:schema_invalid:topic_relevance:float_type"
+        "proposal_0:schema_invalid:rel:float_type"
     ]
     assert result.calls[0]["schema_rejected_count"] == 1
 
@@ -824,9 +808,9 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
         (G.FLASH_SINGLE_PROFILE,
          ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash")),
         (G.FLASH_SPLIT_PROFILE,
-         ("low", 10_240, 28.0, "flash_boundary_selector", "gemini-3-flash-preview")),
+         ("low", 8_192, 28.0, "flash_boundary_selector", "gemini-3.5-flash")),
         (G.PRO_BOUNDARY_PROFILE,
-         ("high", 10_240, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
+         ("high", 8_192, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
     ],
 )
 def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, expected):
@@ -877,7 +861,7 @@ def test_flash_boundary_profile_accepts_bootstrap_low_thinking_override(monkeypa
     )
 
     assert captured["thinking_level"] == "low"
-    assert captured["max_output_tokens"] == 10_240
+    assert captured["max_output_tokens"] == 8_192
 
 
 def test_boundary_profile_keeps_grounded_clip_with_bad_edge_quote(monkeypatch):

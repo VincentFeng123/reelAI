@@ -132,30 +132,42 @@ def test_selector_rejects_non_teaching_non_substantive_and_ungrounded_evidence()
     ]
 
 
-@pytest.mark.parametrize(
-    "quote,reason",
-    [
-        ("line 0 teaches concept", "proposal_0:invalid_topic_evidence_quote_length"),
-        (
-            "line 0 teaches concept 0 and finishes end 0 extra words beyond the source "
-            "one two three four five six seven eight nine ten eleven twelve thirteen "
-            "fourteen fifteen sixteen seventeen eighteen nineteen twenty twentyone "
-            "twentytwo twentythree twentythree twentyfour twentyfive twentysix "
-            "twentyseven twentyeight twentynine thirty thirtyone thirtytwo thirtythree",
-            "proposal_0:invalid_topic_evidence_quote_length",
-        ),
-    ],
-)
-def test_topic_evidence_quote_requires_five_to_forty_words(quote, reason):
+def test_short_grounded_topic_evidence_is_extended_to_five_words():
     segs = _segs(1)
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            "Evidence",
+            0,
+            0,
+            topic_evidence_quote="line 0 teaches concept",
+        )]),
+        segs,
+        _words(segs),
+        {"segment_fine_snap": False},
+    )
+
+    assert len(report.clips) == 1
+    assert report.clips[0]["topic_evidence_quote"] == "line 0 teaches concept 0"
+
+
+def test_oversized_ungrounded_topic_evidence_is_rejected():
+    segs = _segs(1)
+    quote = (
+        "line 0 teaches concept 0 and finishes end 0 extra words beyond the source "
+        "one two three four five six seven eight nine ten eleven twelve thirteen "
+        "fourteen fifteen sixteen seventeen eighteen nineteen twenty twentyone "
+        "twentytwo twentythree twentythree twentyfour twentyfive twentysix "
+        "twentyseven twentyeight twentynine thirty thirtyone thirtytwo thirtythree"
+    )
     report = G._plan_to_report(
         G._Plan(topics=[_topic("Evidence", 0, 0, topic_evidence_quote=quote)]),
         segs,
         _words(segs),
         {"segment_fine_snap": False},
     )
+
     assert report.clips == []
-    assert report.rejected_reasons == [reason]
+    assert report.rejected_reasons == ["proposal_0:ungrounded_topic_evidence_quote"]
 
 
 def test_near_exact_topic_evidence_is_rejected_instead_of_rewritten():
@@ -713,12 +725,12 @@ def test_production_flash_is_compact_exhaustive_boundary_first():
         "never omit a substantive grounded unit solely because its boundary is uncertain"
         in prompt
     )
-    assert G._BOUNDARY_OUTPUT_TOKENS == 10_240
+    assert G._BOUNDARY_OUTPUT_TOKENS == 8_192
     assert "scan the whole transcript from first to last" in prompt
     assert "every distinct" in prompt
     assert "return every distinct qualifying moment" in prompt
     assert "arbitrary count" in prompt
-    assert "up to 16" not in prompt
+    assert "up to 40" in prompt
     assert "never add filler or incomplete material" in prompt
     assert "difficulty is metadata, not an eligibility filter" in prompt
     assert "learning details and assessments are generated later" in prompt
@@ -818,7 +830,7 @@ def test_budget_is_reserved_once_and_default_call_allows_one_transient_retry(mon
         "model": "gemini-3.5-flash",
         "max_output_tokens": 4096,
         "prompt_text": "system\n\nuser",
-        "estimated_input_tokens": 3,
+        "estimated_input_tokens": 1_004,
     }
 
 

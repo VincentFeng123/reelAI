@@ -65,6 +65,59 @@ def test_single_call_boundary_schema_caps_exhaustive_output_before_truncation() 
         ])
 
 
+def test_compact_selector_aliases_preserve_canonical_fields_and_supporting_rank() -> None:
+    compact = gemini_segment._CompactBoundaryTopic(
+        candidate_id="supporting-definition",
+        start_line=0,
+        end_line=0,
+        start_quote="A derivative measures instantaneous change",
+        end_quote="with respect to its input",
+        title="Derivative definition",
+        learning_objective="Define a derivative before a worked example",
+        facet="derivative definition",
+        informativeness=0.9,
+        topic_relevance=0.9,
+        educational_importance=0.85,
+        difficulty=0.2,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        topic_evidence_quote=(
+            "A derivative measures instantaneous change in a function with respect"
+        ),
+        self_contained=True,
+        is_standalone=True,
+        intent_role="supporting",
+    )
+    payload = gemini_segment._CompactBoundaryPlan(topics=[compact]).model_dump_json(
+        by_alias=True
+    )
+    assert '"id":"supporting-definition"' in payload
+    assert '"role":"supporting"' in payload
+    parsed = gemini_segment._CompactBoundaryPlan.model_validate_json(payload)
+
+    report = gemini_segment._plan_to_report(
+        parsed,
+        [{
+            "cue_id": "definition",
+            "start": 0.0,
+            "end": 10.0,
+            "text": (
+                "A derivative measures instantaneous change in a function with respect "
+                "to its input."
+            ),
+        }],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="chain rule worked example",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["intent_role"] == "supporting"
+    assert report.clips[0]["intent_coverage"] == 0.5
+    assert report.clips[0]["intent_evidence"][0]["constraint_id"] == "exact_request"
+
+
 def test_selector_accepts_non_lossy_descriptive_strings_beyond_prompt_limits() -> None:
     proposal = _proposal().model_copy(update={
         "candidate_id": "candidate-" + ("identifier-" * 8),
@@ -471,12 +524,15 @@ def test_selector_prompt_is_exhaustive_and_allows_one_listed_component() -> None
     assert "learning_objective (at most 24 words)" in user
     assert "facet (at most 12 words)" in user
     assert user.index("Transcript (") < user.index("Exact user request:")
-    assert "1. Copy the Exact user request verbatim" in user
-    assert "atomic mandatory constraints" in user
-    assert "intent_role=primary only if grounded intent_evidence covers" in user
+    assert "1. Privately interpret the exact request" in user
+    assert "requested operations or tasks" in user
+    assert "Do not substitute retrieval expansions" in user
     assert "2. Map every distinct educational unit" in user
+    assert "up to 40 for this source" in user
     assert "3. For every qualifying unit" in user
+    assert "end before the transition" in user
     assert "4. Score topic relevance, information density" in user
+    assert user.count("[0] 00:00 Cells use chlorophyll") == 1
     assert "180-second" not in (_system + user)
 
 
@@ -587,6 +643,89 @@ def test_same_cue_preview_inside_teaching_is_tolerated_unchanged() -> None:
     assert report.rejected_reasons == []
     [clip] = report.clips
     assert "talk more about that next time" in clip["_clip_text"]
+
+
+def test_real_course_logistics_opening_is_trimmed_before_biology_teaching() -> None:
+    segments = [
+        {
+            "cue_id": "mit-biology:0",
+            "start": 17.683,
+            "end": 48.650,
+            "text": (
+                "BARBARA IMPERIALI: OK. We're going to get going. Now, we have a "
+                "small class this year because of changes in the institute with pass/fail "
+                "types of things, but Professor Martin and Dr. Ray and I consider this to "
+                "be a special opportunity for us to run the course a little bit differently "
+                "with a few more quirks and surprises. Because we have a small number of you, "
+                "we can listen to you all. We can get input from you. We can even get "
+                "feedback from you of something you might like to see more of."
+            ),
+        },
+        {
+            "cue_id": "mit-biology:1",
+            "start": 48.650,
+            "end": 77.000,
+            "text": (
+                "And in general, we really want to capture the sense of you. I have looked "
+                "at the registration list. We have people from every year. We have people "
+                "from many, many different disciplines. So this is what we're going to do "
+                "today after we I start doing some introductions and so on. We're going to "
+                "talk about the nitty gritty of the organization. We need to tell you this. "
+                "We need to convey this information to you clearly about when exams are, "
+                "and what requirements are,"
+            ),
+        },
+        {
+            "cue_id": "mit-biology:2",
+            "start": 77.000,
+            "end": 112.610,
+            "text": (
+                "and how to do well in this course without even realizing it, that kind of "
+                "thing. And then I'll take you through this sort of fast track through "
+                "molecules to man, all the way down to cells and organisms, to show you that "
+                "there was a breakpoint in the 1950s where the structure, the non-covalent "
+                "structure of DNA was elucidated. And there was an entire revolution after "
+                "that which makes modern biology, the study of modern biology, so entirely "
+                "different from the study"
+            ),
+        },
+        {
+            "cue_id": "mit-biology:3",
+            "start": 112.610,
+            "end": 146.940,
+            "text": (
+                "of biology in the era before that. Biology used to be considered taxonomy "
+                "and dissection, like listing and looking at. But now biology, modern "
+                "biology, is a molecular science."
+            ),
+        },
+    ]
+    proposal = _proposal(end_line=3).model_copy(update={
+        "candidate_id": "modern-biology-shift",
+        "start_quote": "BARBARA IMPERIALI OK We're going to get going",
+        "end_quote": "modern biology is a molecular science",
+        "title": "Why modern biology became molecular",
+        "learning_objective": "Explain how DNA structure changed modern biology",
+        "facet": "molecular biology history",
+        "reason": "The span contrasts descriptive biology with molecular biology.",
+        "topic_evidence_quote": "But now biology modern biology is a molecular science",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="biology",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["mit-biology:2", "mit-biology:3"]
+    assert clip["_clip_text"].startswith("there was a breakpoint in the 1950s")
+    assert "pass/fail" not in clip["_clip_text"]
+    assert "registration list" not in clip["_clip_text"]
+    assert "when exams are" not in clip["_clip_text"]
 
 
 def test_carolingian_visual_dependent_span_is_rejected() -> None:
@@ -982,6 +1121,1022 @@ def test_context_expands_beyond_eight_cues_and_thirty_seconds() -> None:
     assert report.rejected_reasons == []
     assert report.clips[0]["_end_line"] == 10
     assert report.clips[0]["end"] == 55.0
+
+
+def test_real_calculus_example_intro_expands_past_dangling_or_even() -> None:
+    raw_segments = [
+        (114.430, 118.979, "But how are these changing quantities related to one another now? What is the formula for"),
+        (118.979, 125.200, "this change? Again, the answer lies with calculus."),
+        (125.200, 129.929, "So in order to tackle the problem of changing quantities calculus picks up three powerful"),
+        (129.929, 134.980, "tools. These tools are: limits, derivatives, and"),
+        (134.980, 139.569, "integrals. Now there are many other things you'll learn in calculus, but these 3 things"),
+        (139.569, 142.879, "are the most essential. Because of this you'll want to spend as"),
+        (142.879, 148.900, "much time with them as possible. Limits are the tools we use for precisely"),
+        (148.900, 153.790, "describing how a function approaches a value. Derivatives are the tools we use for describing"),
+        (153.790, 157.459, "how a function changes, and integrals give us the area underneith"),
+        (157.459, 161.900, "the curve of a function. Using limits, derivatives and integrals calculus"),
+        (161.900, 167.379, "can solve a variety of problems like where sit in a theater for optimal viewing, or even"),
+        (167.379, 172.470, "how to make the perfect soup can. One of the most fascinating aspects of calculus"),
+        (172.470, 176.140, "is how all of these tools are actually related to one another."),
+    ]
+    segments = [
+        {"cue_id": f"calculus:{index}", "start": start, "end": end, "text": text}
+        for index, (start, end, text) in enumerate(raw_segments)
+    ]
+    proposal = _proposal(end_line=10).model_copy(update={
+        "candidate_id": "calculus-core-tools",
+        "start_quote": "But how are these changing quantities related",
+        "end_quote": "theater for optimal viewing or even",
+        "title": "The three core tools of calculus",
+        "learning_objective": "Explain what limits, derivatives, and integrals describe",
+        "facet": "core calculus tools",
+        "reason": "The span defines the central tools and what they solve.",
+        "topic_evidence_quote": (
+            "Limits are the tools we use for precisely describing how a function"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="calculus",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_end_line"] == 12
+    assert "how to make the perfect soup can" in clip["_clip_text"]
+    assert clip["_clip_text"].endswith("related to one another.")
+
+
+def test_demonstrative_calculus_opening_expands_to_its_cold_viewer_setup() -> None:
+    texts = [
+        "Here is another quick example. If I want to model the volume of a balloon,",
+        "you might assume that it is approximately a sphere, and use the sphere formula",
+        "pi times the radius cubed. This shows that the volume of the balloon",
+        "is related to the radius. Now when I let air out, things start",
+        "to change. The volume is decreasing, and so is the radius.",
+        "But how are these changing quantities related? What is the formula for",
+        "this change? Again, the answer lies with calculus.",
+        "So in order to tackle changing quantities calculus uses three powerful tools.",
+        "These tools are limits, derivatives, and integrals.",
+    ]
+    segments = [
+        {
+            "cue_id": f"calculus-context:{index}",
+            "start": index * 5.0,
+            "end": (index + 1) * 5.0,
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+    proposal = _proposal(end_line=8).model_copy(update={
+        "candidate_id": "calculus-context-chain",
+        "start_line": 6,
+        "start_quote": "this change Again the answer lies",
+        "end_quote": "tools are limits derivatives and integrals",
+        "title": "Calculus tools for changing quantities",
+        "learning_objective": "Explain why calculus uses limits, derivatives, and integrals",
+        "facet": "calculus tools",
+        "reason": "The balloon setup supplies the antecedent for changing quantities.",
+        "topic_evidence_quote": "tools are limits derivatives and integrals",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="calculus",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"][0] == "calculus-context:0"
+    assert report.clips[0]["_clip_text"].startswith("Here is another quick example")
+
+
+def test_complete_answer_trims_a_dangling_final_phrase_instead_of_rejecting() -> None:
+    text = (
+        "Let h of x equal sine of x squared. The chain rule differentiates the outer "
+        "sine and multiplies by the inner derivative two x. Therefore h prime of x "
+        "equals two x cosine of x squared. And"
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "chain-rule-answer",
+        "start_quote": "Let h of x equal sine of x squared",
+        "end_quote": "two x cosine of x squared And",
+        "title": "Complete chain rule derivative",
+        "learning_objective": "Apply the chain rule through the final derivative",
+        "facet": "worked example",
+        "reason": "The worked example reaches its final answer.",
+        "topic_evidence_quote": (
+            "Therefore h prime of x equals two x cosine of x squared"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "chain-rule:0", "start": 0.0, "end": 28.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="chain rule worked example",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].endswith("two x cosine of x squared.")
+    assert "trimmed_incomplete_end_suffix" in clip["_boundary_fallback_reasons"]
+
+
+def test_topic_transition_keeps_only_the_learning_objective_containing_evidence() -> None:
+    segments = [
+        {
+            "cue_id": "limits",
+            "start": 0.0,
+            "end": 8.0,
+            "text": "The limit equals two, which completes the limits problem.",
+        },
+        {
+            "cue_id": "derivative-transition",
+            "start": 8.0,
+            "end": 18.0,
+            "text": (
+                "Now let's move on to derivatives. A derivative measures the "
+                "instantaneous rate of change of a function."
+            ),
+        },
+        {
+            "cue_id": "derivative-example",
+            "start": 18.0,
+            "end": 28.0,
+            "text": (
+                "For example, velocity is the derivative of position with respect to time."
+            ),
+        },
+    ]
+    derivative = _proposal(end_line=2).model_copy(update={
+        "candidate_id": "derivatives-after-limits",
+        "start_quote": "The limit equals two which completes",
+        "end_quote": "derivative of position with respect to time",
+        "title": "What a derivative measures",
+        "learning_objective": "Explain derivatives as instantaneous rates of change",
+        "facet": "derivatives",
+        "reason": "The span defines derivatives and gives a velocity example.",
+        "topic_evidence_quote": (
+            "A derivative measures the instantaneous rate of change of a function"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[derivative]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="calculus",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["derivative-transition", "derivative-example"]
+    assert clip["_clip_text"].startswith("A derivative measures")
+    assert "limit equals two" not in clip["_clip_text"]
+    assert "move on to derivatives" not in clip["_clip_text"]
+
+
+def test_same_cue_topic_transition_still_removes_the_previous_objective() -> None:
+    text = (
+        "The limit equals two, which completes the limits problem. "
+        "Now let's move on to derivatives. A derivative measures the instantaneous "
+        "rate of change of a function."
+    )
+    derivative = _proposal().model_copy(update={
+        "candidate_id": "same-cue-derivative-transition",
+        "start_quote": "The limit equals two which completes",
+        "end_quote": "rate of change of a function",
+        "title": "What a derivative measures",
+        "learning_objective": "Explain derivatives as instantaneous rates of change",
+        "facet": "derivatives",
+        "reason": "The retained section defines derivatives.",
+        "topic_evidence_quote": (
+            "A derivative measures the instantaneous rate of change of a function"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[derivative]),
+        [{"cue_id": "calculus:mixed", "start": 0.0, "end": 20.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="calculus",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith("A derivative measures")
+    assert "limit equals two" not in clip["_clip_text"]
+    assert "move on to derivatives" not in clip["_clip_text"]
+
+
+def test_relational_objective_may_span_an_explicit_topic_transition() -> None:
+    text = (
+        "A limit describes the value a function approaches. Now let's move on to "
+        "derivatives. A derivative is defined by a limit of difference quotients, so "
+        "the two ideas are directly connected."
+    )
+    relationship = _proposal().model_copy(update={
+        "candidate_id": "limits-define-derivatives",
+        "start_quote": "A limit describes the value a function approaches",
+        "end_quote": "two ideas are directly connected",
+        "title": "How limits define derivatives",
+        "learning_objective": "Explain how limits define derivatives",
+        "facet": "limits and derivatives relationship",
+        "reason": "The span explicitly relates the two calculus ideas.",
+        "topic_evidence_quote": (
+            "A derivative is defined by a limit of difference quotients"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[relationship]),
+        [{"cue_id": "calculus:relationship", "start": 0.0, "end": 24.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="calculus",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert "A limit describes" in clip["_clip_text"]
+    assert "A derivative is defined by a limit" in clip["_clip_text"]
+
+
+@pytest.mark.parametrize(
+    ("text", "start_quote", "end_quote", "evidence_quote"),
+    [
+        (
+            "A large class of proteins transports ions across the membrane.",
+            "A large class of proteins transports",
+            "transports ions across the membrane",
+            "A large class of proteins transports ions across the membrane",
+        ),
+        (
+            "Enrollment bias can threaten the validity of an observational study.",
+            "Enrollment bias can threaten the validity",
+            "validity of an observational study",
+            "Enrollment bias can threaten the validity of an observational study",
+        ),
+        (
+            "Deadline scheduling is NP-hard in this machine scheduling model.",
+            "Deadline scheduling is NP-hard in",
+            "this machine scheduling model",
+            "Deadline scheduling is NP-hard in this machine scheduling model",
+        ),
+        (
+            "Voter registration protects access to democratic participation in elections.",
+            "Voter registration protects access to democratic",
+            "democratic participation in elections",
+            "Voter registration protects access to democratic participation in elections",
+        ),
+        (
+            "Pass/fail grading changes student incentives and can affect motivation.",
+            "Pass/fail grading changes student incentives",
+            "and can affect motivation",
+            "Pass/fail grading changes student incentives and can affect motivation",
+        ),
+        (
+            "We need to tell you this theorem follows from compactness.",
+            "We need to tell you this theorem",
+            "this theorem follows from compactness",
+            "We need to tell you this theorem follows from compactness",
+        ),
+        (
+            "There are students in the treatment group and controls in the comparison group.",
+            "There are students in the treatment group",
+            "controls in the comparison group",
+            "students in the treatment group and controls in the comparison group",
+        ),
+    ],
+)
+def test_subject_matter_admin_vocabulary_is_not_misclassified_as_edge_filler(
+    text: str,
+    start_quote: str,
+    end_quote: str,
+    evidence_quote: str,
+) -> None:
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "ambiguous-admin-vocabulary",
+        "start_quote": start_quote,
+        "end_quote": end_quote,
+        "title": "Grounded subject matter",
+        "learning_objective": "Explain the grounded subject-matter claim",
+        "facet": "subject matter",
+        "reason": "The sentence teaches the requested concept.",
+        "topic_evidence_quote": evidence_quote,
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "teaching", "start": 0.0, "end": 10.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="subject matter",
+    )
+
+    assert report.rejected_reasons == []
+    assert len(report.clips) == 1
+
+
+def test_instructional_preview_is_retained_when_trimming_would_start_on_an_anaphor() -> None:
+    text = (
+        "I'll walk you through the chain rule to show you why it multiplies the "
+        "outer derivative by the inner derivative."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "chain-rule-preview-context",
+        "start_quote": "I'll walk you through the chain rule",
+        "end_quote": "outer derivative by the inner derivative",
+        "title": "Why the chain rule multiplies derivatives",
+        "learning_objective": "Explain why the chain rule multiplies inner and outer derivatives",
+        "facet": "chain rule",
+        "reason": "The opening supplies the antecedent required by the explanation.",
+        "topic_evidence_quote": (
+            "chain rule to show you why it multiplies the outer derivative"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "chain-rule", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="chain rule",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("I'll walk you through the chain rule")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Many of these compounds are stable under ordinary laboratory conditions",
+        "One of these enzymes catalyzes the final reaction efficiently",
+        "All of the measured samples remain within the expected confidence interval",
+    ],
+)
+def test_complete_unpunctuated_nominal_sentences_are_not_dangling(text: str) -> None:
+    words = text.split()
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "complete-nominal-sentence",
+        "start_quote": " ".join(words[:6]),
+        "end_quote": " ".join(words[-6:]),
+        "title": "Complete explanatory claim",
+        "learning_objective": "Understand the complete explanatory claim",
+        "facet": "complete claim",
+        "reason": "The caption contains a subject and a finite predicate.",
+        "topic_evidence_quote": " ".join(words[: min(12, len(words))]),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "complete", "start": 0.0, "end": 9.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="complete claim",
+    )
+
+    assert report.rejected_reasons == []
+    assert len(report.clips) == 1
+
+
+def test_nominal_subject_expands_only_when_next_cue_supplies_its_predicate() -> None:
+    segments = [
+        {
+            "cue_id": "subject",
+            "start": 0.0,
+            "end": 6.0,
+            "text": "One of the most fascinating aspects of calculus",
+        },
+        {
+            "cue_id": "predicate",
+            "start": 6.0,
+            "end": 13.0,
+            "text": "is how limits, derivatives, and integrals relate to one another.",
+        },
+    ]
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "calculus-relationship",
+        "start_quote": "One of the most fascinating aspects",
+        "end_quote": "most fascinating aspects of calculus",
+        "title": "How calculus tools relate",
+        "learning_objective": "Explain how limits, derivatives, and integrals relate",
+        "facet": "calculus relationships",
+        "reason": "The next cue supplies the predicate and completes the claim.",
+        "topic_evidence_quote": "most fascinating aspects of calculus",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="calculus",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["subject", "predicate"]
+    assert report.clips[0]["_clip_text"].endswith("relate to one another.")
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_start"),
+    [
+        (
+            "But then things really started to get interesting when the first cells "
+            "evolved and acquired membranes that separated their chemistry from the environment.",
+            "the first cells evolved",
+        ),
+        (
+            "So genomes differ greatly in size because organisms carry different amounts "
+            "of repetitive and protein-coding DNA.",
+            "genomes differ greatly in size",
+        ),
+    ],
+)
+def test_opening_discourse_marker_is_trimmed_only_to_a_standalone_teaching_claim(
+    text: str,
+    expected_start: str,
+) -> None:
+    words = text.split()
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "standalone-after-marker",
+        "start_quote": " ".join(words[:6]),
+        "end_quote": " ".join(words[-6:]),
+        "title": "Standalone biological explanation",
+        "learning_objective": "Explain the biological mechanism in this teaching claim",
+        "facet": "biological mechanism",
+        "reason": "The retained sentence directly teaches a complete biological idea.",
+        "topic_evidence_quote": " ".join(words[-12:]),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "teaching", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="biology",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith(expected_start)
+
+
+def test_leading_so_is_retained_when_removing_it_would_create_an_anaphoric_opening() -> None:
+    text = (
+        "So this means the mutation changes the protein's active site and prevents "
+        "the substrate from binding."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "so-with-required-antecedent",
+        "start_quote": "So this means the mutation changes",
+        "end_quote": "prevents the substrate from binding",
+        "title": "How the mutation changes binding",
+        "learning_objective": "Explain how an active-site mutation prevents substrate binding",
+        "facet": "active-site mutation",
+        "reason": "The complete sentence teaches the requested causal relationship.",
+        "topic_evidence_quote": (
+            "the mutation changes the protein's active site and prevents the substrate"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "teaching", "start": 0.0, "end": 10.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="active-site mutation",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("So this means")
+
+
+def test_leading_so_is_trimmed_at_a_model_selected_mid_cue_boundary() -> None:
+    text = (
+        "The molecular-clock example ends here. So genomes differ greatly in size because "
+        "organisms carry different amounts of repetitive and protein-coding DNA."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "genome-size-mid-cue",
+        "start_quote": "So genomes differ greatly in size",
+        "end_quote": "repetitive and protein-coding DNA",
+        "title": "Why genome sizes differ",
+        "learning_objective": "Explain why genome sizes differ among organisms",
+        "facet": "genome size",
+        "reason": "The selected second sentence is a standalone teaching unit.",
+        "topic_evidence_quote": (
+            "genomes differ greatly in size because organisms carry different amounts"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "mixed", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="genome size",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("genomes differ greatly in size")
+    assert "molecular-clock" not in report.clips[0]["_clip_text"]
+
+
+def test_grounded_explanation_does_not_expand_into_a_visual_preview_sentence() -> None:
+    text = (
+        "Before I move forward, I just want to quickly show you this map. I mentioned "
+        "tracing evolution through a molecular clock, which estimates divergence from "
+        "approximately stable mutation rates."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "molecular-clock-after-preview",
+        "start_quote": "I mentioned tracing evolution through a molecular clock",
+        "end_quote": "approximately stable mutation rates",
+        "title": "How a molecular clock dates divergence",
+        "learning_objective": "Explain how mutation rates support molecular-clock estimates",
+        "facet": "molecular clocks",
+        "reason": "The selected explanation is complete without the map preview.",
+        "topic_evidence_quote": (
+            "molecular clock which estimates divergence from approximately stable mutation rates"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "clock", "start": 0.0, "end": 14.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="molecular clocks",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("I mentioned tracing evolution")
+    assert "show you this map" not in report.clips[0]["_clip_text"]
+
+
+def test_topic_announcement_prefix_is_trimmed_to_the_informational_claim() -> None:
+    text = (
+        "So what we'll talk to you about is the discovery of fluorescent proteins, "
+        "which enables researchers to label and track proteins in living cells."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "fluorescent-protein-discovery",
+        "start_quote": "So what we'll talk to you about",
+        "end_quote": "track proteins in living cells",
+        "title": "How fluorescent proteins support imaging",
+        "learning_objective": "Explain how fluorescent proteins enable live-cell tracking",
+        "facet": "fluorescent proteins",
+        "reason": "The retained claim explains the educational mechanism.",
+        "topic_evidence_quote": (
+            "fluorescent proteins which enables researchers to label and track proteins"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "fluorescence", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="fluorescent proteins",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith(
+        "the discovery of fluorescent proteins"
+    )
+    assert "talk to you about" not in report.clips[0]["_clip_text"]
+
+
+def test_informational_prefix_is_kept_while_a_visual_demonstration_tail_is_trimmed() -> None:
+    segments = [
+        {
+            "cue_id": "fluorescence-explanation",
+            "start": 0.0,
+            "end": 14.0,
+            "text": (
+                "So what we'll talk to you about is fluorescent proteins, which let "
+                "researchers label and track proteins in living cells. Protein engineers "
+                "created colors that fluoresce at different wavelengths in real time. "
+                "These slides show a dividing cell."
+            ),
+        },
+        {
+            "cue_id": "visual-demo",
+            "start": 14.0,
+            "end": 23.0,
+            "text": "In these pictures the chromosomes are red and the microtubules are green.",
+        },
+    ]
+    proposal = _proposal(end_line=1).model_copy(update={
+        "candidate_id": "fluorescence-before-demo",
+        "start_quote": "So what we'll talk to you about is fluorescent proteins",
+        "end_quote": "chromosomes are red and the microtubules are green",
+        "title": "How fluorescent proteins support live-cell imaging",
+        "learning_objective": "Explain how fluorescent proteins label living-cell structures",
+        "facet": "fluorescent protein imaging",
+        "reason": "The spoken mechanism is complete before the visual demonstration.",
+        "topic_evidence_quote": (
+            "fluorescent proteins which let researchers label and track proteins"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="fluorescent proteins",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["fluorescence-explanation"]
+    assert report.clips[0]["_clip_text"].endswith("in real time.")
+    assert "slides" not in report.clips[0]["_clip_text"]
+    assert "pictures" not in report.clips[0]["_clip_text"]
+    assert "trimmed_visual_dependent_tail" in report.clips[0][
+        "_boundary_fallback_reasons"
+    ]
+
+
+def test_grounded_sentence_after_an_excluded_mid_cue_marker_does_not_expand_backward() -> None:
+    text = (
+        "We will cover this next class, because the thing that's critical to building a "
+        "cell is a boundary around it. So very early in life lipid "
+        "bilayers evolved to separate cellular chemistry from the environment."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "lipid-bilayer-after-marker",
+        "start_quote": "the thing that's critical to building",
+        "end_quote": "cellular chemistry from the environment",
+        "title": "Why lipid bilayers evolved",
+        "learning_objective": "Explain how lipid bilayers compartmentalize cellular chemistry",
+        "facet": "lipid bilayer compartmentalization",
+        "reason": "The selected sentence is a complete biological explanation.",
+        "topic_evidence_quote": (
+            "lipid bilayers evolved to separate cellular chemistry from the environment"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "mixed", "start": 0.0, "end": 13.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="lipid bilayers",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("very early in life lipid bilayers")
+    assert "remaining logistics" not in report.clips[0]["_clip_text"]
+
+
+def test_fragmentary_setup_recovers_forward_when_the_anchor_continues_in_the_next_cue() -> None:
+    segments = [
+        {
+            "cue_id": "membrane-origin",
+            "start": 0.0,
+            "end": 12.0,
+            "text": (
+                "We will cover this next class, because the thing that's critical to build "
+                "a cell is a wall around it. So very early in life lipid bilayers evolved "
+                "to make compartmentalized structures."
+            ),
+        },
+        {
+            "cue_id": "membrane-function",
+            "start": 12.0,
+            "end": 22.0,
+            "text": (
+                "Cellular compartmentalization through lipid bilayers regulates what can "
+                "move into or out of the cell."
+            ),
+        },
+    ]
+    proposal = _proposal(end_line=1).model_copy(update={
+        "candidate_id": "compartmentalization-across-cues",
+        "start_quote": "the thing that's critical to build a cell",
+        "end_quote": "move into or out of the cell",
+        "title": "How membranes compartmentalize cells",
+        "learning_objective": "Explain how lipid bilayers create cellular compartmentalization",
+        "facet": "membrane compartmentalization",
+        "reason": "The two cues explain membrane origin and function.",
+        "topic_evidence_quote": (
+            "Cellular compartmentalization through lipid bilayers regulates what can move"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="cellular compartmentalization",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["membrane-origin", "membrane-function"]
+    assert report.clips[0]["_clip_text"].startswith("very early in life lipid bilayers")
+    assert "next class" not in report.clips[0]["_clip_text"]
+
+
+def test_self_contained_adversative_opening_does_not_import_the_previous_topic() -> None:
+    segments = [
+        {
+            "cue_id": "molecular-clock",
+            "start": 0.0,
+            "end": 9.0,
+            "text": "Mutation rates let a molecular clock estimate evolutionary divergence.",
+        },
+        {
+            "cue_id": "dna-structure",
+            "start": 9.0,
+            "end": 21.0,
+            "text": (
+                "But what's fascinating is that all organisms use the same DNA building "
+                "blocks. And what we can teach from the 1950s is how its structure works."
+            ),
+        },
+        {
+            "cue_id": "dna-replication",
+            "start": 21.0,
+            "end": 31.0,
+            "text": "The double-stranded structure explains how DNA can be copied.",
+        },
+    ]
+    proposal = _proposal(end_line=2).model_copy(update={
+        "candidate_id": "dna-structure-only",
+        "start_line": 1,
+        "start_quote": "we can teach from the 1950s",
+        "end_quote": "explains how DNA can be copied",
+        "title": "How DNA structure enables replication",
+        "learning_objective": "Explain how double-stranded DNA structure enables copying",
+        "facet": "DNA structure and replication",
+        "reason": "The second cue is a complete, distinct DNA-structure unit.",
+        "topic_evidence_quote": (
+            "The double-stranded structure explains how DNA can be copied"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="DNA structure",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["dna-structure", "dna-replication"]
+    assert report.clips[0]["_clip_text"].startswith("what's fascinating")
+    assert "molecular clock" not in report.clips[0]["_clip_text"]
+
+
+def test_complete_ordinal_subject_and_prior_conclusion_bound_one_teaching_unit() -> None:
+    segments = [
+        {
+            "cue_id": "membranes",
+            "start": 0.0,
+            "end": 9.0,
+            "text": "Lipid bilayers compartmentalize the chemistry inside a cell.",
+        },
+        {
+            "cue_id": "cell-types",
+            "start": 9.0,
+            "end": 22.0,
+            "text": (
+                "The first prokaryotes were cyanobacteria. Eukaryotic cells are much larger, "
+                "contain a nucleus, and can differentiate into muscle, skin, or bone. And so "
+                "those eukaryotes mark a long gap of time,"
+            ),
+        },
+        {
+            "cue_id": "multicellular-life",
+            "start": 22.0,
+            "end": 31.0,
+            "text": "but later multicellular life evolved and diversified.",
+        },
+    ]
+    proposal = _proposal(end_line=1).model_copy(update={
+        "candidate_id": "prokaryotes-versus-eukaryotes",
+        "start_line": 1,
+        "start_quote": "The first prokaryotes were cyanobacteria",
+        "end_quote": "a long gap of time",
+        "title": "Prokaryotes versus eukaryotes",
+        "learning_objective": "Compare prokaryotic and eukaryotic cell structure",
+        "facet": "cell-type comparison",
+        "reason": "The comparison is complete before the evolutionary transition.",
+        "topic_evidence_quote": (
+            "Eukaryotic cells are much larger contain a nucleus and can differentiate"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="prokaryotes versus eukaryotes",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["cell-types"]
+    assert report.clips[0]["_clip_text"].startswith("The first prokaryotes")
+    assert report.clips[0]["_clip_text"].endswith("muscle, skin, or bone.")
+    assert "long gap" not in report.clips[0]["_clip_text"]
+    assert "multicellular" not in report.clips[0]["_clip_text"]
+
+
+def test_complete_selected_explanation_is_not_rejected_by_a_later_same_cue_question() -> None:
+    text = (
+        "Each human cell has 1.8 meters of DNA in it, yet it fits inside a microscopic "
+        "cell. DNA gets bundled around positively charged proteins to enable packaging. "
+        "When is DNA unraveled?"
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "dna-packaging-before-next-question",
+        "start_quote": "Each human cell has 1.8 meters",
+        "end_quote": "positively charged proteins to enable packaging",
+        "title": "How DNA fits inside a cell",
+        "learning_objective": "Explain how protein binding packages DNA inside cells",
+        "facet": "DNA packaging",
+        "reason": "The selected span contains the complete packaging explanation.",
+        "topic_evidence_quote": (
+            "DNA gets bundled around positively charged proteins to enable packaging"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "dna", "start": 0.0, "end": 16.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="DNA packaging",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].endswith("enable packaging")
+    assert "When is DNA unraveled" not in report.clips[0]["_clip_text"]
+
+
+@pytest.mark.parametrize(
+    "navigation",
+    [
+        "Now we need to discuss the second step of this same derivation.",
+        "Now let's turn to the denominator in the same calculation.",
+        "Let's back up and state the theorem used by this proof.",
+        "The next part substitutes the known coefficients.",
+    ],
+)
+def test_navigation_inside_one_worked_arc_does_not_delete_required_setup(
+    navigation: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "setup",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "The quadratic formula begins with negative b plus or minus the square "
+                "root of b squared minus four a c over two a."
+            ),
+        },
+        {"cue_id": "navigation", "start": 8.0, "end": 13.0, "text": navigation},
+        {
+            "cue_id": "answer",
+            "start": 13.0,
+            "end": 22.0,
+            "text": (
+                "Substituting the coefficients gives x equals two or x equals negative three, "
+                "which completes the worked example."
+            ),
+        },
+    ]
+    proposal = _proposal(end_line=2).model_copy(update={
+        "candidate_id": "quadratic-worked-example",
+        "start_quote": "The quadratic formula begins with negative b",
+        "end_quote": "which completes the worked example",
+        "title": "Complete quadratic-formula example",
+        "learning_objective": "Solve a quadratic equation through both final roots",
+        "facet": "worked example",
+        "reason": "The formula setup is required for the substitution and answer.",
+        "topic_evidence_quote": (
+            "Substituting the coefficients gives x equals two or x equals negative three"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="quadratic formula worked example",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["setup", "navigation", "answer"]
+    assert report.clips[0]["_clip_text"].startswith("The quadratic formula begins")
+
+
+def test_difference_keyword_does_not_disable_a_real_topic_reset() -> None:
+    text = (
+        "The limit equals two, which completes the limits problem. "
+        "Now let's move on to derivatives. The derivative difference quotient "
+        "measures instantaneous change."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "difference-quotient-after-limits",
+        "start_quote": "The limit equals two which completes",
+        "end_quote": "difference quotient measures instantaneous change",
+        "title": "Derivative difference quotient",
+        "learning_objective": "Explain the derivative difference quotient",
+        "facet": "derivatives",
+        "reason": "The retained unit explains the derivative definition.",
+        "topic_evidence_quote": (
+            "The derivative difference quotient measures instantaneous change"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "mixed", "start": 0.0, "end": 18.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="derivative difference quotient",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("The derivative difference quotient")
+    assert "limit equals two" not in report.clips[0]["_clip_text"]
+
+
+def test_true_transition_keeps_both_distinct_candidates_from_one_source() -> None:
+    segments = [
+        {
+            "cue_id": "limits",
+            "start": 0.0,
+            "end": 8.0,
+            "text": "The limit equals two, which completes the limits problem.",
+        },
+        {
+            "cue_id": "transition",
+            "start": 8.0,
+            "end": 17.0,
+            "text": (
+                "Now let's move on to derivatives. A derivative measures the instantaneous "
+                "rate of change of a function."
+            ),
+        },
+    ]
+    limits = _proposal().model_copy(update={
+        "candidate_id": "limits-answer",
+        "start_quote": "The limit equals two which completes",
+        "end_quote": "which completes the limits problem",
+        "title": "Completed limits problem",
+        "learning_objective": "Understand the completed limit result",
+        "facet": "limits",
+        "reason": "The first unit completes the limits result.",
+        "topic_evidence_quote": "The limit equals two which completes the limits problem",
+    })
+    derivative = _proposal(end_line=1).model_copy(update={
+        "candidate_id": "derivative-definition",
+        "start_quote": "The limit equals two which completes",
+        "end_quote": "rate of change of a function",
+        "title": "Derivative as instantaneous change",
+        "learning_objective": "Define a derivative as an instantaneous rate of change",
+        "facet": "derivatives",
+        "reason": "The second unit defines derivatives.",
+        "topic_evidence_quote": (
+            "A derivative measures the instantaneous rate of change of a function"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[limits, derivative]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="calculus",
+    )
+
+    assert report.rejected_reasons == []
+    by_id = {clip["selection_candidate_id"]: clip for clip in report.clips}
+    assert set(by_id) == {"limits-answer", "derivative-definition"}
+    assert by_id["limits-answer"]["cue_ids"] == ["limits"]
+    assert by_id["derivative-definition"]["_clip_text"].startswith(
+        "A derivative measures"
+    )
 
 
 def test_chain_rule_query_keeps_related_prerequisite_and_worked_paraphrase() -> None:

@@ -27,7 +27,7 @@ def test_authoring_model_is_flash_topic_model_is_pro():
 
 def test_segment_router_defaults_to_flash_first_with_pro_fallback():
     assert config.SEGMENT_ROUTING_MODE == "hybrid"
-    assert config.SEGMENT_FLASH_MODEL == "gemini-3-flash-preview"
+    assert config.SEGMENT_FLASH_MODEL == "gemini-3.5-flash"
     assert config.SEGMENT_PRO_MODEL == "gemini-3.1-pro-preview"
     assert config.SEGMENT_MODEL == config.SEGMENT_PRO_MODEL
     assert config.SEGMENT_HYBRID_PERCENT == 100.0
@@ -65,7 +65,7 @@ def test_segment_router_rejects_invalid_values_and_clamps_percent(monkeypatch):
     )
     assert invalid == {
         "mode": "pro_only",
-        "flash": "gemini-3-flash-preview",
+        "flash": "gemini-3.5-flash",
         "pro": "gemini-3.1-pro-preview",
         "legacy": "gemini-3.1-pro-preview",
         "percent": 0.0,

@@ -180,18 +180,9 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
         **kwargs: Any,
     ):
         gemini_calls.append({"system": system, "user": user, **kwargs})
-        assert schema is gemini_segment._IntentBoundaryPlan
+        assert schema is gemini_segment._CompactBoundaryPlan
         plan = schema.model_validate(
             {
-                "request_intent": {
-                    "exact_request": TOPIC,
-                    "constraints": [{
-                        "constraint_id": "intro-python",
-                        "kind": "subject",
-                        "source_phrase": TOPIC,
-                        "requirement": "Teach an introduction to Python.",
-                    }],
-                },
                 "topics": [
                         {
                             "candidate_id": "python-variables",
@@ -203,7 +194,6 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
                         "end_line": 2,
                         "start_quote": "Python variables store values",
                         "end_quote": "first Python program easy to understand",
-                        "reason": "A complete beginner explanation.",
                         "facet": "variables",
                             "informativeness": 0.95,
                             "topic_relevance": 0.99,
@@ -216,17 +206,8 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
                                 ),
                                 "self_contained": True,
                             "is_standalone": True,
-                            "prerequisite_candidate_ids": [],
                         "difficulty": 0.1,
-                        "uncertainty": "low",
-                        "uncertainty_reasons": [],
                         "intent_role": "primary",
-                        "intent_evidence": [{
-                            "constraint_id": "intro-python",
-                            "evidence_quote": (
-                                "Python variables store values such as numbers and strings"
-                            ),
-                        }],
                     }
                 ]
             }

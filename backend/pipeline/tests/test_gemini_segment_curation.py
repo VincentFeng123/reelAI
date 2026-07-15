@@ -257,7 +257,7 @@ def test_forty_realistic_boundary_candidates_fit_bounded_output_reservation():
         data = {
             key: value
             for key, value in _topic(index, index).model_dump().items()
-            if key in G._BoundaryTopic.model_fields
+            if key in G._CompactBoundaryTopic.model_fields
         }
         data.update(
             candidate_id=f"candidate-{index}",
@@ -272,8 +272,12 @@ def test_forty_realistic_boundary_candidates_fit_bounded_output_reservation():
                 f"line {index} explains this informational mechanism and reaches its conclusion"
             ),
         )
-        topics.append(G._BoundaryTopic.model_validate(data))
-    payload = G._BoundaryPlan(topics=topics).model_dump_json(exclude_defaults=True)
+        data["intent_role"] = "primary"
+        topics.append(G._CompactBoundaryTopic.model_validate(data))
+    payload = G._CompactBoundaryPlan(topics=topics).model_dump_json(
+        by_alias=True,
+        exclude_defaults=True,
+    )
 
     estimated_tokens = (len(payload) + 3) // 4
     assert estimated_tokens < G._BOUNDARY_OUTPUT_TOKENS
