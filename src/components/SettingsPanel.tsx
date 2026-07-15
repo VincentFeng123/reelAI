@@ -999,7 +999,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
             <div className="rounded-2xl bg-white/[0.06] p-3.5 backdrop-blur-[4px] md:p-4">
               <div className="flex items-center gap-1.5">
                 <p className="text-sm font-semibold text-white/95">Generation speed</p>
-                <SettingsInfoTooltip text="Both modes use the same relevance, context, and silence checks. Fast analyzes up to 2 sources; Slow analyzes up to 3." />
+                <SettingsInfoTooltip text="Both modes use the same relevance, context, and sentence-boundary refinement. Fast analyzes up to 2 sources; Slow analyzes up to 3." />
               </div>
               <p className="mt-1 text-[11px] text-white/58">
                 Same clip quality rules; choose how many sources to analyze.

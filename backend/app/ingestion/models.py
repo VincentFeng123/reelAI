@@ -163,6 +163,8 @@ class ReelOutWithAttribution(ReelOut):
     selection_quality_mean: float | None = Field(default=None, exclude=True)
     selection_topic_relevance: float | None = Field(default=None, exclude=True)
     selection_source_rank: int = Field(default=0, exclude=True)
+    selection_intent_role: str = Field(default="primary", exclude=True)
+    selection_intent_coverage: float = Field(default=1.0, exclude=True)
 
 
 class IngestResult(BaseModel):

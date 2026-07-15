@@ -73,6 +73,8 @@ class SelectionContractOrderingTests(unittest.TestCase):
         chain_id: str = "",
         chain_position: int = 0,
         prerequisite_ids: list[str] | None = None,
+        intent_role: str = "primary",
+        intent_coverage: float = 1.0,
     ) -> dict:
         item = {
             "reel_id": reel_id,
@@ -89,6 +91,8 @@ class SelectionContractOrderingTests(unittest.TestCase):
             "_selection_chain_id": chain_id,
             "_selection_chain_position": chain_position,
             "_selection_prerequisite_ids": list(prerequisite_ids or []),
+            "_selection_intent_role": intent_role,
+            "_selection_intent_coverage": intent_coverage,
         }
         if informativeness is not None:
             item["_selection_informativeness"] = informativeness
@@ -164,6 +168,68 @@ class SelectionContractOrderingTests(unittest.TestCase):
                 "weaker-floor",
             ],
         )
+
+    def test_primary_intent_ranks_before_support_only_within_same_difficulty_stage(
+        self,
+    ) -> None:
+        items = [
+            self._selection_item(
+                "beginner-support",
+                video_id="video-a",
+                start=10,
+                content_score=0.99,
+                difficulty=0.2,
+                informativeness=0.99,
+                topic_relevance=0.99,
+                educational_importance=0.99,
+                intent_role="supporting",
+                intent_coverage=0.5,
+            ),
+            self._selection_item(
+                "beginner-primary",
+                video_id="video-b",
+                start=20,
+                content_score=0.80,
+                difficulty=0.3,
+                informativeness=0.80,
+                topic_relevance=0.80,
+                educational_importance=0.80,
+                intent_role="primary",
+            ),
+            self._selection_item(
+                "advanced-primary",
+                video_id="video-c",
+                start=30,
+                content_score=1.0,
+                difficulty=0.8,
+                informativeness=1.0,
+                topic_relevance=1.0,
+                educational_importance=1.0,
+                intent_role="primary",
+            ),
+        ]
+
+        ordered = self.service.adaptive_curriculum_order(
+            self.conn,
+            self.MATERIAL,
+            self.LEARNER,
+            items,
+        )
+
+        self.assertEqual(
+            [item["reel_id"] for item in ordered],
+            ["beginner-primary", "beginner-support", "advanced-primary"],
+        )
+
+    def test_persisted_selection_metadata_decodes_intent_role_and_coverage(self) -> None:
+        metadata = self.service._selection_metadata({
+            "selection_contract_version": "quality_silence_v15",
+            "intent_role": "supporting",
+            "intent_coverage": 0.5,
+        })
+
+        self.assertEqual(metadata["_selection_intent_role"], "supporting")
+        self.assertEqual(metadata["_selection_intent_coverage"], 0.5)
 
     def test_explicit_chain_and_prerequisite_edges_remain_ordered(self) -> None:
         items = [
@@ -552,7 +618,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ).fetchone()
             context = json.loads(row[0])
             context.update({
-                "selection_contract_version": "quality_silence_v14",
+                "selection_contract_version": "quality_silence_v15",
                 "self_contained": True,
                 "topic_evidence_quote": (
                     "Chemical bonding explains how atoms share or transfer electrons"
@@ -605,7 +671,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             return {
                 "reel_id": reel_id,
                 "difficulty": difficulty,
-                "selection_contract_version": "quality_silence_v14",
+                "selection_contract_version": "quality_silence_v15",
             }
 
         easy = item("easy", 0.15)
@@ -745,7 +811,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         ).fetchone()
         context = json.loads(row[0])
         context.update({
-            "selection_contract_version": "quality_silence_v14",
+            "selection_contract_version": "quality_silence_v15",
             "topic_relevance": 0.93,
             "self_contained": True,
             "topic_evidence_quote": (
@@ -790,7 +856,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         for result in (fresh, cached):
             self.assertEqual(len(result), 1)
             self.assertEqual(
-                result[0]["selection_contract_version"], "quality_silence_v14"
+                result[0]["selection_contract_version"], "quality_silence_v15"
             )
             self.assertAlmostEqual(result[0]["relevance_score"], 0.93)
             self.assertAlmostEqual(result[0]["topic_relevance"], 0.93)
@@ -1109,7 +1175,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ).fetchone()
             context = json.loads(row[0])
             context.update({
-                "selection_contract_version": "quality_silence_v14",
+                "selection_contract_version": "quality_silence_v15",
                 "self_contained": True,
                 "topic_evidence_quote": (
                     "Chemical bonding explains how atoms share or transfer electrons"

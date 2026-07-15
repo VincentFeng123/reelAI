@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,29 @@ class _FakeGeminiClient:
         return None
 
 
+def _intent_expansion_json(
+    *,
+    corrected: str,
+    source_phrase: str,
+    queries: list[str],
+) -> str:
+    return json.dumps({
+        "corrected": corrected,
+        "intent_constraints": [{
+            "constraint_id": "subject",
+            "source_phrase": source_phrase,
+            "requirement": f"Teach {corrected}",
+        }],
+        "queries": [
+            {
+                "text": query,
+                "preserved_constraint_ids": ["subject"],
+            }
+            for query in queries
+        ],
+    })
+
+
 def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypatch):
     seen = {}
 
@@ -38,9 +62,10 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
         seen.update(
             topic=topic, n=n, model=model, level=level, cancelled=should_cancel()
         )
-        return (
-            '{"corrected":"Calculus","queries":['
-            '"calculus spoken lecture", "Derivatives", " derivatives ", "Limits"]}'
+        return _intent_expansion_json(
+            corrected="Calculus",
+            source_phrase="calclus",
+            queries=["calculus spoken lecture", "Derivatives", " derivatives ", "Limits"],
         )
 
     monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
@@ -59,6 +84,83 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
     assert seen == {
         "topic": "calclus", "n": 3, "model": "gemini-3.1-flash-lite",
         "level": "beginner", "cancelled": False,
+    }
+
+
+def test_practice_fast_expansion_keeps_only_queries_preserving_every_intent_constraint(
+    monkeypatch,
+):
+    payload = {
+        "corrected": "chain rule worked example",
+        "intent_constraints": [
+            {
+                "constraint_id": "subject",
+                "source_phrase": "chain rule",
+                "requirement": "Teach the chain rule",
+            },
+            {
+                "constraint_id": "task",
+                "source_phrase": "worked example",
+                "requirement": "Work through a concrete example to its answer",
+            },
+        ],
+        "queries": [
+            {
+                "text": "chain rule definition lecture",
+                "preserved_constraint_ids": ["subject"],
+            },
+            {
+                "text": "chain rule solved derivative walkthrough",
+                "preserved_constraint_ids": ["subject", "task"],
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    result = expand.expand_query_practice_fast("chain rule worked example", 3)
+
+    assert result == {
+        "corrected": "chain rule worked example",
+        "queries": ["chain rule solved derivative walkthrough"],
+        "provider_used": "gemini",
+    }
+
+
+def test_practice_fast_expansion_falls_back_to_exact_request_when_contract_drops_qualifier(
+    monkeypatch,
+):
+    payload = {
+        "corrected": "chain rule worked example",
+        "intent_constraints": [
+            {
+                "constraint_id": "subject",
+                "source_phrase": "chain rule",
+                "requirement": "Teach the chain rule",
+            },
+        ],
+        "queries": [
+            {
+                "text": "chain rule definition lecture",
+                "preserved_constraint_ids": ["subject"],
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    result = expand.expand_query_practice_fast("chain rule worked example", 3)
+
+    assert result == {
+        "corrected": "chain rule worked example",
+        "queries": ["chain rule worked example"],
+        "provider_used": "literal_fallback",
     }
 
 
@@ -142,7 +244,11 @@ def test_practice_fast_expansion_never_falls_back_to_pro(monkeypatch):
         calls.append(model)
         if model == expand.PRACTICE_FAST_EXPAND_MODEL:
             raise RuntimeError("flash unavailable")
-        return '{"corrected":"Physics","queries":["Physics","mechanics","waves"]}'
+        return _intent_expansion_json(
+            corrected="Physics",
+            source_phrase="physics",
+            queries=["Physics", "mechanics", "waves"],
+        )
 
     monkeypatch.setattr(expand, "_practice_fast_gemini_raw", flash_then_pro)
 
@@ -219,7 +325,11 @@ def test_practice_fast_expansion_stores_success_for_reuse(monkeypatch):
         nonlocal provider_calls
         assert context is not None
         provider_calls += 1
-        return '{"corrected":"Physics","queries":["Physics","mechanics","waves"]}'
+        return _intent_expansion_json(
+            corrected="Physics",
+            source_phrase="physics",
+            queries=["Physics", "mechanics", "waves"],
+        )
 
     monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
 
@@ -234,7 +344,7 @@ def test_practice_fast_expansion_stores_success_for_reuse(monkeypatch):
 def test_practice_fast_expansion_cache_outlives_segment_ttl_and_expires(monkeypatch):
     cached_row = {
         "response_json": (
-            '{"version":4,"corrected":"Physics",'
+            '{"version":5,"corrected":"Physics",'
             '"queries":["physics lecture","mechanics","waves"]}'
         ),
         "created_at": (
@@ -250,7 +360,11 @@ def test_practice_fast_expansion_cache_outlives_segment_ttl_and_expires(monkeypa
     def fake_raw(*_args, **_kwargs):
         nonlocal provider_calls
         provider_calls += 1
-        return '{"corrected":"Physics","queries":["Physics","mechanics","waves"]}'
+        return _intent_expansion_json(
+            corrected="Physics",
+            source_phrase="physics",
+            queries=["Physics", "mechanics", "waves"],
+        )
 
     monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
 

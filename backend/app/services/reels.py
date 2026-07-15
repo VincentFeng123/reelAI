@@ -1208,8 +1208,9 @@ class ReelService:
     # v23: prefer the requested difficulty bin, with a nearest valid-bin fallback.
     # v24: expose current selector relevance consistently in cached feed rows.
     # v25: accept validated transcript-context boundaries in current inventory.
-    RANKED_FEED_CACHE_VERSION = 25
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v14"
+    # v26: rank exact-request fulfillment within each difficulty stage.
+    RANKED_FEED_CACHE_VERSION = 26
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v15"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
         "quality_silence_v4",
@@ -1223,6 +1224,7 @@ class ReelService:
         "quality_silence_v12",
         "quality_silence_v13",
         "quality_silence_v14",
+        "quality_silence_v15",
     })
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
@@ -2440,6 +2442,12 @@ class ReelService:
             "_selection_source_rank": int(
                 getattr(reel_obj, "selection_source_rank", 0) or 0
             ),
+            "_selection_intent_role": str(
+                getattr(reel_obj, "selection_intent_role", "primary") or "primary"
+            ).strip().lower(),
+            "_selection_intent_coverage": self._selection_number(
+                getattr(reel_obj, "selection_intent_coverage", 1.0), 1.0
+            ),
         }
 
     def _finalize_generated_reels(
@@ -2465,6 +2473,7 @@ class ReelService:
                 "quality_silence_v12",
                 "quality_silence_v13",
                 "quality_silence_v14",
+                "quality_silence_v15",
             }
             for reel in generated
         ):
@@ -5601,7 +5610,7 @@ class ReelService:
         item: dict[str, Any],
         *,
         input_order: int = 0,
-    ) -> tuple[int, float, float, float, int, float, int]:
+    ) -> tuple[int, int, float, float, float, float, int, float, int]:
         """Rank value within a difficulty stage, with deterministic fallbacks."""
         compatibility_score = cls._selection_number(
             item.get("_selection_content_score"), 0.0
@@ -5651,8 +5660,19 @@ class ReelService:
             source_rank = max(0, int(item.get("_selection_source_rank") or 0))
         except (TypeError, ValueError):
             source_rank = 0
+        intent_role = str(
+            item.get("_selection_intent_role")
+            or item.get("intent_role")
+            or "primary"
+        ).strip().lower()
+        intent_coverage = cls._selection_number(
+            item.get("_selection_intent_coverage", item.get("intent_coverage")),
+            1.0,
+        )
         return (
             cls._selection_difficulty_stage(item),
+            0 if intent_role == "primary" else 1,
+            -intent_coverage,
             -quality_floor,
             -quality_mean,
             -topic_relevance,
@@ -5745,6 +5765,12 @@ class ReelService:
             "_selection_candidate_id": str(
                 parsed.get("selection_candidate_id") or parsed.get("candidate_id") or ""
             ).strip(),
+            "_selection_intent_role": str(
+                parsed.get("intent_role") or "primary"
+            ).strip().lower(),
+            "_selection_intent_coverage": cls._selection_number(
+                parsed.get("intent_coverage"), 1.0
+            ),
         }
         for source_key, metadata_key in (
             ("quality_floor", "_selection_quality_floor"),
@@ -5790,6 +5816,7 @@ class ReelService:
                 "quality_silence_v12",
                 "quality_silence_v13",
                 "quality_silence_v14",
+                "quality_silence_v15",
             },
         )
         metadata["_selection_substantive"] = selection_bool(
@@ -5808,6 +5835,7 @@ class ReelService:
                 "quality_silence_v12",
                 "quality_silence_v13",
                 "quality_silence_v14",
+                "quality_silence_v15",
             },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
@@ -7294,6 +7322,7 @@ class ReelService:
                     "quality_silence_v12",
                     "quality_silence_v13",
                     "quality_silence_v14",
+                    "quality_silence_v15",
                 }
                 else legacy_difficulty_matches_level
             )
@@ -7332,6 +7361,7 @@ class ReelService:
                             "quality_silence_v12",
                             "quality_silence_v13",
                             "quality_silence_v14",
+                            "quality_silence_v15",
                         }
                         and selection_metadata.get(
                             "_selection_speech_corridor_verified"
@@ -7356,6 +7386,7 @@ class ReelService:
                     "quality_silence_v12",
                     "quality_silence_v13",
                     "quality_silence_v14",
+                    "quality_silence_v15",
                 } and (
                     (
                         min(
@@ -7381,6 +7412,7 @@ class ReelService:
                             "quality_silence_v12",
                             "quality_silence_v13",
                             "quality_silence_v14",
+                            "quality_silence_v15",
                         }
                         else self._selection_number(
                             selection_metadata.get("_selection_topic_relevance"), 0.0
@@ -7716,6 +7748,7 @@ class ReelService:
                 "quality_silence_v12",
                 "quality_silence_v13",
                 "quality_silence_v14",
+                "quality_silence_v15",
             }:
                 # V5+ captions must be immutable selection-time evidence. A
                 # provider artifact key identifies a retrieval profile and may
@@ -7745,6 +7778,7 @@ class ReelService:
                         "quality_silence_v12",
                         "quality_silence_v13",
                         "quality_silence_v14",
+                        "quality_silence_v15",
                     }
                     or transcript_artifact_key
                     else str(clean_item.get("transcript_snippet") or "")

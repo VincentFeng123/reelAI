@@ -118,9 +118,13 @@ INGEST_TOPIC_VIDEO_TIMEOUT_SEC = float(os.environ.get("INGEST_TOPIC_VIDEO_TIMEOU
 INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC = float(
     os.environ.get("INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC", "45")
 )
+INGEST_TOPIC_STRAGGLER_GRACE_SEC = float(
+    os.environ.get("INGEST_TOPIC_STRAGGLER_GRACE_SEC", "8")
+)
 PARTIAL_CUE_MATERIALITY_SEC = 0.05
 SPEECH_OWNERSHIP_EPSILON_SEC = 0.001
 MAX_PLAUSIBLE_CAPTION_WORDS_PER_SEC = 8.0
+CAPTION_PROJECTION_START_PREROLL_SEC = 0.15
 _QUOTE_WORD_RE = re.compile(
     r"[\w+#]+(?:['\u2018\u2019\u02bc-][\w+#]+)*",
     re.UNICODE,
@@ -520,7 +524,7 @@ def _boundary_evidence_grade(
     if (
         not isinstance(context, dict)
         or str(context.get("selection_contract_version") or "").strip()
-        != "quality_silence_v14"
+        != "quality_silence_v15"
     ):
         return 0
     if (
@@ -620,6 +624,63 @@ def _caption_overlap_end_handoff_is_valid(
     )
 
 
+def _interpolated_caption_edge_anchor(
+    *,
+    cue_text: str,
+    quote: str,
+    edge: str,
+    cue_start_sec: float,
+    cue_end_sec: float,
+) -> tuple[float, float] | None:
+    """Estimate one uniquely grounded edge inside a timestamped caption cue.
+
+    Some transcript providers omit native word timings. Uniform token
+    interpolation is a cheap refinement for an explicit filler-edge marker.
+    Ambiguous input returns ``None`` so the caller keeps the complete cue.
+    """
+    matches = list(_QUOTE_WORD_RE.finditer(str(cue_text or "")))
+    spans = _quote_character_spans(cue_text, quote)
+    if (
+        edge not in {"start", "end"}
+        or len(spans) != 1
+        or len(matches) < 2
+        or not math.isfinite(cue_start_sec)
+        or not math.isfinite(cue_end_sec)
+        or cue_end_sec <= cue_start_sec
+    ):
+        return None
+    span_start, span_end = spans[0]
+    selected = [
+        index
+        for index, match in enumerate(matches)
+        if match.start() >= span_start and match.end() <= span_end
+    ]
+    if not selected or selected != list(range(selected[0], selected[-1] + 1)):
+        return None
+    duration = cue_end_sec - cue_start_sec
+    token_count = len(matches)
+    if (
+        duration + SPEECH_OWNERSHIP_EPSILON_SEC
+        < token_count / MAX_PLAUSIBLE_CAPTION_WORDS_PER_SEC
+    ):
+        return None
+
+    def onset(index: int) -> float:
+        return cue_start_sec + duration * (index / token_count)
+
+    if edge == "start":
+        if selected[0] == 0:
+            return None
+        required = max(
+            cue_start_sec,
+            onset(selected[0]) - CAPTION_PROJECTION_START_PREROLL_SEC,
+        )
+        return required, min(required, onset(selected[0] - 1))
+    if selected[-1] + 1 >= token_count:
+        return None
+    return onset(selected[-1]), onset(selected[-1] + 1)
+
+
 def _projected_speech_bounds(
     transcript: dict[str, Any],
     raw_clip: dict[str, Any],
@@ -634,6 +695,126 @@ def _projected_speech_bounds(
     source = getattr(prepared, "source", None)
     words = tuple(getattr(source, "lexical_words", ()) or ())
     if not words:
+        if projections:
+            segments = [
+                segment
+                for segment in (transcript.get("segments") or [])
+                if isinstance(segment, dict)
+            ]
+            index_by_id = {
+                str(segment.get("cue_id") or f"cue-{index}").strip(): index
+                for index, segment in enumerate(segments)
+            }
+            selected_ids = [
+                str(value or "").strip()
+                for value in (raw_clip.get("cue_ids") or [])
+            ]
+            if (
+                not selected_ids
+                or any(cue_id not in index_by_id for cue_id in selected_ids)
+            ):
+                return fallback, {}, "projection_selected_cues_unavailable"
+            selected_indices = [index_by_id[cue_id] for cue_id in selected_ids]
+            if selected_indices != list(
+                range(selected_indices[0], selected_indices[-1] + 1)
+            ):
+                return fallback, {}, "projection_selected_cues_unavailable"
+            required_start, required_end = fallback
+            estimated: dict[str, Any] = {}
+            expected_cue_ids = {
+                "start": str(caption_diagnostics.get("start_cue_id") or ""),
+                "end": str(caption_diagnostics.get("end_cue_id") or ""),
+            }
+            for edge in ("start", "end"):
+                marker = projections.get(edge)
+                if not isinstance(marker, dict):
+                    continue
+                cue_id = str(marker.get("cue_id") or "").strip()
+                quote = " ".join(str(marker.get("quote") or "").split())
+                selected_index = (
+                    selected_indices[0] if edge == "start" else selected_indices[-1]
+                )
+                if (
+                    not cue_id
+                    or cue_id != expected_cue_ids[edge]
+                    or not quote
+                    or index_by_id.get(cue_id) != selected_index
+                ):
+                    return fallback, {}, f"{edge}_projection_marker_invalid"
+                cue = segments[selected_index]
+                try:
+                    cue_start = float(cue.get("start"))
+                    cue_end = float(cue.get("end"))
+                except (TypeError, ValueError, OverflowError):
+                    return fallback, {}, f"{edge}_caption_interpolation_unavailable"
+                if selected_index + 1 < len(segments):
+                    try:
+                        following_start = float(
+                            segments[selected_index + 1].get("start")
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        following_start = cue_end
+                    if (
+                        math.isfinite(following_start)
+                        and cue_start < following_start < cue_end
+                    ):
+                        cue_end = following_start
+                anchor = _interpolated_caption_edge_anchor(
+                    cue_text=str(cue.get("text") or ""),
+                    quote=quote,
+                    edge=edge,
+                    cue_start_sec=cue_start,
+                    cue_end_sec=cue_end,
+                )
+                if anchor is None:
+                    return fallback, {}, f"{edge}_caption_interpolation_unavailable"
+                required_sec, excluded_sec = anchor
+                if edge == "start":
+                    required_start = required_sec
+                else:
+                    required_end = required_sec
+                estimated[edge] = {
+                    "cue_id": cue_id,
+                    "quote": quote,
+                    "mode": "caption_token_interpolation",
+                    "required_speech_sec": round(required_sec, 3),
+                    "excluded_neighbor_onset_sec": round(excluded_sec, 3),
+                }
+            overlap_handoff = (
+                None
+                if "end" in estimated or isinstance(projections.get("end"), dict)
+                else _overlapping_caption_end_handoff(transcript, raw_clip)
+            )
+            if (
+                overlap_handoff is not None
+                and abs(fallback[1] - overlap_handoff[1]["display_end_sec"])
+                > SPEECH_OWNERSHIP_EPSILON_SEC
+            ):
+                overlap_handoff = None
+            if overlap_handoff is not None:
+                required_end, overlap_diagnostics = overlap_handoff
+            else:
+                overlap_diagnostics = None
+            if (
+                not estimated
+                or not math.isfinite(required_start)
+                or not math.isfinite(required_end)
+                or required_end <= required_start
+            ):
+                return fallback, {}, "caption_projection_invalid"
+            return (
+                (required_start, required_end),
+                {
+                    "caption_projection_verified": True,
+                    **estimated,
+                    **(
+                        {"caption_overlap_end_handoff": overlap_diagnostics}
+                        if overlap_diagnostics is not None
+                        else {}
+                    ),
+                },
+                None,
+            )
         overlap_handoff = (
             None
             if isinstance(projections.get("end"), dict)
@@ -1014,19 +1195,20 @@ def _selected_speech_corridor(
         if required_speech_bounds is not None
         else _required_speech_bounds(raw_clip, caption_diagnostics)
     )
-    lexical_boundaries = (
+    timed_boundaries = (
         projection_diagnostics
         if isinstance(projection_diagnostics, dict)
         and (
             projection_diagnostics.get("lexical_boundary_verified") is True
             or projection_diagnostics.get("lexical_projection_verified") is True
+            or projection_diagnostics.get("caption_projection_verified") is True
         )
         else {}
     )
-    start_boundary = lexical_boundaries.get("start")
-    end_boundary = lexical_boundaries.get("end")
-    start_is_lexical = isinstance(start_boundary, dict)
-    end_is_lexical = isinstance(end_boundary, dict)
+    start_boundary = timed_boundaries.get("start")
+    end_boundary = timed_boundaries.get("end")
+    start_is_timed = isinstance(start_boundary, dict)
+    end_is_timed = isinstance(end_boundary, dict)
     end_is_overlap_handoff = _caption_overlap_end_handoff_is_valid(
         transcript,
         raw_clip,
@@ -1040,10 +1222,10 @@ def _selected_speech_corridor(
     start_is_partial = required_start > first_start + PARTIAL_CUE_MATERIALITY_SEC
     end_is_partial = required_end < last_end - PARTIAL_CUE_MATERIALITY_SEC
     if (
-        (start_is_partial and not start_is_lexical)
+        (start_is_partial and not start_is_timed)
         or (
             end_is_partial
-            and not end_is_lexical
+            and not end_is_timed
             and not end_is_overlap_handoff
         )
     ):
@@ -1051,7 +1233,7 @@ def _selected_speech_corridor(
 
     start_limit = (
         float(start_boundary["excluded_neighbor_onset_sec"])
-        if start_is_lexical
+        if start_is_timed
         else 0.0
         if first_index == 0
         else min(
@@ -1061,7 +1243,7 @@ def _selected_speech_corridor(
     )
     end_limit = (
         float(end_boundary["excluded_neighbor_onset_sec"])
-        if end_is_lexical
+        if end_is_timed
         else source_end
         if last_index + 1 >= len(segments)
         else float(segments[last_index + 1]["start"])
@@ -1163,9 +1345,9 @@ def _transcript_aligned_result(
     """Use the selected complete transcript thought when audio is not preferred.
 
     Gemini's exact edge quotes and deterministic discourse checks choose the
-    semantic unit. Native lexical timestamps may tighten a coarse edge cue when
-    they are already available; otherwise the whole cue is retained so this
-    fast path never guesses a word time or cuts required speech.
+    semantic unit. Native lexical timestamps, or conservative token
+    interpolation for a uniquely grounded filler edge, may tighten a coarse
+    cue. If refinement is uncertain the caller retains the whole cue.
     """
 
     if bool(getattr(acoustic, "verified", False)):
@@ -1514,6 +1696,11 @@ def _verified_direct_adapter_clips(
                 if float(candidate.get("difficulty") or 0.0) < 0.67
                 else 2
             ),
+            0
+            if str(candidate.get("intent_role") or "primary").strip().lower()
+            == "primary"
+            else 1,
+            -float(candidate.get("intent_coverage", 1.0) or 0.0),
             -min(candidate["_quality_scores"]),
             -(sum(candidate["_quality_scores"]) / 3.0),
             -float(candidate["_quality_scores"][1]),
@@ -1546,7 +1733,7 @@ def _verified_direct_adapter_clips(
             prepared,
         )
         start_sec, end_sec = speech_bounds
-        if projection_error or not bool(getattr(prepared, "ready", False)):
+        if projection_error:
             speech_bounds = complete_cue_bounds
             start_sec, end_sec = speech_bounds
             projection = (
@@ -1812,7 +1999,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v14",
+            selection_contract_version="quality_silence_v15",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -1843,6 +2030,9 @@ def _verified_direct_adapter_clips(
             ),
             prerequisite_ids=list(clip.get("prerequisite_ids") or []),
             uncertainty=str(clip.get("uncertainty") or "low"),
+            intent_role=str(clip.get("intent_role") or "primary").strip().lower(),
+            intent_coverage=float(clip.get("intent_coverage", 1.0) or 0.0),
+            intent_evidence=list(clip.get("intent_evidence") or []),
             topic_evidence_quote=str(
                 clip.get("topic_evidence_quote") or ""
             ).strip(),
@@ -2263,8 +2453,8 @@ class IngestionPipeline:
         """
         Topic-aware variant of `ingest_url` that emits MULTIPLE reels per video.
 
-        Routes through the same whole-transcript selector and acoustic boundary
-        verifier as material generation, preserving every qualifying facet.
+        Routes through the same whole-transcript selector and transcript boundary
+        refinement as material generation, preserving every qualifying facet.
         Each kept clip is persisted via `_persist_ingest`, producing a list of
         `ReelOutWithAttribution` rows that decode cleanly into the iOS Reel struct.
 
@@ -3134,9 +3324,7 @@ class IngestionPipeline:
                     prepared_audio,
                 )
                 required_start, required_end = speech_bounds
-                if projection_error or not bool(
-                    getattr(prepared_audio, "ready", False)
-                ):
+                if projection_error:
                     speech_bounds = complete_cue_bounds
                     required_start, required_end = speech_bounds
                     projection = (
@@ -3638,6 +3826,7 @@ class IngestionPipeline:
             int,
             tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]],
         ] = {}
+        straggler_deadline: float | None = None
         initial_resolved: set[int] = set()
         provider_errors: list[_ClipProviderError] = []
         initial_count = concurrent_video_count
@@ -3705,14 +3894,18 @@ class IngestionPipeline:
         try:
             while pending:
                 raise_if_cancelled(should_cancel)
-                remaining = max(0.0, deadline - time.monotonic())
+                active_deadline = min(
+                    deadline,
+                    straggler_deadline if straggler_deadline is not None else deadline,
+                )
+                remaining = max(0.0, active_deadline - time.monotonic())
                 done, _ = wait(
                     pending,
                     timeout=min(0.05, remaining),
                     return_when=FIRST_COMPLETED,
                 )
                 if not done:
-                    if time.monotonic() < deadline:
+                    if time.monotonic() < active_deadline:
                         continue
                     initial_resolved.update(
                         index for index, _video in pending.values() if index < initial_count
@@ -3731,8 +3924,10 @@ class IngestionPipeline:
                             matched_queries=(v.get("_search_context") or {}).get("matched_queries"),
                             query_plan_ai_status=(v.get("_search_context") or {}).get("query_plan_ai_status"),
                             error=(
-                                "shared clip fetch deadline exceeded "
-                                f"({shared_timeout_sec:g}s)"
+                                "post-first-clip straggler grace exceeded"
+                                if straggler_deadline is not None
+                                and straggler_deadline < deadline
+                                else "shared clip fetch deadline exceeded"
                             ),
                         )
                     if generation_context is not None:
@@ -3761,12 +3956,23 @@ class IngestionPipeline:
                     if retrieval_profile == "bootstrap":
                         persist_bootstrap_sources()
                     else:
+                        stored_before = stored_count
                         persisted = persist_result(
                             result,
                             limit=max(0, inventory_cap - persisted_count),
                         )
                         reels_by_video[index] = persisted
                         persisted_count += len(persisted)
+                        if (
+                            (persisted or stored_count > stored_before)
+                            and straggler_deadline is None
+                            and retrieval_profile == "deep"
+                        ):
+                            straggler_deadline = min(
+                                deadline,
+                                time.monotonic()
+                                + max(0.0, INGEST_TOPIC_STRAGGLER_GRACE_SEC),
+                            )
 
                 if retrieval_profile == "bootstrap":
                     persist_bootstrap_sources()
@@ -4079,7 +4285,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v14",
+                    selection_contract_version="quality_silence_v15",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,
@@ -4098,6 +4304,11 @@ class IngestionPipeline:
                         for reason in (clip.get("uncertainty_reasons") or [])
                         if str(reason).strip()
                     ],
+                    intent_role=str(
+                        clip.get("intent_role") or "primary"
+                    ).strip().lower(),
+                    intent_coverage=unit(clip.get("intent_coverage"), 1.0),
+                    intent_evidence=list(clip.get("intent_evidence") or []),
                 )
             else:
                 level_fit = 1.0 - abs(difficulty - level_target)
@@ -4141,6 +4352,14 @@ class IngestionPipeline:
         remaining_nodes = set(nodes)
         satisfied_nodes: set[str] = set()
         ordered_kept: list[dict[str, Any]] = []
+        target_difficulty_stage = (
+            0 if level_target < 0.34 else 1 if level_target < 0.67 else 2
+        )
+
+        def difficulty_stage(node_id: str) -> int:
+            difficulty = unit(nodes[node_id].get("difficulty"), 0.5)
+            return 0 if difficulty < 0.34 else 1 if difficulty < 0.67 else 2
+
         while remaining_nodes:
             eligible_nodes = [
                 node_id
@@ -4176,6 +4395,15 @@ class IngestionPipeline:
                             .get("deferred_level")
                         )
                     ),
+                    -abs(difficulty_stage(node_id) - target_difficulty_stage),
+                    -difficulty_stage(node_id),
+                    int(
+                        str(nodes[node_id].get("intent_role") or "primary")
+                        .strip()
+                        .lower()
+                        == "primary"
+                    ),
+                    unit(nodes[node_id].get("intent_coverage"), 1.0),
                     -unit(nodes[node_id].get("difficulty"), 0.5),
                     float(
                         nodes[node_id]
@@ -4746,6 +4974,13 @@ class IngestionPipeline:
             ),
             selection_source_rank=max(
                 0, int(selection_context.get("source_rank") or 0)
+            ),
+            selection_intent_role=str(
+                selection_context.get("intent_role") or "primary"
+            ).strip().lower(),
+            selection_intent_coverage=max(
+                0.0,
+                min(1.0, float(selection_context.get("intent_coverage", 1.0))),
             ),
             source_attribution=attribution,
         )

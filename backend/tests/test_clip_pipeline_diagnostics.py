@@ -1701,6 +1701,90 @@ def test_production_boundary_path_mixes_projected_start_with_last_speech_end(
     assert acoustic["end_windows"] == [[27.0, 33.0]]
 
 
+def test_production_transcript_path_preserves_same_cue_filler_projection(
+    monkeypatch,
+) -> None:
+    text = (
+        "Welcome back. Photosynthesis converts light energy into chemical energy. "
+        "Thanks for watching."
+    )
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:production-caption-projection",
+        "duration": 12.0,
+        "segments": [
+            {"cue_id": "unit", "start": 0.0, "end": 12.0, "text": text},
+        ],
+    }
+    engine_out = {
+        "clips": [
+            _quality_clip(
+                cue_id="unit",
+                start=0.0,
+                end=12.0,
+                quote="Photosynthesis converts light energy into chemical energy",
+                edge_projection={
+                    "start": {
+                        "cue_id": "unit",
+                        "quote": "Photosynthesis converts",
+                    },
+                    "end": {
+                        "cue_id": "unit",
+                        "quote": "into chemical energy",
+                    },
+                },
+            )
+        ],
+        "transcript": transcript,
+        "notes": "",
+    }
+    monkeypatch.setattr(
+        pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery()
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out
+    )
+    prepare = mock.Mock()
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        prepare,
+    )
+    persisted: list[dict] = []
+    pipeline = _pipeline()
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        lambda *, clip, **_kwargs: (
+            persisted.append(clip) or "stored-caption-projection",
+            mock.sentinel.metadata,
+        ),
+    )
+
+    reels, _ = pipeline.ingest_topic(
+        topic="photosynthesis",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext(
+            "fast", require_acoustic_boundaries=False
+        ),
+        retrieval_profile="deep",
+        max_videos=1,
+        max_reels=1,
+    )
+
+    assert reels == ["stored-caption-projection"]
+    assert (persisted[0]["start"], persisted[0]["end"]) == pytest.approx(
+        (1.85, 9.0)
+    )
+    projection = persisted[0]["search_context"]["boundary_diagnostics"][
+        "lexical_projection"
+    ]
+    assert projection["caption_projection_verified"] is True
+    prepare.assert_not_called()
+
+
 def test_mixed_boundary_safety_rejects_missing_proof_and_speech_crossings() -> None:
     diagnostics = {
         "start_speech_handoff_verified": True,
@@ -1764,7 +1848,7 @@ def test_mixed_boundary_safety_rejects_missing_proof_and_speech_crossings() -> N
     ) is True
 
 
-def test_partial_cue_projection_fails_closed_without_native_lexical_words() -> None:
+def test_partial_cue_projection_uses_caption_tokens_without_native_words() -> None:
     transcript = {
         "source": "supadata",
         "native_mode": False,
@@ -1794,15 +1878,173 @@ def test_partial_cue_projection_fails_closed_without_native_lexical_words() -> N
         ),
     )
 
-    _bounds, projection, error = pipeline_module._projected_speech_bounds(
+    bounds, projection, error = pipeline_module._projected_speech_bounds(
         transcript,
         clip,
         caption,
         prepared,
     )
 
-    assert projection == {}
-    assert error == "lexical_timing_unavailable"
+    assert error is None
+    assert bounds == pytest.approx((20.0 / 7.0 - 0.15, 10.0))
+    assert projection["caption_projection_verified"] is True
+    assert projection["start"] == {
+        "cue_id": "unit",
+        "quote": "Python functions package",
+        "mode": "caption_token_interpolation",
+        "required_speech_sec": 2.707,
+        "excluded_neighbor_onset_sec": 1.429,
+    }
+
+
+def test_start_projection_clamps_rolling_cue_and_preserves_end_handoff() -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:rolling-caption-projection",
+        "duration": 20.0,
+        "segments": [
+            {
+                "cue_id": "selected",
+                "start": 0.0,
+                "end": 10.0,
+                "text": (
+                    "Welcome back chain rule differentiates composite functions by "
+                    "multiplying derivatives"
+                ),
+            },
+            {
+                "cue_id": "next",
+                "start": 8.0,
+                "end": 20.0,
+                "text": "The next topic begins with implicit differentiation.",
+            },
+        ],
+    }
+    clip = _quality_clip(
+        cue_id="selected",
+        start=0.0,
+        end=10.0,
+        quote="chain rule differentiates composite functions by multiplying derivatives",
+        edge_projection={
+            "start": {
+                "cue_id": "selected",
+                "quote": "chain rule differentiates",
+            }
+        },
+    )
+    caption = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert caption is not None
+
+    bounds, projection, error = pipeline_module._projected_speech_bounds(
+        transcript,
+        clip,
+        caption,
+        None,
+    )
+
+    assert error is None
+    assert bounds == pytest.approx((1.45, 8.0))
+    assert projection["start"]["required_speech_sec"] == 1.45
+    assert projection["caption_overlap_end_handoff"] == {
+        "mode": "next_cue_onset_two_sided_quiet",
+        "selected_cue_id": "selected",
+        "next_cue_id": "next",
+        "display_end_sec": 10.0,
+        "next_cue_onset_sec": 8.0,
+        "overlap_sec": 2.0,
+    }
+
+
+def test_implausibly_short_rolling_projection_fails_open_to_full_cue() -> None:
+    text = (
+        "Welcome back chain rule differentiates composite functions by multiplying "
+        "the outer and inner derivatives"
+    )
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:short-rolling-projection",
+        "duration": 20.0,
+        "segments": [
+            {"cue_id": "selected", "start": 0.0, "end": 10.0, "text": text},
+            {
+                "cue_id": "next",
+                "start": 0.5,
+                "end": 20.0,
+                "text": "The next topic starts here with a separate explanation.",
+            },
+        ],
+    }
+    clip = _quality_clip(
+        cue_id="selected",
+        start=0.0,
+        end=10.0,
+        quote="chain rule differentiates composite functions by multiplying",
+        kind="educational",
+        edge_projection={
+            "start": {
+                "cue_id": "selected",
+                "quote": "chain rule differentiates",
+            }
+        },
+    )
+
+    verified = pipeline_module._verified_direct_adapter_clips(
+        source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        engine_out={"clips": [clip], "transcript": transcript},
+        should_cancel=None,
+        exact_topic="chain rule",
+    )
+
+    assert len(verified) == 1
+    assert (verified[0]["start"], verified[0]["end"]) == (0.0, 10.0)
+    fallback = verified[0]["search_context"]["boundary_diagnostics"][
+        "lexical_projection"
+    ]["context_fallback"]
+    assert fallback["reason"].startswith("full_cue_fallback:")
+
+
+def test_transcript_only_adapter_preserves_same_cue_filler_projection() -> None:
+    text = (
+        "Welcome back. Photosynthesis converts light energy into chemical energy. "
+        "Thanks for watching."
+    )
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:caption-token-projection",
+        "duration": 12.0,
+        "segments": [
+            {"cue_id": "unit", "start": 0.0, "end": 12.0, "text": text},
+        ],
+    }
+    clip = _quality_clip(
+        cue_id="unit",
+        start=0.0,
+        end=12.0,
+        quote="Photosynthesis converts light energy into chemical energy",
+        kind="educational",
+        edge_projection={
+            "start": {"cue_id": "unit", "quote": "Photosynthesis converts"},
+            "end": {"cue_id": "unit", "quote": "into chemical energy"},
+        },
+    )
+
+    verified = pipeline_module._verified_direct_adapter_clips(
+        source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        engine_out={"clips": [clip], "transcript": transcript},
+        should_cancel=None,
+        exact_topic="photosynthesis",
+    )
+
+    assert len(verified) == 1
+    assert verified[0]["start"] == pytest.approx(1.85)
+    assert verified[0]["end"] == pytest.approx(9.0)
+    projection = verified[0]["search_context"]["boundary_diagnostics"][
+        "lexical_projection"
+    ]
+    assert projection["caption_projection_verified"] is True
 
 
 @pytest.mark.parametrize(
@@ -2543,7 +2785,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
 ) -> None:
     strict_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v14",
+        "selection_contract_version": "quality_silence_v15",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -2553,7 +2795,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
     }
     transcript_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v14",
+        "selection_contract_version": "quality_silence_v15",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -2616,7 +2858,7 @@ def test_failed_boundary_storage_does_not_consume_ready_material_cap(
     deferred.append({
         "search_context_json": json.dumps({
             "surface_eligible": True,
-            "selection_contract_version": "quality_silence_v14",
+            "selection_contract_version": "quality_silence_v15",
             "speech_corridor_verified": True,
             "boundary_status": "verified",
             "boundary_diagnostics": {
@@ -3032,6 +3274,99 @@ def test_candidate_plan_prioritizes_level_eligible_then_difficulty(
     ] == expected_deferred
 
 
+def test_candidate_plan_prioritizes_primary_intent_only_within_difficulty_stage(
+    monkeypatch,
+) -> None:
+    cues = [
+        {
+            "cue_id": "beginner-support",
+            "start": 0.0,
+            "end": 10.0,
+            "text": "Python functions package reusable instructions for a program.",
+        },
+        {
+            "cue_id": "beginner-primary",
+            "start": 10.0,
+            "end": 20.0,
+            "text": "This worked Python example defines greet and then calls greet.",
+        },
+        {
+            "cue_id": "advanced-primary",
+            "start": 20.0,
+            "end": 30.0,
+            "text": "This advanced Python example composes decorators around a generator function.",
+        },
+    ]
+    engine_out = {
+        "clips": [
+            _quality_clip(
+                cue_id="beginner-support",
+                start=0.0,
+                end=10.0,
+                quote=cues[0]["text"],
+                candidate_id="beginner-support",
+                score=0.99,
+                difficulty=0.2,
+                intent_role="supporting",
+                intent_coverage=0.5,
+                intent_evidence=[{
+                    "constraint_id": "subject",
+                    "evidence_quote": cues[0]["text"],
+                }],
+            ),
+            _quality_clip(
+                cue_id="beginner-primary",
+                start=10.0,
+                end=20.0,
+                quote=cues[1]["text"],
+                candidate_id="beginner-primary",
+                score=0.80,
+                difficulty=0.3,
+                intent_role="primary",
+                intent_coverage=1.0,
+            ),
+            _quality_clip(
+                cue_id="advanced-primary",
+                start=20.0,
+                end=30.0,
+                quote=cues[2]["text"],
+                candidate_id="advanced-primary",
+                score=1.0,
+                difficulty=0.8,
+                intent_role="primary",
+                intent_coverage=1.0,
+            ),
+        ],
+        "transcript": {
+            "source": "supadata",
+            "native_mode": False,
+            "artifact_key": "supadata-transcript:v2:intent-stage-order",
+            "duration": 30.0,
+            "segments": cues,
+        },
+        "notes": "",
+    }
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_clip",
+        lambda *_args, **_kwargs: engine_out,
+    )
+
+    _, clips, _ = _pipeline()._clip_and_filter(
+        {**_video(), "_knowledge_level": "beginner"},
+        "Python worked example",
+        "en",
+    )
+
+    assert [clip["selection_candidate_id"] for clip in clips] == [
+        "dQw4w9WgXcQ::beginner-primary",
+        "dQw4w9WgXcQ::beginner-support",
+        "dQw4w9WgXcQ::advanced-primary",
+    ]
+    assert clips[0]["search_context"]["intent_role"] == "primary"
+    assert clips[1]["search_context"]["intent_coverage"] == 0.5
+
+
 @pytest.mark.parametrize(
     ("difficulty", "matching_level"),
     [
@@ -3090,7 +3425,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v14"
+        assert context["selection_contract_version"] == "quality_silence_v15"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"

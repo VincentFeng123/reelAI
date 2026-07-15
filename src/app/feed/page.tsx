@@ -83,7 +83,6 @@ const COMPACT_REELS_PER_FEED_SESSION = 48;
 const MINIMAL_REELS_PER_FEED_SESSION = 20;
 const RECOVERY_REQUEST_IDLE_TIMEOUT_MS = 18_000;
 const GENERATION_STREAM_IDLE_TIMEOUT_MS = 35_000;
-const GENERATION_EXHAUSTED_COOLDOWN_MS = 60_000;
 const COMMUNITY_SET_FEED_HANDOFF_PREFIX = "studyreels-community-feed-handoff-";
 const DESCRIPTION_PREVIEW_CHAR_LIMIT = 180;
 const FEED_PLAYBACK_RATE_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as const;
@@ -1086,7 +1085,6 @@ function FeedPageInner() {
   const pendingResumeRef = useRef<FeedProgressEntry | null>(null);
   const resumeAppliedRef = useRef(false);
   const resumeLoadingRef = useRef(false);
-  const isFastTopUpRef = useRef(false);
   const mobileDetailsCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mutedRestoredFromSnapshotRef = useRef(false);
   const autoplayRestoredFromSnapshotRef = useRef(false);
@@ -1102,8 +1100,7 @@ function FeedPageInner() {
   const generationJobByMaterialRef = useRef<Map<string, ActiveGenerationJob>>(new Map());
   const generationConsumerByMaterialRef = useRef<Map<string, { jobId: string; token: symbol }>>(new Map());
   const generationBatchTokensRef = useRef<Set<symbol>>(new Set());
-  const generationExhaustedUntilRef = useRef<Map<string, number>>(new Map());
-  const generationExhaustedTimerRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const generationFinishedRef = useRef<Set<string>>(new Set());
   const recoveryRequestIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const visibleTransportErrorRef = useRef(false);
   const transportFailureStreakRef = useRef(0);
@@ -1157,7 +1154,6 @@ function FeedPageInner() {
   const resetActiveSearchRequestState = useCallback(() => {
     isFetchingRef.current = false;
     isGeneratingRef.current = false;
-    isFastTopUpRef.current = false;
     isRefreshingFeedRef.current = false;
     isRecoveringMissingMaterialRef.current = false;
     generationConsumerByMaterialRef.current.clear();
@@ -1359,52 +1355,35 @@ function FeedPageInner() {
     generationJobByMaterialRef.current.clear();
     generationConsumerByMaterialRef.current.clear();
     generationBatchTokensRef.current.clear();
-    generationExhaustedUntilRef.current.clear();
-    for (const timer of generationExhaustedTimerRef.current.values()) {
-      clearTimeout(timer);
-    }
-    generationExhaustedTimerRef.current.clear();
+    generationFinishedRef.current.clear();
     setPendingTailAdvance(false);
   }, []);
 
-  const isGenerationCoolingDown = useCallback((materialIdValue: string): boolean => {
-    const until = generationExhaustedUntilRef.current.get(materialIdValue) ?? 0;
-    if (until > Date.now()) {
-      return true;
-    }
-    generationExhaustedUntilRef.current.delete(materialIdValue);
-    return false;
+  const isGenerationFinished = useCallback((materialIdValue: string): boolean => {
+    return generationFinishedRef.current.has(materialIdValue);
   }, []);
 
-  const coolDownExhaustedMaterial = useCallback((materialIdValue: string) => {
+  const markGenerationFinished = useCallback((materialIdValue: string) => {
     const id = String(materialIdValue || "").trim();
     if (!id) {
       return;
     }
-    generationExhaustedUntilRef.current.set(id, Date.now() + GENERATION_EXHAUSTED_COOLDOWN_MS);
-    const existingTimer = generationExhaustedTimerRef.current.get(id);
-    if (existingTimer) {
-      clearTimeout(existingTimer);
-    }
-    generationExhaustedTimerRef.current.set(id, setTimeout(() => {
-      generationExhaustedTimerRef.current.delete(id);
-      generationExhaustedUntilRef.current.delete(id);
-      if (!isIngestMaterial) {
-        setCanRequestMore(true);
-      }
-    }, GENERATION_EXHAUSTED_COOLDOWN_MS));
+    // Every successful terminal has consumed this search scope's fixed source
+    // budget. Persisted pages can still load, but replaying the same request
+    // cannot discover a new clip and must not leave the tail spinner looping.
+    generationFinishedRef.current.add(id);
     const materialIds = getFeedMaterialIds();
-    if (materialIds.length > 0 && materialIds.every((materialIdKey) => isGenerationCoolingDown(materialIdKey))) {
+    if (materialIds.length > 0 && materialIds.every((materialIdKey) => isGenerationFinished(materialIdKey))) {
       setCanRequestMore(false);
     }
-  }, [getFeedMaterialIds, isGenerationCoolingDown, isIngestMaterial]);
+  }, [getFeedMaterialIds, isGenerationFinished]);
 
   const noteGenerationTerminal = useCallback((materialIdValue: string, status: GenerationTerminalStatus) => {
     generationJobByMaterialRef.current.delete(materialIdValue);
-    if (status === "exhausted") {
-      coolDownExhaustedMaterial(materialIdValue);
+    if (status === "completed" || status === "partial" || status === "exhausted") {
+      markGenerationFinished(materialIdValue);
     }
-  }, [coolDownExhaustedMaterial]);
+  }, [markGenerationFinished]);
 
   const rememberFeedGenerationJob = useCallback((
     materialIdValue: string,
@@ -1420,13 +1399,6 @@ function FeedPageInner() {
       noteGenerationTerminal(materialIdValue, status);
     }
   }, [noteGenerationTerminal]);
-
-  useEffect(() => () => {
-    for (const timer of generationExhaustedTimerRef.current.values()) {
-      clearTimeout(timer);
-    }
-    generationExhaustedTimerRef.current.clear();
-  }, []);
 
   useEffect(() => {
     clearGenerationTracking();
@@ -2259,7 +2231,7 @@ function FeedPageInner() {
       setFeedPagesExhausted(true);
       return [];
     }
-    const feedMaterialIds = allFeedMaterialIds.filter((id) => !isGenerationCoolingDown(id));
+    const feedMaterialIds = allFeedMaterialIds.filter((id) => !isGenerationFinished(id));
     if (feedMaterialIds.length === 0) {
       setCanRequestMore(false);
       return [];
@@ -2283,6 +2255,7 @@ function FeedPageInner() {
       const generatedRows = await Promise.all(
         feedMaterialIds.map(async (id) => {
           const streamedReels: Reel[] = [];
+          let observedTerminal = false;
           const currentCount = countReelsForMaterial(id);
           const targetTotal = Math.min(readyReservoirTarget(generationMode), currentCount + perTopicBatch);
           const activeGenerationJob = generationJobByMaterialRef.current.get(id);
@@ -2312,6 +2285,7 @@ function FeedPageInner() {
                 }
               },
               onTerminal: (status) => {
+                observedTerminal = true;
                 if (isSearchScopeActive(searchScope)) {
                   noteGenerationTerminal(id, status);
                 }
@@ -2328,6 +2302,13 @@ function FeedPageInner() {
                 }
               },
             });
+            if (!observedTerminal) {
+              // A completed request-key cache hit returns its final inventory
+              // directly instead of opening a durable stream.
+              if (isSearchScopeActive(searchScope)) {
+                noteGenerationTerminal(id, "completed");
+              }
+            }
             if (!isSearchScopeActive(searchScope)) {
               return { materialId: id, data: null, streamedReels, error: null };
             }
@@ -2374,6 +2355,28 @@ function FeedPageInner() {
         mergeReelBatchesByDifficulty(generatedRows.map((row) => row.streamedReels ?? [])),
       );
       if (generated.length === 0) {
+        const failedMaterialId = String(firstFailedRow?.materialId || "").trim();
+        if (firstFailedRow?.error && failedMaterialId && reelsRef.current.length === 0) {
+          // A submission response can be lost after the backend has already
+          // created its durable job. Re-read the authoritative feed once so we
+          // attach to that job (or let feed autofill create it) instead of
+          // leaving a fresh search at a false terminal empty state.
+          await loadPage(1, {
+            autofill: true,
+            preserveSession: true,
+            generationMode,
+          });
+          if (!isSearchScopeActive(searchScope)) {
+            return [];
+          }
+          if (
+            reelsRef.current.length > 0
+            || generationConsumerByMaterialRef.current.has(failedMaterialId)
+          ) {
+            setGenerationProgress(null);
+            return [];
+          }
+        }
         markRecoveryProgress(0);
         if (isTransportError(firstFailedRow?.error)) {
           noteFeedTransportFailure(firstFailedRow?.error, { forceVisible: Boolean(options?.surfaceError) });
@@ -2436,8 +2439,9 @@ function FeedPageInner() {
     getFeedTuningSettings,
     mergeReelBatchesByDifficulty,
     isIngestMaterial,
-    isGenerationCoolingDown,
+    isGenerationFinished,
     isSearchScopeActive,
+    loadPage,
     markRecoveryProgress,
     materialId,
     noteFeedFailure,
@@ -2610,7 +2614,7 @@ function FeedPageInner() {
       adaptiveExcludeReelIdsRef.current = restoredSession.adaptiveExcludeReelIds;
       setPage(restoredSession.page);
       setTotal(Math.max(restoredSession.total, restoredReels.length));
-      setCanRequestMore(true);
+      setCanRequestMore(restoredSession.canRequestMore);
       setGenerationMode(restoredGenerationMode);
       setMutedPreference(restoredSession.mutedPreference);
       setAutoplayEnabled(restoredSession.autoplayEnabled);
@@ -2651,7 +2655,7 @@ function FeedPageInner() {
       setBootstrappingFirstReels(true);
       const restoredSearchScope = activeSearchScopeRef.current;
       void loadPage(1, {
-        autofill: true,
+        autofill: false,
         preserveSession: true,
         generationMode: restoredGenerationMode,
       }).finally(() => {
@@ -2891,125 +2895,6 @@ function FeedPageInner() {
     finishActiveRecoveryRequest,
   ]);
 
-  const runFastTopUp = useCallback(async () => {
-    const feedMaterialIds = getFeedMaterialIds().filter((id) => !isGenerationCoolingDown(id));
-    if (
-      !settingsScopeReady
-      || feedMaterialIds.length === 0
-      || generationMode !== "fast"
-      || !canRequestMore
-      || isFastTopUpRef.current
-      || isGeneratingRef.current
-    ) {
-      return;
-    }
-    const searchScope = activeSearchScopeRef.current;
-    const tuning = getFeedTuningSettings();
-    const unseenReadyCount = Math.max(0, reelsRef.current.length - activeIndexRef.current - 1);
-    const perTopicBatch = Math.max(
-      1,
-      Math.ceil(Math.max(1, readyReservoirTarget("fast") - unseenReadyCount) / feedMaterialIds.length),
-    );
-    isFastTopUpRef.current = true;
-    const generationBatchToken = Symbol("fast-top-up");
-    generationBatchTokensRef.current.add(generationBatchToken);
-    syncGenerationLockState();
-    try {
-      const generatedRows = await Promise.all(
-        feedMaterialIds.map(async (id) => {
-          const streamedReels: Reel[] = [];
-          const currentCount = countReelsForMaterial(id);
-          const targetTotal = Math.min(readyReservoirTarget("fast"), currentCount + perTopicBatch);
-          const activeGenerationJob = generationJobByMaterialRef.current.get(id);
-          const consumerToken = claimGenerationConsumer(id, activeGenerationJob?.jobId || "new-fast-generation");
-          if (!consumerToken) {
-            return null;
-          }
-          try {
-            const data = await generateReelsStream({
-              materialId: id,
-              numReels: targetTotal,
-              generationJobId: activeGenerationJob?.jobId,
-              generationMode,
-              minRelevance: tuning.minRelevance,
-              creativeCommonsOnly: tuning.creativeCommonsOnly,
-              preferredVideoDuration: tuning.preferredVideoDuration,
-              signal: searchScope.controller.signal,
-              idleTimeoutMs: GENERATION_STREAM_IDLE_TIMEOUT_MS,
-              onTerminal: (status) => {
-                if (isSearchScopeActive(searchScope)) {
-                  noteGenerationTerminal(id, status);
-                }
-              },
-              onCandidate: (reel) => {
-                if (!isSearchScopeActive(searchScope)) {
-                  return;
-                }
-                const appended = appendGeneratedReels([reel]);
-                if (appended.addedCount > 0) {
-                  streamedReels.push(...appended.addedReels);
-                }
-              },
-            });
-            if (!isSearchScopeActive(searchScope)) {
-              return null;
-            }
-            reconcileGeneratedReels(streamedReels, data.reels, { preserveUnmatchedUnseen: true });
-            return { materialId: id, data, streamedReels: dedupeByIdentity(data.reels) };
-          } catch (e) {
-            if (!isRequestInterruptedError(e)) {
-              console.warn(`Fast mode background top-up failed for topic material ${id}:`, e);
-            }
-            return null;
-          } finally {
-            if (isSearchScopeActive(searchScope)) {
-              releaseGenerationConsumer(id, consumerToken);
-            }
-          }
-        }),
-      );
-      if (!isSearchScopeActive(searchScope)) {
-        return;
-      }
-      const generated = dedupeByIdentity(
-        mergeReelBatchesByDifficulty(generatedRows.map((row) => row?.streamedReels ?? [])),
-      );
-      if (generated.length > 0) {
-        markRecoveryProgress(generated.length);
-        setFeedPagesExhausted(false);
-      }
-    } catch (e) {
-      if (!isSearchScopeActive(searchScope) || isRequestInterruptedError(e)) {
-        return;
-      }
-      console.warn("Fast mode background top-up failed:", e);
-    } finally {
-      if (isSearchScopeActive(searchScope)) {
-        isFastTopUpRef.current = false;
-        generationBatchTokensRef.current.delete(generationBatchToken);
-        syncGenerationLockState();
-      }
-    }
-  }, [
-    appendGeneratedReels,
-    canRequestMore,
-    claimGenerationConsumer,
-    countReelsForMaterial,
-    dedupeByIdentity,
-    generationMode,
-    getFeedMaterialIds,
-    getFeedTuningSettings,
-    mergeReelBatchesByDifficulty,
-    isGenerationCoolingDown,
-    isSearchScopeActive,
-    markRecoveryProgress,
-    noteGenerationTerminal,
-    reconcileGeneratedReels,
-    releaseGenerationConsumer,
-    settingsScopeReady,
-    syncGenerationLockState,
-  ]);
-
   const bootstrapFirstReels = useCallback(
     async (manual = false) => {
       if (!materialId || isGeneratingRef.current || !canRequestMore) {
@@ -3053,17 +2938,17 @@ function FeedPageInner() {
         if (Math.max(0, reelsRef.current.length - activeIndexRef.current - 1) >= reservoirTarget) {
           return;
         }
-        const generated = await requestMore({ surfaceError: manual });
-        if (isSearchScopeActive(searchScope) && generationMode === "fast" && generated.length > 0) {
-          void runFastTopUp();
+        if (!manual && reelsRef.current.length > 0) {
+          return;
         }
+        await requestMore({ surfaceError: manual });
       } finally {
         if (isSearchScopeActive(searchScope)) {
           setBootstrappingFirstReels(false);
         }
       }
     },
-    [canRequestMore, generationMode, hasMore, isIngestMaterial, isSearchScopeActive, loadPage, materialId, page, requestMore, runFastTopUp, total],
+    [canRequestMore, generationMode, hasMore, isIngestMaterial, isSearchScopeActive, loadPage, materialId, page, requestMore, total],
   );
 
   useEffect(() => {
@@ -3072,6 +2957,7 @@ function FeedPageInner() {
       || loading
       || bootstrappingFirstReels
       || bootstrapAttemptedRef.current
+      || reels.length > 0
       || !feedNeedsBootstrapTopUp()
     ) {
       return;
@@ -3083,7 +2969,7 @@ function FeedPageInner() {
     }
     bootstrapAttemptedRef.current = true;
     void bootstrapFirstReels(false);
-  }, [bootstrapFirstReels, bootstrappingFirstReels, feedNeedsBootstrapTopUp, isIngestMaterial, loading, materialId]);
+  }, [bootstrapFirstReels, bootstrappingFirstReels, feedNeedsBootstrapTopUp, isIngestMaterial, loading, materialId, reels.length]);
 
   const maybeLoadMore = useCallback(() => {
     // For ingest-only sentinels, the primed session snapshot is the whole feed;
@@ -3092,18 +2978,15 @@ function FeedPageInner() {
       return;
     }
     if (hasMore && !isFetchingRef.current) {
-      loadPage(page + 1, { autofill: true });
+      loadPage(page + 1, { autofill: false });
       return;
     }
-    if (canRequestMore && !isGeneratingRef.current && feedNeedsBootstrapTopUp()) {
-      void (async () => {
-        const generated = await requestMore();
-        if (generationMode === "fast" && generated.length > 0) {
-          void runFastTopUp();
-        }
-      })();
+    const atFeedTail = reelsRef.current.length > 0
+      && activeIndexRef.current >= reelsRef.current.length - 1;
+    if (atFeedTail && canRequestMore && !isGeneratingRef.current && feedNeedsBootstrapTopUp()) {
+      void requestMore();
     }
-  }, [canRequestMore, feedNeedsBootstrapTopUp, generationMode, hasMore, isIngestMaterial, loadPage, page, requestMore, runFastTopUp]);
+  }, [canRequestMore, feedNeedsBootstrapTopUp, hasMore, isIngestMaterial, loadPage, page, requestMore]);
 
   const shouldBlockDownwardAtEnd = useCallback(
     (direction: 1 | -1): boolean => {
@@ -3113,15 +2996,24 @@ function FeedPageInner() {
       if (activeIndexRef.current < reels.length - 1) {
         return false;
       }
-      pendingAutoplayAdvanceRef.current = true;
-      setPendingTailAdvance(true);
-      maybeLoadMore();
+      const canWaitForMore = hasMore
+        || canRequestMore
+        || isGeneratingRef.current
+        || isFetchingRef.current;
+      if (canWaitForMore) {
+        pendingAutoplayAdvanceRef.current = true;
+        setPendingTailAdvance(true);
+        maybeLoadMore();
+      } else {
+        pendingAutoplayAdvanceRef.current = false;
+        setPendingTailAdvance(false);
+      }
       wheelGestureConsumedRef.current = false;
       wheelReadyToRearmRef.current = false;
       wheelAccumRef.current = 0;
       return true;
     },
-    [maybeLoadMore, reels.length],
+    [canRequestMore, hasMore, maybeLoadMore, reels.length],
   );
 
   const maybeResumeProgress = useCallback(() => {
@@ -3159,20 +3051,7 @@ function FeedPageInner() {
 
     if (hasMore) {
       resumeLoadingRef.current = true;
-      void loadPage(page + 1, { autofill: true }).finally(() => {
-        resumeLoadingRef.current = false;
-      });
-      return;
-    }
-
-    if (canRequestMore) {
-      resumeLoadingRef.current = true;
-      void (async () => {
-        const generated = await requestMore();
-        if (generationMode === "fast" && generated.length > 0) {
-          void runFastTopUp();
-        }
-      })().finally(() => {
+      void loadPage(page + 1, { autofill: false }).finally(() => {
         resumeLoadingRef.current = false;
       });
       return;
@@ -3180,7 +3059,7 @@ function FeedPageInner() {
 
     setActiveIndex((prev) => (reels.length > 0 ? Math.min(prev, reels.length - 1) : 0));
     resumeAppliedRef.current = true;
-  }, [canRequestMore, generationMode, hasMore, loadPage, materialId, page, reels, requestMore, runFastTopUp]);
+  }, [hasMore, loadPage, materialId, page, reels]);
 
   useEffect(() => {
     maybeResumeProgress();
@@ -3580,10 +3459,20 @@ function FeedPageInner() {
       jumpOneReel(1);
       return;
     }
+    if (
+      !hasMore
+      && !canRequestMore
+      && !isGeneratingRef.current
+      && !isFetchingRef.current
+    ) {
+      pendingAutoplayAdvanceRef.current = false;
+      setPendingTailAdvance(false);
+      return;
+    }
     pendingAutoplayAdvanceRef.current = true;
     setPendingTailAdvance(true);
     maybeLoadMore();
-  }, [jumpOneReel, maybeLoadMore, reels.length]);
+  }, [canRequestMore, hasMore, jumpOneReel, maybeLoadMore, reels.length]);
 
   useEffect(() => {
     if (!pendingAutoplayAdvanceRef.current) {
@@ -3749,7 +3638,7 @@ function FeedPageInner() {
   const atEndOfVisibleReels = reels.length > 0 && activeIndex >= reels.length - 1;
   const activeRecoveryRequest = recoveryPhase === "fetching-page" || recoveryPhase === "generating";
   const noMoreReelsAvailable =
-    reels.length > 0 &&
+    atEndOfVisibleReels &&
     !hasMore &&
     !canRequestMore &&
     !activeRecoveryRequest &&
@@ -4004,7 +3893,9 @@ function FeedPageInner() {
       }, 0),
     ));
     setPage(pagesToFetch);
-    setCanRequestMore(true);
+    if (levelChanged) {
+      setCanRequestMore(true);
+    }
     setFeedPagesExhausted(false);
     const primaryLevel = nextLevelsByMaterial.get(feedMaterialIds[0]);
     if (primaryLevel) {

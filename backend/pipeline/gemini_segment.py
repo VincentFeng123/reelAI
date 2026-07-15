@@ -21,7 +21,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 from typing import Callable, Literal, Optional
 
 from pydantic import (
@@ -39,6 +39,17 @@ from .. import config
 
 ProgressCb = Optional[Callable[[float, str], None]]
 CancelledCb = Optional[Callable[[], bool]]
+
+_SELECTOR_CALL_LIMIT = 3
+_SELECTOR_SLOT_POLL_S = 0.05
+_SELECTOR_OPERATIONS = frozenset({
+    "boundary_selection",
+    "flash_boundary_selector",
+    "flash_single_candidate",
+    "pro_authoritative",
+    "pro_fallback",
+})
+_selector_call_slots = BoundedSemaphore(_SELECTOR_CALL_LIMIT)
 
 log = logging.getLogger("clipper.segment")
 
@@ -61,6 +72,9 @@ _Facet = Annotated[
 ]
 _EvidenceQuote = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1)
+]
+_IntentConstraintId = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=32)
 ]
 _OptionalReason = Annotated[
     str, StringConstraints(strip_whitespace=True)
@@ -217,7 +231,37 @@ _TERMINAL_DANGLING_ARTICLE_RE = re.compile(
     re.IGNORECASE,
 )
 _TERMINAL_DANGLING_LINK_RE = re.compile(
-    r"\b(?:among|between|than|versus)\s*[.!?]?[\"')\]]*$",
+    r"\b(?:among|between|how|than|versus|what|when|where|which|who|whose|whom|why)"
+    r"\s*[.!?]?[\"')\]]*$",
+    re.IGNORECASE,
+)
+_TERMINAL_HEADLESS_QUANTIFIER_RE = re.compile(
+    r"\b(?:among|between|from|into|of|with)\s+"
+    r"(?:(?:more|less|fewer)\s+than\s+)?"
+    r"(?:one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"several|many|multiple|\d+)\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_DANGLING_MODAL_PREDICATE_RE = re.compile(
+    r"\b(?:can|could|may|might|must|shall|should|will|would)"
+    r"(?:\s+(?:not|n['’]t))?\s+"
+    r"(?:(?:also|generally|just|often|probably|really|still|usually)\s+)?"
+    r"(?:appear|be|become|feel|look|remain|seem|sound)\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_DANGLING_AUXILIARY_ADVERB_RE = re.compile(
+    r"\b(?:am|are|can|could|did|do|does|had|has|have|is|may|might|must|"
+    r"shall|should|was|were|will|would)"
+    r"(?:\s+(?:not|n['’]t))?\s+"
+    r"(?:actually|also|certainly|eventually|generally|hopefully|likely|often|"
+    r"possibly|probably|still|usually)\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_COMPLETE_SHORT_NP_RE = re.compile(
+    r"^(?:(?:the|this|that)\s+)?"
+    r"(?:first|second|third|final|last|next|other|previous|same)\s+"
+    r"(?:case|cases|example|examples|one|ones|step|steps|thing|things|time)"
+    r"[.!?]?[\"')\]]*$",
     re.IGNORECASE,
 )
 _TERMINAL_DANGLING_DEGREE_RE = re.compile(
@@ -228,6 +272,24 @@ _TERMINAL_DANGLING_DEGREE_RE = re.compile(
 _TERMINAL_AMBIGUOUS_DEGREE_RE = re.compile(
     r"\b(?:am|are|be|been|being|feels?|is|looks?|seems?|sounds?|was|were)"
     r"\s+pretty\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_EXPLICIT_INCOMPLETE_CLAUSE_RE = re.compile(
+    r"\b(?:although|because|if|since|unless|until|when|whereas|while)"
+    r"\s*[.!?]?[\"')\]]*$",
+    re.IGNORECASE,
+)
+_TERMINAL_COORDINATING_CONJUNCTION_RE = re.compile(
+    r"\b(?:and|but|or)\s*[.!?]?[\"')\]]*$",
+    re.IGNORECASE,
+)
+_TERMINAL_REQUIRED_COMPLEMENT_RE = re.compile(
+    r"(?:\b(?:depends?|relies?)\s+(?:on|upon)|"
+    r"\b(?:consists?|results?)\s+(?:of|from|in)|"
+    r"\b(?:leads?|refers?|corresponds?|belongs?)\s+to|"
+    r"\b(?:is|are|was|were|be)\s+"
+    r"(?:based|caused|defined|determined|known|proportional|related)\s+"
+    r"(?:as|by|on|to|with))\s*[.!?]?[\"')\]]*$",
     re.IGNORECASE,
 )
 _TRAILING_FORWARD_SETUP_RE = re.compile(
@@ -370,6 +432,54 @@ class _UncertaintyReason(str, Enum):
     OTHER = "other"
 
 
+class _IntentConstraintKind(str, Enum):
+    SUBJECT = "subject"
+    TASK = "task"
+    RELATIONSHIP = "relationship"
+    SCOPE = "scope"
+    FORMAT = "format"
+    OUTCOME = "outcome"
+
+
+class _IntentRole(str, Enum):
+    PRIMARY = "primary"
+    SUPPORTING = "supporting"
+
+
+class _IntentConstraint(_StrictModel):
+    constraint_id: _IntentConstraintId
+    kind: _IntentConstraintKind
+    source_phrase: _NonBlank = Field(
+        description=(
+            "Exact consecutive words copied from the user's request that introduce "
+            "this atomic constraint."
+        )
+    )
+    requirement: _NonBlank
+
+
+class _RequestIntent(_StrictModel):
+    exact_request: _NonBlank
+    constraints: list[_IntentConstraint] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def _unique_constraint_ids(self):
+        ids = [constraint.constraint_id for constraint in self.constraints]
+        if len(ids) != len(set(ids)):
+            raise ValueError("intent constraint ids must be unique")
+        return self
+
+
+class _IntentEvidence(_StrictModel):
+    constraint_id: _IntentConstraintId
+    evidence_quote: _EvidenceQuote = Field(
+        description=(
+            "Five to sixteen consecutive transcript words copied exactly from the "
+            "candidate that demonstrate this intent constraint."
+        )
+    )
+
+
 class _AssessmentDraft(_StrictModel):
     prompt: _NonBlank
     options: list[_NonBlank] = Field(min_length=4, max_length=4)
@@ -430,6 +540,10 @@ class _BoundaryTopic(_StrictModel):
     prerequisite_candidate_ids: list[_CandidateId] = Field(default_factory=list, max_length=8)
     uncertainty: Literal["low", "medium", "high"] = "low"
     uncertainty_reasons: list[_UncertaintyReason] = Field(default_factory=list, max_length=6)
+    # Compatibility defaults keep isolated conversion fixtures readable. The
+    # live selector uses _IntentBoundaryTopic, where both fields are required.
+    intent_role: _IntentRole | None = None
+    intent_evidence: list[_IntentEvidence] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def _uncertainty_has_reason(self):
@@ -459,6 +573,16 @@ class _Plan(_StrictModel):
 
 class _BoundaryPlan(_StrictModel):
     topics: list[_BoundaryTopic] = Field(max_length=_MAX_CLIPS)
+
+
+class _IntentBoundaryTopic(_BoundaryTopic):
+    intent_role: _IntentRole
+    intent_evidence: list[_IntentEvidence] = Field(min_length=1, max_length=8)
+
+
+class _IntentBoundaryPlan(_StrictModel):
+    request_intent: _RequestIntent
+    topics: list[_IntentBoundaryTopic] = Field(max_length=_MAX_CLIPS)
 
 
 class _BoundaryRepairItem(_StrictModel):
@@ -566,6 +690,11 @@ _POLICY_AND_EXAMPLES = """Policy:
   teach the same learning objective in different words.
 - Return every qualifying related unit, while scoring the densest, most useful, and most
   central units highest so the application can prioritize them within difficulty stages.
+- Treat subject relevance and fulfillment of the user's requested operation, relationship,
+  scope, format, and outcome as separate facts. A definition or prerequisite can remain a
+  useful supporting unit, but it is not primary fulfillment of a requested example,
+  comparison, causal explanation, misconception correction, identification, derivation,
+  application, or other task. Never label or rank a supporting facet as primary fulfillment.
 - Return a candidate only when informativeness, topic_relevance, and educational_importance
   are each at least 0.75 and the spoken unit satisfies every substantive, grounding,
   context, and filler rule.
@@ -639,10 +768,12 @@ def _topic_rule(topic: str) -> str:
         "identification, recognition, diagnosis, derivation, comparison, or application, "
         "include units that teach or perform that task for the named object as well as "
         "separate, explicitly topic-anchored prerequisite facets. A history or definition "
-        "alone is not a direct match to the requested task; return it only as a separate "
-        "facet when exact evidence anchors it to the named subject. Task fulfillment raises "
-        "educational importance and centrality; it does not exclude a genuinely related, "
-        "topic-anchored prerequisite facet. Shared vocabulary, a loose analogy, or general "
+        "alone is not a direct match to the complete requested task and is not primary "
+        "fulfillment; return it only as a "
+        "supporting facet when exact evidence anchors it to the named subject. Task "
+        "fulfillment raises educational importance and centrality; it does not exclude a "
+        "genuinely related, topic-anchored supporting facet. Shared vocabulary, a loose "
+        "analogy, or general "
         "systems thinking alone is not a useful prerequisite. Include supporting material "
         "only when it is genuinely needed to understand or apply the exact requested topic."
         " Exclude fictional, supernatural, pseudoscientific, or invented mechanisms unless "
@@ -700,6 +831,15 @@ def _selection_fields(*, enriched: bool) -> str:
     return fields
 
 
+def _intent_selection_fields() -> str:
+    return (
+        "intent_role (primary only when the clip fulfills every atomic request constraint; "
+        "otherwise supporting), and intent_evidence (one item per fulfilled constraint, "
+        "each containing constraint_id and a 5-16 word exact consecutive evidence_quote "
+        "copied from inside the candidate)"
+    )
+
+
 def _prompts(
     lines: str,
     n: int,
@@ -737,14 +877,20 @@ def _boundary_prompts(
         + _POLICY_AND_EXAMPLES
     )
     del learner_level
+    exact_request = topic.strip() or "(all educational topics)"
     user = (
         f"Transcript ({n} lines, formatted `[index] MM:SS text`; valid line IDs are "
         f"0 through {n - 1}):\n{lines}\n\n"
-        f"Exact user request: {topic.strip() or '(all educational topics)'}\n"
+        f"Exact user request: {exact_request}\n"
         f"{_topic_rule(topic)}\n\n"
         "Task:\n"
-        "1. Understand the whole transcript before selecting anything; scan the whole "
-        "transcript from first to last.\n"
+        "1. Copy the Exact user request verbatim into request_intent.exact_request. Decompose "
+        "it into atomic mandatory constraints before selecting anything: named subjects, "
+        "requested operations or tasks, relationships, scope qualifiers, requested formats, "
+        "and outcomes. Give each constraint a unique ID, kind, requirement, and source_phrase "
+        "copied exactly from the request. Separate a task from its subject; together the "
+        "source phrases must cover every meaningful request word. Then scan the whole "
+        "transcript from first to last and understand it before selecting anything.\n"
         "2. Map every distinct educational unit related to the exact request, including "
         "niche facts, useful prerequisite facets, examples, mechanisms, comparisons, and "
         "conclusions. Return every distinct qualifying moment, up to 40 for this source; "
@@ -769,12 +915,18 @@ def _boundary_prompts(
         "it records prior knowledge only: 0.00-0.33 means "
         "beginner, 0.34-0.66 means intermediate, and 0.67-1.00 means advanced. Return units "
         "across that entire scale.\n"
-        "5. Return every distinct qualifying unit. Set substantive and factually_grounded true "
+        "5. For each unit, mark intent_role=primary only if grounded intent_evidence covers "
+        "every request_intent constraint. Mark a definition, background fact, one side of a "
+        "requested relationship, or other related unit as supporting when it does not itself "
+        "fulfill the complete request. Keep both roles when educational, but never let a "
+        "supporting unit stand in for a primary match that exists anywhere in the transcript.\n"
+        "6. Return every distinct qualifying unit. Set substantive and factually_grounded true "
         "only for academically sound teaching; course logistics and institutional framing are "
         "not teaching units. Each unit must be standalone, use a unique "
         "candidate_id, and list no prerequisite candidate IDs because required setup belongs "
         "inside its span.\n"
-        f"Every item must contain {_selection_fields(enriched=False)}. Learning details and "
+        f"Return one request_intent object and the topics list. Every item must contain "
+        f"{_selection_fields(enriched=False)}, {_intent_selection_fields()}. Learning details and "
         "assessments are generated later. Do not include them, chain-of-thought, or hidden "
         "reasoning."
     )
@@ -1085,6 +1237,21 @@ def _cue_opens_mid_thought_at(
             )
         ):
             return True
+        # A model quote can begin at a grammatical-looking framing clause even
+        # though the provider split one continuous thought immediately before
+        # its discourse marker (for example, ``... h prime of x / so I want``).
+        # Keeping the preceding cue is a safe, cheap context fallback; a real
+        # section pause is still enforced by ``_close_cue_context``.
+        from .discourse import CONTINUATION_MARKERS
+        from .sentences import classify_terminator
+
+        opening_words = _toks(text)
+        if (
+            opening_words
+            and opening_words[0] in CONTINUATION_MARKERS
+            and not classify_terminator(previous_text)
+        ):
+            return True
     if _cue_begins_standalone_question(text):
         return False
     opening_terminator = re.search(r"[.!?]", text)
@@ -1182,6 +1349,8 @@ def _cue_has_weak_end(
         word_end_idx=0,
         align_confidence=1.0,
     )
+    if _TERMINAL_COMPLETE_SHORT_NP_RE.fullmatch(guarded.strip()):
+        return False
     if _is_weak_end(sentence):
         return True
     if terminator or not next_text:
@@ -1261,6 +1430,12 @@ def _cue_has_explicit_dangling_end(text: str, next_text: str) -> bool:
         or _TERMINAL_BARE_SUBJECT_RE.search(raw_text)
         or _TERMINAL_DANGLING_ARTICLE_RE.search(raw_text)
         or _TERMINAL_DANGLING_LINK_RE.search(raw_text)
+        or (
+            bool(next_text.strip())
+            and _TERMINAL_HEADLESS_QUANTIFIER_RE.search(raw_text)
+        )
+        or _TERMINAL_DANGLING_MODAL_PREDICATE_RE.search(raw_text)
+        or _TERMINAL_DANGLING_AUXILIARY_ADVERB_RE.search(raw_text)
         or _TERMINAL_DANGLING_DEGREE_RE.search(raw_text)
         or ambiguous_degree_continues
         or _has_unfinished_exemplification_tail(raw_text)
@@ -1280,6 +1455,51 @@ def _has_unfinished_exemplification_tail(text: str) -> bool:
     if match.group("so") and len(tail_words) <= 3:
         return True
     return len(tail_words) <= 2 and not re.search(r"[.!?][\"')\]]*$", raw_text)
+
+
+def _has_unanswered_terminal_question(text: str) -> bool:
+    """Return true only when the final semantic act is a question with no answer."""
+    raw_text = str(text or "").strip()
+    question_mark = raw_text.rfind("?")
+    if question_mark < 0:
+        return False
+    tail_words = _toks(raw_text[question_mark + 1:])
+    return not (
+        len(tail_words) >= 2
+        or (tail_words and tail_words[0] in {"no", "yes"})
+    )
+
+
+def _terminal_content_is_explicitly_incomplete(text: str) -> bool:
+    """Separate semantic incompleteness from an imperfect transcript edge.
+
+    Boundary heuristics are deliberately conservative and may be uncertain on
+    unpunctuated captions. Only direct evidence of a missing educational act is
+    allowed to fail the candidate; all other edge uncertainty is shipped with a
+    diagnostic so a good teaching unit is never lost to caption segmentation.
+    """
+    raw_text = str(text or "").strip()
+    return bool(
+        _has_unanswered_terminal_question(raw_text)
+        or _has_unfinished_exemplification_tail(raw_text)
+        or _TERMINAL_EXPLICIT_INCOMPLETE_CLAUSE_RE.search(raw_text)
+        or _TERMINAL_COORDINATING_CONJUNCTION_RE.search(raw_text)
+        or _TERMINAL_REQUIRED_COMPLEMENT_RE.search(raw_text)
+    )
+
+
+def _complete_prefix_end_quote(text: str) -> str:
+    """Recover the last complete sentence before an unfinished edge suffix."""
+    raw_text = str(text or "")
+    for match in reversed(list(re.finditer(r"[.!?]+[\"'’”)]*", raw_text))):
+        prefix = raw_text[:match.end()].strip()
+        suffix = raw_text[match.end():]
+        if not _WORD_RE.search(prefix) or not _WORD_RE.search(suffix):
+            continue
+        if _terminal_content_is_explicitly_incomplete(prefix):
+            continue
+        return _exact_boundary_quote(prefix, want="end")
+    return ""
 
 
 def _cue_boundary_confidence(text: str, *, ignore_caption_case: bool) -> float:
@@ -1530,7 +1750,9 @@ def _close_cue_context(
         next_text,
         ignore_caption_case=ignore_caption_case,
     ) or force_end_clause_completion:
-        return start_line, end_line, "unresolved_weak_end"
+        if _terminal_content_is_explicitly_incomplete(final_end_text):
+            return start_line, end_line, "unresolved_weak_end"
+        return start_line, end_line, "unresolved_boundary_end"
     return start_line, end_line, None
 
 
@@ -1969,7 +2191,12 @@ def _trim_structural_filler_edges(
     *,
     ignore_caption_case: bool,
 ) -> tuple[int, int] | None:
-    """Trim contiguous edge filler without discarding teaching around an aside."""
+    """Trim contiguous edge filler while keeping the remaining teaching span.
+
+    Discourse expansion and semantic edge projection refine a weak opening or
+    ending later. Edge uncertainty alone must not turn an otherwise useful
+    educational candidate into a filler rejection.
+    """
     filler_lines = {
         line
         for line in range(start_line, end_line + 1)
@@ -1985,17 +2212,6 @@ def _trim_structural_filler_edges(
     while trimmed_end >= trimmed_start and trimmed_end in filler_lines:
         trimmed_end -= 1
     if trimmed_start > trimmed_end:
-        return None
-    if _cue_opens_mid_thought_at(
-        segments, trimmed_start, ignore_caption_case=ignore_caption_case,
-    ):
-        return None
-    trailing_text = str(segments[trimmed_end].get("text") or "").strip()
-    if _cue_has_weak_end(
-        trailing_text,
-        "",
-        ignore_caption_case=ignore_caption_case,
-    ):
         return None
     return trimmed_start, trimmed_end
 
@@ -2308,6 +2524,46 @@ def _strict_score(value: object) -> float | None:
     return score if 0.0 <= score <= 1.0 else None
 
 
+def _normalized_request_text(value: object) -> str:
+    return " ".join(
+        unicodedata.normalize("NFKC", str(value or "")).casefold().split()
+    )
+
+
+def _validated_intent_constraints(
+    plan: object,
+    topic: str,
+) -> tuple[dict[str, _IntentConstraint], str | None]:
+    """Validate the selector's same-call interpretation against the exact request."""
+    if not isinstance(plan, _IntentBoundaryPlan):
+        return {}, None
+    expected_request = topic.strip() or "(all educational topics)"
+    request_intent = plan.request_intent
+    if _normalized_request_text(request_intent.exact_request) != _normalized_request_text(
+        expected_request
+    ):
+        return {}, "intent_contract_request_mismatch"
+    constraints = {
+        constraint.constraint_id: constraint
+        for constraint in request_intent.constraints
+    }
+    if len(constraints) != len(request_intent.constraints) or not constraints:
+        return {}, "intent_contract_duplicate_or_empty_ids"
+    if any(
+        not _contains_quote(expected_request, constraint.source_phrase)
+        for constraint in constraints.values()
+    ):
+        return {}, "intent_contract_ungrounded_source_phrase"
+    required_tokens = _content_tokens(expected_request)
+    covered_tokens = set().union(*(
+        _content_tokens(constraint.source_phrase)
+        for constraint in constraints.values()
+    ))
+    if required_tokens and not required_tokens.issubset(covered_tokens):
+        return {}, "intent_contract_incomplete_request_coverage"
+    return constraints, None
+
+
 def _learning_details(topic_obj: object, clip_text: str, topic: str) -> tuple[dict, list[str]]:
     errors: list[str] = []
     details = {"summary": "", "takeaways": [], "match_reason": "", "assessment": None}
@@ -2353,6 +2609,15 @@ def _quality_order(clip: dict) -> tuple[float, float, float]:
         float(clip.get("educational_importance") or 0.0),
     )
     return min(scores), sum(scores) / len(scores), scores[1]
+
+
+def _intent_priority(clip: dict) -> tuple[int, float]:
+    role = str(clip.get("intent_role") or "primary").strip().lower()
+    try:
+        coverage = max(0.0, min(1.0, float(clip.get("intent_coverage", 1.0))))
+    except (TypeError, ValueError, OverflowError):
+        coverage = 0.0
+    return (0 if role == "primary" else 1, -coverage)
 
 
 def _difficulty_stage(difficulty: object) -> int:
@@ -2437,6 +2702,7 @@ def _finalize_clips(clips: list[dict], settings: dict) -> list[dict]:
     selected.sort(
         key=lambda clip: (
             _difficulty_stage(clip.get("difficulty")),
+            *_intent_priority(clip),
             -_quality_order(clip)[0],
             -_quality_order(clip)[1],
             -_quality_order(clip)[2],
@@ -2494,7 +2760,7 @@ def _drop_unmet_prerequisite_clips(report: _Conversion) -> None:
 
 
 def _plan_to_report(
-    plan: _Plan | _BoundaryPlan | _LegacyPlan | _ProductionPlan,
+    plan: _Plan | _BoundaryPlan | _IntentBoundaryPlan | _LegacyPlan | _ProductionPlan,
     segments: list[dict],
     words: list[dict],
     settings: dict,
@@ -2508,6 +2774,15 @@ def _plan_to_report(
     if not n:
         report.rejected_reasons.append("missing_segments")
         return report
+
+    intent_constraints, intent_contract_error = _validated_intent_constraints(
+        plan,
+        topic,
+    )
+    if intent_contract_error is not None:
+        report.rejected_reasons.append(intent_contract_error)
+        return report
+    intent_constraint_ids = set(intent_constraints)
 
     ignore_caption_case = bool(settings.get("_segment_ignore_caption_case", True))
     raw: list[dict] = []
@@ -2779,13 +3054,29 @@ def _plan_to_report(
         )
         if closure_error:
             if closure_error == "unresolved_weak_end":
+                recovered_end_quote = _complete_prefix_end_quote(
+                    str(segments[b].get("text") or "")
+                )
+                if recovered_end_quote:
+                    end_quote = recovered_end_quote
+                    fallback_end_edge = False
+                    quote_repaired = True
+                    boundary_fallback_reasons.append(
+                        "trimmed_incomplete_end_suffix"
+                    )
+                    closure_error = None
+            if closure_error == "unresolved_weak_end":
                 # A setup, question, or example without its answer is not a
                 # complete educational unit; this is a content failure rather
                 # than a demand for exact acoustic timing.
                 report.rejected_reasons.append(f"{prefix}:{closure_error}")
                 continue
-            fallback_start_edge = True
-            boundary_fallback_reasons.append(closure_error)
+            if closure_error:
+                if closure_error.endswith("_end"):
+                    fallback_end_edge = True
+                else:
+                    fallback_start_edge = True
+                boundary_fallback_reasons.append(closure_error)
 
         filler_trim = _trim_structural_filler_edges(
             segments,
@@ -2797,6 +3088,11 @@ def _plan_to_report(
             report.rejected_reasons.append(f"{prefix}:contains_filler")
             continue
         a, b = filler_trim
+        if _terminal_content_is_explicitly_incomplete(
+            _cue_clip_text(segments, a, b)
+        ):
+            report.rejected_reasons.append(f"{prefix}:unresolved_weak_end")
+            continue
         internal_filler_reason = _internal_structural_filler_reason(segments, a, b)
         if internal_filler_reason:
             boundary_fallback_reasons.append(
@@ -3002,6 +3298,57 @@ def _plan_to_report(
                 topic_evidence_quote,
                 evidence_span,
             )
+        intent_role = "primary"
+        intent_coverage = 1.0
+        grounded_intent_evidence: list[dict[str, str]] = []
+        if intent_constraints:
+            proposed_intent_evidence = list(
+                getattr(proposal, "intent_evidence", None) or []
+            )
+            evidence_by_constraint: dict[str, str] = {}
+            invalid_intent_evidence = False
+            for evidence in proposed_intent_evidence:
+                constraint_id = " ".join(
+                    str(getattr(evidence, "constraint_id", "") or "").split()
+                )
+                quote = " ".join(
+                    str(getattr(evidence, "evidence_quote", "") or "").split()
+                )
+                if (
+                    not constraint_id
+                    or constraint_id not in intent_constraint_ids
+                    or constraint_id in evidence_by_constraint
+                    or not 5 <= len(_toks(quote)) <= 16
+                ):
+                    invalid_intent_evidence = True
+                    break
+                evidence_span = _quote_character_span(clip_text, quote)
+                if evidence_span is None:
+                    invalid_intent_evidence = True
+                    break
+                evidence_by_constraint[constraint_id] = _literal_source_quote(
+                    clip_text,
+                    quote,
+                    evidence_span,
+                )
+            if invalid_intent_evidence or not evidence_by_constraint:
+                report.rejected_reasons.append(f"{prefix}:invalid_intent_evidence")
+                continue
+            fulfilled_ids = set(evidence_by_constraint)
+            intent_role = (
+                "primary"
+                if fulfilled_ids == intent_constraint_ids
+                else "supporting"
+            )
+            intent_coverage = len(fulfilled_ids) / max(1, len(intent_constraint_ids))
+            grounded_intent_evidence = [
+                {
+                    "constraint_id": constraint_id,
+                    "evidence_quote": evidence_by_constraint[constraint_id],
+                }
+                for constraint_id in intent_constraints
+                if constraint_id in evidence_by_constraint
+            ]
         learning_objective = str(
             getattr(proposal, "learning_objective", "")
             or getattr(proposal, "reason", "")
@@ -3106,6 +3453,9 @@ def _plan_to_report(
             "substantive": bool(getattr(proposal, "substantive", True)),
             "factually_grounded": bool(getattr(proposal, "factually_grounded", True)),
             "topic_evidence_quote": topic_evidence_quote,
+            "intent_role": intent_role,
+            "intent_coverage": round(intent_coverage, 6),
+            "intent_evidence": grounded_intent_evidence,
             "summary": "",
             "takeaways": [],
             "match_reason": "",
@@ -3179,7 +3529,7 @@ def _public_clips(clips: list[dict]) -> list[dict]:
             for clip in clips]
 
 
-def _plan_to_clips(plan: _Plan | _BoundaryPlan | _LegacyPlan | _ProductionPlan,
+def _plan_to_clips(plan: _Plan | _BoundaryPlan | _IntentBoundaryPlan | _LegacyPlan | _ProductionPlan,
                    segments: list[dict],
                    words: list[dict], settings: dict) -> list[dict]:
     """Compatibility helper used by focused conversion tests."""
@@ -3258,22 +3608,33 @@ def _validate_model_response(
     schema: type[BaseModel], text: str,
 ) -> tuple[BaseModel, list[str]]:
     """Validate one response, salvaging valid boundary candidates independently."""
-    if schema is not _BoundaryPlan:
+    if schema not in {_BoundaryPlan, _IntentBoundaryPlan}:
         return schema.model_validate_json(text), []
 
     payload = json.loads(text)
+    expected_keys = (
+        {"request_intent", "topics"}
+        if schema is _IntentBoundaryPlan
+        else {"topics"}
+    )
     if (
         not isinstance(payload, dict)
-        or set(payload) != {"topics"}
+        or set(payload) != expected_keys
         or not isinstance(payload.get("topics"), list)
     ):
         return schema.model_validate(payload), []
+
+    request_intent: _RequestIntent | None = None
+    topic_schema: type[_BoundaryTopic] = _BoundaryTopic
+    if schema is _IntentBoundaryPlan:
+        request_intent = _RequestIntent.model_validate(payload["request_intent"])
+        topic_schema = _IntentBoundaryTopic
 
     topics: list[_BoundaryTopic] = []
     rejection_reasons: list[str] = []
     for index, raw_topic in enumerate(payload["topics"]):
         try:
-            topics.append(_BoundaryTopic.model_validate(raw_topic))
+            topics.append(topic_schema.model_validate(raw_topic))
         except ValidationError as exc:
             first_error = exc.errors(include_url=False)[0]
             location = ".".join(str(part) for part in first_error.get("loc", ()))
@@ -3281,7 +3642,57 @@ def _validate_model_response(
                 f"proposal_{index}:schema_invalid:{location or 'item'}:"
                 f"{first_error.get('type') or 'validation_error'}"
             )
+    if schema is _IntentBoundaryPlan:
+        assert request_intent is not None
+        return _IntentBoundaryPlan(
+            request_intent=request_intent,
+            topics=topics,
+        ), rejection_reasons
     return _BoundaryPlan(topics=topics), rejection_reasons
+
+
+def _acquire_selector_slot(
+    *,
+    operation: str,
+    model: str,
+    thinking_level: str,
+    prompt_version: str,
+    deadline_monotonic: float,
+    cancelled: CancelledCb,
+) -> BoundedSemaphore | None:
+    """Bound selector dispatches across jobs without hiding cancellation."""
+    if str(operation or "").casefold() not in _SELECTOR_OPERATIONS:
+        return None
+
+    slot = _selector_call_slots
+    while True:
+        if _cancel_requested(cancelled):
+            raise _ModelCallError(
+                "Gemini selector capacity wait cancelled",
+                {
+                    "model": model,
+                    "operation": operation,
+                    "prompt_version": prompt_version,
+                    "thinking_level": thinking_level,
+                    "error_type": "GeminiCancelledError",
+                    "dispatched": False,
+                },
+            )
+        remaining_s = float(deadline_monotonic) - time.monotonic()
+        if remaining_s <= 0:
+            raise _ModelCallError(
+                "Gemini selector capacity deadline exceeded",
+                {
+                    "model": model,
+                    "operation": operation,
+                    "prompt_version": prompt_version,
+                    "thinking_level": thinking_level,
+                    "error_type": "GeminiDeadlineExceededError",
+                    "dispatched": False,
+                },
+            )
+        if slot.acquire(timeout=min(_SELECTOR_SLOT_POLL_S, remaining_s)):
+            return slot
 
 
 def _call_model(
@@ -3303,65 +3714,77 @@ def _call_model(
     from ..gemini_client import generate_json_v3
 
     prompt_text = f"{system}\n\n{user}"
-    reservation: dict[str, object] = {}
-    if callable(budget_reserve):
-        reserved = budget_reserve(
-            operation=operation,
-            model=model,
-            max_output_tokens=max_output_tokens,
-            prompt_text=prompt_text,
-            estimated_input_tokens=max(1, (len(prompt_text) + 3) // 4),
-        )
-        if isinstance(reserved, dict):
-            reservation = dict(reserved)
+    selector_slot = _acquire_selector_slot(
+        operation=operation,
+        model=model,
+        thinking_level=thinking_level,
+        prompt_version=prompt_version,
+        deadline_monotonic=deadline_monotonic,
+        cancelled=cancelled,
+    )
     try:
-        result = generate_json_v3(
-            system,
-            user,
-            schema,
-            model=model,
-            thinking_level=thinking_level,
-            max_output_tokens=max_output_tokens,
-            timeout_s=timeout_s,
-            deadline_monotonic=deadline_monotonic,
-            operation=operation,
-            prompt_version=prompt_version,
-            max_retries=max_retries,
-            cancelled=cancelled,
-        )
-    except Exception as exc:
-        if _cancel_requested(cancelled):
-            raise
-        provider_telemetry = _telemetry_dict(getattr(exc, "telemetry", None))
-        raise _ModelCallError(
-            f"{type(exc).__name__}: Gemini model call failed",
-            {
-                "model": model,
-                "operation": operation,
-                "prompt_version": prompt_version,
-                "thinking_level": thinking_level,
-                **provider_telemetry,
-                "error_type": type(exc).__name__,
-                "dispatched": True,
-                **reservation,
-            },
-        ) from exc
-    telemetry = _telemetry_dict(result.telemetry)
-    for key, value in reservation.items():
-        telemetry.setdefault(key, value)
-    telemetry.setdefault("dispatched", True)
-    try:
-        parsed, schema_rejections = _validate_model_response(
-            schema, result.text.strip(),
-        )
-    except (ValidationError, ValueError) as exc:
-        raise _SchemaResponseError(
-            f"invalid {schema.__name__} response: {exc}", telemetry,
-        ) from exc
-    if schema_rejections:
-        telemetry["schema_rejected_count"] = len(schema_rejections)
-        telemetry["schema_rejection_reasons"] = schema_rejections
-    return parsed, telemetry
+        reservation: dict[str, object] = {}
+        if callable(budget_reserve):
+            reserved = budget_reserve(
+                operation=operation,
+                model=model,
+                max_output_tokens=max_output_tokens,
+                prompt_text=prompt_text,
+                estimated_input_tokens=max(1, (len(prompt_text) + 3) // 4),
+            )
+            if isinstance(reserved, dict):
+                reservation = dict(reserved)
+        try:
+            result = generate_json_v3(
+                system,
+                user,
+                schema,
+                model=model,
+                thinking_level=thinking_level,
+                max_output_tokens=max_output_tokens,
+                timeout_s=timeout_s,
+                deadline_monotonic=deadline_monotonic,
+                operation=operation,
+                prompt_version=prompt_version,
+                max_retries=max_retries,
+                cancelled=cancelled,
+            )
+        except Exception as exc:
+            if _cancel_requested(cancelled):
+                raise
+            provider_telemetry = _telemetry_dict(getattr(exc, "telemetry", None))
+            raise _ModelCallError(
+                f"{type(exc).__name__}: Gemini model call failed",
+                {
+                    "model": model,
+                    "operation": operation,
+                    "prompt_version": prompt_version,
+                    "thinking_level": thinking_level,
+                    **provider_telemetry,
+                    "error_type": type(exc).__name__,
+                    "dispatched": True,
+                    **reservation,
+                },
+            ) from exc
+        telemetry = _telemetry_dict(result.telemetry)
+        for key, value in reservation.items():
+            telemetry.setdefault(key, value)
+        telemetry.setdefault("dispatched", True)
+        try:
+            parsed, schema_rejections = _validate_model_response(
+                schema, result.text.strip(),
+            )
+        except (ValidationError, ValueError) as exc:
+            raise _SchemaResponseError(
+                f"invalid {schema.__name__} response: {exc}", telemetry,
+            ) from exc
+        if schema_rejections:
+            telemetry["schema_rejected_count"] = len(schema_rejections)
+            telemetry["schema_rejection_reasons"] = schema_rejections
+        return parsed, telemetry
+    finally:
+        if selector_slot is not None:
+            selector_slot.release()
 
 
 def _exception_telemetry(exc: Exception) -> dict:
@@ -3581,7 +4004,7 @@ def _run_selection_profile(
             topic,
             learner_level=learner_level,
         )
-        schema = _BoundaryPlan
+        schema = _IntentBoundaryPlan
         model = config.SEGMENT_FLASH_MODEL
         level, cap, timeout = "low", _BOUNDARY_OUTPUT_TOKENS, _FLASH_BOUNDARY_TIMEOUT_S
         operation = "flash_boundary_selector"
@@ -3592,7 +4015,7 @@ def _run_selection_profile(
             topic,
             learner_level=learner_level,
         )
-        schema = _BoundaryPlan
+        schema = _IntentBoundaryPlan
         model = config.SEGMENT_PRO_MODEL
         level, cap, timeout = "high", _BOUNDARY_OUTPUT_TOKENS, _PRO_TIMEOUT_S
         operation = "pro_fallback"

@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 SEGMENT_CACHE_VERSION = 8
 SEGMENT_CACHE_TTL_SEC = 30 * 24 * 60 * 60
-SELECTION_CONTRACT_VERSION = "quality_silence_v14"
+SELECTION_CONTRACT_VERSION = "quality_silence_v15"
 
 
 def _objective_tokens(clip: Mapping[str, Any]) -> set[str]:
@@ -195,7 +195,7 @@ def _valid_clips(
         return None
     transcript_start, transcript_end = bounds
     clips: list[dict[str, Any]] = []
-    previous_order: tuple[int, float, float, float, float, float] | None = None
+    previous_order: tuple[int, int, float, float, float, float, float, float] | None = None
     for index, raw in enumerate(value, start=1):
         if not isinstance(raw, dict):
             return None
@@ -255,12 +255,44 @@ def _valid_clips(
             )
         )
         difficulty_stage = 0 if difficulty < 0.34 else 1 if difficulty < 0.67 else 2
+        intent_role = str(raw.get("intent_role") or "primary").strip().lower()
+        try:
+            intent_coverage = float(raw.get("intent_coverage", 1.0))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        intent_evidence = raw.get("intent_evidence") or []
+        if not isinstance(intent_evidence, list):
+            return None
+        seen_intent_ids: set[str] = set()
+        for evidence in intent_evidence:
+            if not isinstance(evidence, Mapping):
+                return None
+            constraint_id = " ".join(
+                str(evidence.get("constraint_id") or "").split()
+            )
+            quote_words = re.findall(
+                r"[\w+#'-]+",
+                str(evidence.get("evidence_quote") or "").casefold(),
+            )
+            if (
+                not constraint_id
+                or constraint_id in seen_intent_ids
+                or not 5 <= len(quote_words) <= 16
+                or not any(
+                    window_words[offset : offset + len(quote_words)] == quote_words
+                    for offset in range(len(window_words) - len(quote_words) + 1)
+                )
+            ):
+                return None
+            seen_intent_ids.add(constraint_id)
         quality_floor = min(informativeness, topic_relevance, educational_importance)
         quality_mean = (
             informativeness + topic_relevance + educational_importance
         ) / 3.0
         order_key = (
             difficulty_stage,
+            0 if intent_role == "primary" else 1,
+            -intent_coverage,
             -quality_floor,
             -quality_mean,
             -topic_relevance,
@@ -293,6 +325,10 @@ def _valid_clips(
             or not 0 <= educational_importance <= 1
             or quality_floor < 0.75
             or not 0 <= difficulty <= 1
+            or intent_role not in {"primary", "supporting"}
+            or not math.isfinite(intent_coverage)
+            or not 0 <= intent_coverage <= 1
+            or (intent_role == "supporting" and not intent_evidence)
             or raw.get("self_contained") is not True
             or raw.get("is_standalone") is not True
             or raw.get("directly_teaches_topic") is not True

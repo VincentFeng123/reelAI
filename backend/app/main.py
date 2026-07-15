@@ -352,7 +352,7 @@ assessment_service = AssessmentService()
 MAX_REELS_PER_MATERIAL = 300
 GENERATION_OUTPUT_CEILINGS = {"fast": 8, "slow": 12}
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v14"
+SELECTION_CONTRACT_VERSION = "quality_silence_v15"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -6301,6 +6301,7 @@ def feed(
             else:
                 job_submitted = True
         reels = ranked[page_start:page_end]
+        reported_job = active_job or completed_job
         response = {
             "page": page,
             "limit": limit,
@@ -6308,8 +6309,8 @@ def feed(
             "reels": reels,
             "generation_id": generation_id,
             "response_profile": "unified" if generation_id else None,
-            "generation_job_id": str((active_job or {}).get("id") or "") or None,
-            "generation_job_status": str((active_job or {}).get("status") or "") or None,
+            "generation_job_id": str((reported_job or {}).get("id") or "") or None,
+            "generation_job_status": str((reported_job or {}).get("status") or "") or None,
             "effective_generation_mode": generation_mode,
             "generation_mode_overridden": False,
             "knowledge_level": knowledge_level,

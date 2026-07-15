@@ -40,7 +40,7 @@ def _strict_boundary_context(
     return {
         "selection_candidate_id": candidate_id,
         "surface_eligible": surface,
-        "selection_contract_version": "quality_silence_v14",
+        "selection_contract_version": "quality_silence_v15",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -65,7 +65,7 @@ def _transcript_boundary_context(
     return {
         "selection_candidate_id": candidate_id,
         "surface_eligible": surface,
-        "selection_contract_version": "quality_silence_v14",
+        "selection_contract_version": "quality_silence_v15",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -192,6 +192,41 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "search_context": context,
             },
         )
+
+    def test_intent_role_and_coverage_survive_persistence(self) -> None:
+        pipeline, adapter, metadata = self._boundary_persistence_fixture()
+        context = _strict_boundary_context(
+            "video-a::supporting",
+            start=10.0,
+            end=20.0,
+            surface=True,
+        )
+        context.update({
+            "intent_role": "supporting",
+            "intent_coverage": 0.5,
+        })
+
+        reel = self._persist_boundary_candidate(
+            pipeline=pipeline,
+            adapter=adapter,
+            metadata=metadata,
+            start=10.0,
+            end=20.0,
+            context=context,
+        )
+
+        self.assertEqual(reel.selection_intent_role, "supporting")
+        self.assertEqual(reel.selection_intent_coverage, 0.5)
+        with db_module.get_conn() as conn:
+            row = db_module.fetch_one(
+                conn,
+                "SELECT search_context_json FROM reels WHERE id = ?",
+                (reel.reel_id,),
+            )
+        stored = json.loads(row["search_context_json"])
+        self.assertEqual(stored["intent_role"], "supporting")
+        self.assertEqual(stored["intent_coverage"], 0.5)
+
     def test_scratch_concepts_are_scoped_to_their_material(self) -> None:
         with db_module.get_conn(transactional=True) as conn:
             self._seed_identity(conn, "material-a", "concept-a")
@@ -396,7 +431,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "search_context": {
                     "selection_candidate_id": candidate_id,
                     "surface_eligible": True,
-                    "selection_contract_version": "quality_silence_v14",
+                    "selection_contract_version": "quality_silence_v15",
                     "speech_corridor_verified": True,
                     "boundary_status": "verified",
                     "boundary_diagnostics": {
@@ -591,7 +626,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
             )
         context = json.loads(row["search_context_json"])
         self.assertEqual(
-            context["selection_contract_version"], "quality_silence_v14"
+            context["selection_contract_version"], "quality_silence_v15"
         )
         self.assertEqual(context["boundary_status"], "context_aligned")
 

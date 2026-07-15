@@ -28,6 +28,15 @@ def test_dialogue_reply_and_mid_list_ordinal_are_weak():
     assert opens_mid_thought("All right. To solve this, first define comparative advantage.")
 
 
+def test_opening_purpose_and_reformulation_references_need_prior_context():
+    assert opens_mid_thought(
+        "And to do this, I'm going to use the chain rule."
+    )
+    assert opens_mid_thought(
+        "Another way of writing it is the derivative of h with respect to x."
+    )
+
+
 def test_ordinal_and_reply_words_are_valid_when_they_are_subjects():
     assert is_onset("Second law relates force, mass, and acceleration.")
     assert is_onset("No force acts on the object after release.")

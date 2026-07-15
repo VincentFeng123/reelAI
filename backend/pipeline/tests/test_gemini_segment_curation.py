@@ -1839,7 +1839,7 @@ def test_trailing_outro_does_not_rescue_a_dangling_teaching_clause():
             1,
             start_quote="A confidence interval depends on",
             end_quote="Thanks for watching",
-            topic_evidence_quote="A confidence interval depends on the sampled observations",
+            topic_evidence_quote="A confidence interval depends on",
         )]),
         segments,
         [],
@@ -1848,7 +1848,7 @@ def test_trailing_outro_does_not_rescue_a_dangling_teaching_clause():
     )
 
     assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:contains_filler"]
+    assert report.rejected_reasons == ["proposal_0:unresolved_weak_end"]
 
 
 def test_course_logistics_suffix_is_trimmed_after_complete_teaching():

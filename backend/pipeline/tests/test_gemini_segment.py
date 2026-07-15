@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -801,7 +804,7 @@ def test_budget_is_reserved_once_and_default_call_allows_one_transient_retry(mon
         thinking_level="medium",
         max_output_tokens=4096,
         timeout_s=45.0,
-        deadline_monotonic=10_000.0,
+        deadline_monotonic=time.monotonic() + 10.0,
         operation="flash_boundary_selector",
         prompt_version=G.FLASH_SPLIT_PROFILE,
         cancelled=None,
@@ -817,6 +820,115 @@ def test_budget_is_reserved_once_and_default_call_allows_one_transient_retry(mon
         "prompt_text": "system\n\nuser",
         "estimated_input_tokens": 3,
     }
+
+
+def test_selector_dispatches_are_capped_process_wide_at_three(monkeypatch):
+    slots = threading.BoundedSemaphore(G._SELECTOR_CALL_LIMIT)
+    monkeypatch.setattr(G, "_selector_call_slots", slots)
+    lock = threading.Lock()
+    release = threading.Event()
+    saturated = threading.Event()
+    state = {"active": 0, "maximum": 0}
+
+    def generate(*args, **kwargs):
+        del args, kwargs
+        with lock:
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+            if state["active"] == G._SELECTOR_CALL_LIMIT:
+                saturated.set()
+        try:
+            assert release.wait(timeout=2)
+            return SimpleNamespace(text='{"topics": []}', telemetry={})
+        finally:
+            with lock:
+                state["active"] -= 1
+
+    monkeypatch.setattr("backend.gemini_client.generate_json_v3", generate)
+
+    def dispatch():
+        return G._call_model(
+            "system",
+            "user",
+            G._BoundaryPlan,
+            model="gemini-3.5-flash",
+            thinking_level="low",
+            max_output_tokens=4096,
+            timeout_s=45.0,
+            deadline_monotonic=time.monotonic() + 3.0,
+            operation="flash_boundary_selector",
+            prompt_version=G.FLASH_SPLIT_PROFILE,
+            cancelled=None,
+        )
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(dispatch) for _ in range(6)]
+        assert saturated.wait(timeout=1)
+        with lock:
+            assert state["active"] == G._SELECTOR_CALL_LIMIT
+            assert state["maximum"] == G._SELECTOR_CALL_LIMIT
+        release.set()
+        for future in futures:
+            parsed, _telemetry = future.result(timeout=2)
+            assert parsed.topics == []
+
+    assert state["maximum"] == G._SELECTOR_CALL_LIMIT
+
+
+@pytest.mark.parametrize(
+    ("abort_kind", "expected_error_type"),
+    [
+        ("cancel", "GeminiCancelledError"),
+        ("deadline", "GeminiDeadlineExceededError"),
+    ],
+)
+def test_selector_capacity_wait_exits_without_dispatch(
+    monkeypatch,
+    abort_kind,
+    expected_error_type,
+):
+    slots = threading.BoundedSemaphore(G._SELECTOR_CALL_LIMIT)
+    for _ in range(G._SELECTOR_CALL_LIMIT):
+        assert slots.acquire(blocking=False)
+    monkeypatch.setattr(G, "_selector_call_slots", slots)
+    dispatched = []
+    monkeypatch.setattr(
+        "backend.gemini_client.generate_json_v3",
+        lambda *args, **kwargs: dispatched.append((args, kwargs)),
+    )
+    cancelled = threading.Event()
+    timer = None
+    deadline = time.monotonic() + 0.1
+    if abort_kind == "cancel":
+        deadline = time.monotonic() + 2.0
+        timer = threading.Timer(0.075, cancelled.set)
+        timer.start()
+
+    try:
+        with pytest.raises(G._ModelCallError) as exc_info:
+            G._call_model(
+                "system",
+                "user",
+                G._BoundaryPlan,
+                model="gemini-3.5-flash",
+                thinking_level="low",
+                max_output_tokens=4096,
+                timeout_s=45.0,
+                deadline_monotonic=deadline,
+                operation="flash_boundary_selector",
+                prompt_version=G.FLASH_SPLIT_PROFILE,
+                cancelled=cancelled.is_set,
+            )
+    finally:
+        if timer is not None:
+            timer.cancel()
+            timer.join(timeout=1)
+        for _ in range(G._SELECTOR_CALL_LIMIT):
+            slots.release()
+
+    assert dispatched == []
+    assert exc_info.value.telemetry["error_type"] == expected_error_type
+    assert exc_info.value.telemetry["dispatched"] is False
 
 
 def test_boundary_repair_without_explicit_clip_limit_does_not_compare_none(

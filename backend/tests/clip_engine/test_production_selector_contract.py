@@ -34,6 +34,24 @@ def _proposal(*, end_line: int = 0) -> gemini_segment._BoundaryTopic:
     )
 
 
+def _intent_plan(
+    *,
+    topic: str,
+    constraints: list[dict],
+    topics: list[gemini_segment._BoundaryTopic],
+) -> gemini_segment._IntentBoundaryPlan:
+    return gemini_segment._IntentBoundaryPlan(
+        request_intent={
+            "exact_request": topic,
+            "constraints": constraints,
+        },
+        topics=[
+            gemini_segment._IntentBoundaryTopic.model_validate(dict(item.__dict__))
+            for item in topics
+        ],
+    )
+
+
 def test_single_call_boundary_schema_caps_exhaustive_output_before_truncation() -> None:
     forty = [
         _proposal().model_copy(update={"candidate_id": f"candidate-{index}"})
@@ -453,7 +471,9 @@ def test_selector_prompt_is_exhaustive_and_allows_one_listed_component() -> None
     assert "learning_objective (at most 24 words)" in user
     assert "facet (at most 12 words)" in user
     assert user.index("Transcript (") < user.index("Exact user request:")
-    assert "1. Understand the whole transcript" in user
+    assert "1. Copy the Exact user request verbatim" in user
+    assert "atomic mandatory constraints" in user
+    assert "intent_role=primary only if grounded intent_evidence covers" in user
     assert "2. Map every distinct educational unit" in user
     assert "3. For every qualifying unit" in user
     assert "4. Score topic relevance, information density" in user
@@ -1025,6 +1045,313 @@ def test_chain_rule_query_keeps_related_prerequisite_and_worked_paraphrase() -> 
         clip["selection_candidate_id"] for clip in report.clips
     ] == ["composition-notation", "worked-chain-rule"]
     assert report.rejected_reasons == []
+
+
+def test_same_call_intent_contract_ranks_complete_task_before_stronger_supporting_facet() -> None:
+    topic = "chain rule worked example"
+    constraints = [
+        {
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "chain rule",
+            "requirement": "Teach the chain rule",
+        },
+        {
+            "constraint_id": "task",
+            "kind": "format",
+            "source_phrase": "worked example",
+            "requirement": "Work through a concrete example to its answer",
+        },
+    ]
+    segments = [
+        {
+            "start": 0.0,
+            "end": 12.0,
+            "text": (
+                "The chain rule differentiates a composite function by multiplying "
+                "the outer derivative by the inner derivative."
+            ),
+        },
+        {
+            "start": 20.0,
+            "end": 42.0,
+            "text": (
+                "Differentiate sine of x squared. The outer derivative is cosine of "
+                "x squared, and the inner derivative is two x. Multiplying them gives "
+                "the final answer two x cosine of x squared."
+            ),
+        },
+    ]
+    supporting = _proposal().model_copy(update={
+        "candidate_id": "definition",
+        "start_line": 0,
+        "end_line": 0,
+        "start_quote": "The chain rule differentiates",
+        "end_quote": "by the inner derivative",
+        "title": "Chain rule definition",
+        "learning_objective": "Define the chain rule",
+        "facet": "definition",
+        "reason": "This is useful supporting background.",
+        "topic_evidence_quote": (
+            "The chain rule differentiates a composite function by multiplying"
+        ),
+        "informativeness": 0.99,
+        "topic_relevance": 0.99,
+        "educational_importance": 0.99,
+        "difficulty": 0.2,
+        "intent_role": "supporting",
+        "intent_evidence": [{
+            "constraint_id": "subject",
+            "evidence_quote": (
+                "The chain rule differentiates a composite function by multiplying"
+            ),
+        }],
+    })
+    worked = supporting.model_copy(update={
+        "candidate_id": "worked-example",
+        "start_line": 1,
+        "end_line": 1,
+        "start_quote": "Differentiate sine of x squared",
+        "end_quote": "x cosine of x squared",
+        "title": "Chain rule worked example",
+        "learning_objective": "Apply the chain rule through the final derivative",
+        "facet": "worked example",
+        "reason": "The example includes setup, steps, and answer.",
+        "topic_evidence_quote": (
+            "The outer derivative is cosine of x squared and the inner derivative"
+        ),
+        "informativeness": 0.80,
+        "topic_relevance": 0.80,
+        "educational_importance": 0.80,
+        "intent_role": "primary",
+        "intent_evidence": [
+            {
+                "constraint_id": "subject",
+                "evidence_quote": (
+                    "The outer derivative is cosine of x squared and the inner derivative"
+                ),
+            },
+            {
+                "constraint_id": "task",
+                "evidence_quote": (
+                    "Multiplying them gives the final answer two x cosine"
+                ),
+            },
+        ],
+    })
+
+    report = gemini_segment._plan_to_report(
+        _intent_plan(
+            topic=topic,
+            constraints=constraints,
+            topics=[supporting, worked],
+        ),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic=topic,
+    )
+
+    assert [clip["selection_candidate_id"] for clip in report.clips] == [
+        "worked-example",
+        "definition",
+    ]
+    assert [clip["intent_role"] for clip in report.clips] == [
+        "primary",
+        "supporting",
+    ]
+    assert report.clips[0]["intent_coverage"] == 1.0
+    assert report.clips[1]["intent_coverage"] == 0.5
+    assert report.rejected_reasons == []
+
+
+def test_difficulty_stage_remains_outer_order_for_primary_and_supporting_intent() -> None:
+    topic = "chain rule worked example"
+    constraints = [
+        {
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "chain rule",
+            "requirement": "Teach the chain rule",
+        },
+        {
+            "constraint_id": "task",
+            "kind": "format",
+            "source_phrase": "worked example",
+            "requirement": "Work through a concrete example",
+        },
+    ]
+    segments = [
+        {
+            "start": 0.0,
+            "end": 12.0,
+            "text": "The chain rule multiplies the outer derivative by the inner derivative.",
+        },
+        {
+            "start": 20.0,
+            "end": 42.0,
+            "text": (
+                "Differentiate sine of x squared. Multiply cosine of x squared by "
+                "two x, producing the final derivative two x cosine of x squared."
+            ),
+        },
+    ]
+    beginner_support = _proposal().model_copy(update={
+        "candidate_id": "beginner-support",
+        "start_quote": "The chain rule multiplies",
+        "end_quote": "by the inner derivative",
+        "title": "Chain rule foundation",
+        "learning_objective": "State the chain rule",
+        "facet": "definition",
+        "topic_evidence_quote": (
+            "The chain rule multiplies the outer derivative by the inner derivative"
+        ),
+        "intent_role": "supporting",
+        "intent_evidence": [{
+            "constraint_id": "subject",
+            "evidence_quote": (
+                "The chain rule multiplies the outer derivative by the inner derivative"
+            ),
+        }],
+        "difficulty": 0.2,
+    })
+    advanced_primary = beginner_support.model_copy(update={
+        "candidate_id": "advanced-primary",
+        "start_line": 1,
+        "end_line": 1,
+        "start_quote": "Differentiate sine of x squared",
+        "end_quote": "x cosine of x squared",
+        "title": "Advanced chain rule example",
+        "learning_objective": "Complete a chain rule calculation",
+        "facet": "worked example",
+        "topic_evidence_quote": (
+            "Multiply cosine of x squared by two x producing the final derivative"
+        ),
+        "intent_role": "primary",
+        "intent_evidence": [
+            {
+                "constraint_id": "subject",
+                "evidence_quote": (
+                    "Multiply cosine of x squared by two x producing the final derivative"
+                ),
+            },
+            {
+                "constraint_id": "task",
+                "evidence_quote": (
+                    "producing the final derivative two x cosine of x squared"
+                ),
+            },
+        ],
+        "difficulty": 0.8,
+    })
+
+    report = gemini_segment._plan_to_report(
+        _intent_plan(
+            topic=topic,
+            constraints=constraints,
+            topics=[beginner_support, advanced_primary],
+        ),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic=topic,
+    )
+
+    assert [clip["selection_candidate_id"] for clip in report.clips] == [
+        "beginner-support",
+        "advanced-primary",
+    ]
+
+
+def test_partial_grounded_intent_is_demoted_to_supporting() -> None:
+    topic = "chain rule worked example"
+    text = (
+        "The chain rule differentiates a composite function by multiplying the "
+        "outer derivative by the inner derivative."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "chain-rule-definition",
+        "start_quote": "The chain rule differentiates a composite function",
+        "end_quote": "outer derivative by the inner derivative",
+        "title": "How the chain rule works",
+        "learning_objective": "Explain the chain rule for composite functions",
+        "facet": "chain rule definition",
+        "reason": "The span directly teaches the chain rule relationship.",
+        "topic_evidence_quote": (
+            "The chain rule differentiates a composite function by multiplying"
+        ),
+        "intent_role": "primary",
+        "intent_evidence": [{
+            "constraint_id": "subject",
+            "evidence_quote": (
+                "The chain rule differentiates a composite function by multiplying"
+            ),
+        }],
+    })
+    report = gemini_segment._plan_to_report(
+        _intent_plan(
+            topic=topic,
+            constraints=[
+                {
+                    "constraint_id": "subject",
+                    "kind": "subject",
+                    "source_phrase": "chain rule",
+                    "requirement": "Teach the chain rule",
+                },
+                {
+                    "constraint_id": "task",
+                    "kind": "format",
+                    "source_phrase": "worked example",
+                    "requirement": "Work through an example",
+                },
+            ],
+            topics=[proposal],
+        ),
+        [{"start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {},
+        topic=topic,
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["intent_role"] == "supporting"
+    assert clip["intent_coverage"] == pytest.approx(0.5)
+
+
+def test_duplicate_winner_is_chosen_by_quality_before_difficulty() -> None:
+    base = {
+        "start": 0.0,
+        "end": 12.0,
+        "cue_ids": ["cue-0"],
+        "learning_objective": "Explain chain rule derivative multiplication",
+        "facet": "chain rule derivative",
+        "intent_role": "primary",
+        "intent_coverage": 1.0,
+        "prerequisite_ids": [],
+    }
+    beginner = {
+        **base,
+        "selection_candidate_id": "beginner-weaker",
+        "informativeness": 0.80,
+        "topic_relevance": 0.80,
+        "educational_importance": 0.80,
+        "difficulty": 0.1,
+    }
+    advanced = {
+        **base,
+        "selection_candidate_id": "advanced-stronger",
+        "informativeness": 0.99,
+        "topic_relevance": 0.99,
+        "educational_importance": 0.99,
+        "difficulty": 0.9,
+    }
+
+    clips = gemini_segment._finalize_clips([beginner, advanced], {})
+
+    assert [clip["selection_candidate_id"] for clip in clips] == [
+        "advanced-stronger"
+    ]
 
 
 @pytest.mark.parametrize(

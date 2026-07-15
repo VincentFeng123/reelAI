@@ -46,6 +46,34 @@ def _topic(start: int, end: int, *, title: str) -> G._BoundaryTopic:
     )
 
 
+def _intent_selector(
+    topic: str,
+    topics: list[G._BoundaryTopic],
+) -> G._IntentBoundaryPlan:
+    return G._IntentBoundaryPlan(
+        request_intent={
+            "exact_request": topic,
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": topic,
+                "requirement": "Teach the exact requested subject",
+            }],
+        },
+        topics=[
+            G._IntentBoundaryTopic.model_validate({
+                **item.model_dump(mode="python"),
+                "intent_role": "primary",
+                "intent_evidence": [{
+                    "constraint_id": "subject",
+                    "evidence_quote": item.topic_evidence_quote,
+                }],
+            })
+            for item in topics
+        ],
+    )
+
+
 def _transcript() -> dict:
     texts = [
         "A complete setup introduces the equation.",
@@ -105,6 +133,166 @@ def test_unpunctuated_fixed_size_cue_edges_are_not_marked_clean() -> None:
         "plants and animals complete the list.",
         ignore_caption_case=True,
     ) is True
+
+
+def _live_chain_rule_boundary_segments() -> list[dict]:
+    texts = [
+        "notation so let me make it so i have h",
+        "of x and what i'm curious about is what",
+        "is h prime of x",
+        "so i want to know h prime of x which",
+        "another way of writing it is the",
+        "derivative of h",
+        "with respect to x these are just",
+        "different notations",
+        "and to do this i'm going to use the",
+        "chain rule i am going to use the chain",
+        "rule the chain rule comes into play",
+        "every time any time your function can be",
+        "used as a composition of more than one",
+        "function and as that might not seem",
+        "obvious right now but it will hopefully",
+        "maybe by the end of this video or the",
+        "next one",
+        "now what i want to do is a little bit of a thought experiment",
+    ]
+    starts = [
+        43.36, 45.52, 47.92, 49.68, 52.399, 54.239, 55.6, 57.199,
+        58.399, 60.16, 62.64, 65.36, 67.76, 69.52, 71.6, 73.6,
+        75.36, 76.4,
+    ]
+    return [
+        {
+            "cue_id": f"0T0QrHO56qg:cue:{index}",
+            "start": start,
+            "end": starts[index + 1] if index + 1 < len(starts) else 82.0,
+            "text": text,
+        }
+        for index, (start, text) in enumerate(zip(starts, texts))
+    ]
+
+
+def test_live_chain_rule_fragment_expands_to_cold_context_and_complete_close() -> None:
+    segments = _live_chain_rule_boundary_segments()
+
+    start, end, error = G._close_cue_context(
+        segments,
+        8,
+        12,
+        ignore_caption_case=True,
+    )
+
+    assert (start, end, error) == (0, 16, None)
+    assert segments[start]["start"] == pytest.approx(43.36)
+    assert segments[end]["text"] == "next one"
+    assert "thought experiment" not in G._cue_clip_text(segments, start, end)
+
+
+def test_live_chain_rule_candidate_is_rebounded_instead_of_rejected() -> None:
+    segments = _live_chain_rule_boundary_segments()
+    proposal = G._BoundaryTopic(
+        candidate_id="chain-rule-applicability",
+        start_line=8,
+        end_line=12,
+        start_quote="and to do this i'm going to use",
+        end_quote="composition of more than one",
+        title="When the chain rule applies",
+        learning_objective="Explain when the chain rule applies to composite functions.",
+        facet="chain-rule applicability",
+        reason="Defines the condition for using the chain rule.",
+        informativeness=0.92,
+        topic_relevance=0.98,
+        educational_importance=0.91,
+        difficulty=0.35,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        topic_evidence_quote="the chain rule comes into play every time",
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+        uncertainty="low",
+        uncertainty_reasons=[],
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="chain rule worked example",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_start_line"] == 0
+    assert clip["_end_line"] == 16
+    assert clip["_clip_text"].startswith("notation so let me make it so i have h")
+    assert clip["_clip_text"].endswith("the next one")
+    assert "thought experiment" not in clip["_clip_text"]
+
+
+def test_boundary_only_end_uncertainty_is_diagnostic_not_a_rejection() -> None:
+    segments = [{
+        "cue_id": "cue-0",
+        "start": 0.0,
+        "end": 8.0,
+        "text": (
+            "A catalyst lowers activation energy and is not consumed by the "
+            "reaction it participates in"
+        ),
+    }]
+    proposal = G._BoundaryTopic(
+        candidate_id="catalyst-boundary",
+        start_line=0,
+        end_line=0,
+        start_quote="A catalyst lowers activation energy",
+        end_quote="reaction it participates in",
+        title="Catalysts and activation energy",
+        learning_objective="Explain how a catalyst changes activation energy.",
+        facet="activation-energy mechanism",
+        reason="Directly explains the catalyst mechanism.",
+        informativeness=0.9,
+        topic_relevance=0.95,
+        educational_importance=0.9,
+        difficulty=0.4,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        topic_evidence_quote="A catalyst lowers activation energy",
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+        uncertainty="low",
+        uncertainty_reasons=[],
+    )
+
+    assert G._close_cue_context(
+        segments, 0, 0, ignore_caption_case=True
+    ) == (0, 0, "unresolved_boundary_end")
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="catalyst activation energy",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert "unresolved_boundary_end" in clip["_boundary_fallback_reasons"]
+
+
+def test_unanswered_question_remains_semantic_incompleteness() -> None:
+    segments = [{
+        "start": 0.0,
+        "end": 8.0,
+        "text": "How does a catalyst lower activation energy?",
+    }]
+
+    assert G._close_cue_context(
+        segments, 0, 0, ignore_caption_case=True
+    ) == (0, 0, "unresolved_weak_end")
 
 
 def test_lowercase_fragment_uses_previous_unfinished_cue_as_evidence() -> None:
@@ -608,7 +796,7 @@ def test_dangling_degree_transition_trims_to_prior_complete_teaching() -> None:
     ) == (0, 0, None)
 
 
-def test_dangling_edge_framing_cannot_be_trimmed_into_a_fragment() -> None:
+def test_dangling_edge_framing_trims_without_rejecting_the_teaching() -> None:
     texts = [
         "On this strand, we talked about that.",
         "So now the next goal here is that we",
@@ -627,7 +815,22 @@ def test_dangling_edge_framing_cannot_be_trimmed_into_a_fragment() -> None:
     ) == (0, 5, None)
     assert G._trim_structural_filler_edges(
         segments, 0, 5, ignore_caption_case=True
-    ) is None
+    ) == (2, 5)
+
+
+def test_edge_filler_trim_keeps_teaching_with_a_weak_conjunction_opening() -> None:
+    segments = [
+        {"start": 0.0, "end": 4.0, "text": "Welcome back to the lesson."},
+        {
+            "start": 4.0,
+            "end": 9.0,
+            "text": "And a catalyst lowers activation energy for the reaction.",
+        },
+    ]
+
+    assert G._trim_structural_filler_edges(
+        segments, 0, 1, ignore_caption_case=True
+    ) == (1, 1)
 
 
 def test_anaphoric_function_expands_to_subject_and_completes_comparison() -> None:
@@ -989,6 +1192,72 @@ def test_mixed_complete_thought_and_dangling_cta_fails_closed() -> None:
     assert G._close_cue_context(
         segments, 0, 1, ignore_caption_case=True
     ) == (0, 1, "unresolved_weak_end")
+
+
+def test_complete_teaching_before_incomplete_edge_suffix_is_recovered() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 6.0,
+            "text": "An action potential reaches the next node and",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 6.0,
+            "end": 14.0,
+            "text": (
+                "triggers another action potential, which repeats the cycle. "
+                "Something in my brain is telling me that you"
+            ),
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 14.0,
+            "end": 20.0,
+            "text": "should subscribe to continue learning.",
+        },
+    ]
+    proposal = G._BoundaryTopic(
+        candidate_id="action-potential-cycle",
+        start_line=0,
+        end_line=1,
+        start_quote="An action potential reaches the next",
+        end_quote="brain is telling me that you",
+        title="Action-potential propagation",
+        learning_objective="Explain how an action potential propagates between nodes.",
+        facet="propagation mechanism",
+        reason="Explains the repeated electrical propagation cycle.",
+        informativeness=0.92,
+        topic_relevance=0.96,
+        educational_importance=0.9,
+        difficulty=0.45,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        topic_evidence_quote=(
+            "triggers another action potential, which repeats the cycle"
+        ),
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+        uncertainty="low",
+        uncertainty_reasons=[],
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="action potential propagation",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].endswith("which repeats the cycle")
+    assert "brain" not in clip["_clip_text"]
+    assert "trimmed_incomplete_end_suffix" in clip["_boundary_fallback_reasons"]
 
 
 def test_complete_degree_predicate_with_punctuation_remains_clean() -> None:
@@ -1523,7 +1792,7 @@ def test_complete_cannot_explanation_is_not_mistaken_for_a_forward_setup() -> No
 
 def test_dirty_edges_use_only_the_one_low_thinking_selector_call(monkeypatch):
     transcript = _transcript()
-    selector = G._BoundaryPlan(topics=[
+    selector = _intent_selector("equations", [
         _topic(3, 4, title="equation"),
         _topic(9, 10, title="equilibrium"),
         _topic(13, 13, title="stoichiometry"),
@@ -1534,7 +1803,7 @@ def test_dirty_edges_use_only_the_one_low_thinking_selector_call(monkeypatch):
 
     def fake_call(system, user, schema, **kwargs):
         calls.append((system, user, schema, kwargs))
-        assert schema is G._BoundaryPlan
+        assert schema is G._IntentBoundaryPlan
         return selector, {"operation": kwargs["operation"]}
 
     monkeypatch.setattr(G, "_call_model", fake_call)
@@ -1551,7 +1820,7 @@ def test_dirty_edges_use_only_the_one_low_thinking_selector_call(monkeypatch):
 
     assert len(calls) == 1
     _system, selector_user, schema, kwargs = calls[0]
-    assert schema is G._BoundaryPlan
+    assert schema is G._IntentBoundaryPlan
     assert kwargs["model"] == G.config.SEGMENT_FLASH_MODEL
     assert kwargs["thinking_level"] == "low"
     assert kwargs["max_output_tokens"] == 10_240
@@ -1580,7 +1849,7 @@ def test_dirty_edges_use_only_the_one_low_thinking_selector_call(monkeypatch):
 
 def test_no_boundary_repair_is_attempted_after_selector_validation(monkeypatch):
     transcript = _transcript()
-    selector = G._BoundaryPlan(topics=[
+    selector = _intent_selector("stoichiometry", [
         _topic(3, 4, title="equation"),
         _topic(13, 13, title="stoichiometry"),
     ])
@@ -1589,7 +1858,7 @@ def test_no_boundary_repair_is_attempted_after_selector_validation(monkeypatch):
     def fake_call(system, user, schema, **kwargs):
         nonlocal calls
         calls += 1
-        if schema is G._BoundaryPlan:
+        if schema is G._IntentBoundaryPlan:
             return selector, {"operation": kwargs["operation"]}
         raise RuntimeError("repair unavailable")
 
@@ -1612,13 +1881,13 @@ def test_no_boundary_repair_is_attempted_after_selector_validation(monkeypatch):
 
 def test_candidates_are_validated_independently_without_model_repair(monkeypatch):
     transcript = _transcript()
-    selector = G._BoundaryPlan(topics=[
+    selector = _intent_selector("equations", [
         _topic(3, 4, title="equation"),
         _topic(9, 10, title="equilibrium"),
         _topic(13, 13, title="stoichiometry"),
     ])
     def fake_call(system, user, schema, **kwargs):
-        assert schema is G._BoundaryPlan
+        assert schema is G._IntentBoundaryPlan
         return selector, {"operation": kwargs["operation"]}
 
     monkeypatch.setattr(G, "_call_model", fake_call)
@@ -1638,7 +1907,7 @@ def test_candidates_are_validated_independently_without_model_repair(monkeypatch
 
 def test_clean_fast_path_never_dispatches_boundary_repair(monkeypatch):
     transcript = _transcript()
-    selector = G._BoundaryPlan(topics=[
+    selector = _intent_selector("chemistry", [
         _topic(13, 13, title="stoichiometry"),
     ])
     calls = []
@@ -1656,6 +1925,6 @@ def test_clean_fast_path_never_dispatches_boundary_repair(monkeypatch):
         deadline_monotonic=time.monotonic() + 10,
     )
 
-    assert calls == [G._BoundaryPlan]
+    assert calls == [G._IntentBoundaryPlan]
     assert result.classification == "green"
     assert result.accepted_count == 1

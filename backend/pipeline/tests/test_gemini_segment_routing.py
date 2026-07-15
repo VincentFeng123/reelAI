@@ -19,6 +19,7 @@ def test_provider_schemas_avoid_unsupported_additional_properties():
     for schema in (
         G._Plan,
         G._BoundaryPlan,
+        G._IntentBoundaryPlan,
         G._BoundaryRepairPlan,
         G._EnrichmentPlan,
     ):
@@ -33,6 +34,24 @@ def _transcript(duration: float = 100.0) -> dict:
         {"word": "closes", "start": duration - 1.0, "end": duration - 0.5},
         {"word": "cleanly", "start": duration - 0.5, "end": duration},
     ]}
+
+
+def _empty_plan(schema: type, *, topic: str = ""):
+    if schema is G._IntentBoundaryPlan:
+        exact_request = topic.strip() or "(all educational topics)"
+        return schema(
+            request_intent={
+                "exact_request": exact_request,
+                "constraints": [{
+                    "constraint_id": "subject",
+                    "kind": "subject",
+                    "source_phrase": topic.strip() or "all educational topics",
+                    "requirement": "Teach the exact requested subject",
+                }],
+            },
+            topics=[],
+        )
+    return schema(topics=[])
 
 
 def _clip(**overrides) -> dict:
@@ -576,7 +595,7 @@ def test_schema_failure_preserves_successful_call_usage_telemetry(monkeypatch):
 def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
     monkeypatch,
 ):
-    valid = G._BoundaryTopic(
+    valid = G._IntentBoundaryTopic(
         candidate_id="candidate-alpha",
         start_line=0,
         end_line=0,
@@ -599,6 +618,11 @@ def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
         prerequisite_candidate_ids=[],
         uncertainty="low",
         uncertainty_reasons=[],
+        intent_role="primary",
+        intent_evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": "Alpha lesson defines the concept completely",
+        }],
     ).model_dump(mode="json")
     malformed = {**valid, "candidate_id": "candidate-bad", "topic_relevance": "high"}
     telemetry = GC.GeminiCallTelemetry(
@@ -618,7 +642,19 @@ def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
         GC,
         "generate_json_v3",
         lambda *args, **kwargs: GC.GenerationResult(
-            json.dumps({"topics": [malformed, valid]}), telemetry,
+            json.dumps({
+                "request_intent": {
+                    "exact_request": "alpha lesson",
+                    "constraints": [{
+                        "constraint_id": "subject",
+                        "kind": "subject",
+                        "source_phrase": "alpha lesson",
+                        "requirement": "Teach the alpha lesson",
+                    }],
+                },
+                "topics": [malformed, valid],
+            }),
+            telemetry,
         ),
     )
 
@@ -798,7 +834,7 @@ def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, ex
 
     def fake_call(system, user, schema, **kwargs):
         captured.update(kwargs)
-        plan = G._LegacyPlan(topics=[]) if schema is G._LegacyPlan else schema(topics=[])
+        plan = G._LegacyPlan(topics=[]) if schema is G._LegacyPlan else _empty_plan(schema)
         return plan, {}
 
     monkeypatch.setattr(G, "_call_model", fake_call)
@@ -828,7 +864,7 @@ def test_flash_boundary_profile_accepts_bootstrap_low_thinking_override(monkeypa
 
     def fake_call(system, user, schema, **kwargs):
         captured.update(kwargs)
-        return schema(topics=[]), {}
+        return _empty_plan(schema), {}
 
     monkeypatch.setattr(G, "_call_model", fake_call)
     G._run_selection_profile(

@@ -9,7 +9,7 @@ test("generation speed is visible and fully participates in settings persistence
   assert.match(source, /Generation speed/);
   assert.match(source, /value: "fast", label: "Fast", detail: "2 sources · up to 8 clips"/);
   assert.match(source, /value: "slow", label: "Slow", detail: "3 sources · up to 12 clips"/);
-  assert.match(source, /Both modes use the same relevance, context, and silence checks/);
+  assert.match(source, /Both modes use the same relevance, context, and sentence-boundary refinement/);
   assert.match(source, /setGenerationMode\(saved\.generationMode\)/);
   assert.match(source, /setGenerationMode\(DEFAULT_STUDY_REELS_SETTINGS\.generationMode\)/);
   assert.match(source, /savedPreferences\.generationMode !== generationMode/);

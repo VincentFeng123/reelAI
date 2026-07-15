@@ -814,7 +814,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
             )
 
         self.assertEqual(len(reels), 1)
-        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v14")
+        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v15")
         self.assertEqual(reels[0].t_start, 12.001)
         self.assertEqual(reels[0].t_end, 433.012)
         self.assertGreater(reels[0].t_end - reels[0].t_start, 180.0)
@@ -877,7 +877,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
 
         self.assertEqual(len(beginner_feed), 1)
         self.assertEqual(
-            beginner_feed[0]["selection_contract_version"], "quality_silence_v14"
+            beginner_feed[0]["selection_contract_version"], "quality_silence_v15"
         )
         self.assertIsInstance(beginner_feed[0]["t_start"], float)
         self.assertIsInstance(beginner_feed[0]["t_end"], float)
@@ -1108,6 +1108,197 @@ class IngestTopicProgressTests(unittest.TestCase):
         self.assertLess(elapsed, 0.32)
         self.assertTrue(all(event.wait(0.1) for event in finished))
         self.assertTrue(all(event.is_set() for event in cancelled))
+
+    def test_first_valid_clip_starts_a_bounded_straggler_grace(self) -> None:
+        pipeline = self._pipeline()
+        videos = [self._video("slow-video"), self._video("fast-video")]
+        slow_started = threading.Event()
+        slow_cancelled = threading.Event()
+
+        def clip_and_filter(video, _topic, _language, should_cancel, _context):
+            if video["id"] == "slow-video":
+                slow_started.set()
+                while not should_cancel():
+                    time.sleep(0.005)
+                slow_cancelled.set()
+                return video, [], {"transcript": {}}
+            self.assertTrue(slow_started.wait(1.0))
+            return video, [{"title": "fast", "score": 1.0}], {"transcript": {}}
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(pipeline_module, "INGEST_TOPIC_VIDEO_TIMEOUT_SEC", 1.0),
+            mock.patch.object(pipeline_module, "INGEST_TOPIC_STRAGGLER_GRACE_SEC", 0.05),
+            mock.patch.object(pipeline, "_clip_and_filter", side_effect=clip_and_filter),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (kwargs["v"]["id"], mock.sentinel.metadata),
+            ),
+        ):
+            started = time.monotonic()
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=2,
+                max_reels=8,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(reels, ["fast-video"])
+        self.assertLess(elapsed, 0.3)
+        self.assertTrue(slow_cancelled.wait(0.1))
+
+    def test_deferred_valid_clip_also_starts_the_straggler_grace(self) -> None:
+        pipeline = self._pipeline()
+        videos = [self._video("slow-video"), self._video("deferred-video")]
+        slow_started = threading.Event()
+        slow_cancelled = threading.Event()
+        stored: list[str] = []
+
+        def clip_and_filter(video, _topic, _language, should_cancel, _context):
+            if video["id"] == "slow-video":
+                slow_started.set()
+                while not should_cancel():
+                    time.sleep(0.005)
+                slow_cancelled.set()
+                return video, [], {"transcript": {}}
+            self.assertTrue(slow_started.wait(1.0))
+            return video, [{
+                "title": "valid intermediate lesson",
+                "score": 1.0,
+                "search_context": {
+                    "surface_eligible": True,
+                    "deferred_level": True,
+                },
+            }], {"transcript": {}}
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(pipeline_module, "INGEST_TOPIC_VIDEO_TIMEOUT_SEC", 1.0),
+            mock.patch.object(pipeline_module, "INGEST_TOPIC_STRAGGLER_GRACE_SEC", 0.05),
+            mock.patch.object(pipeline, "_clip_and_filter", side_effect=clip_and_filter),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (
+                    stored.append(kwargs["v"]["id"]) or kwargs["v"]["id"],
+                    mock.sentinel.metadata,
+                ),
+            ),
+        ):
+            started = time.monotonic()
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=2,
+                max_reels=8,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(reels, [])
+        self.assertEqual(stored, ["deferred-video"])
+        self.assertLess(elapsed, 0.3)
+        self.assertTrue(slow_cancelled.wait(0.1))
+
+    def test_empty_first_source_does_not_start_the_straggler_grace(self) -> None:
+        pipeline = self._pipeline()
+        videos = [self._video("empty-video"), self._video("useful-video")]
+
+        def clip_and_filter(video, *_args):
+            if video["id"] == "empty-video":
+                return video, [], {"transcript": {}}
+            time.sleep(0.05)
+            return video, [{"title": "useful", "score": 1.0}], {"transcript": {}}
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(pipeline_module, "INGEST_TOPIC_VIDEO_TIMEOUT_SEC", 0.3),
+            mock.patch.object(pipeline_module, "INGEST_TOPIC_STRAGGLER_GRACE_SEC", 0.01),
+            mock.patch.object(pipeline, "_clip_and_filter", side_effect=clip_and_filter),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (kwargs["v"]["id"], mock.sentinel.metadata),
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=2,
+                max_reels=8,
+            )
+
+        self.assertEqual(reels, ["useful-video"])
+
+    def test_source_finishing_within_straggler_grace_is_preserved(self) -> None:
+        pipeline = self._pipeline()
+        videos = [self._video("first-video"), self._video("second-video")]
+
+        def clip_and_filter(video, *_args):
+            if video["id"] == "second-video":
+                time.sleep(0.03)
+            return video, [{"title": video["id"], "score": 1.0}], {"transcript": {}}
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(pipeline_module, "INGEST_TOPIC_VIDEO_TIMEOUT_SEC", 0.3),
+            mock.patch.object(pipeline_module, "INGEST_TOPIC_STRAGGLER_GRACE_SEC", 0.1),
+            mock.patch.object(pipeline, "_clip_and_filter", side_effect=clip_and_filter),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (kwargs["v"]["id"], mock.sentinel.metadata),
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=2,
+                max_reels=8,
+            )
+
+        self.assertEqual(reels, ["first-video", "second-video"])
 
     def test_capped_result_streams_later_video_when_it_finishes_first(self) -> None:
         pipeline = self._pipeline()

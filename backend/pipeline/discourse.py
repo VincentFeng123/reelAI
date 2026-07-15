@@ -49,6 +49,21 @@ _UNRESOLVED_ACTION_REFERENCE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_OPENING_PURPOSE_REFERENCE_RE = re.compile(
+    r"^(?:(?:and|but|so|now|well)\s*[,;:]?\s+)?"
+    r"(?:in\s+order\s+)?to\s+"
+    r"(?:[a-z][a-z'-]*\s+){0,3}(?:this|that|these|those|it|them)\b",
+    re.IGNORECASE,
+)
+
+_OPENING_REFORMULATION_REFERENCE_RE = re.compile(
+    r"^(?:(?:and|but|so|now|well)\s*[,;:]?\s+)?"
+    r"(?:an?\s+)?(?:other|another)\s+way\s+of\s+"
+    r"(?:describing|expressing|phrasing|representing|saying|showing|writing)\s+"
+    r"(?:this|that|it)\b",
+    re.IGNORECASE,
+)
+
 _UNRESOLVED_EMBEDDED_ANAPHOR_RE = re.compile(
     r"^(?:(?:do|did)\s+)?you\s+know\s+(?:what|how|why)\s+"
     r"(?:else\s+)?(?:it|this|that|these|those|they|he|she)\b|"
@@ -427,6 +442,8 @@ def opens_mid_thought(text: str) -> bool:
         or _OPENING_ASIDE_RE.match(lexical_text)
         or _ELLIPTICAL_SPATIAL_INSTRUCTION_RE.match(lexical_text)
         or _UNRESOLVED_ACTION_REFERENCE_RE.match(lexical_text)
+        or _OPENING_PURPOSE_REFERENCE_RE.match(lexical_text)
+        or _OPENING_REFORMULATION_REFERENCE_RE.match(lexical_text)
         or _UNRESOLVED_EMBEDDED_ANAPHOR_RE.match(lexical_text)
         or _OPENING_UNRESOLVED_OBJECT_RE.match(lexical_text)
         or _OPENING_DEICTIC_LOCATION_RE.match(lexical_text)

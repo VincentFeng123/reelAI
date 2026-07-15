@@ -10,13 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import unicodedata
 from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import config
 from .cancellation import raise_if_cancelled, run_cancellable
@@ -30,20 +31,56 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_INTENT_TOKEN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
+_INTENT_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "do", "does", "for",
+    "from", "how", "i", "in", "is", "it", "me", "my", "of", "on", "or",
+    "please", "the", "to", "what", "when", "where", "which", "who", "why",
+    "with", "would", "you",
+})
+
 PRACTICE_FAST_EXPAND_MODEL = "gemini-3.1-flash-lite"
 # Gemini rejects manually configured deadlines below ten seconds.
 PRACTICE_FAST_EXPAND_TIMEOUT_MS = 10_000
 PRACTICE_FAST_EXPAND_OUTPUT_TOKENS = 1_024
-PRACTICE_FAST_EXPAND_CACHE_VERSION = 4
+PRACTICE_FAST_EXPAND_CACHE_VERSION = 5
 # An expansion can be nearly one segment-cache lifetime old when it discovers a
 # newly analyzed source. Keeping it for two lifetimes guarantees that source's
 # subsequent valid segment-cache lifetime never triggers another expansion call.
 PRACTICE_FAST_EXPAND_CACHE_TTL_SEC = 2 * SEGMENT_CACHE_TTL_SEC
 
 
+class _PracticeFastIntentConstraint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    constraint_id: str = Field(min_length=1, max_length=32)
+    source_phrase: str = Field(min_length=1, max_length=160)
+    requirement: str = Field(min_length=1, max_length=240)
+
+
+class _PracticeFastQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=240)
+    preserved_constraint_ids: list[str] = Field(min_length=1, max_length=8)
+
+
 class _PracticeFastExpansion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     corrected: str
-    queries: list[str]
+    intent_constraints: list[_PracticeFastIntentConstraint] = Field(
+        min_length=1,
+        max_length=8,
+    )
+    queries: list[_PracticeFastQuery]
+
+    @model_validator(mode="after")
+    def _unique_intent_ids(self):
+        ids = [constraint.constraint_id for constraint in self.intent_constraints]
+        if len(set(ids)) != len(ids):
+            raise ValueError("intent constraint ids must be unique")
+        return self
 
 
 _PRACTICE_FAST_SYSTEM = """You expand a user's search topic into a diverse set of
@@ -59,11 +96,18 @@ Do this:
 5. In the optimized query list, prioritize substantive spoken lessons, lectures, or worked
    explanations with natural pauses and little or no background music. Avoid Shorts, reaction
    videos, compilations, montages, and explanations that only work when unseen visuals are shown.
-6. Preserve comparisons, causes, misconceptions, identification tasks, and worked-example intent
-   in every query where the user requested them.
+6. Before writing queries, decompose the exact request into atomic mandatory intent constraints.
+   Give every named subject, requested operation or task, requested relationship, scope qualifier,
+   and requested outcome its own constraint. Copy the exact words that introduced each constraint
+   into source_phrase. Do not collapse a requested task into a generic subject constraint.
+7. For every query, return the IDs of all constraints it preserves. A query is usable only if it
+   preserves every constraint. Synonyms and natural YouTube wording are welcome, but no query may
+   drop a comparison, causal relationship, misconception-correction task, identification task,
+   derivation/application task, example request, or other qualifier from the exact request.
 
-Return only the requested JSON object. Keep corrected separate from queries. Return N
-optimized search queries; do not automatically spend one query on the raw literal wording."""
+Return only the requested JSON object with corrected, intent_constraints, and queries. Keep
+corrected separate from queries. Return N optimized search queries; do not automatically spend
+one query on the raw literal wording."""
 
 
 def literal_fallback(topic: str, n: int) -> dict:
@@ -185,6 +229,63 @@ def _normalize(queries: list[str], n: int) -> list[str]:
     return result
 
 
+def _intent_tokens(value: object) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return [match.group(0) for match in _INTENT_TOKEN_RE.finditer(normalized)]
+
+
+def _contains_token_phrase(text: object, phrase: object) -> bool:
+    source = _intent_tokens(text)
+    target = _intent_tokens(phrase)
+    if not source or not target or len(target) > len(source):
+        return False
+    width = len(target)
+    return any(
+        source[index : index + width] == target
+        for index in range(len(source) - width + 1)
+    )
+
+
+def _validated_ai_queries(
+    topic: str,
+    parsed: _PracticeFastExpansion,
+    count: int,
+) -> list[str]:
+    """Keep only AI queries whose same-call contract preserves exact intent."""
+    constraints = list(parsed.intent_constraints)
+    constraint_ids = {constraint.constraint_id for constraint in constraints}
+    if not constraint_ids:
+        return []
+    if any(
+        not _contains_token_phrase(topic, constraint.source_phrase)
+        for constraint in constraints
+    ):
+        return []
+    required_topic_tokens = {
+        token for token in _intent_tokens(topic) if token not in _INTENT_STOPWORDS
+    }
+    covered_topic_tokens = {
+        token
+        for constraint in constraints
+        for token in _intent_tokens(constraint.source_phrase)
+        if token not in _INTENT_STOPWORDS
+    }
+    if required_topic_tokens and not required_topic_tokens.issubset(covered_topic_tokens):
+        return []
+
+    valid: list[str] = []
+    for query in parsed.queries:
+        preserved = {
+            " ".join(str(value or "").split())
+            for value in query.preserved_constraint_ids
+            if " ".join(str(value or "").split())
+        }
+        if preserved != constraint_ids:
+            continue
+        valid.append(query.text)
+    return _normalize(valid, count)
+
+
 def deterministic_expand(topic: str, n: int, *, level: str | None = None) -> dict:
     topic = " ".join(str(topic or "").split())
     level_key = _key(level)
@@ -256,7 +357,7 @@ async def _practice_fast_gemini_raw_async(
     level_line = f"\nViewer level: {level_text}" if level_text else ""
     user = (
         f"User topic: {topic!r}\nN = {max(1, int(n))}{level_line}\n"
-        "Return corrected and queries as JSON."
+        "Return corrected, intent_constraints, and queries as JSON."
     )
     reservation: dict[str, object] = {}
     try:
@@ -412,9 +513,11 @@ def expand_query_practice_fast(
             raw = _practice_fast_gemini_raw(topic, count, **kwargs)
             parsed = _PracticeFastExpansion.model_validate_json(raw)
             corrected = " ".join(str(parsed.corrected or topic).split()) or topic
-            queries = _normalize(parsed.queries, count)
+            queries = _validated_ai_queries(topic, parsed, count)
             if not queries:
-                raise ValueError("Gemini returned no usable search queries")
+                raise ValueError(
+                    "Gemini returned no search query preserving the exact intent contract"
+                )
             raise_if_cancelled(should_cancel)
             result = {
                 "corrected": corrected,

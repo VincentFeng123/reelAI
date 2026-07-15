@@ -61,7 +61,8 @@ TOPIC_MODEL = os.environ.get("TOPIC_MODEL", "gemini-3.1-pro-preview")
 # ── Gemini-segment clip engine (default) ────────────────────────────────────
 # A single Flash pass reads the complete timestamped Supadata transcript and returns
 # substantive topic clips. Production generation never falls back to Pro; deterministic
-# discourse checks and acoustic silence verification fail closed around its output.
+# discourse checks refine transcript context and sentence edges without turning boundary
+# uncertainty into a rejection of otherwise valuable teaching.
 _segment_routing_mode = os.environ.get("SEGMENT_ROUTING_MODE", "hybrid").strip().lower()
 SEGMENT_ROUTING_MODE = (
     _segment_routing_mode
