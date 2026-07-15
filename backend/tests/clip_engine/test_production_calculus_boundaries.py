@@ -2722,15 +2722,12 @@ def test_live_coarse_captions_isolate_first_power_example_and_complete_answer() 
     ]
     proposal = _proposal(
         candidate_id="example-power-rule-chain",
-        start_line=0,
+        start_line=3,
         end_line=3,
-        start_quote="let's move on to the chain",
+        start_quote="derivative of 5x + 3 raised to the 4th power",
         end_quote="20 * 5x + 3 ra the thir",
-        evidence="find the derivative of 5x + 3 raised to the 4th power",
-        objective=(
-            "Apply the chain rule in combination with the power rule to "
-            "differentiate a polynomial function."
-        ),
+        evidence="derivative of 5x + 3 raised to the 4th power",
+        objective="Differentiate a polynomial function raised to a power using the chain rule.",
     )
 
     report = _report(segments, proposal, topic="chain rule worked example")
@@ -2747,6 +2744,72 @@ def test_live_coarse_captions_isolate_first_power_example_and_complete_answer() 
     assert "x^2 - 3x" not in clip["_clip_text"]
     assert clip["edge_projection"]["start"]["cue_id"] == "HaHsqDjWMLU:cue:2"
     assert clip["edge_projection"]["end"]["cue_id"] == "HaHsqDjWMLU:cue:4"
+
+    compact_plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": "chain rule worked example",
+            "constraints": [
+                {
+                    "constraint_id": "c1",
+                    "kind": "subject",
+                    "source_phrase": "chain rule",
+                    "requirement": "Teach the chain rule",
+                },
+                {
+                    "constraint_id": "c2",
+                    "kind": "format",
+                    "source_phrase": "worked example",
+                    "requirement": "Work through an example",
+                },
+            ],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="poly_chain_rule",
+            start_line=3,
+            end_line=3,
+            start_quote="derivative of 5x + 3 raised to the 4th power",
+            end_quote="20 * 5x + 3 ra the thir",
+            title="Derivative of a polynomial to a power",
+            learning_objective=(
+                "Differentiate a polynomial function raised to a power using the chain rule."
+            ),
+            facet="Polynomial examples",
+            informativeness=0.9,
+            topic_relevance=1.0,
+            educational_importance=0.9,
+            difficulty=0.3,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[
+                {
+                    "constraint_id": "c1",
+                    "evidence_quote": "derivative of 5x + 3 raised to the 4th power",
+                },
+                {
+                    "constraint_id": "c2",
+                    "evidence_quote": "derivative of 5x + 3 raised to the 4th power",
+                },
+            ],
+        )],
+    )
+    compact_report = gemini_segment._plan_to_report(
+        compact_plan,
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="chain rule worked example",
+    )
+
+    assert compact_report.rejected_reasons == []
+    [compact_clip] = compact_report.clips
+    assert compact_clip["_clip_text"].casefold().startswith(
+        "find the derivative of 5x + 3 raised to the 4th power"
+    )
+    assert "going to cover" not in compact_clip["_clip_text"].casefold()
+    assert "x^2 - 3x" not in compact_clip["_clip_text"]
 
 
 def test_grounded_want_to_find_prompt_does_not_retain_the_prior_rule() -> None:
@@ -2790,6 +2853,86 @@ def test_grounded_want_to_find_prompt_does_not_retain_the_prior_rule() -> None:
         "find the derivative of three x plus one squared"
     )
     assert "general chain rule" not in clip["_clip_text"].casefold()
+
+
+def test_cross_cue_future_action_separates_a_completed_prior_topic() -> None:
+    segments = [
+        _cue(
+            "limits-then-prompt",
+            0.0,
+            40.0,
+            "A limit describes the value a function approaches near an input. "
+            "One-sided limits can differ, and if they differ the two-sided limit "
+            "does not exist. That completes our limits discussion. We're now "
+            "going to find",
+        ),
+        _cue(
+            "derivative-answer",
+            40.2,
+            75.0,
+            '"the derivative of 5x plus 3 raised to the fourth power. Bring down four, '
+            "keep 5x plus 3 cubed, and multiply by five. The final answer is 20 "
+            "times 5x plus 3 cubed.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="limits-to-derivative-transition",
+        start_line=1,
+        end_line=1,
+        start_quote="the derivative of 5x plus 3 raised to the fourth power",
+        end_quote="20 times 5x plus 3 cubed",
+        evidence="the derivative of 5x plus 3 raised to the fourth power",
+        objective="Differentiate a polynomial raised to a power using the chain rule.",
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].casefold().startswith(
+        'find "the derivative of 5x plus 3 raised to the fourth power'
+    )
+    assert "limit" not in clip["_clip_text"].casefold()
+    assert clip["edge_projection"]["start"] == {
+        "required": True,
+        "cue_id": "limits-then-prompt",
+        "quote": "find",
+    }
+
+
+def test_cross_cue_future_action_keeps_an_inner_step_with_its_problem() -> None:
+    segments = [
+        _cue(
+            "problem-and-inner-step",
+            0.0,
+            30.0,
+            "For y equals 5x plus 3 to the fourth, bring down four and keep the "
+            "inside cubed. We are now going to find the",
+        ),
+        _cue(
+            "inner-answer",
+            30.2,
+            50.0,
+            '"inner derivative, which is five, then multiply to get 20 times 5x plus 3 cubed. '
+            "That is the final answer.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="same-problem-inner-derivative",
+        start_line=1,
+        end_line=1,
+        start_quote="inner derivative which is five",
+        end_quote="That is the final answer",
+        evidence="inner derivative which is five then multiply to get 20 times",
+        objective="Differentiate 5x plus 3 to the fourth using the chain rule.",
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith("For y equals 5x plus 3 to the fourth")
+    assert 'find the "inner derivative, which is five' in clip["_clip_text"]
 
 
 def test_grounded_action_keeps_its_same_sentence_problem_setup() -> None:

@@ -733,6 +733,12 @@ _WORKED_UNIT_ACTION_TOKEN_RE = re.compile(
     r"find|identify|prove|show|solve)\b",
     re.IGNORECASE,
 )
+_WORKED_UNIT_FUTURE_ACTION_PREFIX_RE = re.compile(
+    r"\b(?:i(?:['’]m|\s+am)?|we(?:['’]re|\s+are)?|"
+    r"you(?:['’]re|\s+are)?)\s+(?:now\s+)?"
+    r"(?:going|need|want)\s+to\s*$",
+    re.IGNORECASE,
+)
 _WORKED_UNIT_EVIDENCE_PROMPT_PREFIX_RE = re.compile(
     r"\b(?:example|exercise|problem)s?\b"
     r"(?P<glue>[^.!?]{0,120})\s*$",
@@ -4835,6 +4841,44 @@ def _worked_unit_prompt_prefix_is_structural(prefix: str) -> bool:
     )
 
 
+def _cross_cue_grounded_action_onset(
+    text: str,
+    next_text: str,
+) -> tuple[int, int] | None:
+    """Find a question action whose object starts in the next caption cue."""
+    raw_text = str(text or "")
+    following_text = str(next_text or "")
+    if not following_text.strip():
+        return None
+    explicitly_dangling = _cue_has_explicit_dangling_end(
+        raw_text,
+        following_text,
+    )
+    for action in reversed(list(_WORKED_UNIT_ACTION_TOKEN_RE.finditer(raw_text))):
+        wrapper = _WORKED_UNIT_FUTURE_ACTION_PREFIX_RE.search(
+            raw_text[:action.start()]
+        )
+        suffix_tokens = _toks(raw_text[action.end():])
+        fragment = raw_text[action.start():]
+        following_first_word = _WORD_RE.search(following_text)
+        guarded_following = (
+            following_text[following_first_word.start():]
+            if following_first_word is not None
+            else following_text
+        )
+        joined_fragment = f"{fragment} {guarded_following}".strip()
+        if (
+            wrapper is not None
+            and len(suffix_tokens) <= 6
+            and set(suffix_tokens) <= _WORKED_UNIT_STRUCTURAL_PROMPT_TOKENS
+            and (explicitly_dangling or not suffix_tokens)
+            and _WORKED_UNIT_PROCEDURAL_STEP_RE.match(joined_fragment) is None
+            and _WORKED_UNIT_ANAPHORIC_CONTINUATION_RE.match(joined_fragment) is None
+        ):
+            return wrapper.start(), action.start()
+    return None
+
+
 def _worked_unit_onsets_in_cue(
     text: str,
     *,
@@ -5150,6 +5194,10 @@ def _worked_unit_transitions(
     evidence_start_line, evidence_left, evidence_end_line, evidence_right = (
         evidence_location
     )
+    evidence_start_text = str(
+        segments[evidence_start_line].get("text") or ""
+    )
+    first_evidence_word = _WORD_RE.search(evidence_start_text)
     normalized_objective = " ".join(str(learning_objective or "").split())
     transitions: list[_TopicTransition] = []
     for line in range(start_line, end_line + 1):
@@ -5160,10 +5208,30 @@ def _worked_unit_transitions(
                 evidence_left,
                 evidence_right if evidence_end_line == line else len(cue_text),
             ))
-        for navigation_left, new_side_left in _worked_unit_onsets_in_cue(
+        cue_onsets = _worked_unit_onsets_in_cue(
             cue_text,
             evidence_spans=evidence_spans,
+        )
+        if (
+            line + 1 == evidence_start_line
+            and first_evidence_word is not None
+            and evidence_left == first_evidence_word.start()
         ):
+            try:
+                next_gap = (
+                    float(segments[line + 1].get("start", 0.0))
+                    - float(segments[line].get("end", 0.0))
+                )
+            except (TypeError, ValueError, OverflowError):
+                next_gap = float("inf")
+            if math.isfinite(next_gap) and next_gap < _SECTION_RESET_GAP_S:
+                cross_cue_onset = _cross_cue_grounded_action_onset(
+                    cue_text,
+                    str(segments[line + 1].get("text") or ""),
+                )
+                if cross_cue_onset is not None:
+                    cue_onsets.append(cross_cue_onset)
+        for navigation_left, new_side_left in sorted(set(cue_onsets)):
             fragment = cue_text[new_side_left:]
             wh_onset = _WORKED_UNIT_WH_ONSET_RE.match(fragment)
             if (
@@ -5299,20 +5367,30 @@ def _worked_unit_transitions(
         only_target_is_explicit_example = bool(
             _SPLIT_CAPTION_NEW_UNIT_FRAMING_RE.match(only_target_text)
         )
+        cross_cue_grounded_prompt = None
+        if only_target.new_side_line + 1 == evidence_start_line:
+            cross_cue_grounded_prompt = _cross_cue_grounded_action_onset(
+                only_target_cue_text,
+                str(segments[evidence_start_line].get("text") or ""),
+            )
         only_target_is_grounded_prompt = bool(
-            (only_target.new_side_line, only_target.new_side_left)
-            == (evidence_start_line, evidence_left)
-            and _WORKED_UNIT_TARGET_PROMPT_RE.match(
-                str(segments[only_target.new_side_line].get("text") or "")[
-                    only_target.new_side_left:
-                ]
+            (
+                (only_target.new_side_line, only_target.new_side_left)
+                == (evidence_start_line, evidence_left)
+                and _WORKED_UNIT_TARGET_PROMPT_RE.match(
+                    str(segments[only_target.new_side_line].get("text") or "")[
+                        only_target.new_side_left:
+                    ]
+                )
+                and _worked_unit_prompt_prefix_is_structural(
+                    str(segments[only_target.new_side_line].get("text") or "")[
+                        max(0, only_target.new_side_left - 160):
+                        only_target.new_side_left
+                    ]
+                )
             )
-            and _worked_unit_prompt_prefix_is_structural(
-                str(segments[only_target.new_side_line].get("text") or "")[
-                    max(0, only_target.new_side_left - 160):
-                    only_target.new_side_left
-                ]
-            )
+            or cross_cue_grounded_prompt
+            == (only_target.navigation_left, only_target.new_side_left)
         )
     if (
         len(prior_or_target) == 1
@@ -6832,9 +6910,45 @@ def _plan_to_report(
             or getattr(proposal, "facet", "")
             or ""
         )
+        transition_scan_start = a
+        if evidence_location_for_section is not None and a > 0:
+            evidence_start_line, evidence_left, _evidence_end_line, _evidence_right = (
+                evidence_location_for_section
+            )
+            evidence_text = str(segments[evidence_start_line].get("text") or "")
+            first_evidence_word = _WORD_RE.search(evidence_text)
+            previous_text = str(segments[a - 1].get("text") or "")
+            previous_cross_cue_onset = _cross_cue_grounded_action_onset(
+                previous_text,
+                evidence_text,
+            )
+            try:
+                previous_gap = (
+                    float(segments[a].get("start", 0.0))
+                    - float(segments[a - 1].get("end", 0.0))
+                )
+            except (TypeError, ValueError, OverflowError):
+                previous_gap = float("inf")
+            if (
+                evidence_start_line == a
+                and first_evidence_word is not None
+                and evidence_left == first_evidence_word.start()
+                and math.isfinite(previous_gap)
+                and previous_gap < _SECTION_RESET_GAP_S
+                and (
+                    _cue_has_explicit_dangling_end(previous_text, evidence_text)
+                    or previous_cross_cue_onset is not None
+                )
+            ):
+                # Gemini often cites the first cue containing the grounded
+                # subject while a fixed-size caption leaves its question or
+                # worked-example prompt in the immediately preceding cue.
+                # Inspect that one cue for a semantic onset so context repair
+                # cannot walk backward through an unrelated prior lesson.
+                transition_scan_start = a - 1
         topic_transitions_for_section = _candidate_topic_transitions(
             segments,
-            a,
+            transition_scan_start,
             b,
             evidence_quote=evidence_quote_for_section,
             learning_objective=objective_for_section,
@@ -6852,7 +6966,7 @@ def _plan_to_report(
             if adjacent_completion_cue:
                 completion_transitions = _candidate_topic_transitions(
                     segments,
-                    a,
+                    transition_scan_start,
                     b + 1,
                     evidence_quote=evidence_quote_for_section,
                     learning_objective=objective_for_section,
@@ -7319,6 +7433,12 @@ def _plan_to_report(
                 str(segments[a - 1].get("text") or "")
             )
         )
+        projected_start_has_lexical_prefix = bool(
+            len(preliminary_start_spans) == 1
+            and _WORD_RE.search(
+                start_text[:preliminary_start_spans[0][0]]
+            )
+        )
         projected_start_is_standalone = bool(
             len(preliminary_start_spans) == 1
             and _projected_start_is_standalone(
@@ -7326,7 +7446,7 @@ def _plan_to_report(
                 preliminary_start_spans[0],
             )
             and (
-                preliminary_start_spans[0][0] > 0
+                projected_start_has_lexical_prefix
                 or preceding_cue_is_closed
                 or not _cue_opens_mid_thought_at(
                     segments,
