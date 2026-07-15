@@ -1209,8 +1209,8 @@ class ReelService:
     # v24: expose current selector relevance consistently in cached feed rows.
     # v25: accept validated transcript-context boundaries in current inventory.
     # v26: rank exact-request fulfillment within each difficulty stage.
-    RANKED_FEED_CACHE_VERSION = 28
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v21"
+    RANKED_FEED_CACHE_VERSION = 29
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v22"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
         "quality_silence_v4",
@@ -1231,6 +1231,7 @@ class ReelService:
         "quality_silence_v19",
         "quality_silence_v20",
         "quality_silence_v21",
+        "quality_silence_v22",
     })
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
@@ -2489,6 +2490,7 @@ class ReelService:
                 "quality_silence_v19",
                 "quality_silence_v20",
                 "quality_silence_v21",
+                "quality_silence_v22",
             }
             for reel in generated
         ):
@@ -5838,6 +5840,7 @@ class ReelService:
                 "quality_silence_v19",
                 "quality_silence_v20",
                 "quality_silence_v21",
+                "quality_silence_v22",
             },
         )
         metadata["_selection_substantive"] = selection_bool(
@@ -5863,6 +5866,7 @@ class ReelService:
                 "quality_silence_v19",
                 "quality_silence_v20",
                 "quality_silence_v21",
+                "quality_silence_v22",
             },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
@@ -7356,6 +7360,7 @@ class ReelService:
                     "quality_silence_v19",
                     "quality_silence_v20",
                     "quality_silence_v21",
+                    "quality_silence_v22",
                 }
                 else legacy_difficulty_matches_level
             )
@@ -7401,6 +7406,7 @@ class ReelService:
                             "quality_silence_v19",
                             "quality_silence_v20",
                             "quality_silence_v21",
+                            "quality_silence_v22",
                         }
                         and selection_metadata.get(
                             "_selection_speech_corridor_verified"
@@ -7432,6 +7438,7 @@ class ReelService:
                     "quality_silence_v19",
                     "quality_silence_v20",
                     "quality_silence_v21",
+                    "quality_silence_v22",
                 } and (
                     (
                         min(
@@ -7464,6 +7471,7 @@ class ReelService:
                             "quality_silence_v19",
                             "quality_silence_v20",
                             "quality_silence_v21",
+                            "quality_silence_v22",
                         }
                         else self._selection_number(
                             selection_metadata.get("_selection_topic_relevance"), 0.0
@@ -7806,6 +7814,7 @@ class ReelService:
                 "quality_silence_v19",
                 "quality_silence_v20",
                 "quality_silence_v21",
+                "quality_silence_v22",
             }:
                 # V5+ captions must be immutable selection-time evidence. A
                 # provider artifact key identifies a retrieval profile and may
@@ -7842,6 +7851,7 @@ class ReelService:
                         "quality_silence_v19",
                         "quality_silence_v20",
                         "quality_silence_v21",
+                        "quality_silence_v22",
                     }
                     or transcript_artifact_key
                     else str(clean_item.get("transcript_snippet") or "")

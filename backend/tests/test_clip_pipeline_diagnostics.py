@@ -1288,7 +1288,7 @@ def test_native_json3_quotes_authorize_only_the_exact_partial_cue_corridor() -> 
     )
 
     assert error is None
-    assert bounds == (2.0, 6.0)
+    assert bounds == (2.0, 6.002)
     assert projection["lexical_projection_verified"] is True
     assert projection["lexical_boundary_verified"] is True
     assert corridor == (1.0, 7.0, None)
@@ -1895,6 +1895,44 @@ def test_partial_cue_projection_uses_caption_tokens_without_native_words() -> No
         "required_speech_sec": 2.707,
         "excluded_neighbor_onset_sec": 1.429,
     }
+
+
+def test_projected_one_token_answer_end_advances_past_its_caption_onset() -> None:
+    text = "The final answer is six cosine 6X now what is the next derivative"
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:split-answer-end-coverage",
+        "duration": 12.0,
+        "segments": [
+            {"cue_id": "answer-next", "start": 0.0, "end": 12.0, "text": text}
+        ],
+    }
+    clip = _quality_clip(
+        cue_id="answer-next",
+        start=0.0,
+        end=12.0,
+        quote="The final answer is six cosine 6X",
+        edge_projection={
+            "end": {"cue_id": "answer-next", "quote": "6X"}
+        },
+    )
+    caption = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert caption is not None
+
+    bounds, projection, error = pipeline_module._projected_speech_bounds(
+        transcript,
+        clip,
+        caption,
+        None,
+    )
+
+    token_count = len(pipeline_module._QUOTE_WORD_RE.findall(text))
+    last_onset = 12.0 * (6 / token_count)
+    assert error is None
+    assert bounds[1] > last_onset + 0.001
+    assert projection["end"]["required_speech_sec"] == round(bounds[1], 3)
+    assert projection["end"]["excluded_neighbor_onset_sec"] > bounds[1]
 
 
 def test_start_projection_clamps_rolling_cue_and_preserves_end_handoff() -> None:
@@ -2785,7 +2823,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
 ) -> None:
     strict_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v21",
+        "selection_contract_version": "quality_silence_v22",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -2795,7 +2833,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
     }
     transcript_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v21",
+        "selection_contract_version": "quality_silence_v22",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -2858,7 +2896,7 @@ def test_failed_boundary_storage_does_not_consume_ready_material_cap(
     deferred.append({
         "search_context_json": json.dumps({
             "surface_eligible": True,
-            "selection_contract_version": "quality_silence_v21",
+            "selection_contract_version": "quality_silence_v22",
             "speech_corridor_verified": True,
             "boundary_status": "verified",
             "boundary_diagnostics": {
@@ -3616,7 +3654,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v21"
+        assert context["selection_contract_version"] == "quality_silence_v22"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"

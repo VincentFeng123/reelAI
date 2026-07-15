@@ -1247,6 +1247,1158 @@ def test_described_next_examples_are_hard_one_topic_boundaries() -> None:
         assert report.clips[0]["cue_ids"] == ["new-unit"]
 
 
+def test_grounded_worked_problem_isolated_from_prior_examples_and_next_problem() -> None:
+    segments = [
+        _cue(
+            "rule",
+            0.0,
+            12.0,
+            "The chain rule multiplies the outer derivative by the inner derivative.",
+        ),
+        _cue(
+            "example-one",
+            12.0,
+            30.0,
+            "Find the derivative of five x plus three to the fourth power. "
+            "The answer is twenty times five x plus three cubed.",
+        ),
+        _cue(
+            "example-two",
+            30.0,
+            49.0,
+            "Find the derivative of x squared minus three x to the fifth power. "
+            "Apply the outer and inner derivatives to finish the answer.",
+        ),
+        _cue(
+            "target",
+            49.0,
+            67.0,
+            "Find the derivative of sine of six x. Differentiate sine first and "
+            "then multiply by the inner derivative six.",
+        ),
+        _cue(
+            "target-answer-next",
+            67.0,
+            83.0,
+            "The final answer is six cosine of six x. Now find the derivative of "
+            "cosine of four x.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="sine-six-x",
+        start_line=0,
+        end_line=4,
+        start_quote="The chain rule multiplies",
+        end_quote="cosine of four x",
+        evidence="Find the derivative of sine of six x",
+        objective="Differentiate sine of six x with the chain rule",
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["target", "target-answer-next"]
+    assert clip["_clip_text"].startswith("Find the derivative of sine of six x")
+    assert clip["_clip_text"].rstrip(" .").endswith("six cosine of six x")
+    assert "five x plus three" not in clip["_clip_text"]
+    assert "cosine of four x" not in clip["_clip_text"]
+
+
+def test_grounded_problem_trims_completed_prior_problem_and_next_topic_in_coarse_cues() -> None:
+    segments = [
+        _cue(
+            "prior-problem",
+            0.0,
+            16.0,
+            "What is the derivative of one over x cubed minus seven. Rewrite the "
+            "denominator with a negative exponent.",
+        ),
+        _cue(
+            "prior-answer-target",
+            16.0,
+            34.0,
+            "The final answer is negative three x squared over x cubed minus seven "
+            "squared. Find the derivative of one over x squared plus eight raised "
+            "to the third power.",
+        ),
+        _cue(
+            "target-reasoning",
+            34.0,
+            52.0,
+            "Rewrite the expression with exponent negative three, use the chain "
+            "rule, and multiply by the inner derivative two x.",
+        ),
+        _cue(
+            "target-answer-next",
+            52.0,
+            70.0,
+            "The simplified answer is negative six x over x squared plus eight to "
+            "the fourth power. Now what if we have a trigonometric function? Find "
+            "the derivative of sine of x squared.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="rational-target",
+        start_line=0,
+        end_line=3,
+        start_quote="What is the derivative of one over x cubed",
+        end_quote="derivative of sine of x squared",
+        evidence=(
+            "Find the derivative of one over x squared plus eight raised to the "
+            "third power"
+        ),
+        objective=(
+            "Differentiate one over x squared plus eight cubed by rewriting a "
+            "negative exponent"
+        ),
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == [
+        "prior-answer-target",
+        "target-reasoning",
+        "target-answer-next",
+    ]
+    assert clip["_clip_text"].startswith("Find the derivative of one over x squared")
+    assert clip["_clip_text"].rstrip(" .").endswith(
+        "x squared plus eight to the fourth power"
+    )
+    assert "x cubed minus seven" not in clip["_clip_text"]
+    assert "trigonometric function" not in clip["_clip_text"]
+
+
+def test_first_worked_problem_keeps_required_rule_context() -> None:
+    segments = [
+        _cue(
+            "rule",
+            0.0,
+            10.0,
+            "The chain rule differentiates the outside and multiplies by the "
+            "derivative of the inside.",
+        ),
+        _cue(
+            "problem",
+            10.0,
+            20.0,
+            "Find the derivative of sine of six x.",
+        ),
+        _cue(
+            "answer",
+            20.0,
+            30.0,
+            "The outside derivative is cosine and the inner derivative is six, so "
+            "the answer is six cosine of six x.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="first-problem-with-rule",
+        start_line=0,
+        end_line=2,
+        start_quote="The chain rule differentiates the outside",
+        end_quote="six cosine of six x",
+        evidence="Find the derivative of sine of six x",
+        objective="Use the chain rule to differentiate sine of six x",
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["rule", "problem", "answer"]
+
+
+def test_reasoning_words_inside_one_solution_do_not_create_new_units() -> None:
+    segments = [
+        _cue(
+            "problem",
+            0.0,
+            8.0,
+            "Find the derivative of sine of x squared.",
+        ),
+        _cue(
+            "reasoning",
+            8.0,
+            18.0,
+            "To find the inner derivative, calculate the derivative of x squared, "
+            "which is two x.",
+        ),
+        _cue(
+            "answer",
+            18.0,
+            27.0,
+            "Then multiply to get the final answer two x cosine of x squared.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="single-solution",
+        start_line=0,
+        end_line=2,
+        start_quote="Find the derivative of sine",
+        end_quote="two x cosine of x squared",
+        evidence="To find the inner derivative calculate the derivative of x squared",
+        objective="Differentiate sine of x squared with the chain rule",
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["problem", "reasoning", "answer"]
+
+
+def test_explicit_comparison_may_keep_two_worked_units() -> None:
+    segments = [
+        _cue(
+            "power-problem",
+            0.0,
+            9.0,
+            "Find the derivative of x squared using the power rule.",
+        ),
+        _cue(
+            "power-answer",
+            9.0,
+            17.0,
+            "The power rule gives two x.",
+        ),
+        _cue(
+            "chain-problem",
+            17.0,
+            27.0,
+            "Now find the derivative of sine of x squared using the chain rule.",
+        ),
+        _cue(
+            "comparison",
+            27.0,
+            40.0,
+            "Unlike the first result, this answer multiplies cosine of x squared by "
+            "the inner derivative two x.",
+        ),
+        _cue(
+            "unrelated-third-problem",
+            40.0,
+            50.0,
+            "Now find the derivative of tangent of x cubed.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="compare-rules",
+        start_line=0,
+        end_line=4,
+        start_quote="Find the derivative of x squared",
+        end_quote="inner derivative two x",
+        evidence="Unlike the first result this answer multiplies cosine",
+        objective="Compare the power rule example with the chain rule example",
+    )
+
+    report = _report(segments, proposal, topic="power rule versus chain rule")
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == [
+        "power-problem",
+        "power-answer",
+        "chain-problem",
+        "comparison",
+    ]
+
+
+def test_compact_comparison_uses_relationship_evidence_and_stops_at_third_unit() -> None:
+    segments = [
+        _cue(
+            "power-problem",
+            0.0,
+            8.0,
+            "Find the derivative of x squared using the power rule.",
+        ),
+        _cue("power-answer", 8.0, 14.0, "The power rule gives two x."),
+        _cue(
+            "chain-problem",
+            14.0,
+            24.0,
+            "Find the derivative of sine of x squared using the chain rule.",
+        ),
+        _cue(
+            "comparison",
+            24.0,
+            36.0,
+            "Unlike the power rule result the chain rule answer multiplies cosine of "
+            "x squared by the inner derivative two x.",
+        ),
+        _cue(
+            "third-problem",
+            36.0,
+            46.0,
+            "Find the derivative of tangent of x cubed.",
+        ),
+    ]
+    relationship_evidence = (
+        "Unlike the power rule result the chain rule answer multiplies"
+    )
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": "power rule versus chain rule",
+            "constraints": [
+                {
+                    "constraint_id": "power",
+                    "kind": "subject",
+                    "source_phrase": "power rule",
+                    "requirement": "Teach the power rule side",
+                },
+                {
+                    "constraint_id": "versus",
+                    "kind": "relationship",
+                    "source_phrase": "versus",
+                    "requirement": "Compare the two rules",
+                },
+                {
+                    "constraint_id": "chain",
+                    "kind": "subject",
+                    "source_phrase": "chain rule",
+                    "requirement": "Teach the chain rule side",
+                },
+            ],
+        },
+        topics=[
+            gemini_segment._CompactBoundaryTopic(
+                candidate_id="compare-rules",
+                start_line=0,
+                end_line=4,
+                start_quote="Find the derivative of x squared",
+                end_quote="derivative of tangent of x cubed",
+                title="Power rule versus chain rule",
+                learning_objective=(
+                    "Compare the power rule example with the chain rule example"
+                ),
+                facet="power rule and chain rule comparison",
+                informativeness=0.95,
+                topic_relevance=0.95,
+                educational_importance=0.95,
+                difficulty=0.5,
+                directly_teaches_topic=True,
+                substantive=True,
+                factually_grounded=True,
+                self_contained=True,
+                is_standalone=True,
+                intent_evidence=[
+                    {
+                        "constraint_id": "power",
+                        "evidence_quote": (
+                            "derivative of x squared using the power rule"
+                        ),
+                    },
+                    {
+                        "constraint_id": "versus",
+                        "evidence_quote": relationship_evidence,
+                    },
+                    {
+                        "constraint_id": "chain",
+                        "evidence_quote": relationship_evidence,
+                    },
+                ],
+            )
+        ],
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="power rule versus chain rule",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == [
+        "power-problem",
+        "power-answer",
+        "chain-problem",
+        "comparison",
+    ]
+
+
+def test_one_source_preserves_several_distinct_worked_units_as_separate_clips() -> None:
+    segments = [
+        _cue(
+            "square",
+            0.0,
+            10.0,
+            "Find the derivative of x squared. The final answer is two x.",
+        ),
+        _cue(
+            "cube",
+            10.0,
+            20.0,
+            "Find the derivative of x cubed. The final answer is three x squared.",
+        ),
+        _cue(
+            "fourth",
+            20.0,
+            30.0,
+            "Find the derivative of x to the fourth. The final answer is four x cubed.",
+        ),
+    ]
+    proposals = [
+        _proposal(
+            candidate_id=candidate_id,
+            start_line=0,
+            end_line=2,
+            start_quote="Find the derivative of x squared",
+            end_quote="four x cubed",
+            evidence=evidence,
+            objective=objective,
+        )
+        for candidate_id, evidence, objective in (
+            ("square", "Find the derivative of x squared", "Differentiate x squared"),
+            ("cube", "Find the derivative of x cubed", "Differentiate x cubed"),
+            (
+                "fourth",
+                "Find the derivative of x to the fourth",
+                "Differentiate x to the fourth power",
+            ),
+        )
+    ]
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=proposals),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="power rule worked examples",
+    )
+
+    assert report.rejected_reasons == []
+    assert [clip["cue_ids"] for clip in report.clips] == [
+        ["square"],
+        ["cube"],
+        ["fourth"],
+    ]
+
+
+def test_evidence_anchored_problem_trims_naturally_completed_prior_examples() -> None:
+    segments = [
+        _cue(
+            "a",
+            0.0,
+            10.0,
+            "Find the derivative of x squared. Using the power rule gives two x.",
+        ),
+        _cue(
+            "b",
+            10.0,
+            20.0,
+            "Find the derivative of x cubed. Bring down the exponent to get three x squared.",
+        ),
+        _cue(
+            "c",
+            20.0,
+            30.0,
+            "Find the derivative of sine of six x. Differentiate sine and multiply "
+            "by six to get six cosine of six x.",
+        ),
+        _cue(
+            "d",
+            30.0,
+            40.0,
+            "Find the derivative of cosine of four x. Differentiate cosine and "
+            "multiply by four.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="natural-worked-completions",
+        start_line=0,
+        end_line=3,
+        start_quote="Find the derivative of x squared",
+        end_quote="multiply by four",
+        evidence="Find the derivative of sine of six x",
+        objective="Differentiate sine of six x with the chain rule",
+    )
+
+    report = _report(segments, proposal, topic="chain rule")
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["c"]
+
+
+def test_discourse_idiom_is_not_mistaken_for_a_new_question() -> None:
+    segments = [
+        _cue(
+            "photosynthesis",
+            0.0,
+            12.0,
+            "Photosynthesis converts light energy into chemical energy. The result "
+            "is glucose. What is more, it releases oxygen that supports aerobic life.",
+        )
+    ]
+    proposal = _proposal(
+        candidate_id="photosynthesis-discourse-continuation",
+        start_line=0,
+        end_line=0,
+        start_quote="Photosynthesis converts light energy into chemical energy",
+        end_quote="oxygen that supports aerobic life",
+        evidence="it releases oxygen that supports aerobic life",
+        objective="Explain how photosynthesis releases oxygen that supports aerobic life",
+    )
+
+    report = _report(segments, proposal, topic="photosynthesis")
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("Photosynthesis converts")
+
+
+def test_anaphoric_show_continuation_keeps_the_reasoning_after_a_result() -> None:
+    segments = [
+        _cue(
+            "power-rule-reasoning",
+            0.0,
+            10.0,
+            "The result is two x. Show this by applying the power rule: bring down "
+            "the exponent and subtract one.",
+        )
+    ]
+    proposal = _proposal(
+        candidate_id="power-rule-reasoning",
+        start_line=0,
+        end_line=0,
+        start_quote="The result is two x",
+        end_quote="bring down the exponent and subtract one",
+        evidence="The result is two x",
+        objective="Explain why the result is two x using the power rule",
+    )
+
+    report = _report(segments, proposal, topic="power rule")
+
+    assert report.rejected_reasons == []
+    assert "applying the power rule" in report.clips[0]["_clip_text"]
+    assert report.clips[0]["_clip_text"].endswith("subtract one.")
+
+
+def test_wh_question_units_are_isolated_across_non_calculus_topics() -> None:
+    segments = [
+        _cue(
+            "reign-of-terror",
+            0.0,
+            10.0,
+            "Who led the Reign of Terror? Robespierre led its most radical phase.",
+        ),
+        _cue(
+            "social-contract",
+            10.0,
+            20.0,
+            "Who wrote The Social Contract? Jean-Jacques Rousseau wrote it and "
+            "argued for popular sovereignty.",
+        ),
+        _cue(
+            "napoleon",
+            20.0,
+            30.0,
+            "Who became emperor in 1804? Napoleon became emperor after the revolution.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="social-contract-author",
+        start_line=0,
+        end_line=2,
+        start_quote="Who led the Reign of Terror",
+        end_quote="Napoleon became emperor after the revolution",
+        evidence="Jean-Jacques Rousseau wrote it and argued for popular sovereignty",
+        objective="Identify who wrote The Social Contract and the political idea it taught",
+    )
+
+    report = _report(segments, proposal, topic="The Social Contract author")
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["social-contract"]
+
+
+def test_wh_explanatory_continuation_is_not_split_from_its_result() -> None:
+    segments = [
+        _cue(
+            "why-result",
+            0.0,
+            10.0,
+            "The result is two x. This shows how the power rule reduces the exponent.",
+        )
+    ]
+    proposal = _proposal(
+        candidate_id="why-result",
+        start_line=0,
+        end_line=0,
+        start_quote="The result is two x",
+        end_quote="power rule reduces the exponent",
+        evidence="power rule reduces the exponent",
+        objective="Explain how the power rule produces two x",
+    )
+
+    report = _report(segments, proposal, topic="power rule")
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].startswith("The result is two x")
+
+
+def test_interrogative_prerequisite_is_kept_for_an_anaphoric_solution() -> None:
+    segments = [
+        _cue(
+            "rule",
+            0.0,
+            12.0,
+            "Why does the chain rule multiply by the inner derivative? Because a "
+            "composite function changes at both the outer and inner rates.",
+        ),
+        _cue(
+            "problem",
+            12.0,
+            18.0,
+            "Find the derivative of sine of six x.",
+        ),
+        _cue(
+            "solution",
+            18.0,
+            25.0,
+            "Applying that rule gives six cosine of six x.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="anaphoric-chain-rule-solution",
+        start_line=0,
+        end_line=2,
+        start_quote="Why does the chain rule multiply by the inner derivative",
+        end_quote="gives six cosine of six x",
+        evidence="Find the derivative of sine of six x",
+        objective="Use the chain rule explanation to differentiate sine of six x",
+    )
+
+    report = _report(segments, proposal, topic="chain rule")
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["rule", "problem", "solution"]
+
+
+def test_relative_wh_continuations_keep_their_antecedents() -> None:
+    cases = (
+        (
+            "atp",
+            "ATP hydrolysis releases usable energy. The result is ADP. Which powers "
+            "cellular work by coupling exergonic and endergonic reactions.",
+            "powers cellular work by coupling exergonic and endergonic reactions",
+            "Explain how ATP hydrolysis powers cellular work",
+            "ATP hydrolysis",
+        ),
+        (
+            "catalyst",
+            "A catalyst lowers the activation energy. The result is an easier reaction "
+            "pathway. Which increases the reaction rate without changing equilibrium.",
+            "increases the reaction rate without changing equilibrium",
+            "Explain how a catalyst lowers activation energy, which increases reaction rate",
+            "A catalyst",
+        ),
+        (
+            "supply",
+            "The upward-sloping graph compares higher prices with greater quantity "
+            "supplied. The result is a positive relationship. What this shows is that "
+            "producers supply more when price rises.",
+            "producers supply more when price rises",
+            "Explain the positive price and quantity-supplied relationship",
+            "The upward-sloping graph",
+        ),
+    )
+    for candidate_id, text, evidence, objective, expected_start in cases:
+        segments = [_cue(candidate_id, 0.0, 12.0, text)]
+        proposal = _proposal(
+            candidate_id=candidate_id,
+            start_line=0,
+            end_line=0,
+            start_quote=expected_start,
+            end_quote=evidence,
+            evidence=evidence,
+            objective=objective,
+        )
+
+        report = _report(segments, proposal, topic=objective)
+
+        assert report.rejected_reasons == []
+        assert report.clips[0]["_clip_text"].startswith(expected_start)
+
+
+def test_cross_cue_evidence_with_a_repeated_tail_still_anchors_target_unit() -> None:
+    segments = [
+        _cue(
+            "prior",
+            0.0,
+            10.0,
+            "Find the derivative of x squared. The result is two x.",
+        ),
+        _cue(
+            "target-head",
+            10.0,
+            18.0,
+            "That completes the prior example. Find the derivative of sine of",
+        ),
+        _cue(
+            "target-tail",
+            18.0,
+            28.0,
+            "six x. Differentiate sine and multiply by six to get six cosine of six x.",
+        ),
+        _cue(
+            "next",
+            28.0,
+            36.0,
+            "Find the derivative of cosine of four x. Multiply by four.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="repeated-cross-cue-tail",
+        start_line=0,
+        end_line=3,
+        start_quote="Find the derivative of x squared",
+        end_quote="Multiply by four",
+        evidence="Find the derivative of sine of six x",
+        objective="Differentiate sine of six x with the chain rule",
+    )
+
+    report = _report(segments, proposal, topic="chain rule")
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["target-head", "target-tail"]
+    assert report.clips[0]["_clip_text"].startswith("Find the derivative of sine")
+
+
+def test_unpunctuated_which_noun_question_is_a_distinct_learning_unit() -> None:
+    segments = [
+        _cue(
+            "terror",
+            0.0,
+            10.0,
+            "Who led the Reign of Terror Robespierre led its radical phase",
+        ),
+        _cue(
+            "financial-crisis",
+            10.0,
+            22.0,
+            "Which factor most directly caused the financial crisis The regressive "
+            "tax system and war debt drove the monarchy toward bankruptcy",
+        ),
+        _cue(
+            "napoleon",
+            22.0,
+            30.0,
+            "Who became emperor in 1804 Napoleon became emperor",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="financial-crisis-cause",
+        start_line=0,
+        end_line=2,
+        start_quote="Who led the Reign of Terror",
+        end_quote="Napoleon became emperor",
+        evidence="The regressive tax system and war debt drove the monarchy toward bankruptcy",
+        objective="Identify the regressive tax system and war debt as causes of the crisis",
+    )
+
+    report = _report(segments, proposal, topic="French financial crisis")
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["financial-crisis"]
+
+
+def test_locally_defined_result_resolves_later_demonstrative_reference() -> None:
+    segments = [
+        _cue(
+            "square",
+            0.0,
+            8.0,
+            "Find the area of a square with side three. The answer is nine.",
+        ),
+        _cue(
+            "circle-question",
+            8.0,
+            14.0,
+            "Find the area of a circle with radius two.",
+        ),
+        _cue(
+            "circle-answer",
+            14.0,
+            23.0,
+            "The result is four pi. Using this result, we know the circle covers four "
+            "pi square units.",
+        ),
+        _cue(
+            "cube",
+            23.0,
+            31.0,
+            "Find the volume of a cube with side three. The answer is twenty seven.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="circle-area",
+        start_line=0,
+        end_line=3,
+        start_quote="Find the area of a square with side three",
+        end_quote="The answer is twenty seven",
+        evidence="Find the area of a circle with radius two",
+        objective="Calculate the area of a circle with radius two",
+    )
+
+    report = _report(segments, proposal, topic="circle area")
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["circle-question", "circle-answer"]
+
+
+def test_unpunctuated_which_plural_noun_question_is_isolated() -> None:
+    segments = [
+        _cue("prior", 0.0, 8.0, "Who led the radical phase Robespierre led it"),
+        _cue(
+            "economic-causes",
+            8.0,
+            20.0,
+            "Which causes of the French Revolution were economic Fiscal inequality "
+            "war debt and food prices destabilized the monarchy",
+        ),
+        _cue("next", 20.0, 28.0, "Who became emperor Napoleon became emperor"),
+    ]
+    proposal = _proposal(
+        candidate_id="economic-causes",
+        start_line=0,
+        end_line=2,
+        start_quote="Who led the radical phase",
+        end_quote="Napoleon became emperor",
+        evidence="Fiscal inequality war debt and food prices destabilized the monarchy",
+        objective="Explain the economic causes that destabilized the French monarchy",
+    )
+
+    report = _report(segments, proposal, topic="French Revolution economic causes")
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["economic-causes"]
+
+
+def test_procedural_numerator_step_stays_with_its_problem_and_answer() -> None:
+    segments = [
+        _cue(
+            "limit-question",
+            0.0,
+            10.0,
+            "Find the limit of x squared minus four over x minus two as x approaches two.",
+        ),
+        _cue(
+            "factor-step",
+            10.0,
+            18.0,
+            "Now calculate the numerator by factoring it as x minus two times x plus two.",
+        ),
+        _cue(
+            "limit-answer",
+            18.0,
+            25.0,
+            "Cancel x minus two and substitute two. The final answer is four.",
+        ),
+        _cue(
+            "next-limit",
+            25.0,
+            34.0,
+            "Find the limit of x cubed minus eight over x minus two.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="factored-limit",
+        start_line=0,
+        end_line=3,
+        start_quote="Find the limit of x squared minus four",
+        end_quote="x cubed minus eight over x minus two",
+        evidence="Find the limit of x squared minus four over x minus two",
+        objective="Evaluate the stated limit by factoring and cancellation",
+    )
+
+    report = _report(segments, proposal, topic="factoring limits")
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == [
+        "limit-question",
+        "factor-step",
+        "limit-answer",
+    ]
+
+
+def test_live_coarse_captions_isolate_sine_six_x_worked_unit() -> None:
+    segments = [
+        _cue(
+            "HaHsqDjWMLU:cue:0",
+            0.919,
+            34.879,
+            "let's move on to the chain rule we're going to cover a lot of examples "
+            "the first Formula you need to be familiar with is the derivative of the "
+            "composite function f of g ofx a composite function is one where you have "
+            "one function inside of another notice that g is inside of f which makes "
+            "it a composite function so the first thing you need to do is differentiate "
+            "the outside portion of the function that is f and you need to keep the "
+            "inside the same and then multiply it by the derivative",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:1",
+            32.8,
+            69.159,
+            "of the inside that's the main idea behind the chain rule if you follow "
+            "this process you're going to get the answer right so let's say for example "
+            "if we have a function U raised to the N where U is another function in "
+            "terms of X using the chain Rule and the power rule combined it's going to "
+            "be n * U you have to keep that the same raised to the N minus one times "
+            "the derivative of what's on the inside that's the general power rule "
+            "formula with the chain rule combine so never forget to",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:2",
+            64.92,
+            77.119,
+            "multiply by the derivative of the inside function so let's use an "
+            "example let's say if we want to find the",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:3",
+            78.28,
+            124.6,
+            "derivative of 5x + 3 raised to the 4th power so the first thing we're "
+            "going to do is we're going to move the constant I mean the exponent to "
+            "the front so it's going to be four and then keep the inside stuff the "
+            "same * 5x + 3 subtract the exponent by 1 4 - 1 is 3 and then multiply by "
+            "the derivative of the inside the inside function is four it's 5x + 3 the "
+            "derivative of 5x + 3 is just 5 and so that's the answer we can multiply "
+            "four and 5 that's going to give us 20 so it's 20 * 5x + 3 ra the thir",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:4",
+            120.92,
+            165.92,
+            "power so that's the final answer fully simplified now let's work on some "
+            "more examples find the derivative of x^2 - 3x raised to the 5th power so "
+            "first let's bring down to five so it's going to be five and then keep the "
+            "inside function the same and then subtract the exponent by 1 so this is "
+            "four and then multiply by the derivative of the inside the derivative of "
+            "x^2 - 3x is 2x - 3 and so that's the answer once you get used to the "
+            "process it's not that bad here's another example that you can",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:5",
+            159.959,
+            185.44,
+            "try find the derivative of s of 6X the derivative of the outside part of "
+            "the function s is cosine and you got to keep the inside function the same "
+            "then you multiply by the derivative of the inside function the derivative "
+            "of 6X is 6 so the answer is simply 6 cosine",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:6",
+            189.519,
+            227.56,
+            "6X now what is the derivative of cosine x^2 so first differentiate the "
+            "outside part of the function cosine the derivative of cosine is negative "
+            "sign now the inside part of the function has to remain the same that is "
+            "the angle of cosine so it's going to be x^2 and then differentiate the "
+            "inside function x^2 which is 2x so basically you're working away from the "
+            "outside towards the inside the final answer is -2X sin",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="ex3",
+        start_line=0,
+        end_line=6,
+        start_quote="let's move on to the chain",
+        end_quote="6X",
+        evidence="find the derivative of s of 6X",
+        objective=(
+            "Differentiate a trigonometric function with a linear inside function "
+            "using the chain rule."
+        ),
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].casefold().startswith(
+        "find the derivative of s of 6x"
+    )
+    assert clip["_clip_text"].rstrip(" .!?").endswith("6 cosine 6X")
+    assert "5x + 3" not in clip["_clip_text"]
+    assert "x^2 - 3x" not in clip["_clip_text"]
+    assert "derivative of cosine x^2" not in clip["_clip_text"]
+    assert clip["start"] >= 159.959
+    assert clip["edge_projection"]["end"] == {
+        "required": True,
+        "cue_id": "HaHsqDjWMLU:cue:6",
+        "quote": "6X",
+    }
+
+
+def test_live_compact_selector_evidence_isolates_rational_worked_unit() -> None:
+    segments = [
+        _cue(
+            "HaHsqDjWMLU:cue:9",
+            304.8,
+            323.56,
+            "subtract the exponent by one so 7 - 1 is 6 now we got to multiply by "
+            "the derivative of the inside function the derivative of Ln X is simply "
+            "1 /x so the final answer is 7 Ln X raised to 6 power /",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:10",
+            328.08,
+            376.72,
+            "X What is the dtive of theun of XB - 7 take a minute and work on that "
+            "example the first thing I would do is rewrite it so this is the same as X "
+            "Cub - 7 raised to the 12 and so that's going to be equal to2 we got to "
+            "bring the exponent to the front keep the inside function the same and then "
+            "subtract the exponent by one 1 12 - 1 which is 12 - 2 2 that's a half and "
+            "then we got to multiply by the derivative of the inside the derivative of "
+            "x Cub - 7 is simply 3x^2 so we could bring this back to the",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:11",
+            374.319,
+            428.72,
+            "bottom since it has a negative exponent so it's 3x^2 / we have a two on "
+            "the bottom 2 XB - 7 and now the exponent is going to change from negative "
+            "half to positive half and now we could put it back in its radical form so "
+            "it's 3x^2 / 2 < TK XB - 7 and so that's the final answer for this problem "
+            "find the derivative of 1 / x^2 + 8 raised to the 3 power so first let's "
+            "rewrite the expression let's bring the variables to the top so this is is "
+            "x^2 + 8 raed Theus 3 and now we can use the chain",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:12",
+            426.12,
+            469.0,
+            "rule combined with the power rule let's move the3 to the front and let's "
+            "keep the inside function let's rewrite it exactly the way we see it and "
+            "then let's subtract this by 1 -3 - 1 is4 and now let's multiply by the "
+            "derivative of the inside function which is 2x so now let's take this term "
+            "move it back to the bottom so we have -3 * 2x which is -6x on top and on "
+            "the bottom it's x^2 + 8 raised to the 4th power and so that's all we need "
+            "to do for this problem so for some examples you need to",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:13",
+            465.199,
+            469.0,
+            "rewrite it before you find the",
+        ),
+        _cue(
+            "HaHsqDjWMLU:cue:14",
+            471.039,
+            483.199,
+            "derivative now what if we have a trig function inside another trig "
+            "function find the Der of this uh",
+        ),
+    ]
+    evidence = "find the derivative of 1 / x^2 + 8 raised to the 3 power"
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": "chain rule worked example",
+            "constraints": [
+                {
+                    "constraint_id": "c1",
+                    "kind": "subject",
+                    "source_phrase": "chain rule",
+                    "requirement": "Teach the chain rule",
+                },
+                {
+                    "constraint_id": "c2",
+                    "kind": "format",
+                    "source_phrase": "worked example",
+                    "requirement": "Include a worked example",
+                },
+            ],
+        },
+        topics=[
+            gemini_segment._CompactBoundaryTopic(
+                candidate_id="ex6",
+                start_line=1,
+                end_line=5,
+                start_quote="X What is the dtive of",
+                end_quote="find the Der of this uh",
+                title="Derivative of 1/(x^2+8)^3",
+                learning_objective=(
+                    "Differentiate a rational function using the chain rule by "
+                    "rewriting it with a negative exponent."
+                ),
+                facet="Rational function chain rule example",
+                informativeness=0.95,
+                topic_relevance=1.0,
+                educational_importance=0.95,
+                difficulty=0.5,
+                directly_teaches_topic=True,
+                substantive=True,
+                factually_grounded=True,
+                self_contained=True,
+                is_standalone=True,
+                intent_evidence=[
+                    {"constraint_id": "c1", "evidence_quote": evidence},
+                    {"constraint_id": "c2", "evidence_quote": evidence},
+                ],
+            )
+        ],
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="chain rule worked example",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith(evidence)
+    assert "-6x on top" in clip["_clip_text"]
+    assert "x^2 + 8 raised to the 4th power" in clip["_clip_text"]
+    assert "XB - 7" not in clip["_clip_text"]
+    assert "3x^2 / 2" not in clip["_clip_text"]
+    assert "trig function inside another trig function" not in clip["_clip_text"]
+    assert 374.319 <= clip["start"] < 428.72
+    assert 426.12 < clip["end"] < 471.039
+    assert clip["edge_projection"]["start"]["cue_id"] == (
+        "HaHsqDjWMLU:cue:11"
+    )
+
+
+def test_split_answer_prefix_stops_before_following_bare_problem() -> None:
+    segments = [
+        _cue(
+            "answer-head",
+            0.0,
+            10.0,
+            "The final answer is negative two x sine",
+        ),
+        _cue(
+            "answer-tail-next",
+            10.0,
+            24.0,
+            "x squared find the derivative of tangent x cubed and then apply the "
+            "chain rule.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="split-answer-before-next",
+        start_line=0,
+        end_line=1,
+        start_quote="The final answer is negative",
+        end_quote="apply the chain rule",
+        evidence="The final answer is negative two x sine",
+        objective="State the completed derivative answer negative two x sine x squared",
+    )
+
+    report = _report(segments, proposal, topic="chain rule worked example")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].rstrip(" .!?").endswith(
+        "negative two x sine x squared"
+    )
+    assert "tangent x cubed" not in clip["_clip_text"]
+
+
 def test_ambiguous_evidence_cannot_span_a_topic_reset() -> None:
     segments = [
         _cue(

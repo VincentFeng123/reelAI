@@ -352,7 +352,7 @@ assessment_service = AssessmentService()
 MAX_REELS_PER_MATERIAL = 300
 GENERATION_OUTPUT_CEILINGS = {"fast": 8, "slow": 12}
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v21"
+SELECTION_CONTRACT_VERSION = "quality_silence_v22"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -4049,7 +4049,16 @@ def _run_leased_generation_job(
                 generation_id=generation_id,
                 material_id=material_id,
             )
-            if cumulative_count or has_verified_reservoir:
+            refreshed_job = get_generation_job(conn, job_id) or {
+                **job_row,
+                "result_generation_id": generation_id,
+            }
+            rankable_fallback = (
+                []
+                if cumulative_count or has_verified_reservoir
+                else _generation_job_reels(conn, refreshed_job)
+            )
+            if cumulative_count or has_verified_reservoir or rankable_fallback:
                 _activate_generation(
                     conn,
                     material_id=material_id,
@@ -4057,8 +4066,10 @@ def _run_leased_generation_job(
                     generation_id=generation_id,
                     retrieval_profile="unified",
                 )
-                refreshed_job = get_generation_job(conn, job_id) or {**job_row, "result_generation_id": generation_id}
-                final_reels = _generation_job_reels(conn, refreshed_job)
+                final_reels = rankable_fallback or _generation_job_reels(
+                    conn,
+                    refreshed_job,
+                )
             else:
                 _complete_generation(
                     conn,

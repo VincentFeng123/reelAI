@@ -58,7 +58,7 @@ def test_live_runner_uses_the_canonical_practice_segmenter():
 
 
 def test_direct_url_segment_cache_hit_skips_all_gemini_and_budget(monkeypatch):
-    assert run.segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v21"
+    assert run.segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v22"
     transcript = {
         "segments": [{
             "cue_id": "cached-cue",

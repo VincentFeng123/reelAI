@@ -658,10 +658,131 @@ _PEDAGOGICAL_SETUP_ONSET_RE = re.compile(
     r"(?:how|what|when|where|which|why)\b)",
     re.IGNORECASE,
 )
+_WORKED_UNIT_ACTION_ONSET_RE = re.compile(
+    r"^\s*(?:(?:now|next)\s*[,;:]?\s+)?(?:"
+    r"let(?:['’]?s|\s+us)\s+(?:analyze|calculate|compute|consider|determine|"
+    r"differentiate|evaluate|find|identify|prove|show|solve|try)|"
+    r"(?:analyze|calculate|compute|determine|differentiate|evaluate|find|"
+    r"identify|prove|show|solve)\b|"
+    r"(?:how|what|why)\s+"
+    r"(?:are|can|could|did|do|does|is|should|was|were|will|would)\b)",
+    re.IGNORECASE,
+)
+_WORKED_UNIT_ACTION_TOKEN_RE = re.compile(
+    r"(?<!\w)(?:analyze|calculate|compute|determine|differentiate|evaluate|"
+    r"find|identify|prove|show|solve)\b",
+    re.IGNORECASE,
+)
+_WORKED_UNIT_WH_ONSET_RE = re.compile(
+    r"^\s*(?:(?:now|next)\s*[,;:]?\s+)?"
+    r"(?:how|what|when|where|which|who|why)\b",
+    re.IGNORECASE,
+)
+_WORKED_UNIT_QUESTION_TOKEN_RE = re.compile(
+    r"(?<!\w)(?:how|what|when|where|which|who|why)\b",
+    re.IGNORECASE,
+)
+_WORKED_UNIT_DISCOURSE_CONTINUATION_RE = re.compile(
+    r"^\s*what\s+is\s+(?:more|also|worse)\b|"
+    r"^\s*what\s+is\s+(?:clear|crucial|important|interesting|notable|"
+    r"remarkable|significant)(?:\s+here)?\s+is\b",
+    re.IGNORECASE,
+)
+_WORKED_UNIT_ANAPHORIC_CONTINUATION_RE = re.compile(
+    r"^\s*(?:(?:calculate|compute|determine|differentiate|evaluate|find|"
+    r"identify|solve)\s+(?:it|that|this)\b|"
+    r"(?:prove|show)\s+(?:by|how|it|this|why)\b)",
+    re.IGNORECASE,
+)
+_WORKED_UNIT_NONQUESTION_WH_CONTINUATION_RE = re.compile(
+    r"^\s*(?:"
+    r"which\s+(?:in\s+turn\b|is\s+(?:how|what|when|where|why)\b|means?\b)|"
+    r"who\s+in\s+turn\b|"
+    r"what\s+(?:this|that)\s+(?:[a-z][\w'’-]*\s+){0,3}is\b|"
+    r"(?:when|where)\s+(?:it|that|this|these|those|we|you)\b)",
+    re.IGNORECASE,
+)
+_WORKED_UNIT_UNRESOLVED_METHOD_REFERENCE_RE = re.compile(
+    r"\b(?:apply(?:ing)?|follow(?:ing)?|use|using)\s+"
+    r"(?:this|that|these|those)\s+"
+    r"(?P<head>approach|formula|idea|method|principle|relationship|result|"
+    r"rule|step|technique)\b",
+    re.IGNORECASE,
+)
+_WORKED_UNIT_WH_PREVIOUS_LICENSE_RE = re.compile(
+    r"\b(?:about|ask(?:ed|ing)?|describ(?:e|ed|es|ing)|discuss(?:ed|es|ing)?|"
+    r"explain(?:ed|ing|s)?|know(?:ing)?|learn(?:ed|ing|s)?|recall(?:ed|ing|s)?|"
+    r"remember(?:ed|ing|s)?|see(?:ing)?|show(?:ed|ing|s)?|"
+    r"understand(?:ing|s)?|wonder(?:ed|ing|s)?)\s*$",
+    re.IGNORECASE,
+)
+_WORKED_UNIT_TARGET_PROMPT_RE = re.compile(
+    r"^\s*(?:(?:now|next)\s*[,;:]?\s+)?(?:"
+    r"let(?:['’]?s|\s+us)\s+(?:calculate|compute|determine|evaluate|find|"
+    r"identify|prove|show|solve|try)|"
+    r"(?:calculate|compute|determine|evaluate|find|identify|prove|show|solve)\b|"
+    r"(?:how|what|when|where|which|who|why)\b)",
+    re.IGNORECASE,
+)
+_MARKED_WORKED_UNIT_ONSET_RE = re.compile(
+    r"(?<!\w)(?P<navigation>"
+    r"(?:(?:all\s+right|alright|okay|ok|so)\s*[,;:]?\s+)*"
+    r"(?:now|next)\s*[,;:]?\s+)"
+    r"(?P<unit>(?:"
+    r"let(?:['’]?s|\s+us)\s+(?:analyze|calculate|compute|consider|determine|"
+    r"differentiate|evaluate|find|identify|prove|show|solve|try)|"
+    r"(?:analyze|calculate|compute|determine|differentiate|evaluate|find|"
+    r"identify|prove|show|solve)\b|"
+    r"(?:how|what|when|where|which|who|why)\b))",
+    re.IGNORECASE,
+)
+_WORKED_UNIT_PROCEDURAL_STEP_RE = re.compile(
+    r"^\s*(?:(?:first|next|now|then)\s*[,;:]?\s+)?"
+    r"(?:calculate|compute|determine|differentiate|find|identify)\s+"
+    r"(?:(?:our|the|this)\s+)?(?:"
+    r"(?:inner|inside|outer|outside)\s+(?:derivative|function|part|piece)|"
+    r"(?:common\s+)?(?:denominator|factor|numerator)|"
+    r"(?:current|given|remaining|resulting|same)\s+"
+    r"(?:equation|expression|factor|function|quantity|term|value)|"
+    r"next\s+(?:step|term)|remaining\s+(?:factor|step|term)|"
+    r"derivative\s+of\s+(?:(?:our|the)\s+)?(?:inner|inside|outer|outside)\b)",
+    re.IGNORECASE,
+)
+_WORKED_UNIT_PROCEDURAL_QUESTION_RE = re.compile(
+    r"^\s*(?:(?:now|so)\s*[,;:]?\s+)?(?:"
+    r"what\s+(?:do|does|should)\s+(?:i|we)\s+do\b|"
+    r"what\s+(?:is|would\s+be)\s+(?:our|the)\s+next\s+step\b|"
+    r"what\s+remains\b|how\s+do\s+(?:i|we)\s+(?:continue|finish|proceed)\b)",
+    re.IGNORECASE,
+)
+_WORKED_UNIT_POSSIBLE_ONSET_RE = re.compile(
+    r"(?<!\w)(?:analyze|calculate|compute|determine|differentiate|evaluate|"
+    r"find|identify|prove|show|solve)\b|"
+    r"(?<!\w)(?:how|what|when|where|which|who|why)\b|"
+    r"(?<!\w)let(?:['’]?s|\s+us)\s+(?:analyze|calculate|compute|consider|"
+    r"determine|differentiate|evaluate|find|identify|prove|show|solve|try)\b|"
+    r"(?<!\w)(?:here(?:['’]s|\s+is)|let(?:['’]?s|\s+us))\b[^.!?]{0,80}"
+    r"\b(?:another|more|next|new)\b[^.!?]{0,50}"
+    r"\b(?:calculation|case|derivation|example|exercise|problem|proof)s?\b",
+    re.IGNORECASE,
+)
 _SPLIT_CAPTION_COMPLETION_SIGNAL_RE = re.compile(
     r"\b(?:(?:the\s+)?(?:answer|result|solution)\s+(?:is|equals?)|"
     r"(?:final|simplified)\s+(?:answer|result|solution)|"
     r"fully\s+simplified|that(?:['’]s|\s+is)\s+the\s+final\s+answer)\b",
+    re.IGNORECASE,
+)
+_WORKED_UNIT_CLOSING_TAIL_RE = re.compile(
+    r"\b(?:fully\s+simplified|"
+    r"that(?:['’]s|\s+is)\s+(?:the\s+)?(?:final\s+)?"
+    r"(?:answer|result|solution)|"
+    r"that(?:['’]s|\s+is)\s+all\s+(?:i|we|you)\s+need\s+to\s+do\s+"
+    r"for\s+(?:this|the)\s+(?:calculation|case|derivation|example|exercise|"
+    r"problem|proof)|"
+    r"(?:which|that)\s+(?:complete|finish)(?:d|es)?\s+(?:this|the)\s+"
+    r"(?:calculation|case|derivation|example|exercise|problem|proof)|"
+    r"(?:the\s+)?final\s+(?:answer|result|solution)\s+for\s+(?:this|the)\s+"
+    r"(?:calculation|case|derivation|example|exercise|problem|proof))\b",
     re.IGNORECASE,
 )
 _SPLIT_CAPTION_ONSET_MARKER_RE = re.compile(
@@ -2628,6 +2749,8 @@ def _close_cue_context(
     end_boundary_verified: bool = False,
     protected_quote: str = "",
     learning_objective: str = "",
+    min_start_line: int | None = None,
+    max_end_line: int | None = None,
 ) -> tuple[int, int, str | None]:
     """Expand dirty edges until discourse closes or a real section edge is reached."""
     expansion_limit = (
@@ -2738,6 +2861,8 @@ def _close_cue_context(
         candidate = start_line - 1
         if candidate < 0:
             break
+        if min_start_line is not None and candidate < min_start_line:
+            break
         if crosses_section_reset(candidate, start_line):
             break
         start_line = candidate
@@ -2759,6 +2884,8 @@ def _close_cue_context(
     if forward_solution_needed and not suffix_was_trimmed:
         candidate = end_line + 1
         if candidate >= len(segments) or expansion_limit <= 0:
+            return start_line, end_line, "unresolved_weak_end"
+        if max_end_line is not None and candidate > max_end_line:
             return start_line, end_line, "unresolved_weak_end"
         if crosses_section_reset(end_line, candidate):
             return start_line, end_line, "unresolved_weak_end"
@@ -2790,6 +2917,8 @@ def _close_cue_context(
             break
         candidate = end_line + 1
         if candidate >= len(segments):
+            break
+        if max_end_line is not None and candidate > max_end_line:
             break
         if crosses_section_reset(end_line, candidate):
             break
@@ -2998,29 +3127,27 @@ def _quote_character_span(text: str, quote: str) -> tuple[int, int] | None:
     return spans[0] if spans else None
 
 
-def _cross_cue_quote_matches(
+def _cross_cue_token_windows(
     segments: list[dict],
     quote: str,
     start_line: int,
     end_line: int,
-) -> list[tuple[int, int, str, str]]:
-    """Return unique literal edge projections for exact adjacent-cue quotes."""
+) -> list[tuple[int, int, int, int, int, int]]:
+    """Locate exact full-token quote windows that cross contiguous cues."""
     quote_tokens = _toks(quote)
     if not quote_tokens or start_line < 0 or end_line >= len(segments):
         return []
 
     flattened: list[tuple[str, int, int, int]] = []
-    texts: dict[int, str] = {}
     for line in range(start_line, end_line + 1):
         text = str(segments[line].get("text") or "")
-        texts[line] = text
         for match in _WORD_RE.finditer(text):
             [token] = _toks(match.group(0))
             flattened.append((token, line, match.start(), match.end()))
     if len(flattened) < len(quote_tokens):
         return []
 
-    matches: list[tuple[int, int, str, str]] = []
+    matches: list[tuple[int, int, int, int, int, int]] = []
     for index in range(len(flattened) - len(quote_tokens) + 1):
         window = flattened[index:index + len(quote_tokens)]
         if [item[0] for item in window] != quote_tokens:
@@ -3050,11 +3177,40 @@ def _cross_cue_quote_matches(
 
         first_tokens = [item for item in window if item[1] == first_line]
         last_tokens = [item for item in window if item[1] == last_line]
-        start_quote = texts[first_line][first_tokens[0][2]:first_tokens[-1][3]]
-        end_quote = texts[last_line][last_tokens[0][2]:last_tokens[-1][3]]
+        matches.append((
+            first_line,
+            last_line,
+            first_tokens[0][2],
+            first_tokens[-1][3],
+            last_tokens[0][2],
+            last_tokens[-1][3],
+        ))
+    return matches
+
+
+def _cross_cue_quote_matches(
+    segments: list[dict],
+    quote: str,
+    start_line: int,
+    end_line: int,
+) -> list[tuple[int, int, str, str]]:
+    """Return unique literal edge projections for exact adjacent-cue quotes."""
+    matches: list[tuple[int, int, str, str]] = []
+    for (
+        first_line,
+        last_line,
+        first_left,
+        first_right,
+        last_left,
+        last_right,
+    ) in _cross_cue_token_windows(segments, quote, start_line, end_line):
+        first_text = str(segments[first_line].get("text") or "")
+        last_text = str(segments[last_line].get("text") or "")
+        start_quote = first_text[first_left:first_right]
+        end_quote = last_text[last_left:last_right]
         if (
-            len(_quote_character_spans(texts[first_line], start_quote)) != 1
-            or len(_quote_character_spans(texts[last_line], end_quote)) != 1
+            len(_quote_character_spans(first_text, start_quote)) != 1
+            or len(_quote_character_spans(last_text, end_quote)) != 1
         ):
             continue
         matches.append((first_line, last_line, start_quote, end_quote))
@@ -3075,25 +3231,71 @@ def _unique_evidence_location(
             (line, left, line, right)
             for left, right in _quote_character_spans(text, quote)
         )
-    for first_line, last_line, first_quote, last_quote in _cross_cue_quote_matches(
-        segments,
-        quote,
-        start_line,
-        end_line,
-    ):
-        first_span = _quote_character_span(
-            str(segments[first_line].get("text") or ""),
-            first_quote,
-        )
-        last_span = _quote_character_span(
-            str(segments[last_line].get("text") or ""),
-            last_quote,
-        )
-        if first_span is not None and last_span is not None:
-            locations.append(
-                (first_line, first_span[0], last_line, last_span[1])
-            )
+    locations.extend(
+        (first_line, first_left, last_line, last_right)
+        for (
+            first_line,
+            last_line,
+            first_left,
+            _first_right,
+            _last_left,
+            last_right,
+        ) in _cross_cue_token_windows(segments, quote, start_line, end_line)
+    )
     return locations[0] if len(locations) == 1 else None
+
+
+def _proposal_evidence_anchor(
+    proposal: object,
+    intent_constraints: dict[str, _IntentConstraint],
+    segments: list[dict],
+    start_line: int,
+    end_line: int,
+) -> tuple[str, tuple[int, int, int, int] | None]:
+    """Choose the first uniquely grounded selector quote for unit trimming."""
+    direct_quote = " ".join(
+        str(getattr(proposal, "topic_evidence_quote", "") or "").split()
+    )
+    candidates: list[str] = [direct_quote] if direct_quote else []
+    if isinstance(proposal, _CompactBoundaryTopic) and not candidates:
+        proposed = list(proposal.intent_evidence)
+        specificity = {
+            _IntentConstraintKind.RELATIONSHIP: 0,
+            _IntentConstraintKind.TASK: 1,
+            _IntentConstraintKind.OUTCOME: 1,
+            _IntentConstraintKind.FORMAT: 2,
+            _IntentConstraintKind.SCOPE: 3,
+            _IntentConstraintKind.SUBJECT: 4,
+        }
+        ordered_constraint_ids = sorted(
+            intent_constraints,
+            key=lambda constraint_id: (
+                specificity.get(intent_constraints[constraint_id].kind, 5),
+                list(intent_constraints).index(constraint_id),
+            ),
+        )
+        ordered = [
+            evidence
+            for constraint_id in ordered_constraint_ids
+            for evidence in proposed
+            if evidence.constraint_id == constraint_id
+        ]
+        ordered.extend(item for item in proposed if item not in ordered)
+        candidates.extend(
+            " ".join(str(item.evidence_quote or "").split())
+            for item in ordered
+        )
+    candidates = list(dict.fromkeys(quote for quote in candidates if quote))
+    for quote in candidates:
+        location = _unique_evidence_location(
+            segments,
+            quote,
+            start_line,
+            end_line,
+        )
+        if location is not None:
+            return quote, location
+    return (candidates[0], None) if candidates else ("", None)
 
 
 def _literal_source_quote(
@@ -4371,6 +4573,445 @@ class _TopicTransition:
     navigation_left: int
     new_side_line: int
     new_side_left: int
+    worked_unit: bool = False
+
+
+def _worked_unit_onsets_in_cue(
+    text: str,
+    *,
+    evidence_spans: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Locate high-confidence new problem/question starts in one coarse cue."""
+    raw_text = str(text or "")
+    if _WORKED_UNIT_POSSIBLE_ONSET_RE.search(raw_text) is None:
+        return []
+    onsets: dict[int, int] = {}
+
+    def add(navigation_left: int, new_side_left: int) -> None:
+        fragment = raw_text[new_side_left:]
+        if (
+            _WORKED_UNIT_DISCOURSE_CONTINUATION_RE.match(fragment)
+            or _WORKED_UNIT_ANAPHORIC_CONTINUATION_RE.match(fragment)
+            or _WORKED_UNIT_NONQUESTION_WH_CONTINUATION_RE.match(fragment)
+            or _WORKED_UNIT_PROCEDURAL_STEP_RE.match(fragment)
+            or _WORKED_UNIT_PROCEDURAL_QUESTION_RE.match(fragment)
+        ):
+            return
+        previous = onsets.get(navigation_left)
+        if previous is None or new_side_left > previous:
+            onsets[navigation_left] = new_side_left
+
+    for marked in _MARKED_WORKED_UNIT_ONSET_RE.finditer(raw_text):
+        add(marked.start("navigation"), marked.start("unit"))
+
+    for framing in _SPLIT_CAPTION_NEW_UNIT_FRAMING_RE.finditer(raw_text):
+        following_action = _WORKED_UNIT_ACTION_TOKEN_RE.search(
+            raw_text,
+            framing.end(),
+        )
+        new_side = (
+            following_action.start()
+            if following_action is not None
+            and len(_toks(raw_text[framing.end():following_action.start()])) <= 12
+            else framing.start()
+        )
+        add(framing.start(), new_side)
+
+    sentence_spans = _sentence_character_spans(raw_text)
+    for sentence_left, sentence_right in sentence_spans:
+        first_word = _WORD_RE.search(raw_text, sentence_left, sentence_right)
+        if first_word is None:
+            continue
+        onset = first_word.start()
+        if (
+            _WORKED_UNIT_ACTION_ONSET_RE.match(raw_text[onset:sentence_right])
+            or _WORKED_UNIT_WH_ONSET_RE.match(raw_text[onset:sentence_right])
+        ):
+            marker = _SPLIT_CAPTION_ONSET_MARKER_RE.search(raw_text[:onset])
+            navigation_left = marker.start() if marker is not None else onset
+            add(navigation_left, onset)
+
+    # Caption providers often omit punctuation inside a long cue. The exact
+    # grounded evidence still identifies its prompt without guessing from an
+    # unrelated reasoning verb elsewhere in the solution.
+    for action in _WORKED_UNIT_ACTION_TOKEN_RE.finditer(raw_text):
+        action_left = action.start()
+        previous_words = list(_WORD_RE.finditer(raw_text[:action_left]))
+        previous_word = (
+            previous_words[-1].group(0).casefold()
+            if previous_words
+            else ""
+        )
+        if previous_word in {
+            "and", "by", "can", "could", "first", "i", "must", "should",
+            "then", "to", "we", "will", "would", "you",
+        }:
+            continue
+        evidence_anchored = any(
+            action_left <= evidence_left
+            and evidence_left - action_left <= 160
+            and evidence_right - action_left <= 240
+            for evidence_left, evidence_right in evidence_spans
+        )
+        prefix = raw_text[:action_left]
+        sentence_left = max(
+            raw_text.rfind(marker, 0, action_left)
+            for marker in ".!?"
+        ) + 1
+        local_prefix = raw_text[sentence_left:action_left]
+        if not (
+            evidence_anchored
+            or len(_toks(local_prefix)) <= 12
+            or _SPLIT_CAPTION_COMPLETION_SIGNAL_RE.search(local_prefix)
+        ):
+            continue
+        marker = _SPLIT_CAPTION_ONSET_MARKER_RE.search(raw_text[:action_left])
+        navigation_left = marker.start() if marker is not None else action_left
+        add(navigation_left, action_left)
+
+    for question in _WORKED_UNIT_QUESTION_TOKEN_RE.finditer(raw_text):
+        question_left = question.start()
+        prefix = raw_text[:question_left]
+        sentence_left = max(
+            raw_text.rfind(marker, 0, question_left)
+            for marker in ".!?"
+        ) + 1
+        local_prefix = raw_text[sentence_left:question_left]
+        previous_words = list(_WORD_RE.finditer(prefix))
+        previous_word = (
+            previous_words[-1].group(0).casefold()
+            if previous_words
+            else ""
+        )
+        if previous_word in {
+            "about", "and", "are", "as", "by", "demonstrates", "explains",
+            "explaining", "for", "from", "illustrates", "is", "know",
+            "knowing", "learn", "learning", "notice", "noticing", "observe",
+            "observing", "of", "on", "reason", "recall", "recalling",
+            "remember", "remembering", "see", "seeing", "showing", "shows",
+            "that", "the", "to", "understand", "understanding", "was", "were",
+            "with", "without",
+        }:
+            continue
+        evidence_anchored = any(
+            question_left <= evidence_left
+            and evidence_left - question_left <= 160
+            and evidence_right - question_left <= 240
+            for evidence_left, evidence_right in evidence_spans
+        )
+        if not (
+            len(_toks(local_prefix)) <= 3
+            or _SPLIT_CAPTION_COMPLETION_SIGNAL_RE.search(local_prefix)
+            or evidence_anchored
+        ):
+            continue
+        marker = _SPLIT_CAPTION_ONSET_MARKER_RE.search(prefix)
+        navigation_left = marker.start() if marker is not None else question_left
+        add(navigation_left, question_left)
+
+    return sorted(onsets.items())
+
+
+def _worked_unit_prefix_is_complete(
+    segments: list[dict],
+    start_line: int,
+    transition: _TopicTransition,
+    *,
+    after: _TopicTransition | None = None,
+) -> bool:
+    """Distinguish prior solved work from useful rule/setup context."""
+    first_line = after.new_side_line if after is not None else start_line
+    parts: list[str] = []
+    for line in range(first_line, transition.navigation_line + 1):
+        text = str(segments[line].get("text") or "")
+        left = after.new_side_left if after is not None and line == first_line else 0
+        right = (
+            transition.navigation_left
+            if line == transition.navigation_line
+            else len(text)
+        )
+        if right > left:
+            parts.append(text[left:right])
+    prefix = " ".join(parts)
+    return bool(
+        _SPLIT_CAPTION_COMPLETION_SIGNAL_RE.search(prefix)
+        or re.search(
+            r"\b(?:final\s+answer|fully\s+simplified|"
+            r"(?:answer|result|solution)\s+(?:is|equals?)|"
+            r"that(?:['’]s|\s+is)\s+(?:all\s+we\s+need\s+to\s+do\s+for\s+"
+            r"(?:this|the)\s+(?:calculation|case|derivation|example|exercise|"
+            r"problem|proof)|(?:the\s+)?(?:answer|result|solution))|"
+            r"(?:complete|finish(?:ed|es)?|solv(?:e|ed|es))\s+(?:"
+            r"(?:(?:this|the)\s+)?(?:answer|calculation|case|derivation|"
+            r"example|exercise|problem|proof|solution)))\b",
+            prefix,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _worked_unit_target_needs_prior_explanation(
+    segments: list[dict],
+    target: _TopicTransition,
+    raw_transitions: list[_TopicTransition],
+    end_line: int,
+) -> bool:
+    """Detect a target solution that explicitly reuses an unnamed prior method."""
+    following = min(
+        (
+            item
+            for item in raw_transitions
+            if (item.navigation_line, item.navigation_left)
+            > (target.navigation_line, target.navigation_left)
+        ),
+        default=None,
+        key=lambda item: (item.navigation_line, item.navigation_left),
+    )
+    last_line = following.navigation_line if following is not None else end_line
+    parts: list[str] = []
+    for line in range(target.new_side_line, last_line + 1):
+        text = str(segments[line].get("text") or "")
+        left = target.new_side_left if line == target.new_side_line else 0
+        right = (
+            following.navigation_left
+            if following is not None and line == following.navigation_line
+            else len(text)
+        )
+        if right > left:
+            parts.append(text[left:right])
+    target_text = " ".join(parts)
+    generic_modifiers = {
+        "a", "an", "our", "that", "the", "these", "this", "those", "your",
+    }
+    for reference in _WORKED_UNIT_UNRESOLVED_METHOD_REFERENCE_RE.finditer(
+        target_text
+    ):
+        head = reference.group("head").casefold()
+        prefix_text = target_text[:reference.start()]
+        prefix_tokens = _toks(prefix_text)
+        locally_defined = re.search(
+            rf"\b(?:the|this|that)\s+{re.escape(head)}\s+"
+            r"(?:are|equals?|gives?|is|means?|states?|was|were)\b",
+            prefix_text,
+            re.IGNORECASE,
+        ) is not None
+        locally_named = any(
+            token == head
+            and index > 0
+            and prefix_tokens[index - 1] not in generic_modifiers
+            for index, token in enumerate(prefix_tokens)
+        )
+        if not locally_defined and not locally_named:
+            return True
+    return False
+
+
+def _which_onset_is_interrogative(
+    fragment: str,
+    learning_objective: str,
+) -> bool:
+    """Separate a ``Which + noun`` prompt from a dangling relative clause."""
+    raw_fragment = str(fragment or "").lstrip()
+    if re.match(r"^[^.!?]{1,200}\?", raw_fragment):
+        return True
+    if re.match(
+        r"^\s*(?:choose|determine|distinguish|identify|name|select)\b",
+        learning_objective,
+        re.IGNORECASE,
+    ):
+        return True
+    words = _toks(raw_fragment)
+    if len(words) < 2 or words[0] != "which":
+        return False
+    second = words[1]
+    if second in {"of", "one", "ones"}:
+        return True
+    if len(words) >= 3 and second.endswith("s") and words[2] in {
+        "act", "actually", "affect", "apply", "are", "best", "can", "cause",
+        "commonly", "contribute", "control", "could", "determine", "did",
+        "directly", "do", "does", "drive", "encode", "explain", "have",
+        "influence", "is", "lead", "least", "mainly", "may", "might", "most",
+        "of", "often", "primarily", "produce", "regulate", "result", "should",
+        "support", "typically", "was", "were", "will", "would",
+    }:
+        return True
+    finite_predicates = {
+        "also", "am", "are", "became", "can", "could", "did", "do", "does",
+        "had", "has", "have", "is", "led", "made", "may", "might", "must",
+        "shall", "should", "then", "thereby", "was", "were", "will", "would",
+        "wrote",
+    }
+    return bool(
+        second not in finite_predicates
+        and not second.endswith(("ed", "ing", "s"))
+    )
+
+
+def _worked_unit_transitions(
+    segments: list[dict],
+    start_line: int,
+    end_line: int,
+    *,
+    evidence_location: tuple[int, int, int, int] | None,
+    learning_objective: str,
+) -> list[_TopicTransition]:
+    """Return distinct worked-unit boundaries around one grounded objective."""
+    if evidence_location is None:
+        return []
+    evidence_start_line, evidence_left, evidence_end_line, evidence_right = (
+        evidence_location
+    )
+    normalized_objective = " ".join(str(learning_objective or "").split())
+    transitions: list[_TopicTransition] = []
+    for line in range(start_line, end_line + 1):
+        cue_text = str(segments[line].get("text") or "")
+        evidence_spans: list[tuple[int, int]] = []
+        if line == evidence_start_line:
+            evidence_spans.append((
+                evidence_left,
+                evidence_right if evidence_end_line == line else len(cue_text),
+            ))
+        for navigation_left, new_side_left in _worked_unit_onsets_in_cue(
+            cue_text,
+            evidence_spans=evidence_spans,
+        ):
+            fragment = cue_text[new_side_left:]
+            wh_onset = _WORKED_UNIT_WH_ONSET_RE.match(fragment)
+            if (
+                wh_onset is not None
+                and new_side_left == 0
+                and line > start_line
+                and _WORKED_UNIT_WH_PREVIOUS_LICENSE_RE.search(
+                    str(segments[line - 1].get("text") or "")
+                )
+            ):
+                continue
+            if (
+                re.match(r"^\s*which\b", fragment, re.IGNORECASE)
+                and (new_side_left > 0 or line > start_line)
+                and not _which_onset_is_interrogative(
+                    fragment,
+                    normalized_objective,
+                )
+            ):
+                # A sentence-initial relative ``Which ...`` needs its prior
+                # antecedent. Keep it unless punctuation or the selector's
+                # objective establishes a real interrogative target.
+                continue
+            transitions.append(_TopicTransition(
+                navigation_line=line,
+                navigation_left=navigation_left,
+                new_side_line=line,
+                new_side_left=new_side_left,
+                worked_unit=True,
+            ))
+
+    transitions.sort(
+        key=lambda item: (item.navigation_line, item.navigation_left)
+    )
+    raw_transitions = transitions
+    target_onset = max(
+        (
+            item
+            for item in raw_transitions
+            if (item.new_side_line, item.new_side_left)
+            <= (evidence_start_line, evidence_left)
+        ),
+        default=None,
+        key=lambda item: (item.new_side_line, item.new_side_left),
+    )
+    transitions = []
+    current_unit: _TopicTransition | None = None
+    for transition in raw_transitions:
+        cue_text = str(segments[transition.navigation_line].get("text") or "")
+        navigation_text = cue_text[transition.navigation_left:]
+        explicitly_marked = bool(
+            _SPLIT_CAPTION_NEW_UNIT_FRAMING_RE.match(navigation_text)
+        )
+        prior_unit_is_complete = bool(
+            current_unit is not None
+            and _worked_unit_prefix_is_complete(
+                segments,
+                start_line,
+                transition,
+                after=current_unit,
+            )
+        )
+        prefix_is_complete = _worked_unit_prefix_is_complete(
+            segments,
+            start_line,
+            transition,
+        )
+        begins_at_or_before_evidence = bool(
+            (transition.new_side_line, transition.new_side_left)
+            <= (evidence_start_line, evidence_left)
+        )
+        follows_evidence_with_target_prompt = bool(
+            (transition.navigation_line, transition.navigation_left)
+            > (evidence_end_line, evidence_right)
+            and _WORKED_UNIT_TARGET_PROMPT_RE.match(
+                cue_text[transition.new_side_left:]
+            )
+        )
+        if current_unit is None:
+            accept = bool(
+                begins_at_or_before_evidence
+                or explicitly_marked
+                or prefix_is_complete
+            )
+        else:
+            accept = bool(
+                transition == target_onset
+                or explicitly_marked
+                or prior_unit_is_complete
+                or follows_evidence_with_target_prompt
+            )
+        if accept:
+            transitions.append(transition)
+            current_unit = transition
+
+    if _EXPLICIT_COMPARISON_OBJECTIVE_RE.search(normalized_objective):
+        # The candidate's grounded relational evidence identifies the compared
+        # arc. Preserve its earlier prompts, but retain the first later prompt
+        # as a hard end so a third unrelated exercise cannot leak in.
+        return [
+            item
+            for item in transitions
+            if (item.navigation_line, item.navigation_left)
+            > (evidence_end_line, evidence_right)
+        ]
+
+    if (
+        target_onset is not None
+        and target_onset in transitions
+        and _worked_unit_target_needs_prior_explanation(
+            segments,
+            target_onset,
+            raw_transitions,
+            end_line,
+        )
+    ):
+        transitions.remove(target_onset)
+
+    prior_or_target = [
+        item
+        for item in transitions
+        if (item.navigation_line, item.navigation_left)
+        <= (evidence_start_line, evidence_left)
+    ]
+    if (
+        len(prior_or_target) == 1
+        and not _worked_unit_prefix_is_complete(
+            segments,
+            start_line,
+            prior_or_target[0],
+        )
+    ):
+        # Keep a rule, definition, or prerequisite explanation attached to the
+        # first worked problem. Once another problem or a completed answer is
+        # present, the evidence-anchored problem becomes its own unit.
+        transitions.remove(prior_or_target[0])
+    return transitions
 
 
 _DESCRIBED_UNIT_SUBJECT_RE = re.compile(
@@ -4416,11 +5057,24 @@ def _candidate_topic_transitions(
         str(segments[line].get("text") or "")
         for line in range(start_line, end_line + 1)
     ]
-    if (
-        _HARD_TOPIC_RESET_RE.search(" . ".join(cue_texts)) is None
-        and _HARD_TOPIC_RESET_RE.search(" ".join(cue_texts)) is None
-    ):
+    dotted_text = " . ".join(cue_texts)
+    joined_text = " ".join(cue_texts)
+    has_hard_reset = bool(
+        _HARD_TOPIC_RESET_RE.search(dotted_text)
+        or _HARD_TOPIC_RESET_RE.search(joined_text)
+    )
+    has_worked_unit_onset = bool(
+        _WORKED_UNIT_POSSIBLE_ONSET_RE.search(dotted_text)
+        or _WORKED_UNIT_POSSIBLE_ONSET_RE.search(joined_text)
+    )
+    if not has_hard_reset and not has_worked_unit_onset:
         return []
+    evidence_location = _unique_evidence_location(
+        segments,
+        evidence_quote,
+        start_line,
+        end_line,
+    )
     evidence_locations = {
         line: _quote_character_spans(
             str(segments[line].get("text") or ""), evidence_quote
@@ -4573,7 +5227,31 @@ def _candidate_topic_transitions(
                 new_side_line=new_side_line,
                 new_side_left=new_side_left,
             ))
-    return transitions
+    if has_worked_unit_onset:
+        transitions.extend(_worked_unit_transitions(
+            segments,
+            start_line,
+            end_line,
+            evidence_location=evidence_location,
+            learning_objective=learning_objective,
+        ))
+
+    # A phrase such as "now let's work on more examples" may satisfy both the
+    # navigation and worked-unit detectors. Keep one boundary and prefer the
+    # later grounded teaching onset over its generic framing words.
+    unique: dict[tuple[int, int], _TopicTransition] = {}
+    for transition in transitions:
+        key = (transition.navigation_line, transition.navigation_left)
+        previous = unique.get(key)
+        if previous is None or (
+            transition.new_side_line,
+            transition.new_side_left,
+        ) > (previous.new_side_line, previous.new_side_left):
+            unique[key] = transition
+    return sorted(
+        unique.values(),
+        key=lambda item: (item.navigation_line, item.navigation_left),
+    )
 
 
 def _contains_bridged_topic_navigation(
@@ -4742,14 +5420,78 @@ def _single_objective_intra_cue_quotes(
             key=lambda item: (item.navigation_line, item.navigation_left),
         )
         text = str(segments[transition.navigation_line].get("text") or "")
-        retained = _last_safe_complete_prefix(
-            text[:transition.navigation_left]
-        )
+        raw_prefix = text[:transition.navigation_left].rstrip(" ,;:—-")
+        retained = _last_safe_complete_prefix(raw_prefix)
+        if (
+            not retained
+            and transition.navigation_line > 0
+            and 1 <= len(_toks(raw_prefix)) <= 12
+        ):
+            previous_text = str(
+                segments[transition.navigation_line - 1].get("text") or ""
+            )
+            combined_tail = " ".join(
+                f"{previous_text} {raw_prefix}".split()[-48:]
+            )
+            if (
+                _SPLIT_CAPTION_COMPLETION_SIGNAL_RE.search(combined_tail)
+                and not _terminal_content_is_explicitly_incomplete(combined_tail)
+            ):
+                retained = raw_prefix
         if _WORD_RE.search(retained):
             quote = _exact_boundary_quote(retained, want="end")
-            span = _quote_character_span(retained, quote)
-            end_quote = retained[span[0]:].strip() if span is not None else quote
+            if transition.worked_unit:
+                end_quote = quote
+            else:
+                span = _quote_character_span(retained, quote)
+                end_quote = (
+                    retained[span[0]:].strip() if span is not None else quote
+                )
     return start_quote, end_quote
+
+
+def _completed_unit_end_before_transition(
+    segments: list[dict],
+    *,
+    evidence_location: tuple[int, int, int, int] | None,
+    transitions: list[_TopicTransition],
+) -> tuple[int, str] | None:
+    """Recover an explicit answer ending before later coarse-caption filler."""
+    if evidence_location is None:
+        return None
+    _evidence_start_line, _evidence_left, evidence_end_line, evidence_right = (
+        evidence_location
+    )
+    following = [
+        item
+        for item in transitions
+        if (item.navigation_line, item.navigation_left)
+        > (evidence_end_line, evidence_right)
+    ]
+    if not following:
+        return None
+    transition = min(
+        following,
+        key=lambda item: (item.navigation_line, item.navigation_left),
+    )
+    for line in range(transition.navigation_line, evidence_end_line - 1, -1):
+        text = str(segments[line].get("text") or "")
+        selected = (
+            text[:transition.navigation_left]
+            if line == transition.navigation_line
+            else text
+        )
+        matches = list(_WORKED_UNIT_CLOSING_TAIL_RE.finditer(selected))
+        for closing in reversed(matches):
+            if line == evidence_end_line and closing.end() <= evidence_right:
+                continue
+            retained = selected[:closing.end()].rstrip(" ,;:—-")
+            if len(_toks(retained)) < 5:
+                continue
+            quote = _exact_boundary_quote(retained, want="end")
+            if quote:
+                return line, quote
+    return None
 
 
 def _internal_structural_filler_reason(
@@ -5691,19 +6433,19 @@ def _plan_to_report(
             fallback_start_edge = fallback_end_edge = True
             boundary_fallback_reasons.append("reversed_quote_order")
             quote_repaired = True
-        evidence_quote_for_section = " ".join(
-            str(getattr(proposal, "topic_evidence_quote", "") or "").split()
+        evidence_quote_for_section, evidence_location_for_section = (
+            _proposal_evidence_anchor(
+                proposal,
+                intent_constraints,
+                segments,
+                a,
+                b,
+            )
         )
         objective_for_section = str(
             getattr(proposal, "learning_objective", "")
             or getattr(proposal, "facet", "")
             or ""
-        )
-        evidence_location_for_section = _unique_evidence_location(
-            segments,
-            evidence_quote_for_section,
-            a,
-            b,
         )
         topic_transitions_for_section = _candidate_topic_transitions(
             segments,
@@ -5725,6 +6467,15 @@ def _plan_to_report(
             evidence_location=evidence_location_for_section,
             transitions=topic_transitions_for_section,
         )
+        completed_end_override = (
+            None
+            if intra_end_quote
+            else _completed_unit_end_before_transition(
+                segments,
+                evidence_location=evidence_location_for_section,
+                transitions=topic_transitions_for_section,
+            )
+        )
         section_start, section_end = _single_objective_section_bounds(
             segments,
             a,
@@ -5732,6 +6483,26 @@ def _plan_to_report(
             evidence_location=evidence_location_for_section,
             transitions=topic_transitions_for_section,
         )
+        if completed_end_override is not None:
+            section_end, intra_end_quote = completed_end_override
+        semantic_min_start: int | None = None
+        semantic_max_end: int | None = None
+        if evidence_location_for_section is not None:
+            evidence_start_line, evidence_left, evidence_end_line, evidence_right = (
+                evidence_location_for_section
+            )
+            if any(
+                (item.navigation_line, item.navigation_left)
+                <= (evidence_start_line, evidence_left)
+                for item in topic_transitions_for_section
+            ):
+                semantic_min_start = section_start
+            if any(
+                (item.navigation_line, item.navigation_left)
+                > (evidence_end_line, evidence_right)
+                for item in topic_transitions_for_section
+            ):
+                semantic_max_end = section_end
         if section_start != a:
             a = section_start
             start_text = str(segments[a].get("text") or "").strip()
@@ -5757,6 +6528,7 @@ def _plan_to_report(
             quote_repaired = True
             boundary_fallback_reasons.append("trimmed_adjacent_topic_after")
         intra_start_boundary = bool(intra_start_quote)
+        intra_end_boundary = bool(intra_end_quote)
         if intra_start_quote:
             start_quote = intra_start_quote
             fallback_start_edge = False
@@ -6171,9 +6943,13 @@ def _plan_to_report(
             start_boundary_verified=(
                 repaired_start_edge or projected_start_is_standalone
             ),
-            end_boundary_verified=projected_end_is_complete,
+            end_boundary_verified=(
+                intra_end_boundary or projected_end_is_complete
+            ),
             protected_quote=evidence_quote_for_section,
             learning_objective=objective_for_section,
+            min_start_line=semantic_min_start,
+            max_end_line=semantic_max_end,
         )
         if closure_error:
             if closure_error == "unresolved_weak_end":
@@ -6503,22 +7279,7 @@ def _plan_to_report(
         ):
             report.rejected_reasons.append(f"{prefix}:requires_visual_context")
             continue
-        topic_evidence_quote = " ".join(
-            str(getattr(proposal, "topic_evidence_quote", "") or "").split()
-        )
-        if isinstance(proposal, _CompactBoundaryTopic) and not topic_evidence_quote:
-            proposed_intent_evidence = list(proposal.intent_evidence)
-            topic_evidence_quote = next(
-                (
-                    " ".join(str(evidence.evidence_quote or "").split())
-                    for constraint_id in intent_constraints
-                    for evidence in proposed_intent_evidence
-                    if evidence.constraint_id == constraint_id
-                ),
-                " ".join(
-                    str(proposed_intent_evidence[0].evidence_quote or "").split()
-                ) if proposed_intent_evidence else "",
-            )
+        topic_evidence_quote = evidence_quote_for_section
         if isinstance(proposal, (_BoundaryTopic, _CompactBoundaryTopic)):
             grounded_evidence = _grounded_evidence_span_with_minimum_words(
                 clip_text,

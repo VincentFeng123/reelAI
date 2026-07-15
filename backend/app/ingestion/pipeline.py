@@ -125,6 +125,7 @@ PARTIAL_CUE_MATERIALITY_SEC = 0.05
 SPEECH_OWNERSHIP_EPSILON_SEC = 0.001
 MAX_PLAUSIBLE_CAPTION_WORDS_PER_SEC = 8.0
 CAPTION_PROJECTION_START_PREROLL_SEC = 0.15
+PROJECTED_END_COVERAGE_SEC = 0.002
 _QUOTE_WORD_RE = re.compile(
     r"[\w+#]+(?:['\u2018\u2019\u02bc-][\w+#]+)*",
     re.UNICODE,
@@ -524,7 +525,7 @@ def _boundary_evidence_grade(
     if (
         not isinstance(context, dict)
         or str(context.get("selection_contract_version") or "").strip()
-        != "quality_silence_v21"
+        != "quality_silence_v22"
     ):
         return 0
     if (
@@ -678,7 +679,13 @@ def _interpolated_caption_edge_anchor(
         return required, min(required, onset(selected[0] - 1))
     if selected[-1] + 1 >= token_count:
         return None
-    return onset(selected[-1]), onset(selected[-1] + 1)
+    last_onset = onset(selected[-1])
+    excluded_onset = onset(selected[-1] + 1)
+    required_end = min(
+        last_onset + PROJECTED_END_COVERAGE_SEC,
+        (last_onset + excluded_onset) / 2.0,
+    )
+    return required_end, excluded_onset
 
 
 def _projected_speech_bounds(
@@ -938,12 +945,24 @@ def _projected_speech_bounds(
             if is_projected:
                 return fallback, {}, f"{edge}_lexical_alignment_unavailable"
             continue
+        excluded_sec = float(anchor.excluded_neighbor_onset_sec)
         required_sec = (
             float(anchor.quote_start_sec)
             if edge == "start"
-            else float(anchor.quote_last_onset_sec)
+            else (
+                min(
+                    float(anchor.quote_last_onset_sec)
+                    + PROJECTED_END_COVERAGE_SEC,
+                    (
+                        float(anchor.quote_last_onset_sec)
+                        + excluded_sec
+                    )
+                    / 2.0,
+                )
+                if is_projected
+                else float(anchor.quote_last_onset_sec)
+            )
         )
-        excluded_sec = float(anchor.excluded_neighbor_onset_sec)
         if (
             not math.isfinite(required_sec)
             or not math.isfinite(excluded_sec)
@@ -1999,7 +2018,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v21",
+            selection_contract_version="quality_silence_v22",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -4319,7 +4338,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v21",
+                    selection_contract_version="quality_silence_v22",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,

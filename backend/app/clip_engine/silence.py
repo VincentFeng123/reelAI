@@ -312,9 +312,10 @@ def persisted_boundary_is_usable(
     """Accept strict silence or an explicit, bounded transcript fallback.
 
     Context-aligned rows remain distinguishable from acoustically verified
-    rows. They are usable only for the current selection contract and only
-    when their final range contains every required word while staying inside
-    the already validated semantic corridor.
+    rows. Current rows and the immediately preceding history contract remain
+    viewable only when their final range contains every required word while
+    staying inside the already validated semantic corridor. Fresh-generation
+    reuse is gated separately by the current request and selector contracts.
     """
 
     if not isinstance(context, Mapping):
@@ -332,7 +333,7 @@ def persisted_boundary_is_usable(
             return False
         is_current_contract = bool(
             str(context.get("selection_contract_version") or "").strip()
-            == "quality_silence_v21"
+            == "quality_silence_v22"
         )
         final = _diagnostic_range(diagnostics.get("final_range"))
         if final is not None:
@@ -361,7 +362,7 @@ def persisted_boundary_is_usable(
     captions = context.get("selection_caption_cues")
     if (
         str(context.get("selection_contract_version") or "").strip()
-        != "quality_silence_v21"
+        not in {"quality_silence_v21", "quality_silence_v22"}
         or str(context.get("boundary_status") or "").strip().lower()
         != "context_aligned"
         or context.get("speech_corridor_verified") is not True
