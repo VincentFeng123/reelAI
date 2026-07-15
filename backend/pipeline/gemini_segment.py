@@ -229,6 +229,25 @@ _INSTRUCTIONAL_PREVIEW_PREFIX_RE = re.compile(
     r"(?:see|understand)\s+(?:that|how|why))\s+",
     re.IGNORECASE,
 )
+_CROSS_CUE_INSTRUCTIONAL_PREVIEW_RE = re.compile(
+    r"^\s*what\s+(?:i|we)(?:['’](?:m|re)|\s+(?:am|are))\s+going\s+to\s+"
+    r"(?:cover|discuss|explain|go\s+over|introduce|review|show|teach|"
+    r"talk\s+about)\s+in\s+(?:this|the)\s+"
+    r"(?:course|lesson|section|video)\s+(?:is|are)\b",
+    re.IGNORECASE,
+)
+_OPENING_ANAPHORIC_SETUP_REFERENCE_RE = re.compile(
+    r"\b(?:this|that|these|those)\s+(?:approach|argument|case|change|concept|"
+    r"effect|equation|example|expression|function|idea|method|model|movement|"
+    r"object|problem|process|proof|quantity|relationship|result|rule|statement|"
+    r"step|system|term|value)\b",
+    re.IGNORECASE,
+)
+_OPENING_SETUP_PRONOUN_REFERENCE_RE = re.compile(
+    r"^\s*given\s+that\b|\b(?:it|them|these|they|this|those)\b|"
+    r"\b(?:apply|calculate|consider|evaluate|solve|use)\s+that\b",
+    re.IGNORECASE,
+)
 _VISUAL_DEPENDENCY_RE = re.compile(
     r"\b(?:as you can see|as shown (?:here|on (?:the )?screen)|"
     r"on (?:the )?screen|this (?:diagram|figure|chart|graph|image|slide|drawing)|"
@@ -1091,18 +1110,53 @@ _TRAILING_TRANSITION_FRAGMENT_RE = re.compile(
     re.IGNORECASE,
 )
 _TERMINAL_FUTURE_PREVIEW_RE = re.compile(
-    r"^\s*as\s+you(?:['’]ll|\s+will)\s+see\s+in\s+future\s+videos\b",
+    r"(?:^\s*as\s+you(?:['’]ll|\s+will)\s+see\s+in\s+future\s+videos\b|"
+    r"(?P<media_promise>\b(?:(?:and|but)\s+)?as\s+(?:that|this|it)\s+"
+    r"(?:can|could|may|might)\s+not\s+(?:(?:be|seem)\s+)?"
+    r"(?:clear|intuitive|obvious|simple)\b[^.!?]{0,180}?"
+    r"\bby\s+the\s+end\s+of\s+(?:this|the)\s+"
+    r"(?:course|lesson|section|video)\b"
+    r"(?:\s+or\s+(?:the\s+)?next\s+"
+    r"(?:course|lesson|one|section|video))?[.!?]*))",
+    re.IGNORECASE,
+)
+_TERMINAL_MEDIA_PROMO_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:be\s+sure\s+to|please)\s+(?:see|view|watch)\b[^.!?]{0,180}"
+    r"\b(?:course|lesson|section|video)s?\b[^.!?]*|"
+    r"(?:check\s+out|continue\s+to|view|watch)\s+(?:the\s+)?"
+    r"(?:following|future|next)\s+(?:course|lesson|section|video)\b"
+    r"(?!\s+(?:frame|signal)\b)[^.!?]*|"
+    r"see\s+you\s+in\s+(?:the\s+)?(?:following|future|next)\s+"
+    r"(?:course|lesson|section|video)\b[^.!?]*|"
+    r"(?:i|we)(?:['’]ll|\s+will)\s+(?:cover|discuss|explain|prove|show)\b"
+    r"[^.!?]{0,140}\bin\s+(?:the\s+)?(?:following|future|next)\s+"
+    r"(?:course|lesson|section|video)\b[^.!?]*|"
+    r"you\s+can\s+(?:find|learn|read|see|watch)\s+more\b[^.!?]{0,120}"
+    r"\bin\s+(?:the\s+)?(?:following|future|next)\s+"
+    r"(?:course|lesson|section|video)\b[^.!?]*"
+    r")[.!?]*\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_MEDIA_SUBJECT_SENSE_RE = re.compile(
+    r"\b(?:course|section)s?\s+of\s+"
+    r"(?!(?:(?:a|her|his|its|my|our|the|their|this|your)\s+)?"
+    r"(?:course|lesson|section|video)\b)|"
+    r"\bvideo\s+(?:clip|file|frame|segment|sequence|signal|stream)s?\b",
     re.IGNORECASE,
 )
 _TERMINAL_MASTERY_RECAP_RE = re.compile(
     r"\b(?:(?:and|so)\s+)?now\s+you\s+know\s+how\s+to\b",
     re.IGNORECASE,
 )
-_TERMINAL_META_RESUMPTION_RE = re.compile(
-    r"^\s*(?:(?:now|next|then|finally)\s*[,;:]?\s+)?(?:"
-    r"apply|calculate|compute|continue|derive|determine|divide|evaluate|factor|"
-    r"multiply|return\s+to|solve|substitute|the\s+(?:answer|result)\s+is|"
-    r"therefore|thus)\b",
+_TERMINAL_META_CONTINUATION_INCOMPLETE_RE = re.compile(
+    r"\b(?:a|an|the)\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_META_REQUIRED_OBJECT_RE = re.compile(
+    r"^\s*(?:(?:i|they|we|you)\s+(?:can|could|may|might|should|will|would)\s+)?"
+    r"(?:apply|calculate|compute|derive|determine|differentiate|evaluate|"
+    r"explain|find|solve|use)\s*$",
     re.IGNORECASE,
 )
 _EDGE_ONLY_FRAMING_RE = re.compile(
@@ -4225,6 +4279,77 @@ def _recover_start_forward_across_cues(
     return None
 
 
+def _trim_initial_instructional_preview(
+    segments: list[dict],
+    start_line: int,
+    end_line: int,
+    *,
+    evidence_quote: str,
+) -> tuple[int, str] | None:
+    """Skip a cross-cue lesson preview when a grounded setup follows it.
+
+    Rolling captions commonly split ``what we're going to cover in this
+    video`` across several cues, so cue-local filler checks cannot recognize
+    it.  Keep this repair conservative: the later setup must be explicit, the
+    grounded evidence must remain after the cut, and none of that evidence may
+    occur in the omitted preview.
+    """
+    if start_line >= end_line:
+        return None
+    preview_head = _cue_clip_text(
+        segments,
+        start_line,
+        min(end_line, start_line + 3),
+    )
+    if _CROSS_CUE_INSTRUCTIONAL_PREVIEW_RE.match(preview_head) is None:
+        return None
+
+    def has_unresolved_setup_reference(opening: str) -> bool:
+        references = [
+            match
+            for pattern in (
+                _OPENING_ANAPHORIC_SETUP_REFERENCE_RE,
+                _OPENING_SETUP_PRONOUN_REFERENCE_RE,
+            )
+            if (match := pattern.search(opening)) is not None
+        ]
+        if not references:
+            return False
+        first_reference = min(references, key=lambda match: match.start())
+        local_prefix = opening[:first_reference.start()]
+        return _LOCAL_EXPLICIT_PROBLEM_RE.search(local_prefix) is None
+
+    for line in range(start_line + 1, end_line + 1):
+        current = str(segments[line].get("text") or "").strip()
+        if _PEDAGOGICAL_SETUP_ONSET_RE.match(current) is None:
+            continue
+        opening_candidates = [current]
+        marker = _LEADING_DISCOURSE_MARKER_RE.match(current)
+        if marker is not None:
+            without_marker = current[marker.end():].strip()
+            if without_marker:
+                opening_candidates.insert(0, without_marker)
+        if not any(
+            _opening_clause_is_standalone(opening)
+            and not has_unresolved_setup_reference(opening)
+            for opening in opening_candidates
+        ):
+            continue
+        retained = _cue_clip_text(segments, line, end_line)
+        omitted = _cue_clip_text(segments, start_line, line - 1)
+        if evidence_quote and (
+            not _contains_quote(retained, evidence_quote)
+            or _contains_quote(omitted, evidence_quote)
+        ):
+            continue
+        if len(_content_tokens(current)) < 3:
+            continue
+        quote = _exact_boundary_quote(current, want="start")
+        if quote:
+            return line, quote
+    return None
+
+
 def _recover_start_after_edge_navigation(
     text: str,
     *,
@@ -6401,6 +6526,94 @@ def _trim_before_visual_dependency(
     return None
 
 
+def _terminal_meta_tail_is_only_meta(text: str) -> bool:
+    """Return true only for bounded watch/admin copy after a terminal preview."""
+    raw_text = str(text or "").strip()
+    if not _WORD_RE.search(raw_text):
+        return True
+    sentences = [
+        raw_text[left:right].strip()
+        for left, right in _sentence_character_spans(raw_text)
+        if _WORD_RE.search(raw_text[left:right])
+    ]
+    return bool(sentences) and all(
+        _cue_is_only_structural_filler(sentence)
+        or (
+            _TERMINAL_MEDIA_PROMO_RE.fullmatch(sentence) is not None
+            and _TERMINAL_MEDIA_SUBJECT_SENSE_RE.search(sentence) is None
+        )
+        for sentence in sentences
+    )
+
+
+def _framed_terminal_meta_tail_start(
+    remaining: str,
+    preview_parts: list[str],
+    noise: re.Match[str],
+) -> int:
+    """Skip the one sentence grammatically introduced by a meta prefix."""
+    containing_sentence = next(
+        (
+            (left, right)
+            for left, right in _sentence_character_spans(remaining)
+            if left <= noise.start() < right and noise.end() <= right
+        ),
+        (noise.start(), noise.end()),
+    )
+    _sentence_left, sentence_right = containing_sentence
+    if (
+        sentence_right < len(remaining)
+        or re.search(r"[.!?]", remaining[noise.end():sentence_right])
+    ):
+        return sentence_right
+    # Punctuationless captions still expose cue boundaries.  When the cue
+    # already completes the meta claim, protect teaching in later cues.
+    joined_parts = [part for part in preview_parts if part]
+    cursor = 0
+    matched_part_index: int | None = None
+    matched_part_end = 0
+    matched_part_tail = ""
+    part_ends: list[int] = []
+    for index, part in enumerate(joined_parts):
+        part_start = cursor
+        part_end = part_start + len(part)
+        part_ends.append(part_end)
+        if matched_part_index is None and noise.end() <= part_end:
+            matched_part_index = index
+            matched_part_end = part_end
+            matched_part_tail = part[max(0, noise.end() - part_start):]
+        cursor = part_end + 1
+    if matched_part_index is not None:
+        continuation = matched_part_tail.strip()
+        continuation_index = matched_part_index
+        continuation_end = matched_part_end
+        if not _WORD_RE.search(continuation):
+            continuation_index += 1
+            if continuation_index >= len(joined_parts):
+                return sentence_right
+            continuation = joined_parts[continuation_index].strip()
+            continuation_end = part_ends[continuation_index]
+        while continuation_index + 1 < len(joined_parts):
+            next_part = joined_parts[continuation_index + 1].strip()
+            requires_object = bool(
+                _TERMINAL_META_REQUIRED_OBJECT_RE.fullmatch(continuation)
+            )
+            continuation_is_incomplete = bool(
+                _TERMINAL_META_CONTINUATION_INCOMPLETE_RE.search(continuation)
+                or requires_object
+                or _cue_has_explicit_dangling_end(continuation, next_part)
+            )
+            if not continuation_is_incomplete:
+                break
+            continuation_index += 1
+            continuation = " ".join(
+                part for part in (continuation, next_part) if part
+            )
+            continuation_end = part_ends[continuation_index]
+        return continuation_end
+    return sentence_right
+
+
 def _trim_terminal_meta_suffix(
     segments: list[dict],
     start_line: int,
@@ -6425,12 +6638,84 @@ def _trim_terminal_meta_suffix(
                 right = spans[0][1]
         return text[left:right]
 
+    selected_parts = {
+        line: selected_part(line)
+        for line in range(start_line, end_line + 1)
+    }
+    substantive_suffix: dict[int, bool] = {end_line + 1: False}
+    for line in range(end_line, start_line - 1, -1):
+        part = selected_parts[line]
+        substantive_suffix[line] = bool(
+            substantive_suffix[line + 1]
+            or (
+                _WORD_RE.search(part)
+                and not _terminal_meta_tail_is_only_meta(part)
+            )
+        )
+
     prefix_parts: list[str] = []
     for line in range(start_line, end_line + 1):
-        text = str(segments[line].get("text") or "")
-        selected = selected_part(line)
-        future_preview = _TERMINAL_FUTURE_PREVIEW_RE.match(selected)
-        mastery_recap = _TERMINAL_MASTERY_RECAP_RE.search(selected)
+        selected = selected_parts[line]
+        preview_parts = [selected]
+        preview_characters = len(selected)
+        preview_last_line = line
+        for later in range(line + 1, min(end_line + 1, line + 12)):
+            part = selected_parts[later].strip()
+            if part:
+                preview_parts.append(part)
+                preview_characters += len(part) + 1
+                preview_last_line = later
+            if preview_characters >= 320:
+                break
+        remaining = " ".join(part for part in preview_parts if part)
+        cross_cue_future_preview = _TERMINAL_FUTURE_PREVIEW_RE.search(remaining)
+        future_preview = (
+            cross_cue_future_preview
+            if cross_cue_future_preview is not None
+            and cross_cue_future_preview.start() < len(selected)
+            else None
+        )
+        if future_preview is not None:
+            tail_start = (
+                future_preview.end()
+                if future_preview.group("media_promise") is not None
+                else _framed_terminal_meta_tail_start(
+                    remaining,
+                    preview_parts,
+                    future_preview,
+                )
+            )
+            local_tail = remaining[tail_start:].strip()
+            if (
+                (
+                    _WORD_RE.search(local_tail)
+                    and not _terminal_meta_tail_is_only_meta(local_tail)
+                )
+                or substantive_suffix.get(preview_last_line + 1, False)
+            ):
+                future_preview = None
+        cross_cue_mastery_recap = _TERMINAL_MASTERY_RECAP_RE.search(remaining)
+        mastery_recap = (
+            cross_cue_mastery_recap
+            if cross_cue_mastery_recap is not None
+            and cross_cue_mastery_recap.start() < len(selected)
+            else None
+        )
+        if mastery_recap is not None:
+            tail_start = _framed_terminal_meta_tail_start(
+                remaining,
+                preview_parts,
+                mastery_recap,
+            )
+            local_tail = remaining[tail_start:].strip()
+            if (
+                (
+                    _WORD_RE.search(local_tail)
+                    and not _terminal_meta_tail_is_only_meta(local_tail)
+                )
+                or substantive_suffix.get(preview_last_line + 1, False)
+            ):
+                mastery_recap = None
         noise = future_preview or mastery_recap
         if noise is None:
             if selected.strip():
@@ -6440,34 +6725,6 @@ def _trim_terminal_meta_suffix(
         prefix_text = " ".join(
             part for part in (*prefix_parts, retained_here) if part
         ).strip()
-        later_parts = [
-            selected_part(later).strip()
-            for later in range(line + 1, end_line + 1)
-            if selected_part(later).strip()
-        ]
-        same_cue_suffix = selected[noise.start():]
-        later_sentences = [
-            same_cue_suffix[left:right].strip()
-            for left, right in _sentence_character_spans(same_cue_suffix)
-        ][1:]
-        teaching_resumes = any(
-            _TERMINAL_META_RESUMPTION_RE.match(part)
-            for part in (*later_sentences, *later_parts)
-        )
-        later_text = " ".join(later_parts)
-        if (
-            future_preview is not None
-            and later_text
-            and _objective_bridges_sections(
-                learning_objective,
-                prefix_text,
-                later_text,
-            )
-        ):
-            teaching_resumes = True
-        if teaching_resumes:
-            prefix_parts.append(selected.strip())
-            continue
         if (
             len(_toks(prefix_text)) < 8
             or not _contains_quote(prefix_text, evidence_quote)
@@ -7150,6 +7407,7 @@ def _plan_to_report(
         completed_forward_sentence = False
         completed_split_caption_tail = False
         trimmed_repeated_caption_tail = False
+        trimmed_instructional_preview = False
         end_quote_occurrence: str | None = None
         start_recovered_forward = False
         trimmed_terminal_meta_suffix = False
@@ -7267,6 +7525,21 @@ def _plan_to_report(
             or getattr(proposal, "facet", "")
             or ""
         )
+        instructional_preview_trim = _trim_initial_instructional_preview(
+            segments,
+            a,
+            b,
+            evidence_quote=evidence_quote_for_section,
+        )
+        if instructional_preview_trim is not None:
+            a, start_quote = instructional_preview_trim
+            start_text = str(segments[a].get("text") or "").strip()
+            trimmed_instructional_preview = True
+            start_recovered_forward = True
+            quote_repaired = True
+            boundary_fallback_reasons.append(
+                "trimmed_opening_instructional_preview"
+            )
         transition_scan_start = a
         if evidence_location_for_section is not None and a > 0:
             evidence_start_line, evidence_left, _evidence_end_line, _evidence_right = (
@@ -7537,7 +7810,11 @@ def _plan_to_report(
             start_quote,
             want="start",
         )
-        repaired_start_edge = repaired_start_edge or intra_start_boundary
+        repaired_start_edge = bool(
+            repaired_start_edge
+            or intra_start_boundary
+            or trimmed_instructional_preview
+        )
         if edge_error:
             start_quote = _exact_boundary_quote(start_text, want="start")
             fallback_start_edge = True
@@ -7742,23 +8019,6 @@ def _plan_to_report(
             trimmed_visual_end_suffix = True
             quote_repaired = True
             boundary_fallback_reasons.append("trimmed_visual_dependent_tail")
-        terminal_meta_trim = _trim_terminal_meta_suffix(
-            segments,
-            a,
-            b,
-            start_quote=start_quote,
-            end_quote=end_quote,
-            evidence_quote=evidence_quote_for_section,
-            learning_objective=objective_for_section,
-        )
-        if terminal_meta_trim is not None:
-            b, end_quote = terminal_meta_trim
-            end_text = str(segments[b].get("text") or "").strip()
-            repaired_end_edge = True
-            fallback_end_edge = False
-            trimmed_terminal_meta_suffix = True
-            quote_repaired = True
-            boundary_fallback_reasons.append("trimmed_terminal_meta_suffix")
         if not trimmed_visual_end_suffix and not trimmed_terminal_meta_suffix:
             repeated_caption_trim = _trim_repeated_rolling_caption_tail(
                 segments,
@@ -8030,6 +8290,51 @@ def _plan_to_report(
                 boundary_fallback_reasons.append(
                     "accepted_later_restated_example_target"
                 )
+
+        # Context closure can expand beyond the model's original edges. Run
+        # semantic edge cleanup against that final span so it cannot reimport
+        # an opening agenda or a terminal promise that the earlier pass never
+        # saw.
+        final_instructional_preview_trim = _trim_initial_instructional_preview(
+            segments,
+            a,
+            b,
+            evidence_quote=evidence_quote_for_section,
+        )
+        if final_instructional_preview_trim is not None:
+            final_start_line, final_start_quote = final_instructional_preview_trim
+            if final_start_line > a:
+                a, start_quote = final_start_line, final_start_quote
+                start_text = str(segments[a].get("text") or "").strip()
+                repaired_start_edge = True
+                trimmed_instructional_preview = True
+                start_recovered_forward = True
+                quote_repaired = True
+                if (
+                    "trimmed_opening_instructional_preview"
+                    not in boundary_fallback_reasons
+                ):
+                    boundary_fallback_reasons.append(
+                        "trimmed_opening_instructional_preview"
+                    )
+        terminal_meta_trim = _trim_terminal_meta_suffix(
+            segments,
+            a,
+            b,
+            start_quote=start_quote,
+            end_quote=end_quote,
+            evidence_quote=evidence_quote_for_section,
+            learning_objective=objective_for_section,
+        )
+        if terminal_meta_trim is not None:
+            b, end_quote = terminal_meta_trim
+            end_quote_occurrence = None
+            end_text = str(segments[b].get("text") or "").strip()
+            repaired_end_edge = True
+            fallback_end_edge = False
+            trimmed_terminal_meta_suffix = True
+            quote_repaired = True
+            boundary_fallback_reasons.append("trimmed_terminal_meta_suffix")
 
         filler_trim = _trim_structural_filler_edges(
             segments,

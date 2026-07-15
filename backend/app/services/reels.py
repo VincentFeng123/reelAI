@@ -1217,8 +1217,9 @@ class ReelService:
     # v36: require the v29 sentence-tail selection contract.
     # v37: require the v30 direct-URL selection contract.
     # v38: require the v31 repeated-caption boundary contract.
-    RANKED_FEED_CACHE_VERSION = 38
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v31"
+    # v39: require the v32 post-closure edge-preview contract.
+    RANKED_FEED_CACHE_VERSION = 39
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v32"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
         "quality_silence_v4",
@@ -1249,6 +1250,7 @@ class ReelService:
         "quality_silence_v29",
         "quality_silence_v30",
         "quality_silence_v31",
+        "quality_silence_v32",
     })
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
@@ -2517,6 +2519,7 @@ class ReelService:
                 "quality_silence_v29",
                 "quality_silence_v30",
                 "quality_silence_v31",
+                "quality_silence_v32",
             }
             for reel in generated
         ):
@@ -5602,41 +5605,22 @@ class ReelService:
         items: list[dict[str, Any]],
         knowledge_level: str | None,
     ) -> list[dict[str, Any]]:
-        """Keep the requested difficulty bin, or the nearest valid bin if empty."""
-        staged = [
-            item
-            for item in items
-            if str(
-                item.get("_selection_contract_version")
-                or item.get("selection_contract_version")
-                or ""
-            ).strip()
-            in cls.DIFFICULTY_FALLBACK_CONTRACTS
-        ]
-        if not staged:
-            return list(items)
+        """Order every valid clip by proximity to the requested difficulty."""
         target_stage = {
             "beginner": 0,
             "intermediate": 1,
             "advanced": 2,
         }.get(str(knowledge_level or "").strip().lower(), 0)
-        available_stages = {
-            cls._selection_difficulty_stage(item) for item in staged
-        }
-        chosen_stage = min(
-            available_stages,
-            key=lambda stage: (abs(stage - target_stage), stage),
-        )
         return [
             item
-            for item in items
-            if str(
-                item.get("_selection_contract_version")
-                or item.get("selection_contract_version")
-                or ""
-            ).strip()
-            not in cls.DIFFICULTY_FALLBACK_CONTRACTS
-            or cls._selection_difficulty_stage(item) == chosen_stage
+            for _index, item in sorted(
+                enumerate(items),
+                key=lambda pair: cls._selection_contract_sort_key(
+                    pair[1],
+                    input_order=pair[0],
+                    target_stage=target_stage,
+                ),
+            )
         ]
 
     @staticmethod
@@ -5653,7 +5637,8 @@ class ReelService:
         item: dict[str, Any],
         *,
         input_order: int = 0,
-    ) -> tuple[int, int, float, float, float, float, int, float, int]:
+        target_stage: int | None = None,
+    ) -> tuple[int, int, int, float, float, float, float, int, float, int]:
         """Rank value within a difficulty stage, with deterministic fallbacks."""
         compatibility_score = cls._selection_number(
             item.get("_selection_content_score"), 0.0
@@ -5712,8 +5697,14 @@ class ReelService:
             item.get("_selection_intent_coverage", item.get("intent_coverage")),
             1.0,
         )
+        difficulty_stage = cls._selection_difficulty_stage(item)
         return (
-            cls._selection_difficulty_stage(item),
+            (
+                difficulty_stage
+                if target_stage is None
+                else abs(difficulty_stage - max(0, min(2, int(target_stage))))
+            ),
+            difficulty_stage,
             0 if intent_role == "primary" else 1,
             -intent_coverage,
             -quality_floor,
@@ -5876,6 +5867,7 @@ class ReelService:
                 "quality_silence_v29",
                 "quality_silence_v30",
                 "quality_silence_v31",
+                "quality_silence_v32",
             },
         )
         metadata["_selection_substantive"] = selection_bool(
@@ -5911,6 +5903,7 @@ class ReelService:
                 "quality_silence_v29",
                 "quality_silence_v30",
                 "quality_silence_v31",
+                "quality_silence_v32",
             },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
@@ -6027,6 +6020,9 @@ class ReelService:
         satisfied: set[str] = set()
         ordered: list[dict[str, Any]] = []
         last_video = str(previous_video_id or "")
+        target_stage = self._selection_difficulty_stage(
+            {"difficulty": level_target}
+        )
         while remaining:
             eligible = [
                 node_id
@@ -6054,6 +6050,7 @@ class ReelService:
                     input_order=int(
                         nodes[node_id].get("_selection_input_order") or 0
                     ),
+                    target_stage=target_stage,
                 ),
             )
             chosen = nodes[chosen_id]
@@ -7414,6 +7411,7 @@ class ReelService:
                     "quality_silence_v29",
                     "quality_silence_v30",
                     "quality_silence_v31",
+                    "quality_silence_v32",
                 }
                 else legacy_difficulty_matches_level
             )
@@ -7469,6 +7467,7 @@ class ReelService:
                             "quality_silence_v29",
                             "quality_silence_v30",
                             "quality_silence_v31",
+                            "quality_silence_v32",
                         }
                         and selection_metadata.get(
                             "_selection_speech_corridor_verified"
@@ -7510,6 +7509,7 @@ class ReelService:
                     "quality_silence_v29",
                     "quality_silence_v30",
                     "quality_silence_v31",
+                    "quality_silence_v32",
                 } and (
                     (
                         min(
@@ -7552,6 +7552,7 @@ class ReelService:
                             "quality_silence_v29",
                             "quality_silence_v30",
                             "quality_silence_v31",
+                            "quality_silence_v32",
                         }
                         else self._selection_number(
                             selection_metadata.get("_selection_topic_relevance"), 0.0
@@ -7747,7 +7748,6 @@ class ReelService:
             scored,
             str(progress.get("selected_level") or "beginner"),
         )
-        scored.sort(key=lambda x: (x["score"], x["created_at"]), reverse=True)
         deduped: list[dict[str, Any]] = []
         seen_reel_ids: set[str] = set()
         seen_clip_keys: set[str] = set()
@@ -7904,6 +7904,7 @@ class ReelService:
                 "quality_silence_v29",
                 "quality_silence_v30",
                 "quality_silence_v31",
+                "quality_silence_v32",
             }:
                 # V5+ captions must be immutable selection-time evidence. A
                 # provider artifact key identifies a retrieval profile and may
@@ -7950,6 +7951,7 @@ class ReelService:
                         "quality_silence_v29",
                         "quality_silence_v30",
                         "quality_silence_v31",
+                        "quality_silence_v32",
                     }
                     or transcript_artifact_key
                     else str(clean_item.get("transcript_snippet") or "")

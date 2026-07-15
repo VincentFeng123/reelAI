@@ -114,12 +114,12 @@ logger: logging.Logger = get_ingest_logger(__name__)
 
 # Shared wall-clock budget for one topic's concurrent clip+filter batch. A
 # pathological set of videos must not multiply this deadline by video count.
-INGEST_TOPIC_VIDEO_TIMEOUT_SEC = float(os.environ.get("INGEST_TOPIC_VIDEO_TIMEOUT_SEC", "180"))
+INGEST_TOPIC_VIDEO_TIMEOUT_SEC = float(os.environ.get("INGEST_TOPIC_VIDEO_TIMEOUT_SEC", "60"))
+INGEST_TOPIC_USEFUL_INVENTORY_IDLE_TIMEOUT_SEC = float(
+    os.environ.get("INGEST_TOPIC_USEFUL_INVENTORY_IDLE_TIMEOUT_SEC", "30")
+)
 INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC = float(
     os.environ.get("INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC", "45")
-)
-INGEST_TOPIC_STRAGGLER_GRACE_SEC = float(
-    os.environ.get("INGEST_TOPIC_STRAGGLER_GRACE_SEC", "8")
 )
 PARTIAL_CUE_MATERIALITY_SEC = 0.05
 SPEECH_OWNERSHIP_EPSILON_SEC = 0.001
@@ -538,7 +538,7 @@ def _boundary_evidence_grade(
     if (
         not isinstance(context, dict)
         or str(context.get("selection_contract_version") or "").strip()
-        != "quality_silence_v31"
+        != "quality_silence_v32"
     ):
         return 0
     if (
@@ -2092,7 +2092,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v31",
+            selection_contract_version="quality_silence_v32",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -3162,8 +3162,6 @@ class IngestionPipeline:
 
         def submit_video(index: int):
             analyzed_video_id = str(videos[index].get("id") or "").strip()
-            if analyzed_video_ids is not None and analyzed_video_id:
-                analyzed_video_ids.add(analyzed_video_id)
             videos[index].pop("_segment_max_candidates", None)
             if (
                 audio_executor is not None
@@ -3359,7 +3357,6 @@ class IngestionPipeline:
             v, kept, engine_out = result
             persisted_by_index: dict[int, ReelOutWithAttribution] = {}
             level_deferred_by_index: dict[int, ReelOutWithAttribution] = {}
-            level_deferred_stage_by_index: dict[int, int] = {}
             callback_indices: set[int] = set()
             if persistence_cap is not None and stored_count >= persistence_cap:
                 return []
@@ -3368,6 +3365,37 @@ class IngestionPipeline:
             )
             surface_limit = None if limit is None else max(0, int(limit))
             candidate_clips = list(kept)
+            target_stage = {
+                "beginner": 0,
+                "intermediate": 1,
+                "advanced": 2,
+            }.get(str(v.get("_knowledge_level") or "").strip().lower(), 0)
+
+            def candidate_stage(clip: dict[str, Any]) -> int:
+                try:
+                    difficulty = max(
+                        0.0, min(1.0, float(clip.get("difficulty", 0.5)))
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    difficulty = 0.5
+                return 0 if difficulty < 0.34 else 1 if difficulty < 0.67 else 2
+
+            candidate_stage_by_index = {
+                index: candidate_stage(clip)
+                for index, clip in enumerate(candidate_clips)
+            }
+            preferred_candidate_indices = sorted(
+                range(len(candidate_clips)),
+                key=lambda candidate_index: (
+                    abs(candidate_stage_by_index[candidate_index] - target_stage),
+                    candidate_stage_by_index[candidate_index],
+                    candidate_index,
+                ),
+            )
+            preferred_candidate_rank = {
+                candidate_index: rank
+                for rank, candidate_index in enumerate(preferred_candidate_indices)
+            }
             storage_is_limited = bool(
                 persistence_cap is not None
                 and stored_count + len(candidate_clips) > persistence_cap
@@ -3879,6 +3907,14 @@ class IngestionPipeline:
                         generation_context.increment_counter("stored_clips")
                     if boundary_verified_for_storage:
                         generation_context.increment_counter("verified_clips")
+                candidate_id = str(
+                    clip.get("selection_candidate_id") or ""
+                ).strip()
+                if candidate_id and (
+                    surface_eligible
+                    or search_context.get("surface_reason") == "level_mismatch"
+                ):
+                    surfaceable_candidate_ids.add(candidate_id)
                 if not surface_eligible:
                     if generation_context is not None:
                         generation_context.increment_counter("deferred_clips")
@@ -3888,54 +3924,40 @@ class IngestionPipeline:
                             )
                     if search_context.get("surface_reason") == "level_mismatch":
                         level_deferred_by_index[candidate_index] = reel
-                        try:
-                            difficulty = max(
-                                0.0, min(1.0, float(clip.get("difficulty", 0.5)))
-                            )
-                        except (TypeError, ValueError, OverflowError):
-                            difficulty = 0.5
-                        level_deferred_stage_by_index[candidate_index] = (
-                            0 if difficulty < 0.34 else 1 if difficulty < 0.67 else 2
-                        )
+                        if on_reel_created is not None and (
+                            surface_limit is None
+                            or preferred_candidate_rank[candidate_index]
+                            < surface_limit
+                        ):
+                            on_reel_created(reel)
+                            callback_indices.add(candidate_index)
                     continue
-                candidate_id = str(clip.get("selection_candidate_id") or "").strip()
-                if candidate_id:
-                    surfaceable_candidate_ids.add(candidate_id)
                 persisted_by_index[candidate_index] = reel
-                definitely_selected = (
+                if on_reel_created is not None and (
                     surface_limit is None
-                    or candidate_index < surface_limit
-                    or (
-                        not completion_order_safe
-                        and len(persisted_by_index) <= surface_limit
-                    )
-                )
-                if on_reel_created is not None and definitely_selected:
+                    or preferred_candidate_rank[candidate_index] < surface_limit
+                ):
                     on_reel_created(reel)
                     callback_indices.add(candidate_index)
 
-            selected_reels = persisted_by_index
-            selected_indices = sorted(selected_reels)
-            if not selected_indices and level_deferred_by_index:
-                # Difficulty is an ordering preference, not a reason to make a
-                # valid source appear empty. Stream the nearest already-ranked
-                # level only when this source has no current-level candidate;
-                # the final inventory remains authoritative across sources.
-                target_stage = {
-                    "beginner": 0,
-                    "intermediate": 1,
-                    "advanced": 2,
-                }.get(str(v.get("_knowledge_level") or "").strip().lower(), 0)
-                nearest_stage = min(
-                    set(level_deferred_stage_by_index.values()),
-                    key=lambda stage: (abs(stage - target_stage), stage),
-                )
-                selected_reels = {
-                    candidate_index: reel
-                    for candidate_index, reel in level_deferred_by_index.items()
-                    if level_deferred_stage_by_index[candidate_index] == nearest_stage
-                }
-                selected_indices = sorted(selected_reels)
+            # Difficulty organizes valid inventory; it never removes it. Keep
+            # the requested stage first, then the nearest remaining stages,
+            # while preserving selector order inside each stage.
+            selected_reels = {
+                **persisted_by_index,
+                **level_deferred_by_index,
+            }
+            selected_indices = sorted(
+                selected_reels,
+                key=lambda candidate_index: (
+                    abs(
+                        candidate_stage_by_index[candidate_index]
+                        - target_stage
+                    ),
+                    candidate_stage_by_index[candidate_index],
+                    candidate_index,
+                ),
+            )
             if surface_limit is not None:
                 selected_indices = selected_indices[:surface_limit]
             if on_reel_created is not None:
@@ -3953,12 +3975,13 @@ class IngestionPipeline:
             int,
             tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]],
         ] = {}
-        straggler_deadline: float | None = None
         initial_resolved: set[int] = set()
         provider_errors: list[_ClipProviderError] = []
         initial_count = concurrent_video_count
         persisted_count = 0
         bootstrap_attempted_indices: set[int] = set()
+        useful_inventory_idle_deadline: float | None = None
+        useful_inventory_threshold = min(3, inventory_cap)
 
         def persist_bootstrap_sources() -> None:
             """Persist at most one best clip per completed source before reuse.
@@ -4023,7 +4046,9 @@ class IngestionPipeline:
                 raise_if_cancelled(should_cancel)
                 active_deadline = min(
                     deadline,
-                    straggler_deadline if straggler_deadline is not None else deadline,
+                    useful_inventory_idle_deadline
+                    if useful_inventory_idle_deadline is not None
+                    else deadline,
                 )
                 remaining = max(0.0, active_deadline - time.monotonic())
                 done, _ = wait(
@@ -4034,6 +4059,11 @@ class IngestionPipeline:
                 if not done:
                     if time.monotonic() < active_deadline:
                         continue
+                    useful_inventory_idle_expired = bool(
+                        useful_inventory_idle_deadline is not None
+                        and useful_inventory_idle_deadline < deadline
+                        and time.monotonic() >= useful_inventory_idle_deadline
+                    )
                     initial_resolved.update(
                         index for index, _video in pending.values() if index < initial_count
                     )
@@ -4051,14 +4081,17 @@ class IngestionPipeline:
                             matched_queries=(v.get("_search_context") or {}).get("matched_queries"),
                             query_plan_ai_status=(v.get("_search_context") or {}).get("query_plan_ai_status"),
                             error=(
-                                "post-first-clip straggler grace exceeded"
-                                if straggler_deadline is not None
-                                and straggler_deadline < deadline
+                                "useful inventory idle budget exceeded"
+                                if useful_inventory_idle_expired
                                 else "shared clip fetch deadline exceeded"
                             ),
                         )
                     if generation_context is not None:
                         generation_context.increment_counter("clip_fetch_timeouts", len(pending))
+                        if useful_inventory_idle_expired:
+                            generation_context.increment_counter(
+                                "post_progress_timeouts", len(pending)
+                            )
                     break
 
                 for future in sorted(done, key=lambda item: pending[item][0]):
@@ -4079,6 +4112,9 @@ class IngestionPipeline:
                         continue
                     if result is None:
                         continue
+                    analyzed_video_id = str(v.get("id") or "").strip()
+                    if analyzed_video_ids is not None and analyzed_video_id:
+                        analyzed_video_ids.add(analyzed_video_id)
                     completed_results[index] = result
                     if retrieval_profile == "bootstrap":
                         persist_bootstrap_sources()
@@ -4090,14 +4126,17 @@ class IngestionPipeline:
                         reels_by_video[index] = persisted
                         persisted_count += len(persisted)
                         if (
-                            persisted
-                            and straggler_deadline is None
-                            and retrieval_profile == "deep"
+                            retrieval_profile == "deep"
+                            and pending
+                            and persisted_count >= useful_inventory_threshold
                         ):
-                            straggler_deadline = min(
+                            useful_inventory_idle_deadline = min(
                                 deadline,
                                 time.monotonic()
-                                + max(0.0, INGEST_TOPIC_STRAGGLER_GRACE_SEC),
+                                + max(
+                                    0.0,
+                                    INGEST_TOPIC_USEFUL_INVENTORY_IDLE_TIMEOUT_SEC,
+                                ),
                             )
 
                 if retrieval_profile == "bootstrap":
@@ -4411,7 +4450,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v31",
+                    selection_contract_version="quality_silence_v32",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,

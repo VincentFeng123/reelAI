@@ -198,10 +198,12 @@ def test_live_chain_rule_candidate_is_rebounded_instead_of_rejected() -> None:
     assert report.rejected_reasons == []
     [clip] = report.clips
     assert clip["_start_line"] == 0
-    assert clip["_end_line"] == 16
+    assert clip["_end_line"] == 13
     assert clip["_clip_text"].startswith("notation so let me make it so i have h")
-    assert clip["_clip_text"].endswith("the next one")
+    assert clip["_clip_text"].endswith("more than one function")
     assert "thought experiment" not in clip["_clip_text"]
+    assert "by the end of this video" not in clip["_clip_text"]
+    assert "trimmed_terminal_meta_suffix" in clip["_boundary_fallback_reasons"]
 
 
 def _live_chain_rule_setup_segments() -> list[dict]:
@@ -333,6 +335,839 @@ def test_live_chain_rule_setup_trims_split_repeated_caption_tail() -> None:
     assert bounds[1] == pytest.approx(60.438, abs=0.001)
     assert bounds[1] < 62.64
     assert projection["end"]["excluded_neighbor_onset_sec"] == 60.711
+
+
+def test_live_chain_rule_mechanism_trims_edge_previews_without_rejection() -> None:
+    segments = _live_chain_rule_setup_segments()
+    rows = [
+        (65.36, 69.52, "every time any time your function can be"),
+        (67.76, 71.6, "used as a composition of more than one"),
+        (69.52, 73.6, "function and as that might not seem"),
+        (71.6, 75.36, "obvious right now but it will hopefully"),
+        (73.6, 77.6, "maybe by the end of this video or the next one"),
+    ]
+    segments.extend(
+        {
+            "cue_id": f"0T0QrHO56qg:cue:{index}",
+            "start": start,
+            "end": end,
+            "text": text,
+        }
+        for index, (start, end, text) in enumerate(rows, 31)
+    )
+    proposal = G._BoundaryTopic(
+        candidate_id="chain_rule_mechanism",
+        start_line=0,
+        end_line=35,
+        start_quote="what we're going to go over",
+        end_quote="the next one",
+        title="When the Chain Rule Applies",
+        learning_objective=(
+            "Identify that the chain rule is used when a function is a "
+            "composition of more than one function."
+        ),
+        facet="Concept",
+        reason="Explains when a composite function requires the chain rule.",
+        informativeness=0.9,
+        topic_relevance=1.0,
+        educational_importance=0.9,
+        difficulty=0.3,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        topic_evidence_quote=(
+            "the chain rule comes into play every time any time your function can be used"
+        ),
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+        uncertainty="low",
+        uncertainty_reasons=[],
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="chain rule",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_start_line"] == 12
+    assert clip["_end_line"] == 33
+    assert clip["_clip_text"].startswith("let's say that i had a function")
+    assert clip["_clip_text"].endswith("more than one function")
+    assert "what we're going to go over" not in clip["_clip_text"]
+    assert "by the end of this video" not in clip["_clip_text"]
+    assert clip["end_quote"] == "function"
+    assert "occurrence" not in clip["edge_projection"]["end"]
+    assert "trimmed_opening_instructional_preview" in clip[
+        "_boundary_fallback_reasons"
+    ]
+    assert "trimmed_terminal_meta_suffix" in clip[
+        "_boundary_fallback_reasons"
+    ]
+
+    from backend.app.ingestion import pipeline as ingestion_pipeline
+
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:live-chain-rule-mechanism",
+        "duration": segments[-1]["end"],
+        "segments": segments,
+    }
+    caption = ingestion_pipeline._supadata_boundary_diagnostics(
+        transcript,
+        clip,
+    )
+    assert caption is not None
+    bounds, projection, error = ingestion_pipeline._projected_speech_bounds(
+        transcript,
+        clip,
+        caption,
+        None,
+    )
+
+    assert error is None
+    assert bounds == pytest.approx((21.88, 69.522), abs=0.001)
+    assert projection["caption_projection_verified"] is True
+    assert projection["end"]["excluded_neighbor_onset_sec"] == 69.817
+
+
+def test_instructional_preview_trim_requires_a_media_agenda() -> None:
+    segments = [
+        {
+            "cue_id": "proof",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "what we're going to go over in this proof is why the rule works",
+        },
+        {
+            "cue_id": "setup",
+            "start": 4.0,
+            "end": 8.0,
+            "text": "let's consider a composite function",
+        },
+        {
+            "cue_id": "evidence",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "the derivative multiplies the outer and inner derivatives",
+        },
+    ]
+
+    assert G._trim_initial_instructional_preview(
+        segments,
+        0,
+        2,
+        evidence_quote="outer and inner derivatives",
+    ) is None
+
+
+def test_instructional_preview_trim_preserves_grounded_teaching_in_the_intro() -> None:
+    segments = [
+        {
+            "cue_id": "agenda-a",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "what we're going to go over in this",
+        },
+        {
+            "cue_id": "agenda-b",
+            "start": 4.0,
+            "end": 8.0,
+            "text": "video is why the chain rule multiplies derivatives",
+        },
+        {
+            "cue_id": "setup",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "let's consider a composite function",
+        },
+    ]
+
+    assert G._trim_initial_instructional_preview(
+        segments,
+        0,
+        2,
+        evidence_quote="why the chain rule multiplies derivatives",
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "setup_text",
+    [
+        "How does this process move water afterward?",
+        "What causes this movement across the membrane?",
+        "Let's consider this process in more detail.",
+        "Let's calculate this value for the example.",
+        "Let's calculate it for x equals three.",
+        "Let's consider it in more detail.",
+        "What causes it to move across the membrane?",
+        "Let's say it moves to the right.",
+        "Given that, calculate the next value.",
+        "Let's calculate this for x equals three.",
+        "Let's consider these in more detail.",
+        "Let's solve this now.",
+        "Given this, calculate the next value.",
+    ],
+)
+def test_instructional_preview_keeps_definition_needed_by_anaphoric_setup(
+    setup_text: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "agenda",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "what we're going to cover in this",
+        },
+        {
+            "cue_id": "definition",
+            "start": 4.0,
+            "end": 9.0,
+            "text": (
+                "video is osmosis, the movement of water across a semipermeable "
+                "membrane."
+            ),
+        },
+        {
+            "cue_id": "question",
+            "start": 9.0,
+            "end": 13.0,
+            "text": setup_text,
+        },
+        {
+            "cue_id": "answer",
+            "start": 13.0,
+            "end": 19.0,
+            "text": (
+                "Water flows toward the side with more dissolved solute particles."
+            ),
+        },
+    ]
+    proposal = G._BoundaryTopic(
+        candidate_id="osmosis-context",
+        start_line=0,
+        end_line=3,
+        start_quote="what we're going to cover",
+        end_quote="more dissolved solute particles",
+        title="Osmosis",
+        learning_objective=(
+            "Define osmosis and explain why water moves across a semipermeable "
+            "membrane."
+        ),
+        facet="Definition",
+        reason="Defines osmosis and explains its direction.",
+        informativeness=0.9,
+        topic_relevance=1.0,
+        educational_importance=0.9,
+        difficulty=0.3,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        topic_evidence_quote=(
+            "Water flows toward the side with more dissolved solute particles"
+        ),
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+        uncertainty="low",
+        uncertainty_reasons=[],
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="osmosis",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_start_line"] == 0
+    assert "osmosis, the movement of water" in clip["_clip_text"]
+    assert setup_text in clip["_clip_text"]
+
+
+def test_instructional_preview_can_trim_to_a_named_setup() -> None:
+    segments = [
+        {
+            "cue_id": "agenda-a",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "what we're going to cover in this",
+        },
+        {
+            "cue_id": "agenda-b",
+            "start": 4.0,
+            "end": 8.0,
+            "text": "video is a central biology concept",
+        },
+        {
+            "cue_id": "setup",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "Let's consider osmosis across a membrane.",
+        },
+        {
+            "cue_id": "evidence",
+            "start": 12.0,
+            "end": 16.0,
+            "text": "Water moves toward the greater solute concentration.",
+        },
+    ]
+
+    assert G._trim_initial_instructional_preview(
+        segments,
+        0,
+        3,
+        evidence_quote="Water moves toward the greater solute concentration",
+    ) == (2, "Let's consider osmosis across a membrane")
+
+
+def test_instructional_preview_can_trim_to_a_locally_grounded_pronoun() -> None:
+    segments = [
+        {
+            "cue_id": "agenda-a",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "what we're going to cover in this",
+        },
+        {
+            "cue_id": "agenda-b",
+            "start": 4.0,
+            "end": 8.0,
+            "text": "video is a short algebra example",
+        },
+        {
+            "cue_id": "setup",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "Given x equals three, calculate it using the formula.",
+        },
+        {
+            "cue_id": "evidence",
+            "start": 12.0,
+            "end": 16.0,
+            "text": "Substitution gives the final value nine.",
+        },
+    ]
+
+    assert G._trim_initial_instructional_preview(
+        segments,
+        0,
+        3,
+        evidence_quote="Substitution gives the final value nine",
+    ) == (2, "Given x equals three, calculate it")
+
+
+def test_promissory_preview_is_tolerated_when_teaching_resumes() -> None:
+    segments = [
+        {
+            "cue_id": "criterion",
+            "start": 0.0,
+            "end": 6.0,
+            "text": "A composite function uses one function inside another function.",
+        },
+        {
+            "cue_id": "aside",
+            "start": 6.0,
+            "end": 11.0,
+            "text": (
+                "And as that might not seem obvious right now, it will hopefully "
+                "make sense by the end of this lesson."
+            ),
+        },
+        {
+            "cue_id": "return",
+            "start": 11.0,
+            "end": 17.0,
+            "text": (
+                "Now apply the chain rule by multiplying the outer and inner "
+                "derivatives."
+            ),
+        },
+    ]
+
+    assert G._trim_terminal_meta_suffix(
+        segments,
+        0,
+        2,
+        start_quote="A composite function uses one function",
+        end_quote="the outer and inner derivatives",
+        evidence_quote="one function inside another function",
+        learning_objective="Explain and apply the chain rule to a composite function",
+    ) is None
+
+
+def test_promissory_preview_keeps_arbitrary_later_declarative_teaching() -> None:
+    segments = [
+        {
+            "cue_id": "criterion",
+            "start": 0.0,
+            "end": 6.0,
+            "text": "A composite function uses one function inside another function.",
+        },
+        {
+            "cue_id": "aside",
+            "start": 6.0,
+            "end": 11.0,
+            "text": (
+                "And as that might not seem obvious right now, it will hopefully "
+                "make sense by the end of this video."
+            ),
+        },
+        {
+            "cue_id": "teaching",
+            "start": 11.0,
+            "end": 17.0,
+            "text": (
+                "The inner derivative measures how quickly the input to the outer "
+                "function changes."
+            ),
+        },
+    ]
+
+    assert G._trim_terminal_meta_suffix(
+        segments,
+        0,
+        2,
+        start_quote="A composite function uses one function",
+        end_quote="the input to the outer function changes",
+        evidence_quote="one function inside another function",
+        learning_objective="Identify when the chain rule applies",
+    ) is None
+
+
+def test_future_video_aside_keeps_arbitrary_later_declarative_teaching() -> None:
+    segments = [
+        {
+            "cue_id": "rule",
+            "start": 0.0,
+            "end": 6.0,
+            "text": (
+                "The chain rule multiplies the outer derivative by the inner "
+                "derivative."
+            ),
+        },
+        {
+            "cue_id": "aside",
+            "start": 6.0,
+            "end": 10.0,
+            "text": "As you'll see in future videos, this becomes intuitive.",
+        },
+        {
+            "cue_id": "consequence",
+            "start": 10.0,
+            "end": 16.0,
+            "text": (
+                "The inner derivative measures how quickly the input changes."
+            ),
+        },
+    ]
+
+    assert G._trim_terminal_meta_suffix(
+        segments,
+        0,
+        2,
+        start_quote="The chain rule multiplies the outer derivative",
+        end_quote="how quickly the input changes",
+        evidence_quote="outer derivative by the inner derivative",
+        learning_objective="Explain the central rule and its consequence",
+    ) is None
+
+
+def test_mastery_recap_keeps_arbitrary_later_declarative_teaching() -> None:
+    segments = [
+        {
+            "cue_id": "rule",
+            "start": 0.0,
+            "end": 6.0,
+            "text": (
+                "The chain rule multiplies the outer derivative by the inner "
+                "derivative."
+            ),
+        },
+        {
+            "cue_id": "recap",
+            "start": 6.0,
+            "end": 10.0,
+            "text": "Now you know how to apply the basic rule.",
+        },
+        {
+            "cue_id": "consequence",
+            "start": 10.0,
+            "end": 16.0,
+            "text": (
+                "The inner derivative measures how quickly the input changes."
+            ),
+        },
+    ]
+
+    assert G._trim_terminal_meta_suffix(
+        segments,
+        0,
+        2,
+        start_quote="The chain rule multiplies the outer derivative",
+        end_quote="how quickly the input changes",
+        evidence_quote="outer derivative by the inner derivative",
+        learning_objective="Explain the central rule and its consequence",
+    ) is None
+
+
+def test_terminal_mastery_recap_split_across_cues_is_trimmed() -> None:
+    segments = [
+        {
+            "cue_id": "answer",
+            "start": 0.0,
+            "end": 6.0,
+            "text": "The final derivative is three x squared after simplification.",
+        },
+        {
+            "cue_id": "recap-prefix",
+            "start": 6.0,
+            "end": 9.0,
+            "text": "now you know how",
+        },
+        {
+            "cue_id": "recap-tail",
+            "start": 9.0,
+            "end": 13.0,
+            "text": "to apply the chain rule",
+        },
+    ]
+
+    assert G._trim_terminal_meta_suffix(
+        segments,
+        0,
+        2,
+        start_quote="The final derivative is",
+        end_quote="apply the chain rule",
+        evidence_quote="final derivative is three x squared after simplification",
+        learning_objective="Apply the chain rule",
+    ) == (0, "is three x squared after simplification")
+
+
+@pytest.mark.parametrize(
+    "meta_cues",
+    [
+        ["As you'll see in future videos", "this rule appears often"],
+        ["As you'll see in future videos", "this course is about calculus"],
+        ["As you'll see in future videos", "we will talk about biology"],
+        ["As you'll see in future videos", "this is easy"],
+        ["As you'll see in future videos", "it gets easier"],
+        ["As you'll see in future videos", "this becomes intuitive"],
+        ["As you'll see in future videos", "the idea is simple"],
+        ["As you'll see in future videos", "you will understand"],
+        ["As you'll see in future videos", "it makes sense"],
+        ["As you'll see in future videos", "we will explain more"],
+        ["As you'll see in future videos", "it matters less"],
+        ["As you'll see in future videos", "this is quite general"],
+        ["As you'll see in future videos", "the idea is very specific"],
+        ["As you'll see in future videos", "it is more general"],
+        ["As you'll see in future videos", "we will carry on"],
+        ["As you'll see in future videos", "you can log in"],
+        ["As you'll see in future videos", "we will stand by"],
+        ["Now you know how to apply", "the basic chain rule"],
+    ],
+)
+def test_punctuationless_split_meta_keeps_later_declarative_teaching(
+    meta_cues: list[str],
+) -> None:
+    texts = [
+        "The chain rule multiplies the outer derivative by the inner derivative",
+        *meta_cues,
+        "the inner derivative measures how quickly the input changes",
+    ]
+    segments = [
+        {
+            "cue_id": f"cue-{index}",
+            "start": index * 4.0,
+            "end": (index + 1) * 4.0,
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    assert G._trim_terminal_meta_suffix(
+        segments,
+        0,
+        3,
+        start_quote="The chain rule multiplies the outer derivative",
+        end_quote="how quickly the input changes",
+        evidence_quote="outer derivative by the inner derivative",
+        learning_objective="Explain the central rule and its consequence",
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "meta_cues",
+    [
+        [
+            "As you'll see in future videos",
+            "this will become more intuitive with examples",
+        ],
+        ["Now you know how to apply the basic chain rule correctly"],
+    ],
+)
+def test_terminal_meta_trim_is_independent_of_caption_partition(
+    meta_cues: list[str],
+) -> None:
+    texts = [
+        "The final derivative is three x squared after simplification",
+        *meta_cues,
+    ]
+    segments = [
+        {
+            "cue_id": f"cue-{index}",
+            "start": index * 4.0,
+            "end": (index + 1) * 4.0,
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    assert G._trim_terminal_meta_suffix(
+        segments,
+        0,
+        len(segments) - 1,
+        start_quote="The final derivative is",
+        end_quote=meta_cues[-1].split()[-1],
+        evidence_quote="final derivative is three x squared after simplification",
+        learning_objective="Apply the chain rule",
+    ) == (0, "is three x squared after simplification")
+
+
+@pytest.mark.parametrize(
+    "meta_cues",
+    [
+        [
+            "As you'll see in future videos",
+            "this will become more",
+            "intuitive with examples",
+        ],
+        ["Now you know", "how to", "apply the basic", "chain rule correctly"],
+    ],
+)
+def test_ambiguous_punctuationless_meta_partition_fails_open(
+    meta_cues: list[str],
+) -> None:
+    texts = [
+        "The final derivative is three x squared after simplification",
+        *meta_cues,
+    ]
+    segments = [
+        {
+            "cue_id": f"cue-{index}",
+            "start": index * 4.0,
+            "end": (index + 1) * 4.0,
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    assert G._trim_terminal_meta_suffix(
+        segments,
+        0,
+        len(segments) - 1,
+        start_quote="The final derivative is",
+        end_quote=meta_cues[-1].split()[-1],
+        evidence_quote="final derivative is three x squared after simplification",
+        learning_objective="Apply the chain rule",
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "teaching",
+    [
+        "plants absorb light during photosynthesis",
+        "markets allocate scarce resources through prices",
+        "electrons repel one another at short distances",
+        "enzymes catalyze chemical reactions",
+        "water evaporates when heated",
+    ],
+)
+def test_ambiguous_meta_tail_never_erases_varied_teaching(teaching: str) -> None:
+    texts = [
+        "A complete explanation establishes the relevant educational principle",
+        "As you'll see in future videos",
+        "we will explain more",
+        teaching,
+    ]
+    segments = [
+        {
+            "cue_id": f"cue-{index}",
+            "start": index * 4.0,
+            "end": (index + 1) * 4.0,
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    assert G._trim_terminal_meta_suffix(
+        segments,
+        0,
+        3,
+        start_quote="A complete explanation establishes",
+        end_quote=teaching.split()[-1],
+        evidence_quote="complete explanation establishes the relevant educational principle",
+        learning_objective="Explain the educational principle",
+    ) is None
+
+
+def test_media_promise_trims_a_terminal_watch_promotion() -> None:
+    segments = [
+        {
+            "cue_id": "criterion",
+            "start": 0.0,
+            "end": 6.0,
+            "text": "A composite function uses one function inside another function.",
+        },
+        {
+            "cue_id": "promise",
+            "start": 6.0,
+            "end": 12.0,
+            "text": (
+                "And as that might not seem obvious right now, it will make sense "
+                "by the end of this video."
+            ),
+        },
+        {
+            "cue_id": "promotion",
+            "start": 12.0,
+            "end": 17.0,
+            "text": "Be sure to watch those lessons for the full story.",
+        },
+    ]
+
+    assert G._trim_terminal_meta_suffix(
+        segments,
+        0,
+        2,
+        start_quote="A composite function uses one function",
+        end_quote="lessons for the full story",
+        evidence_quote="one function inside another function",
+        learning_objective="Identify a composite function",
+    ) == (0, "uses one function inside another function")
+
+
+@pytest.mark.parametrize(
+    "promotion",
+    [
+        "Watch the next video for more examples.",
+        "Check out the next lesson for more examples.",
+        "Continue to the next video for the proof.",
+        "See you in the next video.",
+        "We'll cover the proof in the next lesson.",
+        "You can learn more in the next section.",
+    ],
+)
+def test_terminal_media_promotion_variants_are_meta(promotion: str) -> None:
+    assert G._terminal_meta_tail_is_only_meta(promotion)
+
+
+@pytest.mark.parametrize(
+    "promotion",
+    [
+        "Continue to the next section of this lesson for more examples.",
+        "Watch the next section of the course for the proof.",
+        "Check out the next section of the video for more examples.",
+        "Continue to the next section of your lesson for more examples.",
+        "Continue to the next section of my lesson for more examples.",
+        "Continue to the next section of their lesson for more examples.",
+    ],
+)
+def test_media_section_navigation_remains_meta(promotion: str) -> None:
+    assert G._terminal_meta_tail_is_only_meta(promotion)
+
+
+@pytest.mark.parametrize(
+    "teaching",
+    [
+        "Watch the next video frame to measure the particle velocity.",
+        "Watch the next video segment to measure the particle velocity.",
+        "The video signal continues to the next section of the encoder.",
+        "The next section of DNA contains the regulatory sequence.",
+        "Continue to the next section of DNA to locate the promoter sequence.",
+        "Check out the next section of the chromosome where recombination occurs.",
+        "Continue to the next course of antibiotics if the infection persists.",
+        "Watch the next course of treatment for adverse effects.",
+        "Check out the next course of the river after the bend.",
+        "View the next section of tissue under the microscope.",
+    ],
+)
+def test_subject_matter_media_words_are_not_promotions(teaching: str) -> None:
+    assert not G._terminal_meta_tail_is_only_meta(teaching)
+
+
+def test_terminal_meta_scan_keeps_suffix_work_bounded(monkeypatch) -> None:
+    segments = [
+        {
+            "cue_id": f"cue-{index}",
+            "start": index * 3.0,
+            "end": (index + 1) * 3.0,
+            "text": (
+                "A derivative measures change. And as that might not seem obvious, "
+                "it will make sense by the end of this video."
+            ),
+        }
+        for index in range(120)
+    ]
+    original = G._terminal_meta_tail_is_only_meta
+    inspected_word_counts: list[int] = []
+
+    def counted(text: str) -> bool:
+        inspected_word_counts.append(len(G._toks(text)))
+        return original(text)
+
+    monkeypatch.setattr(G, "_terminal_meta_tail_is_only_meta", counted)
+    G._trim_terminal_meta_suffix(
+        segments,
+        0,
+        len(segments) - 1,
+        start_quote="A derivative measures change",
+        end_quote="the end of this video",
+        evidence_quote="A derivative measures change",
+        learning_objective="Explain what a derivative measures",
+    )
+
+    assert len(inspected_word_counts) <= 3 * len(segments)
+    assert max(inspected_word_counts) <= 12 * 22
+
+
+def test_reaction_interval_is_not_misclassified_as_a_media_preview() -> None:
+    segments = [
+        {
+            "cue_id": "reaction",
+            "start": 0.0,
+            "end": 7.0,
+            "text": "The indicator remains colorless during the induction period.",
+        },
+        {
+            "cue_id": "interval",
+            "start": 7.0,
+            "end": 14.0,
+            "text": (
+                "And as that might not seem obvious now, it will become clear by "
+                "the end of the reaction interval."
+            ),
+        },
+    ]
+
+    assert G._trim_terminal_meta_suffix(
+        segments,
+        0,
+        1,
+        start_quote="The indicator remains colorless",
+        end_quote="the end of the reaction interval",
+        evidence_quote="indicator remains colorless during the induction period",
+        learning_objective="Explain the induction period of a chemical reaction",
+    ) is None
 
 
 def test_repeated_compound_noun_without_a_repeated_clause_is_not_trimmed() -> None:

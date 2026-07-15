@@ -2076,7 +2076,7 @@ def test_selected_caption_snapshot_clamps_every_overlapping_cue_to_lexical_end()
     assert cues[-1]["text"] == "which is exactly what dhdx is"
 
     context = {
-        "selection_contract_version": "quality_silence_v31",
+        "selection_contract_version": "quality_silence_v32",
         "boundary_status": "context_aligned",
         "speech_corridor_verified": True,
         "selection_caption_cues": [
@@ -3114,7 +3114,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
 ) -> None:
     strict_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v31",
+        "selection_contract_version": "quality_silence_v32",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -3124,7 +3124,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
     }
     transcript_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v31",
+        "selection_contract_version": "quality_silence_v32",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -3187,7 +3187,7 @@ def test_failed_boundary_storage_does_not_consume_ready_material_cap(
     deferred.append({
         "search_context_json": json.dumps({
             "surface_eligible": True,
-            "selection_contract_version": "quality_silence_v31",
+            "selection_contract_version": "quality_silence_v32",
             "speech_corridor_verified": True,
             "boundary_status": "verified",
             "boundary_diagnostics": {
@@ -3662,7 +3662,7 @@ def test_all_deferred_source_streams_nearest_valid_level_immediately(
     assert context.counters()["persisted_clips"] == 1
 
 
-def test_all_deferred_source_streams_only_the_nearest_difficulty_bin(
+def test_all_deferred_source_streams_all_valid_clips_by_difficulty_proximity(
     monkeypatch,
 ) -> None:
     transcript = _transcript()
@@ -3724,11 +3724,17 @@ def test_all_deferred_source_streams_only_the_nearest_difficulty_bin(
         on_reel_created=emitted.append,
     )
 
-    assert reels == ["dQw4w9WgXcQ::intermediate-python"]
-    assert emitted == ["dQw4w9WgXcQ::intermediate-python"]
+    assert reels == [
+        "dQw4w9WgXcQ::intermediate-python",
+        "dQw4w9WgXcQ::advanced-python",
+    ]
+    assert emitted == [
+        "dQw4w9WgXcQ::intermediate-python",
+        "dQw4w9WgXcQ::advanced-python",
+    ]
 
 
-def test_current_level_candidate_suppresses_provisional_deferred_fallback(
+def test_current_level_candidate_precedes_without_suppressing_other_levels(
     monkeypatch,
 ) -> None:
     transcript = _transcript()
@@ -3790,8 +3796,8 @@ def test_current_level_candidate_suppresses_provisional_deferred_fallback(
     )
 
     assert stored == ["beginner-python", "advanced-python"]
-    assert reels == ["reel-beginner-python"]
-    assert emitted == ["reel-beginner-python"]
+    assert reels == ["reel-beginner-python", "reel-advanced-python"]
+    assert emitted == ["reel-beginner-python", "reel-advanced-python"]
 
 
 def test_candidate_plan_prioritizes_primary_intent_only_within_difficulty_stage(
@@ -3945,7 +3951,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v31"
+        assert context["selection_contract_version"] == "quality_silence_v32"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"

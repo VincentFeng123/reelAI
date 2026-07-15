@@ -352,7 +352,7 @@ assessment_service = AssessmentService()
 MAX_REELS_PER_MATERIAL = 300
 GENERATION_OUTPUT_CEILINGS = {"fast": 8, "slow": 12}
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v31"
+SELECTION_CONTRACT_VERSION = "quality_silence_v32"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -2590,7 +2590,8 @@ def _count_generation_reels(conn, generation_id: str) -> int:
             surface_eligible = surface_eligible.strip().lower() in {
                 "1", "true", "yes", "on",
             }
-        if surface_eligible is not True:
+        surface_reason = str(context.get("surface_reason") or "").strip().lower()
+        if surface_eligible is not True and surface_reason != "level_mismatch":
             continue
         if not _search_context_has_usable_boundary(
             context, t_start=row.get("t_start"), t_end=row.get("t_end")
@@ -2617,7 +2618,14 @@ def _count_material_ready_reels(conn, material_id: str) -> int:
             surface_eligible = surface_eligible.strip().lower() in {
                 "1", "true", "yes", "on",
             }
-        if surface_eligible is True and _search_context_has_usable_boundary(
+        surface_reason = (
+            str(context.get("surface_reason") or "").strip().lower()
+            if isinstance(context, dict)
+            else ""
+        )
+        if (
+            surface_eligible is True or surface_reason == "level_mismatch"
+        ) and _search_context_has_usable_boundary(
             context, t_start=row.get("t_start"), t_end=row.get("t_end")
         ):
             count += 1
@@ -2876,6 +2884,7 @@ def _merge_request_reel_lists(*reel_lists: list[dict[str, Any]]) -> list[dict[st
 
 def _merge_selection_ordered_reel_lists(
     *reel_lists: list[dict[str, Any]],
+    target_stage: int | None = None,
 ) -> list[dict[str, Any]]:
     """Quality-merge topologically ordered generation batches.
 
@@ -2898,6 +2907,7 @@ def _merge_selection_ordered_reel_lists(
                 reel_service._selection_contract_sort_key(
                     reel_list[positions[batch_index]],
                     input_order=input_offsets[batch_index] + positions[batch_index],
+                    target_stage=target_stage,
                 ),
                 batch_index,
             )
@@ -2976,14 +2986,14 @@ def _verified_reusable_generation_chain(
         try:
             context = json.loads(str(row.get("search_context_json") or "{}"))
         except (TypeError, json.JSONDecodeError):
-            return False
+            continue
         if not isinstance(context, dict):
-            return False
+            continue
         if (
             str(context.get("selection_contract_version") or "").strip()
             != SELECTION_CONTRACT_VERSION
         ):
-            return False
+            continue
         try:
             quality_scores = (
                 float(context.get("informativeness")),
@@ -2991,12 +3001,12 @@ def _verified_reusable_generation_chain(
                 float(context.get("educational_importance")),
             )
         except (TypeError, ValueError, OverflowError):
-            return False
+            continue
         if (
             any(not math.isfinite(score) for score in quality_scores)
             or any(score < 0.75 for score in quality_scores)
         ):
-            return False
+            continue
         if any(
             context.get(field) is not True
             for field in (
@@ -3007,7 +3017,7 @@ def _verified_reusable_generation_chain(
                 "is_standalone",
             )
         ):
-            return False
+            continue
         evidence_words = re.findall(
             r"[\w+#'-]+",
             str(context.get("topic_evidence_quote") or "").casefold(),
@@ -3028,9 +3038,9 @@ def _verified_reusable_generation_chain(
                 )
             )
         ):
-            return False
+            continue
         if "surface_eligible" not in context:
-            return False
+            continue
         surface_eligible = context.get("surface_eligible")
         if isinstance(surface_eligible, str):
             surface_eligible = surface_eligible.strip().lower() in {
@@ -3046,7 +3056,7 @@ def _verified_reusable_generation_chain(
         if not _search_context_has_usable_boundary(
             context, t_start=row.get("t_start"), t_end=row.get("t_end")
         ):
-            return False
+            continue
         verified_reusable_count += 1
     return verified_reusable_count > 0
 
@@ -3056,7 +3066,7 @@ def _generation_chain_analyzed_source_budget(
     *,
     generation_id: str,
 ) -> int:
-    """Return the broadest source budget already attempted by a terminal job."""
+    """Return completed source analyses across a reusable generation chain."""
     generation_ids = _response_generation_ids(conn, generation_id)
     if not generation_ids:
         return 0
@@ -3065,7 +3075,7 @@ def _generation_chain_analyzed_source_budget(
     rows = fetch_all(
         conn,
         f"""
-        SELECT DISTINCT generations.generation_mode
+        SELECT jobs.id, jobs.usage_json, generations.generation_mode
         FROM reel_generations AS generations
         JOIN reel_generation_jobs AS jobs
           ON jobs.result_generation_id = generations.id
@@ -3074,15 +3084,26 @@ def _generation_chain_analyzed_source_budget(
         """,
         tuple(generation_ids),
     )
-    return max(
-        (
-            GENERATION_SOURCE_BUDGETS[mode]
-            for row in rows
-            for mode in [str(row.get("generation_mode") or "").strip().lower()]
-            if mode in GENERATION_SOURCE_BUDGETS
-        ),
-        default=0,
-    )
+    completed_sources = 0
+    for row in rows:
+        mode = str(row.get("generation_mode") or "").strip().lower()
+        try:
+            usage = json.loads(str(row.get("usage_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            usage = {}
+        counters = usage.get("counters") if isinstance(usage, dict) else None
+        if isinstance(counters, dict) and "analyzed_sources" in counters:
+            try:
+                completed_sources += max(
+                    0, int(counters.get("analyzed_sources") or 0)
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+        elif mode in GENERATION_SOURCE_BUDGETS:
+            # Jobs written before actual-source accounting only recorded their
+            # mode. Preserve their historical fixed-budget semantics.
+            completed_sources += GENERATION_SOURCE_BUDGETS[mode]
+    return completed_sources
 
 
 def _generation_chain_meets_source_budget(
@@ -3262,6 +3283,7 @@ def _ranked_request_reels(
         concept_id=None,
     )
     generation_ids = _response_generation_ids(conn, generation_id)
+    difficulty_progress: dict[str, Any] | None = None
     if generation_ids:
         ranked_batches: list[list[dict[str, Any]]] = []
         for current_generation_id in generation_ids:
@@ -3286,7 +3308,21 @@ def _ranked_request_reels(
             for batch in ranked_batches
             for reel in batch
         ):
-            ranked = _merge_selection_ordered_reel_lists(*ranked_batches)
+            difficulty_progress = reel_service.learner_progress(
+                conn, material_id, learner_id
+            )
+            target_stage = {
+                "beginner": 0,
+                "intermediate": 1,
+                "advanced": 2,
+            }.get(
+                str(difficulty_progress.get("selected_level") or "beginner"),
+                0,
+            )
+            ranked = _merge_selection_ordered_reel_lists(
+                *ranked_batches,
+                target_stage=target_stage,
+            )
         else:
             ranked = _merge_request_reel_lists(*ranked_batches)
     else:
@@ -3301,7 +3337,10 @@ def _ranked_request_reels(
             content_fingerprint=content_fingerprint,
             require_verified_boundaries=True,
         )
-    if any(
+    selection_ordered = bool(ranked) and all(
+        bool(reel.get("_selection_ordered")) for reel in ranked
+    )
+    if not selection_ordered and any(
         str(
             reel.get("_selection_contract_version")
             or reel.get("selection_contract_version")
@@ -3310,9 +3349,10 @@ def _ranked_request_reels(
         in reel_service.DIFFICULTY_FALLBACK_CONTRACTS
         for reel in ranked
     ):
-        difficulty_progress = reel_service.learner_progress(
-            conn, material_id, learner_id
-        )
+        if difficulty_progress is None:
+            difficulty_progress = reel_service.learner_progress(
+                conn, material_id, learner_id
+            )
         ranked = reel_service.select_difficulty_inventory(
             ranked,
             str(difficulty_progress.get("selected_level") or "beginner"),
@@ -3968,6 +4008,14 @@ def _run_leased_generation_job(
                 )
 
             base_exclusions = list(params.get("exclude_video_ids") or [])
+            completed_source_ids: set[str] = set()
+
+            def usage_payload_with_completed_sources() -> dict[str, Any]:
+                payload = context.usage_payload()
+                counters = dict(payload.get("counters") or {})
+                counters["analyzed_sources"] = len(completed_source_ids)
+                payload["counters"] = counters
+                return payload
 
             def run_retrieval_stage(
                 *,
@@ -4016,14 +4064,13 @@ def _run_leased_generation_job(
                 context.budget.reserve_pass()
                 if should_cancel():
                     raise GenerationCancelledError("Generation cancelled.")
-                analyzed_video_ids: set[str] = set()
                 retrieved_video_ids: set[str] = set()
                 run_retrieval_stage(
                     retrieval_profile="deep",
                     video_budget=remaining_source_budget,
                     new_reel_cap=requested_count - current_count,
                     excluded_video_ids=base_exclusions,
-                    analyzed_video_ids=analyzed_video_ids,
+                    analyzed_video_ids=completed_source_ids,
                     retrieved_video_ids=retrieved_video_ids,
                 )
                 current_count = source_reel_count + _count_generation_reels(
@@ -4035,7 +4082,7 @@ def _run_leased_generation_job(
                     lease_owner=lease_owner,
                     phase="ranking",
                     progress=0.85,
-                    usage=context.usage_payload(),
+                    usage=usage_payload_with_completed_sources(),
                 ):
                     raise JobLeaseLostError(
                         f"generation job lease is no longer active: {job_id}"
@@ -4083,7 +4130,8 @@ def _run_leased_generation_job(
 
             usage_records = context.usage()
             stage_counters = context.counters()
-            usage_payload = context.usage_payload()
+            stage_counters["analyzed_sources"] = len(completed_source_ids)
+            usage_payload = usage_payload_with_completed_sources()
             model_records = [
                 row
                 for row in usage_records
