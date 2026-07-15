@@ -38,7 +38,7 @@ def _transcript(duration: float = 100.0) -> dict:
 
 
 def _empty_plan(schema: type, *, topic: str = ""):
-    if schema is G._IntentBoundaryPlan:
+    if schema in {G._CompactBoundaryPlan, G._IntentBoundaryPlan}:
         exact_request = topic.strip() or "(all educational topics)"
         return schema(
             request_intent={
@@ -612,10 +612,12 @@ def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
         directly_teaches_topic=True,
         substantive=True,
         factually_grounded=True,
-        topic_evidence_quote="Alpha lesson defines the concept completely",
         self_contained=True,
         is_standalone=True,
-        intent_role="primary",
+        intent_evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": "Alpha lesson defines the concept completely",
+        }],
     ).model_dump(mode="json", by_alias=True)
     malformed = {**valid, "id": "candidate-bad", "rel": "high"}
     telemetry = GC.GeminiCallTelemetry(
@@ -636,6 +638,15 @@ def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
         "generate_json_v3",
         lambda *args, **kwargs: GC.GenerationResult(
             json.dumps({
+                "request_intent": {
+                    "exact_request": "alpha lesson",
+                    "constraints": [{
+                        "constraint_id": "subject",
+                        "kind": "subject",
+                        "source_phrase": "alpha lesson",
+                        "requirement": "Teach the alpha lesson",
+                    }],
+                },
                 "topics": [malformed, valid],
             }),
             telemetry,

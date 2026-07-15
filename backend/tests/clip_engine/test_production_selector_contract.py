@@ -57,6 +57,29 @@ def _intent_plan(
     )
 
 
+def _compact_plan(
+    *,
+    exact_request: str,
+    constraints: list[dict],
+    evidence: list[dict],
+) -> gemini_segment._CompactBoundaryPlan:
+    proposal = _proposal()
+    data = {
+        key: value
+        for key, value in proposal.model_dump().items()
+        if key in gemini_segment._CompactBoundaryTopic.model_fields
+        and key != "intent_evidence"
+    }
+    data["intent_evidence"] = evidence
+    return gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": exact_request,
+            "constraints": constraints,
+        },
+        topics=[gemini_segment._CompactBoundaryTopic.model_validate(data)],
+    )
+
+
 def test_single_call_boundary_schema_caps_exhaustive_output_before_truncation() -> None:
     forty = [
         _proposal().model_copy(update={"candidate_id": f"candidate-{index}"})
@@ -91,7 +114,12 @@ def test_selector_reconciles_actual_usage_before_conversion(
         gemini_client,
         "generate_json_v3",
         lambda *_args, **_kwargs: SimpleNamespace(
-            text='{"topics":[]}',
+            text=(
+                '{"request_intent":{"exact_request":"test topic","constraints":['
+                '{"constraint_id":"subject","kind":"subject",'
+                '"source_phrase":"test topic","requirement":"Teach the test topic"}]},'
+                '"topics":[]}'
+            ),
             telemetry={
                 "model": "gemini-3.5-flash",
                 "prompt_tokens": 2_000,
@@ -535,18 +563,39 @@ def test_compact_selector_aliases_preserve_canonical_fields_and_supporting_rank(
         directly_teaches_topic=True,
         substantive=True,
         factually_grounded=True,
-        topic_evidence_quote=(
-            "A derivative measures instantaneous change in a function with respect"
-        ),
         self_contained=True,
         is_standalone=True,
-        intent_role="supporting",
+        intent_evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": (
+                "A derivative measures instantaneous change in a function with respect"
+            ),
+        }],
     )
-    payload = gemini_segment._CompactBoundaryPlan(topics=[compact]).model_dump_json(
-        by_alias=True
-    )
+    payload = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": "chain rule worked example",
+            "constraints": [
+                {
+                    "constraint_id": "subject",
+                    "kind": "subject",
+                    "source_phrase": "chain rule",
+                    "requirement": "Teach the chain rule",
+                },
+                {
+                    "constraint_id": "task",
+                    "kind": "format",
+                    "source_phrase": "worked example",
+                    "requirement": "Work through an example",
+                },
+            ],
+        },
+        topics=[compact],
+    ).model_dump_json(by_alias=True)
     assert '"id":"supporting-definition"' in payload
-    assert '"role":"supporting"' in payload
+    assert '"ie":[{"id":"subject","q":' in payload
+    assert '"role"' not in payload
+    assert '"evidence"' not in payload
     parsed = gemini_segment._CompactBoundaryPlan.model_validate_json(payload)
 
     report = gemini_segment._plan_to_report(
@@ -568,7 +617,85 @@ def test_compact_selector_aliases_preserve_canonical_fields_and_supporting_rank(
     assert report.rejected_reasons == []
     assert report.clips[0]["intent_role"] == "supporting"
     assert report.clips[0]["intent_coverage"] == 0.5
-    assert report.clips[0]["intent_evidence"][0]["constraint_id"] == "exact_request"
+    assert report.clips[0]["intent_evidence"][0]["constraint_id"] == "subject"
+    assert report.clips[0]["topic_evidence_quote"].startswith(
+        "A derivative measures instantaneous change"
+    )
+
+
+def test_compact_selector_rejects_a_retrieval_expansion_as_exact_request() -> None:
+    plan = _compact_plan(
+        exact_request="plant energy conversion",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "plant energy conversion",
+            "requirement": "Teach plant energy conversion",
+        }],
+        evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": (
+                "Cells use chlorophyll to capture light energy and power the chemical reactions"
+            ),
+        }],
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{
+            "cue_id": "photosynthesis",
+            "start": 0.0,
+            "end": 10.0,
+            "text": (
+                "Cells use chlorophyll to capture light energy and power the chemical "
+                "reactions of photosynthesis."
+            ),
+        }],
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["intent_contract_request_mismatch"]
+
+
+def test_compact_selector_derives_primary_and_topic_evidence_from_grounding() -> None:
+    evidence_quote = (
+        "Cells use chlorophyll to capture light energy and power the chemical reactions"
+    )
+    plan = _compact_plan(
+        exact_request="photosynthesis",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "photosynthesis",
+            "requirement": "Teach photosynthesis",
+        }],
+        evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": evidence_quote,
+        }],
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{
+            "cue_id": "photosynthesis",
+            "start": 0.0,
+            "end": 10.0,
+            "text": f"{evidence_quote} of photosynthesis.",
+        }],
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["intent_role"] == "primary"
+    assert clip["intent_coverage"] == 1.0
+    assert clip["topic_evidence_quote"] == evidence_quote
 
 
 def test_selector_accepts_non_lossy_descriptive_strings_beyond_prompt_limits() -> None:
@@ -977,7 +1104,9 @@ def test_selector_prompt_is_exhaustive_and_allows_one_listed_component() -> None
     assert "learning_objective (at most 24 words)" in user
     assert "facet (at most 12 words)" in user
     assert user.index("Transcript (") < user.index("Exact user request:")
-    assert "1. Privately interpret the exact request" in user
+    assert "1. Interpret the exact request" in user
+    assert "request_intent" in user
+    assert "Do not output a role" in user
     assert "requested operations or tasks" in user
     assert "Do not substitute retrieval expansions" in user
     assert "2. Map every distinct educational unit" in user

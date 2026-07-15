@@ -1210,7 +1210,7 @@ class ReelService:
     # v25: accept validated transcript-context boundaries in current inventory.
     # v26: rank exact-request fulfillment within each difficulty stage.
     RANKED_FEED_CACHE_VERSION = 26
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v18"
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v19"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
         "quality_silence_v4",
@@ -1228,6 +1228,7 @@ class ReelService:
         "quality_silence_v16",
         "quality_silence_v17",
         "quality_silence_v18",
+        "quality_silence_v19",
     })
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
@@ -1926,15 +1927,18 @@ class ReelService:
             )
             if video_budget <= 0:
                 break
+            surface_reel_capacity = (
+                new_reel_limit - len(generated)
+                if new_reel_limit is not None
+                else (
+                    num_reels - len(generated)
+                    if generation_context is not None
+                    else max(3, num_reels - len(generated)) + 2
+                )
+            )
             ingest_reel_cap = min(
                 remaining_reel_capacity,
-                remaining_reel_capacity
-                if generation_context is not None
-                else (
-                    new_reel_limit - len(generated)
-                    if new_reel_limit is not None
-                    else max(3, num_reels - len(generated)) + 2
-                ),
+                max(0, surface_reel_capacity),
             )
             if ingest_reel_cap <= 0:
                 break
@@ -2480,6 +2484,7 @@ class ReelService:
                 "quality_silence_v16",
                 "quality_silence_v17",
                 "quality_silence_v18",
+                "quality_silence_v19",
             }
             for reel in generated
         ):
@@ -5826,6 +5831,7 @@ class ReelService:
                 "quality_silence_v16",
                 "quality_silence_v17",
                 "quality_silence_v18",
+                "quality_silence_v19",
             },
         )
         metadata["_selection_substantive"] = selection_bool(
@@ -5848,6 +5854,7 @@ class ReelService:
                 "quality_silence_v16",
                 "quality_silence_v17",
                 "quality_silence_v18",
+                "quality_silence_v19",
             },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
@@ -7338,6 +7345,7 @@ class ReelService:
                     "quality_silence_v16",
                     "quality_silence_v17",
                     "quality_silence_v18",
+                    "quality_silence_v19",
                 }
                 else legacy_difficulty_matches_level
             )
@@ -7380,6 +7388,7 @@ class ReelService:
                             "quality_silence_v16",
                             "quality_silence_v17",
                             "quality_silence_v18",
+                            "quality_silence_v19",
                         }
                         and selection_metadata.get(
                             "_selection_speech_corridor_verified"
@@ -7408,6 +7417,7 @@ class ReelService:
                     "quality_silence_v16",
                     "quality_silence_v17",
                     "quality_silence_v18",
+                    "quality_silence_v19",
                 } and (
                     (
                         min(
@@ -7437,6 +7447,7 @@ class ReelService:
                             "quality_silence_v16",
                             "quality_silence_v17",
                             "quality_silence_v18",
+                            "quality_silence_v19",
                         }
                         else self._selection_number(
                             selection_metadata.get("_selection_topic_relevance"), 0.0
@@ -7776,6 +7787,7 @@ class ReelService:
                 "quality_silence_v16",
                 "quality_silence_v17",
                 "quality_silence_v18",
+                "quality_silence_v19",
             }:
                 # V5+ captions must be immutable selection-time evidence. A
                 # provider artifact key identifies a retrieval profile and may
@@ -7809,6 +7821,7 @@ class ReelService:
                         "quality_silence_v16",
                         "quality_silence_v17",
                         "quality_silence_v18",
+                        "quality_silence_v19",
                     }
                     or transcript_artifact_key
                     else str(clean_item.get("transcript_snippet") or "")

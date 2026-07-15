@@ -352,7 +352,7 @@ assessment_service = AssessmentService()
 MAX_REELS_PER_MATERIAL = 300
 GENERATION_OUTPUT_CEILINGS = {"fast": 8, "slow": 12}
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v18"
+SELECTION_CONTRACT_VERSION = "quality_silence_v19"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -3939,14 +3939,16 @@ def _run_leased_generation_job(
             )
             emitted: set[tuple[str, str]] = set()
             # Candidate events are provisional and reconciled against the
-            # authoritative capped final. Every persisted candidate streams as
-            # soon as it passes verification.
+            # authoritative capped final. Accepted overflow stays persisted for
+            # later difficulty progression without exceeding the live ceiling.
 
             def on_candidate(reel: dict[str, Any]) -> None:
                 if should_cancel():
                     raise GenerationCancelledError("Generation cancelled.")
                 identity = _reel_identity_key(reel)
                 if identity in emitted:
+                    return
+                if len(emitted) >= requested_count:
                     return
                 emitted.add(identity)
                 public_reel = _public_generation_reel(reel)

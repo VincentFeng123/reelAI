@@ -27,6 +27,7 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("REELAI_INGEST_SKIP_IMPORT_SWEEP", "1")
 
 from backend.app import db as db_module  # noqa: E402
+from backend.app.clip_engine.provider_runtime import GenerationContext  # noqa: E402
 from backend.app.config import get_settings  # noqa: E402
 import backend.app.main as main_module  # noqa: E402
 from backend.app.ingestion import pipeline as pipeline_module  # noqa: E402
@@ -201,6 +202,44 @@ def _five_minute_engine_out() -> dict:
             ],
             "words": [],
             "duration": 300.0,
+        },
+        "notes": "",
+    })
+
+
+def _many_clip_engine_out(count: int) -> dict:
+    """Distinct valid teaching units from one source-level selector call."""
+    clips = []
+    segments = []
+    for index in range(count):
+        start = float(index * 10)
+        end = start + 8.0
+        clips.append({
+            "start": start,
+            "end": end,
+            "cut_end": end,
+            "title": f"Cellular respiration teaching unit {index}",
+            "facet": f"unit-{index}",
+            "reason": "Distinct informational teaching unit.",
+            "sequence_index": index,
+            "selection_candidate_id": f"candidate-{index}",
+            "embed_url": "",
+        })
+        segments.append({
+            "start": start,
+            "end": end,
+            "text": (
+                "Cellular respiration transfers chemical energy in distinct "
+                f"teaching unit {index}."
+            ),
+        })
+    return _quality_v2_engine_out({
+        "video_id": VIDEO_ID,
+        "clips": clips,
+        "transcript": {
+            "segments": segments,
+            "words": [],
+            "duration": float(count * 10),
         },
         "notes": "",
     })
@@ -843,9 +882,37 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertEqual(len(feed), 2)
         self.assertTrue(all(
-            reel.get("selection_contract_version") == "quality_silence_v18"
+            reel.get("selection_contract_version") == "quality_silence_v19"
             for reel in feed
         ))
+
+    def test_generation_ceiling_streams_eight_but_persists_all_forty(self) -> None:
+        self._patched_engine(_many_clip_engine_out(40))
+        collector: list[dict] = []
+
+        with db_module.get_conn() as conn:
+            result = main_module.reel_service.generate_reels(
+                conn,
+                material_id=MATERIAL_ID,
+                concept_id=CONCEPT_ID,
+                num_reels=8,
+                creative_commons_only=False,
+                generation_id="gen-forty-candidates",
+                on_reel_created=collector.append,
+                generation_context=GenerationContext("fast"),
+                max_new_reels=8,
+            )
+
+        with db_module.get_conn() as conn:
+            stored = db_module.fetch_all(
+                conn,
+                "SELECT id FROM reels WHERE generation_id = ?",
+                ("gen-forty-candidates",),
+            )
+
+        self.assertEqual(len(stored), 40)
+        self.assertEqual(len(collector), 8)
+        self.assertEqual(len(result), 8)
 
     def test_quality_silence_v12_response_orders_stage_before_quality(self) -> None:
         generated = [

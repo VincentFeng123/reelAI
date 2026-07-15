@@ -298,7 +298,12 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
 
 @pytest.mark.parametrize(
     "stale_version",
-    ["quality_silence_v6", "quality_silence_v9", "quality_silence_v10"],
+    [
+        "quality_silence_v6",
+        "quality_silence_v9",
+        "quality_silence_v10",
+        "quality_silence_v18",
+    ],
 )
 def test_request_key_version_invalidates_stale_inventory(
     monkeypatch,
@@ -316,7 +321,7 @@ def test_request_key_version_invalidates_stale_inventory(
         "target_clip_duration_min_sec": 20,
         "target_clip_duration_max_sec": 55,
     }
-    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v18"
+    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v19"
     verified_key = jobs.build_request_key(**params)
     monkeypatch.setattr(jobs, "REQUEST_SCHEMA_VERSION", stale_version)
 

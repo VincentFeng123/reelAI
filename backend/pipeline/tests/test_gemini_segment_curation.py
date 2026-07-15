@@ -268,13 +268,26 @@ def test_forty_realistic_boundary_candidates_fit_bounded_output_reservation():
             facet=f"facet-{index}",
             start_quote=f"line {index} explains the mechanism",
             end_quote=f"and reaches conclusion {index}",
-            topic_evidence_quote=(
-                f"line {index} explains this informational mechanism and reaches its conclusion"
-            ),
+            intent_evidence=[{
+                "constraint_id": "subject",
+                "evidence_quote": (
+                    f"line {index} explains this informational mechanism and reaches its conclusion"
+                ),
+            }],
         )
-        data["intent_role"] = "primary"
         topics.append(G._CompactBoundaryTopic.model_validate(data))
-    payload = G._CompactBoundaryPlan(topics=topics).model_dump_json(
+    payload = G._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": "informational mechanism",
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": "informational mechanism",
+                "requirement": "Teach an informational mechanism",
+            }],
+        },
+        topics=topics,
+    ).model_dump_json(
         by_alias=True,
         exclude_defaults=True,
     )
@@ -1568,7 +1581,7 @@ def test_brief_same_cue_internal_aside_is_tolerated():
 
 
 @pytest.mark.parametrize("topic", ["biology", "biology myths", "Gothic architecture"])
-def test_unrequested_fictional_biology_is_rejected_even_with_real_terminology(topic):
+def test_unrequested_fictional_biology_fails_the_universal_factuality_gate(topic):
     segments = [{
         "cue_id": "oJLA8iNUV-0:722.37-773.27",
         "start": 722.37,
@@ -1595,7 +1608,7 @@ def test_unrequested_fictional_biology_is_rejected_even_with_real_terminology(to
             topic_evidence_quote=(
                 "our eyes contain arrays of specialized receptor cells some only activate"
             ),
-        )]),
+        ).model_copy(update={"factually_grounded": False})]),
         segments,
         [],
         {},
@@ -1603,7 +1616,7 @@ def test_unrequested_fictional_biology_is_rejected_even_with_real_terminology(to
     )
 
     assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:fictional_framing"]
+    assert report.rejected_reasons == ["proposal_0:not_factually_grounded"]
 
 
 def test_requested_fictional_topic_can_still_teach_its_named_subject():

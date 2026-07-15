@@ -183,6 +183,15 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
         assert schema is gemini_segment._CompactBoundaryPlan
         plan = schema.model_validate(
             {
+                "request_intent": {
+                    "exact_request": TOPIC,
+                    "constraints": [{
+                        "constraint_id": "subject",
+                        "kind": "subject",
+                        "source_phrase": TOPIC,
+                        "requirement": "Teach an introduction to Python",
+                    }],
+                },
                 "topics": [
                         {
                             "candidate_id": "python-variables",
@@ -201,14 +210,16 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
                                     "directly_teaches_topic": True,
                                     "substantive": True,
                                     "factually_grounded": True,
-                                    "topic_evidence_quote": (
+                                    "self_contained": True,
+                                "is_standalone": True,
+                            "difficulty": 0.1,
+                            "intent_evidence": [{
+                                "constraint_id": "subject",
+                                "evidence_quote": (
                                     "Python variables store values such as numbers and strings"
                                 ),
-                                "self_contained": True,
-                            "is_standalone": True,
-                        "difficulty": 0.1,
-                        "intent_role": "primary",
-                    }
+                            }],
+                        }
                 ]
             }
         )

@@ -21,6 +21,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
+from functools import lru_cache
 from threading import BoundedSemaphore, Lock
 from typing import Callable, Literal, Optional
 
@@ -120,6 +121,8 @@ _STRUCTURAL_FILLER_RE = re.compile(
     r"let(?:['’]?s| us)\s+(?:begin|get started|start|dive in|delve)"
     r"\s*[.!?](?=\s|$)|"
     r"(?:cool|hey|fun fact|brilliant)\s*[!,.](?=\s|$)|"
+    r"there(?:['’]s|\s+is)\s+(?:just\s+)?(?:a|one)\s+"
+    r"(?:issue|problem|thing)\s*:|"
     r"(?:oh\s*[,;:]?\s*)?(?:yeah\s*[,;:]?\s*)?by the way\b|"
     r"sponsored by\b|"
     r"we (?:made|have) (?:a|an|another|whole) video "
@@ -208,10 +211,33 @@ _VISUAL_DEPENDENCY_RE = re.compile(
     r"these (?:diagrams|figures|charts|graphs|images|pictures|slides)\b|"
     r"the (?:diagram|figure|chart|graph|image|slide) (?:shows|illustrates)|"
     r"what (?:you(?:['’]re| are)|we(?:['’]re| are)) seeing (?:here|on screen)|"
-    r"look (?:here|at this|at (?:(?:this|the) )?(?:animation|chart|diagram|drawing|equation|"
+    r"look (?:here(?=\s*[.!?]*\s*$)|at this(?=\s*[.!?]*\s*$)|"
+    r"at (?:(?:this|the) )?(?:animation|chart|diagram|drawing|equation|"
     r"figure|graph|image|map|object|screen|shape|simulation|slide|table))|"
-    r"over here|watch (?:this|what happens)|"
-    r"I(?:['’]m| am)? (?:drawing|writing)|I(?:['’]ll| will) (?:draw|write))\b",
+    r"over here|right over there|watch (?:this|what happens)(?=\s*[.!?]*\s*$)|"
+    r"looks? (?:something )?like (?:that|this(?=\s*[.!?]*\s*$))|"
+    r"(?:I(?:['’]m| am)? (?:drawing|writing)|I(?:['’]ll| will) (?:draw|write))"
+    r"(?=\s*(?:(?:(?:this|that|the|a)\s+)?(?:chart|diagram|figure|graph|line|"
+    r"map|shape)|here|on (?:the )?screen)\b|\s*[.!?]*\s*$))",
+    re.IGNORECASE,
+)
+_DEICTIC_POINT_DEPENDENCY_RE = re.compile(
+    r"\b(?:between|pick|take|choose)\s+"
+    r"(?P<first>this|that)\s+point\s+(?:and|to)\s+"
+    r"(?P<second>this|that)\s+point\b",
+    re.IGNORECASE,
+)
+_SENTENCE_LOCAL_VISUAL_SIGNAL_RE = re.compile(
+    r"\b(?:look\s+(?:here|at\s+this)|watch\s+(?:this|what\s+happens)|"
+    r"looks?\s+(?:something\s+)?like\s+this|"
+    r"i(?:['’]m|\s+am)?\s+(?:drawing|writing)|"
+    r"i(?:['’]ll|\s+will)\s+(?:draw|write))\b",
+    re.IGNORECASE,
+)
+_DEICTIC_POINT_DEFINITION_RE = re.compile(
+    r"(?:\b(?:let|define|take|suppose|assume)\s+|\band\s+)"
+    r"(?P<label>this|that)\s+point\b[^.!?]{0,80}?"
+    r"\b(?:at|be|coordinate|equal|x|y)\b",
     re.IGNORECASE,
 )
 _DANGLING_TAIL_PREFIX_RE = re.compile(
@@ -277,6 +303,11 @@ _TERMINAL_CALLBACK_RE = re.compile(
 _TERMINAL_DANGLING_TRANSITION_RE = re.compile(
     r"(?:^|[.!?]\s+)(?:all\s+right\s*[,;:]?\s*)?"
     r"let(?:['’]?s|\s+us)\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_DANGLING_DISCOURSE_LEADIN_RE = re.compile(
+    r"\b(?:but|however|now|so|then)\s+"
+    r"(?:occasionally|sometimes|typically|usually)\s*[,.!?]?\s*$",
     re.IGNORECASE,
 )
 _TERMINAL_DANGLING_EXAMPLE_INTRO_RE = re.compile(
@@ -394,8 +425,21 @@ _FORWARD_TOPIC_TRANSITION_RE = re.compile(
     rf"(?:now\s+(?:we\s+(?:got|have|need)\s+to\s+"
     rf"{_TOPIC_NAVIGATION_ACTION_PATTERN}|"
     r"let(?:['’]?s|\s+us)\s+(?:back\s+up|move\s+on|turn\s+to))|"
+    r"(?:(?:now|next)\s*[,;:]?\s+)?"
+    r"(?:let(?:['’]?s|\s+us)\s+(?:consider|do|go\s+through|look\s+at|take|"
+    r"try|work\s+out|work\s+through)|consider|for|try)\s+"
+    r"(?:another|one\s+more|the\s+next|a\s+(?:different|new))\s+"
+    r"(?:(?:brief|concrete|quick|short|simple|worked)\s+)*"
+    r"(?:calculation|case|demonstration|derivation|example|exercise|problem|proof)|"
+    r"(?:now\s+)?our\s+next\s+"
+    r"(?:calculation|case|demonstration|derivation|example|exercise|problem|proof)"
+    r"\s+is|"
     rf"next\s+(?:we|i)(?:\s+will|['’]ll)\s+"
     rf"{_TOPIC_NAVIGATION_ACTION_PATTERN}|"
+    r"(?:now\s+)?here(?:['’]s|\s+is)\s+"
+    r"(?:another|one\s+more|the\s+next|a\s+(?:different|new))\s+"
+    r"(?:(?:brief|concrete|quick|short|simple|worked)\s+)*"
+    r"(?:calculation|case|demonstration|derivation|example|exercise|problem|proof)|"
     r"(?:now\s+)?(?:the\s+)?next\s+(?:topic|concept|section|part)|"
     r"let(?:['’]?s|\s+us)\s+(?:back\s+up|move\s+on|turn\s+to))\b",
     re.IGNORECASE,
@@ -429,6 +473,18 @@ _HARD_TOPIC_RESET_RE = re.compile(
     r"(?:now\s+)?that\s+brings\s+us\s+to|"
     r"(?:now\s+)?moving\s+on\s+to|"
     r"(?:now\s+)?turn\s+(?:our\s+)?attention\s+to|"
+    r"(?:now\s+)?(?:let(?:['’]?s|\s+us)\s+(?:consider|do|go\s+through|"
+    r"look\s+at|take|try|work\s+out|work\s+through)|consider|for|try)"
+    r"(?=\s+(?:another|one\s+more|the\s+next|a\s+(?:different|new))\s+"
+    r"(?:(?:brief|concrete|quick|short|simple|worked)\s+)*"
+    r"(?:calculation|case|demonstration|derivation|example|exercise|problem|proof)\b)|"
+    r"(?:now\s+)?our\s+next\s+"
+    r"(?:calculation|case|demonstration|derivation|example|exercise|problem|proof)"
+    r"\s+is|"
+    r"(?:now\s+)?here(?:['’]s|\s+is)"
+    r"(?=\s+(?:another|one\s+more|the\s+next|a\s+(?:different|new))\s+"
+    r"(?:(?:brief|concrete|quick|short|simple|worked)\s+)*"
+    r"(?:calculation|case|demonstration|derivation|example|exercise|problem|proof)\b)|"
     r"(?:now\s+)?(?:the\s+)?next\s+(?:topic|concept|section)\s+(?:is|covers))"
     r"\s+(?P<subject>[^.!?,;:]{1,100})",
     re.IGNORECASE,
@@ -501,14 +557,30 @@ _OPENING_TOPIC_ANNOUNCEMENT_PREFIX_RE = re.compile(
 _OPENING_EXAMPLE_FRAMING_SENTENCE_RE = re.compile(
     r"^\s*(?:"
     r"here(?:['’]s|\s+is)\s+|"
-    r"let(?:['’]?s|\s+us)\s+(?:consider|look\s+at|try|walk\s+through|"
-    r"work\s+through)\s+|"
+    r"let(?:['’]?s|\s+us)\s+(?:consider|do|go\s+through|look\s+at|take|try|"
+    r"walk\s+through|work\s+out|work\s+through)\s+|"
     r"(?:now\s*[,;:]?\s+)?(?:consider|try)\s+"
+    r"|(?:now\s*[,;:]?\s+)?for\s+"
     r")"
     r"(?:(?:an?|(?:yet\s+)?another|one\s+more|the\s+(?:following|next)|"
     r"a\s+(?:new|second))\s+)"
     r"(?:(?:brief|concrete|quick|short|simple|worked)\s+)*"
-    r"(?:case|example|problem)(?:\s+(?:for\s+us|here|now))?\s*[.!?]+\s*$",
+    r"(?:calculation|case|demonstration|derivation|example|exercise|problem|proof)"
+    r"(?:\s+(?:for\s+us|here|now))?\s*[.!?]+\s*$",
+    re.IGNORECASE,
+)
+_NEXT_EXAMPLE_FRAMING_RE = re.compile(
+    r"^\s*(?:(?:now|next)\s*[,;:]?\s+)?(?:"
+    r"let(?:['’]?s|\s+us)\s+(?:consider|do|go\s+through|look\s+at|take|try|"
+    r"work\s+out|work\s+through)\s+|"
+    r"(?:consider|for|try)\s+|here(?:['’]s|\s+is)\s+)"
+    r"(?:another|one\s+more|the\s+next|a\s+(?:different|new))\s+"
+    r"(?:(?:brief|concrete|quick|short|simple|worked)\s+)*"
+    r"(?:calculation|case|demonstration|derivation|example|exercise|problem|proof)"
+    r"\s*[.!?]*\s*$|"
+    r"^\s*(?:(?:now|next)\s*[,;:]?\s+)?our\s+next\s+"
+    r"(?:calculation|case|demonstration|derivation|example|exercise|problem|proof)"
+    r"\s+is\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
 _OPENING_EDGE_META_SENTENCE_RE = re.compile(
@@ -518,12 +590,72 @@ _OPENING_EDGE_META_SENTENCE_RE = re.compile(
 )
 _OPENING_CONTEXTUAL_REFORMULATION_RE = re.compile(
     r"^\s*(?:(?:now|so)\s*[,;:]?\s+)?(?:"
-    r"there\s+(?:is|are|was|were)\s+(?:an?\s+)?other\b|"
+    r"there(?:['’]s|\s+(?:is|are|was|were))\s+(?:an?\s+)?other\b|"
     r"one\s+more\s+(?:case|example|function|point|reason|step|thing|way)s?"
     r"\s*[.!?]?\s*$|"
     r"another\s+(?:(?:one|ones|thing|things)\b|"
     r"(?:example|examples|case|cases)\b(?!\s+of\b))"
     r")",
+    re.IGNORECASE,
+)
+_OPENING_CONTEXTUAL_EXAMPLE_RE = re.compile(
+    r"^\s*(?:in|for)\s+(?:this|that|the)\s+"
+    r"(?:(?:particular|previous|same|specific)\s+)?"
+    r"(?:calculation|case|demonstration|derivation|example|exercise|problem|proof)\b",
+    re.IGNORECASE,
+)
+_LOCAL_EXAMPLE_SETUP_RE = re.compile(
+    r"\b(?:assume|calculate|consider|determine|evaluate|find|given|let|prove|"
+    r"show|solve|suppose)\b|"
+    r"\blimit\b[^.!?]{0,140}\b(?:approaches|tends\s+to)\b|"
+    r"\b(?:equation|expression|function|problem)\b[^.!?]{0,140}"
+    r"\b(?:equals?|gives?|is)\b",
+    re.IGNORECASE,
+)
+_LOCAL_SETUP_ACTION_RE = re.compile(
+    r"\b(?:calculate|consider|determine|evaluate|find|prove|show|solve)\b"
+    r"(?P<object>[^.!?]{0,120})",
+    re.IGNORECASE,
+)
+_GENERAL_SETUP_ACTION_RE = re.compile(
+    r"^\s*(?:analyze|apply|classify|compare|contrast|describe|explain|identify|"
+    r"interpret|name|state|trace)\b(?P<object>[^.!?]{0,180})",
+    re.IGNORECASE,
+)
+_UNGROUNDED_IMPERATIVE_RE = re.compile(
+    r"^\s*(?:apply|cancel|differentiate|divide|factor|multiply|plug|replace|"
+    r"substitute|simplify)\b",
+    re.IGNORECASE,
+)
+_LOCAL_EXPLICIT_PROBLEM_RE = re.compile(
+    r"\blimit\b[^.!?]{0,140}\b(?:approaches|tends\s+to)\b|"
+    r"\b(?:equation|expression|function|problem)\b[^.!?]{0,140}"
+    r"\b(?:equals?|gives?|is)\b|"
+    r"\b(?:given|let)\s+"
+    r"(?!(?:it|this|that|these|those|they|here|there|next|previous|same)\b)"
+    r"(?:the\s+)?[a-z0-9][a-z0-9'_-]*\b",
+    re.IGNORECASE,
+)
+_OPENING_AGENDA_RE = re.compile(
+    r"^\s*in\s+(?:this|the)\s+(?:course|lesson|section|video)\s+"
+    r"(?:i|we)(?:['’](?:ll|m|re)|\s+(?:am|are|will))\s+"
+    r"(?:just\s+)?(?:going\s+to\s+)?"
+    r"(?:cover|discuss|explain|go(?:\s+over)?|introduce|review|show|talk\s+about|teach)\b",
+    re.IGNORECASE,
+)
+_OPENING_AGENDA_CONTINUATION_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:about|including|over)\s+|"
+    r"(?:and|or)\s+(?:algebraically|analytically|conceptually|graphically|"
+    r"numerically|(?:how|what|when|where)\s+to)\b)",
+    re.IGNORECASE,
+)
+_PEDAGOGICAL_SETUP_ONSET_RE = re.compile(
+    r"^\s*(?:(?:now|so)\s*[,;:]?\s+)?(?:"
+    r"let(?:['’]?s|\s+us)\s+(?:assume|calculate|consider|evaluate|find|say|solve|suppose|try)|"
+    r"(?:assume|assuming|consider|given|suppose)\b|"
+    r"(?:calculate|determine|evaluate|find|prove|show|solve)\b|"
+    r"(?:how|what|when|where|which|why)\b)",
     re.IGNORECASE,
 )
 _OPENING_PREPOSITIONAL_TAG_RE = re.compile(
@@ -552,7 +684,24 @@ _OPENING_RECOVERABLE_SETUP_RE = re.compile(
 )
 _OPENING_SETUP_BACK_REFERENCE_RE = re.compile(
     r"\b(?:it|this|that|these|those|they|here|there|again|above|earlier|"
-    r"previous|same)\b",
+    r"next|previous|same)\b",
+    re.IGNORECASE,
+)
+_LOCAL_SETUP_EXPLICIT_GROUNDING_RE = re.compile(
+    r"\b(?:is|are|was|were)\s+(?:described|defined|given|written)\s+as\b",
+    re.IGNORECASE,
+)
+_LATER_RESTATED_EXAMPLE_REASONING_RE = re.compile(
+    r"\b(?:after|because|before|by|cancel(?:ing|led|s)?|derive(?:d|s)?|"
+    r"differentiat(?:e|ed|es|ing)|divide(?:d|s)?|factor(?:ed|ing|s)?|first|"
+    r"multiply|next|replace|rewrite|simplif(?:y|ied|ies)|substitut(?:e|ed|es|ing)|"
+    r"then|therefore|through|thus|using|which\s+means)\b",
+    re.IGNORECASE,
+)
+_LATER_RESTATED_EXAMPLE_CONCLUSION_RE = re.compile(
+    r"\b(?:(?:the\s+)?(?:answer|result|solution)\s+(?:is|equals?)|"
+    r"approaches?\s+(?:a\s+)?value|finally|gives?|hence|therefore|thus|"
+    r"this\s+(?:means|shows))\b",
     re.IGNORECASE,
 )
 _NON_STANDALONE_MARKER_SUFFIX_RE = re.compile(
@@ -566,6 +715,9 @@ _NON_STANDALONE_MARKER_SUFFIX_RE = re.compile(
 )
 _UNCONDITIONAL_TRAILING_EDGE_NOISE_PATTERN = (
     r"(?:"
+    r"(?:(?:and\s+)?so\s*[,;:]?\s+)?that(?:['’]s|\s+is)\s+it\s+for\s+"
+    r"(?:this|that|the)\s+(?:worked\s+)?"
+    r"(?:calculation|case|derivation|example|exercise|problem|proof)\b|"
     r"trust\s+me(?:\s*[,;:]\s*|\s+)"
     r"(?:we|i)(?:['’]ll|\s+will)\b[^\n]{0,180}?"
     r"\b(?:later|next\s+time|in\s+(?:a|the)\s+(?:later|future)\s+"
@@ -626,6 +778,21 @@ _TRAILING_TRANSITION_FRAGMENT_RE = re.compile(
     r"\bthough\s+now\s*[,;:.!?]*\s*$",
     re.IGNORECASE,
 )
+_TERMINAL_FUTURE_PREVIEW_RE = re.compile(
+    r"^\s*as\s+you(?:['’]ll|\s+will)\s+see\s+in\s+future\s+videos\b",
+    re.IGNORECASE,
+)
+_TERMINAL_MASTERY_RECAP_RE = re.compile(
+    r"\b(?:(?:and|so)\s+)?now\s+you\s+know\s+how\s+to\b",
+    re.IGNORECASE,
+)
+_TERMINAL_META_RESUMPTION_RE = re.compile(
+    r"^\s*(?:(?:now|next|then|finally)\s*[,;:]?\s+)?(?:"
+    r"apply|calculate|compute|continue|derive|determine|divide|evaluate|factor|"
+    r"multiply|return\s+to|solve|substitute|the\s+(?:answer|result)\s+is|"
+    r"therefore|thus)\b",
+    re.IGNORECASE,
+)
 _EDGE_ONLY_FRAMING_RE = re.compile(
     r"^\s*(?:remember\s+)?(?:on|in|for|with)\b.{0,80}\b"
     r"(?:right\s+)?we\s+(?:talked|spoke|learned|covered|went\s+over)\s+"
@@ -647,15 +814,6 @@ _TERMINAL_STRANDED_PREPOSITION_RE = re.compile(
     r"(?:i|we|you|they)\s+(?:can|could|will|would|should|may|might)\s+"
     r"(?:[a-z][a-z'-]*\s+){1,4}(?:from|with|to|for|about|on|at|by)"
     r"[.!?][\"')\]]*$",
-    re.IGNORECASE,
-)
-_VAMPIRE_TOPIC_RE = re.compile(
-    r"\b(?:vampir\w*|dracula|nosferatu)\b",
-    re.IGNORECASE,
-)
-_VAMPIRE_PSEUDOSCIENCE_SIGNAL_RE = re.compile(
-    r"\b(?:supernatural|lore|condition|virus|cross[- ]?wired|receptors?|"
-    r"visual cortex|crucifix|dark entit\w*)\b",
     re.IGNORECASE,
 )
 _STANDALONE_QUESTION_HEADS = frozenset({
@@ -905,6 +1063,16 @@ _CompactEvidenceQuote = Annotated[
 ]
 
 
+class _CompactIntentEvidence(_StrictModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    constraint_id: _IntentConstraintId = Field(alias="id")
+    evidence_quote: _CompactEvidenceQuote = Field(
+        alias="q",
+        description="Five to sixteen exact consecutive transcript words in this candidate.",
+    )
+
+
 class _CompactBoundaryTopic(_StrictModel):
     """Token-efficient production schema; attributes retain canonical names."""
 
@@ -929,22 +1097,18 @@ class _CompactBoundaryTopic(_StrictModel):
     directly_teaches_topic: bool = Field(strict=True, alias="direct")
     substantive: bool = Field(strict=True, alias="sub")
     factually_grounded: bool = Field(strict=True, alias="fact")
-    topic_evidence_quote: _CompactEvidenceQuote = Field(
-        alias="evidence",
-        description="Exact transcript quote proving relevance to the request.",
-    )
     self_contained: bool = Field(strict=True, alias="self")
     is_standalone: bool = Field(strict=True, alias="stand")
-    intent_role: _IntentRole = Field(
-        alias="role",
-        description=(
-            "primary only when this unit fulfills the exact requested task or relationship; "
-            "otherwise supporting"
-        ),
+    intent_evidence: list[_CompactIntentEvidence] = Field(
+        alias="ie",
+        min_length=1,
+        max_length=8,
+        description="One grounded item for each exact-request constraint this unit fulfills.",
     )
 
 
 class _CompactBoundaryPlan(_StrictModel):
+    request_intent: _RequestIntent
     topics: list[_CompactBoundaryTopic] = Field(max_length=_MAX_CLIPS)
 
 
@@ -1168,17 +1332,6 @@ def _topic_rule(topic: str) -> str:
     )
 
 
-def _contains_unrequested_vampire_pseudoscience(text: str, topic: str) -> bool:
-    requested = " ".join(str(topic or "").split())
-    if _VAMPIRE_TOPIC_RE.search(requested):
-        return False
-    candidate = re.sub(r"\bvampire bats?\b", "", str(text or ""), flags=re.IGNORECASE)
-    return bool(
-        re.search(r"\bvampir\w*\b", candidate, flags=re.IGNORECASE)
-        and _VAMPIRE_PSEUDOSCIENCE_SIGNAL_RE.search(candidate)
-    )
-
-
 def _learner_rule(level: str) -> str:
     normalized = " ".join(str(level or "").split()).casefold()
     if normalized not in {"beginner", "intermediate", "advanced"}:
@@ -1201,24 +1354,25 @@ def _selection_fields(*, enriched: bool, compact: bool = False) -> str:
         "learning_objective (at most 24 words), facet (at most 12 words), "
         "informativeness, topic_relevance, "
         "educational_importance, difficulty, directly_teaches_topic, substantive, "
-        "factually_grounded, "
-        "topic_evidence_quote (the shortest exact 5-12 consecutive-word quote copied wholly "
-        "between the chosen edges that proves the clip teaches the topic; preserve spelling "
-        "and never paraphrase or stitch), self_contained, is_standalone"
+        "factually_grounded"
     )
     if not compact:
         fields += (
+            ", topic_evidence_quote (the shortest exact 5-12 consecutive-word quote copied "
+            "wholly between the chosen edges that proves the clip teaches the topic; preserve "
+            "spelling and never paraphrase or stitch), self_contained, is_standalone"
             ", prerequisite_candidate_ids (omit it or return []), uncertainty "
             "(omit for low), uncertainty_reasons (omit for low)"
         )
     else:
         fields += (
+            ", self_contained, is_standalone"
             ". Use the compact schema keys: id=candidate_id, s=start_line, e=end_line, "
             "sq=start_quote, eq=end_quote, obj=learning_objective, "
             "info=informativeness, rel=topic_relevance, imp=educational_importance, "
             "diff=difficulty, direct=directly_teaches_topic, sub=substantive, "
-            "fact=factually_grounded, evidence=topic_evidence_quote, "
-            "self=self_contained, stand=is_standalone, role=intent_role"
+            "fact=factually_grounded, self=self_contained, stand=is_standalone, "
+            "ie=intent_evidence"
         )
     if enriched:
         fields += (
@@ -1283,7 +1437,11 @@ def _boundary_prompts(
         f"Exact user request: {exact_request}\n"
         f"{_topic_rule(topic)}\n\n"
         "Task:\n"
-        "1. Privately interpret the exact request before selecting anything: preserve its "
+        "1. Interpret the exact request before selecting anything. Return request_intent with "
+        "exact_request copied exactly from the Exact user request above and 1-8 atomic "
+        "constraints. Give every constraint a unique constraint_id, its kind, a concise "
+        "requirement, and source_phrase copied as exact consecutive words from that request. "
+        "Together the source phrases must cover every content-bearing request term. Preserve "
         "named subjects, requested operations or tasks, relationships, scope qualifiers, "
         "formats, and outcomes. Do not substitute retrieval expansions or a broader topic. "
         "Then scan the whole transcript from first to last and understand it before selecting. "
@@ -1310,12 +1468,11 @@ def _boundary_prompts(
         "Keep opening and ending edges clean, including generic lead-ins and bracketed "
         "non-speech markers. Split around an internal interruption when separate complete "
         "units remain; otherwise keep it rather than discard a valuable complete arc. "
-        "Never omit a substantive grounded unit solely "
-        "because its boundary is uncertain: return its complete cue span and mark "
-        "high uncertainty with boundary_ambiguous or overlap_risk. Omit only high content, "
-        "context, or topic uncertainty; severe transcript noise counts as content "
-        "uncertainty. Low or medium uncertainty is allowed. Omit material that requires an "
-        "unseen visual.\n"
+        "Never omit a substantive grounded unit solely because its boundary is uncertain: "
+        "return the best complete cue span and let deterministic post-processing refine it. "
+        "Omit only when content, context, or topic meaning is too uncertain to support grounded "
+        "teaching; severe transcript noise counts as content uncertainty. Omit material that "
+        "requires an unseen visual.\n"
         "4. Score topic relevance, information density, educational value, and difficulty "
         "honestly. Return a unit only when topic_relevance, informativeness, and "
         "educational_importance are each at least 0.75. Difficulty is metadata, not an "
@@ -1327,11 +1484,12 @@ def _boundary_prompts(
         "only for academically sound teaching; course logistics and institutional framing are "
         "not teaching units. Each unit must be standalone, use a unique "
         "candidate_id, and include required setup inside its span.\n"
-        f"Return only the topics list. Every item must contain "
-        f"{_selection_fields(enriched=False, compact=True)}, and intent_role (primary only "
-        "when this unit "
-        "itself fulfills the exact requested task, relationship, format, and outcome; "
-        "otherwise supporting). Learning details and "
+        f"Return only the object {{request_intent, topics}}. Every topic must contain "
+        f"{_selection_fields(enriched=False, compact=True)}. The ie list must be nonempty and "
+        "contain one {id, q} item per request constraint the unit fulfills, where id is the "
+        "constraint_id and q is an exact consecutive 5-16 word transcript quote wholly inside "
+        "the candidate. Do not output a role: the backend derives primary only when grounded "
+        "evidence covers every request constraint, and supporting otherwise. Learning details and "
         "assessments are generated later. Do not include them, chain-of-thought, or hidden "
         "reasoning."
     )
@@ -1617,6 +1775,279 @@ def _cue_opens_mid_thought(text: str, *, ignore_caption_case: bool) -> bool:
     return opens_mid_thought(guarded)
 
 
+def _opening_contextual_example_needs_context(text: str) -> bool:
+    """Distinguish a backward reference from a locally restated example setup."""
+    raw_text = str(text or "").strip()
+    match = _OPENING_CONTEXTUAL_EXAMPLE_RE.match(raw_text)
+    if match is None:
+        return False
+    tail = raw_text[match.end():]
+    return not _local_example_setup_is_complete(tail)
+
+
+def _opening_has_context_dependent_subject(text: str) -> bool:
+    raw_text = str(text or "").strip()
+    match = re.match(
+        r"^\s*(?:(?:after|before|during|following|using|with|without)\b"
+        r"[^,;:]{0,100}[,;:]\s*)?"
+        r"(?:the|this|that|these|those)\s+"
+        r"(?P<head>answer|calculation|case|concept|equation|example|expression|"
+        r"formula|method|problem|process|proof|result|solution|step|term|thing|value)\b",
+        raw_text,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return False
+    if match.group("head").casefold() in {"concept", "method", "process", "proof"}:
+        named_complement = re.match(
+            r"\s+of\s+(?!(?:it|this|that|these|those|them)\b)[a-z0-9]",
+            raw_text[match.end():],
+            re.IGNORECASE,
+        )
+        if named_complement is not None:
+            return False
+    return True
+
+
+def _general_local_setup_is_complete(text: str) -> bool:
+    """Recognize a grounded non-math statement, imperative, or question."""
+    raw_text = str(text or "").strip(" ,;:—-")
+    if (
+        _OPENING_AGENDA_RE.match(raw_text)
+        or _OPENING_CONTEXTUAL_REFORMULATION_RE.match(raw_text)
+        or _opening_has_context_dependent_subject(raw_text)
+        or len(_toks(raw_text)) < 3
+        or _cue_opens_mid_thought(
+        raw_text,
+        ignore_caption_case=True,
+        )
+    ):
+        return False
+    words = _toks(raw_text)
+    if words[0] in _STANDALONE_QUESTION_HEADS:
+        return len(_content_tokens(raw_text)) >= 2
+    action = _GENERAL_SETUP_ACTION_RE.match(raw_text)
+    if action is not None:
+        generic = {
+            "a", "again", "an", "answer", "briefly", "carefully", "exactly",
+            "it", "merely", "one", "result", "simply", "step", "that", "the",
+            "them", "thing", "this", "value",
+        }
+        concrete = {
+            token for token in _toks(action.group("object"))
+            if token not in generic and len(token) >= 3
+        }
+        return bool(concrete)
+    if words[0] in {
+        "and", "but", "he", "here", "i", "it", "or", "she", "so", "that",
+        "there", "these", "they", "this", "those", "we", "you",
+    }:
+        return False
+    if _UNGROUNDED_IMPERATIVE_RE.match(raw_text):
+        return False
+    return len(_content_tokens(raw_text)) >= 3
+
+
+def _definition_has_named_subject(text: str, definition_start: int) -> bool:
+    """Require a noun or symbol before ``is defined as``, not a bare pronoun."""
+    prefix = str(text or "")[:definition_start]
+    framing = list(re.finditer(
+        r"\b(?:assume|consider|given|let|suppose)\b",
+        prefix,
+        re.IGNORECASE,
+    ))
+    subject = prefix[framing[-1].end():] if framing else prefix
+    generic = {
+        "a", "an", "it", "one", "that", "the", "these", "they", "thing",
+        "this", "those",
+    }
+    return any(
+        (len(token) == 1 and token not in {"a", "i"})
+        or (len(token) >= 2 and token not in generic)
+        for token in _toks(subject)
+    )
+
+
+def _explicit_problem_resolves_back_reference(
+    text: str,
+    explicit_problem: re.Match[str],
+    back_reference: re.Match[str],
+) -> bool:
+    """Reject ``the problem is this`` while retaining a stated expression/result."""
+    if explicit_problem.start() >= back_reference.start():
+        return False
+    between = str(text or "")[explicit_problem.end():back_reference.start()]
+    generic = {
+        "a", "again", "an", "and", "by", "carefully", "exactly", "for",
+        "just", "merely", "now", "of", "one", "only", "simply", "so", "the",
+        "then", "to", "with",
+    }
+    tokens = _toks(between)
+    has_named_symbol = any(
+        len(token) == 1 and token not in {"a", "i"}
+        for token in tokens
+    )
+    concrete_tokens = {
+        token for token in tokens
+        if token not in generic and len(token) >= 2
+    }
+    return has_named_symbol or len(concrete_tokens) >= 2
+
+
+def _explicit_problem_has_substantive_object(
+    text: str,
+    explicit_problem: re.Match[str],
+) -> bool:
+    """Require the actual target/expression, not merely ``the problem is``."""
+    matched = explicit_problem.group(0).casefold()
+    statement = str(text or "")[explicit_problem.start():]
+    statement = re.split(r"[.!?]", statement, maxsplit=1)[0]
+    generic = {
+        "a", "again", "an", "answer", "calculate", "determine", "equation",
+        "equals", "evaluate", "expression", "factor", "find", "function", "given",
+        "gives", "is", "it", "just", "one", "problem", "result", "same", "so",
+        "solve", "that", "the", "this", "to", "unknown",
+    }
+    if re.match(r"\s*(?:given|let)\b", matched):
+        tail = str(text or "")[explicit_problem.end():]
+        tail = re.split(r"[.!?]", tail, maxsplit=1)[0]
+        relation = re.search(
+            r"\b(?:be|denote|equal|equals|represent)\b|=",
+            tail,
+            re.IGNORECASE,
+        )
+        if relation is not None:
+            object_tokens = {
+                token for token in _toks(tail[relation.end():])
+                if token not in {
+                    "a", "an", "it", "that", "the", "this", "unknown",
+                }
+            }
+            return bool(object_tokens)
+        meaningful_tail = {
+            token for token in _toks(tail)
+            if token not in generic
+        }
+        return len(meaningful_tail) >= 2
+    meaningful = {
+        token for token in _toks(statement)
+        if token not in generic
+    }
+    if "limit" in _toks(matched):
+        target = re.split(
+            r"\b(?:approaches|tends\s+to)\b",
+            statement,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )
+        return bool(
+            len(target) == 2
+            and {
+                token for token in _toks(target[1])
+                if token not in generic
+            }
+        )
+    return bool(meaningful)
+
+
+def _local_example_setup_is_complete(text: str) -> bool:
+    """Require a stated problem/object, while allowing an explicitly defined referent."""
+    raw_text = str(text or "").strip()
+    if _OPENING_AGENDA_RE.match(raw_text):
+        return False
+    contextual_frame = _OPENING_CONTEXTUAL_EXAMPLE_RE.match(raw_text)
+    if contextual_frame is not None:
+        return _local_example_setup_is_complete(
+            raw_text[contextual_frame.end():]
+        )
+    if not (
+        _OPENING_RECOVERABLE_SETUP_RE.match(raw_text)
+        or _LOCAL_EXAMPLE_SETUP_RE.search(raw_text)
+    ):
+        return _general_local_setup_is_complete(raw_text)
+    explicit_problem = _LOCAL_EXPLICIT_PROBLEM_RE.search(raw_text)
+    if (
+        explicit_problem is not None
+        and not _explicit_problem_has_substantive_object(
+            raw_text,
+            explicit_problem,
+        )
+    ):
+        return False
+    action = _LOCAL_SETUP_ACTION_RE.search(raw_text)
+    if action is not None and explicit_problem is None:
+        generic_object_tokens = {
+            "a", "again", "an", "answer", "by", "carefully", "for", "it",
+            "next", "of", "one", "problem", "result", "step", "that", "the",
+            "them", "thing", "this", "to", "value", "with",
+        }
+        object_tokens = _toks(action.group("object"))
+        has_named_symbol = any(
+            len(token) == 1 and token not in {"a", "i"}
+            for token in object_tokens
+        )
+        concrete_tokens = {
+            token for token in object_tokens
+            if token not in generic_object_tokens and len(token) >= 2
+        }
+        if not has_named_symbol and len(concrete_tokens) < 2:
+            return False
+    back_reference = next(
+        (
+            match
+            for match in _OPENING_SETUP_BACK_REFERENCE_RE.finditer(raw_text)
+            if not (
+                match.group(0).casefold() in {"here", "there"}
+                and re.match(
+                    r"\s+(?:is|are|was|were)\b",
+                    raw_text[match.end():],
+                    re.IGNORECASE,
+                )
+            )
+        ),
+        None,
+    )
+    if back_reference is None:
+        return True
+    explicit_definition = _LOCAL_SETUP_EXPLICIT_GROUNDING_RE.search(raw_text)
+    return bool(
+        (
+            explicit_definition is not None
+            and _definition_has_named_subject(
+                raw_text,
+                explicit_definition.start(),
+            )
+        )
+        or (
+            explicit_problem is not None
+            and _explicit_problem_resolves_back_reference(
+                raw_text,
+                explicit_problem,
+                back_reference,
+            )
+        )
+    )
+
+
+def _selected_example_restates_complete_target(text: str) -> bool:
+    """Keep a complete worked unit when its explicit target is restated later."""
+    raw_text = str(text or "").strip()
+    frame = _OPENING_CONTEXTUAL_EXAMPLE_RE.match(raw_text)
+    if frame is None or len(_content_tokens(raw_text)) < 12:
+        return False
+    explicit_targets = [
+        match
+        for match in _LOCAL_EXPLICIT_PROBLEM_RE.finditer(raw_text, frame.end())
+        if _explicit_problem_has_substantive_object(raw_text, match)
+    ]
+    if not explicit_targets or _terminal_content_is_explicitly_incomplete(raw_text):
+        return False
+    return bool(
+        _LATER_RESTATED_EXAMPLE_REASONING_RE.search(raw_text)
+        and _LATER_RESTATED_EXAMPLE_CONCLUSION_RE.search(raw_text)
+    )
+
+
 def _cue_opens_mid_thought_at(
     segments: list[dict],
     index: int,
@@ -1636,6 +2067,9 @@ def _cue_opens_mid_thought_at(
         or _OPENING_DEMONSTRATIVE_REFERENCE_RE.match(opening_text)
         or _OPENING_BARE_RELATIONAL_PREDICATE_RE.match(opening_text)
         or _OPENING_CONTEXTUAL_REFORMULATION_RE.match(opening_text)
+        or _opening_contextual_example_needs_context(opening_text)
+        or _OPENING_AGENDA_RE.match(opening_text)
+        or _NEXT_EXAMPLE_FRAMING_RE.fullmatch(opening_text)
         or _OPENING_PREPOSITIONAL_TAG_RE.match(opening_text)
     ):
         return True
@@ -1881,6 +2315,10 @@ def _cue_has_explicit_dangling_end(text: str, next_text: str) -> bool:
         or _TERMINAL_DANGLING_MODAL_PREDICATE_RE.search(raw_text)
         or _TERMINAL_DANGLING_AUXILIARY_ADVERB_RE.search(raw_text)
         or _TERMINAL_DANGLING_DEGREE_RE.search(raw_text)
+        or (
+            bool(str(next_text or "").strip())
+            and _TERMINAL_DANGLING_DISCOURSE_LEADIN_RE.search(raw_text)
+        )
         or ambiguous_degree_continues
         or _has_unfinished_exemplification_tail(raw_text)
         or re.search(r"[,;:\-—][\"')\]]*$", raw_text)
@@ -1976,6 +2414,41 @@ def _trim_trailing_incomplete_suffix(
     solution_continues = bool(
         _FORWARD_SOLUTION_CONTINUATION_RE.search(following_text)
     )
+    full_suffix = _cue_clip_text(segments, start_line, end_line)
+    final_text = str(segments[end_line].get("text") or "")
+    following_lexical_index = first_lexical_character_index(following_text)
+    ambiguous_degree = _TERMINAL_AMBIGUOUS_DEGREE_RE.search(full_suffix)
+    bare_subject = _TERMINAL_BARE_SUBJECT_RE.search(full_suffix)
+    possible_trigger = bool(
+        _TERMINAL_DANGLING_TRANSITION_RE.search(full_suffix)
+        or _TERMINAL_DANGLING_DEGREE_RE.search(full_suffix)
+        or (
+            ambiguous_degree
+            and following_lexical_index is not None
+            and following_text[following_lexical_index].islower()
+        )
+        or (
+            bare_subject
+            and re.search(r"[.!?]", full_suffix[:bare_subject.start()])
+        )
+        or (
+            solution_continues
+            and _TRAILING_FORWARD_SETUP_RE.search(full_suffix)
+        )
+        or _FORWARD_TOPIC_TRANSITION_RE.match(final_text)
+        or _unconditional_trailing_edge_noise_start(
+            final_text,
+            require_edge_prefix=True,
+        )
+        is not None
+        or _trailing_version_edge_noise_start(
+            final_text,
+            require_edge_prefix=True,
+        )
+        is not None
+    )
+    if not possible_trigger:
+        return end_line
     for line in range(end_line, start_line - 1, -1):
         suffix = _cue_clip_text(segments, line, end_line)
         unconditional_edge_noise = (
@@ -2019,7 +2492,6 @@ def _trim_trailing_incomplete_suffix(
         )
         dangling_degree = bool(_TERMINAL_DANGLING_DEGREE_RE.search(suffix))
         ambiguous_degree = _TERMINAL_AMBIGUOUS_DEGREE_RE.search(suffix)
-        following_lexical_index = first_lexical_character_index(following_text)
         dangling_ambiguous_degree = bool(
             ambiguous_degree
             and following_lexical_index is not None
@@ -2370,7 +2842,8 @@ def _course_admin_sentence(text: str) -> bool:
     )
 
 
-def _sentence_character_spans(text: str) -> list[tuple[int, int]]:
+@lru_cache(maxsize=4_096)
+def _sentence_character_spans(text: str) -> tuple[tuple[int, int], ...]:
     """Return abbreviation-aware sentence spans without rewriting source text."""
     raw_text = str(text or "")
     from .sentences import segment_sentences
@@ -2386,17 +2859,20 @@ def _sentence_character_spans(text: str) -> list[tuple[int, int]]:
         spans.append((left, right))
         cursor = right
     if spans:
-        return spans
-    return [
+        return tuple(spans)
+    return tuple(
         (match.start(), match.end())
         for match in re.finditer(r"[^.!?]+(?:[.!?]+|$)", raw_text)
         if _WORD_RE.search(match.group(0))
-    ]
+    )
 
 
 def _cue_is_only_structural_filler(text: str) -> bool:
     raw_text = str(text or "")
-    if _literal_structural_filler_only(raw_text):
+    if (
+        _literal_structural_filler_only(raw_text)
+        or _NEXT_EXAMPLE_FRAMING_RE.fullmatch(raw_text)
+    ):
         return True
     sentences = [
         raw_text[left:right].strip()
@@ -2506,6 +2982,41 @@ def _cross_cue_quote_matches(
             continue
         matches.append((first_line, last_line, start_quote, end_quote))
     return matches
+
+
+def _unique_evidence_location(
+    segments: list[dict],
+    quote: str,
+    start_line: int,
+    end_line: int,
+) -> tuple[int, int, int, int] | None:
+    """Ground one evidence quote either within one cue or across adjacent cues."""
+    locations: list[tuple[int, int, int, int]] = []
+    for line in range(start_line, end_line + 1):
+        text = str(segments[line].get("text") or "")
+        locations.extend(
+            (line, left, line, right)
+            for left, right in _quote_character_spans(text, quote)
+        )
+    for first_line, last_line, first_quote, last_quote in _cross_cue_quote_matches(
+        segments,
+        quote,
+        start_line,
+        end_line,
+    ):
+        first_span = _quote_character_span(
+            str(segments[first_line].get("text") or ""),
+            first_quote,
+        )
+        last_span = _quote_character_span(
+            str(segments[last_line].get("text") or ""),
+            last_quote,
+        )
+        if first_span is not None and last_span is not None:
+            locations.append(
+                (first_line, first_span[0], last_line, last_span[1])
+            )
+    return locations[0] if len(locations) == 1 else None
 
 
 def _literal_source_quote(
@@ -2834,6 +3345,10 @@ def _opening_clause_is_standalone(text: str) -> bool:
     if (
         _OPENING_EDGE_META_SENTENCE_RE.match(opening_clause)
         or _OPENING_CONTEXTUAL_REFORMULATION_RE.match(opening_clause)
+        or _opening_contextual_example_needs_context(opening_clause)
+        or _opening_has_context_dependent_subject(opening_clause)
+        or _OPENING_AGENDA_RE.match(opening_clause)
+        or _NEXT_EXAMPLE_FRAMING_RE.fullmatch(opening_clause)
         or _OPENING_LIST_TAIL_RE.match(opening_clause)
         or _OPENING_PREPOSITIONAL_TAG_RE.match(opening_clause)
         or (
@@ -2886,11 +3401,8 @@ def _leading_example_framing_quote(text: str) -> str:
     if len(_toks(retained)) < 4:
         return ""
     complete_setup = bool(
-        _OPENING_RECOVERABLE_SETUP_RE.match(retained)
+        _local_example_setup_is_complete(retained)
         and len(_toks(retained)) >= 5
-        and not _OPENING_SETUP_BACK_REFERENCE_RE.search(
-            retained[:_sentence_character_spans(retained)[0][1]]
-        )
     )
     if not (_opening_clause_is_standalone(retained) or complete_setup):
         return ""
@@ -2920,6 +3432,71 @@ def _projected_start_is_standalone(
     )
 
 
+def _opening_agenda_prefix_is_only_preview(
+    segments: list[dict],
+    start_line: int,
+    teaching_line: int,
+) -> bool:
+    """Allow forward agenda trimming only across preview fragments, never teaching."""
+    if teaching_line <= start_line:
+        return False
+    start_text = str(segments[start_line].get("text") or "").strip()
+    agenda = _OPENING_AGENDA_RE.match(start_text)
+    if agenda is None:
+        return False
+    if _LOCAL_EXPLICIT_PROBLEM_RE.search(start_text[agenda.end():]):
+        return False
+    prefix = _cue_clip_text(segments, start_line, teaching_line - 1)
+    for line in range(start_line + 1, teaching_line):
+        text = str(segments[line].get("text") or "").strip()
+        if (
+            _cue_is_only_structural_filler(text)
+            or _OPENING_AGENDA_CONTINUATION_RE.match(text)
+            or _NEXT_EXAMPLE_FRAMING_RE.fullmatch(text)
+        ):
+            continue
+        return False
+    return True
+
+
+def _recover_agenda_setup_within_cue(
+    text: str,
+    *,
+    evidence_quote: str,
+    learning_objective: str,
+    following_text: str = "",
+) -> str:
+    """Recover an explicit setup after an agenda even when captions lack punctuation."""
+    raw_text = str(text or "")
+    agenda = _OPENING_AGENDA_RE.match(raw_text)
+    if agenda is None:
+        return ""
+    setup = _LOCAL_EXPLICIT_PROBLEM_RE.search(raw_text, agenda.end())
+    if setup is None:
+        return ""
+    left = setup.start()
+    article = re.search(r"\b(?:a|an|the)\s+$", raw_text[:left], re.IGNORECASE)
+    if article is not None and article.end() == left:
+        left = article.start()
+    retained = raw_text[left:].strip()
+    if not _local_example_setup_is_complete(retained):
+        return ""
+    grounded_text = " ".join(
+        part for part in (retained, following_text) if part
+    )
+    if evidence_quote and not _contains_quote(grounded_text, evidence_quote):
+        return ""
+    if (
+        not evidence_quote
+        and len(
+            _content_tokens(grounded_text)
+            & _content_tokens(learning_objective)
+        ) < 2
+    ):
+        return ""
+    return _exact_boundary_quote(retained, want="start")
+
+
 def _recover_start_forward_across_cues(
     segments: list[dict],
     start_line: int,
@@ -2932,18 +3509,43 @@ def _recover_start_forward_across_cues(
     from .sentences import classify_terminator
 
     anchor_tokens = _content_tokens(f"{evidence_quote} {learning_objective}")
+    agenda_teaching_line = next(
+        (
+            line
+            for line in range(start_line + 1, end_line + 1)
+            if _opening_agenda_prefix_is_only_preview(
+                segments,
+                start_line,
+                line,
+            )
+            and not _OPENING_AGENDA_CONTINUATION_RE.match(
+                str(segments[line].get("text") or "").strip()
+            )
+        ),
+        None,
+    )
     for line in range(start_line + 1, end_line + 1):
+        if agenda_teaching_line is not None:
+            if line < agenda_teaching_line:
+                continue
+            if line > agenda_teaching_line:
+                break
         previous = str(segments[line - 1].get("text") or "").strip()
         current = str(segments[line].get("text") or "").strip()
         gap = (
             float(segments[line].get("start", 0.0))
             - float(segments[line - 1].get("end", 0.0))
         )
-        if not (
+        ordinary_boundary = bool(
             classify_terminator(previous)
             or _cue_is_only_structural_filler(previous)
             or gap >= _SECTION_RESET_GAP_S
-        ):
+        )
+        agenda_boundary = bool(
+            agenda_teaching_line is not None
+            and line == agenda_teaching_line
+        )
+        if not ordinary_boundary and not agenda_boundary:
             continue
         if _cue_is_only_structural_filler(current):
             continue
@@ -2956,6 +3558,11 @@ def _recover_start_forward_across_cues(
         if not evidence_quote and len(_content_tokens(retained) & anchor_tokens) < 2:
             continue
         opening_candidates = [current]
+        marker = _LEADING_DISCOURSE_MARKER_RE.match(current)
+        if marker is not None:
+            without_marker = current[marker.end():].strip()
+            if without_marker:
+                opening_candidates.insert(0, without_marker)
         comparative = _OPENING_COMPARATIVE_LEADIN_RE.match(current)
         if comparative is not None:
             suffix = current[comparative.end():].strip()
@@ -2978,9 +3585,9 @@ def _recover_start_forward_across_cues(
             ):
                 continue
             setup_is_complete = bool(
-                _OPENING_RECOVERABLE_SETUP_RE.match(opening)
-                and len(_toks(opening)) >= 5
-                and len(_toks(retained)) >= 10
+                _local_example_setup_is_complete(opening)
+                and len(_toks(opening)) >= 4
+                and len(_toks(retained)) >= 8
             )
             if not (
                 _opening_clause_is_standalone(opening) or setup_is_complete
@@ -3273,6 +3880,14 @@ def _recover_projected_start_within_cue(
     following_text: str = "",
 ) -> str:
     """Move a fragmentary model start to a complete sentence in the same cue."""
+    agenda_setup_quote = _recover_agenda_setup_within_cue(
+        text,
+        evidence_quote=evidence_quote,
+        learning_objective=learning_objective,
+        following_text=following_text,
+    )
+    if agenda_setup_quote:
+        return agenda_setup_quote
     sentence_spans = _sentence_character_spans(text)
     if not sentence_spans:
         return ""
@@ -3284,7 +3899,8 @@ def _recover_projected_start_within_cue(
             without_marker = retained[marker.end():].strip()
             if _opening_clause_is_standalone(without_marker):
                 retained = without_marker
-        if not _opening_clause_is_standalone(retained):
+        local_setup = _local_example_setup_is_complete(retained)
+        if not (_opening_clause_is_standalone(retained) or local_setup):
             return ""
         return _exact_boundary_quote(retained, want="start")
 
@@ -3315,7 +3931,16 @@ def _recover_projected_start_within_cue(
             and len(_content_tokens(selected_with_following) & anchor_tokens) >= 2
         )
     )
-    if suffix_is_grounded and _opening_clause_is_standalone(selected_suffix):
+    omitted_prefix = text[:quote_span[0]].strip()
+    projected_suffix_is_complete = bool(
+        _opening_clause_is_standalone(selected_suffix)
+        or (
+            omitted_prefix
+            and _cue_is_only_structural_filler(omitted_prefix)
+            and _general_local_setup_is_complete(selected_with_following)
+        )
+    )
+    if suffix_is_grounded and projected_suffix_is_complete:
         return _exact_boundary_quote(selected_suffix, want="start")
     for index in range(current_index + 1, len(sentence_spans)):
         left, _right = sentence_spans[index]
@@ -3529,6 +4154,44 @@ def _objective_bridges_sections(
     return len(left_overlap) >= 2 and len(right_overlap) >= 2
 
 
+@dataclass(frozen=True)
+class _TopicTransition:
+    navigation_line: int
+    navigation_left: int
+    new_side_line: int
+    new_side_left: int
+
+
+_DESCRIBED_UNIT_SUBJECT_RE = re.compile(
+    r"^\s*(?:another|one\s+more|the\s+next|a\s+(?:different|new))\s+"
+    r"(?:(?:brief|concrete|quick|short|simple|worked)\s+)*"
+    r"(?:calculation|case|demonstration|derivation|example|exercise|problem|proof)"
+    r"\s*$",
+    re.IGNORECASE,
+)
+
+
+def _clause_after_described_unit(
+    subject: str,
+    suffix: str,
+    *,
+    suffix_start: int,
+) -> int | None:
+    """Skip a generic ``another example:`` label before explicit teaching."""
+    if _DESCRIBED_UNIT_SUBJECT_RE.fullmatch(str(subject or "")) is None:
+        return None
+    clause = re.match(
+        r"\s*[,;:—-]\s*(?P<text>[a-z0-9])",
+        str(suffix or ""),
+        re.IGNORECASE,
+    )
+    return (
+        suffix_start + clause.start("text")
+        if clause is not None
+        else None
+    )
+
+
 def _candidate_topic_transitions(
     segments: list[dict],
     start_line: int,
@@ -3536,15 +4199,24 @@ def _candidate_topic_transitions(
     *,
     evidence_quote: str,
     learning_objective: str,
-) -> list[tuple[int, int, int]]:
-    """Return unbridged navigation as (cue, nav start, new-side start)."""
+) -> list[_TopicTransition]:
+    """Return unbridged same-cue and adjacent-cue topic navigation."""
+    cue_texts = [
+        str(segments[line].get("text") or "")
+        for line in range(start_line, end_line + 1)
+    ]
+    if (
+        _HARD_TOPIC_RESET_RE.search(" . ".join(cue_texts)) is None
+        and _HARD_TOPIC_RESET_RE.search(" ".join(cue_texts)) is None
+    ):
+        return []
     evidence_locations = {
         line: _quote_character_spans(
             str(segments[line].get("text") or ""), evidence_quote
         )
         for line in range(start_line, end_line + 1)
     }
-    transitions: list[tuple[int, int, int]] = []
+    transitions: list[_TopicTransition] = []
     for line in range(start_line, end_line + 1):
         text = str(segments[line].get("text") or "")
         sentence_spans = _sentence_character_spans(text)
@@ -3593,12 +4265,103 @@ def _candidate_topic_transitions(
                 span[0] >= subject_left and span[0] < sentence_right
                 for span in evidence_locations[line]
             )
-            new_side_start = (
-                subject_left
-                if _WORD_RE.search(subject_tail) or evidence_in_reset_body
-                else sentence_right
+            described_clause = _clause_after_described_unit(
+                subject,
+                subject_tail,
+                suffix_start=reset.end("subject"),
             )
-            transitions.append((line, navigation_left, new_side_start))
+            new_side_start = (
+                described_clause
+                if described_clause is not None
+                else (
+                    subject_left
+                    if _WORD_RE.search(subject_tail) or evidence_in_reset_body
+                    else sentence_right
+                )
+            )
+            transitions.append(_TopicTransition(
+                navigation_line=line,
+                navigation_left=navigation_left,
+                new_side_line=line,
+                new_side_left=new_side_start,
+            ))
+
+    for line in range(start_line, end_line):
+        left_text = str(segments[line].get("text") or "")
+        right_text = str(segments[line + 1].get("text") or "")
+        joined = f"{left_text} {right_text}"
+        split = len(left_text) + 1
+        sentence_spans = _sentence_character_spans(joined)
+        for reset in _HARD_TOPIC_RESET_RE.finditer(joined):
+            if not (reset.start() < split < reset.end("subject")):
+                continue
+            subject = reset.group("subject")
+            if _plain_same_unit_navigation_subject(subject):
+                continue
+            navigation_left = reset.start()
+            connector = re.search(
+                r"\b(?:and|but|so)\s*$",
+                joined[:navigation_left],
+                re.IGNORECASE,
+            )
+            if connector is not None:
+                navigation_left = connector.start()
+            subject_left = reset.start("subject")
+            left_parts = [
+                str(segments[index].get("text") or "")
+                for index in range(start_line, line)
+            ]
+            left_parts.append(joined[:navigation_left])
+            right_parts = [joined[subject_left:]]
+            right_parts.extend(
+                str(segments[index].get("text") or "")
+                for index in range(line + 2, end_line + 1)
+            )
+            if _objective_bridges_sections(
+                learning_objective,
+                " ".join(left_parts),
+                " ".join(right_parts),
+                reset_subject=subject,
+            ):
+                continue
+            _sentence_left, sentence_right = next(
+                (
+                    (left, right)
+                    for left, right in sentence_spans
+                    if left <= reset.start() < right
+                ),
+                (reset.start(), len(joined)),
+            )
+            evidence_in_reset_body = any(
+                span[0] >= subject_left and span[0] < sentence_right
+                for span in _quote_character_spans(joined, evidence_quote)
+            )
+            subject_tail = joined[reset.end("subject"):sentence_right]
+            described_clause = _clause_after_described_unit(
+                subject,
+                subject_tail,
+                suffix_start=reset.end("subject"),
+            )
+            new_side_global = (
+                described_clause
+                if described_clause is not None
+                else (
+                    subject_left
+                    if _WORD_RE.search(subject_tail) or evidence_in_reset_body
+                    else sentence_right
+                )
+            )
+            new_side_line, new_side_left = (
+                (line, new_side_global)
+                if new_side_global < split
+                else (line + 1, new_side_global - split)
+            )
+            transitions.append(_TopicTransition(
+                navigation_line=line,
+                navigation_left=navigation_left,
+                new_side_line=new_side_line,
+                new_side_left=new_side_left,
+            ))
     return transitions
 
 
@@ -3642,116 +4405,136 @@ def _single_objective_section_bounds(
     start_line: int,
     end_line: int,
     *,
-    evidence_quote: str,
-    learning_objective: str,
+    evidence_location: tuple[int, int, int, int] | None,
+    transitions: list[_TopicTransition],
 ) -> tuple[int, int]:
     """Keep the explicit topic section containing the candidate's grounded evidence."""
-    evidence_locations: list[tuple[int, int, int]] = []
-    for line in range(start_line, end_line + 1):
-        text = str(segments[line].get("text") or "")
-        span = _quote_character_span(text, evidence_quote)
-        if span is not None:
-            evidence_locations.append((line, span[0], span[1]))
-    if len(evidence_locations) != 1:
+    if evidence_location is None:
         return start_line, end_line
-    evidence_line, evidence_left, evidence_right = evidence_locations[0]
-
-    transitions = _candidate_topic_transitions(
-        segments,
-        start_line,
-        end_line,
-        evidence_quote=evidence_quote,
-        learning_objective=learning_objective,
+    evidence_start_line, evidence_left, evidence_end_line, evidence_right = (
+        evidence_location
     )
+
     prior = [
         item
         for item in transitions
-        if (item[0], item[1]) <= (evidence_line, evidence_left)
+        if (item.navigation_line, item.navigation_left)
+        <= (evidence_start_line, evidence_left)
     ]
     following = [
         item
         for item in transitions
-        if (item[0], item[1]) > (evidence_line, evidence_right)
+        if (item.navigation_line, item.navigation_left)
+        > (evidence_end_line, evidence_right)
     ]
 
-    selected_start = max(prior, default=None, key=lambda item: (item[0], item[1]))
-    selected_end = min(following, default=None, key=lambda item: (item[0], item[1]))
+    selected_start = max(
+        prior,
+        default=None,
+        key=lambda item: (item.navigation_line, item.navigation_left),
+    )
+    selected_end = min(
+        following,
+        default=None,
+        key=lambda item: (item.navigation_line, item.navigation_left),
+    )
     bounded_start = start_line
     if selected_start is not None:
-        transition_line, _left, transition_right = selected_start
-        suffix = str(segments[transition_line].get("text") or "")[
-            transition_right:
+        suffix = str(
+            segments[selected_start.new_side_line].get("text") or ""
+        )[
+            selected_start.new_side_left:
         ]
         bounded_start = (
-            transition_line if _WORD_RE.search(suffix) else transition_line + 1
+            selected_start.new_side_line
+            if _WORD_RE.search(suffix)
+            else selected_start.new_side_line + 1
         )
     bounded_end = end_line
     if selected_end is not None:
-        transition_line, transition_left, _right = selected_end
-        prefix = str(segments[transition_line].get("text") or "")[
-            :transition_left
+        prefix = str(
+            segments[selected_end.navigation_line].get("text") or ""
+        )[
+            :selected_end.navigation_left
         ]
         bounded_end = (
-            transition_line if _WORD_RE.search(prefix) else transition_line - 1
+            selected_end.navigation_line
+            if _WORD_RE.search(prefix)
+            else selected_end.navigation_line - 1
         )
     if bounded_start > bounded_end:
         return start_line, end_line
     return bounded_start, bounded_end
 
 
+def _evidence_crosses_topic_transition(
+    *,
+    evidence_location: tuple[int, int, int, int] | None,
+    transitions: list[_TopicTransition],
+) -> bool:
+    """Reject a purported evidence quote that stitches across an unbridged reset."""
+    if evidence_location is None:
+        # A repeated or missing quote cannot identify which side of a real
+        # topic reset the model intended. Keeping both sides would violate the
+        # one-learning-objective contract, so fail closed here.
+        return bool(transitions)
+    evidence_start_line, evidence_left, evidence_end_line, evidence_right = (
+        evidence_location
+    )
+    return any(
+        (evidence_start_line, evidence_left)
+        < (transition.navigation_line, transition.navigation_left)
+        < (evidence_end_line, evidence_right)
+        for transition in transitions
+    )
+
+
 def _single_objective_intra_cue_quotes(
     segments: list[dict],
-    start_line: int,
-    end_line: int,
     *,
-    evidence_quote: str,
-    learning_objective: str,
+    evidence_location: tuple[int, int, int, int] | None,
+    transitions: list[_TopicTransition],
 ) -> tuple[str | None, str | None]:
     """Project edges around a topic transition contained inside a coarse cue."""
-    evidence_locations: list[tuple[int, int, int]] = []
-    for line in range(start_line, end_line + 1):
-        text = str(segments[line].get("text") or "")
-        span = _quote_character_span(text, evidence_quote)
-        if span is not None:
-            evidence_locations.append((line, span[0], span[1]))
-    if len(evidence_locations) != 1:
+    if evidence_location is None:
         return None, None
-    evidence_line, evidence_left, evidence_right = evidence_locations[0]
-    transitions = _candidate_topic_transitions(
-        segments,
-        start_line,
-        end_line,
-        evidence_quote=evidence_quote,
-        learning_objective=learning_objective,
+    evidence_start_line, evidence_left, evidence_end_line, evidence_right = (
+        evidence_location
     )
 
     prior = [
         item
         for item in transitions
-        if (item[0], item[2]) <= (evidence_line, evidence_left)
+        if (item.new_side_line, item.new_side_left)
+        <= (evidence_start_line, evidence_left)
     ]
     following = [
         item
         for item in transitions
-        if (item[0], item[1]) > (evidence_line, evidence_right)
+        if (item.navigation_line, item.navigation_left)
+        > (evidence_end_line, evidence_right)
     ]
     start_quote: str | None = None
     end_quote: str | None = None
     if prior:
-        transition_line, _transition_left, transition_right = max(
-            prior, key=lambda item: (item[0], item[2])
+        transition = max(
+            prior,
+            key=lambda item: (item.new_side_line, item.new_side_left),
         )
-        text = str(segments[transition_line].get("text") or "")
-        retained = text[transition_right:]
-        if transition_line == start_line and _WORD_RE.search(retained):
+        text = str(segments[transition.new_side_line].get("text") or "")
+        retained = text[transition.new_side_left:]
+        if _WORD_RE.search(retained):
             start_quote = _exact_boundary_quote(retained, want="start")
     if following:
-        transition_line, transition_left, _transition_right = min(
-            following, key=lambda item: (item[0], item[1])
+        transition = min(
+            following,
+            key=lambda item: (item.navigation_line, item.navigation_left),
         )
-        text = str(segments[transition_line].get("text") or "")
-        retained = _last_safe_complete_prefix(text[:transition_left])
-        if transition_line == end_line and _WORD_RE.search(retained):
+        text = str(segments[transition.navigation_line].get("text") or "")
+        retained = _last_safe_complete_prefix(
+            text[:transition.navigation_left]
+        )
+        if _WORD_RE.search(retained):
             quote = _exact_boundary_quote(retained, want="end")
             span = _quote_character_span(retained, quote)
             end_quote = retained[span[0]:].strip() if span is not None else quote
@@ -3836,8 +4619,9 @@ def _trim_before_visual_dependency(
     end_quote: str,
     evidence_quote: str,
 ) -> tuple[int, str] | None:
-    """Keep a self-contained spoken explanation before a visual-only tail."""
-    prefix_parts: list[str] = []
+    """Keep a self-contained spoken explanation before a terminal visual-only run."""
+    records: list[tuple[int, int, str, bool]] = []
+    prior_parts: list[str] = []
     for line in range(start_line, end_line + 1):
         text = str(segments[line].get("text") or "")
         left, right = 0, len(text)
@@ -3854,34 +4638,219 @@ def _trim_before_visual_dependency(
             sentence = selected[sentence_left:sentence_right].strip()
             if not sentence:
                 continue
-            if not _VISUAL_DEPENDENCY_RE.search(sentence):
-                prefix_parts.append(sentence)
-                continue
-            prefix_text = " ".join(prefix_parts).strip()
-            if (
-                len(_toks(prefix_text)) < 8
-                or not _contains_quote(prefix_text, evidence_quote)
-                or _terminal_content_is_explicitly_incomplete(prefix_text)
-            ):
-                return None
-            if sentence_left > 0:
-                trim_line = line
-                retained_edge = text[:left + sentence_left].rstrip()
-            else:
-                trim_line = line - 1
-                if trim_line < start_line:
-                    return None
-                retained_edge = str(segments[trim_line].get("text") or "").rstrip()
-            replacement, _ = _expanded_context_edge_quote(
-                retained_edge,
-                want="end",
+            requires_visual = _sentence_requires_visual_context(
+                sentence,
+                prior_text=" ".join(prior_parts),
             )
-            return (trim_line, replacement) if replacement else None
+            records.append((line, left + sentence_left, sentence, requires_visual))
+            prior_parts.append(sentence)
+
+    for index, (line, sentence_left, _sentence, requires_visual) in enumerate(records):
+        if not requires_visual:
+            continue
+        later_verbal = " ".join(
+            sentence
+            for _line, _left, sentence, visual in records[index + 1:]
+            if not visual
+        )
+        if len(_toks(later_verbal)) >= 6:
+            # The visual passage is internal and later verbal teaching resumes.
+            # Boundary trimming must not erase that later educational content.
+            continue
+        prefix_text = " ".join(
+            sentence for _line, _left, sentence, _visual in records[:index]
+        ).strip()
+        if (
+            len(_toks(prefix_text)) < 8
+            or not _contains_quote(prefix_text, evidence_quote)
+            or _terminal_content_is_explicitly_incomplete(prefix_text)
+        ):
+            return None
+        text = str(segments[line].get("text") or "")
+        if sentence_left > 0:
+            trim_line = line
+            retained_edge = text[:sentence_left].rstrip()
+        else:
+            trim_line = line - 1
+            if trim_line < start_line:
+                return None
+            retained_edge = str(segments[trim_line].get("text") or "").rstrip()
+        replacement, _ = _expanded_context_edge_quote(
+            retained_edge,
+            want="end",
+        )
+        return (trim_line, replacement) if replacement else None
     return None
 
 
-def _clip_requires_visual_context(text: str) -> bool:
-    return bool(_VISUAL_DEPENDENCY_RE.search(str(text or "")))
+def _trim_terminal_meta_suffix(
+    segments: list[dict],
+    start_line: int,
+    end_line: int,
+    *,
+    start_quote: str,
+    end_quote: str,
+    evidence_quote: str,
+    learning_objective: str,
+) -> tuple[int, str] | None:
+    """Drop a terminal future preview or mastery recap after complete teaching."""
+    def selected_part(line: int) -> str:
+        text = str(segments[line].get("text") or "")
+        left, right = 0, len(text)
+        if line == start_line:
+            spans = _quote_character_spans(text, start_quote)
+            if len(spans) == 1:
+                left = spans[0][0]
+        if line == end_line:
+            spans = _quote_character_spans(text, end_quote)
+            if len(spans) == 1:
+                right = spans[0][1]
+        return text[left:right]
+
+    prefix_parts: list[str] = []
+    for line in range(start_line, end_line + 1):
+        text = str(segments[line].get("text") or "")
+        selected = selected_part(line)
+        future_preview = _TERMINAL_FUTURE_PREVIEW_RE.match(selected)
+        mastery_recap = _TERMINAL_MASTERY_RECAP_RE.search(selected)
+        noise = future_preview or mastery_recap
+        if noise is None:
+            if selected.strip():
+                prefix_parts.append(selected.strip())
+            continue
+        retained_here = selected[:noise.start()].rstrip(" ,;:—-")
+        prefix_text = " ".join(
+            part for part in (*prefix_parts, retained_here) if part
+        ).strip()
+        later_parts = [
+            selected_part(later).strip()
+            for later in range(line + 1, end_line + 1)
+            if selected_part(later).strip()
+        ]
+        same_cue_suffix = selected[noise.start():]
+        later_sentences = [
+            same_cue_suffix[left:right].strip()
+            for left, right in _sentence_character_spans(same_cue_suffix)
+        ][1:]
+        teaching_resumes = any(
+            _TERMINAL_META_RESUMPTION_RE.match(part)
+            for part in (*later_sentences, *later_parts)
+        )
+        later_text = " ".join(later_parts)
+        if (
+            future_preview is not None
+            and later_text
+            and _objective_bridges_sections(
+                learning_objective,
+                prefix_text,
+                later_text,
+            )
+        ):
+            teaching_resumes = True
+        if teaching_resumes:
+            prefix_parts.append(selected.strip())
+            continue
+        if (
+            len(_toks(prefix_text)) < 8
+            or not _contains_quote(prefix_text, evidence_quote)
+            or _terminal_content_is_explicitly_incomplete(prefix_text)
+            or _cue_has_explicit_dangling_end(prefix_text, "")
+        ):
+            if selected.strip():
+                prefix_parts.append(selected.strip())
+            continue
+        if _WORD_RE.search(retained_here):
+            replacement = _exact_boundary_quote(retained_here, want="end")
+            return (line, replacement) if replacement else None
+        trim_line = line - 1
+        if trim_line < start_line:
+            return None
+        retained_edge = str(segments[trim_line].get("text") or "").rstrip()
+        replacement = _exact_boundary_quote(retained_edge, want="end")
+        return (trim_line, replacement) if replacement else None
+    return None
+
+
+def _sentence_requires_visual_context(
+    text: str,
+    *,
+    prior_text: str = "",
+) -> bool:
+    raw_text = str(text or "")
+    if _VISUAL_DEPENDENCY_RE.search(raw_text):
+        return True
+    for match in _DEICTIC_POINT_DEPENDENCY_RE.finditer(raw_text):
+        grounding_context = " ".join(
+            part for part in (prior_text, raw_text[:match.start()]) if part
+        )
+        definitions = [
+            definition.group("label").casefold()
+            for definition in _DEICTIC_POINT_DEFINITION_RE.finditer(
+                grounding_context
+            )
+        ]
+        first = match.group("first").casefold()
+        second = match.group("second").casefold()
+        required = {first: 1, second: 1}
+        if first == second:
+            required[first] = 2
+        if any(definitions.count(label) < count for label, count in required.items()):
+            return True
+    return False
+
+
+def _clip_requires_visual_context(
+    text: str,
+    *,
+    learning_objective: str = "",
+) -> bool:
+    raw_text = str(text or "")
+    if (
+        _VISUAL_DEPENDENCY_RE.search(raw_text) is None
+        and _DEICTIC_POINT_DEPENDENCY_RE.search(raw_text) is None
+        and _SENTENCE_LOCAL_VISUAL_SIGNAL_RE.search(raw_text) is None
+    ):
+        return False
+    prior_parts: list[str] = []
+    records: list[tuple[str, bool]] = []
+    for left, right in _sentence_character_spans(raw_text):
+        sentence = raw_text[left:right].strip()
+        requires_visual = _sentence_requires_visual_context(
+            sentence,
+            prior_text=" ".join(prior_parts),
+        )
+        records.append((sentence, requires_visual))
+        if sentence:
+            prior_parts.append(sentence)
+    visual_indexes = [
+        index for index, (_sentence, visual) in enumerate(records) if visual
+    ]
+    if not visual_indexes:
+        return False
+    first_visual, last_visual = visual_indexes[0], visual_indexes[-1]
+    visual_text = " ".join(records[index][0] for index in visual_indexes)
+    if len(
+        _content_tokens(learning_objective) & _content_tokens(visual_text)
+    ) >= 2:
+        return True
+    verbal_before = " ".join(
+        sentence for sentence, visual in records[:first_visual] if not visual
+    )
+    verbal_after = " ".join(
+        sentence for sentence, visual in records[last_visual + 1:] if not visual
+    )
+    teaching_resumes = any(
+        len(_toks(sentence)) >= 6
+        and _opening_clause_is_standalone(sentence)
+        for sentence, visual in records[last_visual + 1:]
+        if not visual
+    )
+    teaching_resumes = teaching_resumes or len(_toks(verbal_after)) >= 16
+    return not (
+        len(_toks(verbal_before)) >= 8
+        and len(_toks(verbal_after)) >= 6
+        and teaching_resumes
+    )
 
 
 def _near_duplicate(a: dict, b: dict, threshold: float = _DUPLICATE_OVERLAP) -> bool:
@@ -4130,7 +5099,7 @@ def _validated_intent_constraints(
     topic: str,
 ) -> tuple[dict[str, _IntentConstraint], str | None]:
     """Validate the selector's same-call interpretation against the exact request."""
-    if not isinstance(plan, _IntentBoundaryPlan):
+    if not isinstance(plan, (_CompactBoundaryPlan, _IntentBoundaryPlan)):
         return {}, None
     expected_request = topic.strip() or "(all educational topics)"
     request_intent = plan.request_intent
@@ -4409,6 +5378,7 @@ def _plan_to_report(
         trimmed_visual_end_suffix = False
         completed_forward_sentence = False
         start_recovered_forward = False
+        trimmed_terminal_meta_suffix = False
         boundary_fallback_reasons: list[str] = []
         if not _contains_quote(start_text, start_quote):
             nearby_start = max(0, proposed_start - 2)
@@ -4517,12 +5487,38 @@ def _plan_to_report(
             or getattr(proposal, "facet", "")
             or ""
         )
-        section_start, section_end = _single_objective_section_bounds(
+        evidence_location_for_section = _unique_evidence_location(
+            segments,
+            evidence_quote_for_section,
+            a,
+            b,
+        )
+        topic_transitions_for_section = _candidate_topic_transitions(
             segments,
             a,
             b,
             evidence_quote=evidence_quote_for_section,
             learning_objective=objective_for_section,
+        )
+        if _evidence_crosses_topic_transition(
+            evidence_location=evidence_location_for_section,
+            transitions=topic_transitions_for_section,
+        ):
+            report.rejected_reasons.append(
+                f"{prefix}:topic_evidence_crosses_topic_reset"
+            )
+            continue
+        intra_start_quote, intra_end_quote = _single_objective_intra_cue_quotes(
+            segments,
+            evidence_location=evidence_location_for_section,
+            transitions=topic_transitions_for_section,
+        )
+        section_start, section_end = _single_objective_section_bounds(
+            segments,
+            a,
+            b,
+            evidence_location=evidence_location_for_section,
+            transitions=topic_transitions_for_section,
         )
         if section_start != a:
             a = section_start
@@ -4548,13 +5544,6 @@ def _plan_to_report(
             fallback_end_edge = True
             quote_repaired = True
             boundary_fallback_reasons.append("trimmed_adjacent_topic_after")
-        intra_start_quote, intra_end_quote = _single_objective_intra_cue_quotes(
-            segments,
-            a,
-            b,
-            evidence_quote=evidence_quote_for_section,
-            learning_objective=objective_for_section,
-        )
         intra_start_boundary = bool(intra_start_quote)
         if intra_start_quote:
             start_quote = intra_start_quote
@@ -4567,7 +5556,11 @@ def _plan_to_report(
             fallback_end_edge = False
             quote_repaired = True
             boundary_fallback_reasons.append("trimmed_same_cue_topic_after")
+        contextual_example_needs_context = (
+            _opening_contextual_example_needs_context(start_text)
+        )
         selected_start_before_context = a
+        selected_start_quote_before_context = start_quote
         selected_end_before_context = b
         context_repair_source_text = _cue_clip_text(
             segments, a, min(n - 1, b + 1)
@@ -4717,6 +5710,21 @@ def _plan_to_report(
                     ),
                 )
                 if recovered_start_quote:
+                    recovered_start_span = _quote_character_span(
+                        start_text,
+                        recovered_start_quote,
+                    )
+                    if (
+                        recovered_start_span is not None
+                        and recovered_start_span[0] == 0
+                        and a > 0
+                        and _cue_has_explicit_dangling_end(
+                            str(segments[a - 1].get("text") or ""),
+                            start_text,
+                        )
+                    ):
+                        recovered_start_quote = ""
+                if recovered_start_quote:
                     start_quote = recovered_start_quote
                     repaired_start_edge = True
                     quote_repaired = True
@@ -4731,6 +5739,15 @@ def _plan_to_report(
                         evidence_quote=evidence_quote_for_section,
                         learning_objective=objective_for_section,
                     )
+                    if (
+                        recovered_forward is not None
+                        and _opening_contextual_example_needs_context(start_text)
+                    ):
+                        recovered_text = str(
+                            segments[recovered_forward[0]].get("text") or ""
+                        )
+                        if not _local_example_setup_is_complete(recovered_text):
+                            recovered_forward = None
                     if recovered_forward is not None:
                         a, start_quote = recovered_forward
                         start_text = str(segments[a].get("text") or "").strip()
@@ -4809,6 +5826,23 @@ def _plan_to_report(
             trimmed_visual_end_suffix = True
             quote_repaired = True
             boundary_fallback_reasons.append("trimmed_visual_dependent_tail")
+        terminal_meta_trim = _trim_terminal_meta_suffix(
+            segments,
+            a,
+            b,
+            start_quote=start_quote,
+            end_quote=end_quote,
+            evidence_quote=evidence_quote_for_section,
+            learning_objective=objective_for_section,
+        )
+        if terminal_meta_trim is not None:
+            b, end_quote = terminal_meta_trim
+            end_text = str(segments[b].get("text") or "").strip()
+            repaired_end_edge = True
+            fallback_end_edge = False
+            trimmed_terminal_meta_suffix = True
+            quote_repaired = True
+            boundary_fallback_reasons.append("trimmed_terminal_meta_suffix")
         quote_repaired = quote_repaired or repaired_start_edge or repaired_end_edge
 
         # Run discourse closure against the teaching slice the model selected, not
@@ -4816,6 +5850,13 @@ def _plan_to_report(
         closure_segments = segments
         preliminary_start_spans = _quote_character_spans(start_text, start_quote)
         preliminary_end_spans = _quote_character_spans(end_text, end_quote)
+        projected_end_needs_continuation = bool(
+            len(preliminary_end_spans) == 1
+            and b + 1 < len(segments)
+            and _TERMINAL_DANGLING_DISCOURSE_LEADIN_RE.search(
+                end_text[:preliminary_end_spans[0][1]]
+            )
+        )
         projected_start_is_standalone = bool(
             len(preliminary_start_spans) == 1
             and _projected_start_is_standalone(
@@ -4824,15 +5865,19 @@ def _plan_to_report(
             )
         )
         projected_end_is_complete = bool(
-            len(preliminary_end_spans) == 1
-            and _projected_end_is_complete(
-                end_text,
-                preliminary_end_spans[0],
-                following_text=(
-                    str(segments[b + 1].get("text") or "")
-                    if b + 1 < len(segments)
-                    else ""
-                ),
+            trimmed_terminal_meta_suffix
+            or (
+                not projected_end_needs_continuation
+                and len(preliminary_end_spans) == 1
+                and _projected_end_is_complete(
+                    end_text,
+                    preliminary_end_spans[0],
+                    following_text=(
+                        str(segments[b + 1].get("text") or "")
+                        if b + 1 < len(segments)
+                        else ""
+                    ),
+                )
             )
         )
         if len(preliminary_start_spans) == 1 or len(preliminary_end_spans) == 1:
@@ -4847,6 +5892,8 @@ def _plan_to_report(
                 if len(preliminary_end_spans) == 1
                 else len(end_text)
             )
+            if projected_end_needs_continuation:
+                end_right = len(end_text)
             terminal_suffix = re.match(
                 r"\s*[,;:.!?]+[\"'’”)]*",
                 end_text[end_right:],
@@ -4863,9 +5910,12 @@ def _plan_to_report(
         closure_selected_end = b
         closure_end_requires_completion = bool(
             not projected_end_is_complete
-            and re.search(
-                r"[,;:\-—][\"'’”)]*\s*$",
-                str(closure_segments[b].get("text") or ""),
+            and (
+                projected_end_needs_continuation
+                or re.search(
+                    r"[,;:\-—][\"'’”)]*\s*$",
+                    str(closure_segments[b].get("text") or ""),
+                )
             )
         )
         a, b, closure_error = _close_cue_context(
@@ -4924,6 +5974,70 @@ def _plan_to_report(
                 quote_repaired = True
                 boundary_fallback_reasons.append("completed_forward_sentence")
                 break
+
+        selected_opening_has_local_setup = False
+        if a == selected_start_before_context:
+            current_start_text = str(segments[a].get("text") or "")
+            current_start_span = _quote_character_span(
+                current_start_text,
+                start_quote,
+            )
+            if current_start_span is not None:
+                selected_opening_has_local_setup = (
+                    _local_example_setup_is_complete(
+                        current_start_text[current_start_span[0]:]
+                    )
+                )
+        if (
+            contextual_example_needs_context
+            and not start_recovered_forward
+            and not selected_opening_has_local_setup
+        ):
+            selected_start_text = str(
+                segments[selected_start_before_context].get("text") or ""
+            )
+            selected_end_text = str(segments[b].get("text") or "")
+            selected_example_text, _ = _semantic_clip_slice(
+                segments,
+                selected_start_before_context,
+                b,
+                start_span=_quote_character_span(
+                    selected_start_text,
+                    selected_start_quote_before_context,
+                ),
+                end_span=_quote_character_span(selected_end_text, end_quote),
+            )
+            recovered_setup = (
+                _cue_clip_text(
+                    segments,
+                    a,
+                    selected_start_before_context - 1,
+                )
+                if a < selected_start_before_context
+                else ""
+            )
+            recovered_setup_complete = _local_example_setup_is_complete(
+                recovered_setup
+            )
+            later_target_complete = _selected_example_restates_complete_target(
+                selected_example_text
+            )
+            if (
+                not recovered_setup_complete
+                and not later_target_complete
+            ):
+                report.rejected_reasons.append(
+                    f"{prefix}:unresolved_example_setup"
+                )
+                continue
+            if later_target_complete:
+                a = selected_start_before_context
+                start_text = str(segments[a].get("text") or "").strip()
+                start_quote = selected_start_quote_before_context
+                fallback_start_edge = False
+                boundary_fallback_reasons.append(
+                    "accepted_later_restated_example_target"
+                )
 
         filler_trim = _trim_structural_filler_edges(
             segments,
@@ -5032,6 +6146,7 @@ def _plan_to_report(
         if (
             b != selected_end_before_context
             and not trimmed_visual_end_suffix
+            and not trimmed_terminal_meta_suffix
             and not completed_forward_sentence
         ):
             expanded_end_text = str(segments[b].get("text") or "")
@@ -5132,20 +6247,33 @@ def _plan_to_report(
             if not clip_text:
                 report.rejected_reasons.append(f"{prefix}:empty_cue_transcript")
                 continue
-        if _contains_unrequested_vampire_pseudoscience(clip_text, topic):
-            report.rejected_reasons.append(f"{prefix}:fictional_framing")
-            continue
         same_cue_filler_reason = _same_cue_internal_filler_reason(clip_text)
         if same_cue_filler_reason:
             boundary_fallback_reasons.append(
                 f"retained_{same_cue_filler_reason}"
             )
-        if _clip_requires_visual_context(clip_text):
+        if _clip_requires_visual_context(
+            clip_text,
+            learning_objective=objective_for_section,
+        ):
             report.rejected_reasons.append(f"{prefix}:requires_visual_context")
             continue
         topic_evidence_quote = " ".join(
             str(getattr(proposal, "topic_evidence_quote", "") or "").split()
         )
+        if isinstance(proposal, _CompactBoundaryTopic) and not topic_evidence_quote:
+            proposed_intent_evidence = list(proposal.intent_evidence)
+            topic_evidence_quote = next(
+                (
+                    " ".join(str(evidence.evidence_quote or "").split())
+                    for constraint_id in intent_constraints
+                    for evidence in proposed_intent_evidence
+                    if evidence.constraint_id == constraint_id
+                ),
+                " ".join(
+                    str(proposed_intent_evidence[0].evidence_quote or "").split()
+                ) if proposed_intent_evidence else "",
+            )
         if isinstance(proposal, (_BoundaryTopic, _CompactBoundaryTopic)):
             grounded_evidence = _grounded_evidence_span_with_minimum_words(
                 clip_text,
@@ -5215,17 +6343,6 @@ def _plan_to_report(
                 for constraint_id in intent_constraints
                 if constraint_id in evidence_by_constraint
             ]
-        elif isinstance(proposal, _CompactBoundaryTopic):
-            intent_role = str(proposal.intent_role.value)
-            intent_coverage = 1.0 if intent_role == "primary" else 0.5
-            evidence_words = list(_WORD_RE.finditer(topic_evidence_quote))
-            intent_quote = topic_evidence_quote
-            if len(evidence_words) > 16:
-                intent_quote = topic_evidence_quote[:evidence_words[15].end()].strip()
-            grounded_intent_evidence = [{
-                "constraint_id": "exact_request",
-                "evidence_quote": intent_quote,
-            }]
         learning_objective = str(
             getattr(proposal, "learning_objective", "")
             or getattr(proposal, "reason", "")
@@ -5491,7 +6608,7 @@ def _validate_model_response(
     payload = json.loads(text)
     expected_keys = (
         {"request_intent", "topics"}
-        if schema is _IntentBoundaryPlan
+        if schema in {_CompactBoundaryPlan, _IntentBoundaryPlan}
         else {"topics"}
     )
     if (
@@ -5505,8 +6622,9 @@ def _validate_model_response(
     topic_schema: type[BaseModel] = (
         _CompactBoundaryTopic if schema is _CompactBoundaryPlan else _BoundaryTopic
     )
-    if schema is _IntentBoundaryPlan:
+    if schema in {_CompactBoundaryPlan, _IntentBoundaryPlan}:
         request_intent = _RequestIntent.model_validate(payload["request_intent"])
+    if schema is _IntentBoundaryPlan:
         topic_schema = _IntentBoundaryTopic
 
     topics: list[_BoundaryTopic] = []
@@ -5528,7 +6646,11 @@ def _validate_model_response(
             topics=topics,
         ), rejection_reasons
     if schema is _CompactBoundaryPlan:
-        return _CompactBoundaryPlan(topics=topics), rejection_reasons
+        assert request_intent is not None
+        return _CompactBoundaryPlan(
+            request_intent=request_intent,
+            topics=topics,
+        ), rejection_reasons
     return _BoundaryPlan(topics=topics), rejection_reasons
 
 
