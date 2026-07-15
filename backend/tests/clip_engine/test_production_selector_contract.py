@@ -1021,6 +1021,172 @@ def test_same_cue_trailing_preview_is_trimmed_from_model_end_quote() -> None:
     assert "next time" not in clip["_clip_text"]
 
 
+@pytest.mark.parametrize(
+    ("candidate_id", "segments", "topic", "objective", "evidence", "forbidden"),
+    [
+        (
+            "area-before-future-preview",
+            [
+                (
+                    "The definite integral adds the areas of increasingly thin "
+                    "rectangles and in the limit this equals the area under the curve "
+                    "trust me we'll get much more involved later don't worry we'll do "
+                    "that later in chapter four so let's define a limit as the value a "
+                    "function approaches"
+                ),
+            ],
+            "area under a curve",
+            "Explain why a definite integral equals the area under a curve",
+            "in the limit this equals the area under the curve",
+            "trust me",
+        ),
+        (
+            "differential-equation-before-assignment",
+            [
+                (
+                    "Separating variables and integrating gives y equals c e to the "
+                    "negative k t which is the complete solution"
+                ),
+                (
+                    "There are many other examples, so I'll leave one as an exercise "
+                    "to write a differential equation that describes a radioactive "
+                    "substance Okay so we'll come"
+                ),
+            ],
+            "differential equations",
+            "Solve the separable differential equation through its general solution",
+            "y equals c e to the negative k t",
+            "many other examples",
+        ),
+        (
+            "indefinite-parts-before-definite-version",
+            [
+                (
+                    "For an indefinite integral integration by parts gives integral u "
+                    "d v equals u v minus integral v d u and that completes the derivation "
+                    "So let me spell it out So this is the definite integral's version"
+                ),
+            ],
+            "indefinite integration by parts",
+            "Derive the indefinite integration by parts identity",
+            "integral u d v equals u v minus integral v d u",
+            "So let me spell it out",
+        ),
+    ],
+)
+def test_coarse_caption_tail_is_trimmed_without_losing_complete_teaching(
+    candidate_id: str,
+    segments: list[str],
+    topic: str,
+    objective: str,
+    evidence: str,
+    forbidden: str,
+) -> None:
+    cues = [
+        {
+            "cue_id": f"{candidate_id}:{index}",
+            "start": index * 12.0,
+            "end": (index + 1) * 12.0,
+            "text": text,
+        }
+        for index, text in enumerate(segments)
+    ]
+    proposal = _proposal(end_line=len(cues) - 1).model_copy(update={
+        "candidate_id": candidate_id,
+        "start_quote": " ".join(segments[0].split()[:8]),
+        "end_quote": " ".join(segments[-1].split()[-8:]),
+        "title": "Complete teaching before an edge transition",
+        "learning_objective": objective,
+        "facet": topic,
+        "reason": "The retained prefix completes the requested teaching unit.",
+        "topic_evidence_quote": evidence,
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        cues,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic=topic,
+    )
+
+    assert report.rejected_reasons == []
+    assert len(report.clips) == 1
+    assert evidence in report.clips[0]["_clip_text"]
+    assert forbidden.lower() not in report.clips[0]["_clip_text"].lower()
+
+
+def test_assignment_leadin_is_retained_when_its_cue_contains_grounded_teaching() -> None:
+    segments = [
+        {
+            "cue_id": "decay-setup",
+            "start": 0.0,
+            "end": 8.0,
+            "text": "The decay rate is proportional to the amount remaining.",
+        },
+        {
+            "cue_id": "decay-solution",
+            "start": 8.0,
+            "end": 20.0,
+            "text": (
+                "As an exercise, solve the differential equation by separating "
+                "variables. The answer is y equals c e to the negative k t."
+            ),
+        },
+    ]
+    proposal = _proposal(end_line=1).model_copy(update={
+        "candidate_id": "grounded-assignment-solution",
+        "start_quote": "The decay rate is proportional",
+        "end_quote": "y equals c e to the negative k t",
+        "title": "Solve a radioactive decay equation",
+        "learning_objective": "Solve the radioactive decay differential equation",
+        "facet": "differential equation solution",
+        "reason": "The assignment cue contains the grounded answer.",
+        "topic_evidence_quote": "The answer is y equals c e to the negative k t",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="radioactive decay differential equation",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == ["decay-setup", "decay-solution"]
+    assert "The answer is y equals c e to the negative k t" in report.clips[0]["_clip_text"]
+
+
+def test_same_unit_future_step_is_not_unconditional_trailing_noise() -> None:
+    text = (
+        "We will differentiate the outer function first and multiply by the "
+        "inner derivative later, which completes the chain rule."
+    )
+
+    assert gemini_segment._unconditional_trailing_edge_noise_start(text) is None
+
+
+def test_requested_formula_version_comparison_keeps_both_versions() -> None:
+    text = (
+        "The indefinite integration by parts identity is integral u d v equals "
+        "u v minus integral v d u. So let me spell it out. So this is the "
+        "definite integral's version"
+    )
+
+    end_quote, trimmed = gemini_segment._trim_end_quote_before_edge_noise(
+        text,
+        "So this is the definite integral's version",
+        evidence_quote="integral u d v equals u v minus integral v d u",
+        learning_objective=(
+            "Compare the indefinite and definite integration by parts versions"
+        ),
+    )
+
+    assert not trimmed
+    assert end_quote == "So this is the definite integral's version"
+
+
 def test_same_cue_leading_welcome_is_trimmed_from_model_start_quote() -> None:
     text = (
         "Welcome to the channel. Cells use chlorophyll to capture light energy and "
@@ -2013,6 +2179,42 @@ def test_relational_word_overlap_does_not_merge_a_named_adjacent_topic() -> None
     assert report.rejected_reasons == []
     assert report.clips[0]["_clip_text"] == (
         "Photosynthesis converts light into glucose."
+    )
+
+
+def test_relational_reset_requires_more_than_one_anchor_only_on_the_new_side() -> None:
+    assert not gemini_segment._objective_bridges_sections(
+        "Explain how indefinite integration by parts yields a boundary formula",
+        "Indefinite integration by parts moves the derivative between factors.",
+        "Boundary conditions determine a radioactive decay solution.",
+        reset_subject="boundary conditions",
+    )
+
+
+def test_explicit_one_concept_to_one_concept_comparison_can_bridge_a_reset() -> None:
+    assert gemini_segment._objective_bridges_sections(
+        "Compare limits with derivatives",
+        "A limit describes an approached value.",
+        "A derivative describes instantaneous change.",
+        reset_subject="derivatives",
+    )
+
+
+def test_explicit_comparison_can_bridge_when_setup_already_names_both_sides() -> None:
+    assert gemini_segment._objective_bridges_sections(
+        "Compare limits with derivatives",
+        "Limits and derivatives differ in what they measure.",
+        "Derivatives measure instantaneous change.",
+        reset_subject="derivatives",
+    )
+
+
+def test_comparison_does_not_bridge_on_only_a_shared_head_noun() -> None:
+    assert not gemini_segment._objective_bridges_sections(
+        "Compare opportunity cost with sunk cost",
+        "Cost represents a tradeoff.",
+        "Cost accounting assigns expenditures to categories.",
+        reset_subject="cost accounting",
     )
 
 

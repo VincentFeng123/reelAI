@@ -407,8 +407,13 @@ _EXPLICIT_RELATIONAL_OBJECTIVE_RE = re.compile(
     r"\b(?:in\s+terms\s+of)\b|"
     r"\bderiv(?:e|ed|es|ing)\b[^.!?]{0,100}\bfrom\b|"
     r"\b(?:how|why)\b[^.!?]{1,100}\b(?:affect|cause|define|depend|derive|differ|"
-    r"form|imply|influence|interact|produce|relate|shape|use|yield)\w*\b|"
+    r"form|impl(?:y|ies)|influence|interact|produce|relate|shape|use|yield)\w*\b|"
     r"\b(?:form|produce|yield)\w*\b|"
+    r"\bversus\b|\bvs\.?(?:\s|$)",
+    re.IGNORECASE,
+)
+_EXPLICIT_COMPARISON_OBJECTIVE_RE = re.compile(
+    r"\b(?:compare|contrast|distinguish)\b[^.!?]{0,120}\b(?:and|from|with)\b|"
     r"\bversus\b|\bvs\.?(?:\s|$)",
     re.IGNORECASE,
 )
@@ -541,14 +546,50 @@ _NON_STANDALONE_MARKER_SUFFIX_RE = re.compile(
     r"they|this|those|to|unless|until|when|which|while)\b",
     re.IGNORECASE,
 )
+_UNCONDITIONAL_TRAILING_EDGE_NOISE_PATTERN = (
+    r"(?:"
+    r"trust\s+me(?:\s*[,;:]\s*|\s+)"
+    r"(?:we|i)(?:['’]ll|\s+will)\b[^\n]{0,180}?"
+    r"\b(?:later|next\s+time|in\s+(?:a|the)\s+(?:later|future)\s+"
+    r"(?:chapter|lesson|section|video))\b|"
+    r"(?:we|i)(?:['’]ll|\s+will)\s+(?:do|cover|discuss|revisit|explore|"
+    r"explain|develop|return\s+to|come\s+back\s+to|"
+    r"get\s+(?:more|much\s+more)\s+involved(?:\s+(?:in|with))?)\b"
+    r"[^\n]{0,120}?"
+    r"\b(?:later|next\s+time|in\s+(?:a|the)\s+(?:later|future)\s+"
+    r"(?:chapter|lesson|section|video))\b|"
+    r"(?:there\s+(?:are|is)\s+(?:many|some|several)\s+"
+    r"(?:(?:other|more)\s+)?examples?\s*[,;:]?\s*(?:so\s+)?)?"
+    r"(?:i(?:['’]ll|\s+will)?\s+leave\s+[^.!?\n]{0,80}?\s+as\s+|"
+    r"as\s+|for\s+)(?:an?\s+)?exercise\b|"
+    r"for\s+homework\b"
+    r")"
+)
+_TRAILING_VERSION_EDGE_NOISE_PATTERN = (
+    r"(?:(?:so|now)\s+)?let\s+(?:me|us)\s+(?:spell|write)\s+"
+    r"(?:it|this|that)\s+out\b[^\n]{0,80}?"
+    r"(?:(?:so|now)\s+)?this\s+is\s+(?:the\s+)?"
+    r"[^.!?\n]{1,100}\bversion\b(?=\s*[.!?]*\s*$)"
+)
+_UNCONDITIONAL_TRAILING_EDGE_NOISE_RE = re.compile(
+    rf"(?:^|\s)(?P<noise>{_UNCONDITIONAL_TRAILING_EDGE_NOISE_PATTERN})",
+    re.IGNORECASE,
+)
+_TRAILING_VERSION_EDGE_NOISE_RE = re.compile(
+    rf"(?:^|\s)(?P<noise>{_TRAILING_VERSION_EDGE_NOISE_PATTERN})",
+    re.IGNORECASE,
+)
 _TRAILING_EDGE_NOISE_RE = re.compile(
     r"(?:^|\s)(?P<noise>"
+    rf"{_UNCONDITIONAL_TRAILING_EDGE_NOISE_PATTERN}|"
+    rf"{_TRAILING_VERSION_EDGE_NOISE_PATTERN}|"
     r"(?:(?:all\s+right|alright|okay|ok|so)\s*[,;:]?\s+)?"
-    r"(?:now\s+)?let(?:['’]?s|\s+us)(?:\s+(?:talk|discuss|cover|move\s+on|"
+    r"(?:now\s+)?let(?:['’]?s|\s+us)(?:\s+(?:talk|discuss|cover|define|"
+    r"introduce|move\s+on|"
     r"head(?:\s+(?:over|on))?|turn|switch|begin(?:\s+our\s+discussion)?)\b|"
     r"(?=\s*[.!?]?\s*$))|"
     r"(?:(?:now|next)\s+)?(?:we|i)(?:['’]ll|\s+will)\s+(?:move\s+on|turn|switch|"
-    r"head(?:\s+(?:over|on))?|talk|discuss|cover)\b|"
+    r"head(?:\s+(?:over|on))?|talk|discuss|cover|define|introduce)\b|"
     r"so\s+let(?:['’]?s|\s+us)\s+begin\s+our\s+discussion\b|"
     r"you\s+(?:might|may|will|can|could)\s+be\s+(?:tested|quizzed)\s+on\s+"
     r"(?:this|that|it)\b|"
@@ -1896,7 +1937,12 @@ def _cue_boundary_confidence(text: str, *, ignore_caption_case: bool) -> float:
 
 
 def _trim_trailing_incomplete_suffix(
-    segments: list[dict], start_line: int, end_line: int,
+    segments: list[dict],
+    start_line: int,
+    end_line: int,
+    *,
+    protected_quote: str = "",
+    learning_objective: str = "",
 ) -> int | None:
     """Trim a cue-aligned teaser/transition suffix, or reject if no clean prefix exists."""
     from .discourse import first_lexical_character_index
@@ -1912,6 +1958,35 @@ def _trim_trailing_incomplete_suffix(
     )
     for line in range(end_line, start_line - 1, -1):
         suffix = _cue_clip_text(segments, line, end_line)
+        unconditional_edge_noise = (
+            line == end_line
+            and _unconditional_trailing_edge_noise_start(
+                suffix,
+                require_edge_prefix=True,
+            )
+            is not None
+            and not (
+                protected_quote
+                and _contains_quote(suffix, protected_quote)
+            )
+        )
+        version_edge_noise = (
+            line == end_line
+            and _trailing_version_edge_noise_start(
+                suffix,
+                require_edge_prefix=True,
+            )
+            is not None
+            and not (
+                protected_quote
+                and _contains_quote(suffix, protected_quote)
+            )
+            and not _objective_bridges_sections(
+                learning_objective,
+                _cue_clip_text(segments, start_line, end_line - 1),
+                suffix,
+            )
+        )
         dangling_transition = bool(
             _TERMINAL_DANGLING_TRANSITION_RE.search(suffix)
         )
@@ -1942,12 +2017,20 @@ def _trim_trailing_incomplete_suffix(
             or dangling_bare_subject
             or forward_setup
             or forward_transition
+            or unconditional_edge_noise
+            or version_edge_noise
         ):
             continue
         previous_line = line - 1
         if previous_line < start_line:
             return end_line if forward_setup else None
         previous_text = str(segments[previous_line].get("text") or "").strip()
+        if unconditional_edge_noise or version_edge_noise:
+            return (
+                previous_line
+                if _last_safe_complete_prefix(previous_text)
+                else None
+            )
         if (
             forward_transition
             and len(_toks(previous_text)) >= 3
@@ -1969,6 +2052,8 @@ def _close_cue_context(
     cue_limit: int | None = None,
     start_boundary_verified: bool = False,
     end_boundary_verified: bool = False,
+    protected_quote: str = "",
+    learning_objective: str = "",
 ) -> tuple[int, int, str | None]:
     """Expand dirty edges until discourse closes or a real section edge is reached."""
     expansion_limit = (
@@ -1997,7 +2082,11 @@ def _close_cue_context(
         )
     )
     trimmed_end = _trim_trailing_incomplete_suffix(
-        segments, start_line, end_line
+        segments,
+        start_line,
+        end_line,
+        protected_quote=protected_quote,
+        learning_objective=learning_objective,
     )
     if trimmed_end is None:
         return start_line, end_line, "unresolved_weak_end"
@@ -2979,6 +3068,48 @@ def _trailing_edge_noise_start(
     return None
 
 
+def _unconditional_trailing_edge_noise_start(
+    text: str,
+    *,
+    require_edge_prefix: bool = False,
+) -> int | None:
+    """Locate assignment/future-unit speech that cannot complete teaching."""
+    raw_text = str(text or "")
+    for match in _UNCONDITIONAL_TRAILING_EDGE_NOISE_RE.finditer(raw_text):
+        start = match.start("noise")
+        connector = re.search(
+            r"\b(?:and|but|so)\s*$",
+            raw_text[:start],
+            re.IGNORECASE,
+        )
+        cut_start = connector.start() if connector is not None else start
+        if require_edge_prefix and _WORD_RE.search(raw_text[:cut_start]):
+            continue
+        return cut_start
+    return None
+
+
+def _trailing_version_edge_noise_start(
+    text: str,
+    *,
+    require_edge_prefix: bool = False,
+) -> int | None:
+    """Locate a formula-version transition that may belong to another facet."""
+    raw_text = str(text or "")
+    for match in _TRAILING_VERSION_EDGE_NOISE_RE.finditer(raw_text):
+        start = match.start("noise")
+        connector = re.search(
+            r"\b(?:and|but|so)\s*$",
+            raw_text[:start],
+            re.IGNORECASE,
+        )
+        cut_start = connector.start() if connector is not None else start
+        if require_edge_prefix and _WORD_RE.search(raw_text[:cut_start]):
+            continue
+        return cut_start
+    return None
+
+
 def _last_safe_complete_prefix(text: str) -> str:
     """Keep a whole claim before navigation, never a dangling predicate."""
     from .sentences import classify_terminator
@@ -3027,7 +3158,8 @@ def _trim_end_quote_before_edge_noise(
     if any(evidence_span[0] >= noise_start for evidence_span in evidence_spans):
         return quote, False
     retained = selected[:noise_start].rstrip(" ,;:—-")
-    if _objective_bridges_sections(
+    unconditional_noise_start = _unconditional_trailing_edge_noise_start(selected)
+    if unconditional_noise_start != noise_start and _objective_bridges_sections(
         learning_objective,
         retained,
         selected[noise_start:],
@@ -3275,32 +3407,58 @@ def _objective_bridges_sections(
     objective_tokens = _content_tokens(learning_objective) - generic
     if not objective_tokens:
         return False
-    left_overlap = objective_tokens & _content_tokens(left_text)
-    right_overlap = objective_tokens & _content_tokens(right_text)
+
+    def objective_overlap(text: str) -> set[str]:
+        side_tokens = _content_tokens(text)
+        return {
+            objective_token
+            for objective_token in objective_tokens
+            if any(
+                objective_token == side_token
+                or (
+                    min(len(objective_token), len(side_token)) >= 5
+                    and (
+                        objective_token.startswith(side_token)
+                        or side_token.startswith(objective_token)
+                        or objective_token == f"sub{side_token}"
+                        or side_token == f"sub{objective_token}"
+                    )
+                )
+                for side_token in side_tokens
+            )
+        }
+
+    left_overlap = objective_overlap(left_text)
+    right_overlap = objective_overlap(right_text)
     if not left_overlap or not right_overlap:
         return False
     subject_tokens = _content_tokens(reset_subject) - {
         "about", "cover", "discuss", "how", "look", "next", "talk", "why",
     }
-    subject_is_anchored = bool(objective_tokens & subject_tokens) or any(
-        min(len(objective_token), len(subject_token)) >= 5
-        and (
-            objective_token.startswith(subject_token)
-            or subject_token.startswith(objective_token)
-        )
-        for objective_token in objective_tokens
-        for subject_token in subject_tokens
-    )
+    subject_is_anchored = bool(objective_overlap(reset_subject))
     if subject_tokens and not subject_is_anchored:
         # A broad relational objective can share one word with an adjacent
         # lesson without actually naming that lesson. The explicit reset
         # subject must itself belong to the objective before the reset is kept.
         return False
+    normalized_objective = " ".join(str(learning_objective or "").split())
+    if _EXPLICIT_COMPARISON_OBJECTIVE_RE.search(normalized_objective):
+        # Comparisons may use one anchor per side, but a shared head noun such
+        # as "cost" cannot by itself connect opportunity cost to cost accounting.
+        return len(left_overlap | right_overlap) >= 2
     if _objective_explicitly_relates_sections(learning_objective):
-        return True
-    # Non-relational method changes need stronger evidence from the setup;
-    # this prevents one shared word (for example, glucose) from merging topics.
-    return len(left_overlap) >= 2
+        if _RELATIONAL_RESET_SUBJECT_RE.match(str(reset_subject or "")):
+            # "why/how it is X" explicitly continues the claim on the old
+            # side; its anaphoric subject cannot supply two lexical anchors.
+            return True
+        if len(right_overlap) >= 2:
+            # The new side explicitly restates enough of the relationship to
+            # connect back to even a one-concept setup.
+            return True
+        return False
+    # A method change within one objective needs independent multi-token
+    # evidence on both sides; one shared word cannot merge adjacent lessons.
+    return len(left_overlap) >= 2 and len(right_overlap) >= 2
 
 
 def _candidate_topic_transitions(
@@ -4652,6 +4810,8 @@ def _plan_to_report(
                 repaired_start_edge or projected_start_is_standalone
             ),
             end_boundary_verified=projected_end_is_complete,
+            protected_quote=evidence_quote_for_section,
+            learning_objective=objective_for_section,
         )
         if closure_error:
             if closure_error == "unresolved_weak_end":
