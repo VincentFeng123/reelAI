@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -708,7 +709,7 @@ def test_dispatched_transport_failure_preserves_call_identity(monkeypatch):
     assert telemetry["model"] == G.config.SEGMENT_FLASH_MODEL
 
 
-def test_production_selector_reserves_once_without_transport_retry(monkeypatch):
+def test_production_selector_retries_one_503_with_one_reservation(monkeypatch):
     class TransientHTTPError(RuntimeError):
         status_code = 503
 
@@ -718,7 +719,30 @@ def test_production_selector_reserves_once_without_transport_retry(monkeypatch):
 
         def generate_content(self, **kwargs):
             self.calls.append(kwargs)
-            raise TransientHTTPError("status 503")
+            if len(self.calls) == 1:
+                raise TransientHTTPError("status 503")
+            return SimpleNamespace(
+                text=json.dumps({
+                    "request_intent": {
+                        "exact_request": "calculus",
+                        "constraints": [{
+                            "constraint_id": "subject",
+                            "kind": "subject",
+                            "source_phrase": "calculus",
+                            "requirement": "Teach calculus",
+                        }],
+                    },
+                    "topics": [],
+                }),
+                candidates=[],
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=120,
+                    candidates_token_count=10,
+                    thoughts_token_count=0,
+                    total_token_count=130,
+                    cached_content_token_count=0,
+                ),
+            )
 
     models = Models()
     monkeypatch.setattr(
@@ -742,17 +766,21 @@ def test_production_selector_reserves_once_without_transport_retry(monkeypatch):
         deadline_monotonic=time.monotonic() + 10,
     )
 
-    assert len(models.calls) == 1
+    assert len(models.calls) == 2
+    assert {call["model"] for call in models.calls} == {
+        G.config.SEGMENT_FLASH_MODEL
+    }
     assert len(reservations) == 1
-    assert result.calls[0]["retries"] == 0
-    assert result.calls[0]["provider_error_type"] == "TransientHTTPError"
-    assert result.calls[0]["provider_status_code"] == 503
-    assert result.calls[0]["retryable"] is True
+    assert result.calls[0]["retries"] == 1
+    assert result.calls[0]["error_history"] == ({
+        "provider_error_type": "TransientHTTPError",
+        "provider_status_code": 503,
+        "retryable": True,
+    },)
     assert result.calls[0]["dispatched"] is True
     assert result.calls[0]["reserved_cost_usd"] == 0.25
-    assert result.classification_reasons == [
-        "request_failure:GeminiTransportError"
-    ]
+    assert result.error is None
+    assert result.classification_reasons == ["zero_valid_candidates"]
 
 
 def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
@@ -813,15 +841,15 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
     "profile,expected",
     [
         (G.PRODUCTION_PRO_PROFILE,
-         ("high", 24_576, 90.0, "pro_authoritative", "gemini-3.1-pro-preview")),
+         ("high", 24_576, 90.0, "pro_authoritative", "gemini-3.1-pro-preview", 0)),
         (G.CORRECTED_PRO_PROFILE,
-         ("high", 24_576, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
+         ("high", 24_576, 90.0, "pro_fallback", "gemini-3.1-pro-preview", 0)),
     (G.FLASH_SINGLE_PROFILE,
-         ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash")),
+         ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash", 0)),
     (G.FLASH_SPLIT_PROFILE,
-         ("low", 6_000, 28.0, "flash_boundary_selector", "gemini-3.5-flash")),
+         ("low", 6_000, 28.0, "flash_boundary_selector", "gemini-3.5-flash", 1)),
     (G.PRO_BOUNDARY_PROFILE,
-         ("high", 6_000, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
+         ("high", 6_000, 90.0, "pro_fallback", "gemini-3.1-pro-preview", 0)),
     ],
 )
 def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, expected):
@@ -837,7 +865,7 @@ def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, ex
         profile, _transcript(), "", {},
         deadline=time.monotonic() + 10, cancelled=None,
     )
-    level, cap, timeout, operation, default_model = expected
+    level, cap, timeout, operation, default_model, max_retries = expected
     expected_model = (G.config.SEGMENT_PRO_MODEL if "pro" in default_model
                       else G.config.SEGMENT_FLASH_MODEL)
     assert (
@@ -850,7 +878,7 @@ def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, ex
         timeout,
         operation,
         expected_model,
-        0,
+        max_retries,
     )
 
 

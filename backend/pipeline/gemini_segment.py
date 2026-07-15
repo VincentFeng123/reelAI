@@ -7148,10 +7148,10 @@ def _run_selection_profile(
         cancelled=cancelled,
         budget_reserve=settings.get("_segment_budget_reserve"),
         budget_reconcile=settings.get("_segment_budget_reconcile"),
-        # One uncached source gets exactly one physical selector request. A
-        # second provider attempt would add latency and billable work while
-        # violating the shared source-level cost contract.
-        max_retries=0,
+        # Healthy sources still use one physical request. The active Flash
+        # selector gets one deadline-aware retry so a brief provider-capacity
+        # failure cannot discard an otherwise usable source.
+        max_retries=1 if profile == FLASH_SPLIT_PROFILE else 0,
     )
     require_enrichment = profile in {CORRECTED_PRO_PROFILE, FLASH_SINGLE_PROFILE}
     conversion_settings = dict(settings)

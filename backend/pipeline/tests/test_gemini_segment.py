@@ -742,7 +742,7 @@ def test_production_flash_has_a_bounded_latency_tail():
     assert G._FLASH_BOUNDARY_TIMEOUT_S < G._TOTAL_DEADLINE_S
 
 
-def test_production_flash_selector_disables_transport_retries(monkeypatch):
+def test_production_flash_selector_allows_one_bounded_transport_retry(monkeypatch):
     dispatched = []
 
     def call_model(*args, **kwargs):
@@ -762,7 +762,7 @@ def test_production_flash_selector_disables_transport_retries(monkeypatch):
 
     assert len(dispatched) == 1
     assert dispatched[0]["operation"] == "flash_boundary_selector"
-    assert dispatched[0]["max_retries"] == 0
+    assert dispatched[0]["max_retries"] == 1
 
 
 def test_production_flash_has_no_requested_duration_contract():
