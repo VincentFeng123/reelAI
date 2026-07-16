@@ -1657,9 +1657,9 @@ SEGMENT_PROFILES = (
     PRO_BOUNDARY_PROFILE,
 )
 
-_TOTAL_DEADLINE_S = 36.0
+_TOTAL_DEADLINE_S = 75.0
 _FLASH_SINGLE_TIMEOUT_S = 45.0
-_FLASH_BOUNDARY_TIMEOUT_S = 20.0
+_FLASH_BOUNDARY_TIMEOUT_S = 45.0
 _FLASH_REPAIR_TIMEOUT_S = 20.0
 _FLASH_ENRICH_TIMEOUT_S = 25.0
 _PRO_TIMEOUT_S = 90.0
@@ -12496,9 +12496,15 @@ def _run_selection_profile(
         if video_grounded
         else 0
     )
+    retry_flash_capacity_once = bool(
+        profile == FLASH_SPLIT_PROFILE
+        and not video_grounded
+        and settings.get("_segment_allow_flash_lite_failover") is not True
+    )
     retry_pro_capacity_once = bool(
         video_grounded and profile == PRO_BOUNDARY_PROFILE
     )
+    retry_capacity_once = retry_flash_capacity_once or retry_pro_capacity_once
     operation = str(settings.get("_segment_operation") or operation)
     parsed, call = _call_model(
         system,
@@ -12514,12 +12520,12 @@ def _run_selection_profile(
         cancelled=cancelled,
         budget_reserve=settings.get("_segment_budget_reserve"),
         budget_reconcile=settings.get("_segment_budget_reconcile"),
-        # Production transcript selection is single-attempt. Only an explicit
-        # video-grounded Pro evaluation may retry one confirmed 503 inside the
-        # existing deadline; there is no lower-quality model failover.
-        max_retries=1 if retry_pro_capacity_once else 0,
+        # A confirmed 503 may receive one bounded retry on the same model. This
+        # follows Gemini's transient-capacity guidance without adding another
+        # billable selection, changing model tiers, or allowing an open-ended wait.
+        max_retries=1 if retry_capacity_once else 0,
         retry_status_codes=(
-            frozenset({503}) if retry_pro_capacity_once else None
+            frozenset({503}) if retry_capacity_once else None
         ),
         failover_model=(
             config.SEGMENT_FLASH_FALLBACK_MODEL

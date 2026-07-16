@@ -114,12 +114,12 @@ logger: logging.Logger = get_ingest_logger(__name__)
 
 # Shared wall-clock budget for one topic's concurrent clip+filter batch. A
 # pathological set of videos must not multiply this deadline by video count.
-INGEST_TOPIC_VIDEO_TIMEOUT_SEC = float(os.environ.get("INGEST_TOPIC_VIDEO_TIMEOUT_SEC", "60"))
+INGEST_TOPIC_VIDEO_TIMEOUT_SEC = float(os.environ.get("INGEST_TOPIC_VIDEO_TIMEOUT_SEC", "75"))
 INGEST_TOPIC_USEFUL_INVENTORY_IDLE_TIMEOUT_SEC = float(
     os.environ.get("INGEST_TOPIC_USEFUL_INVENTORY_IDLE_TIMEOUT_SEC", "30")
 )
 INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC = float(
-    os.environ.get("INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC", "45")
+    os.environ.get("INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC", "75")
 )
 PARTIAL_CUE_MATERIALITY_SEC = 0.05
 SPEECH_OWNERSHIP_EPSILON_SEC = 0.001

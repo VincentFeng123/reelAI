@@ -15,7 +15,7 @@ ReelAI turns study materials into a learner-specific feed of transcript-grounded
 - Railway hosts the durable FastAPI process and generation worker.
 - PostgreSQL stores material data, generation jobs/events, provider usage, Supadata search evidence, and timestamped transcript artifacts.
 - Supadata supplies YouTube search and hosted timestamped transcript cues, preferring native captions and generating a transcript when captions are unavailable.
-- The guarded practice selector sends one complete Supadata transcript as text to Gemini 3.5 Flash, makes one authoritative selection call per analyzed source, and emits exact-word-aligned YouTube iframe timestamps. Audio refinement may only expand those semantic edges outward to nearby silence. YouTube media is not attached to the production selector.
+- The guarded practice selector sends one complete Supadata transcript as text to Gemini 3.5 Flash, makes one authoritative logical selection per analyzed source (with at most one same-model retry for a confirmed 503), and emits exact-word-aligned YouTube iframe timestamps. Audio refinement may only expand those semantic edges outward to nearby silence. YouTube media is not attached to the production selector.
 
 ### Generation contract
 

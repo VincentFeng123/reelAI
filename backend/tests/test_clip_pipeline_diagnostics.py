@@ -4538,6 +4538,11 @@ def test_clip_call_uses_one_medium_thinking_flash_selector_and_ignores_duration(
     assert clip_mock.call_count == 1
 
 
+def test_topic_deadlines_cover_one_bounded_flash_capacity_retry() -> None:
+    assert pipeline_module.INGEST_TOPIC_VIDEO_TIMEOUT_SEC >= 75.0
+    assert pipeline_module.INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC >= 75.0
+
+
 @pytest.mark.parametrize("mode", ["fast", "slow"])
 def test_fast_and_slow_clip_calls_use_identical_quality_routing(
     monkeypatch, mode: str

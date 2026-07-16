@@ -1063,7 +1063,7 @@ def test_selector_reconciles_actual_usage_before_conversion(
     )
 
 
-def test_flash_profile_fast_fails_primary_transport_errors(monkeypatch) -> None:
+def test_flash_profile_retries_one_confirmed_503_on_the_same_model(monkeypatch) -> None:
     captured: dict[str, object] = {}
     empty_plan = gemini_segment._CompactBoundaryPlan(
         request_intent={
@@ -1102,8 +1102,9 @@ def test_flash_profile_fast_fails_primary_transport_errors(monkeypatch) -> None:
         topic="photosynthesis",
     )
 
-    assert captured["max_retries"] == 0
-    assert captured["retry_status_codes"] is None
+    assert captured["max_retries"] == 1
+    assert captured["retry_status_codes"] == frozenset({503})
+    assert captured["timeout_s"] == 45.0
 
 
 def test_flash_selector_fails_over_immediately_after_one_503(monkeypatch) -> None:

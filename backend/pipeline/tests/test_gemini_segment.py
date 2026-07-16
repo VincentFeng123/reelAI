@@ -739,12 +739,12 @@ def test_production_flash_is_compact_exhaustive_boundary_first():
 
 
 def test_production_flash_has_a_bounded_latency_tail():
-    assert G._TOTAL_DEADLINE_S == 36.0
-    assert G._FLASH_BOUNDARY_TIMEOUT_S == 20.0
+    assert G._TOTAL_DEADLINE_S == 75.0
+    assert G._FLASH_BOUNDARY_TIMEOUT_S == 45.0
     assert G._FLASH_BOUNDARY_TIMEOUT_S < G._TOTAL_DEADLINE_S
 
 
-def test_production_flash_selector_fails_over_without_retrying_primary(monkeypatch):
+def test_production_flash_selector_retries_only_one_confirmed_503(monkeypatch):
     dispatched = []
 
     def call_model(*args, **kwargs):
@@ -764,8 +764,8 @@ def test_production_flash_selector_fails_over_without_retrying_primary(monkeypat
 
     assert len(dispatched) == 1
     assert dispatched[0]["operation"] == "flash_boundary_selector"
-    assert dispatched[0]["max_retries"] == 0
-    assert dispatched[0]["retry_status_codes"] is None
+    assert dispatched[0]["max_retries"] == 1
+    assert dispatched[0]["retry_status_codes"] == frozenset({503})
     assert dispatched[0]["failover_model"] is None
 
 

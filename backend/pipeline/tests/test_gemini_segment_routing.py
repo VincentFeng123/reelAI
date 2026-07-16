@@ -332,7 +332,7 @@ def test_route_event_uses_selected_authoritative_prompt_version(monkeypatch):
 
 @pytest.mark.parametrize(
     ("configured_deadline", "expected_deadline"),
-    [(None, 136.0), (120.0, 120.0), (200.0, 136.0)],
+    [(None, 175.0), (120.0, 120.0), (200.0, 175.0)],
 )
 def test_production_route_caps_and_respects_the_shared_deadline(
     monkeypatch,
@@ -1188,7 +1188,7 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
     (G.FLASH_SINGLE_PROFILE,
          ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash", 0)),
     (G.FLASH_SPLIT_PROFILE,
-         ("low", 6_000, 20.0, "flash_boundary_selector", "gemini-3.5-flash", 0)),
+         ("low", 6_000, 45.0, "flash_boundary_selector", "gemini-3.5-flash", 1)),
     (G.PRO_BOUNDARY_PROFILE,
          ("medium", 6_000, 90.0, "pro_fallback", "gemini-3.1-pro-preview", 0)),
     ],
@@ -1222,7 +1222,9 @@ def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, ex
         max_retries,
     )
     assert captured["failover_model"] is None
-    assert captured["retry_status_codes"] is None
+    assert captured["retry_status_codes"] == (
+        frozenset({503}) if profile == G.FLASH_SPLIT_PROFILE else None
+    )
 
 
 @pytest.mark.parametrize(
