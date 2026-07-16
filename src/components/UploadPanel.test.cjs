@@ -140,7 +140,7 @@ test("URL ingestion primes every returned reel with a legacy single-reel fallbac
   );
 });
 
-test("URL ingestion primes feed snapshots with the current v37 selection contract", () => {
+test("URL ingestion primes feed snapshots with the current v38 selection contract", () => {
   const filePath = path.join(__dirname, "UploadPanel.tsx");
   const source = fs.readFileSync(filePath, "utf8");
   const sourceFile = ts.createSourceFile(
@@ -177,7 +177,7 @@ test("URL ingestion primes feed snapshots with the current v37 selection contrac
     `${compiled}\nreturn primeFeedSessionSnapshot;`,
   )(
     { localStorage },
-    "quality_silence_v37",
+    "quality_silence_v38",
     "studyreels-feed-sessions",
     (storage, key, value) => {
       storage.setItem(key, value);
@@ -198,7 +198,7 @@ test("URL ingestion primes feed snapshots with the current v37 selection contrac
   assert.equal(writes.length, 1);
   assert.equal(writes[0].key, "studyreels-feed-sessions");
   const stored = JSON.parse(writes[0].value);
-  assert.equal(stored["ingest-search:abc"].selectionContractVersion, "quality_silence_v37");
+  assert.equal(stored["ingest-search:abc"].selectionContractVersion, "quality_silence_v38");
   assert.equal(stored["ingest-search:abc"].activeIndex, 1);
   assert.deepEqual(stored.existing, { reels: [] });
 });

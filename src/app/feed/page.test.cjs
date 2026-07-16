@@ -130,11 +130,11 @@ test("debounced history sync retains its originating community session", () => {
   assert.deepEqual(syncCalls[1].sessionContext, sessionB, "unmount flush must not recapture account A");
 });
 
-test("feed session restore accepts v37 and rejects v36, v35, or unversioned snapshots", () => {
-  const currentContract = "quality_silence_v37";
+test("feed session restore accepts v38 and rejects v37, v36, or unversioned snapshots", () => {
+  const currentContract = "quality_silence_v38";
   assert.match(
     typesSource,
-    /CURRENT_SELECTION_CONTRACT_VERSION = "quality_silence_v37"/,
+    /CURRENT_SELECTION_CONTRACT_VERSION = "quality_silence_v38"/,
     "the client contract must remain explicit and shared",
   );
   const parseFeedSessions = compileFunctionDeclaration("parseFeedSessions", {
@@ -159,8 +159,8 @@ test("feed session restore accepts v37 and rejects v36, v35, or unversioned snap
 
   const restored = parseFeedSessions(JSON.stringify({
     current: { ...snapshot, selectionContractVersion: currentContract },
-    oldCurrent: { ...snapshot, selectionContractVersion: "quality_silence_v36" },
-    predecessor: { ...snapshot, selectionContractVersion: "quality_silence_v35" },
+    oldCurrent: { ...snapshot, selectionContractVersion: "quality_silence_v37" },
+    predecessor: { ...snapshot, selectionContractVersion: "quality_silence_v36" },
     missing: snapshot,
   }));
 
@@ -176,7 +176,7 @@ test("feed session restore accepts v37 and rejects v36, v35, or unversioned snap
 
 test("feed snapshot persistence always stamps the current selection contract", () => {
   const writes = [];
-  const currentContract = "quality_silence_v37";
+  const currentContract = "quality_silence_v38";
   const persistFeedSessionSnapshot = compileFunctionDeclaration("persistFeedSessionSnapshot", {
     window: { localStorage: { getItem: () => null } },
     FEED_SESSION_STORAGE_KEY: "studyreels-feed-sessions",

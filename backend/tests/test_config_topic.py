@@ -26,10 +26,10 @@ def test_authoring_model_is_flash_topic_model_is_pro():
     assert config.TOPIC_MODEL == "gemini-3.1-pro-preview"
 
 
-def test_segment_router_defaults_to_pro_only_for_clip_selection():
-    assert config.SEGMENT_ROUTING_MODE == "pro_only"
+def test_segment_router_defaults_to_normal_flash_only_for_clip_selection():
+    assert config.SEGMENT_ROUTING_MODE == "flash_only"
     assert config.SEGMENT_FLASH_MODEL == "gemini-3.5-flash"
-    assert config.SEGMENT_FLASH_FALLBACK_MODEL == "gemini-3.1-flash-lite"
+    assert config.SEGMENT_FLASH_FALLBACK_MODEL == ""
     assert config.SEGMENT_PRO_MODEL == "gemini-3.1-pro-preview"
     assert config.SEGMENT_MODEL == config.SEGMENT_PRO_MODEL
     assert config.SEGMENT_HYBRID_PERCENT == 100.0
@@ -68,9 +68,9 @@ def test_segment_router_rejects_invalid_values_and_clamps_percent(monkeypatch):
         SEGMENT_FLASH_MODEL="",
     )
     assert invalid == {
-        "mode": "pro_only",
+        "mode": "flash_only",
         "flash": "gemini-3.5-flash",
-        "flash_fallback": "gemini-3.1-flash-lite",
+        "flash_fallback": "",
         "pro": "gemini-3.1-pro-preview",
         "legacy": "gemini-3.1-pro-preview",
         "percent": 0.0,
@@ -81,6 +81,26 @@ def test_segment_router_rejects_invalid_values_and_clamps_percent(monkeypatch):
     assert _reload_segment_config(
         monkeypatch, SEGMENT_HYBRID_PERCENT="-1",
     )["percent"] == 0.0
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gemini-3.1-pro-preview",
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash",
+        "not-a-model",
+    ],
+)
+def test_authoritative_flash_model_is_pinned_against_environment_overrides(
+    monkeypatch,
+    model,
+):
+    loaded = _reload_segment_config(
+        monkeypatch,
+        SEGMENT_FLASH_MODEL=model,
+    )
+    assert loaded["flash"] == "gemini-3.5-flash"
 
 
 def test_explicit_pro_override_wins_then_legacy_pro_model_is_fallback(monkeypatch):

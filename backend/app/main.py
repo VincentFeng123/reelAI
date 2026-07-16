@@ -356,7 +356,7 @@ GENERATION_OUTPUT_CEILINGS = {
     "slow": INITIAL_READY_REEL_TARGET,
 }
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v37"
+SELECTION_CONTRACT_VERSION = "quality_silence_v38"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -4942,13 +4942,11 @@ def admin_health() -> dict:
         "supadata_configured": bool(os.getenv("SUPADATA_API_KEY", "").strip()),
         "gemini_primary_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
         "gemini_chat_configured": bool(os.getenv("GEMINI_API_KEY_2", "").strip()),
-        "gemini_clip_selector_model": pipeline_config.SEGMENT_PRO_MODEL,
-        # Preserve the legacy health field while exposing the actual selector
-        # separately above.
+        "gemini_clip_selector_model": pipeline_config.SEGMENT_FLASH_MODEL,
+        # Preserve the health field while reporting only the selector's actual
+        # optional failover. Hosted production leaves it disabled.
         "gemini_fallback_model": (
-            os.getenv("SEGMENT_PRO_MODEL", "").strip()
-            or os.getenv("SEGMENT_FALLBACK_MODEL", "").strip()
-            or "gemini-3.1-pro-preview"
+            pipeline_config.SEGMENT_FLASH_FALLBACK_MODEL or None
         ),
         "text_llm_available": bool(text_llm["available"]),
         "text_llm_provider": text_llm["provider"],

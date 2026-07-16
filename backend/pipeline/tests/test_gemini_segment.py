@@ -766,7 +766,7 @@ def test_production_flash_selector_fails_over_without_retrying_primary(monkeypat
     assert dispatched[0]["operation"] == "flash_boundary_selector"
     assert dispatched[0]["max_retries"] == 0
     assert dispatched[0]["retry_status_codes"] is None
-    assert dispatched[0]["failover_model"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
+    assert dispatched[0]["failover_model"] is None
 
 
 def test_production_flash_has_no_requested_duration_contract():

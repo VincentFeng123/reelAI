@@ -60,24 +60,25 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 TOPIC_MODEL = os.environ.get("TOPIC_MODEL", "gemini-3.1-pro-preview")
 
 # ── Gemini-segment clip engine (default) ────────────────────────────────────
-# Clip selection is the one quality-critical Gemini operation.  Production uses
-# the stronger Pro model for that compact timestamp/evidence response while
-# search, transcript retrieval, enrichment, chat, and embeddings keep their
-# existing cheaper paths.  The bounded selector budget prevents a model upgrade
-# from multiplying calls per batch.
-_segment_routing_mode = os.environ.get("SEGMENT_ROUTING_MODE", "pro_only").strip().lower()
+# Clip selection is the one quality-critical Gemini operation. Production uses
+# one normal Flash call for the compact timestamp/evidence response; search,
+# transcript retrieval, enrichment, chat, and embeddings retain their existing
+# cheaper paths. The bounded selector budget prevents duplicate calls per batch.
+_segment_routing_mode = os.environ.get(
+    "SEGMENT_ROUTING_MODE", "flash_only"
+).strip().lower()
 SEGMENT_ROUTING_MODE = (
     _segment_routing_mode
-    if _segment_routing_mode in {"pro_only", "shadow", "hybrid"}
-    else "pro_only"
+    if _segment_routing_mode in {"flash_only", "pro_only", "shadow", "hybrid"}
+    else "flash_only"
 )
-SEGMENT_FLASH_MODEL = (
-    os.environ.get("SEGMENT_FLASH_MODEL", "").strip() or "gemini-3.5-flash"
-)
-# Used once only when the active Flash selector exhausts its bounded HTTP 503
-# retry. An explicitly empty value disables the emergency failover.
+# Production is intentionally pinned: stale Railway variables cannot silently
+# move clip selection to an older Flash generation or another model tier.
+SEGMENT_FLASH_MODEL = "gemini-3.5-flash"
+# Optional evaluation-only emergency failover. Hosted production does not set
+# this: a failed normal-Flash call must not silently downgrade clip quality.
 SEGMENT_FLASH_FALLBACK_MODEL = os.environ.get(
-    "SEGMENT_FLASH_FALLBACK_MODEL", "gemini-3.1-flash-lite",
+    "SEGMENT_FLASH_FALLBACK_MODEL", "",
 ).strip()
 # SEGMENT_MODEL was the original Pro-only selector model. Keep it only as a
 # fallback migration alias: an explicit SEGMENT_PRO_MODEL must win, and a stale

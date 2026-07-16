@@ -1218,9 +1218,10 @@ class ReelService:
     # v38: require the v31 repeated-caption boundary contract.
     # v39: require the v32 post-closure edge-preview contract.
     # v40: require the v33 grounded atomic-claim selector contract.
-    # The separate contract key below invalidates prior inventory under v37.
-    RANKED_FEED_CACHE_VERSION = 40
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v37"
+    # v41: require authoritative Flash word edges and outward-only silence refinement.
+    # The separate contract key below invalidates prior inventory under v38.
+    RANKED_FEED_CACHE_VERSION = 41
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v38"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
         "quality_silence_v4",
@@ -1256,6 +1257,7 @@ class ReelService:
         "quality_silence_v35",
         "quality_silence_v36",
         "quality_silence_v37",
+        "quality_silence_v38",
     })
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
@@ -2510,6 +2512,7 @@ class ReelService:
                 "quality_silence_v35",
                 "quality_silence_v36",
                 "quality_silence_v37",
+                "quality_silence_v38",
             }
             for reel in generated
         ):
@@ -5861,6 +5864,7 @@ class ReelService:
                 "quality_silence_v35",
                 "quality_silence_v36",
                 "quality_silence_v37",
+                "quality_silence_v38",
             },
         )
         metadata["_selection_substantive"] = selection_bool(
@@ -5900,6 +5904,7 @@ class ReelService:
                 "quality_silence_v35",
                 "quality_silence_v36",
                 "quality_silence_v37",
+                "quality_silence_v38",
             },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
@@ -7411,6 +7416,7 @@ class ReelService:
                     "quality_silence_v35",
                     "quality_silence_v36",
                     "quality_silence_v37",
+                    "quality_silence_v38",
                 }
                 else legacy_difficulty_matches_level
             )
@@ -7478,6 +7484,7 @@ class ReelService:
                             "quality_silence_v35",
                             "quality_silence_v36",
                             "quality_silence_v37",
+                            "quality_silence_v38",
                         }
                         and selection_metadata.get(
                             "_selection_speech_corridor_verified"
@@ -7523,6 +7530,7 @@ class ReelService:
                     "quality_silence_v35",
                     "quality_silence_v36",
                     "quality_silence_v37",
+                    "quality_silence_v38",
                 } and (
                     (
                         min(
@@ -7569,6 +7577,7 @@ class ReelService:
                             "quality_silence_v35",
                             "quality_silence_v36",
                             "quality_silence_v37",
+                            "quality_silence_v38",
                         }
                         else self._selection_number(
                             selection_metadata.get("_selection_topic_relevance"), 0.0
@@ -7924,6 +7933,7 @@ class ReelService:
                 "quality_silence_v35",
                 "quality_silence_v36",
                 "quality_silence_v37",
+                "quality_silence_v38",
             }:
                 # V5+ captions must be immutable selection-time evidence. A
                 # provider artifact key identifies a retrieval profile and may
@@ -7974,6 +7984,7 @@ class ReelService:
                         "quality_silence_v35",
                         "quality_silence_v36",
                         "quality_silence_v37",
+                        "quality_silence_v38",
                     }
                     or transcript_artifact_key
                     else str(clean_item.get("transcript_snippet") or "")

@@ -369,6 +369,16 @@ _OPENING_COMPARATIVE_FRAGMENT_RE = re.compile(
     r"^\s*(?:much\s+)?(?:more|less)\s+[a-z][a-z'-]*\?(?:\s+|$)",
     re.IGNORECASE,
 )
+_OPENING_UNRESOLVED_EDGE_REFERENCE_RE = re.compile(
+    r"^\s*(?:based|depending)\s+(?:on|upon)\s+"
+    r"(?:which|this|that|these|those|it|them)\b|"
+    r"^\s*(?:[a-z]\s+(?:calculate|compare|conclude|determine|evaluate|find|"
+    r"identify|solve|test)\b|[a-z]{1,3}\s+then\s+(?:i|we|you|they)\b)|"
+    r"^\s*[$€£]?\d[\d,.]*(?:\s*%)?\s+(?:now|so|then)\b|"
+    r"^\s*(?:p\s+)?(?:value|statistic|score|probability)\s+to\s+"
+    r"(?:a|an|the|your)\b",
+    re.IGNORECASE,
+)
 _EXISTENTIAL_OPENING_RE = re.compile(
     r"^\s*there\s+(?:is|are|was|were)\s+"
     r"(?:(?:(?:a|an|no|some|many|several|multiple|numerous|few)|"
@@ -473,6 +483,10 @@ _TERMINAL_DANGLING_ARTICLE_RE = re.compile(
     r"\b(?:a|an|the)\s*$",
     re.IGNORECASE,
 )
+_TERMINAL_DANGLING_POSSESSIVE_RE = re.compile(
+    r"\b(?:her|his|its|my|our|their|your)\s*[.!?]?[\"')\]]*$",
+    re.IGNORECASE,
+)
 _TERMINAL_DANGLING_LINK_RE = re.compile(
     r"\b(?:among|between|how|than|versus|what|when|where|which|who|whose|whom|why)"
     r"\s*[.!?]?[\"')\]]*$",
@@ -551,6 +565,12 @@ _TERMINAL_DANGLING_TRANSITIVE_RE = re.compile(
     r"(?:can|could|may|might|will|would)\s+"
     r"(?:demonstrate|describe|explain|give|illustrate|indicate|reveal|show|tell)"
     r")"
+    r"\s*[.!?]?[\"')\]]*$",
+    re.IGNORECASE,
+)
+_TERMINAL_AUXILIARY_TRANSITIVE_RE = re.compile(
+    r"\b(?:can|could|did|do|does|may|might|must|shall|should|will|would)\s+"
+    r"(?:calculate|compare|determine|evaluate|find|identify|specify|write)"
     r"\s*[.!?]?[\"')\]]*$",
     re.IGNORECASE,
 )
@@ -1882,10 +1902,20 @@ class _CompactBoundaryTopic(_StrictModel):
     start_line: int = Field(ge=0, strict=True, alias="s")
     end_line: int = Field(ge=0, strict=True, alias="e")
     start_quote: _CompactBoundaryQuote = Field(
-        alias="sq", description="Exact opening transcript quote."
+        alias="sq",
+        description=(
+            "Shortest unique exact transcript quote whose first spoken word is the "
+            "first word required by this complete one-topic unit; ignore acoustic "
+            "silence and never include earlier speech for a pause."
+        ),
     )
     end_quote: _CompactBoundaryQuote = Field(
-        alias="eq", description="Exact concluding transcript quote."
+        alias="eq",
+        description=(
+            "Shortest unique exact transcript quote whose final spoken word is the "
+            "final word of this unit's first complete conclusion; ignore acoustic "
+            "silence and never include later speech for a pause."
+        ),
     )
     claim_quote: _CompactEvidenceQuote = Field(
         alias="cq",
@@ -2331,8 +2361,11 @@ def _boundary_prompts(
         "duration is never a selection criterion, so keep the complete unit regardless of "
         "its duration. Preserve all necessary setup and context, "
         "even when that makes the clip longer. End immediately after the first complete "
-        "conclusion of that one learning objective—a complete thought at a natural speech "
-        "pause or silence—and before a new concept begins. Adjacent named concepts, "
+        "conclusion of that one learning objective and before a new concept begins. Choose "
+        "the exact semantic first and final required spoken words and ignore acoustic silence "
+        "when choosing them. Do not widen or shorten the semantic unit to guess a pause: "
+        "downstream audio processing may only expand outward from your exact interval to "
+        "nearby verified silence and may never remove speech you selected. Adjacent named concepts, "
         "procedures, worked examples, decision rules, misconceptions, and error cases are "
         "new-concept boundaries unless their explicit relationship is the single requested "
         "objective. Give it exactly one learning objective. Split independent adjacent "
@@ -3429,6 +3462,7 @@ def _cue_has_explicit_dangling_end(text: str, next_text: str) -> bool:
         or pronoun_subject_continues
         or attributive_subject_continues
         or _TERMINAL_DANGLING_ARTICLE_RE.search(raw_text)
+        or _TERMINAL_DANGLING_POSSESSIVE_RE.search(raw_text)
         or _TERMINAL_DANGLING_LINK_RE.search(raw_text)
         or (
             bool(next_text.strip())
@@ -3438,6 +3472,7 @@ def _cue_has_explicit_dangling_end(text: str, next_text: str) -> bool:
         or _TERMINAL_DANGLING_AUXILIARY_ADVERB_RE.search(raw_text)
         or _TERMINAL_DANGLING_DEGREE_RE.search(raw_text)
         or _TERMINAL_DANGLING_TRANSITIVE_RE.search(raw_text)
+        or _TERMINAL_AUXILIARY_TRANSITIVE_RE.search(raw_text)
         or (
             bool(str(next_text or "").strip())
             and _TERMINAL_DANGLING_DISCOURSE_LEADIN_RE.search(raw_text)
@@ -3508,8 +3543,10 @@ def _terminal_content_is_explicitly_incomplete(text: str) -> bool:
         or _TERMINAL_INCOMPLETE_SUBJECT_RE.search(raw_text)
         or _TERMINAL_COORDINATING_CONJUNCTION_RE.search(raw_text)
         or _TERMINAL_DANGLING_ARTICLE_RE.search(raw_text)
+        or _TERMINAL_DANGLING_POSSESSIVE_RE.search(raw_text)
         or _TERMINAL_REQUIRED_COMPLEMENT_RE.search(raw_text)
         or _TERMINAL_DANGLING_TRANSITIVE_RE.search(raw_text)
+        or _TERMINAL_AUXILIARY_TRANSITIVE_RE.search(raw_text)
     )
 
 
@@ -4822,6 +4859,7 @@ def _opening_clause_is_standalone(text: str) -> bool:
         _OPENING_EDGE_META_SENTENCE_RE.match(opening_clause)
         or _OPENING_CONTEXTUAL_REFORMULATION_RE.match(opening_clause)
         or _OPENING_CONTEXTUAL_MODIFIER_SUBJECT_RE.match(opening_clause)
+        or _OPENING_UNRESOLVED_EDGE_REFERENCE_RE.match(opening_clause)
         or _opening_contextual_example_needs_context(opening_clause)
         or _opening_has_context_dependent_subject(opening_clause)
         or _OPENING_RELATIVE_WHERE_FRAGMENT_RE.match(opening_clause)
@@ -9611,6 +9649,49 @@ def _plan_to_report(
         end_quote = str(proposal.end_quote or "").strip()
         start_text = str(segments[a].get("text") or "").strip()
         end_text = str(segments[b].get("text") or "").strip()
+        model_boundary_is_authoritative = bool(
+            isinstance(proposal, _CompactBoundaryTopic)
+            and settings.get("_segment_model_boundary_authoritative") is True
+        )
+        model_start_span: tuple[int, int] | None = None
+        model_end_span: tuple[int, int] | None = None
+        if model_boundary_is_authoritative:
+            if not 1 <= len(_toks(start_quote)) <= 12:
+                report.rejected_reasons.append(
+                    f"{prefix}:invalid_model_start_quote_length"
+                )
+                continue
+            if not 1 <= len(_toks(end_quote)) <= 12:
+                report.rejected_reasons.append(
+                    f"{prefix}:invalid_model_end_quote_length"
+                )
+                continue
+            model_start_matches = _quote_character_spans(
+                str(segments[a].get("text") or ""), start_quote
+            )
+            model_end_matches = _quote_character_spans(
+                str(segments[b].get("text") or ""), end_quote
+            )
+            if len(model_start_matches) != 1:
+                report.rejected_reasons.append(
+                    f"{prefix}:ungrounded_model_start_quote"
+                )
+                continue
+            if len(model_end_matches) != 1:
+                report.rejected_reasons.append(
+                    f"{prefix}:ungrounded_model_end_quote"
+                )
+                continue
+            model_start_span = model_start_matches[0]
+            model_end_span = model_end_matches[0]
+            if a == b and (
+                model_start_span[0] > model_end_span[0]
+                or model_start_span[1] > model_end_span[1]
+            ):
+                report.rejected_reasons.append(
+                    f"{prefix}:reversed_model_boundary"
+                )
+                continue
         quote_repaired = False
         fallback_start_edge = False
         fallback_end_edge = False
@@ -11033,6 +11114,53 @@ def _plan_to_report(
             start, end = _padded_cue_bounds(segments, a, b)
             start, end = round(start, 3), round(end, 3)
 
+        if model_boundary_is_authoritative:
+            assert model_start_span is not None and model_end_span is not None
+            if (
+                a != proposed_start
+                or b != proposed_end
+                or start_span is None
+                or end_span is None
+                or start_span[0] != model_start_span[0]
+                or end_span[1] != model_end_span[1]
+            ):
+                report.rejected_reasons.append(
+                    f"{prefix}:model_boundary_rewrite_forbidden"
+                )
+                continue
+            a, b = proposed_start, proposed_end
+            start_text = str(segments[a].get("text") or "")
+            end_text = str(segments[b].get("text") or "")
+            start_span = model_start_span
+            end_span = model_end_span
+            start_quote = _literal_source_quote(
+                start_text,
+                str(proposal.start_quote or "").strip(),
+                start_span,
+            )
+            end_quote = _literal_source_quote(
+                end_text,
+                str(proposal.end_quote or "").strip(),
+                end_span,
+            )
+            start_projected = bool(
+                _WORD_RE.search(start_text[:start_span[0]])
+            )
+            end_projected = bool(
+                _WORD_RE.search(end_text[end_span[1]:])
+            )
+            end_quote_occurrence = None
+            start, end = _padded_cue_bounds(segments, a, b)
+            start, end = round(start, 3), round(end, 3)
+            quote_repaired = False
+            atomic_claim_trimmed = False
+            context_was_trimmed = False
+            boundary_fallback_reasons = [
+                reason
+                for reason in boundary_fallback_reasons
+                if reason.startswith("model_")
+            ]
+
         clip_text, semantic_spans_by_cue = _semantic_clip_slice(
             segments,
             a,
@@ -11062,6 +11190,28 @@ def _plan_to_report(
                 else ""
             )
         )
+        if model_boundary_is_authoritative:
+            opening_is_complete = bool(
+                _opening_clause_is_standalone(clip_text)
+                or (
+                    _OPENING_RECOVERABLE_SETUP_RE.match(clip_text)
+                    and _local_example_setup_is_complete(clip_text)
+                )
+            )
+            if not opening_is_complete:
+                report.rejected_reasons.append(
+                    f"{prefix}:model_boundary_start_incomplete"
+                )
+                continue
+            if _cue_has_weak_end(
+                clip_text,
+                semantic_following_text,
+                ignore_caption_case=ignore_caption_case,
+            ):
+                report.rejected_reasons.append(
+                    f"{prefix}:model_boundary_end_incomplete"
+                )
+                continue
         if _next_cue_completes_embedded_predicate(
             clip_text,
             semantic_following_text,
@@ -12373,7 +12523,11 @@ def _run_selection_profile(
         ),
         failover_model=(
             config.SEGMENT_FLASH_FALLBACK_MODEL
-            if profile == FLASH_SPLIT_PROFILE and not video_grounded
+            if (
+                profile == FLASH_SPLIT_PROFILE
+                and not video_grounded
+                and settings.get("_segment_allow_flash_lite_failover") is True
+            )
             else None
         ),
         media_resolution=media_resolution,
@@ -12383,6 +12537,9 @@ def _run_selection_profile(
     require_enrichment = profile in {CORRECTED_PRO_PROFILE, FLASH_SINGLE_PROFILE}
     conversion_settings = dict(settings)
     conversion_settings["_segment_video_grounded"] = video_grounded
+    conversion_settings["_segment_model_boundary_authoritative"] = (
+        profile == FLASH_SPLIT_PROFILE
+    )
     conversion_settings.setdefault(
         "_segment_ignore_caption_case",
         str(transcript.get("source") or "").casefold() == "supadata",
@@ -12791,13 +12948,14 @@ def segment_clips_detailed(
         settings["_segment_budget_reserve"] = reserve_hook
         settings["_segment_budget_reconcile"] = reconcile_hook
 
-    # Production defaults to the single Pro boundary selector. Explicit Flash,
-    # hybrid, and shadow modes remain available only to evaluation callers.
+    # Production defaults to one authoritative normal-Flash boundary selector.
+    # Pro, hybrid, and shadow modes remain available only to evaluation callers.
     configured_mode = str(routing_mode or "flash_only").lower()
     flash_only = configured_mode == "flash_only"
     mode = configured_mode
     if mode not in {"pro_only", "shadow", "hybrid", "flash_only"}:
-        mode = "pro_only"
+        mode = "flash_only"
+        flash_only = True
     disabled_reason = None if flash_only else _flash_disable_reason()
     if disabled_reason is not None and mode in {"shadow", "hybrid"}:
         mode = "pro_only"
@@ -12813,7 +12971,9 @@ def segment_clips_detailed(
     selected = flash_only or (
         mode == "hybrid" and _hybrid_selected(generation_hash_key, percent)
     )
-    route = "flash_first" if selected else "pro_authoritative"
+    route = "flash_only" if flash_only else (
+        "flash_first" if selected else "pro_authoritative"
+    )
     sink = settings.get("_segment_telemetry") if isinstance(settings, dict) else None
     cancelled = settings.get("_segment_cancelled") if isinstance(settings, dict) else None
     deadline = time.monotonic() + _TOTAL_DEADLINE_S
@@ -12902,7 +13062,7 @@ def segment_clips_detailed(
                   reason="flash_model_access_or_configuration_failure")
         if flash.classification == "green" and not flash.error:
             result = flash
-            result.route = "hybrid_flash"
+            result.route = "flash_only" if flash_only else "hybrid_flash"
         else:
             # Bootstrap's hard latency contract never dispatches Pro, even if a
             # caller forgets to install the normal generation-level fallback gate.
@@ -12961,7 +13121,11 @@ def segment_clips_detailed(
                 flash.accepted_count = 0
                 flash.fallback_reasons = []
                 result = flash
-                result.route = "hybrid_flash_deferred"
+                result.route = (
+                    "flash_only_rejected"
+                    if flash_only
+                    else "hybrid_flash_deferred"
+                )
     else:
         result = _authoritative_pro(
             transcript, settings, topic, deadline, cancelled,

@@ -71,7 +71,7 @@ def _key(transcript: dict, settings: dict | None = None, *, topic: str = "physic
 def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> None:
     transcript = _transcript()
     baseline = _key(transcript)
-    assert baseline.startswith("clip-segmentation:quality_silence_v37:v32:")
+    assert baseline.startswith("clip-segmentation:quality_silence_v38:v32:")
 
     changed_text = deepcopy(transcript)
     changed_text["segments"][0]["text"] = "changed lesson"
@@ -102,7 +102,7 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
         transcript,
         {"segment_enrich_clips": False},
     )
-    assert _key(transcript, {"_segment_routing_mode": "flash_only"}) != baseline
+    assert _key(transcript, {"_segment_routing_mode": "pro_only"}) != baseline
     assert _key(transcript, {"_segment_thinking_level": "low"}) != baseline
     assert _key(transcript, {"_knowledge_level": "beginner"}) != _key(
         transcript, {"_knowledge_level": "advanced"},

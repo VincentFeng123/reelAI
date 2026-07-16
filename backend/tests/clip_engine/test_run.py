@@ -116,7 +116,7 @@ def test_standalone_pro_boundary_fallback_dispatches_with_bounded_selector(monke
     assert budget["inflight_reserved_cost_usd"] == 0.0
 
 
-def test_production_url_records_one_text_only_pro_selector_call(monkeypatch):
+def test_production_url_records_one_text_only_normal_flash_selector_call(monkeypatch):
     transcript = {
         "segments": [{
             "cue_id": "supadata-cue-0",
@@ -127,7 +127,7 @@ def test_production_url_records_one_text_only_pro_selector_call(monkeypatch):
         "words": [],
         "duration": 7.0,
         "source": "supadata",
-        "artifact_key": "supadata-transcript:v2:text-only-pro",
+        "artifact_key": "supadata-transcript:v2:text-only-flash",
         "native_mode": False,
     }
     provider_calls: list[dict] = []
@@ -150,13 +150,13 @@ def test_production_url_records_one_text_only_pro_selector_call(monkeypatch):
             },
         )
 
-    context = GenerationContext("slow", generation_id="production-text-only-pro")
+    context = GenerationContext("slow", generation_id="production-text-only-flash")
     monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
     monkeypatch.setattr(gemini_client, "generate_json_v3", fake_generate)
     monkeypatch.setattr(
         run.gemini_segment.config,
         "SEGMENT_ROUTING_MODE",
-        "flash_only",
+        "pro_only",
     )
 
     output = run.clip(
@@ -165,24 +165,92 @@ def test_production_url_records_one_text_only_pro_selector_call(monkeypatch):
         settings={
             "generation_context": context,
             "_segment_routing_mode": "hybrid",
+            "_segment_allow_flash_lite_failover": True,
         },
     )
 
     assert output["clips"] == []
     assert len(provider_calls) == 1
     [provider_call] = provider_calls
-    assert provider_call["model"] == "gemini-3.1-pro-preview"
+    assert provider_call["model"] == "gemini-3.5-flash"
+    assert provider_call["thinking_level"] == "medium"
     assert isinstance(provider_call["user"], str)
     assert provider_call["media_resolution"] is None
     usage = context.usage()
     assert len(usage) == 1
-    assert usage[0]["model_used"] == "gemini-3.1-pro-preview"
+    assert usage[0]["model_used"] == "gemini-3.5-flash"
     assert usage[0]["billable_requests"] == 1
     assert usage[0]["input_tokens"] == 1_200
     assert usage[0]["output_tokens"] == 50
     budget = context.budget.snapshot()["gemini"]
     assert budget["selector_calls"] == 1
-    assert budget["pro_selector_calls"] == 1
+    assert budget["flash_selector_calls"] == 1
+    assert budget["pro_selector_calls"] == 0
+
+
+def test_production_flash_failure_never_dispatches_lite_or_pro(monkeypatch):
+    transcript = {
+        "segments": [{
+            "cue_id": "supadata-cue-0",
+            "start": 0.0,
+            "end": 7.0,
+            "text": "Plants convert captured light into stored chemical energy.",
+        }],
+        "words": [],
+        "duration": 7.0,
+        "source": "supadata",
+        "artifact_key": "supadata-transcript:v2:flash-failure",
+        "native_mode": False,
+    }
+    models: list[str] = []
+
+    def fail_flash(_system, _user, _schema, **kwargs):
+        model = str(kwargs["model"])
+        models.append(model)
+        raise gemini_client.GeminiTransportError(
+            "provider overloaded",
+            gemini_client.GeminiCallTelemetry(
+                model=model,
+                operation="flash_boundary_selector",
+                prompt_version=run.gemini_segment.FLASH_SPLIT_PROFILE,
+                thinking_level="medium",
+                latency_ms=5.0,
+                retries=0,
+                finish_reason=None,
+                prompt_tokens=None,
+                candidate_tokens=None,
+                thought_tokens=None,
+                total_tokens=None,
+                provider_error_type="ServerError",
+                provider_status_code=503,
+                retryable=True,
+                error_history=({
+                    "provider_error_type": "ServerError",
+                    "provider_status_code": 503,
+                    "retryable": True,
+                },),
+            ),
+        )
+
+    monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(gemini_client, "generate_json_v3", fail_flash)
+    monkeypatch.setattr(
+        run.gemini_segment.config,
+        "SEGMENT_FLASH_FALLBACK_MODEL",
+        "gemini-3.1-flash-lite",
+    )
+
+    with pytest.raises(ProviderTransientError):
+        run.clip(
+            "https://youtu.be/dQw4w9WgXcQ",
+            "photosynthesis",
+            settings={
+                "_segment_routing_mode": "pro_only",
+                "_segment_allow_flash_lite_failover": True,
+            },
+        )
+
+    assert models == ["gemini-3.5-flash"]
 
 
 def test_live_runner_uses_the_canonical_practice_segmenter():
@@ -220,7 +288,7 @@ def test_pro_boundary_fallback_preserves_canonical_video_cache_identity(monkeypa
 
 
 def test_direct_url_segment_cache_hit_skips_all_gemini_and_budget(monkeypatch):
-    assert run.segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v37"
+    assert run.segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v38"
     transcript = {
         "segments": [{
             "cue_id": "cached-cue",

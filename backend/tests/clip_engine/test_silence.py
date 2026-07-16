@@ -57,7 +57,7 @@ def _prepared() -> silence.AudioPreparationResult:
 
 def _context_aligned_search_context() -> dict:
     return {
-        "selection_contract_version": "quality_silence_v37",
+        "selection_contract_version": "quality_silence_v38",
         "boundary_status": "context_aligned",
         "speech_corridor_verified": True,
         "selection_caption_cues": [
@@ -94,6 +94,10 @@ def test_context_aligned_boundary_is_usable_but_not_acoustically_verified() -> N
 
 def test_previous_context_aligned_contract_remains_viewable() -> None:
     context = _context_aligned_search_context()
+    context["selection_contract_version"] = "quality_silence_v37"
+    assert silence.persisted_boundary_is_usable(
+        context, t_start=2.0, t_end=9.0
+    ) is True
     context["selection_contract_version"] = "quality_silence_v31"
     assert silence.persisted_boundary_is_usable(
         context, t_start=2.0, t_end=9.0
@@ -143,7 +147,7 @@ def test_previous_context_aligned_contract_remains_viewable() -> None:
 
 def test_current_strict_boundary_is_bound_to_persisted_range() -> None:
     context = {
-        "selection_contract_version": "quality_silence_v37",
+        "selection_contract_version": "quality_silence_v38",
         "boundary_status": "verified",
         "boundary_diagnostics": {
             "acoustic_verified": True,
@@ -288,6 +292,8 @@ def test_caption_handoff_observation_accepts_only_the_straddling_quiet_run(
     assert result.verified
     assert result.start_sec == 9.93
     assert result.end_sec == 20.0
+    assert result.start_sec <= 10.0
+    assert result.end_sec >= 20.0
     assert result.diagnostics["speech_handoff_verified"] is True
     assert result.diagnostics["semantic_start_limit_sec"] == 10.0
     assert result.diagnostics["semantic_end_limit_sec"] == 20.0
@@ -2483,6 +2489,7 @@ def test_preparation_attempt_reasons_reach_boundary_diagnostics() -> None:
     )
 
     assert result.status == "unavailable"
+    assert (result.start_sec, result.end_sec) == (10.0, 20.0)
     assert result.diagnostics["attempt_reasons"] == prepared.diagnostics["attempt_reasons"]
     assert result.diagnostics["prepare_elapsed_ms"] == 123
 

@@ -296,7 +296,8 @@ def test_boundary_prompt_demands_shortest_complete_unit_without_duration_cap() -
 
     assert "shortest concise" in prompt
     assert "necessary setup and context" in prompt
-    assert "natural speech pause or silence" in prompt
+    assert "ignore acoustic silence" in prompt
+    assert "only expand outward" in prompt
     assert "adjacent named concepts" in prompt
     assert "procedures" in prompt
     assert "worked examples" in prompt

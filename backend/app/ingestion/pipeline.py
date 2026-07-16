@@ -256,8 +256,9 @@ def _run_clip(
     if deadline_monotonic is not None:
         settings["deadline_monotonic"] = float(deadline_monotonic)
     settings["_segment_pro_fallback_gate"] = lambda **_kwargs: False
-    settings["_segment_routing_mode"] = "pro_only"
+    settings["_segment_routing_mode"] = "flash_only"
     settings["_segment_thinking_level"] = "medium"
+    settings["_segment_allow_flash_lite_failover"] = False
     kwargs = {
         "topic": topic,
         "settings": settings,
@@ -541,7 +542,7 @@ def _boundary_evidence_grade(
     if (
         not isinstance(context, dict)
         or str(context.get("selection_contract_version") or "").strip()
-        != "quality_silence_v37"
+        != "quality_silence_v38"
     ):
         return 0
     if (
@@ -2640,7 +2641,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v37",
+            selection_contract_version="quality_silence_v38",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -5093,7 +5094,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v37",
+                    selection_contract_version="quality_silence_v38",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,

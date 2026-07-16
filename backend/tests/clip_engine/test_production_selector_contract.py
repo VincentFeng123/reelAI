@@ -84,6 +84,50 @@ def _compact_plan(
     )
 
 
+def _compact_custom_plan(
+    *,
+    request: str,
+    start_quote: str,
+    end_quote: str,
+    claim_quote: str,
+) -> gemini_segment._CompactBoundaryPlan:
+    return gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": request,
+                "requirement": f"Teach {request}",
+            }],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="authoritative-model-cut",
+            start_line=0,
+            end_line=0,
+            start_quote=start_quote,
+            end_quote=end_quote,
+            claim_quote=claim_quote,
+            title="Grounded statistics lesson",
+            learning_objective=f"Explain {request}",
+            facet=request,
+            informativeness=0.9,
+            topic_relevance=0.9,
+            educational_importance=0.9,
+            difficulty=0.5,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[{
+                "id": "subject",
+                "q": claim_quote,
+            }],
+        )],
+    )
+
+
 def test_single_call_boundary_schema_caps_exhaustive_output_before_truncation() -> None:
     forty = [
         _proposal().model_copy(update={"candidate_id": f"candidate-{index}"})
@@ -107,7 +151,219 @@ def test_selector_contract_allows_short_exact_edges_without_padding() -> None:
     assert "shortest unique 1-12" in system
     assert "one-word quote" in user
     assert "never pad" in user
+    assert "ignore acoustic silence" in user
+    assert "only expand outward" in user
     assert "4-8" not in f"{system}\n{user}"
+
+    schema = gemini_segment._CompactBoundaryTopic.model_json_schema()
+    assert "first spoken word" in schema["properties"]["sq"]["description"]
+    assert "final spoken word" in schema["properties"]["eq"]["description"]
+
+
+def test_compact_selector_preserves_the_models_exact_word_interval() -> None:
+    text = (
+        "Welcome back. Cells use chlorophyll to capture light energy and power the "
+        "chemical reactions of photosynthesis. Next, respiration releases that energy."
+    )
+    plan = _compact_plan(
+        exact_request="photosynthesis",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "photosynthesis",
+            "requirement": "Teach photosynthesis",
+        }],
+        evidence=[{
+            "id": "subject",
+            "q": "power the chemical reactions of photosynthesis",
+        }],
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 18.0, "text": text}],
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_model_boundary_authoritative": True,
+        },
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"] == (
+        "Cells use chlorophyll to capture light energy and power the chemical "
+        "reactions of photosynthesis"
+    )
+    assert clip["start_quote"] == "Cells use chlorophyll to capture light energy"
+    assert clip["end_quote"] == "chemical reactions of photosynthesis"
+    assert clip["edge_projection"] == {
+        "start": {
+            "required": True,
+            "cue_id": "cue-0",
+            "quote": "Cells use chlorophyll to capture light energy",
+        },
+        "end": {
+            "required": True,
+            "cue_id": "cue-0",
+            "quote": "chemical reactions of photosynthesis",
+        },
+    }
+
+
+def test_compact_selector_rejects_instead_of_contracting_a_dirty_model_cut() -> None:
+    text = (
+        "Welcome back. Cells use chlorophyll to capture light energy and power the "
+        "chemical reactions of photosynthesis."
+    )
+    plan = _compact_plan(
+        exact_request="photosynthesis",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "photosynthesis",
+            "requirement": "Teach photosynthesis",
+        }],
+        evidence=[{
+            "id": "subject",
+            "q": "power the chemical reactions of photosynthesis",
+        }],
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_quote": "Welcome back Cells use chlorophyll",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_model_boundary_authoritative": True,
+        },
+        topic="photosynthesis",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == [
+        "proposal_0:model_boundary_rewrite_forbidden"
+    ]
+
+
+def test_compact_selector_never_falls_back_from_an_ungrounded_model_quote() -> None:
+    plan = _compact_plan(
+        exact_request="photosynthesis",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "photosynthesis",
+            "requirement": "Teach photosynthesis",
+        }],
+        evidence=[{
+            "id": "subject",
+            "q": "power the chemical reactions of photosynthesis",
+        }],
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_quote": "words that are not in the transcript",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 10.0,
+            "text": (
+                "Cells use chlorophyll to capture light energy and power the chemical "
+                "reactions of photosynthesis."
+            ),
+        }],
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_model_boundary_authoritative": True,
+        },
+        topic="photosynthesis",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == [
+        "proposal_0:ungrounded_model_start_quote"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("topic_request", "text", "start_quote", "end_quote", "claim_quote"),
+    [
+        (
+            "p value",
+            "based on which one is larger when it comes to your conclusion there are "
+            "two outcomes. If the p value is small, reject the null hypothesis.",
+            "based on which one is larger",
+            "reject the null hypothesis",
+            "If the p value is small reject the null hypothesis",
+        ),
+        (
+            "test statistic",
+            "C compare once you have your test statistic and P value you need to compare "
+            "these values to the critical value for your",
+            "C compare once you have",
+            "critical value for your",
+            "your test statistic and P value you need",
+        ),
+        (
+            "false negatives",
+            "who DO have cancer will get false negatives 46% of the time. This means "
+            "we miss a lot.",
+            "who DO have cancer will",
+            "we miss a lot",
+            "cancer will get false negatives 46% of the time",
+        ),
+        (
+            "significance test",
+            "A significance test compares evidence against the null hypothesis, but "
+            "some problems will specify",
+            "A significance test compares evidence",
+            "some problems will specify",
+            "A significance test compares evidence against the null hypothesis",
+        ),
+    ],
+)
+def test_compact_selector_rejects_real_fragmentary_model_edges(
+    topic_request: str,
+    text: str,
+    start_quote: str,
+    end_quote: str,
+    claim_quote: str,
+) -> None:
+    report = gemini_segment._plan_to_report(
+        _compact_custom_plan(
+            request=topic_request,
+            start_quote=start_quote,
+            end_quote=end_quote,
+            claim_quote=claim_quote,
+        ),
+        [{"cue_id": "cue-0", "start": 0.0, "end": 30.0, "text": text}],
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_model_boundary_authoritative": True,
+        },
+        topic=topic_request,
+    )
+
+    assert report.clips == []
+    assert any(
+        reason.startswith("proposal_0:model_boundary_")
+        or reason == "proposal_0:unresolved_weak_end"
+        for reason in report.rejected_reasons
+    )
 
 
 def test_explicit_comparison_prompt_requires_every_named_side_in_each_clip() -> None:

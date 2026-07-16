@@ -2321,7 +2321,7 @@ def test_selected_caption_snapshot_clamps_every_overlapping_cue_to_lexical_end()
     assert cues[-1]["text"] == "which is exactly what dhdx is"
 
     context = {
-        "selection_contract_version": "quality_silence_v37",
+        "selection_contract_version": "quality_silence_v38",
         "boundary_status": "context_aligned",
         "speech_corridor_verified": True,
         "selection_caption_cues": [
@@ -3362,7 +3362,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
 ) -> None:
     strict_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v37",
+        "selection_contract_version": "quality_silence_v38",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -3372,7 +3372,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
     }
     transcript_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v37",
+        "selection_contract_version": "quality_silence_v38",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -3435,7 +3435,7 @@ def test_failed_boundary_storage_does_not_consume_ready_material_cap(
     deferred.append({
         "search_context_json": json.dumps({
             "surface_eligible": True,
-            "selection_contract_version": "quality_silence_v37",
+            "selection_contract_version": "quality_silence_v38",
             "speech_corridor_verified": True,
             "boundary_status": "verified",
             "boundary_diagnostics": {
@@ -4199,7 +4199,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v37"
+        assert context["selection_contract_version"] == "quality_silence_v38"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"
@@ -4503,7 +4503,7 @@ def test_generation_skips_pro_repair_and_synchronous_enrichment(monkeypatch) -> 
     assert context.counters()["pro_fallbacks"] == 0
 
 
-def test_clip_call_uses_one_medium_thinking_pro_selector_and_ignores_duration(
+def test_clip_call_uses_one_medium_thinking_flash_selector_and_ignores_duration(
     monkeypatch,
 ) -> None:
     captured: dict = {}
@@ -4529,8 +4529,9 @@ def test_clip_call_uses_one_medium_thinking_pro_selector_and_ignores_duration(
     fallback_gate = captured.get("_segment_pro_fallback_gate")
     assert callable(fallback_gate)
     assert fallback_gate(accepted_count=0, video_id="dQw4w9WgXcQ") is False
-    assert captured["_segment_routing_mode"] == "pro_only"
+    assert captured["_segment_routing_mode"] == "flash_only"
     assert captured["_segment_thinking_level"] == "medium"
+    assert captured["_segment_allow_flash_lite_failover"] is False
     assert "_segment_target_sec" not in captured
     assert "_segment_target_min_sec" not in captured
     assert "_segment_target_max_sec" not in captured
@@ -4559,7 +4560,8 @@ def test_fast_and_slow_clip_calls_use_identical_quality_routing(
     )
 
     assert captured["_segment_thinking_level"] == "medium"
-    assert captured["_segment_routing_mode"] == "pro_only"
+    assert captured["_segment_routing_mode"] == "flash_only"
+    assert captured["_segment_allow_flash_lite_failover"] is False
     assert captured["_segment_pro_fallback_gate"](
         accepted_count=0,
         video_id="dQw4w9WgXcQ",

@@ -15,7 +15,7 @@ ReelAI turns study materials into a learner-specific feed of transcript-grounded
 - Railway hosts the durable FastAPI process and generation worker.
 - PostgreSQL stores material data, generation jobs/events, provider usage, Supadata search evidence, and timestamped transcript artifacts.
 - Supadata supplies YouTube search and hosted timestamped transcript cues, preferring native captions and generating a transcript when captions are unavailable.
-- The guarded practice selector sends one complete Supadata transcript as text to Gemini 3.1 Pro, makes one authoritative selection call per analyzed source, and emits quote-aligned YouTube iframe timestamps. YouTube media is not attached to the production selector.
+- The guarded practice selector sends one complete Supadata transcript as text to Gemini 3.5 Flash, makes one authoritative selection call per analyzed source, and emits exact-word-aligned YouTube iframe timestamps. Audio refinement may only expand those semantic edges outward to nearby silence. YouTube media is not attached to the production selector.
 
 ### Generation contract
 
@@ -55,7 +55,7 @@ npm install
 npm run dev
 ```
 
-For production, set `DATABASE_URL`, `DATA_DIR=/data`, `SUPADATA_API_KEY`, `GEMINI_API_KEY`, `SEGMENT_ROUTING_MODE=pro_only`, and `SEGMENT_PRO_MODEL=gemini-3.1-pro-preview` on Railway. `SEGMENT_MODEL` is only a legacy Pro-model fallback. Set `RAILWAY_BACKEND_ORIGIN` on Vercel. Provider-backed live smoke tests are separately gated because they consume credits; mocked provider tests are the CI requirement.
+For production, set `DATABASE_URL`, `DATA_DIR=/data`, `SUPADATA_API_KEY`, `GEMINI_API_KEY`, `SEGMENT_ROUTING_MODE=flash_only`, and `SEGMENT_FLASH_MODEL=gemini-3.5-flash` on Railway. Leave `SEGMENT_FLASH_FALLBACK_MODEL` empty so selection never silently downgrades to Flash-Lite. `SEGMENT_PRO_MODEL` and `SEGMENT_MODEL` remain evaluation/legacy compatibility settings only. Set `RAILWAY_BACKEND_ORIGIN` on Vercel. Provider-backed live smoke tests are separately gated because they consume credits; mocked provider tests are the CI requirement.
 
 ## Local YouTube Topic-Clipper
 

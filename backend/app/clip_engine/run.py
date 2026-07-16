@@ -186,9 +186,11 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
     settings.setdefault("segment_fine_snap", config.SEGMENT_FINE_SNAP)
     # Candidates are independently gated; one weak proposal must not poison others.
     settings.setdefault("segment_accept_partial_flash", True)
-    # This adapter is the production selector boundary. Flash/hybrid modes are
-    # benchmark-only and must not be activated by stale env or request settings.
-    settings["_segment_routing_mode"] = "pro_only"
+    # This adapter is the production selector boundary. One normal Flash call is
+    # authoritative; stale env or request settings cannot reactivate Pro/hybrid.
+    settings["_segment_routing_mode"] = "flash_only"
+    settings["_segment_thinking_level"] = "medium"
+    settings["_segment_allow_flash_lite_failover"] = False
     settings["should_cancel"] = should_cancel
 
     canonical_url = f"https://www.youtube.com/watch?v={video_id}"

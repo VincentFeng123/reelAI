@@ -132,7 +132,7 @@ class GenerationBudget:
     }
     _GEMINI_COST_LIMIT_USD: dict[GenerationMode, float] = {
         # Worst-case response reservations plus buffered input estimates cover
-        # one Flash-Lite expansion and a bounded number of Pro clip selectors.
+        # one Flash-Lite expansion and a bounded number of normal-Flash selectors.
         # These are job ceilings, not expected spend; billed usage is recorded
         # from provider telemetry and is normally much lower.
         "fast": 0.45,

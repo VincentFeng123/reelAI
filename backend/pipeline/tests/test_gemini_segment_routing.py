@@ -390,7 +390,7 @@ def test_flash_only_ignores_rollout_and_never_calls_pro(monkeypatch):
     )
 
     assert seen == [G.PRODUCTION_FLASH_PROFILE]
-    assert result.route == "hybrid_flash_deferred"
+    assert result.route == "flash_only_rejected"
     assert result.clips == []
 
 
@@ -836,6 +836,11 @@ def test_dispatched_transport_failure_preserves_call_identity(monkeypatch):
 
 
 def test_production_selector_fails_over_one_503_with_one_reservation(monkeypatch):
+    monkeypatch.setattr(
+        G.config,
+        "SEGMENT_FLASH_FALLBACK_MODEL",
+        "gemini-3.1-flash-lite",
+    )
     models = _install_model_sequence(
         monkeypatch,
         _HTTPStatusError(503),
@@ -849,7 +854,10 @@ def test_production_selector_fails_over_one_503_with_one_reservation(monkeypatch
 
     result = G.run_segment_profile(
         _transcript(),
-        {"_segment_budget_reserve": reserve},
+        {
+            "_segment_budget_reserve": reserve,
+            "_segment_allow_flash_lite_failover": True,
+        },
         G.PRODUCTION_FLASH_PROFILE,
         topic="calculus",
         deadline_monotonic=time.monotonic() + 10,
@@ -888,6 +896,11 @@ def test_production_selector_failover_reuses_one_reservation(
     primary_status,
     failover_reason,
 ):
+    monkeypatch.setattr(
+        G.config,
+        "SEGMENT_FLASH_FALLBACK_MODEL",
+        "gemini-3.1-flash-lite",
+    )
     models = _install_model_sequence(
         monkeypatch,
         _HTTPStatusError(primary_status),
@@ -910,6 +923,7 @@ def test_production_selector_failover_reuses_one_reservation(
         {
             "_segment_budget_reserve": reserve,
             "_segment_budget_reconcile": reconcile,
+            "_segment_allow_flash_lite_failover": True,
         },
         G.PRODUCTION_FLASH_PROFILE,
         topic="calculus",
@@ -1079,6 +1093,11 @@ def test_flash_failover_requires_time_and_no_cancellation(monkeypatch):
 
 
 def test_production_selector_does_not_retry_failed_lite_failover(monkeypatch):
+    monkeypatch.setattr(
+        G.config,
+        "SEGMENT_FLASH_FALLBACK_MODEL",
+        "gemini-3.1-flash-lite",
+    )
     models = _install_model_sequence(
         monkeypatch,
         _HTTPStatusError(503),
@@ -1087,7 +1106,7 @@ def test_production_selector_does_not_retry_failed_lite_failover(monkeypatch):
 
     result = G.run_segment_profile(
         _transcript(),
-        {},
+        {"_segment_allow_flash_lite_failover": True},
         G.PRODUCTION_FLASH_PROFILE,
         topic="calculus",
         deadline_monotonic=time.monotonic() + 10,
@@ -1202,12 +1221,45 @@ def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, ex
         expected_model,
         max_retries,
     )
-    assert captured["failover_model"] == (
-        G.config.SEGMENT_FLASH_FALLBACK_MODEL
-        if profile == G.FLASH_SPLIT_PROFILE
-        else None
-    )
+    assert captured["failover_model"] is None
     assert captured["retry_status_codes"] is None
+
+
+@pytest.mark.parametrize(
+    ("profile", "authoritative"),
+    [
+        (G.FLASH_SPLIT_PROFILE, True),
+        (G.PRO_BOUNDARY_PROFILE, False),
+    ],
+)
+def test_normal_flash_profile_makes_model_word_boundaries_authoritative(
+    monkeypatch,
+    profile,
+    authoritative,
+):
+    captured: dict = {}
+
+    monkeypatch.setattr(
+        G,
+        "_call_model",
+        lambda *_args, **_kwargs: (_empty_plan(G._CompactBoundaryPlan), {}),
+    )
+
+    def convert(_plan, _segments, _words, settings, **_kwargs):
+        captured.update(settings)
+        return G._Conversion()
+
+    monkeypatch.setattr(G, "_plan_to_report", convert)
+    G._run_selection_profile(
+        profile,
+        _transcript(),
+        "calculus",
+        {},
+        deadline=time.monotonic() + 10,
+        cancelled=None,
+    )
+
+    assert captured["_segment_model_boundary_authoritative"] is authoritative
 
 
 def test_flash_boundary_profile_accepts_bootstrap_low_thinking_override(monkeypatch):
