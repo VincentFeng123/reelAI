@@ -113,8 +113,8 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
         "_segment_media_resolution": "low",
     }
     preferred_url = {**grounded, "_segment_video_grounding_required": False}
-    assert _key(transcript, preferred_url) != baseline
-    assert _key(transcript, preferred_url) != _key(
+    assert _key(transcript, preferred_url) == baseline
+    assert _key(transcript, preferred_url) == _key(
         transcript,
         {**preferred_url, "_segment_video_url": "https://youtu.be/aqz-KE-bpKQ"},
     )

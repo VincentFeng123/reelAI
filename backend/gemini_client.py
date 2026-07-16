@@ -152,6 +152,42 @@ def _field(value, name: str):
     return getattr(value, name, None)
 
 
+def count_request_tokens(
+    system: str,
+    user_text: str,
+    schema,
+    *,
+    model: str,
+    timeout_s: float = 10.0,
+) -> int:
+    """Count one pathological long structured request without generating output."""
+    mdl = str(model or "").strip()
+    timeout = float(timeout_s)
+    if not _is_gemini3_model(mdl):
+        raise ValueError("count_request_tokens requires an explicit Gemini 3 model")
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout_s must be positive")
+    response = get_client().models.count_tokens(
+        model=mdl,
+        contents=str(user_text or ""),
+        config=types.CountTokensConfig(
+            system_instruction=str(system or ""),
+            generation_config=types.GenerationConfig(
+                response_mime_type="application/json",
+                response_json_schema=_gemini3_json_schema(schema),
+            ),
+            http_options=types.HttpOptions(
+                timeout=max(1, int(timeout * 1_000.0)),
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
+        ),
+    )
+    total = int(_field(response, "total_tokens") or 0)
+    if total <= 0:
+        raise RuntimeError("Gemini token count was unavailable")
+    return total
+
+
 def _finish_reason(response) -> Optional[str]:
     candidates = _field(response, "candidates") or []
     if not candidates:

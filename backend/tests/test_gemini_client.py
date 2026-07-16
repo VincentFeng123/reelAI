@@ -88,6 +88,36 @@ def _call_v3(monkeypatch, fake, **overrides):
     return gc.generate_json_v3("system", "user", schema, **kwargs)
 
 
+def test_count_text_tokens_uses_one_bounded_non_generation_request(monkeypatch):
+    calls = []
+
+    class Models:
+        def count_tokens(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(total_tokens=123)
+
+    monkeypatch.setattr(
+        gc,
+        "get_client",
+        lambda: SimpleNamespace(models=Models()),
+    )
+
+    assert gc.count_request_tokens(
+        "system",
+        "long transcript",
+        _Schema,
+        model="gemini-3.1-pro-preview",
+        timeout_s=4.0,
+    ) == 123
+    assert len(calls) == 1
+    assert calls[0]["contents"] == "long transcript"
+    assert calls[0]["config"].system_instruction == "system"
+    assert calls[0]["config"].generation_config.response_json_schema["required"] == [
+        "ok"
+    ]
+    assert calls[0]["config"].http_options.retry_options.attempts == 1
+
+
 @pytest.mark.parametrize(
     "operation,level,cap,timeout_s,model",
     [

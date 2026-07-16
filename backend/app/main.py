@@ -27,6 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 
+from backend import config as pipeline_config
+
 from .config import get_settings
 from .db import (
     DEFAULT_COMMUNITY_VISIBILITY,
@@ -4873,6 +4875,9 @@ def admin_health() -> dict:
         "supadata_configured": bool(os.getenv("SUPADATA_API_KEY", "").strip()),
         "gemini_primary_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
         "gemini_chat_configured": bool(os.getenv("GEMINI_API_KEY_2", "").strip()),
+        "gemini_clip_selector_model": pipeline_config.SEGMENT_PRO_MODEL,
+        # Preserve the legacy health field while exposing the actual selector
+        # separately above.
         "gemini_fallback_model": (
             os.getenv("SEGMENT_PRO_MODEL", "").strip()
             or os.getenv("SEGMENT_FALLBACK_MODEL", "").strip()

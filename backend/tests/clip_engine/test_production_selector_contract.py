@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import time
 from types import SimpleNamespace
@@ -225,9 +226,13 @@ def test_video_grounded_boundary_selector_sends_one_youtube_part_before_text(
         assert call["max_retries"] == 0
         assert call["retry_status_codes"] is None
     [reservation] = reservations
-    text_estimate = (
-        math.ceil(len(f"{call['system']}\n\n{contents[1].text}") / 3) + 1_000
-    )
+    prompt_text = f"{call['system']}\n\n{contents[1].text}"
+    schema_bytes = len(json.dumps(
+        gemini_segment._CompactBoundaryPlan.model_json_schema(),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8"))
+    text_estimate = math.ceil((len(prompt_text) + schema_bytes) / 3) + 1_000
     assert reservation["estimated_input_tokens"] == (
         text_estimate
         + 600 * gemini_segment._LOW_RESOLUTION_VIDEO_TOKENS_PER_SECOND
@@ -402,6 +407,107 @@ def test_long_preferred_video_url_dispatches_one_pro_transcript_only_call(
     )
     assert budget["committed_cost_usd"] < budget["cost_limit_usd"]
     assert budget["inflight_reserved_cost_usd"] == 0.0
+
+
+def test_no_space_unicode_transcript_cannot_cross_long_context_price_tier(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("slow", generation_id="selector-unicode-tier")
+    calls: list[object] = []
+    monkeypatch.setattr(
+        gemini_client,
+        "generate_json_v3",
+        lambda *_args, **_kwargs: calls.append(True),
+    )
+
+    def fail_count(*_args, **_kwargs):
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(gemini_client, "count_request_tokens", fail_count)
+
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "start": 0.0,
+                "end": 60.0,
+                "text": "統" * 67_000,
+            }],
+            "words": [],
+            "duration": 60.0,
+            "source": "supadata",
+        },
+        {
+            "_segment_video_grounding_required": False,
+            "_segment_operation": "pro_authoritative",
+            "_segment_budget_reserve": context.reserve_gemini_call,
+            "_segment_budget_reconcile": context.reconcile_gemini_call,
+        },
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic="statistics",
+    )
+
+    assert calls == []
+    assert result.clips == []
+    assert result.classification_reasons == [
+        "request_failure:ProviderBudgetExceededError"
+    ]
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["selector_calls"] == 0
+    assert budget["cost_exposure_usd"] == 0.0
+
+
+def test_exact_token_preflight_admits_affordable_long_unicode_text(
+    monkeypatch,
+) -> None:
+    reservations: list[dict] = []
+    token_counts: list[dict] = []
+    calls: list[dict] = []
+
+    def count_tokens(system, user_text, schema, **kwargs):
+        token_counts.append({
+            "system": system,
+            "user_text": user_text,
+            "schema": schema,
+            **kwargs,
+        })
+        return 60_000
+
+    def generate(_system, _user, _schema, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            text='{"topics": []}',
+            telemetry={
+                "model": kwargs["model"],
+                "prompt_tokens": 60_000,
+                "candidate_tokens": 10,
+                "total_tokens": 60_010,
+            },
+        )
+
+    monkeypatch.setattr(gemini_client, "count_request_tokens", count_tokens)
+    monkeypatch.setattr(gemini_client, "generate_json_v3", generate)
+
+    parsed, _call = gemini_segment._call_model(
+        "system",
+        "統" * 67_000,
+        gemini_segment._BoundaryPlan,
+        model="gemini-3.1-pro-preview",
+        thinking_level="medium",
+        max_output_tokens=6_000,
+        timeout_s=30.0,
+        deadline_monotonic=time.monotonic() + 10.0,
+        operation="pro_authoritative",
+        prompt_version=gemini_segment.PRO_BOUNDARY_PROFILE,
+        cancelled=None,
+        budget_reserve=lambda **payload: reservations.append(payload) or {},
+        max_retries=0,
+    )
+
+    assert parsed.topics == []
+    assert len(token_counts) == len(calls) == 1
+    assert token_counts[0]["model"] == "gemini-3.1-pro-preview"
+    assert token_counts[0]["schema"] is gemini_segment._BoundaryPlan
+    assert reservations[0]["estimated_input_tokens"] == 61_000
 
 
 def test_preferred_video_url_failure_never_dispatches_a_media_retry(
@@ -800,6 +906,434 @@ def test_inline_next_topic_tail_is_trimmed_at_the_complete_claim() -> None:
         "the plant releases oxygen during photosynthesis"
     )
     assert "now let's" not in report.clips[0]["_clip_text"].casefold()
+
+
+@pytest.mark.parametrize(
+    "claim_quote",
+    [
+        "if data gives us strong evidence that the hypothesis is wrong",
+        "hypothesis but not exactly the same then the best",
+    ],
+)
+def test_recap_evidence_rejects_the_full_production_like_coarse_span(
+    claim_quote: str,
+) -> None:
+    texts = [
+        "A hypothesis gives us a claim that an experiment can test.",
+        "Drugs A and B produce measurements we can compare.",
+        "The first experiment gives evidence against the hypothesis.",
+        "Repeated results make that evidence stronger.",
+        "The observed difference is not what the hypothesis predicts.",
+        "That makes the first result unlikely under the hypothesis.",
+        "every time we do the experiment we get the opposite result so we can "
+        "confidently reject this hypothesis BAM",
+        "now let's imagine we had two more drugs C and D just like before",
+        "Their measurements are close but not identical.",
+        "That similarity does not prove that the hypothesis is true.",
+        "The second experiment therefore supports a weaker conclusion.",
+        "the best we can do is fail to reject the hypothesis small BAM",
+        "to summarize what we've covered so far we can create a hypothesis and if "
+        "data gives us strong evidence that the hypothesis is wrong then we can "
+        "reject the hypothesis but when we have data that is similar to the",
+        "hypothesis but not exactly the same then the best we can do is fail to "
+        "reject the hypothesis",
+    ]
+    starts = [0.08, 38.0, 76.0, 114.0, 152.0, 190.0, 228.0, 266.0,
+              304.0, 342.0, 380.0, 418.0, 450.0, 500.0]
+    ends = [38.0, 76.0, 114.0, 152.0, 190.0, 228.0, 266.0, 304.0,
+            342.0, 380.0, 418.0, 450.0, 500.0, 523.78]
+    segments = [
+        {"cue_id": f"cue-{index}", "start": starts[index], "end": ends[index], "text": text}
+        for index, text in enumerate(texts)
+    ]
+    plan = _compact_plan(
+        exact_request="hypothesis testing",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "hypothesis testing",
+            "requirement": "Teach hypothesis testing",
+        }],
+        evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": claim_quote,
+        }],
+    )
+    plan.topics[0] = plan.topics[0].model_copy(update={
+        "candidate_id": "hypothesis-testing-summary",
+        "start_line": 0,
+        "end_line": 13,
+        "start_quote": "A hypothesis gives us a claim",
+        "end_quote": "do is fail to reject the hypothesis",
+        "claim_quote": claim_quote,
+        "title": "Rejecting and failing to reject a hypothesis",
+        "learning_objective": "Explain when evidence rejects a hypothesis",
+        "facet": "hypothesis decisions",
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="hypothesis testing",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == [
+        "proposal_0:recap_evidence"
+    ]
+    assert segments[-1]["end"] - segments[0]["start"] > 500.0
+
+
+def test_recap_inside_one_coarse_cue_is_a_hard_end_for_prior_evidence() -> None:
+    text = (
+        "Competitive inhibitors occupy the active site and prevent the substrate from "
+        "binding. To summarize what we've covered so far, inhibitors can change enzyme "
+        "activity through several distinct mechanisms."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "competitive-inhibition",
+        "start_quote": "Competitive inhibitors occupy the active site",
+        "end_quote": "through several distinct mechanisms",
+        "title": "How competitive inhibition works",
+        "learning_objective": "Explain how competitive inhibitors block substrates",
+        "facet": "competitive inhibition",
+        "topic_evidence_quote": (
+            "Competitive inhibitors occupy the active site and prevent the substrate"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "coarse-recap-cue", "start": 0.0, "end": 410.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="competitive inhibition",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].rstrip(".") == (
+        "Competitive inhibitors occupy the active site and prevent the substrate from "
+        "binding"
+    )
+    assert "summarize" not in report.clips[0]["_clip_text"].casefold()
+
+
+@pytest.mark.parametrize("split_hypothetical", [False, True])
+def test_explicit_new_hypothetical_starts_a_new_example(
+    split_hypothetical: bool,
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-6",
+            "start": 228.0,
+            "end": 266.0,
+            "text": (
+                "every time we do the experiment we get the opposite result so we can "
+                "confidently reject this hypothesis BAM"
+            ),
+        },
+    ]
+    if split_hypothetical:
+        segments.extend([
+            {
+                "cue_id": "cue-7",
+                "start": 266.0,
+                "end": 280.0,
+                "text": "now let's imagine we had two",
+            },
+            {
+                "cue_id": "cue-8",
+                "start": 280.0,
+                "end": 304.0,
+                "text": (
+                    "more drugs C and D just like before and their measurements are "
+                    "similar but not exactly the same"
+                ),
+            },
+        ])
+    else:
+        segments.append({
+            "cue_id": "cue-7",
+            "start": 266.0,
+            "end": 304.0,
+            "text": (
+                "now let's imagine we had two more drugs C and D just like before and "
+                "their measurements are similar but not exactly the same"
+            ),
+        })
+    proposal = _proposal(end_line=len(segments) - 1).model_copy(update={
+        "candidate_id": "second-drug-experiment",
+        "start_quote": "every time we do the experiment",
+        "end_quote": "similar but not exactly the same",
+        "title": "A second drug hypothesis experiment",
+        "learning_objective": "Explain the evidence in the drugs C and D experiment",
+        "facet": "hypothesis evidence",
+        "topic_evidence_quote": (
+            "their measurements are similar but not exactly the same"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="hypothesis testing with drugs C and D",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == (
+        ["cue-7", "cue-8"] if split_hypothetical else ["cue-7"]
+    )
+    assert report.clips[0]["_clip_text"].startswith("now let's imagine")
+    assert "opposite result" not in report.clips[0]["_clip_text"]
+    assert report.clips[0]["_clip_text"].endswith("similar but not exactly the same")
+
+
+@pytest.mark.parametrize(
+    ("marker_text", "middle_text", "claim_prefix"),
+    [
+        ("To summarize what we've covered so far.", "", ""),
+        ("To summarize what we've", "", "covered so far. "),
+        (
+            "To summarize what we've covered so far.",
+            "The first result rejected the null hypothesis.",
+            "",
+        ),
+        (
+            "To summarize what we've covered so far.",
+            "Kinesin proteins move on microtubules.",
+            "",
+        ),
+    ],
+)
+def test_recap_marker_in_previous_cue_rejects_compact_claim_in_next_cue(
+    marker_text: str,
+    middle_text: str,
+    claim_prefix: str,
+) -> None:
+    claim = "Strong evidence against a hypothesis lets us reject it"
+    plan = _compact_plan(
+        exact_request="hypothesis testing",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "hypothesis testing",
+            "requirement": "Teach hypothesis testing",
+        }],
+        evidence=[{"constraint_id": "subject", "evidence_quote": claim}],
+    )
+    claim_line = 2 if middle_text else 1
+    plan.topics[0] = plan.topics[0].model_copy(update={
+        "start_line": claim_line,
+        "end_line": claim_line,
+        "start_quote": "Strong evidence against a hypothesis",
+        "end_quote": "a hypothesis lets us reject it",
+        "claim_quote": claim,
+        "title": "Rejecting a hypothesis",
+        "learning_objective": "Explain when to reject a hypothesis",
+        "facet": "hypothesis decisions",
+    })
+    segments = [
+        {
+            "cue_id": "recap-marker",
+            "start": 0.0,
+            "end": 4.0,
+            "text": marker_text,
+        },
+    ]
+    if middle_text:
+        segments.append({
+            "cue_id": "recap-middle",
+            "start": 4.0,
+            "end": 8.0,
+            "text": middle_text,
+        })
+    segments.append(
+        {
+            "cue_id": "recap-claim",
+            "start": 8.0 if middle_text else 4.0,
+            "end": 80.0,
+            "text": f"{claim_prefix}{claim}.",
+        }
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="hypothesis testing",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:recap_evidence"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        (
+            "To recap, Alpha is a baseline statistical model. "
+            "Beta is a flexible statistical model."
+        ),
+        (
+            "To recap, here's another example of a statistical model. "
+            "Beta is a flexible statistical model."
+        ),
+        (
+            "To recap. Concept one is bias. Concept two is variance. "
+            "Beta is a flexible statistical model."
+        ),
+        (
+            "To recap, let's consider another example where proteins move on to the "
+            "next compartment. Beta is a flexible statistical model."
+        ),
+        (
+            "To recap, let's consider another example where cells switch to aerobic "
+            "respiration. Beta is a flexible statistical model."
+        ),
+    ],
+)
+def test_ordinary_transitions_inside_a_recap_do_not_clear_recap_state(
+    text: str,
+) -> None:
+    claim = "Beta is a flexible statistical model"
+    plan = _compact_plan(
+        exact_request="beta statistical model",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "beta statistical model",
+            "requirement": "Teach the beta statistical model",
+        }],
+        evidence=[{"constraint_id": "subject", "evidence_quote": claim}],
+    )
+    plan.topics[0] = plan.topics[0].model_copy(update={
+        "start_line": 0,
+        "end_line": 0,
+        "start_quote": "To recap Alpha is a baseline",
+        "end_quote": "Beta is a flexible statistical model",
+        "claim_quote": claim,
+        "title": "Beta statistical model",
+        "learning_objective": "Explain the beta statistical model",
+        "facet": "statistical models",
+    })
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "recap-facts", "start": 0.0, "end": 90.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="beta statistical model",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:recap_evidence"]
+
+
+@pytest.mark.parametrize(
+    ("recap_prefix", "navigation"),
+    [
+        (
+            "To recap, alpha was the earlier topic. ",
+            "Now let's move on to confidence intervals.",
+        ),
+        (
+            "To recap, alpha was the earlier topic. ",
+            "Now let's turn to confidence intervals.",
+        ),
+        (
+            "To recap, alpha was the earlier topic. ",
+            "Next we'll cover confidence intervals.",
+        ),
+        (
+            "To recap alpha was the earlier topic ",
+            "now let's move on to confidence intervals ",
+        ),
+        (
+            "To recap, alpha was the earlier topic; ",
+            "now let's turn to confidence intervals; ",
+        ),
+    ],
+)
+def test_explicit_new_topic_after_recap_clears_recap_state(
+    recap_prefix: str,
+    navigation: str,
+) -> None:
+    text = (
+        f"{recap_prefix}{navigation} "
+        "Confidence intervals estimate a plausible range for a population mean."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "confidence-intervals",
+        "start_quote": "To recap alpha was the earlier topic",
+        "end_quote": "plausible range for a population mean",
+        "title": "Confidence intervals",
+        "learning_objective": "Explain how confidence intervals estimate a population mean",
+        "facet": "confidence intervals",
+        "topic_evidence_quote": (
+            "Confidence intervals estimate a plausible range for a population mean"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "new-topic", "start": 0.0, "end": 95.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="confidence intervals",
+    )
+
+    assert report.rejected_reasons == []
+    assert len(report.clips) == 1
+    assert "earlier topic" not in report.clips[0]["_clip_text"]
+    assert "Confidence intervals estimate" in report.clips[0]["_clip_text"]
+
+
+def test_relational_hypothetical_comparison_is_not_split() -> None:
+    claim = "compare sample sizes ten and one hundred"
+    text = (
+        "With sample size ten, the sample mean varies widely. Now let's imagine a new "
+        "sample size of one hundred and compare sample sizes ten and one hundred. The "
+        "larger sample has a narrower sampling distribution."
+    )
+
+    transitions = gemini_segment._candidate_topic_transitions(
+        [{"cue_id": "sample-size-comparison", "start": 0.0, "end": 120.0, "text": text}],
+        0,
+        0,
+        evidence_quote=claim,
+        learning_objective="Compare sample sizes ten and one hundred",
+        relationship_bridge_allowed=True,
+    )
+
+    assert transitions == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "To recap, the estimate is unbiased.",
+        "Let's recap the main result.",
+        "To sum up, the null hypothesis is rejected.",
+        "In summary the larger sample has less variability.",
+    ],
+)
+def test_common_explicit_recap_forms_are_recognized(text: str) -> None:
+    assert gemini_segment._EXPLICIT_RECAP_NAVIGATION_RE.search(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "To summarize the measurements, compute the mean.",
+        "Let's sum up the squared deviations, then divide by n.",
+    ],
+)
+def test_substantive_summary_verbs_are_not_recap_navigation(text: str) -> None:
+    assert gemini_segment._EXPLICIT_RECAP_NAVIGATION_RE.search(text) is None
 
 
 def test_edge_navigation_never_manufactures_an_incomplete_ending() -> None:

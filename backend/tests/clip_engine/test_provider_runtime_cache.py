@@ -245,6 +245,9 @@ def test_job_cost_budget_fits_expansion_and_typical_whole_transcript_selectors(
     ) / 1_000_000.0
     assert budget["pro_selector_calls"] == selector_count
     assert budget["reserved_cost_usd"] == pytest.approx(expected_reserved_cost)
+    assert budget["lifetime_reserved_worst_case_cost_usd"] == pytest.approx(
+        budget["reserved_cost_usd"]
+    )
     assert budget["reserved_cost_usd"] <= cost_limit
     assert budget["cost_limit_usd"] == pytest.approx(cost_limit)
 

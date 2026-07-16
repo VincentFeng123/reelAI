@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -78,13 +79,22 @@ SEGMENT_FLASH_MODEL = (
 SEGMENT_FLASH_FALLBACK_MODEL = os.environ.get(
     "SEGMENT_FLASH_FALLBACK_MODEL", "gemini-3.1-flash-lite",
 ).strip()
-# SEGMENT_MODEL was the original Pro-only selector model. Keep it as the
-# highest-precedence migration override so existing deployments do not change models.
+# SEGMENT_MODEL was the original Pro-only selector model. Keep it only as a
+# fallback migration alias: an explicit SEGMENT_PRO_MODEL must win, and a stale
+# non-Pro legacy value must not silently downgrade authoritative clip selection.
 _legacy_segment_model = os.environ.get("SEGMENT_MODEL", "").strip()
-SEGMENT_PRO_MODEL = (
-    _legacy_segment_model
-    or os.environ.get("SEGMENT_PRO_MODEL", "").strip()
-    or "gemini-3.1-pro-preview"
+_SEGMENT_PRO_MODEL_RE = re.compile(
+    r"^(?:models/)?gemini-\d+(?:\.\d+)*-pro(?:-[a-z0-9]+)*$",
+    re.IGNORECASE,
+)
+SEGMENT_PRO_MODEL = next(
+    model
+    for model in (
+        os.environ.get("SEGMENT_PRO_MODEL", "").strip(),
+        _legacy_segment_model,
+        "gemini-3.1-pro-preview",
+    )
+    if _SEGMENT_PRO_MODEL_RE.fullmatch(model)
 )
 SEGMENT_MODEL = SEGMENT_PRO_MODEL
 try:

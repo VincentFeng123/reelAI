@@ -386,7 +386,15 @@ class GenerationBudget:
                 "max_no_growth_passes": self.max_no_growth_passes,
                 "gemini": {
                     "cost_limit_usd": self._GEMINI_COST_LIMIT_USD[self.mode],
+                    "lifetime_reserved_worst_case_cost_usd": round(
+                        self._gemini_reserved_cost_usd, 8
+                    ),
+                    # Compatibility alias. This is cumulative reservation
+                    # history, not a charge or the current admission exposure.
                     "reserved_cost_usd": round(self._gemini_reserved_cost_usd, 8),
+                    "settled_cost_exposure_usd": round(
+                        self._gemini_committed_cost_usd, 8
+                    ),
                     "committed_cost_usd": round(self._gemini_committed_cost_usd, 8),
                     "inflight_reserved_cost_usd": round(
                         sum(self._gemini_inflight.values()), 8
@@ -1101,7 +1109,7 @@ class GenerationContext:
             ),
             "estimated_cost_usd": round(estimated_cost, 8),
             "reserved_worst_case_cost_usd": self.budget.snapshot()["gemini"][
-                "reserved_cost_usd"
+                "lifetime_reserved_worst_case_cost_usd"
             ],
             "billing_unknown_calls": sum(
                 1

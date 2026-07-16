@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -838,7 +840,17 @@ def test_budget_is_reserved_once_and_default_call_allows_one_transient_retry(mon
         "model": "gemini-3.5-flash",
         "max_output_tokens": 4096,
         "prompt_text": "system\n\nuser",
-        "estimated_input_tokens": 1_004,
+        "estimated_input_tokens": (
+            math.ceil((
+                len("system\n\nuser")
+                + len(json.dumps(
+                    G._BoundaryPlan.model_json_schema(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8"))
+            ) / 3)
+            + 1_000
+        ),
         "cancelled": None,
     }
 

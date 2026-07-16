@@ -74,7 +74,7 @@ def _relevant_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     video_url = " ".join(str(
         settings.get("_segment_video_url") or ""
     ).split())
-    video_grounding_enabled = video_grounding_required or bool(video_url)
+    video_grounding_enabled = video_grounding_required and bool(video_url)
     return {
         "fine_snap": (
             bool(pipeline_config.SEGMENT_FINE_SNAP)

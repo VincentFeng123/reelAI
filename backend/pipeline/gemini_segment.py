@@ -1,8 +1,8 @@
 """Guarded Gemini educational clip segmentation.
 
 Production uses one medium-thinking Pro boundary-selection call over the whole
-timestamped transcript plus low-resolution video grounding, then applies
-deterministic quality, context, grounding, filler, and deduplication guards.
+timestamped transcript as text, then applies deterministic quality, context,
+grounding, filler, and deduplication guards. Video media is not attached.
 Legacy routing and enrichment helpers remain available only for isolated
 evaluation compatibility; the public production adapter never dispatches them.
 
@@ -20,7 +20,7 @@ import re
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from enum import Enum
 from functools import lru_cache
 from threading import BoundedSemaphore, Lock
@@ -656,6 +656,44 @@ _FOLLOWUP_EXAMPLE_REUSE_RE = re.compile(
     r"let(?:['’]?s|\s+us)\s+(?:(?:again|also|still)\s+)?"
     r"(?:reuse|take|use)\b[^.!?]{0,120}?\bas\s+an?\s+"
     r"(?:case|example)\b",
+    re.IGNORECASE,
+)
+_NEW_HYPOTHETICAL_EXAMPLE_RE = re.compile(
+    r"(?<!\w)(?P<navigation>"
+    r"(?:(?:all\s+right|alright|okay|ok|so)\s*[,;:]?\s+)*"
+    r"now\s*[,;:]?\s+let(?:['’]?s|\s+us)\s+imagine\b)"
+    r"(?=[^.!?]{0,180}\b(?:(?:another|different|new|second)\b|"
+    r"(?:one|two|three|four|five|\d+)\s+more\b|"
+    r"just\s+like\s+before\b))",
+    re.IGNORECASE,
+)
+_EXPLICIT_RECAP_NAVIGATION_RE = re.compile(
+    r"(?<!\w)(?P<navigation>"
+    r"(?:(?:all\s+right|alright|okay|ok|so|now)\s*[,;:]?\s+)*"
+    r"(?:"
+    r"(?:to\s+|let(?:['’]?s|\s+us)\s+)"
+    r"(?:(?:briefly|quickly)\s+)?(?:recap|(?:sum\s+up|summarize)(?:"
+    r"(?=\s*(?:[,;:—-]|[.!?…]+|$))|"
+    r"\s+what\s+(?:(?:we|you)(?:['’]?ve|\s+have)?\s+)?"
+    r"(?:covered|discussed|learned|seen)\s+"
+    r"(?:so\s+far|up\s+to\s+this\s+point)))|"
+    r"in\s+summary\b(?!\s+(?:form|measure|report|statistic|table)s?\b)"
+    r")"
+    r"\s*(?:[,;:—-]|[.!?…]+)?\s*)",
+    re.IGNORECASE,
+)
+_STRONG_RECAP_EXIT_RE = re.compile(
+    r"\b(?:"
+    r"move\s+on\s+to|switch\s+to|shift\s+to|turn\s+to|talk\s+about|"
+    r"we(?:['’]re|\s+are)\s+(?:moving\s+on|switching|shifting|turning)\s+to|"
+    r"next\s+(?:we|i)(?:['’]ll|\s+will)\s+"
+    r"(?:move\s+on\s+to|switch\s+to|shift\s+to|turn\s+to|talk\s+about|"
+    r"discuss|cover|look\s+at)|"
+    r"let(?:['’]?s|\s+us)\s+(?:discuss|cover|look\s+at)|"
+    r"next\s+up\s+is|that\s+brings\s+us\s+to|moving\s+on\s+to|"
+    r"turn\s+(?:our\s+)?attention\s+to|"
+    r"(?:the\s+)?next\s+(?:topic|concept|section)"
+    r")\b",
     re.IGNORECASE,
 )
 _HARD_TOPIC_RESET_RE = re.compile(
@@ -6040,6 +6078,8 @@ class _TopicTransition:
     new_side_line: int
     new_side_left: int
     worked_unit: bool = False
+    recap: bool = False
+    clears_recap: bool = False
 
 
 @dataclass(frozen=True)
@@ -7120,6 +7160,53 @@ def _clause_after_described_unit(
     )
 
 
+def _reset_clears_recap(
+    reset_pattern: re.Pattern[str],
+    navigation_text: str,
+) -> bool:
+    """Only an explicit new-topic exit can leave an active recap region."""
+    return bool(
+        reset_pattern is _NEXT_DISTINCT_UNIT_RESET_RE
+        or (
+            reset_pattern is _HARD_TOPIC_RESET_RE
+            and _STRONG_RECAP_EXIT_RE.search(navigation_text)
+        )
+    )
+
+
+def _reset_navigation_prefix(reset: re.Match[str]) -> str:
+    return reset.string[reset.start():reset.start("subject")]
+
+
+def _recap_lookback_start(segments: list[dict], start_line: int) -> int:
+    """Find the nearest still-active recap marker before a modelled start."""
+    if start_line <= 0:
+        return start_line
+    reset_patterns = (_HARD_TOPIC_RESET_RE, _NEXT_DISTINCT_UNIT_RESET_RE)
+    for line in range(start_line - 1, -1, -1):
+        text = str(segments[line].get("text") or "")
+        following = str(segments[line + 1].get("text") or "")
+        joined = f"{text} {following}"
+        if _EXPLICIT_RECAP_NAVIGATION_RE.search(joined):
+            return line
+        for pattern in reset_patterns:
+            exits = [
+                reset
+                for reset in pattern.finditer(joined)
+                if _reset_clears_recap(
+                    pattern,
+                    _reset_navigation_prefix(reset),
+                )
+                and not (
+                    pattern is _HARD_TOPIC_RESET_RE
+                    and _plain_same_unit_navigation_subject(reset.group("subject"))
+                )
+            ]
+            if exits:
+                return start_line
+    return start_line
+
+
 def _candidate_topic_transitions(
     segments: list[dict],
     start_line: int,
@@ -7158,6 +7245,68 @@ def _candidate_topic_transitions(
         start_line,
         end_line,
     )
+    explicit_boundary_transitions: list[_TopicTransition] = []
+    for line in range(start_line, end_line + 1):
+        text = str(segments[line].get("text") or "")
+        for match in _EXPLICIT_RECAP_NAVIGATION_RE.finditer(text):
+            new_side_line = line
+            new_side_left = match.end("navigation")
+            if (
+                not _WORD_RE.search(text[new_side_left:])
+                and line < end_line
+            ):
+                next_text = str(segments[line + 1].get("text") or "")
+                first_next_word = _WORD_RE.search(next_text)
+                if first_next_word is not None:
+                    new_side_line = line + 1
+                    new_side_left = first_next_word.start()
+            explicit_boundary_transitions.append(_TopicTransition(
+                navigation_line=line,
+                navigation_left=match.start("navigation"),
+                new_side_line=new_side_line,
+                new_side_left=new_side_left,
+                recap=True,
+            ))
+        if relationship_bridge_allowed is not True:
+            explicit_boundary_transitions.extend(
+                _TopicTransition(
+                    navigation_line=line,
+                    navigation_left=match.start("navigation"),
+                    new_side_line=line,
+                    new_side_left=match.start("navigation"),
+                    worked_unit=True,
+                )
+                for match in _NEW_HYPOTHETICAL_EXAMPLE_RE.finditer(text)
+            )
+    for line in range(start_line, end_line):
+        left_text = str(segments[line].get("text") or "")
+        right_text = str(segments[line + 1].get("text") or "")
+        joined = f"{left_text} {right_text}"
+        split = len(left_text) + 1
+        for match in _EXPLICIT_RECAP_NAVIGATION_RE.finditer(joined):
+            if not (match.start("navigation") < split < match.end("navigation")):
+                continue
+            explicit_boundary_transitions.append(_TopicTransition(
+                navigation_line=line,
+                navigation_left=match.start("navigation"),
+                new_side_line=line + 1,
+                new_side_left=max(0, match.end("navigation") - split),
+                recap=True,
+            ))
+        if (
+            relationship_bridge_allowed is not True
+            and _NEW_HYPOTHETICAL_EXAMPLE_RE.search(left_text) is None
+        ):
+            for match in _NEW_HYPOTHETICAL_EXAMPLE_RE.finditer(joined):
+                if match.start("navigation") >= split:
+                    continue
+                explicit_boundary_transitions.append(_TopicTransition(
+                    navigation_line=line,
+                    navigation_left=match.start("navigation"),
+                    new_side_line=line,
+                    new_side_left=match.start("navigation"),
+                    worked_unit=True,
+                ))
     evidence_location = _unique_evidence_location(
         segments,
         evidence_quote,
@@ -7189,6 +7338,7 @@ def _candidate_topic_transitions(
         not has_hard_reset
         and not has_worked_unit_onset
         and not detected_lens_transitions
+        and not explicit_boundary_transitions
         and not atomic_transitions
         and not comparison_transitions
     ):
@@ -7202,6 +7352,7 @@ def _candidate_topic_transitions(
     transitions: list[_TopicTransition] = [
         *atomic_transitions,
         *comparison_transitions,
+        *explicit_boundary_transitions,
     ]
     if evidence_location is not None:
         evidence_end = evidence_location[2], evidence_location[3]
@@ -7298,6 +7449,10 @@ def _candidate_topic_transitions(
                     navigation_left=navigation_left,
                     new_side_line=line,
                     new_side_left=new_side_start,
+                    clears_recap=_reset_clears_recap(
+                        reset_pattern,
+                        _reset_navigation_prefix(reset),
+                    ),
                 ))
 
     for line in range(start_line, end_line):
@@ -7395,6 +7550,10 @@ def _candidate_topic_transitions(
                     navigation_left=navigation_left,
                     new_side_line=new_side_line,
                     new_side_left=new_side_left,
+                    clears_recap=_reset_clears_recap(
+                        reset_pattern,
+                        _reset_navigation_prefix(reset),
+                    ),
                 ))
     if has_worked_unit_onset:
         transitions.extend(_worked_unit_transitions(
@@ -7412,11 +7571,20 @@ def _candidate_topic_transitions(
     for transition in transitions:
         key = (transition.navigation_line, transition.navigation_left)
         previous = unique.get(key)
-        if previous is None or (
-            transition.new_side_line,
-            transition.new_side_left,
-        ) > (previous.new_side_line, previous.new_side_left):
-            unique[key] = transition
+        selected = transition
+        if previous is not None and (
+            previous.new_side_line,
+            previous.new_side_left,
+        ) >= (transition.new_side_line, transition.new_side_left):
+            selected = previous
+        unique[key] = replace(
+            selected,
+            recap=transition.recap or bool(previous and previous.recap),
+            clears_recap=(
+                transition.clears_recap
+                or bool(previous and previous.clears_recap)
+            ),
+        )
     return sorted(
         unique.values(),
         key=lambda item: (item.navigation_line, item.navigation_left),
@@ -9301,7 +9469,7 @@ def _plan_to_report(
             boundary_fallback_reasons.append(
                 "trimmed_opening_instructional_preview"
             )
-        transition_scan_start = a
+        transition_scan_start = _recap_lookback_start(segments, a)
         if evidence_location_for_section is not None and a > 0:
             evidence_start_line, evidence_left, _evidence_end_line, _evidence_right = (
                 evidence_location_for_section
@@ -9357,7 +9525,7 @@ def _plan_to_report(
                 # worked-example prompt in the immediately preceding cue.
                 # Inspect that one cue for a semantic onset so context repair
                 # cannot walk backward through an unrelated prior lesson.
-                transition_scan_start = a - 1
+                transition_scan_start = min(transition_scan_start, a - 1)
         topic_transitions_for_section = _candidate_topic_transitions(
             segments,
             transition_scan_start,
@@ -9369,6 +9537,38 @@ def _plan_to_report(
             atomic_scope_text=atomic_scope_text,
             comparison_subject_anchors=comparison_subject_anchors,
         )
+        if evidence_location_for_section is not None:
+            evidence_start = (
+                evidence_location_for_section[0],
+                evidence_location_for_section[1],
+            )
+            evidence_end = (
+                evidence_location_for_section[2],
+                evidence_location_for_section[3],
+            )
+            recap_marker_overlap = any(
+                item.recap
+                and (item.navigation_line, item.navigation_left) < evidence_end
+                and evidence_start < (item.new_side_line, item.new_side_left)
+                for item in topic_transitions_for_section
+            )
+            recap_active = False
+            for item in sorted(
+                topic_transitions_for_section,
+                key=lambda transition: (
+                    transition.new_side_line,
+                    transition.new_side_left,
+                ),
+            ):
+                if (item.new_side_line, item.new_side_left) > evidence_start:
+                    break
+                if item.recap:
+                    recap_active = True
+                if item.clears_recap:
+                    recap_active = False
+            if recap_marker_overlap or recap_active:
+                report.rejected_reasons.append(f"{prefix}:recap_evidence")
+                continue
         completion_transitions = topic_transitions_for_section
         if b + 1 < n:
             try:
@@ -11200,7 +11400,7 @@ def _call_model(
     media_resolution=None,
     estimated_media_tokens: int = 0,
 ) -> tuple[BaseModel, dict]:
-    from ..gemini_client import generate_json_v3
+    from ..gemini_client import count_request_tokens, generate_json_v3
 
     if isinstance(user, str):
         prompt_user_text = user
@@ -11222,16 +11422,40 @@ def _call_model(
     try:
         reservation: dict[str, object] = {}
         if callable(budget_reserve):
+            schema_bytes = len(json.dumps(
+                schema.model_json_schema(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8"))
+            request_bytes = len(prompt_text.encode("utf-8")) + schema_bytes
+            estimated_text_tokens = max(
+                1,
+                math.ceil((len(prompt_text) + schema_bytes) / 3),
+            )
+            if request_bytes + 1_000 > 200_000:
+                remaining_s = max(0.0, deadline_monotonic - time.monotonic())
+                if remaining_s >= 1.0 and not _cancel_requested(cancelled):
+                    try:
+                        estimated_text_tokens = count_request_tokens(
+                            system,
+                            prompt_user_text,
+                            schema,
+                            model=model,
+                            timeout_s=min(10.0, remaining_s),
+                        )
+                    except Exception:  # fail closed on preflight unavailability
+                        estimated_text_tokens = request_bytes
+                else:
+                    estimated_text_tokens = request_bytes
             reserved = budget_reserve(
                 operation=operation,
                 model=model,
                 max_output_tokens=max_output_tokens,
                 prompt_text=prompt_text,
-                estimated_input_tokens=max(
-                    1,
-                    math.ceil(len(prompt_text) / 3)
+                estimated_input_tokens=(
+                    estimated_text_tokens
                     + 1_000
-                    + max(0, int(estimated_media_tokens)),
+                    + max(0, int(estimated_media_tokens))
                 ),
                 deadline_monotonic=deadline_monotonic,
                 cancelled=cancelled,

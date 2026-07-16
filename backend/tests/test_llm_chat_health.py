@@ -314,6 +314,8 @@ def test_chat_endpoint_prefers_configured_dedicated_key(monkeypatch) -> None:
 
 
 def test_admin_health_reports_callable_text_and_embedding_backends(monkeypatch) -> None:
+    monkeypatch.delenv("SEGMENT_PRO_MODEL", raising=False)
+    monkeypatch.setenv("SEGMENT_FALLBACK_MODEL", "legacy-health-fallback")
     monkeypatch.setattr(
         llm_router,
         "text_llm_status",
@@ -338,6 +340,8 @@ def test_admin_health_reports_callable_text_and_embedding_backends(monkeypatch) 
     assert health["chat_model"] == "gemini-health-test"
     assert health["embedding_backend"] == "hash"
     assert health["text_llm_providers"]["groq"] is False
+    assert health["gemini_clip_selector_model"] == "gemini-3.1-pro-preview"
+    assert health["gemini_fallback_model"] == "legacy-health-fallback"
 
 
 @pytest.mark.skipif(

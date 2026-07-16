@@ -1,6 +1,7 @@
 import importlib
 
 import dotenv
+import pytest
 
 from backend import config
 
@@ -82,18 +83,36 @@ def test_segment_router_rejects_invalid_values_and_clamps_percent(monkeypatch):
     )["percent"] == 0.0
 
 
-def test_legacy_pro_override_wins_then_explicit_pro_model_is_fallback(monkeypatch):
-    legacy = _reload_segment_config(
+def test_explicit_pro_override_wins_then_legacy_pro_model_is_fallback(monkeypatch):
+    explicit = _reload_segment_config(
         monkeypatch,
         SEGMENT_PRO_MODEL="gemini-3.1-pro-explicit",
         SEGMENT_MODEL="gemini-3.1-pro-legacy",
     )
+    assert explicit["pro"] == explicit["legacy"] == "gemini-3.1-pro-explicit"
+
+    legacy = _reload_segment_config(
+        monkeypatch, SEGMENT_MODEL="gemini-3.1-pro-legacy",
+    )
     assert legacy["pro"] == legacy["legacy"] == "gemini-3.1-pro-legacy"
 
-    explicit = _reload_segment_config(
-        monkeypatch, SEGMENT_PRO_MODEL="gemini-3.1-pro-explicit",
+
+@pytest.mark.parametrize("variable", ["SEGMENT_PRO_MODEL", "SEGMENT_MODEL"])
+def test_non_pro_selector_override_cannot_downgrade_authoritative_selection(
+    monkeypatch,
+    variable,
+):
+    loaded = _reload_segment_config(monkeypatch, **{variable: "gemini-3.5-flash"})
+    assert loaded["pro"] == loaded["legacy"] == "gemini-3.1-pro-preview"
+
+
+def test_invalid_explicit_selector_can_use_a_valid_legacy_pro_fallback(monkeypatch):
+    loaded = _reload_segment_config(
+        monkeypatch,
+        SEGMENT_PRO_MODEL="gemini-flash-proxy",
+        SEGMENT_MODEL="gemini-3.1-pro-legacy",
     )
-    assert explicit["pro"] == explicit["legacy"] == "gemini-3.1-pro-explicit"
+    assert loaded["pro"] == loaded["legacy"] == "gemini-3.1-pro-legacy"
 
 
 def test_segment_flash_failover_model_is_configurable_and_can_be_disabled(monkeypatch):

@@ -15,7 +15,7 @@ ReelAI turns study materials into a learner-specific feed of transcript-grounded
 - Railway hosts the durable FastAPI process and generation worker.
 - PostgreSQL stores material data, generation jobs/events, provider usage, Supadata search evidence, and timestamped transcript artifacts.
 - Supadata supplies YouTube search and hosted timestamped transcript cues, preferring native captions and generating a transcript when captions are unavailable.
-- The guarded practice selector uses Gemini 3.5 Flash first, reruns uncertain or invalid output through Gemini 3.1 Pro, and emits quote-aligned YouTube iframe timestamps.
+- The guarded practice selector sends one complete Supadata transcript as text to Gemini 3.1 Pro, makes one authoritative selection call per analyzed source, and emits quote-aligned YouTube iframe timestamps. YouTube media is not attached to the production selector.
 
 ### Generation contract
 
@@ -36,7 +36,7 @@ Every event includes `job_id`, a monotonic `seq`, and a timestamp. Status and ca
 
 ### Retrieval and duration semantics
 
-Only canonical YouTube video, playlist, and channel URLs are accepted by ingestion surfaces. Topic materials use the practice retrieval flow: Gemini Flash expands the literal topic into eight level-aware educational queries, Supadata searches them sequentially, and candidates are merged by repeated-query matches, provider rank, and views. Creative Commons and source-duration filters map directly to Supadata when selected. Transcripts use `mode=auto`: native captions are used when available and Supadata generates hosted timestamped cues otherwise.
+Only canonical YouTube video, playlist, and channel URLs are accepted by ingestion surfaces. Topic materials use the practice retrieval flow: one cached Gemini Flash-Lite call expands the literal topic into level-aware educational queries, and the job budget sends at most two queries in fast mode or three in slow mode to Supadata. Candidates are merged by repeated-query matches, provider rank, and views. Creative Commons and source-duration filters map directly to Supadata when selected. Transcripts use `mode=auto`: native captions are used when available and Supadata generates hosted timestamped cues otherwise.
 
 Production clip selection has no duration target or maximum. It keeps the shortest range that contains the necessary setup, one complete teaching claim, and a clean silent ending—even when a worked explanation legitimately runs longer than 180 seconds.
 
@@ -55,7 +55,7 @@ npm install
 npm run dev
 ```
 
-For production, set `DATABASE_URL`, `DATA_DIR=/data`, `SUPADATA_API_KEY`, `GEMINI_API_KEY`, `SEGMENT_MODEL`, and optionally `SEGMENT_FALLBACK_MODEL` on Railway. Set `RAILWAY_BACKEND_ORIGIN` on Vercel. Provider-backed live smoke tests are separately gated because they consume credits; mocked provider tests are the CI requirement.
+For production, set `DATABASE_URL`, `DATA_DIR=/data`, `SUPADATA_API_KEY`, `GEMINI_API_KEY`, `SEGMENT_ROUTING_MODE=pro_only`, and `SEGMENT_PRO_MODEL=gemini-3.1-pro-preview` on Railway. `SEGMENT_MODEL` is only a legacy Pro-model fallback. Set `RAILWAY_BACKEND_ORIGIN` on Vercel. Provider-backed live smoke tests are separately gated because they consume credits; mocked provider tests are the CI requirement.
 
 ## Local YouTube Topic-Clipper
 
