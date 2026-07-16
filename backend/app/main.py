@@ -136,7 +136,7 @@ from .clip_engine.provider_cache import search_cache_key
 from .clip_engine.provider_runtime import GenerationContext, ProviderUsageRecord
 from .clip_engine.clipper.supadata_client import fetch_transcript_artifact
 from .clip_engine.supadata_search import search_one as supadata_search_one
-from .clip_engine.metadata import canonicalize_youtube_url
+from .clip_engine.metadata import canonicalize_youtube_url, normalize_youtube_video_id
 from .clip_engine.silence import persisted_boundary_is_usable
 from .ingestion.models import (
     IngestFeedRequest,
@@ -355,7 +355,7 @@ GENERATION_OUTPUT_CEILINGS = {
     "slow": INITIAL_READY_REEL_TARGET,
 }
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v34"
+SELECTION_CONTRACT_VERSION = "quality_silence_v35"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -3109,6 +3109,46 @@ def _generation_chain_analyzed_source_budget(
     return completed_sources
 
 
+def _generation_chain_consumed_video_ids(
+    conn,
+    *,
+    generation_id: str,
+) -> set[str]:
+    """Return exact provider sources already selected across a generation chain."""
+    generation_ids = _response_generation_ids(conn, generation_id)
+    if not generation_ids:
+        return set()
+
+    placeholders = ", ".join("?" for _ in generation_ids)
+    rows = fetch_all(
+        conn,
+        f"""
+        SELECT jobs.usage_json
+        FROM reel_generations AS generations
+        JOIN reel_generation_jobs AS jobs
+          ON jobs.result_generation_id = generations.id
+        WHERE generations.id IN ({placeholders})
+          AND jobs.status IN ('completed', 'partial', 'failed', 'exhausted')
+        """,
+        tuple(generation_ids),
+    )
+    consumed: set[str] = set()
+    for row in rows:
+        try:
+            usage = json.loads(str(row.get("usage_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        raw_ids = usage.get("consumed_video_ids") if isinstance(usage, dict) else None
+        if not isinstance(raw_ids, list):
+            continue
+        consumed.update(
+            video_id
+            for raw_id in raw_ids
+            if (video_id := normalize_youtube_video_id(raw_id)) is not None
+        )
+    return consumed
+
+
 def _generation_chain_meets_source_budget(
     conn,
     *,
@@ -4093,6 +4133,21 @@ def _run_leased_generation_job(
         require_acoustic_boundaries=True,
     )
     generation_id = ""
+    completed_source_ids: set[str] = set()
+    retrieved_video_ids: set[str] = set()
+
+    def generation_usage_payload() -> dict[str, Any]:
+        payload = context.usage_payload()
+        counters = dict(payload.get("counters") or {})
+        counters["analyzed_sources"] = len(completed_source_ids)
+        payload["counters"] = counters
+        payload["consumed_video_ids"] = sorted(
+            video_id
+            for raw_id in retrieved_video_ids
+            if (video_id := normalize_youtube_video_id(raw_id)) is not None
+        )
+        return payload
+
     try:
         with get_conn(transactional=True) as setup_conn:
             if not update_generation_progress(
@@ -4148,6 +4203,10 @@ def _run_leased_generation_job(
                 conn,
                 source_generation_id,
             )
+            prior_consumed_video_ids = _generation_chain_consumed_video_ids(
+                conn,
+                generation_id=source_generation_id or "",
+            )
             source_reel_count = _current_level_reusable_generation_reel_count(
                 conn,
                 generation_id=source_generation_id,
@@ -4202,14 +4261,6 @@ def _run_leased_generation_job(
                 )
 
             base_exclusions = list(params.get("exclude_video_ids") or [])
-            completed_source_ids: set[str] = set()
-
-            def usage_payload_with_completed_sources() -> dict[str, Any]:
-                payload = context.usage_payload()
-                counters = dict(payload.get("counters") or {})
-                counters["analyzed_sources"] = len(completed_source_ids)
-                payload["counters"] = counters
-                return payload
 
             def run_retrieval_stage(
                 *,
@@ -4217,6 +4268,7 @@ def _run_leased_generation_job(
                 video_budget: int,
                 new_reel_cap: int,
                 excluded_video_ids: list[str],
+                consumed_video_ids: set[str],
                 analyzed_video_ids: set[str],
                 retrieved_video_ids: set[str],
             ) -> None:
@@ -4227,6 +4279,7 @@ def _run_leased_generation_job(
                     num_reels=requested_count,
                     creative_commons_only=bool(params.get("creative_commons_only")),
                     exclude_video_ids=excluded_video_ids,
+                    consumed_video_ids=sorted(consumed_video_ids),
                     exclude_generation_ids=source_generation_ids,
                     fast_mode=mode == "fast",
                     preferred_video_duration=_normalize_preferred_video_duration(
@@ -4258,12 +4311,12 @@ def _run_leased_generation_job(
                 context.budget.reserve_pass()
                 if should_cancel():
                     raise GenerationCancelledError("Generation cancelled.")
-                retrieved_video_ids: set[str] = set()
                 run_retrieval_stage(
                     retrieval_profile="deep",
                     video_budget=remaining_source_budget,
                     new_reel_cap=requested_count - current_count,
                     excluded_video_ids=base_exclusions,
+                    consumed_video_ids=prior_consumed_video_ids,
                     analyzed_video_ids=completed_source_ids,
                     retrieved_video_ids=retrieved_video_ids,
                 )
@@ -4276,7 +4329,7 @@ def _run_leased_generation_job(
                     lease_owner=lease_owner,
                     phase="ranking",
                     progress=0.85,
-                    usage=usage_payload_with_completed_sources(),
+                    usage=generation_usage_payload(),
                 ):
                     raise JobLeaseLostError(
                         f"generation job lease is no longer active: {job_id}"
@@ -4342,7 +4395,7 @@ def _run_leased_generation_job(
             )
 
             usage_records = context.usage()
-            usage_payload = usage_payload_with_completed_sources()
+            usage_payload = generation_usage_payload()
             model_records = [
                 row
                 for row in usage_records
@@ -4407,7 +4460,7 @@ def _run_leased_generation_job(
                 status="failed",
                 result_generation_id=generation_id or None,
                 lease_owner=lease_owner,
-                usage=context.usage_payload(),
+                usage=generation_usage_payload(),
                 error_code=exc.code,
                 error_message=str(exc),
                 error_detail={**exc.as_dict(), "counters": context.counters()},
@@ -4423,7 +4476,7 @@ def _run_leased_generation_job(
                 status="failed",
                 result_generation_id=generation_id or None,
                 lease_owner=lease_owner,
-                usage=context.usage_payload(),
+                usage=generation_usage_payload(),
                 error_code="generation_failed",
                 error_message=str(exc),
                 error_detail={"counters": context.counters()},

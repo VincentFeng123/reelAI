@@ -333,7 +333,7 @@ def persisted_boundary_is_usable(
             return False
         is_current_contract = bool(
             str(context.get("selection_contract_version") or "").strip()
-            == "quality_silence_v34"
+            == "quality_silence_v35"
         )
         final = _diagnostic_range(diagnostics.get("final_range"))
         if final is not None:
@@ -376,6 +376,7 @@ def persisted_boundary_is_usable(
             "quality_silence_v31",
             "quality_silence_v32",
             "quality_silence_v34",
+            "quality_silence_v35",
         }
         or str(context.get("boundary_status") or "").strip().lower()
         != "context_aligned"

@@ -760,6 +760,40 @@ _NEXT_DISTINCT_UNIT_RESET_RE = re.compile(
     r"(?:problem|question|topic|concept|goal|area)))\b",
     re.IGNORECASE,
 )
+_ENUMERATED_META_OUTLINE_RE = re.compile(
+    r"(?<!\w)(?P<navigation>"
+    r"(?:(?:(?:small|double)\s+)?bam\s+)?"
+    r"(?:(?:all\s+right|alright|okay|ok|so|now)\s*[,;:]?\s+)*"
+    r"(?:before\s+(?:(?:we|i)(?:['’]?re|\s+are)?\s+)?"
+    r"(?:done|finish|wrap\s+up|are\s+done|end)\s*[,;:]?\s+)?"
+    r"let\s+me\s+(?:add|cover|discuss|explain|mention|say)\s+"
+    r"(?:(?:two|three|four|five|six|seven|eight|nine|ten)|\d+|"
+    r"a\s+couple(?:\s+of)?)\s+(?:more\s+)?"
+    r"(?:ideas|notes|observations|points|things)\b\s*)",
+    re.IGNORECASE,
+)
+_ENUMERATED_META_UNIT_RE = re.compile(
+    r"(?<!\w)(?P<navigation>"
+    r"(?:(?:(?:small|double)\s+)?bam\s+)?"
+    r"(?:(?:all\s+right|alright|okay|ok|so|now)\s*[,;:]?\s+)*"
+    r"(?:(?:now\s+)?that\s+(?:i|we)(?:['’]?ve|\s+have)\s+"
+    r"[^.!?]{0,120}?\s+out\s+of\s+the\s+way\s+)?"
+    r"(?:the\s+)?(?:first|second|third|fourth|fifth|sixth|seventh|eighth|"
+    r"ninth|tenth|final|last)\s+thing\s+"
+    r"(?:(?:i|we)\s+)?(?:have|need|want|would\s+like)\s+to\s+"
+    r"(?:add|cover|discuss|explain|mention|say|tell\s+you)"
+    r"(?:\s+(?:is|concerns?))?"
+    r"(?:\s+(?:"
+    r"(?:(?:(?:just|only)\s+(?:more\s+)?|more\s+)"
+    r"(?:background|context|terminology)"
+    r"(?:\s+in\s+(?:fancy|formal|technical)\s+"
+    r"(?:[a-z][\w'’-]*\s+){0,2}(?:language|lingo|terms))?)|"
+    r"(?:background|context|terminology)\s+in\s+"
+    r"(?:fancy|formal|technical)\s+"
+    r"(?:[a-z][\w'’-]*\s+){0,2}(?:language|lingo|terms))\s+"
+    r"(?=(?:a|an|the|this|that|these|those)\b))?\s*)",
+    re.IGNORECASE,
+)
 _ENUMERATED_OUTLINE_RE = re.compile(
     r"\b(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|several|"
     r"multiple)|\d+)\s+"
@@ -7207,6 +7241,44 @@ def _recap_lookback_start(segments: list[dict], start_line: int) -> int:
     return start_line
 
 
+def _enumerated_meta_lookback_start(
+    segments: list[dict],
+    start_line: int,
+) -> int:
+    """Include a short preceding caption only when meta navigation spans it."""
+    if start_line <= 0:
+        return start_line
+    earliest = max(0, start_line - 2)
+    selected = start_line
+    patterns = (_ENUMERATED_META_OUTLINE_RE, _ENUMERATED_META_UNIT_RE)
+    for window_start in range(earliest, start_line):
+        texts = [
+            str(segments[index].get("text") or "")
+            for index in range(window_start, start_line + 1)
+        ]
+        starts: list[int] = []
+        offset = 0
+        for text in texts:
+            starts.append(offset)
+            offset += len(text) + 1
+        current_start = starts[-1]
+        joined = " ".join(texts)
+        for pattern in patterns:
+            for match in pattern.finditer(joined):
+                if not (
+                    match.start("navigation") < current_start
+                    <= match.end("navigation")
+                ):
+                    continue
+                match_line_index = max(
+                    index
+                    for index, cue_start in enumerate(starts)
+                    if cue_start <= match.start("navigation")
+                )
+                selected = min(selected, window_start + match_line_index)
+    return selected
+
+
 def _candidate_topic_transitions(
     segments: list[dict],
     start_line: int,
@@ -7278,6 +7350,19 @@ def _candidate_topic_transitions(
                 )
                 for match in _NEW_HYPOTHETICAL_EXAMPLE_RE.finditer(text)
             )
+        for pattern in (
+            _ENUMERATED_META_OUTLINE_RE,
+            _ENUMERATED_META_UNIT_RE,
+        ):
+            explicit_boundary_transitions.extend(
+                _TopicTransition(
+                    navigation_line=line,
+                    navigation_left=match.start("navigation"),
+                    new_side_line=line,
+                    new_side_left=match.end("navigation"),
+                )
+                for match in pattern.finditer(text)
+            )
     for line in range(start_line, end_line):
         left_text = str(segments[line].get("text") or "")
         right_text = str(segments[line + 1].get("text") or "")
@@ -7306,6 +7391,51 @@ def _candidate_topic_transitions(
                     new_side_line=line,
                     new_side_left=match.start("navigation"),
                     worked_unit=True,
+                ))
+        for pattern in (
+            _ENUMERATED_META_OUTLINE_RE,
+            _ENUMERATED_META_UNIT_RE,
+        ):
+            for match in pattern.finditer(joined):
+                if not (match.start("navigation") < split < match.end("navigation")):
+                    continue
+                explicit_boundary_transitions.append(_TopicTransition(
+                    navigation_line=line,
+                    navigation_left=match.start("navigation"),
+                    new_side_line=line + 1,
+                    new_side_left=max(0, match.end("navigation") - split),
+                ))
+    for line in range(start_line, end_line - 1):
+        texts = [
+            str(segments[index].get("text") or "")
+            for index in range(line, line + 3)
+        ]
+        starts = [0, len(texts[0]) + 1]
+        starts.append(starts[1] + len(texts[1]) + 1)
+        joined = " ".join(texts)
+        for pattern in (
+            _ENUMERATED_META_OUTLINE_RE,
+            _ENUMERATED_META_UNIT_RE,
+        ):
+            for match in pattern.finditer(joined):
+                if not (
+                    match.start("navigation") < starts[1]
+                    and match.end("navigation") > starts[2]
+                ):
+                    continue
+                new_side_index = max(
+                    index
+                    for index, cue_start in enumerate(starts)
+                    if cue_start <= match.end("navigation")
+                )
+                explicit_boundary_transitions.append(_TopicTransition(
+                    navigation_line=line,
+                    navigation_left=match.start("navigation"),
+                    new_side_line=line + new_side_index,
+                    new_side_left=max(
+                        0,
+                        match.end("navigation") - starts[new_side_index],
+                    ),
                 ))
     evidence_location = _unique_evidence_location(
         segments,
@@ -9469,7 +9599,10 @@ def _plan_to_report(
             boundary_fallback_reasons.append(
                 "trimmed_opening_instructional_preview"
             )
-        transition_scan_start = _recap_lookback_start(segments, a)
+        transition_scan_start = min(
+            _recap_lookback_start(segments, a),
+            _enumerated_meta_lookback_start(segments, a),
+        )
         if evidence_location_for_section is not None and a > 0:
             evidence_start_line, evidence_left, _evidence_end_line, _evidence_right = (
                 evidence_location_for_section

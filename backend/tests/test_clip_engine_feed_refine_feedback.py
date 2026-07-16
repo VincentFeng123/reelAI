@@ -527,7 +527,7 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
         self.assertNotEqual(learner_a_revision_1, learner_a_revision_2)
 
     def test_ranked_feed_cache_version_is_40(self) -> None:
-        """Cache rows must require the v34 grounded-claim selector contract."""
+        """Cache rows must require the current v35 selector contract."""
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_VERSION,
             40,
@@ -535,7 +535,7 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
         )
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
-            "quality_silence_v34",
+            "quality_silence_v35",
         )
 
 

@@ -541,7 +541,7 @@ def _boundary_evidence_grade(
     if (
         not isinstance(context, dict)
         or str(context.get("selection_contract_version") or "").strip()
-        != "quality_silence_v34"
+        != "quality_silence_v35"
     ):
         return 0
     if (
@@ -2641,7 +2641,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v34",
+            selection_contract_version="quality_silence_v35",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -5102,7 +5102,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v34",
+                    selection_contract_version="quality_silence_v35",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,

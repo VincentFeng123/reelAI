@@ -882,7 +882,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertEqual(len(feed), 2)
         self.assertTrue(all(
-            reel.get("selection_contract_version") == "quality_silence_v34"
+            reel.get("selection_contract_version") == "quality_silence_v35"
             for reel in feed
         ))
 
@@ -1013,6 +1013,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
     def test_two_stage_cap_and_profile_reach_ingestion(self) -> None:
         analyzed: set[str] = set()
         retrieved: set[str] = set()
+        consumed = ["AAAAAAAAAAA", "yt:BBBBBBBBBBB"]
         with mock.patch.object(
             main_module.ingestion_pipeline,
             "ingest_topic",
@@ -1030,6 +1031,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                     max_new_reels=2,
                     analyzed_video_ids=analyzed,
                     retrieved_video_ids=retrieved,
+                    consumed_video_ids=consumed,
                 )
 
         kwargs = ingest_topic.call_args.kwargs
@@ -1037,6 +1039,10 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertEqual(kwargs["retrieval_profile"], "bootstrap")
         self.assertIs(kwargs["analyzed_video_ids"], analyzed)
         self.assertIs(kwargs["retrieved_video_ids"], retrieved)
+        self.assertEqual(
+            kwargs["consumed_video_ids"],
+            ["AAAAAAAAAAA", "BBBBBBBBBBB"],
+        )
         self.assertEqual(retrieved, {VIDEO_ID})
 
     def test_retrieval_defaults_and_invalid_values_use_ai_expansion(self) -> None:
@@ -1357,7 +1363,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 40)
         self.assertEqual(
             main_module.reel_service.RANKED_FEED_CACHE_CONTRACT_VERSION,
-            "quality_silence_v34",
+            "quality_silence_v35",
         )
         self.assertIn(
             "quality_silence_v27",
@@ -1384,7 +1390,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
             main_module.reel_service.DIFFICULTY_FALLBACK_CONTRACTS,
         )
         self.assertIn(
-            "quality_silence_v34",
+            "quality_silence_v35",
             main_module.reel_service.DIFFICULTY_FALLBACK_CONTRACTS,
         )
 

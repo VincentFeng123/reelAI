@@ -1020,6 +1020,294 @@ def test_recap_inside_one_coarse_cue_is_a_hard_end_for_prior_evidence() -> None:
     assert "summarize" not in report.clips[0]["_clip_text"].casefold()
 
 
+def test_enumerated_meta_topics_trim_the_exact_production_statquest_span() -> None:
+    texts = [
+        (
+            "5 percent of the time we do the experiment we will get a p-value less "
+            "than 0.05 aka a false positive note if it is extremely important that "
+            "we are correct when we say the drugs are different then we can use a "
+            "smaller threshold like 0.00001"
+        ),
+        (
+            "using a threshold of 0.00001 means we would only get a false positive "
+            "once every 100 000 experiments likewise if it's not that important for "
+            "example if we're trying to decide if the ice cream truck will arrive on "
+            "time then we can use a larger threshold like 0.2 using a threshold of "
+            "0.2 means we are willing to get a false positive two times out of 10. "
+            "that said the most common threshold is 0.05 because trying to reduce the "
+            "number of false positives below 5 often costs more than it's worth"
+        ),
+        (
+            "so if we calculate a p-value for this experiment and the p-value is less "
+            "than 0.05 then we will decide that drug a is different from drug b that "
+            "said the p-value is actually 0.24 so we are not confident that drug a is "
+            "different from drug b bam okay before we're done let me say two more "
+            "things about p-values unfortunately the first thing i want to say is just "
+            "more terminology in fancy statistical lingo the idea of trying to "
+            "determine if these drugs are the same or not is called hypothesis testing"
+        ),
+        (
+            "the null hypothesis is that the drugs are the same and the p-value helps "
+            "us decide if we should reject the null hypothesis or not small bam okay "
+            "now that we have that fancy terminology out of the way the second thing i "
+            "want to say is way more interesting while a small p-value helps us decide "
+            "if drug a is different from drug b it does not tell us how different they "
+            "are in other words you can have a small p-value regardless of the size of "
+            "difference between drug a and drug b"
+        ),
+        (
+            "the difference can be tiny or huge for example this experiment gives us "
+            "a relatively large p-value 0.24 even though there is a six-point "
+            "difference between drug a and drug b in contrast this experiment which "
+            "involves a lot more people gives us a smaller p-value 0.04 even though "
+            "given the new data there is a one point difference between drug a and "
+            "drug b in summary a small p-value does not imply that the effect size or "
+            "difference between drug a and drug b is large double bam hooray"
+        ),
+    ]
+    starts = [447.84, 471.599, 517.76, 564.32, 604.399]
+    ends = [469.8, 520.64, 567.04, 608.32, 653.16]
+    segments = [
+        {
+            "cue_id": f"statquest-{index}",
+            "start": starts[index],
+            "end": ends[index],
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+    evidence = "p-value helps us decide if we should reject"
+    plan = _compact_plan(
+        exact_request="hypothesis testing p-value",
+        constraints=[
+            {
+                "constraint_id": "hypothesis-testing",
+                "kind": "subject",
+                "source_phrase": "hypothesis testing",
+                "requirement": "Define hypothesis testing",
+            },
+            {
+                "constraint_id": "p-value",
+                "kind": "subject",
+                "source_phrase": "p-value",
+                "requirement": "Explain the p-value decision",
+            },
+        ],
+        evidence=[
+            {
+                "constraint_id": "hypothesis-testing",
+                "evidence_quote": "same or not is called hypothesis testing",
+            },
+            {
+                "constraint_id": "p-value",
+                "evidence_quote": evidence,
+            },
+        ],
+    )
+    plan.topics[0] = plan.topics[0].model_copy(update={
+        "candidate_id": "hypothesis-testing-null",
+        "start_line": 0,
+        "end_line": 4,
+        "start_quote": "5 percent of the time we do the experiment",
+        "end_quote": "difference between drug a and drug b is large double bam hooray",
+        "claim_quote": evidence,
+        "title": "Hypothesis testing and the null hypothesis",
+        "learning_objective": (
+            "Define hypothesis testing and explain how the p-value relates to the "
+            "null hypothesis"
+        ),
+        "facet": "hypothesis-testing null",
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="hypothesis testing p-value",
+    )
+
+    assert report.rejected_reasons == []
+    assert len(report.clips) == 1
+    clip_text = report.clips[0]["_clip_text"].casefold()
+    assert "hypothesis testing" in clip_text
+    assert "p-value helps us decide if we should reject" in clip_text
+    assert "5 percent of the time" not in clip_text
+    assert "ice cream truck" not in clip_text
+    assert "just more terminology" not in clip_text
+    assert "the second thing" not in clip_text
+    assert "in summary" not in clip_text
+    assert len(clip_text.split()) < 80
+
+
+def test_procedural_first_thing_language_stays_inside_one_worked_unit() -> None:
+    text = (
+        "For the chain rule the first thing you need to do is differentiate the "
+        "outer function and then multiply by the derivative of the inner function."
+    )
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "chain-rule-procedure",
+        "start_quote": "For the chain rule the first thing",
+        "end_quote": "derivative of the inner function",
+        "title": "Applying the chain rule",
+        "learning_objective": "Explain the two operations in the chain rule",
+        "facet": "chain rule procedure",
+        "topic_evidence_quote": (
+            "differentiate the outer function and then multiply by the derivative"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "chain-rule", "start": 0.0, "end": 14.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="chain rule",
+    )
+
+    assert report.rejected_reasons == []
+    assert "first thing you need to do" in report.clips[0]["_clip_text"].casefold()
+
+
+def test_enumerated_meta_unit_split_across_cues_still_bounds_one_topic() -> None:
+    texts = [
+        "A p-value below alpha is one decision rule from the earlier example.",
+        "Before we're done the first thing I want",
+        (
+            "to say is the null hypothesis is the default claim and a p-value helps "
+            "us decide whether to reject it."
+        ),
+        (
+            "The second thing I want to say is effect size describes how large the "
+            "observed difference is."
+        ),
+    ]
+    proposal = _proposal(end_line=3).model_copy(update={
+        "candidate_id": "split-caption-null-hypothesis",
+        "start_line": 2,
+        "start_quote": "to say is the null hypothesis",
+        "end_quote": "how large the observed difference is",
+        "title": "The null hypothesis",
+        "learning_objective": "Explain how a p-value informs the null hypothesis",
+        "facet": "null hypothesis decision",
+        "topic_evidence_quote": (
+            "a p-value helps us decide whether to reject it"
+        ),
+    })
+    segments = [
+        {
+            "cue_id": f"split-meta-{index}",
+            "start": float(index * 10),
+            "end": float(index * 10 + 10),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="null hypothesis and p-values",
+    )
+
+    assert report.rejected_reasons == []
+    clip_text = report.clips[0]["_clip_text"].casefold()
+    assert "null hypothesis is the default claim" in clip_text
+    assert "earlier example" not in clip_text
+    assert "first thing i want" not in clip_text
+    assert "effect size" not in clip_text
+
+
+def test_enumerated_meta_unit_split_across_three_cues_is_still_detected() -> None:
+    texts = [
+        "The first thing",
+        "I want to",
+        "say is the null hypothesis is the default statistical claim.",
+        "The second thing I want to say is effect size measures magnitude.",
+    ]
+    proposal = _proposal(end_line=3).model_copy(update={
+        "candidate_id": "three-cue-meta-unit",
+        "start_line": 2,
+        "start_quote": "say is the null hypothesis",
+        "end_quote": "effect size measures magnitude",
+        "title": "The null hypothesis",
+        "learning_objective": "Define the null hypothesis",
+        "facet": "null hypothesis",
+        "topic_evidence_quote": (
+            "the null hypothesis is the default statistical claim"
+        ),
+    })
+    segments = [
+        {
+            "cue_id": f"three-cue-meta-{index}",
+            "start": float(index * 4),
+            "end": float(index * 4 + 4),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="null hypothesis",
+    )
+
+    assert report.rejected_reasons == []
+    clip_text = report.clips[0]["_clip_text"].casefold()
+    assert "null hypothesis is the default statistical claim" in clip_text
+    assert "the first thing" not in clip_text
+    assert "effect size" not in clip_text
+
+
+@pytest.mark.parametrize(
+    ("claim", "evidence"),
+    [
+        (
+            "background the detector sees can bias measurements",
+            "the detector sees can bias measurements",
+        ),
+        (
+            "context the parser retains determines later behavior",
+            "the parser retains determines later behavior",
+        ),
+        (
+            "terminology this field uses differs across sources",
+            "this field uses differs across sources",
+        ),
+    ],
+)
+def test_enumerated_meta_navigation_never_drops_the_real_subject(
+    claim: str,
+    evidence: str,
+) -> None:
+    text = f"The first thing I want to explain is {claim}."
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "meta-real-subject",
+        "start_quote": "The first thing I want to explain",
+        "end_quote": claim,
+        "title": claim,
+        "learning_objective": f"Explain why {claim}",
+        "facet": claim,
+        "topic_evidence_quote": evidence,
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "meta-subject", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic=claim,
+    )
+
+    assert report.rejected_reasons == []
+    assert claim in report.clips[0]["_clip_text"].casefold()
+
+
 @pytest.mark.parametrize("split_hypothetical", [False, True])
 def test_explicit_new_hypothetical_starts_a_new_example(
     split_hypothetical: bool,
