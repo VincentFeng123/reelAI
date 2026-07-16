@@ -2346,7 +2346,7 @@ def test_prompt_layout_and_contract_follow_gemini3_guidance():
     assert "chain-of-thought" in combined
 
 
-def test_boundary_prompt_selects_all_difficulties_and_rejects_course_framing():
+def test_boundary_prompt_enforces_advanced_level_and_rejects_course_framing():
     _system, user = G._boundary_prompts(
         "[0] 00:00 Biology explains cells.",
         1,
@@ -2354,10 +2354,12 @@ def test_boundary_prompt_selects_all_difficulties_and_rejects_course_framing():
         learner_level="advanced",
     )
     assert "current level is advanced" in user
-    assert "target-level preference" in user
-    assert "return qualifying units at every difficulty" in user
+    assert "level fit is a gemini selection eligibility rule" in user.lower()
+    assert "difficulty band 0.60-1.00" in user
+    assert "genuinely advanced reasoning or application" in user
+    assert "omit units whose teaching is only elementary review" in user
     assert "0.00-0.33 means beginner" in user
-    assert "return units across that entire scale" in user.lower()
+    assert "obey its eligibility band" in user.lower()
     assert "course logistics" in user
     assert "institutional framing" in user
     assert "merely names the subject" in user

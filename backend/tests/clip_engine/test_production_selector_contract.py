@@ -981,6 +981,85 @@ def test_production_advances_generic_intro_only_to_gemini_intent_evidence() -> N
     )
 
 
+@pytest.mark.parametrize(
+    ("text", "claim_quote", "should_advance"),
+    [
+        (
+            "This is simply equal to 5. So that's the derivative of five x "
+            "minus four. It's five. Now let's try another example. So let's "
+            "say if f ofx is equal to x^2, the derivative is two x.",
+            "the derivative is two x",
+            True,
+        ),
+        (
+            "This is simply equal to 5. The lesson continues. So let's say if "
+            "f ofx is equal to x^2, the derivative is two x.",
+            "the derivative is two x",
+            False,
+        ),
+        (
+            "This is simply equal to 5. So let's say if f ofx is equal to "
+            "x^2. Now let's try another example. The derivative is two x.",
+            "The derivative is two x",
+            False,
+        ),
+        (
+            "This is simply equal to 5. Now let's try another example. So "
+            "let's say if f ofx is equal to x^2, the derivative is two x.",
+            "This is simply equal to 5",
+            False,
+        ),
+    ],
+    ids=(
+        "live-explicit-handoff",
+        "no-explicit-handoff",
+        "handoff-after-evidence",
+        "claim-before-evidence",
+    ),
+)
+def test_production_new_example_handoff_licenses_only_grounded_start_repair(
+    text: str,
+    claim_quote: str,
+    should_advance: bool,
+) -> None:
+    evidence_quote = "if f ofx is equal to x^2"
+    plan = _compact_custom_plan(
+        request="derive x squared",
+        start_quote="This is simply equal to 5",
+        end_quote="derivative is two x",
+        claim_quote=claim_quote,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "intent_evidence": [gemini_segment._CompactIntentEvidence(
+                id="subject", q=evidence_quote,
+            )],
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 30.0, "text": text}],
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    repaired = "new_example_start_advanced_to_intent_evidence" in (
+        clip["_boundary_fallback_reasons"]
+    )
+    assert repaired is should_advance
+    if should_advance:
+        assert clip["_clip_text"].startswith(evidence_quote)
+        assert "five x minus four" not in clip["_clip_text"]
+        assert clip["edge_projection"]["start"]["quote"] == evidence_quote
+    else:
+        assert clip["_clip_text"].startswith("This is simply equal to 5")
+
+
 def test_production_preserves_gemini_range_without_semantic_expansion() -> None:
     segments = [
         {
@@ -1377,9 +1456,16 @@ def test_specific_request_prompt_excludes_partial_supporting_units_and_prior_exa
 
     assert "every required non-scope constraint" in normalized
     assert "do not return it as a separate clip" in normalized.casefold()
-    assert "the earlier five x minus four example" in normalized.casefold()
+    assert "earlier five-x-minus-four objective" in normalized.casefold()
     assert "begin at the x-squared setup" in normalized.casefold()
-    assert "end at its final two-x result" in normalized.casefold()
+    assert "end at the final two-x result" in normalized.casefold()
+    assert 'wrong: s=40 and sq="this is simply equal to five"' in (
+        normalized.casefold()
+    )
+    assert "sq=\"so let's say if f of x is equal to x squared\"" in (
+        normalized.casefold()
+    )
+    assert "preserve its first 'so'" in normalized.casefold()
     assert "x-squared-minus-three example is also a different function" in (
         normalized.casefold()
     )
@@ -1387,6 +1473,10 @@ def test_specific_request_prompt_excludes_partial_supporting_units_and_prior_exa
         normalized.casefold()
     )
     assert "q must include its complete spoken expression" in normalized.casefold()
+    assert "all examples below assume no learner-level restriction" in (
+        normalized.casefold()
+    )
+    assert "never override a supplied learner band" in normalized.casefold()
     assert "one q never" in normalized.casefold()
     assert "whole-span completeness check" in normalized.casefold()
 
@@ -1413,9 +1503,10 @@ def test_boundary_prompt_stays_transcript_only_when_video_is_requested() -> None
     assert "omit material that requires an unseen visual" in prompt
     assert "factually_grounded" in prompt
     assert "current level is advanced" in prompt
-    assert "target-level preference" in prompt
-    assert "difficulty is metadata, not an eligibility filter" in prompt
-    assert "return qualifying units at every difficulty" in prompt
+    assert "level fit is a gemini selection eligibility rule" in prompt
+    assert "difficulty band 0.60-1.00" in prompt
+    assert "genuinely advanced reasoning or application" in prompt
+    assert "obey its eligibility band" in prompt
     assert "sq=start_quote" in prompt
     assert "eq=end_quote" in prompt
     assert "cq=claim_quote" in prompt
@@ -1491,6 +1582,8 @@ def test_boundary_selector_never_attaches_video_even_when_requested(
     assert isinstance(contents, str)
     assert "Transcript (1 lines" in contents
     assert "current level is beginner" in contents
+    assert "difficulty band 0.00-0.40" in contents
+    assert "assume no topic-specific background" in contents
     assert "youtube.com" not in contents
     assert call["media_resolution"] is None
     assert call.get("estimated_media_tokens", 0) == 0
@@ -5018,7 +5111,8 @@ def test_selector_prompt_is_exhaustive_and_requires_full_constrained_request() -
         "informativeness, topic_relevance, and educational_importance\n"
         "  are each at least 0.75"
     ) in (_system + user)
-    assert "return units across that entire scale" in user.lower()
+    assert "difficulty band 0.00-0.40" in user
+    assert "level fit is a gemini selection eligibility rule" in user.lower()
     assert "unseen visual" in user
     assert "Return every distinct qualifying moment" in user
     assert "internal interruption" in (_system + user)

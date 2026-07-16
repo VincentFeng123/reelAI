@@ -1655,7 +1655,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v1"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v3"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v4"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -2222,13 +2222,30 @@ def _learner_rule(level: str) -> str:
     normalized = " ".join(str(level or "").split()).casefold()
     if normalized not in {"beginner", "intermediate", "advanced"}:
         return ""
+    level_contracts = {
+        "beginner": (
+            "0.00-0.40",
+            "assume no topic-specific background; include or plainly explain every symbol, "
+            "term, and prerequisite needed for the objective",
+        ),
+        "intermediate": (
+            "0.30-0.70",
+            "assume foundational topic knowledge but no advanced specialization; omit units "
+            "that rely on unexplained advanced notation or theory",
+        ),
+        "advanced": (
+            "0.60-1.00",
+            "assume strong foundations and return genuinely advanced reasoning or application; "
+            "omit units whose teaching is only elementary review",
+        ),
+    }
+    score_band, accessibility = level_contracts[normalized]
     return (
-        f"The viewer's current level is {normalized}. Use that level to calibrate each "
-        "difficulty score and give target-level preference among otherwise equally useful "
-        "units. Still return qualifying units at every difficulty. Difficulty is metadata, "
-        "not an eligibility filter; never omit, downgrade below a quality gate, or narrow the "
-        "broad educational reservoir solely because of learner level. The application "
-        "organizes accepted units later."
+        f"The viewer's current level is {normalized}. Level fit is a Gemini selection "
+        f"eligibility rule, not a ranking preference. Return only units in difficulty band "
+        f"{score_band}: {accessibility}. Judge required prior knowledge after accounting for "
+        "setup included inside the clip. If an otherwise relevant unit is outside this band, "
+        "do not return it; never expect the backend to filter it later."
     )
 
 
@@ -2312,7 +2329,8 @@ def _compact_output_guide() -> str:
 - rel = topic_relevance, 0.0-1.0: how strongly this exact unit serves the exact user request.
 - imp = educational_importance, 0.0-1.0: how valuable this unit is for learning that request.
 - diff = difficulty, 0.0-1.0: required prior knowledge only; 0.00-0.33 beginner,
-  0.34-0.66 intermediate, 0.67-1.00 advanced. Difficulty never disqualifies a unit.
+  0.34-0.66 intermediate, 0.67-1.00 advanced. When a learner level is supplied, obey its
+  explicit eligibility band; without one, difficulty alone never disqualifies a unit.
 - direct = directly_teaches_topic: true only when the span actually fulfills the requested
   subject, task, relationship, format, and outcome rather than merely naming or supporting it.
 - sub = substantive: true only for real teaching, reasoning, explanation, demonstration, or
@@ -2336,6 +2354,9 @@ def _compact_output_guide() -> str:
   replaces the whole-span completeness check.
 
 Worked format example — understand the boundary logic, but never copy its content or scores:
+All examples below assume no learner-level restriction. They demonstrate only schema and
+boundary behavior. Their inclusion and diff values never override a supplied learner band:
+recompute difficulty for the actual span and omit it when it falls outside that band.
 Example transcript:
 [18] 02:10 Welcome back. A small p value
 [19] 02:15 provides stronger evidence against the null hypothesis. Next, confidence intervals measure uncertainty.
@@ -2353,25 +2374,29 @@ Do not start at line 32 with "Divide that change" because "that change" depends 
 setup. Include line 31 and begin sq at "To calculate acceleration" so self and stand are true.
 
 Named worked-example boundary example:
-[40] 06:00 The derivative of five x minus four is five. Now try another example.
-[41] 06:08 Let f of x equal x squared. Use the limit definition of the derivative.
+[40] 06:00 This is simply equal to five. So that's the derivative of five x minus four. It's five. Now let's try another example. So let's say if f of x is equal to x squared, what is the first derivative?
+[41] 06:08 Use the limit definition of the derivative.
 [42] 06:16 Substitute x plus h to get open parenthesis x plus h close parenthesis squared minus x squared over h.
 [43] 06:26 Expand the square to x squared plus two x h plus h squared, then cancel x squared.
 [44] 06:36 Divide by h and cancel the common h to obtain two x plus h.
 [45] 06:44 Taking h to zero gives two x, so the derivative of x squared is two x.
 Exact request: Use the limit definition to derive f of x equal x squared, include every
 algebra step, and finish at two x.
-The earlier five x minus four example is a different objective: do not include it and do not
-return it as a separate clip. Begin at the x-squared setup in line 41 and end at its final
-two-x result in line 45. Lines 42-44 are required reasoning, so never replace them with a
-formula-only clip, a summary, another function, or a general derivative explanation.
+"This is simply equal to five" completes the earlier five-x-minus-four objective, and "Now
+let's try another example" is navigation. Both occur inside line 40 but are outside the
+requested semantic unit. Begin at the x-squared setup later inside that same coarse line,
+preserving its first "So": s=40 and sq="So let's say if f of x is equal to x squared".
+WRONG: s=40 and sq="This is simply equal to five".
+WRONG: s=41, because that omits the named x-squared setup.
+End at the final two-x result in line 45. Lines 42-44 are required reasoning, so never replace
+them with a formula-only clip, a summary, another function, or a general derivative explanation.
 An x-squared-minus-three example is also a different function and does not qualify, even
 though its derivative also simplifies to two x.
-Example output boundaries: s=41, e=45, sq="Let f of x equal x squared",
+Example output boundaries: s=40, e=45, sq="So let's say if f of x is equal to x squared",
 eq="the derivative of x squared is two x". The topic's ie must evidence the named function,
 limit-definition task, algebra-step requirement, and final two-x outcome.
 Example compact output:
-{"request_intent":{"exact_request":"Use the limit definition to derive f of x equal x squared, include every algebra step, and finish at two x.","constraints":[{"constraint_id":"object","kind":"subject","source_phrase":"f of x equal x squared","requirement":"Derive f of x equal x squared"},{"constraint_id":"method","kind":"task","source_phrase":"Use the limit definition","requirement":"Use the limit definition"},{"constraint_id":"steps","kind":"format","source_phrase":"include every algebra step","requirement":"Include every spoken algebra step"},{"constraint_id":"result","kind":"outcome","source_phrase":"finish at two x","requirement":"Reach the final result two x"}]},"topics":[{"id":"x-squared-limit-derivation","s":41,"e":45,"sq":"Let f of x equal x squared","eq":"the derivative of x squared is two x","cq":"Taking h to zero gives two x","title":"Derive x Squared from the Limit Definition","obj":"Derive the derivative of x squared through every algebra step","facet":"x-squared limit derivation","info":0.99,"rel":1.0,"imp":0.99,"diff":0.45,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"object","q":"Let f of x equal x squared"},{"id":"method","q":"Use the limit definition of the derivative"},{"id":"steps","q":"Expand the square to x squared plus two x h"},{"id":"result","q":"Taking h to zero gives two x"}]}]}
+{"request_intent":{"exact_request":"Use the limit definition to derive f of x equal x squared, include every algebra step, and finish at two x.","constraints":[{"constraint_id":"object","kind":"subject","source_phrase":"f of x equal x squared","requirement":"Derive f of x equal x squared"},{"constraint_id":"method","kind":"task","source_phrase":"Use the limit definition","requirement":"Use the limit definition"},{"constraint_id":"steps","kind":"format","source_phrase":"include every algebra step","requirement":"Include every spoken algebra step"},{"constraint_id":"result","kind":"outcome","source_phrase":"finish at two x","requirement":"Reach the final result two x"}]},"topics":[{"id":"x-squared-limit-derivation","s":40,"e":45,"sq":"So let's say if f of x is equal to x squared","eq":"the derivative of x squared is two x","cq":"Taking h to zero gives two x","title":"Derive x Squared from the Limit Definition","obj":"Derive the derivative of x squared through every algebra step","facet":"x-squared limit derivation","info":0.99,"rel":1.0,"imp":0.99,"diff":0.45,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"object","q":"f of x is equal to x squared"},{"id":"method","q":"Use the limit definition of the derivative"},{"id":"steps","q":"Expand the square to x squared plus two x h"},{"id":"result","q":"Taking h to zero gives two x"}]}]}
 """
 
 
@@ -2511,6 +2536,11 @@ def _boundary_prompts(
         "the transition for the old unit and start after it for the new unit. When a coarse "
         "line contains the old conclusion, transition, and new opening, place the exact edge "
         "quotes inside the selected range on the correct side of the transition. "
+        "When one coarse line contains previous-objective conclusion, navigation, then the "
+        "requested setup, keep s as that shared line but sq MUST begin at the first word of "
+        "the requested setup inside it. Never begin sq at the previous conclusion or "
+        "navigation. A clause such as 'So let's say if f' that states the requested object is "
+        "setup, not context-only handoff; preserve its first 'So'. "
         "Never start a candidate with context-only handoff language such as 'on the other "
         "hand', 'now/then the next step', or 'so step five'; include the "
         "missing setup or begin at the first independently understandable teaching sentence. "
@@ -2535,11 +2565,11 @@ def _boundary_prompts(
         f"{visual_rule}"
         "4. Score topic relevance, information density, educational value, and difficulty "
         "honestly. Return a unit only when topic_relevance, informativeness, and "
-        "educational_importance are each at least 0.75. Difficulty is metadata, not an "
-        "eligibility filter; "
-        "it records prior knowledge only: 0.00-0.33 means "
-        "beginner, 0.34-0.66 means intermediate, and 0.67-1.00 means advanced. Return units "
-        "across that entire scale.\n"
+        "educational_importance are each at least 0.75. Difficulty records prior knowledge "
+        "only: 0.00-0.33 means beginner, 0.34-0.66 means intermediate, and 0.67-1.00 means "
+        "advanced. When a learner-level rule appears above, obey its eligibility band. When "
+        "no learner level is supplied, difficulty is metadata, not an eligibility filter, and "
+        "qualifying units may span the entire scale.\n"
         "5. Return every distinct qualifying unit. Set substantive and factually_grounded true "
         "only for academically sound teaching; "
         f"{factual_rule}"
@@ -9982,10 +10012,7 @@ def _trusted_compact_plan_to_report(
             for constraint_id, evidence_quote, location in grounded_intent_locations
             if constraint_kinds[constraint_id] is not _IntentConstraintKind.SCOPE
         ]
-        if (
-            _GENERIC_MODEL_START_RE.fullmatch(model_start_quote)
-            and required_intent_locations
-        ):
+        if required_intent_locations:
             evidence_quote, grounded_location = min(
                 required_intent_locations,
                 key=lambda item: (item[1][0], item[1][1]),
@@ -10002,9 +10029,26 @@ def _trusted_compact_plan_to_report(
                 a,
                 start_span[0] if start_span is not None else 0,
             )
+            intervening_parts: list[str] = []
+            if current_start[0] <= grounded_start:
+                for line in range(current_start[0], grounded_start + 1):
+                    text = str(segments[line].get("text") or "")
+                    left = current_start[1] if line == current_start[0] else 0
+                    right = grounded_left if line == grounded_start else len(text)
+                    if right > left:
+                        intervening_parts.append(text[left:right])
+            explicit_new_example_handoff = bool(
+                _SPLIT_CAPTION_NEW_UNIT_FRAMING_RE.search(
+                    " ".join(intervening_parts)
+                )
+            )
+            generic_model_start = bool(
+                _GENERIC_MODEL_START_RE.fullmatch(model_start_quote)
+            )
             if (
                 (grounded_start, grounded_left) > current_start
                 and not claim_starts_before_grounded_intent
+                and (generic_model_start or explicit_new_example_handoff)
             ):
                 a = grounded_start
                 start_text_for_evidence = str(segments[a].get("text") or "")
@@ -10015,7 +10059,11 @@ def _trusted_compact_plan_to_report(
                     else len(start_text_for_evidence),
                 )
                 effective_start_quote = evidence_quote
-                diagnostics.append("generic_start_advanced_to_intent_evidence")
+                diagnostics.append(
+                    "new_example_start_advanced_to_intent_evidence"
+                    if explicit_new_example_handoff
+                    else "generic_start_advanced_to_intent_evidence"
+                )
 
         if a > b:
             if claim_location is not None:
