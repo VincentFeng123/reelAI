@@ -154,6 +154,38 @@ def test_uploads_only_bounded_wav_and_returns_absolute_word_onsets(
     assert b"media.example" not in payload
 
 
+def test_trailing_word_straddling_wav_endpoint_keeps_valid_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    wav_path = tmp_path / "short.wav"
+    _write_wav(wav_path)
+    _install_decode(monkeypatch, wav_path)
+    client = _Client(
+        {
+            "words": [
+                {"word": "cell", "start": 0.25, "end": 0.65},
+                {"word": "division", "start": 0.65, "end": 1.4},
+                {"word": "continues", "start": 1.75, "end": 2.12},
+            ]
+        }
+    )
+    monkeypatch.setenv("GROQ_API_KEY", "unit-test-key")
+    monkeypatch.setattr(groq_boundary_asr, "_create_client", lambda **_kwargs: client)
+
+    words = groq_boundary_asr.transcribe_boundary_words(
+        _prepared(),
+        window_start_sec=10.0,
+        window_end_sec=12.0,
+        timeout_sec=5.0,
+    )
+
+    assert [(word.text, word.onset_sec) for word in words] == [
+        ("cell", 10.25),
+        ("division", 10.65),
+    ]
+
+
 def test_client_disables_sdk_retries_and_sets_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -399,6 +431,15 @@ def test_groq_edge_fragment_requires_real_excluded_timed_neighbor() -> None:
         [
             {"word": "first", "start": 0.2, "end": 0.8},
             {"word": "overlap", "start": 0.7, "end": 1.0},
+        ],
+        [
+            {"word": "first", "start": 0.2, "end": 0.8},
+            {"word": "interior", "start": 1.8, "end": 2.1},
+            {"word": "tail", "start": 2.1, "end": 2.2},
+        ],
+        [
+            {"word": "first", "start": 0.2, "end": 1.85},
+            {"word": "overlap", "start": 1.8, "end": 2.1},
         ],
         [{"word": " ", "start": 0.1, "end": 0.2}],
     ],

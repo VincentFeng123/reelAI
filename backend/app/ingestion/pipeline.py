@@ -1309,7 +1309,7 @@ class _GroqBoundaryWordCache:
         self._lock = threading.Lock()
         self._entries: dict[
             str,
-            list[tuple[float, float, Future[tuple[object, ...]]]],
+            list[tuple[float, float, bool, Future[tuple[object, ...]]]],
         ] = collections.defaultdict(list)
 
     def _window(self, target_sec: float) -> tuple[float, float] | None:
@@ -1333,6 +1333,7 @@ class _GroqBoundaryWordCache:
         target_sec: float,
         timeout_sec: float,
         cancel_check: Callable[[], bool] | None,
+        refresh: bool = False,
     ) -> tuple[object, ...]:
         window = self._window(target_sec)
         if window is None or not cue_id or timeout_sec <= 0.0:
@@ -1341,7 +1342,14 @@ class _GroqBoundaryWordCache:
         owner = False
         with self._lock:
             future: Future[tuple[object, ...]] | None = None
-            for cached_start, cached_end, cached_future in self._entries[cue_id]:
+            for (
+                cached_start,
+                cached_end,
+                cached_refresh,
+                cached_future,
+            ) in reversed(self._entries[cue_id]):
+                if refresh and not cached_refresh:
+                    continue
                 same_window = (
                     abs(cached_start - window_start)
                     <= SPEECH_OWNERSHIP_EPSILON_SEC
@@ -1364,7 +1372,9 @@ class _GroqBoundaryWordCache:
                     break
             if future is None:
                 future = Future()
-                self._entries[cue_id].append((window_start, window_end, future))
+                self._entries[cue_id].append(
+                    (window_start, window_end, refresh, future)
+                )
                 owner = True
         if owner:
             try:
@@ -1395,12 +1405,16 @@ class _GroqBoundaryWordCache:
         speech_bounds: tuple[float, float],
         timeout_sec: float,
         cancel_check: Callable[[], bool] | None,
+        refresh: bool = False,
     ) -> tuple[object, ...]:
         edge_projection = raw_clip.get("edge_projection")
         projections = edge_projection if isinstance(edge_projection, dict) else {}
+        explicit_projection = bool(projections)
         requests: list[tuple[str, float]] = []
         for edge, target_sec in zip(("start", "end"), speech_bounds, strict=True):
             marker = projections.get(edge)
+            if explicit_projection and not isinstance(marker, dict):
+                continue
             quote = (
                 str(marker.get("quote") or "").strip()
                 if isinstance(marker, dict)
@@ -1433,6 +1447,7 @@ class _GroqBoundaryWordCache:
                     target_sec=target_sec,
                     timeout_sec=edge_timeout,
                     cancel_check=cancel_check,
+                    refresh=refresh,
                 )
             )
         unique: dict[tuple[str, float], object] = {}
@@ -1456,14 +1471,14 @@ class _GroqBoundaryWordCache:
 def _groq_boundary_request_count(raw_clip: dict[str, Any]) -> int:
     edge_projection = raw_clip.get("edge_projection")
     projections = edge_projection if isinstance(edge_projection, dict) else {}
-    return sum(
-        bool(
-            (
-                str(projections[edge].get("quote") or "").strip()
-                if isinstance(projections.get(edge), dict)
-                else str(raw_clip.get(f"{edge}_quote") or "").strip()
-            )
+    if projections:
+        return sum(
+            isinstance(projections.get(edge), dict)
+            and bool(str(projections[edge].get("quote") or "").strip())
+            for edge in ("start", "end")
         )
+    return sum(
+        bool(str(raw_clip.get(f"{edge}_quote") or "").strip())
         for edge in ("start", "end")
     )
 
@@ -1490,42 +1505,69 @@ def _groq_refine_without_silence(
         getattr(prepared, "ready", False)
     ):
         return acoustic, speech_bounds, projection_diagnostics, search_limits
-    words = cache.words_for_clip(
-        raw_clip=raw_clip,
-        caption_diagnostics=caption_diagnostics,
-        speech_bounds=speech_bounds,
-        timeout_sec=timeout_sec,
-        cancel_check=cancel_check,
-    )
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    requested_edge_count = _groq_boundary_request_count(raw_clip)
+    groq_bounds: dict[str, float] = {}
+    groq_projections: dict[str, dict[str, Any]] = {}
+    word_counts: list[int] = []
+    projection_error: str | None = None
+
+    for transcription_index in range(2):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        words = cache.words_for_clip(
+            raw_clip=raw_clip,
+            caption_diagnostics=caption_diagnostics,
+            speech_bounds=speech_bounds,
+            timeout_sec=remaining,
+            cancel_check=cancel_check,
+            refresh=transcription_index > 0,
+        )
+        word_counts.append(len(words))
+        if words:
+            (
+                candidate_bounds,
+                candidate_projection,
+                projection_error,
+            ) = _projected_speech_bounds(
+                transcript,
+                raw_clip,
+                caption_diagnostics,
+                prepared,
+                lexical_words=words,
+                lexical_timing_source="groq_boundary_asr",
+            )
+            for edge, bound_index in (("start", 0), ("end", 1)):
+                marker = candidate_projection.get(edge)
+                if (
+                    edge not in groq_projections
+                    and isinstance(marker, dict)
+                    and marker.get("timing_source") == "groq_boundary_asr"
+                ):
+                    groq_projections[edge] = marker
+                    groq_bounds[edge] = candidate_bounds[bound_index]
+        if len(groq_projections) >= requested_edge_count:
+            break
+        if projection_error and not projection_error.endswith(
+            "_lexical_alignment_unavailable"
+        ):
+            break
+
     attempt = {
         "attempted": True,
         "applied": False,
-        "word_count": len(words),
+        "word_count": max(word_counts, default=0),
+        "transcription_attempts": len(word_counts),
+        "word_counts": word_counts,
     }
-    if not words:
-        return (
-            acoustic,
-            speech_bounds,
-            {**projection_diagnostics, "groq_boundary_asr": attempt},
-            search_limits,
+    applied_edges = [edge for edge in ("start", "end") if edge in groq_projections]
+    if not applied_edges:
+        attempt["reason"] = projection_error or (
+            "transcription_unavailable"
+            if not attempt["word_count"]
+            else "quote_alignment_unavailable"
         )
-
-    refined_bounds, refined_projection, projection_error = _projected_speech_bounds(
-        transcript,
-        raw_clip,
-        caption_diagnostics,
-        prepared,
-        lexical_words=words,
-        lexical_timing_source="groq_boundary_asr",
-    )
-    applied_edges = [
-        edge
-        for edge in ("start", "end")
-        if isinstance(refined_projection.get(edge), dict)
-        and refined_projection[edge].get("timing_source") == "groq_boundary_asr"
-    ]
-    if projection_error or not applied_edges:
-        attempt["reason"] = projection_error or "quote_alignment_unavailable"
         return (
             acoustic,
             speech_bounds,
@@ -1534,20 +1576,17 @@ def _groq_refine_without_silence(
         )
 
     merged_bounds = (
-        refined_bounds[0] if "start" in applied_edges else speech_bounds[0],
-        refined_bounds[1] if "end" in applied_edges else speech_bounds[1],
+        groq_bounds.get("start", speech_bounds[0]),
+        groq_bounds.get("end", speech_bounds[1]),
     )
     merged_projection = {
         **projection_diagnostics,
-        **{
-            edge: refined_projection[edge]
-            for edge in applied_edges
-        },
+        **groq_projections,
         "lexical_boundary_verified": True,
         **(
             {"lexical_projection_verified": True}
             if any(
-                refined_projection[edge].get("mode") == "projected"
+                groq_projections[edge].get("mode") == "projected"
                 for edge in applied_edges
             )
             else {}

@@ -107,10 +107,21 @@ def _absolute_words(
 
     words: list[LexicalWord] = []
     previous_end = 0.0
-    for raw_word in raw_words:
+    for index, raw_word in enumerate(raw_words):
         text = _field(raw_word, "word")
         local_start = _finite_number(_field(raw_word, "start"))
         local_end = _finite_number(_field(raw_word, "end"))
+        trailing_partial = bool(
+            index == len(raw_words) - 1
+            and isinstance(text, str)
+            and text.strip()
+            and local_start is not None
+            and local_end is not None
+            and 0 <= local_start < decoded_duration_sec < local_end
+            and local_start >= previous_end
+        )
+        if trailing_partial:
+            break
         if (
             not isinstance(text, str)
             or not text.strip()

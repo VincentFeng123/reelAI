@@ -2667,6 +2667,11 @@ def test_direct_adapter_uses_groq_words_after_ambiguous_edge_silence_fails(
     assert groq_words.call_args.args == (prepared,)
     assert groq_words.call_args.kwargs["window_start_sec"] >= 0.0
     assert groq_words.call_args.kwargs["window_end_sec"] <= 12.0
+    attempt = verified[0]["search_context"]["boundary_diagnostics"][
+        "lexical_projection"
+    ]["groq_boundary_asr"]
+    assert attempt["transcription_attempts"] == 1
+    assert attempt["word_counts"] == [len(_groq_edge_words())]
 
 
 def test_direct_adapter_aligns_supadata_symbolic_math_quote_to_spoken_groq_words(
@@ -2777,6 +2782,67 @@ def test_direct_adapter_aligns_supadata_symbolic_math_quote_to_spoken_groq_words
     transcribe.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "first_words",
+    [
+        (),
+        (
+            pipeline_module.clip_engine_silence.lexical_timing.LexicalWord(
+                "unrelated", 1.0
+            ),
+            pipeline_module.clip_engine_silence.lexical_timing.LexicalWord(
+                "speech", 1.4
+            ),
+        ),
+    ],
+    ids=["empty", "nonaligning"],
+)
+def test_groq_retries_once_after_empty_or_nonaligning_first_result(
+    monkeypatch,
+    first_words,
+) -> None:
+    engine_out = _ambiguous_gemini_edge_engine_out()
+    prepared = _ready_audio()
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        mock.Mock(
+            return_value=pipeline_module.clip_engine_silence.SilenceVerificationResult(
+                "unavailable",
+                0.0,
+                12.0,
+                {"stage": "start", "reason": "start_silence_not_found"},
+            )
+        ),
+    )
+    transcribe = mock.Mock(side_effect=[first_words, _groq_edge_words()])
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_groq_boundary_asr,
+        "transcribe_boundary_words",
+        transcribe,
+    )
+
+    verified = pipeline_module._verified_direct_adapter_clips(
+        source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        engine_out=engine_out,
+        should_cancel=None,
+        prepared_audio=prepared,
+        require_acoustic_boundaries=True,
+        exact_topic="x squared limit",
+    )
+
+    assert len(verified) == 1
+    assert verified[0]["start"] == 5.0
+    assert verified[0]["end"] == 12.0
+    assert transcribe.call_count == 2
+    attempt = verified[0]["search_context"]["boundary_diagnostics"][
+        "lexical_projection"
+    ]["groq_boundary_asr"]
+    assert attempt["transcription_attempts"] == 2
+    assert attempt["word_counts"] == [len(first_words), len(_groq_edge_words())]
+    assert attempt["applied"] is True
+
+
 def test_unverified_native_alignment_still_attempts_groq_and_keeps_native_fallback(
     monkeypatch,
 ) -> None:
@@ -2814,7 +2880,7 @@ def test_unverified_native_alignment_still_attempts_groq_and_keeps_native_fallba
     assert len(verified) == 1
     assert (verified[0]["start"], verified[0]["end"]) == (5.0, 12.0)
     assert verified[0]["search_context"]["surface_eligible"] is True
-    groq_words.assert_called_once()
+    assert groq_words.call_count == 2
 
 
 def test_empty_groq_timing_never_drops_ambiguous_gemini_clip(monkeypatch) -> None:
@@ -2853,7 +2919,116 @@ def test_empty_groq_timing_never_drops_ambiguous_gemini_clip(monkeypatch) -> Non
     assert verified[0]["selection_candidate_id"] == "ambiguous-edge"
     assert 0.0 < verified[0]["start"] < verified[0]["end"] == 12.0
     assert verified[0]["search_context"]["surface_eligible"] is True
-    groq_words.assert_called_once()
+    assert groq_words.call_count == 2
+    attempt = verified[0]["search_context"]["boundary_diagnostics"][
+        "lexical_projection"
+    ]["groq_boundary_asr"]
+    assert attempt["transcription_attempts"] == 2
+    assert attempt["word_counts"] == [0, 0]
+    assert attempt["applied"] is False
+
+
+def test_nonaligning_groq_retry_never_drops_ambiguous_gemini_clip(
+    monkeypatch,
+) -> None:
+    engine_out = _ambiguous_gemini_edge_engine_out()
+    prepared = _ready_audio()
+    nonaligning_words = (
+        pipeline_module.clip_engine_silence.lexical_timing.LexicalWord(
+            "unrelated", 1.0
+        ),
+        pipeline_module.clip_engine_silence.lexical_timing.LexicalWord(
+            "speech", 1.4
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        mock.Mock(
+            return_value=pipeline_module.clip_engine_silence.SilenceVerificationResult(
+                "unavailable",
+                0.0,
+                12.0,
+                {"stage": "start", "reason": "start_silence_not_found"},
+            )
+        ),
+    )
+    transcribe = mock.Mock(return_value=nonaligning_words)
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_groq_boundary_asr,
+        "transcribe_boundary_words",
+        transcribe,
+    )
+
+    verified = pipeline_module._verified_direct_adapter_clips(
+        source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        engine_out=engine_out,
+        should_cancel=None,
+        prepared_audio=prepared,
+        require_acoustic_boundaries=True,
+        exact_topic="x squared limit",
+    )
+
+    assert len(verified) == 1
+    assert verified[0]["selection_candidate_id"] == "ambiguous-edge"
+    assert 0.0 < verified[0]["start"] < verified[0]["end"] == 12.0
+    assert verified[0]["search_context"]["surface_eligible"] is True
+    assert transcribe.call_count == 2
+    attempt = verified[0]["search_context"]["boundary_diagnostics"][
+        "lexical_projection"
+    ]["groq_boundary_asr"]
+    assert attempt["transcription_attempts"] == 2
+    assert attempt["word_counts"] == [len(nonaligning_words)] * 2
+    assert attempt["applied"] is False
+
+
+def test_groq_does_not_retry_after_its_absolute_deadline(monkeypatch) -> None:
+    engine_out = _ambiguous_gemini_edge_engine_out()
+    transcript = engine_out["transcript"]
+    raw_clip = engine_out["clips"][0]
+    prepared = _ready_audio()
+    caption = pipeline_module._supadata_boundary_diagnostics(transcript, raw_clip)
+    assert caption is not None
+    acoustic = pipeline_module.clip_engine_silence.SilenceVerificationResult(
+        "unavailable",
+        0.0,
+        12.0,
+        {"stage": "start", "reason": "start_silence_not_found"},
+    )
+    clock = [100.0]
+    monkeypatch.setattr(pipeline_module.time, "monotonic", lambda: clock[0])
+    cache = mock.Mock()
+
+    def consume_deadline(**kwargs):
+        clock[0] += float(kwargs["timeout_sec"]) + 0.001
+        return ()
+
+    cache.words_for_clip.side_effect = consume_deadline
+
+    refined, bounds, projection, limits = (
+        pipeline_module._groq_refine_without_silence(
+            acoustic,
+            transcript=transcript,
+            raw_clip=raw_clip,
+            caption_diagnostics=caption,
+            prepared=prepared,
+            speech_bounds=(0.0, 12.0),
+            projection_diagnostics={},
+            search_limits=(0.0, 12.0),
+            source_end_sec=12.0,
+            sibling_clips=[raw_clip],
+            cache=cache,
+            timeout_sec=0.5,
+            cancel_check=None,
+        )
+    )
+
+    assert refined is acoustic
+    assert bounds == limits == (0.0, 12.0)
+    cache.words_for_clip.assert_called_once()
+    assert cache.words_for_clip.call_args.kwargs["refresh"] is False
+    assert projection["groq_boundary_asr"]["transcription_attempts"] == 1
+    assert projection["groq_boundary_asr"]["word_counts"] == [0]
 
 
 def test_partial_groq_refinement_preserves_existing_native_other_edge(
@@ -2975,6 +3150,70 @@ def test_groq_cache_dedupes_identical_near_media_edge_window(monkeypatch) -> Non
     groq_words.assert_called_once()
     assert groq_words.call_args.kwargs["window_start_sec"] == 0.0
     assert groq_words.call_args.kwargs["window_end_sec"] == 12.0
+
+
+@pytest.mark.parametrize("projected_edge", ["start", "end"])
+def test_groq_request_count_uses_only_explicit_projected_edges(
+    projected_edge,
+) -> None:
+    raw_clip = {
+        "start_quote": "raw start quote",
+        "end_quote": "raw end quote",
+        "edge_projection": {
+            projected_edge: {
+                "cue_id": f"projected-{projected_edge}",
+                "quote": f"projected {projected_edge} quote",
+            }
+        },
+    }
+
+    assert pipeline_module._groq_boundary_request_count(raw_clip) == 1
+
+
+@pytest.mark.parametrize(
+    ("projected_edge", "projected_target"),
+    [("start", 4.0), ("end", 18.0)],
+)
+def test_groq_words_for_clip_uses_only_explicit_projected_edges(
+    projected_edge,
+    projected_target,
+) -> None:
+    raw_clip = {
+        "start_quote": "raw start quote",
+        "end_quote": "raw end quote",
+        "edge_projection": {
+            projected_edge: {
+                "cue_id": f"projected-{projected_edge}",
+                "quote": f"projected {projected_edge} quote",
+            }
+        },
+    }
+    cache = pipeline_module._GroqBoundaryWordCache(
+        _ready_audio(duration_sec=30.0),
+        source_end_sec=30.0,
+    )
+
+    with mock.patch.object(
+        cache,
+        "words_for_edge",
+        return_value=_groq_edge_words(),
+    ) as words_for_edge:
+        words = cache.words_for_clip(
+            raw_clip=raw_clip,
+            caption_diagnostics={
+                "start_cue_id": "raw-start-cue",
+                "end_cue_id": "raw-end-cue",
+            },
+            speech_bounds=(4.0, 18.0),
+            timeout_sec=1.0,
+            cancel_check=None,
+        )
+
+    assert words == _groq_edge_words()
+    words_for_edge.assert_called_once()
+    call = words_for_edge.call_args.kwargs
+    assert call["cue_id"] == f"projected-{projected_edge}"
+    assert call["target_sec"] == projected_target
 
 
 def test_topic_generation_clamps_boundary_deadline_and_skips_late_groq(
