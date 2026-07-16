@@ -43,22 +43,37 @@ import {
   readStudyReelsSettings,
   setActiveStudyReelsSettingsScope,
 } from "@/lib/settings";
-import type {
+import {
   AssessmentSession,
   AssessmentStatusResponse,
   ChatMessage,
+  CURRENT_SELECTION_CONTRACT_VERSION,
   GenerationJobStatus,
   GenerationTerminalStatus,
   Reel,
 } from "@/lib/types";
 
-const PAGE_SIZE = 5;
-const FAST_READY_RESERVOIR_TARGET = 8;
-const SLOW_READY_RESERVOIR_TARGET = 12;
-const READY_RESERVOIR_REFILL_THRESHOLD = 4;
+const REEL_BATCH_SIZE = 3;
+const INITIAL_READY_BATCH_COUNT = 3;
+const INITIAL_READY_REEL_TARGET = REEL_BATCH_SIZE * INITIAL_READY_BATCH_COUNT;
+const PAGE_SIZE = INITIAL_READY_REEL_TARGET;
 
-function readyReservoirTarget(mode: GenerationMode): number {
-  return mode === "fast" ? FAST_READY_RESERVOIR_TARGET : SLOW_READY_RESERVOIR_TARGET;
+function readyReservoirTarget(_mode: GenerationMode): number {
+  return INITIAL_READY_REEL_TARGET;
+}
+
+function shouldRefillReadyBuffer(reelCount: number, activeIndex: number): boolean {
+  if (reelCount <= 0) {
+    return true;
+  }
+  const safeIndex = Math.max(0, Math.min(activeIndex, reelCount - 1));
+  const readyIncludingActive = reelCount - safeIndex;
+  if (readyIncludingActive <= 1) {
+    return true;
+  }
+  return safeIndex > 0
+    && safeIndex % REEL_BATCH_SIZE === 0
+    && readyIncludingActive <= REEL_BATCH_SIZE;
 }
 const REEL_SNAP_DURATION_MS = 300;
 const POST_SNAP_COOLDOWN_MS = 30;
@@ -88,6 +103,7 @@ const DESCRIPTION_PREVIEW_CHAR_LIMIT = 180;
 const FEED_PLAYBACK_RATE_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as const;
 type FeedbackAction = "helpful" | "confusing" | "save";
 type FeedRecoveryPhase = "idle" | "fetching-page" | "generating";
+type KnowledgeLevel = "beginner" | "intermediate" | "advanced";
 
 type FeedTuningSettings = {
   minRelevance: number;
@@ -105,6 +121,7 @@ type ReelFeedbackState = {
 type MaterialSeed = {
   topic?: string;
   text?: string;
+  knowledgeLevel?: KnowledgeLevel;
   title?: string;
   updatedAt?: number;
 };
@@ -122,6 +139,7 @@ type FeedProgressEntry = {
 };
 
 type FeedSessionSnapshot = {
+  selectionContractVersion: string;
   reels: Reel[];
   feedbackByReel: Record<string, ReelFeedbackState>;
   adaptiveExcludeReelIds: string[];
@@ -446,6 +464,9 @@ function parseFeedSessions(raw: string | null): Record<string, FeedSessionSnapsh
         continue;
       }
       const row = value as Record<string, unknown>;
+      if (row.selectionContractVersion !== CURRENT_SELECTION_CONTRACT_VERSION) {
+        continue;
+      }
       const reels = Array.isArray(row.reels)
         ? row.reels
             .filter((item) => {
@@ -487,6 +508,7 @@ function parseFeedSessions(raw: string | null): Record<string, FeedSessionSnapsh
             .slice(-200)
         : [];
       result[materialId] = {
+        selectionContractVersion: CURRENT_SELECTION_CONTRACT_VERSION,
         reels,
         feedbackByReel,
         adaptiveExcludeReelIds,
@@ -733,7 +755,11 @@ function persistFeedSessionSnapshot(materialId: string, snapshot: FeedSessionSna
   }
   try {
     const allSessions = parseFeedSessions(window.localStorage.getItem(FEED_SESSION_STORAGE_KEY));
-    allSessions[materialId] = snapshot;
+    const currentSnapshot: FeedSessionSnapshot = {
+      ...snapshot,
+      selectionContractVersion: CURRENT_SELECTION_CONTRACT_VERSION,
+    };
+    allSessions[materialId] = currentSnapshot;
     const ordered = Object.entries(allSessions)
       .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
       .slice(0, MAX_SAVED_FEED_SESSIONS);
@@ -747,8 +773,8 @@ function persistFeedSessionSnapshot(materialId: string, snapshot: FeedSessionSna
       ordered
         .slice(0, Math.min(4, ordered.length))
         .map(([id, value]) => [id, compactFeedSessionSnapshot(value, id === materialId ? "compact" : "minimal")]),
-      [[materialId, compactFeedSessionSnapshot(snapshot, "compact")]],
-      [[materialId, compactFeedSessionSnapshot(snapshot, "minimal")]],
+      [[materialId, compactFeedSessionSnapshot(currentSnapshot, "compact")]],
+      [[materialId, compactFeedSessionSnapshot(currentSnapshot, "minimal")]],
     ];
     for (const candidate of attempts) {
       if (safeLocalStorageSetItem(FEED_SESSION_STORAGE_KEY, JSON.stringify(Object.fromEntries(candidate)))) {
@@ -1098,6 +1124,8 @@ function FeedPageInner() {
   const historySyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const generationJobByMaterialRef = useRef<Map<string, ActiveGenerationJob>>(new Map());
+  const continuationTokenByMaterialRef = useRef<Map<string, string>>(new Map());
+  const lastTerminalStatusByMaterialRef = useRef<Map<string, GenerationTerminalStatus>>(new Map());
   const generationConsumerByMaterialRef = useRef<Map<string, { jobId: string; token: symbol }>>(new Map());
   const generationBatchTokensRef = useRef<Set<symbol>>(new Set());
   const generationFinishedRef = useRef<Set<string>>(new Set());
@@ -1323,22 +1351,9 @@ function FeedPageInner() {
     setReels(nextReels);
   }, []);
 
-  const orderReelsByDifficulty = useCallback((rows: Reel[]): Reel[] => {
-    return rows
-      .map((reel, index) => ({
-        reel,
-        index,
-        difficulty: typeof reel.difficulty === "number" && Number.isFinite(reel.difficulty)
-          ? Math.min(1, Math.max(0, reel.difficulty))
-          : 0.5,
-      }))
-      .sort((left, right) => left.difficulty - right.difficulty || left.index - right.index)
-      .map(({ reel }) => reel);
-  }, []);
-
-  const mergeReelBatchesByDifficulty = useCallback(
-    (batches: Reel[][]): Reel[] => orderReelsByDifficulty(batches.flatMap((batch) => batch)),
-    [orderReelsByDifficulty],
+  const mergeReelBatchesInServerOrder = useCallback(
+    (batches: Reel[][]): Reel[] => batches.flatMap((batch) => batch),
+    [],
   );
 
   const getFeedMaterialIds = useCallback((): string[] => {
@@ -1358,6 +1373,8 @@ function FeedPageInner() {
 
   const clearGenerationTracking = useCallback(() => {
     generationJobByMaterialRef.current.clear();
+    continuationTokenByMaterialRef.current.clear();
+    lastTerminalStatusByMaterialRef.current.clear();
     generationConsumerByMaterialRef.current.clear();
     generationBatchTokensRef.current.clear();
     generationFinishedRef.current.clear();
@@ -1373,9 +1390,8 @@ function FeedPageInner() {
     if (!id) {
       return;
     }
-    // Every successful terminal has consumed this search scope's fixed source
-    // budget. Persisted pages can still load, but replaying the same request
-    // cannot discover a new clip and must not leave the tail spinner looping.
+    // Persisted pages can still load. Only an authoritative exhausted terminal
+    // closes continuation; completed and partial batches remain resumable.
     generationFinishedRef.current.add(id);
     const materialIds = getFeedMaterialIds();
     if (materialIds.length > 0 && materialIds.every((materialIdKey) => isGenerationFinished(materialIdKey))) {
@@ -1385,10 +1401,44 @@ function FeedPageInner() {
 
   const noteGenerationTerminal = useCallback((materialIdValue: string, status: GenerationTerminalStatus) => {
     generationJobByMaterialRef.current.delete(materialIdValue);
-    if (status === "completed" || status === "partial" || status === "exhausted") {
+    lastTerminalStatusByMaterialRef.current.set(materialIdValue, status);
+    if (status === "exhausted") {
       markGenerationFinished(materialIdValue);
     }
   }, [markGenerationFinished]);
+
+  const rememberFeedContinuationToken = useCallback((
+    materialIdValue: string,
+    response: Awaited<ReturnType<typeof fetchFeed>>,
+  ) => {
+    const id = String(materialIdValue || "").trim();
+    if (!id) {
+      return;
+    }
+    const token = String(response.continuation_token || "").trim();
+    if (token) {
+      continuationTokenByMaterialRef.current.set(id, token);
+    } else {
+      continuationTokenByMaterialRef.current.delete(id);
+    }
+  }, []);
+
+  const settleGenerationContinuation = useCallback((
+    materialIdValue: string,
+    response: Awaited<ReturnType<typeof generateReelsStream>>,
+  ) => {
+    const id = String(materialIdValue || "").trim();
+    const status = response.terminal_status;
+    if (!id || (status !== "completed" && status !== "partial" && status !== "exhausted")) {
+      return;
+    }
+    const nextToken = String(response.continuation_token || response.batch_id || "").trim();
+    lastTerminalStatusByMaterialRef.current.set(id, status);
+    if (nextToken) {
+      continuationTokenByMaterialRef.current.set(id, nextToken);
+    }
+    noteGenerationTerminal(id, status);
+  }, [noteGenerationTerminal]);
 
   const rememberFeedGenerationJob = useCallback((
     materialIdValue: string,
@@ -1404,6 +1454,7 @@ function FeedPageInner() {
       return;
     }
     if (status && status !== "queued" && status !== "running") {
+      lastTerminalStatusByMaterialRef.current.set(materialIdValue, status);
       noteGenerationTerminal(materialIdValue, status);
     }
   }, [noteGenerationTerminal]);
@@ -1788,6 +1839,7 @@ function FeedPageInner() {
         const rebuilt = await uploadMaterial({
           subjectTag: topic || undefined,
           text: text || undefined,
+          knowledgeLevel: seed?.knowledgeLevel,
           signal: searchScope.controller.signal,
         });
         if (!isSearchScopeActive(searchScope)) {
@@ -1839,29 +1891,14 @@ function FeedPageInner() {
     [isSearchScopeActive, params, router, setVisibleFeedError],
   );
 
-  const countReelsForMaterial = useCallback(
-    (materialIdValue: string): number => {
-      const materialIdKey = String(materialIdValue || "").trim();
-      if (!materialIdKey) {
-        return 0;
-      }
-      const singleFeedMaterialId = getFeedMaterialIds().length === 1 ? materialIdKey : "";
-      return reels.reduce((count, reel) => {
-        const reelMaterialId = String(reel.material_id || singleFeedMaterialId).trim();
-        return reelMaterialId === materialIdKey ? count + 1 : count;
-      }, 0);
-    },
-    [getFeedMaterialIds, reels],
-  );
-
   const feedNeedsBootstrapTopUp = useCallback((): boolean => {
     const feedMaterialIds = getFeedMaterialIds();
     if (feedMaterialIds.length === 0) {
       return false;
     }
-    const unseenReadyCount = Math.max(0, reels.length - activeIndex - 1);
-    return reels.length === 0 || unseenReadyCount <= READY_RESERVOIR_REFILL_THRESHOLD;
-  }, [activeIndex, getFeedMaterialIds, reels.length]);
+    const currentReels = reelsRef.current;
+    return shouldRefillReadyBuffer(currentReels.length, activeIndexRef.current);
+  }, [getFeedMaterialIds]);
 
   const appendGeneratedReels = useCallback(
     (generated: Reel[]): SessionMergeResult => {
@@ -1952,8 +1989,7 @@ function FeedPageInner() {
             && !provisionalClipKeys.has(reelClipKey(reel));
         }));
       }
-      const orderedTail = orderReelsByDifficulty(authoritativeTail);
-      const reordered = dedupeByIdentity([...lockedPrefix, ...orderedTail]);
+      const reordered = dedupeByIdentity([...lockedPrefix, ...authoritativeTail]);
       const previousIdentity = new Set(currentRows.map((reel) => `${String(reel.reel_id || "").trim()}|${reelClipKey(reel)}`));
       const addedReels = reordered.filter(
         (reel) => !previousIdentity.has(`${String(reel.reel_id || "").trim()}|${reelClipKey(reel)}`),
@@ -1968,7 +2004,7 @@ function FeedPageInner() {
       setTotal((prevTotal) => Math.max(prevTotal, reordered.length));
       return merged;
     },
-    [dedupeByIdentity, orderReelsByDifficulty, reelClipKey, updateSessionReels],
+    [dedupeByIdentity, reelClipKey, updateSessionReels],
   );
 
   const consumeFeedGenerationJob = useCallback((
@@ -1996,7 +2032,10 @@ function FeedPageInner() {
           signal: searchScope.controller.signal,
           idleTimeoutMs: GENERATION_STREAM_IDLE_TIMEOUT_MS,
           onTerminal: (terminalStatus) => {
-            if (isSearchScopeActive(searchScope)) {
+            if (
+              isSearchScopeActive(searchScope)
+              && (terminalStatus === "failed" || terminalStatus === "cancelled")
+            ) {
               noteGenerationTerminal(materialIdValue, terminalStatus);
             }
           },
@@ -2020,6 +2059,7 @@ function FeedPageInner() {
           data.reels,
           { preserveUnmatchedUnseen: true },
         );
+        settleGenerationContinuation(materialIdValue, data);
         madeProgress = madeProgress || reconciled.addedCount > 0;
       } catch (error) {
         if (isSearchScopeActive(searchScope) && !isRequestInterruptedError(error)) {
@@ -2040,6 +2080,7 @@ function FeedPageInner() {
     isSearchScopeActive,
     markRecoveryProgress,
     noteGenerationTerminal,
+    settleGenerationContinuation,
     claimGenerationConsumer,
     reconcileGeneratedReels,
     releaseGenerationConsumer,
@@ -2065,6 +2106,7 @@ function FeedPageInner() {
         const tuning = getFeedTuningSettings();
         const requestGenerationMode = options?.generationMode ?? generationMode;
         const requestLimit = adaptiveExcludeReelIdsRef.current.length > 0 ? 25 : PAGE_SIZE;
+        const allowServerAutofill = (options?.autofill ?? true) && feedMaterialIds.length === 1;
         const rows = await Promise.all(
           feedMaterialIds.map(async (id) => {
             try {
@@ -2073,7 +2115,7 @@ function FeedPageInner() {
                 page: targetPage,
                 limit: requestLimit,
                 excludeReelIds: adaptiveExcludeReelIdsRef.current,
-                autofill: options?.autofill ?? true,
+                autofill: allowServerAutofill,
                 prefetch: readyReservoirTarget(requestGenerationMode),
                 generationMode: requestGenerationMode,
                 minRelevance: tuning.minRelevance,
@@ -2130,10 +2172,11 @@ function FeedPageInner() {
         }
 
         for (const row of successful) {
+          rememberFeedContinuationToken(row.materialId, row.data!);
           rememberFeedGenerationJob(row.materialId, row.data!);
         }
 
-        const fetchedReels = dedupeByIdentity(mergeReelBatchesByDifficulty(successful.map((row) => row.data!.reels)));
+        const fetchedReels = dedupeByIdentity(mergeReelBatchesInServerOrder(successful.map((row) => row.data!.reels)));
         const fetchedTotal = successful.reduce((sum, row) => sum + Math.max(0, Number(row.data!.total) || 0), 0);
         const merged = targetPage === 1
           ? options?.preserveSession
@@ -2232,7 +2275,7 @@ function FeedPageInner() {
       generationMode,
       getFeedMaterialIds,
       getFeedTuningSettings,
-      mergeReelBatchesByDifficulty,
+      mergeReelBatchesInServerOrder,
       isSearchScopeActive,
       markRecoveryProgress,
       materialId,
@@ -2242,6 +2285,7 @@ function FeedPageInner() {
       noteFeedTransportFailure,
       recoverMissingMaterial,
       reconcileGeneratedReels,
+      rememberFeedContinuationToken,
       rememberFeedGenerationJob,
       settingsScopeReady,
       syncGenerationLockState,
@@ -2250,7 +2294,11 @@ function FeedPageInner() {
     ],
   );
 
-  const requestMore = useCallback(async (options?: { surfaceError?: boolean }): Promise<Reel[]> => {
+  const requestMore = useCallback(async (options?: {
+    surfaceError?: boolean;
+    initialFill?: boolean;
+    requestedCount?: number;
+  }): Promise<Reel[]> => {
     const allFeedMaterialIds = getFeedMaterialIds();
     if (!settingsScopeReady || allFeedMaterialIds.length === 0 || isGeneratingRef.current || !canRequestMore) {
       return [];
@@ -2269,13 +2317,25 @@ function FeedPageInner() {
     }
     const searchScope = activeSearchScopeRef.current;
     const tuning = getFeedTuningSettings();
-    const unseenReadyCount = Math.max(0, reelsRef.current.length - activeIndexRef.current - 1);
-    const requestedReadyCount = Math.max(1, readyReservoirTarget(generationMode) - unseenReadyCount);
-    const perTopicBatch = Math.max(1, Math.ceil(requestedReadyCount / feedMaterialIds.length));
+    const requestedReadyCount = Math.max(1, Math.floor(
+      options?.requestedCount
+        ?? (options?.initialFill ? readyReservoirTarget(generationMode) : REEL_BATCH_SIZE),
+    ));
+    const startingMaterialOffset = Math.floor(reelsRef.current.length / REEL_BATCH_SIZE)
+      % feedMaterialIds.length;
+    const requestedByMaterial = new Map<string, number>();
+    for (let slot = 0; slot < requestedReadyCount; slot += 1) {
+      const id = feedMaterialIds[(startingMaterialOffset + slot) % feedMaterialIds.length];
+      requestedByMaterial.set(id, (requestedByMaterial.get(id) ?? 0) + 1);
+    }
+    const generationPlan = feedMaterialIds
+      .map((id) => ({ id, batchSize: requestedByMaterial.get(id) ?? 0 }))
+      .filter((item) => item.batchSize > 0);
     const generationBatchToken = Symbol("request-more");
     generationBatchTokensRef.current.add(generationBatchToken);
     syncGenerationLockState();
     armActiveRecoveryRequest(searchScope, "generating");
+    setVisibleFeedError(null);
     if (progressClearTimerRef.current) {
       clearTimeout(progressClearTimerRef.current);
       progressClearTimerRef.current = null;
@@ -2284,12 +2344,13 @@ function FeedPageInner() {
     let progressErrored = false;
     try {
       const generatedRows = await Promise.all(
-        feedMaterialIds.map(async (id) => {
+        generationPlan.map(async ({ id, batchSize }) => {
           const streamedReels: Reel[] = [];
-          let observedTerminal = false;
-          const currentCount = countReelsForMaterial(id);
-          const targetTotal = Math.min(readyReservoirTarget(generationMode), currentCount + perTopicBatch);
           const activeGenerationJob = generationJobByMaterialRef.current.get(id);
+          const continuationToken = continuationTokenByMaterialRef.current.get(id);
+          const existingMaterialReels = reelsRef.current.reduce((count, reel) => (
+            reel.material_id === id ? count + 1 : count
+          ), 0);
           const consumerToken = claimGenerationConsumer(id, activeGenerationJob?.jobId || "new-generation");
           if (!consumerToken) {
             return { materialId: id, data: null, streamedReels, error: null };
@@ -2297,8 +2358,11 @@ function FeedPageInner() {
           try {
             const data = await generateReelsStream({
               materialId: id,
-              numReels: targetTotal,
+              numReels: continuationToken
+                ? batchSize
+                : Math.min(INITIAL_READY_REEL_TARGET, existingMaterialReels + batchSize),
               generationJobId: activeGenerationJob?.jobId,
+              continuationToken,
               generationMode,
               minRelevance: tuning.minRelevance,
               creativeCommonsOnly: tuning.creativeCommonsOnly,
@@ -2316,8 +2380,10 @@ function FeedPageInner() {
                 }
               },
               onTerminal: (status) => {
-                observedTerminal = true;
-                if (isSearchScopeActive(searchScope)) {
+                if (
+                  isSearchScopeActive(searchScope)
+                  && (status === "failed" || status === "cancelled")
+                ) {
                   noteGenerationTerminal(id, status);
                 }
               },
@@ -2333,19 +2399,18 @@ function FeedPageInner() {
                 }
               },
             });
-            if (!observedTerminal) {
-              // A completed request-key cache hit returns its final inventory
-              // directly instead of opening a durable stream.
-              if (isSearchScopeActive(searchScope)) {
-                noteGenerationTerminal(id, "completed");
-              }
-            }
             if (!isSearchScopeActive(searchScope)) {
               return { materialId: id, data: null, streamedReels, error: null };
             }
-            reconcileGeneratedReels(streamedReels, data.reels, { preserveUnmatchedUnseen: true });
+            const reconciled = reconcileGeneratedReels(
+              streamedReels,
+              data.reels,
+              { preserveUnmatchedUnseen: true },
+            );
+            settleGenerationContinuation(id, data);
+            const batchAddedReels = dedupeByIdentity([...streamedReels, ...reconciled.addedReels]);
             armActiveRecoveryRequest(searchScope, "generating");
-            return { materialId: id, data, streamedReels: dedupeByIdentity(data.reels), error: null };
+            return { materialId: id, data, streamedReels: batchAddedReels, error: null };
           } catch (e) {
             if (!isRequestInterruptedError(e)) {
               console.warn(`Background reel generation failed for topic material ${id}:`, e);
@@ -2387,9 +2452,12 @@ function FeedPageInner() {
         return [];
       }
       const generated = dedupeByIdentity(
-        mergeReelBatchesByDifficulty(generatedRows.map((row) => row.streamedReels ?? [])),
+        mergeReelBatchesInServerOrder(generatedRows.map((row) => row.streamedReels ?? [])),
       );
       if (generated.length === 0) {
+        const authoritativeExhausted = !firstFailedRow
+          && generatedRows.some((row) => row.data)
+          && generatedRows.every((row) => row.data?.terminal_status === "exhausted");
         const failedMaterialId = String(firstFailedRow?.materialId || "").trim();
         if (firstFailedRow?.error && failedMaterialId && reelsRef.current.length === 0) {
           // A submission response can be lost after the backend has already
@@ -2420,14 +2488,14 @@ function FeedPageInner() {
         }
         clearPendingTailAdvance();
         markRecoveryProgress(0);
-        if (isTransportError(firstFailedRow?.error)) {
-          noteFeedTransportFailure(firstFailedRow?.error, { forceVisible: Boolean(options?.surfaceError) });
-        } else if (options?.surfaceError) {
-          if (firstFailedRow?.error) {
-            noteFeedFailure(firstFailedRow.error);
-          } else {
-            noteFeedFailure("Still searching for fresh reels. No new source videos yet.");
-          }
+        if (authoritativeExhausted) {
+          clearRecoveredTransportError();
+        } else if (isTransportError(firstFailedRow?.error)) {
+          noteFeedTransportFailure(firstFailedRow?.error, { forceVisible: true });
+        } else if (firstFailedRow?.error) {
+          noteFeedFailure(firstFailedRow.error);
+        } else {
+          noteFeedFailure("No new clips arrived. Retry to continue searching.");
         }
         setRecoveryPhase("idle");
         return [];
@@ -2450,8 +2518,8 @@ function FeedPageInner() {
       clearPendingTailAdvance();
       markRecoveryProgress(0);
       if (isTransportError(e)) {
-        noteFeedTransportFailure(e, { forceVisible: Boolean(options?.surfaceError) });
-      } else if (options?.surfaceError) {
+        noteFeedTransportFailure(e, { forceVisible: true });
+      } else {
         noteFeedFailure(e instanceof Error ? e.message : "Could not generate reels right now.");
       }
       setRecoveryPhase("idle");
@@ -2480,12 +2548,11 @@ function FeedPageInner() {
     claimGenerationConsumer,
     clearPendingTailAdvance,
     clearRecoveredTransportError,
-    countReelsForMaterial,
     dedupeByIdentity,
     generationMode,
     getFeedMaterialIds,
     getFeedTuningSettings,
-    mergeReelBatchesByDifficulty,
+    mergeReelBatchesInServerOrder,
     isIngestMaterial,
     isGenerationFinished,
     isSearchScopeActive,
@@ -2499,9 +2566,47 @@ function FeedPageInner() {
     reconcileGeneratedReels,
     releaseGenerationConsumer,
     settingsScopeReady,
+    settleGenerationContinuation,
+    setVisibleFeedError,
     syncGenerationLockState,
     finishActiveRecoveryRequest,
   ]);
+
+  const requestReadyBatch = useCallback(async (
+    requestedCount = REEL_BATCH_SIZE,
+    surfaceError = false,
+  ): Promise<number> => {
+    const targetCount = Math.max(1, Math.min(REEL_BATCH_SIZE, Math.floor(requestedCount)));
+    let addedTotal = 0;
+    let consecutiveEmptyPartialBatches = 0;
+    for (let attempt = 0; attempt < REEL_BATCH_SIZE + 1 && addedTotal < targetCount; attempt += 1) {
+      const openMaterialIds = getFeedMaterialIds().filter((id) => !isGenerationFinished(id));
+      if (openMaterialIds.length === 0 || isGeneratingRef.current) {
+        break;
+      }
+      const countBeforeRequest = reelsRef.current.length;
+      await requestMore({
+        surfaceError,
+        requestedCount: targetCount - addedTotal,
+      });
+      const addedCount = Math.max(0, reelsRef.current.length - countBeforeRequest);
+      if (addedCount > 0) {
+        addedTotal += Math.min(targetCount - addedTotal, addedCount);
+        consecutiveEmptyPartialBatches = 0;
+        continue;
+      }
+      const hasOpenPartialCursor = openMaterialIds.some((id) => (
+        lastTerminalStatusByMaterialRef.current.get(id) === "partial"
+        && !isGenerationFinished(id)
+      ));
+      if (hasOpenPartialCursor && consecutiveEmptyPartialBatches < 1) {
+        consecutiveEmptyPartialBatches += 1;
+        continue;
+      }
+      break;
+    }
+    return addedTotal;
+  }, [getFeedMaterialIds, isGenerationFinished, requestMore]);
 
   useEffect(() => {
     mutedRestoredFromSnapshotRef.current = false;
@@ -2894,7 +2999,10 @@ function FeedPageInner() {
         setRecoveryPhase("idle");
         return;
       }
-      const refreshedReels = dedupeByIdentity(mergeReelBatchesByDifficulty(successful.map((row) => row.data.reels)));
+      for (const row of successful) {
+        rememberFeedContinuationToken(row.materialId, row.data);
+      }
+      const refreshedReels = dedupeByIdentity(mergeReelBatchesInServerOrder(successful.map((row) => row.data.reels)));
       const refreshedTotal = successful.reduce((sum, row) => sum + Math.max(0, Number(row.data.total) || 0), 0);
       const currentReels = reelsRef.current;
       const currentReelId = currentReels[activeIndexRef.current]?.reel_id;
@@ -2938,11 +3046,12 @@ function FeedPageInner() {
     generationMode,
     getFeedMaterialIds,
     getFeedTuningSettings,
-    mergeReelBatchesByDifficulty,
+    mergeReelBatchesInServerOrder,
     isSearchScopeActive,
     markRecoveryProgress,
     mergeSessionReels,
     noteFeedTransportFailure,
+    rememberFeedContinuationToken,
     settingsScopeReady,
     updateSessionReels,
     finishActiveRecoveryRequest,
@@ -2976,7 +3085,7 @@ function FeedPageInner() {
         while (
           !persistedPagesExhausted
           && nextPersistedPage <= lastPersistedPage
-          && Math.max(0, reelsRef.current.length - activeIndexRef.current - 1) < reservoirTarget
+          && Math.max(0, reelsRef.current.length - activeIndexRef.current) < reservoirTarget
         ) {
           const persisted = await loadPage(nextPersistedPage, {
             autofill: false,
@@ -2988,30 +3097,68 @@ function FeedPageInner() {
           persistedPagesExhausted = persisted.exhausted;
           nextPersistedPage += 1;
         }
-        if (Math.max(0, reelsRef.current.length - activeIndexRef.current - 1) >= reservoirTarget) {
+        let consecutiveEmptyPartialBatches = 0;
+        for (let attempt = 0; attempt < INITIAL_READY_REEL_TARGET; attempt += 1) {
+          const startupMaterialIds = getFeedMaterialIds();
+          if (
+            startupMaterialIds.length === 0
+            || startupMaterialIds.every((id) => isGenerationFinished(id))
+          ) {
+            return;
+          }
+          const startupShortfall = Math.max(
+            0,
+            reservoirTarget - reelsRef.current.length,
+          );
+          if (startupShortfall === 0) {
+            return;
+          }
+          const countBeforeRequest = reelsRef.current.length;
+          await requestMore({
+            surfaceError: manual,
+            initialFill: true,
+            requestedCount: countBeforeRequest === 0
+              ? startupShortfall
+              : Math.min(REEL_BATCH_SIZE, startupShortfall),
+          });
+          if (!isSearchScopeActive(searchScope)) {
+            return;
+          }
+          if (reelsRef.current.length > countBeforeRequest) {
+            consecutiveEmptyPartialBatches = 0;
+            continue;
+          }
+          const hasOpenPartialCursor = getFeedMaterialIds().some((id) => (
+            lastTerminalStatusByMaterialRef.current.get(id) === "partial"
+            && !isGenerationFinished(id)
+          ));
+          if (hasOpenPartialCursor && consecutiveEmptyPartialBatches < 1) {
+            consecutiveEmptyPartialBatches += 1;
+            continue;
+          }
           return;
         }
-        if (!manual && reelsRef.current.length > 0) {
-          return;
-        }
-        await requestMore({ surfaceError: manual });
       } finally {
         if (isSearchScopeActive(searchScope)) {
           setBootstrappingFirstReels(false);
         }
       }
     },
-    [canRequestMore, generationMode, hasMore, isIngestMaterial, isSearchScopeActive, loadPage, materialId, page, requestMore, total],
+    [canRequestMore, generationMode, getFeedMaterialIds, hasMore, isGenerationFinished, isIngestMaterial, isSearchScopeActive, loadPage, materialId, page, requestMore, total],
   );
 
   useEffect(() => {
+    const startupReservoirComplete = reels.length >= readyReservoirTarget(generationMode);
+    if (startupReservoirComplete) {
+      bootstrapAttemptedRef.current = true;
+      return;
+    }
     if (
       !materialId
       || loading
       || bootstrappingFirstReels
+      || generatingMore
       || bootstrapAttemptedRef.current
-      || reels.length > 0
-      || !feedNeedsBootstrapTopUp()
     ) {
       return;
     }
@@ -3022,28 +3169,36 @@ function FeedPageInner() {
     }
     bootstrapAttemptedRef.current = true;
     void bootstrapFirstReels(false);
-  }, [bootstrapFirstReels, bootstrappingFirstReels, feedNeedsBootstrapTopUp, isIngestMaterial, loading, materialId, reels.length]);
+  }, [bootstrapFirstReels, bootstrappingFirstReels, generatingMore, generationMode, isIngestMaterial, loading, materialId, reels.length]);
 
-  const maybeLoadMore = useCallback(() => {
+  const maybeLoadMore = useCallback(async () => {
     // For ingest-only sentinels, the primed session snapshot is the whole feed;
     // no durable generation or paginated feed request is valid.
     if (isIngestMaterial) {
       return;
     }
     if (hasMore && !isFetchingRef.current) {
-      void loadPage(page + 1, { autofill: false });
+      const countBeforePage = reelsRef.current.length;
+      await loadPage(page + 1, { autofill: false });
+      const persistedAdded = Math.max(0, reelsRef.current.length - countBeforePage);
+      const remainingBatchCount = Math.max(0, REEL_BATCH_SIZE - persistedAdded);
+      if (
+        remainingBatchCount > 0
+        && canRequestMore
+        && !isGeneratingRef.current
+        && !isFetchingRef.current
+      ) {
+        await requestReadyBatch(remainingBatchCount);
+      }
       return;
     }
-    const atFeedTail = reelsRef.current.length > 0
-      && activeIndexRef.current >= reelsRef.current.length - 1;
     if (
-      atFeedTail
-      && canRequestMore
+      canRequestMore
       && !isGeneratingRef.current
       && !isFetchingRef.current
       && feedNeedsBootstrapTopUp()
     ) {
-      void requestMore();
+      await requestReadyBatch();
     }
   }, [
     canRequestMore,
@@ -3052,7 +3207,7 @@ function FeedPageInner() {
     isIngestMaterial,
     loadPage,
     page,
-    requestMore,
+    requestReadyBatch,
   ]);
 
   const shouldBlockDownwardAtEnd = useCallback(
@@ -3245,6 +3400,7 @@ function FeedPageInner() {
     const index = dedupedReels.length > 0 ? clamp(activeIndex, 0, dedupedReels.length - 1) : 0;
     const activeReelId = dedupedReels[index]?.reel_id;
     persistFeedSessionSnapshot(materialId, {
+      selectionContractVersion: CURRENT_SELECTION_CONTRACT_VERSION,
       reels: dedupedReels,
       feedbackByReel,
       adaptiveExcludeReelIds: adaptiveExcludeReelIdsRef.current,
@@ -3406,11 +3562,11 @@ function FeedPageInner() {
       beginSnapTransitionLock();
       activeIndexRef.current = next;
       setActiveIndex(next);
-      if (reels.length - next - 1 <= READY_RESERVOIR_REFILL_THRESHOLD) {
+      if (feedNeedsBootstrapTopUp()) {
         maybeLoadMore();
       }
     },
-    [beginSnapTransitionLock, maybeLoadMore, reels.length],
+    [beginSnapTransitionLock, feedNeedsBootstrapTopUp, maybeLoadMore, reels.length],
   );
 
   const jumpOneReel = useCallback(
@@ -3940,11 +4096,18 @@ function FeedPageInner() {
       setAssessmentPreparingFeed(false);
       renewActiveSearchScope();
     }
+    for (let index = 0; index < successful.length; index += 1) {
+      const pages = successful[index];
+      const lastResponse = pages[pages.length - 1];
+      if (lastResponse) {
+        rememberFeedContinuationToken(feedMaterialIds[index], lastResponse);
+      }
+    }
 
-    const rankedTail = dedupeByIdentity(mergeReelBatchesByDifficulty(
+    const serverOrderedTail = dedupeByIdentity(mergeReelBatchesInServerOrder(
       successful.map((pages) => dedupeByIdentity(pages.flatMap((response) => response.reels))),
     ));
-    const nextReels = dedupeByIdentity(rankedTail, watchedPrefix).slice(0, MAX_REELS_PER_FEED_SESSION);
+    const nextReels = dedupeByIdentity(serverOrderedTail, watchedPrefix).slice(0, MAX_REELS_PER_FEED_SESSION);
     adaptiveExcludeReelIdsRef.current = excludeReelIds.slice(-200);
     updateSessionReels(nextReels);
     const nextActiveIndex = currentActiveReelId
@@ -3974,9 +4137,10 @@ function FeedPageInner() {
     generationMode,
     getFeedMaterialIds,
     getFeedTuningSettings,
-    mergeReelBatchesByDifficulty,
+    mergeReelBatchesInServerOrder,
     isSearchScopeActive,
     renewActiveSearchScope,
+    rememberFeedContinuationToken,
     settingsScopeReady,
     updateSessionReels,
   ]);
@@ -4318,9 +4482,16 @@ function FeedPageInner() {
       </button>
       {error ? (
         <div className="absolute left-0 right-0 top-3 z-[2147483647] mx-auto w-fit">
-          <div className="relative overflow-hidden rounded-xl border border-gray-300/45 bg-white/10 px-4 py-2 text-xs text-white shadow-[0_12px_28px_rgba(0,0,0,0.35)] backdrop-blur-xl backdrop-saturate-150">
+          <div className="relative flex items-center gap-3 overflow-hidden rounded-xl border border-gray-300/45 bg-white/10 px-4 py-2 text-xs text-white shadow-[0_12px_28px_rgba(0,0,0,0.35)] backdrop-blur-xl backdrop-saturate-150">
             <div aria-hidden="true" className="pointer-events-none absolute inset-0 bg-black/45" />
             <span className="relative">{error}</span>
+            <button
+              type="button"
+              onClick={() => void requestReadyBatch(REEL_BATCH_SIZE, true)}
+              className="relative rounded-lg border border-white/25 bg-white/15 px-2.5 py-1 font-semibold transition hover:bg-white/25"
+            >
+              Retry
+            </button>
           </div>
         </div>
       ) : null}

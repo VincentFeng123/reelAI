@@ -203,6 +203,9 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
                         "end_line": 2,
                         "start_quote": "Python variables store values",
                         "end_quote": "first Python program easy to understand",
+                        "claim_quote": (
+                            "Python variables store values such as numbers and strings"
+                        ),
                         "facet": "variables",
                             "informativeness": 0.95,
                             "topic_relevance": 0.99,
@@ -235,8 +238,7 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
 
     monkeypatch.setattr(gemini_segment, "_call_model", fake_model_call)
     monkeypatch.setattr(gemini_segment, "_flash_disabled_reason", None)
-    monkeypatch.setattr(gemini_segment.config, "SEGMENT_ROUTING_MODE", "hybrid")
-    monkeypatch.setattr(gemini_segment.config, "SEGMENT_HYBRID_PERCENT", 100.0)
+    monkeypatch.setattr(gemini_segment.config, "SEGMENT_ROUTING_MODE", "pro_only")
 
     cache = MemoryProviderCache()
     context = GenerationContext("fast", cache_store=cache)
@@ -286,9 +288,15 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
             "chunkSize": "50",
         }
         assert provider_calls[1][0].endswith("/transcript/captionless-job")
-        assert gemini_calls[0]["prompt_version"] == gemini_segment.PRODUCTION_FLASH_PROFILE
+        assert gemini_calls[0]["prompt_version"] == gemini_segment.PRO_BOUNDARY_PROFILE
+        assert gemini_calls[0]["model"] == gemini_segment.config.SEGMENT_PRO_MODEL
+        assert gemini_calls[0]["thinking_level"] == "medium"
         assert "timestamped transcripts" in gemini_calls[0]["system"]
-        assert "[0] 00:05 Python variables store values" in gemini_calls[0]["user"]
+        selector_text = "\n".join(
+            str(getattr(part, "text", "") or "")
+            for part in gemini_calls[0]["user"]
+        )
+        assert "[0] 00:05 Python variables store values" in selector_text
 
         artifacts = list(cache.transcript_rows.values())
         assert len(artifacts) == 1

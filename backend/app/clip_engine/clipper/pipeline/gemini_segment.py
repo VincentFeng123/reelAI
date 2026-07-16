@@ -119,7 +119,10 @@ def _prompts(lines: str, n: int, topic: str = "") -> tuple[str, str]:
         "a same-position takeaway_cue_ids list; every match_reason must include "
         "match_reason_cue_ids; assessment must include cue_ids alongside prompt, exactly "
         "four distinct options, correct_index, and explanation. Grounding IDs must all be "
-        "selected by that clip. Unsupported metadata will be discarded. "
+        "selected by that clip. Use LaTeX in assessment text only when it improves "
+        "mathematical clarity; wrap inline math in \\( ... \\) and display math in "
+        "\\[ ... \\]. Escape every LaTeX backslash in JSON string values (for example, "
+        "emit `\\\\(` for an inline opening delimiter). Unsupported metadata will be discarded. "
         f"Line indices are strict integers from 0 through {n - 1}."
     )
     user = (

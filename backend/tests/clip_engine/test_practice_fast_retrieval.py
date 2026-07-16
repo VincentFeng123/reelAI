@@ -1087,6 +1087,233 @@ def test_discover_practice_fast_threads_runtime_args_and_applies_exclude_top_n(m
     ]
 
 
+def test_consumed_first_page_fetches_next_provider_page_before_exhaustion(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda topic, *_args, **_kwargs: {
+            "corrected": topic,
+            "queries": [topic],
+            "provider_used": "literal_fallback",
+        },
+    )
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        calls.append(kwargs.get("page_tokens"))
+        if kwargs.get("page_tokens") is None:
+            return {
+                "per_query": [{
+                    "query": queries[0],
+                    "videos": [{"id": "already-consumed"}],
+                    "next_page_token": "page-2",
+                }],
+                "credits_used": 0,
+                "warning": None,
+            }
+        return {
+            "per_query": [{
+                "query": queries[0],
+                "videos": [{"id": "fresh-page-2"}],
+                "next_page_token": None,
+            }],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        "AP Statistics sampling distributions",
+        limit=1,
+        breadth=1,
+        consumed_video_ids=["already-consumed"],
+        retrieval_profile="deep",
+    )
+
+    assert calls == [None, ["page-2"]]
+    assert [video["id"] for video in result["videos"]] == ["fresh-page-2"]
+    assert result["provider_exhausted"] is True
+
+
+def test_provider_cursor_remains_open_when_current_page_fills_batch(monkeypatch):
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda topic, *_args, **_kwargs: {
+            "corrected": topic,
+            "queries": [topic],
+            "provider_used": "literal_fallback",
+        },
+    )
+    monkeypatch.setattr(
+        search.supadata_search,
+        "search_all",
+        lambda queries, filters=None, **kwargs: {
+            "per_query": [{
+                "query": queries[0],
+                "videos": [{"id": "current-page"}],
+                "next_page_token": "page-2",
+            }],
+            "credits_used": 0,
+            "warning": None,
+        },
+    )
+
+    result = search.discover_practice_fast(
+        "AP Statistics confidence intervals",
+        limit=1,
+        breadth=1,
+        retrieval_profile="deep",
+    )
+
+    assert [video["id"] for video in result["videos"]] == ["current-page"]
+    assert result["provider_exhausted"] is False
+
+
+def test_temporarily_empty_provider_page_walks_to_later_fresh_inventory(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda topic, *_args, **_kwargs: {
+            "corrected": topic,
+            "queries": [topic],
+            "provider_used": "literal_fallback",
+        },
+    )
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        page_tokens = kwargs.get("page_tokens")
+        calls.append(page_tokens)
+        token = page_tokens[0] if page_tokens else None
+        if token is None:
+            videos = [{"id": "already-consumed"}]
+            next_page_token = "page-2"
+        elif token == "page-2":
+            videos = []
+            next_page_token = "page-3"
+        else:
+            videos = [{"id": "fresh-page-3"}]
+            next_page_token = "page-4"
+        return {
+            "per_query": [{
+                "query": queries[0],
+                "videos": videos,
+                "next_page_token": next_page_token,
+            }],
+            "credits_used": int(token is not None),
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        "AP Statistics experimental design",
+        limit=1,
+        breadth=1,
+        consumed_video_ids=["already-consumed"],
+        retrieval_profile="deep",
+    )
+
+    assert calls == [None, ["page-2"], ["page-3"]]
+    assert [video["id"] for video in result["videos"]] == ["fresh-page-3"]
+    assert result["provider_exhausted"] is False
+
+
+def test_terminal_empty_provider_page_is_exhausted(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda topic, *_args, **_kwargs: {
+            "corrected": topic,
+            "queries": [topic],
+            "provider_used": "literal_fallback",
+        },
+    )
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        page_tokens = kwargs.get("page_tokens")
+        calls.append(page_tokens)
+        return {
+            "per_query": [{
+                "query": queries[0],
+                "videos": (
+                    [{"id": "already-consumed"}]
+                    if page_tokens is None
+                    else []
+                ),
+                "next_page_token": (
+                    "page-2" if page_tokens is None else None
+                ),
+            }],
+            "credits_used": int(page_tokens is not None),
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        "AP Statistics experimental design",
+        limit=1,
+        breadth=1,
+        consumed_video_ids=["already-consumed"],
+        retrieval_profile="deep",
+    )
+
+    assert calls == [None, ["page-2"]]
+    assert result["videos"] == []
+    assert result["provider_exhausted"] is True
+
+
+def test_search_budget_exhaustion_keeps_unfetched_provider_cursor_open(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda topic, *_args, **_kwargs: {
+            "corrected": topic,
+            "queries": [topic],
+            "provider_used": "literal_fallback",
+        },
+    )
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        page_tokens = kwargs.get("page_tokens")
+        calls.append(page_tokens)
+        if page_tokens is not None:
+            raise search.ProviderBudgetExceededError(
+                "search budget exhausted",
+                provider="supadata",
+                operation="search",
+            )
+        return {
+            "per_query": [{
+                "query": queries[0],
+                "videos": [{"id": "already-consumed"}],
+                "next_page_token": "page-2",
+            }],
+            "credits_used": 0,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        "AP Statistics chi-square tests",
+        limit=1,
+        breadth=1,
+        consumed_video_ids=["already-consumed"],
+        retrieval_profile="deep",
+    )
+
+    assert calls == [None, ["page-2"]]
+    assert result["videos"] == []
+    assert result["provider_exhausted"] is False
+    assert "provider pages remaining" in str(result["warning"])
+
+
 def test_discover_practice_fast_limits_ai_queries_to_remaining_search_budget(monkeypatch):
     context = GenerationContext("fast")
     context.reserve("search")

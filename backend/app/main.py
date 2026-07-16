@@ -343,16 +343,17 @@ reel_service = ReelService(
 assessment_service = AssessmentService()
 
 
-# Cumulative upper bound on reels stored per material across all feed pages.
-# The per-request generation cap in ReelService already bounds each individual
-# call, but without this ceiling a client that keeps paginating indefinitely
-# can drive total storage to unbounded growth (200 pages * 25 limit = 5,000
-# reels per material in the worst case). 300 comfortably covers typical study
-# sessions (3-50 reels) while guarding against runaway pagination.
-MAX_REELS_PER_MATERIAL = 300
-GENERATION_OUTPUT_CEILINGS = {"fast": 8, "slow": 12}
+# Each worker job remains tightly bounded; continuation jobs create additional
+# unseen batches instead of imposing a terminal material-wide inventory cap.
+REEL_BATCH_SIZE = 3
+INITIAL_READY_BATCH_COUNT = 3
+INITIAL_READY_REEL_TARGET = REEL_BATCH_SIZE * INITIAL_READY_BATCH_COUNT
+GENERATION_OUTPUT_CEILINGS = {
+    "fast": INITIAL_READY_REEL_TARGET,
+    "slow": INITIAL_READY_REEL_TARGET,
+}
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v32"
+SELECTION_CONTRACT_VERSION = "quality_silence_v33"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -3121,6 +3122,71 @@ def _generation_chain_meets_source_budget(
     )
 
 
+def _latest_compatible_generation_job(
+    conn,
+    *,
+    material_id: str,
+    learner_id: str,
+    concept_id: str | None,
+    content_fingerprint: str,
+    request_params: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Find the latest batch in the same learner/material/settings stream."""
+    concept_clause = "AND concept_id IS NULL"
+    query_params: tuple[Any, ...] = (
+        material_id,
+        learner_id,
+        content_fingerprint,
+    )
+    if concept_id is not None:
+        concept_clause = "AND concept_id = ?"
+        query_params = (*query_params, concept_id)
+    rows = fetch_all(
+        conn,
+        f"""
+        SELECT *
+        FROM reel_generation_jobs
+        WHERE material_id = ?
+          AND learner_id = ?
+          AND content_fingerprint = ?
+          {concept_clause}
+          AND status IN ('queued', 'running', 'completed', 'partial', 'exhausted')
+        ORDER BY created_at DESC, id DESC
+        LIMIT 50
+        """,
+        query_params,
+    )
+    expected_exclusions = sorted(_normalize_excluded_video_ids(
+        request_params.get("exclude_video_ids") or []
+    ))
+    expected_relevance = _normalize_min_relevance(request_params.get("min_relevance"))
+    for row in rows:
+        prior_params = _job_request_params(row)
+        if (
+            str(prior_params.get("knowledge_level") or "beginner")
+            != str(request_params.get("knowledge_level") or "beginner")
+            or str(prior_params.get("generation_mode") or "slow")
+            != str(request_params.get("generation_mode") or "slow")
+            or bool(prior_params.get("creative_commons_only"))
+            != bool(request_params.get("creative_commons_only"))
+            or _normalize_preferred_video_duration(
+                str(prior_params.get("preferred_video_duration") or "any")
+            ) != _normalize_preferred_video_duration(
+                str(request_params.get("preferred_video_duration") or "any")
+            )
+            or str(prior_params.get("language") or "en").strip().lower()
+            != str(request_params.get("language") or "en").strip().lower()
+            or sorted(_normalize_excluded_video_ids(
+                prior_params.get("exclude_video_ids") or []
+            )) != expected_exclusions
+            or _normalize_min_relevance(prior_params.get("min_relevance"))
+            != expected_relevance
+        ):
+            continue
+        return row
+    return None
+
+
 def _verified_cross_request_source_generation(
     conn,
     *,
@@ -3235,6 +3301,65 @@ def _finalize_request_reel_order(
     )
 
 
+def _learner_seen_reel_ids(conn, *, material_id: str, learner_id: str) -> set[str]:
+    """Return durable clip-level history used by every feed surface."""
+    try:
+        rows = fetch_all(
+            conn,
+            """
+            SELECT reel_id
+            FROM learner_reel_progress
+            WHERE learner_id = ?
+              AND material_id = ?
+              AND (scrolled_at IS NOT NULL OR completed_at IS NOT NULL)
+            """,
+            (str(learner_id or LEGACY_LEARNER_ID), material_id),
+        )
+    except Exception as exc:
+        if "table" not in str(exc).lower() and "exist" not in str(exc).lower():
+            raise
+        return set()
+    return {
+        str(row.get("reel_id") or "").strip()
+        for row in rows
+        if str(row.get("reel_id") or "").strip()
+    }
+
+
+def _generation_cursor_reel_count(
+    conn,
+    *,
+    material_id: str,
+    generation_id: str | None,
+    reel_ids: set[str],
+) -> int:
+    """Count filtered rows from the active generation chain for page offsets."""
+    clean_reel_ids = sorted(
+        {
+            str(reel_id or "").strip()
+            for reel_id in reel_ids
+            if str(reel_id or "").strip()
+        }
+    )
+    generation_ids = _response_generation_ids(conn, generation_id)
+    if not clean_reel_ids or not generation_ids:
+        return 0
+    reel_placeholders = ", ".join("?" for _reel_id in clean_reel_ids)
+    generation_placeholders = ", ".join("?" for _generation_id in generation_ids)
+    row = fetch_one(
+        conn,
+        f"""
+        SELECT COUNT(DISTINCT id) AS reel_count
+        FROM reels
+        WHERE material_id = ?
+          AND generation_id IN ({generation_placeholders})
+          AND id IN ({reel_placeholders})
+        """,
+        (material_id, *generation_ids, *clean_reel_ids),
+    )
+    return max(0, int((row or {}).get("reel_count") or 0))
+
+
 def _ranked_request_reels(
     conn,
     *,
@@ -3251,6 +3376,7 @@ def _ranked_request_reels(
     limit: int = 5,
     learner_id: str = LEGACY_LEARNER_ID,
     exclude_reel_ids: list[str] | None = None,
+    include_source_chain: bool = True,
 ) -> list[dict[str, Any]]:
     try:
         material_row = fetch_one(conn, "SELECT subject_tag, source_type FROM materials WHERE id = ?", (material_id,))
@@ -3282,7 +3408,11 @@ def _ranked_request_reels(
         material_id=material_id,
         concept_id=None,
     )
-    generation_ids = _response_generation_ids(conn, generation_id)
+    generation_ids = (
+        _response_generation_ids(conn, generation_id)
+        if include_source_chain
+        else ([generation_id] if generation_id else [])
+    )
     difficulty_progress: dict[str, Any] | None = None
     if generation_ids:
         ranked_batches: list[list[dict[str, Any]]] = []
@@ -3357,6 +3487,17 @@ def _ranked_request_reels(
             ranked,
             str(difficulty_progress.get("selected_level") or "beginner"),
         )
+    seen_reel_ids = _learner_seen_reel_ids(
+        conn,
+        material_id=material_id,
+        learner_id=learner_id,
+    )
+    if seen_reel_ids:
+        ranked = [
+            reel
+            for reel in ranked
+            if str(reel.get("reel_id") or "").strip() not in seen_reel_ids
+        ]
     excluded_video_id_set = {
         _bare_video_id(video_id)
         for video_id in (exclude_video_ids or [])
@@ -3524,6 +3665,36 @@ def _job_request_params(job_row: dict[str, Any]) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _continuation_delivered_reel_ids(
+    conn,
+    continuation_token: str | None,
+) -> list[str]:
+    """Return authoritative reel ids already delivered by prior batches."""
+    delivered: set[str] = set()
+    visited_jobs: set[str] = set()
+    current_job_id = str(continuation_token or "").strip()
+    while current_job_id and current_job_id not in visited_jobs:
+        visited_jobs.add(current_job_id)
+        job_row = get_generation_job(conn, current_job_id)
+        if not job_row:
+            break
+        for event in replay_generation_events(conn, job_id=current_job_id):
+            if str(event.get("type") or "") != "final":
+                continue
+            payload = event.get("payload") or {}
+            reels = payload.get("reels") if isinstance(payload, dict) else []
+            for reel in reels if isinstance(reels, list) else []:
+                if not isinstance(reel, dict):
+                    continue
+                reel_id = str(reel.get("reel_id") or "").strip()
+                if reel_id:
+                    delivered.add(reel_id)
+        current_job_id = str(
+            _job_request_params(job_row).get("continuation_token") or ""
+        ).strip()
+    return sorted(delivered)
+
+
 def _currently_surfaceable_generation_reel_ids(
     conn,
     job_row: dict[str, Any],
@@ -3570,6 +3741,7 @@ def _generation_job_reels(
     if not generation_id:
         return []
     params = _job_request_params(job_row)
+    continuation_token = str(params.get("continuation_token") or "").strip()
     mode = "fast" if str(params.get("generation_mode") or "slow") == "fast" else "slow"
     requested = max(
         1,
@@ -3598,6 +3770,11 @@ def _generation_job_reels(
         page=1,
         limit=requested,
         learner_id=str(job_row.get("learner_id") or LEGACY_LEARNER_ID),
+        exclude_reel_ids=_continuation_delivered_reel_ids(
+            conn,
+            continuation_token,
+        ),
+        include_source_chain=True,
     )
     public_reels = [_public_generation_reel(reel) for reel in ranked]
     return [
@@ -3854,6 +4031,8 @@ def _run_leased_generation_job(
     job_id = str(job_row.get("id") or "")
     lease_owner = str(job_row.get("lease_owner") or "")
     params = _job_request_params(job_row)
+    is_continuation = bool(str(params.get("continuation_token") or "").strip())
+    has_fresh_source_budget = bool(params.get("fresh_source_budget"))
     mode: Literal["fast", "slow"] = "fast" if params.get("generation_mode") == "fast" else "slow"
     requested_count = max(
         1,
@@ -3909,7 +4088,7 @@ def _run_leased_generation_job(
         generation_id=job_id,
         usage_sink=lambda record: _persist_generation_provider_usage(job_id, record),
         cache_store=DatabaseProviderCache(),
-        require_acoustic_boundaries=False,
+        require_acoustic_boundaries=True,
     )
     generation_id = ""
     try:
@@ -3980,10 +4159,23 @@ def _run_leased_generation_job(
                 conn,
                 generation_id=source_generation_id or "",
             )
+            if is_continuation or has_fresh_source_budget:
+                # A continuation gets a fresh provider budget, but verified
+                # source-chain clips that were never delivered fill the batch
+                # before another paid search. An initial cross-request cache
+                # top-up also gets one fresh bounded budget when that cache is
+                # strict but too small for the nine-reel startup reservoir.
+                analyzed_source_budget = 0
             remaining_source_budget = max(
                 0,
                 GENERATION_SOURCE_BUDGETS[mode] - analyzed_source_budget,
             )
+            if is_continuation and source_reel_count > 0:
+                # Return an unseen cached sibling immediately, even when it is
+                # smaller than the requested batch. The following continuation
+                # receives the fresh provider budget after cached inventory is
+                # drained, so playback never waits on Gemini after clip three.
+                remaining_source_budget = 0
             emitted: set[tuple[str, str]] = set()
             # Candidate events are provisional and reconciled against the
             # authoritative capped final. Accepted overflow stays persisted for
@@ -4091,10 +4283,14 @@ def _run_leased_generation_job(
             cumulative_count = source_reel_count + _count_generation_reels(
                 conn, generation_id
             )
-            has_verified_reservoir = _verified_reusable_generation_chain(
-                conn,
-                generation_id=generation_id,
-                material_id=material_id,
+            has_verified_reservoir = (
+                False
+                if is_continuation
+                else _verified_reusable_generation_chain(
+                    conn,
+                    generation_id=generation_id,
+                    material_id=material_id,
+                )
             )
             refreshed_job = get_generation_job(conn, job_id) or {
                 **job_row,
@@ -4105,6 +4301,11 @@ def _run_leased_generation_job(
                 if cumulative_count or has_verified_reservoir
                 else _generation_job_reels(conn, refreshed_job)
             )
+            stage_counters = context.counters()
+            stage_counters["analyzed_sources"] = len(completed_source_ids)
+            provider_cursor_open = int(
+                stage_counters.get("provider_cursor_open") or 0
+            ) > 0
             if cumulative_count or has_verified_reservoir or rankable_fallback:
                 _activate_generation(
                     conn,
@@ -4117,6 +4318,14 @@ def _run_leased_generation_job(
                     conn,
                     refreshed_job,
                 )
+            elif provider_cursor_open:
+                _complete_generation(
+                    conn,
+                    generation_id=generation_id,
+                    retrieval_profile="unified",
+                    status="partial",
+                )
+                final_reels = []
             else:
                 _complete_generation(
                     conn,
@@ -4126,11 +4335,11 @@ def _run_leased_generation_job(
                     error_text="inventory_exhausted",
                 )
                 final_reels = []
-            has_terminal_result = bool(final_reels) or has_verified_reservoir
+            has_terminal_result = (
+                bool(final_reels) or has_verified_reservoir or provider_cursor_open
+            )
 
             usage_records = context.usage()
-            stage_counters = context.counters()
-            stage_counters["analyzed_sources"] = len(completed_source_ids)
             usage_payload = usage_payload_with_completed_sources()
             model_records = [
                 row
@@ -5412,6 +5621,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
     min_relevance = _normalize_min_relevance(payload.min_relevance)
     safe_video_duration_pref = _normalize_preferred_video_duration(payload.preferred_video_duration)
     excluded_video_ids = _normalize_excluded_video_ids(payload.exclude_video_ids)
+    continuation_token = str(payload.continuation_token or "").strip() or None
     requested_num_reels = max(
         1,
         min(
@@ -5439,6 +5649,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             material_id=payload.material_id,
             concept_id=payload.concept_id,
             content_fingerprint=content_fingerprint,
+            learner_id=learner_id,
             knowledge_level=learner_knowledge_level,
             generation_mode=payload.generation_mode,
             creative_commons_only=payload.creative_commons_only,
@@ -5448,12 +5659,14 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             target_clip_duration_max_sec=None,
             min_relevance=min_relevance,
             exclude_video_ids=excluded_video_ids,
+            continuation_token=continuation_token,
         )
         request_params = {
             "material_id": payload.material_id,
             "concept_id": payload.concept_id,
             "num_reels": requested_num_reels,
             "exclude_video_ids": excluded_video_ids,
+            "continuation_token": continuation_token,
             "creative_commons_only": payload.creative_commons_only,
             "generation_mode": payload.generation_mode,
             "min_relevance": min_relevance,
@@ -5462,6 +5675,64 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             "language": "en",
         }
         source_generation_id: str | None = None
+        continuation_job: dict[str, Any] | None = None
+        if continuation_token:
+            continuation_job = get_generation_job(conn, continuation_token)
+            continuation_status = str((continuation_job or {}).get("status") or "")
+            continuation_params = _job_request_params(continuation_job or {})
+            continuation_matches = bool(
+                continuation_job
+                and str(continuation_job.get("material_id") or "") == payload.material_id
+                and (str(continuation_job.get("concept_id") or "") or None) == payload.concept_id
+                and str(continuation_job.get("learner_id") or "") == learner_id
+                and str(continuation_job.get("content_fingerprint") or "") == content_fingerprint
+                and str(continuation_params.get("knowledge_level") or "beginner")
+                == learner_knowledge_level
+                and str(continuation_params.get("generation_mode") or "slow")
+                == payload.generation_mode
+                and bool(continuation_params.get("creative_commons_only"))
+                == bool(payload.creative_commons_only)
+                and _normalize_preferred_video_duration(
+                    str(continuation_params.get("preferred_video_duration") or "any")
+                ) == safe_video_duration_pref
+                and _normalize_min_relevance(continuation_params.get("min_relevance"))
+                == min_relevance
+                and sorted(_normalize_excluded_video_ids(
+                    continuation_params.get("exclude_video_ids") or []
+                )) == sorted(excluded_video_ids)
+            )
+            if not continuation_matches or continuation_status not in {
+                "completed", "partial", "exhausted"
+            }:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "invalid_continuation_token",
+                        "message": "The requested reel batch can no longer be continued.",
+                    },
+                )
+            if continuation_status == "exhausted":
+                return {
+                    "reels": [],
+                    "generation_id": None,
+                    "response_profile": "unified",
+                    "batch_id": continuation_token,
+                    "batch_size": 0,
+                    "continuation_token": continuation_token,
+                    "terminal_status": "exhausted",
+                }
+            source_generation_id = (
+                str(continuation_job.get("result_generation_id") or "").strip()
+                or None
+            )
+            if source_generation_id is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "invalid_continuation_token",
+                        "message": "The previous reel batch has no reusable generation state.",
+                    },
+                )
         completed_job = find_completed_generation_job(conn, request_key)
         active_job = find_active_generation_job(conn, request_key)
         if completed_job:
@@ -5474,8 +5745,12 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 "reels": cached_reels,
                 "generation_id": str(completed_job.get("result_generation_id") or "") or None,
                 "response_profile": "unified",
+                "batch_id": str(completed_job.get("id") or "") or None,
+                "batch_size": len(cached_reels),
+                "continuation_token": str(completed_job.get("id") or "") or None,
+                "terminal_status": str(completed_job.get("status") or "completed"),
             }
-        elif not active_job:
+        elif not active_job and continuation_job is None:
             source_generation_id = _verified_cross_request_source_generation(
                 conn,
                 material_id=payload.material_id,
@@ -5485,26 +5760,15 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 content_fingerprint=content_fingerprint,
                 request_params=request_params,
             )
-            if source_generation_id and _generation_chain_meets_source_budget(
-                conn,
-                generation_id=source_generation_id,
-                generation_mode=payload.generation_mode,
-            ):
-                reused_reels = _reused_generation_reels(
+            if (
+                source_generation_id
+                and _generation_chain_meets_source_budget(
                     conn,
                     generation_id=source_generation_id,
-                    material_id=payload.material_id,
-                    concept_id=payload.concept_id,
-                    learner_id=learner_id,
-                    request_params=request_params,
-                    requested=requested_num_reels,
+                    generation_mode=payload.generation_mode,
                 )
-                if reused_reels:
-                    return {
-                        "reels": reused_reels,
-                        "generation_id": source_generation_id,
-                        "response_profile": "unified",
-                    }
+            ):
+                request_params["fresh_source_budget"] = True
         job_row, _created = _submit_bounded_generation_job(
             conn,
             material_id=payload.material_id,
@@ -5566,9 +5830,19 @@ def generation_status(request: Request, job_id: str):
     )
     clean_job_id = str(job_id or "").strip()
     with get_conn(transactional=True) as conn:
+        learner_id = _resolve_learner_identity(conn, request)
+        job_row = get_generation_job(conn, clean_job_id)
+        if (
+            not job_row
+            or str(job_row.get("learner_id") or LEGACY_LEARNER_ID) != learner_id
+        ):
+            raise HTTPException(status_code=404, detail="job_id not found")
         expire_stale_generation_job(conn, job_id=clean_job_id)
         job_row = get_generation_job(conn, clean_job_id)
-        if not job_row:
+        if (
+            not job_row
+            or str(job_row.get("learner_id") or LEGACY_LEARNER_ID) != learner_id
+        ):
             raise HTTPException(status_code=404, detail="job_id not found")
         return _generation_job_status_payload(conn, job_row)
 
@@ -5583,8 +5857,19 @@ async def generation_stream(request: Request, job_id: str, after_seq: int = 0):
     )
     clean_job_id = str(job_id or "").strip()
     with get_conn(transactional=True) as conn:
+        learner_id = _resolve_learner_identity(conn, request)
+        job_row = get_generation_job(conn, clean_job_id)
+        if (
+            not job_row
+            or str(job_row.get("learner_id") or LEGACY_LEARNER_ID) != learner_id
+        ):
+            raise HTTPException(status_code=404, detail="job_id not found")
         expire_stale_generation_job(conn, job_id=clean_job_id)
-        if not get_generation_job(conn, clean_job_id):
+        job_row = get_generation_job(conn, clean_job_id)
+        if (
+            not job_row
+            or str(job_row.get("learner_id") or LEGACY_LEARNER_ID) != learner_id
+        ):
             raise HTTPException(status_code=404, detail="job_id not found")
 
     async def ndjson_events():
@@ -5644,9 +5929,18 @@ def cancel_generation_job(request: Request, job_id: str):
         limit=GENERATION_JOB_STATUS_RATE_LIMIT_PER_WINDOW,
     )
     with get_conn(transactional=True) as conn:
+        clean_job_id = str(job_id or "").strip()
+        learner_id = _resolve_learner_identity(conn, request)
+        existing_job = get_generation_job(conn, clean_job_id)
+        if (
+            not existing_job
+            or str(existing_job.get("learner_id") or LEGACY_LEARNER_ID)
+            != learner_id
+        ):
+            raise HTTPException(status_code=404, detail="job_id not found")
         job_row = request_generation_cancellation(
             conn,
-            job_id=str(job_id or "").strip(),
+            job_id=clean_job_id,
         )
         if not job_row:
             raise HTTPException(status_code=404, detail="job_id not found")
@@ -6189,7 +6483,7 @@ def feed(
     page: int = 1,
     limit: int = 5,
     autofill: bool = True,
-    prefetch: int = 7,
+    prefetch: int = INITIAL_READY_REEL_TARGET,
     creative_commons_only: bool = False,
     generation_mode: Literal["slow", "fast"] = "slow",
     min_relevance: float | None = None,
@@ -6247,6 +6541,7 @@ def feed(
             material_id=material_id,
             concept_id=None,
             content_fingerprint=content_fingerprint,
+            learner_id=learner_id,
             knowledge_level=knowledge_level,
             generation_mode=generation_mode,
             creative_commons_only=creative_commons_only,
@@ -6271,9 +6566,27 @@ def feed(
         }
         completed_job = find_completed_generation_job(conn, request_key)
         active_job = find_active_generation_job(conn, request_key)
+        latest_compatible_job = _latest_compatible_generation_job(
+            conn,
+            material_id=material_id,
+            learner_id=learner_id,
+            concept_id=None,
+            content_fingerprint=content_fingerprint,
+            request_params=request_params,
+        )
+        latest_status = str((latest_compatible_job or {}).get("status") or "")
+        if latest_status in {"queued", "running"}:
+            active_job = latest_compatible_job
+        elif latest_status in {"completed", "partial", "exhausted"}:
+            completed_job = latest_compatible_job
+            active_job = None
         cross_request_source = False
         cross_request_source_covers_mode = False
-        generation_id = str((completed_job or {}).get("result_generation_id") or "") or None
+        generation_id = (
+            str((latest_compatible_job or completed_job or {}).get("result_generation_id") or "").strip()
+            or str((latest_compatible_job or active_job or {}).get("source_generation_id") or "").strip()
+            or None
+        )
         if generation_id is None:
             head = _fetch_active_generation_row(conn, material_id=material_id, request_key=request_key)
             generation_id = str((head or {}).get("id") or "") or None
@@ -6300,13 +6613,7 @@ def feed(
                         generation_mode=generation_mode,
                     )
                 )
-        ranked = [] if (
-            generation_id is None
-            or (
-                completed_job
-                and str(completed_job.get("status") or "") == "exhausted"
-            )
-        ) else _ranked_request_reels(
+        ranked = [] if generation_id is None else _ranked_request_reels(
             conn,
             material_id=material_id,
             fast_mode=generation_mode == "fast",
@@ -6322,31 +6629,53 @@ def feed(
             learner_id=learner_id,
             exclude_reel_ids=excluded_reels,
         )
-        page_start = (page - 1) * limit
+        legacy_page_start = (page - 1) * limit
+        cursor_reel_ids = set(excluded_reels)
+        cursor_reel_ids.update(
+            _learner_seen_reel_ids(
+                conn,
+                material_id=material_id,
+                learner_id=learner_id,
+            )
+        )
+        removed_cursor_count = _generation_cursor_reel_count(
+            conn,
+            material_id=material_id,
+            generation_id=generation_id,
+            reel_ids=cursor_reel_ids,
+        )
+        page_start = max(
+            0,
+            legacy_page_start - min(legacy_page_start, removed_cursor_count),
+        )
         page_end = page_start + limit
-        sparse = len(ranked) < page_end
-        unseen_ready = max(0, len(ranked) - page_end)
-        material_ready_count = _count_material_ready_reels(conn, material_id)
+        initial_ready_target = min(
+            GENERATION_OUTPUT_CEILINGS[generation_mode],
+            max(limit, prefetch),
+        )
+        initial_reservoir_shortfall = len(ranked) < initial_ready_target
+        fresh_cross_request_budget = bool(
+            cross_request_source
+            and cross_request_source_covers_mode
+            and initial_reservoir_shortfall
+        )
         if (
             autofill
+            and page == 1
             and completed_job is None
+            and active_job is None
             and (
                 (
                     cross_request_source
-                    and (not cross_request_source_covers_mode or not ranked)
+                    and (
+                        not cross_request_source_covers_mode
+                        or initial_reservoir_shortfall
+                    )
                 )
-                or (not cross_request_source and (sparse or unseen_ready <= 4))
+                or (not cross_request_source and initial_reservoir_shortfall)
             )
-            and material_ready_count < MAX_REELS_PER_MATERIAL
         ):
-            target_total = min(
-                GENERATION_OUTPUT_CEILINGS[generation_mode],
-                max(
-                    1,
-                    page_end + 4,
-                    len(ranked) + max(limit, prefetch),
-                ),
-            )
+            target_total = max(1, initial_ready_target)
             try:
                 active_job, _created = _submit_bounded_generation_job(
                     conn,
@@ -6355,7 +6684,11 @@ def feed(
                     request_key=request_key,
                     content_fingerprint=content_fingerprint,
                     learner_id=learner_id,
-                    request_params={**request_params, "num_reels": target_total},
+                    request_params={
+                        **request_params,
+                        "num_reels": target_total,
+                        "fresh_source_budget": fresh_cross_request_budget,
+                    },
                     source_generation_id=generation_id,
                     before_create=lambda: _enforce_rate_limit(
                         request,
@@ -6370,6 +6703,12 @@ def feed(
                 job_submitted = True
         reels = ranked[page_start:page_end]
         reported_job = active_job or completed_job
+        reported_status = str((reported_job or {}).get("status") or "")
+        continuation_token = (
+            str((reported_job or {}).get("id") or "").strip()
+            if reported_status in {"completed", "partial", "exhausted"}
+            else str(_job_request_params(reported_job or {}).get("continuation_token") or "").strip()
+        ) or None
         response = {
             "page": page,
             "limit": limit,
@@ -6379,6 +6718,7 @@ def feed(
             "response_profile": "unified" if generation_id else None,
             "generation_job_id": str((reported_job or {}).get("id") or "") or None,
             "generation_job_status": str((reported_job or {}).get("status") or "") or None,
+            "continuation_token": continuation_token,
             "effective_generation_mode": generation_mode,
             "generation_mode_overridden": False,
             "knowledge_level": knowledge_level,

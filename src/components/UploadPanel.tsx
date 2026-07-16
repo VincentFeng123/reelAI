@@ -7,7 +7,7 @@ import { ingestUrl, isRequestInterruptedError, uploadMaterial } from "@/lib/api"
 import { safeStorageSetItem } from "@/lib/browserStorage";
 import { buildSearchFeedQuery } from "@/lib/feedQuery";
 import { type GenerationMode, type SearchInputMode, readStudyReelsSettings, subscribeToStudyReelsSettings } from "@/lib/settings";
-import type { Reel } from "@/lib/types";
+import { CURRENT_SELECTION_CONTRACT_VERSION, type Reel } from "@/lib/types";
 
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
@@ -15,7 +15,6 @@ const MAX_MATERIAL_SEEDS = 120;
 const MAX_MATERIAL_GROUPS = 80;
 const MAX_SEED_TEXT_CHARS = 16000;
 const INGEST_SENTINEL_MATERIAL_ID = "ingest-scratch";
-const DEFAULT_KNOWLEDGE_LEVEL = "beginner" as const;
 // Must stay in sync with FEED_SESSION_STORAGE_KEY in src/app/feed/page.tsx — both
 // read/write the same localStorage key. Priming the session snapshot here lets the
 // feed page hydrate with ingested reels on mount instead of submitting a durable
@@ -23,12 +22,19 @@ const DEFAULT_KNOWLEDGE_LEVEL = "beginner" as const;
 // no independently searchable material record.
 const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
 type InputMode = SearchInputMode;
+type KnowledgeLevel = "beginner" | "intermediate" | "advanced";
 
 const INPUT_MODE_OPTIONS: Array<{ value: InputMode; label: string }> = [
   { value: "topic", label: "Topic" },
   { value: "source", label: "Text" },
   { value: "file", label: "File Upload" },
   { value: "url", label: "YouTube URL" },
+];
+
+const KNOWLEDGE_LEVEL_OPTIONS: Array<{ value: KnowledgeLevel; label: string }> = [
+  { value: "beginner", label: "Beginner" },
+  { value: "intermediate", label: "Intermediate" },
+  { value: "advanced", label: "Advanced" },
 ];
 
 const INGEST_URL_HOST_ALLOWLIST = new Set([
@@ -81,6 +87,7 @@ function isLikelyIngestUrl(raw: string): boolean {
 type MaterialSeed = {
   topic?: string;
   text?: string;
+  knowledgeLevel?: KnowledgeLevel;
   title: string;
   updatedAt: number;
 };
@@ -121,12 +128,19 @@ function parseMaterialSeeds(raw: string | null): Record<string, MaterialSeed> {
       }
       const seed = value as Record<string, unknown>;
       const title = String(seed.title || "").trim();
+      const storedKnowledgeLevel = String(seed.knowledgeLevel || "").trim();
+      const knowledgeLevel = storedKnowledgeLevel === "beginner"
+        || storedKnowledgeLevel === "intermediate"
+        || storedKnowledgeLevel === "advanced"
+        ? storedKnowledgeLevel
+        : undefined;
       if (!title) {
         continue;
       }
       normalized[id] = {
         topic: String(seed.topic || "").trim() || undefined,
         text: String(seed.text || "").trim() || undefined,
+        knowledgeLevel,
         title,
         updatedAt: Number(seed.updatedAt) || 0,
       };
@@ -201,6 +215,7 @@ type UploadPanelProps = {
  * exactly match `feed/page.tsx` or hydration will silently fail.
  */
 type PrimedFeedSessionSnapshot = {
+  selectionContractVersion: string;
   reels: Reel[];
   page: number;
   total: number;
@@ -238,6 +253,7 @@ function primeFeedSessionSnapshot(
     }
   }
   const snapshot: PrimedFeedSessionSnapshot = {
+    selectionContractVersion: CURRENT_SELECTION_CONTRACT_VERSION,
     reels,
     page: 1,
     total: reels.length,
@@ -295,6 +311,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
   const [file, setFile] = useState<File | undefined>();
   const [reelUrl, setReelUrl] = useState("");
   const [inputMode, setInputMode] = useState<InputMode>("source");
+  const [knowledgeLevel, setKnowledgeLevel] = useState<KnowledgeLevel>("beginner");
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -459,7 +476,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
         // must not orphan successfully-created materials for the others —
         // Promise.all rejects the whole batch and would do exactly that.
         const settled = await Promise.allSettled(
-          topicList.map((topic) => uploadMaterial({ subjectTag: topic, knowledgeLevel: DEFAULT_KNOWLEDGE_LEVEL, signal: controller.signal })),
+          topicList.map((topic) => uploadMaterial({ subjectTag: topic, knowledgeLevel, signal: controller.signal })),
         );
         if (controller.signal.aborted) {
           return;
@@ -486,7 +503,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
           text: textValue || undefined,
           file: fileValue,
           subjectTag: topicValue || undefined,
-          knowledgeLevel: inputMode === "topic" ? DEFAULT_KNOWLEDGE_LEVEL : undefined,
+          knowledgeLevel,
           signal: controller.signal,
         });
         if (controller.signal.aborted) {
@@ -508,6 +525,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
             seeds[materialId] = {
               topic,
               text: undefined,
+              knowledgeLevel,
               title: topic,
               updatedAt: now - index,
             };
@@ -516,6 +534,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
           seeds[primaryMaterialId] = {
             topic: topicValue || undefined,
             text: textValue ? textValue.slice(0, MAX_SEED_TEXT_CHARS) : undefined,
+            knowledgeLevel,
             title,
             updatedAt: now,
           };
@@ -576,7 +595,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
         setLoading(false);
       }
     }
-  }, [active, file, inputMode, onMaterialCreated, reelUrl, router, text, topics]);
+  }, [active, file, inputMode, knowledgeLevel, onMaterialCreated, reelUrl, router, text, topics]);
 
   const onFileDrop = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();
@@ -840,6 +859,40 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
       <div className="relative z-20 mt-6 shrink-0 flex flex-col gap-2 md:mt-6">
         <p className="min-h-5 text-sm text-white/80">{error ?? ""}</p>
         <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+          {inputMode !== "url" ? (
+            <fieldset className="w-full md:w-[19rem]">
+              <legend className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-white/70">
+                Knowledge Level
+              </legend>
+              <div
+                className="grid grid-cols-3 rounded-2xl border border-white/15 bg-white/[0.08] p-1 backdrop-blur-[18px] backdrop-saturate-150"
+              >
+                {KNOWLEDGE_LEVEL_OPTIONS.map((option) => {
+                  const selected = option.value === knowledgeLevel;
+                  return (
+                    <label
+                      key={option.value}
+                      className={`cursor-pointer rounded-xl px-2 py-2 text-center text-[10px] font-semibold uppercase tracking-[0.04em] transition-colors focus-within:ring-2 focus-within:ring-white/70 md:text-[11px] ${
+                        selected
+                          ? "bg-white text-black shadow-[0_4px_18px_rgba(255,255,255,0.12)]"
+                          : "text-white/72 hover:bg-white/[0.07] hover:text-white"
+                      }`}
+                    >
+                      <input
+                        className="sr-only"
+                        type="radio"
+                        name="knowledge-level"
+                        value={option.value}
+                        checked={selected}
+                        onChange={() => setKnowledgeLevel(option.value)}
+                      />
+                      {option.label}
+                    </label>
+                  );
+                })}
+              </div>
+            </fieldset>
+          ) : null}
           <button
             type="submit"
             disabled={disabled}

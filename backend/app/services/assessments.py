@@ -25,9 +25,9 @@ from ..clip_engine.errors import CancellationError, ProviderError
 
 
 COMPLETION_FRACTION = 0.80
-MIN_CADENCE_TARGET = 2
+MIN_CADENCE_TARGET = 3
 MAX_CADENCE_TARGET = 5
-SESSION_QUESTION_TARGET = 2
+SESSION_QUESTION_TARGET = 3
 CONCEPT_ADJUSTMENT_BOUND = 0.25
 BACKFILL_CACHE_PREFIX = "assessment_question_backfill:"
 NEGATIVE_BACKFILL_CACHE_TTL_SECONDS = 30
@@ -282,7 +282,7 @@ class AssessmentService:
         recent_accuracy: float | None,
         scroll_rows: list[dict[str, Any]],
     ) -> int:
-        """Choose a stable 2-5 reel cadence, then adapt it to current evidence."""
+        """Choose a stable 3-5 reel cadence, then adapt it to current evidence."""
         seed = f"{learner_id}|{material_id}|{window_cutoff or 'initial'}"
         digest = hashlib.sha256(seed.encode("utf-8")).digest()
         target = MIN_CADENCE_TARGET + digest[0] % (
@@ -502,22 +502,7 @@ class AssessmentService:
             for row in available
             if str(row.get("reel_id") or "")
         }
-        question_concepts = {
-            str(row.get("concept_id") or "")
-            for row in available
-            if str(row.get("concept_id") or "")
-        }
-        scroll_concepts = {
-            str(row.get("concept_id") or "")
-            for row in scroll_rows
-            if str(row.get("concept_id") or "")
-        }
-        question_target = min(SESSION_QUESTION_TARGET, len(scroll_concepts))
-        question_pool_complete = (
-            question_target > 0
-            and len(question_reels) >= question_target
-            and len(question_concepts) >= question_target
-        )
+        question_pool_complete = len(question_reels) >= SESSION_QUESTION_TARGET
         numeric_due = len(scroll_rows) >= cadence_target
         # Readiness is the durable due state. Question availability is handled
         # separately so a transient provider failure cannot erase that state.
@@ -704,13 +689,17 @@ class AssessmentService:
                 "Every option must be distinct. The explanation must be supported by that clip's transcript. "
                 "Keep each prompt at most 16 words, each option at most 8 words, and each "
                 "explanation one sentence and at most 24 words. "
+                "Use LaTeX only when it improves mathematical clarity; wrap inline math in "
+                "\\( ... \\) and display math in \\[ ... \\]. Because the response is JSON, "
+                "escape every LaTeX backslash in string values (for example, emit `\\\\(` "
+                "for an inline opening delimiter). "
                 "Return JSON only as {\"questions\":[{\"reel_id\":...,\"prompt\":...,"
                 "\"options\":[... exactly four ...],\"correct_index\":0-3,\"explanation\":...}]}"
             ),
             dumps_json({"clips": clips}),
             _BackfillPlan,
             temperature=0.2,
-            model=clipper_config.SEGMENT_MODEL,
+            model=clipper_config.ASSESSMENT_MODEL,
             max_output_tokens=max(2048, min(8192, len(rows) * 700)),
             should_cancel=should_cancel,
         )
@@ -729,6 +718,7 @@ class AssessmentService:
         uncached: list[dict[str, Any]] = []
         satisfied_reels: set[str] = set()
         satisfied_concepts: set[str] = set()
+        satisfied_videos: set[str] = set()
         newest_first = list(reversed(source_rows))
         distinct_concepts: list[dict[str, Any]] = []
         repeated_concepts: list[dict[str, Any]] = []
@@ -740,14 +730,19 @@ class AssessmentService:
                 seen_concepts.add(concept_id)
             else:
                 repeated_concepts.append(row)
-        question_target = min(SESSION_QUESTION_TARGET, len(seen_concepts))
+        question_target = min(
+            SESSION_QUESTION_TARGET,
+            len(
+                {
+                    str(row.get("reel_id") or row.get("id") or "")
+                    for row in source_rows
+                    if str(row.get("reel_id") or row.get("id") or "")
+                }
+            ),
+        )
 
         def pool_complete() -> bool:
-            return (
-                question_target > 0
-                and len(satisfied_reels) >= question_target
-                and len(satisfied_concepts) >= question_target
-            )
+            return question_target > 0 and len(satisfied_reels) >= question_target
 
         candidates: list[dict[str, Any]] = []
         for row in [*distinct_concepts, *repeated_concepts]:
@@ -761,6 +756,7 @@ class AssessmentService:
             if existing:
                 satisfied_reels.add(str(row["reel_id"]))
                 satisfied_concepts.add(str(row.get("concept_id") or ""))
+                satisfied_videos.add(str(row.get("video_id") or ""))
                 continue
             candidates.append({**row, "fingerprint": fingerprint})
         if pool_complete():
@@ -768,7 +764,10 @@ class AssessmentService:
 
         candidates.sort(
             key=lambda row: (
+                int(str(row.get("concept_id") or "") not in satisfied_concepts)
+                + int(str(row.get("video_id") or "") not in satisfied_videos),
                 int(str(row.get("concept_id") or "") not in satisfied_concepts),
+                int(str(row.get("video_id") or "") not in satisfied_videos),
                 str(row.get("scrolled_at") or ""),
             ),
             reverse=True,
@@ -793,6 +792,7 @@ class AssessmentService:
                     if stored:
                         satisfied_reels.add(str(row["reel_id"]))
                         satisfied_concepts.add(str(row.get("concept_id") or ""))
+                        satisfied_videos.add(str(row.get("video_id") or ""))
                         if pool_complete():
                             return
                 continue
@@ -800,13 +800,7 @@ class AssessmentService:
             projected_reels = satisfied_reels | {
                 str(candidate.get("reel_id") or "") for candidate in uncached
             }
-            projected_concepts = satisfied_concepts | {
-                str(candidate.get("concept_id") or "") for candidate in uncached
-            }
-            if (
-                len(projected_reels) >= question_target
-                and len(projected_concepts) >= question_target
-            ):
+            if len(projected_reels) >= question_target:
                 break
         if not uncached:
             return
@@ -872,36 +866,36 @@ class AssessmentService:
             for row in state["available_questions"]
             if str(row.get("reel_id") or "")
         }
-        distinct_concepts = {
-            str(row.get("concept_id") or "")
-            for row in state["available_questions"]
-            if str(row.get("concept_id") or "")
-        }
-        return min(
-            SESSION_QUESTION_TARGET,
-            len(distinct_reels),
-            len(distinct_concepts),
-        )
+        return min(SESSION_QUESTION_TARGET, len(distinct_reels))
 
     @staticmethod
-    def _select_questions(rows: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
+    def _select_questions(
+        rows: list[dict[str, Any]],
+        count: int,
+        *,
+        existing_concepts: set[str] | None = None,
+        existing_reels: set[str] | None = None,
+        existing_videos: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         remaining = list(rows)
         chosen: list[dict[str, Any]] = []
-        concepts: set[str] = set()
-        reels: set[str] = set()
-        videos: set[str] = set()
+        concepts = set(existing_concepts or ())
+        reels = set(existing_reels or ())
+        videos = set(existing_videos or ())
         while remaining and len(chosen) < count:
             distinct_rows = [
                 row
                 for row in remaining
                 if str(row.get("reel_id") or "") not in reels
-                and str(row.get("concept_id") or "") not in concepts
             ]
             if not distinct_rows:
                 break
             best = max(
                 distinct_rows,
                 key=lambda row: (
+                    int(str(row.get("concept_id") or "") not in concepts)
+                    + int(str(row.get("video_id") or "") not in videos),
+                    int(str(row.get("concept_id") or "") not in concepts),
                     int(str(row.get("video_id") or "") not in videos),
                     str(row.get("scrolled_at") or ""),
                     str(row.get("id") or ""),
@@ -914,9 +908,102 @@ class AssessmentService:
             videos.add(str(best.get("video_id") or ""))
         return chosen
 
+    @staticmethod
+    def _pending_question_rows(conn: Any, session_id: str) -> list[dict[str, Any]]:
+        return fetch_all(
+            conn,
+            """
+            SELECT
+                sq.position,
+                q.id,
+                q.reel_id,
+                r.concept_id,
+                r.video_id
+            FROM assessment_session_questions sq
+            JOIN reel_assessment_questions q ON q.id = sq.question_id
+            JOIN reels r ON r.id = q.reel_id
+            WHERE sq.session_id = ?
+            ORDER BY sq.position ASC
+            """,
+            (session_id,),
+        )
+
+    def _repair_pending_session(
+        self,
+        conn: Any,
+        *,
+        state: dict[str, Any],
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any] | None:
+        pending = state.get("pending")
+        if not pending:
+            return None
+        session_id = str(pending["id"])
+        existing = self._pending_question_rows(conn, session_id)
+        if len(existing) >= SESSION_QUESTION_TARGET:
+            if int(pending.get("question_count") or 0) != len(existing):
+                execute_modify(
+                    conn,
+                    "UPDATE assessment_sessions SET question_count = ?, updated_at = ? WHERE id = ?",
+                    (len(existing), now_iso(), session_id),
+                )
+            return fetch_one(
+                conn, "SELECT * FROM assessment_sessions WHERE id = ?", (session_id,)
+            )
+
+        needed = SESSION_QUESTION_TARGET - len(existing)
+        additions = self._select_questions(
+            state["available_questions"],
+            needed,
+            existing_concepts={str(row.get("concept_id") or "") for row in existing},
+            existing_reels={str(row.get("reel_id") or "") for row in existing},
+            existing_videos={str(row.get("video_id") or "") for row in existing},
+        )
+        if len(additions) != needed:
+            return pending
+
+        _check_cancelled(should_cancel)
+        with _atomic_write(conn):
+            for offset, question in enumerate(additions, start=len(existing)):
+                _check_cancelled(should_cancel)
+                execute_modify(
+                    conn,
+                    """
+                    INSERT INTO assessment_session_questions (session_id, question_id, position)
+                    VALUES (?, ?, ?)
+                    """,
+                    (session_id, question["id"], offset),
+                )
+            _check_cancelled(should_cancel)
+            execute_modify(
+                conn,
+                """
+                UPDATE assessment_sessions
+                SET question_count = ?, updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (SESSION_QUESTION_TARGET, now_iso(), session_id),
+            )
+        return fetch_one(
+            conn, "SELECT * FROM assessment_sessions WHERE id = ?", (session_id,)
+        )
+
+    def _exposable_pending_session(
+        self, conn: Any, pending: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        session = self._serialize_session(conn, pending)
+        if (
+            session
+            and len(session["questions"]) >= SESSION_QUESTION_TARGET
+            and int(session["question_count"]) == len(session["questions"])
+        ):
+            return session
+        return None
+
     def pending(self, conn: Any, *, learner_id: str, material_id: str) -> dict[str, Any]:
         state = self._readiness_state(conn, learner_id, material_id)
-        session = self._serialize_session(conn, state["pending"]) if state["pending"] else None
+        pending = self._repair_pending_session(conn, state=state)
+        session = self._exposable_pending_session(conn, pending)
         return {
             "status": "pending" if session else "none",
             "assessment_ready": bool(session or state["assessment_ready"]),
@@ -935,10 +1022,31 @@ class AssessmentService:
     ) -> dict[str, Any]:
         state = self._readiness_state(conn, learner_id, material_id)
         if state["pending"]:
+            if not self._exposable_pending_session(conn, state["pending"]):
+                self._ensure_question_pool(
+                    conn,
+                    learner_id=learner_id,
+                    material_id=material_id,
+                    source_rows=state["scroll_rows"],
+                    should_cancel=should_cancel,
+                )
+                state = self._readiness_state(conn, learner_id, material_id)
+                state["pending"] = self._repair_pending_session(
+                    conn, state=state, should_cancel=should_cancel
+                )
+            session = self._exposable_pending_session(conn, state["pending"])
+            if not session:
+                return {
+                    "status": "not_ready",
+                    "assessment_ready": True,
+                    "session": None,
+                    "recent_accuracy": state["recent_accuracy"],
+                    "rolling_accuracy": state["rolling_accuracy"],
+                }
             return {
                 "status": "pending",
                 "assessment_ready": True,
-                "session": self._serialize_session(conn, state["pending"]),
+                "session": session,
                 "recent_accuracy": state["recent_accuracy"],
                 "rolling_accuracy": state["rolling_accuracy"],
             }
@@ -964,7 +1072,7 @@ class AssessmentService:
             }
         count = self._desired_question_count(conn, state)
         selected = self._select_questions(state["available_questions"], count)
-        if not selected:
+        if len(selected) != SESSION_QUESTION_TARGET:
             return {
                 "status": "not_ready",
                 "assessment_ready": bool(state["numeric_due"]),
@@ -1356,6 +1464,17 @@ class AssessmentService:
         if not existing:
             if str(session.get("status") or "") != "pending":
                 raise ValueError("assessment session is not pending")
+            state = self._readiness_state(
+                conn,
+                learner_id,
+                str(session.get("material_id") or ""),
+            )
+            repaired = self._repair_pending_session(conn, state=state)
+            if not self._exposable_pending_session(conn, repaired):
+                raise ValueError(
+                    "assessment session must contain at least three questions"
+                )
+            session = repaired or session
             expected = fetch_one(
                 conn,
                 """

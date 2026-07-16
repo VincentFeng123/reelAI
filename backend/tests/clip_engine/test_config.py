@@ -25,6 +25,27 @@ def test_segment_model_defaults_to_flash_with_pro_fallback(monkeypatch):
     assert cfg.SEGMENT_FALLBACK_MODEL == cfg.TOPIC_MODEL
 
 
+def test_assessment_model_stays_flash_when_shared_or_assessment_models_are_pro(
+    monkeypatch,
+):
+    with monkeypatch.context() as patch:
+        patch.setenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
+        patch.setenv("SEGMENT_MODEL", "gemini-3.1-pro-preview")
+        patch.delenv("ASSESSMENT_MODEL", raising=False)
+        cfg = importlib.reload(importlib.import_module("backend.app.clip_engine.config"))
+        assert cfg.ASSESSMENT_MODEL == "gemini-3.5-flash"
+
+        patch.setenv("ASSESSMENT_MODEL", "gemini-3.1-pro-preview")
+        cfg = importlib.reload(cfg)
+        assert cfg.ASSESSMENT_MODEL == "gemini-3.5-flash"
+
+        patch.setenv("ASSESSMENT_MODEL", "gemini-3.1-flash-lite")
+        cfg = importlib.reload(cfg)
+        assert cfg.ASSESSMENT_MODEL == "gemini-3.1-flash-lite"
+
+    importlib.reload(cfg)
+
+
 def test_curation_gate_defaults(monkeypatch):
     monkeypatch.delenv("SEGMENT_MAX_CLIP_S", raising=False)
     monkeypatch.delenv("SEGMENT_INFORMATIVENESS_MIN", raising=False)

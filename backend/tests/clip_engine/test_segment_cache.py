@@ -71,7 +71,7 @@ def _key(transcript: dict, settings: dict | None = None, *, topic: str = "physic
 def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> None:
     transcript = _transcript()
     baseline = _key(transcript)
-    assert baseline.startswith("clip-segmentation:quality_silence_v32:v22:")
+    assert baseline.startswith("clip-segmentation:quality_silence_v33:v32:")
 
     changed_text = deepcopy(transcript)
     changed_text["segments"][0]["text"] = "changed lesson"
@@ -102,10 +102,24 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
         transcript,
         {"segment_enrich_clips": False},
     )
-    assert _key(transcript, {"_segment_routing_mode": "flash_only"}) == baseline
-    assert _key(transcript, {"_knowledge_level": "beginner"}) == _key(
+    assert _key(transcript, {"_segment_routing_mode": "flash_only"}) != baseline
+    assert _key(transcript, {"_segment_thinking_level": "low"}) != baseline
+    assert _key(transcript, {"_knowledge_level": "beginner"}) != _key(
         transcript, {"_knowledge_level": "advanced"},
     )
+    grounded = {
+        "_segment_video_grounding_required": True,
+        "_segment_video_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "_segment_media_resolution": "low",
+    }
+    assert _key(transcript, grounded) != baseline
+    assert _key(
+        transcript,
+        {
+            **grounded,
+            "_segment_video_url": "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+        },
+    ) != _key(transcript, grounded)
 
     original_primary = segment_cache.pipeline_config.SEGMENT_FLASH_MODEL
     monkeypatch.setattr(segment_cache.pipeline_config, "SEGMENT_FLASH_MODEL", "new-model")
@@ -117,6 +131,12 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
         segment_cache.pipeline_config,
         "SEGMENT_FLASH_FALLBACK_MODEL",
         "new-fallback-model",
+    )
+    assert _key(transcript) != baseline
+    monkeypatch.setattr(
+        segment_cache.pipeline_config,
+        "SEGMENT_PRO_MODEL",
+        "new-pro-model",
     )
     assert _key(transcript) != baseline
 

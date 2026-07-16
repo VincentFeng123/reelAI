@@ -90,7 +90,6 @@ STRICT_WORD_BOUNDARY_POST_ROLL_SEC = 0.08
 # first-result latency bounded.
 MATERIAL_MAX_VIDEOS_PER_CONCEPT = 5
 MATERIAL_GEN_MAX_VIDEOS = 12
-MATERIAL_REEL_INVENTORY_LIMIT = 300
 
 
 # A2: ratio-based auto-punctuation gate. Restoration fires on transcripts
@@ -1218,8 +1217,9 @@ class ReelService:
     # v37: require the v30 direct-URL selection contract.
     # v38: require the v31 repeated-caption boundary contract.
     # v39: require the v32 post-closure edge-preview contract.
-    RANKED_FEED_CACHE_VERSION = 39
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v32"
+    # v40: require the v33 grounded atomic-claim selector contract.
+    RANKED_FEED_CACHE_VERSION = 40
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v33"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
         "quality_silence_v4",
@@ -1251,6 +1251,7 @@ class ReelService:
         "quality_silence_v30",
         "quality_silence_v31",
         "quality_silence_v32",
+        "quality_silence_v33",
     })
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
@@ -1875,17 +1876,15 @@ class ReelService:
                 )
         generated: list[dict[str, Any]] = []
         accumulated_exclusions: list[str] = list(exclude_video_ids or [])
-        # Finding #3: exclude videos we've already clipped for this generation and
-        # videos from the excluded prior generations (exclude_generation_ids) so
-        # refinement/extension doesn't re-pay the engine to re-discover + re-clip the
-        # same videos. `existing_video_counts` aggregates both scans; rows carry
-        # `yt:`-prefixed ids while discover matches BARE ids, so normalize.
-        _already_excluded = set(accumulated_exclusions)
-        for _prior_video_id in existing_video_counts:
-            _bare = str(_prior_video_id or "").strip().split(":", 1)[-1]
-            if _bare and _bare not in _already_excluded:
-                accumulated_exclusions.append(_bare)
-                _already_excluded.add(_bare)
+        # Prior source videos are consumed provider pages, not user-requested
+        # bans. Their unseen sibling ranges remain reusable from the persisted
+        # generation chain; discovery walks past them only when fresh analysis
+        # is needed.
+        consumed_discovery_video_ids = {
+            str(video_id or "").strip().split(":", 1)[-1]
+            for video_id in existing_video_counts
+            if str(video_id or "").strip()
+        }
         # The user's actual topic (root concept) always gets the first tranche of
         # the video budget: _order_concepts sorts by (mastery, reel_count, ...) so
         # once the root has reels it sinks behind fresh wiki subtopics, starving
@@ -1916,25 +1915,6 @@ class ReelService:
             raise_if_cancelled()
             if new_reel_limit is not None and len(generated) >= new_reel_limit:
                 break
-            # Persistence is never truncated by the requested response page;
-            # only the material-wide inventory ceiling and provider budgets bound it.
-            material_reel_count = int(
-                (
-                    fetch_one(
-                        conn,
-                        "SELECT COUNT(*) AS reel_count FROM reels WHERE material_id = ?",
-                        (material_id,),
-                    )
-                    or {}
-                ).get("reel_count")
-                or 0
-            )
-            remaining_reel_capacity = max(
-                0,
-                MATERIAL_REEL_INVENTORY_LIMIT - material_reel_count,
-            )
-            if remaining_reel_capacity <= 0:
-                break
             if videos_processed >= generation_video_limit:
                 break
             topic = self._concept_topic_query(
@@ -1958,10 +1938,7 @@ class ReelService:
                     else max(3, num_reels - len(generated)) + 2
                 )
             )
-            ingest_reel_cap = min(
-                remaining_reel_capacity,
-                max(0, surface_reel_capacity),
-            )
+            ingest_reel_cap = max(0, surface_reel_capacity)
             if ingest_reel_cap <= 0:
                 break
 
@@ -1989,6 +1966,7 @@ class ReelService:
                     concept_id=concept["id"],
                     generation_id=generation_id,
                     exclude_video_ids=accumulated_exclusions,
+                    consumed_video_ids=sorted(consumed_discovery_video_ids),
                     target_clip_duration_sec=safe_target_clip_duration,
                     target_clip_duration_min_sec=clip_min_len,
                     target_clip_duration_max_sec=clip_max_len,
@@ -1996,7 +1974,7 @@ class ReelService:
                     knowledge_level=material_knowledge_level,
                     max_videos=video_budget,
                     max_reels=ingest_reel_cap,
-                    max_persisted_reels=remaining_reel_capacity,
+                    max_persisted_reels=None,
                     on_reel_created=(None if dry_run else _stream),
                     dry_run=dry_run,
                     should_cancel=should_cancel,
@@ -2042,7 +2020,11 @@ class ReelService:
                     concept.get("id"),
                 )
                 continue
-            accumulated_exclusions.extend(resolved_ids)
+            consumed_discovery_video_ids.update(
+                str(video_id or "").strip().split(":", 1)[-1]
+                for video_id in resolved_ids
+                if str(video_id or "").strip()
+            )
             if retrieved_video_ids is not None:
                 retrieved_video_ids.update(
                     str(video_id or "").strip().split(":", 1)[-1]
@@ -2520,6 +2502,7 @@ class ReelService:
                 "quality_silence_v30",
                 "quality_silence_v31",
                 "quality_silence_v32",
+                "quality_silence_v33",
             }
             for reel in generated
         ):
@@ -5868,6 +5851,7 @@ class ReelService:
                 "quality_silence_v30",
                 "quality_silence_v31",
                 "quality_silence_v32",
+                "quality_silence_v33",
             },
         )
         metadata["_selection_substantive"] = selection_bool(
@@ -5904,6 +5888,7 @@ class ReelService:
                 "quality_silence_v30",
                 "quality_silence_v31",
                 "quality_silence_v32",
+                "quality_silence_v33",
             },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
@@ -7412,6 +7397,7 @@ class ReelService:
                     "quality_silence_v30",
                     "quality_silence_v31",
                     "quality_silence_v32",
+                    "quality_silence_v33",
                 }
                 else legacy_difficulty_matches_level
             )
@@ -7435,7 +7421,8 @@ class ReelService:
             )
             if require_verified_boundaries:
                 if (
-                    boundary_status not in {"verified", "context_aligned"}
+                    boundary_status != "verified"
+                    or selection_metadata.get("_selection_acoustic_verified") is not True
                     or selection_metadata.get("_selection_boundary_usable") is not True
                     or (
                         selection_version
@@ -7468,6 +7455,7 @@ class ReelService:
                             "quality_silence_v30",
                             "quality_silence_v31",
                             "quality_silence_v32",
+                            "quality_silence_v33",
                         }
                         and selection_metadata.get(
                             "_selection_speech_corridor_verified"
@@ -7510,6 +7498,7 @@ class ReelService:
                     "quality_silence_v30",
                     "quality_silence_v31",
                     "quality_silence_v32",
+                    "quality_silence_v33",
                 } and (
                     (
                         min(
@@ -7553,6 +7542,7 @@ class ReelService:
                             "quality_silence_v30",
                             "quality_silence_v31",
                             "quality_silence_v32",
+                            "quality_silence_v33",
                         }
                         else self._selection_number(
                             selection_metadata.get("_selection_topic_relevance"), 0.0
@@ -7905,6 +7895,7 @@ class ReelService:
                 "quality_silence_v30",
                 "quality_silence_v31",
                 "quality_silence_v32",
+                "quality_silence_v33",
             }:
                 # V5+ captions must be immutable selection-time evidence. A
                 # provider artifact key identifies a retrieval profile and may
@@ -7952,6 +7943,7 @@ class ReelService:
                         "quality_silence_v30",
                         "quality_silence_v31",
                         "quality_silence_v32",
+                        "quality_silence_v33",
                     }
                     or transcript_artifact_key
                     else str(clean_item.get("transcript_snippet") or "")

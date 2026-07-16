@@ -660,6 +660,7 @@ def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
         end_line=0,
         start_quote="Alpha lesson defines the concept",
         end_quote="closes with a clear conclusion",
+        claim_quote="Alpha lesson defines the concept completely",
         title="Alpha lesson",
         learning_objective="Understand the complete alpha lesson.",
         facet="alpha",
@@ -1102,7 +1103,7 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
     (G.FLASH_SPLIT_PROFILE,
          ("low", 6_000, 20.0, "flash_boundary_selector", "gemini-3.5-flash", 0)),
     (G.PRO_BOUNDARY_PROFILE,
-         ("high", 6_000, 90.0, "pro_fallback", "gemini-3.1-pro-preview", 0)),
+         ("medium", 6_000, 90.0, "pro_fallback", "gemini-3.1-pro-preview", 0)),
     ],
 )
 def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, expected):
@@ -1555,6 +1556,25 @@ def test_flash_lite_failover_cost_uses_its_lower_rates():
         "candidate_tokens": 100_000,
         "thought_tokens": 50_000,
     }) == pytest.approx(0.475)
+
+
+@pytest.mark.parametrize(
+    ("prompt_tokens", "input_rate", "output_rate"),
+    [(200_000, 2.0, 12.0), (200_001, 4.0, 18.0)],
+)
+def test_pro_telemetry_cost_uses_long_context_tier(
+    prompt_tokens,
+    input_rate,
+    output_rate,
+):
+    assert G._model_cost({
+        "model": "gemini-3.1-pro-preview",
+        "prompt_tokens": prompt_tokens,
+        "candidate_tokens": 100,
+        "thought_tokens": 50,
+    }) == pytest.approx(
+        (prompt_tokens * input_rate + 150 * output_rate) / 1_000_000.0
+    )
 
 
 def test_cancelled_worker_never_publishes_late_boundary_or_done_progress(monkeypatch):

@@ -210,6 +210,7 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
             material_id="material-1",
             concept_id="concept-1",
             content_fingerprint=fingerprint,
+            learner_id="learner-1",
             knowledge_level="beginner",
             generation_mode="slow",
             creative_commons_only=False,
@@ -222,6 +223,7 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
             material_id="material-1",
             concept_id="concept-1",
             content_fingerprint=fingerprint,
+            learner_id="learner-1",
             knowledge_level="advanced",
             generation_mode="slow",
             creative_commons_only=False,
@@ -236,6 +238,7 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
             material_id="material-1",
             concept_id="concept-1",
             content_fingerprint=fingerprint,
+            learner_id="learner-1",
             knowledge_level="beginner",
             generation_mode="slow",
             creative_commons_only=False,
@@ -250,6 +253,7 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
             material_id="material-1",
             concept_id="concept-1",
             content_fingerprint=fingerprint,
+            learner_id="learner-1",
             knowledge_level="beginner",
             generation_mode="slow",
             creative_commons_only=False,
@@ -265,6 +269,7 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
             material_id="material-1",
             concept_id="concept-1",
             content_fingerprint=fingerprint,
+            learner_id="learner-1",
             knowledge_level="beginner",
             generation_mode="slow",
             creative_commons_only=False,
@@ -278,6 +283,7 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
             material_id="material-1",
             concept_id="concept-1",
             content_fingerprint=fingerprint,
+            learner_id="learner-1",
             knowledge_level="beginner",
             generation_mode="slow",
             creative_commons_only=False,
@@ -289,6 +295,67 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
         )
         assert excluded_source != base
         assert reordered_exclusions == excluded_source
+
+        continued_batch = jobs.build_request_key(
+            material_id="material-1",
+            concept_id="concept-1",
+            content_fingerprint=fingerprint,
+            learner_id="learner-1",
+            knowledge_level="beginner",
+            generation_mode="slow",
+            creative_commons_only=False,
+            source_duration="medium",
+            target_clip_duration_sec=55,
+            target_clip_duration_min_sec=20,
+            target_clip_duration_max_sec=55,
+            continuation_token="job-batch-1",
+        )
+        repeated_continuation = jobs.build_request_key(
+            material_id="material-1",
+            concept_id="concept-1",
+            content_fingerprint=fingerprint,
+            learner_id="learner-1",
+            knowledge_level="beginner",
+            generation_mode="slow",
+            creative_commons_only=False,
+            source_duration="medium",
+            target_clip_duration_sec=999,
+            target_clip_duration_min_sec=-10,
+            target_clip_duration_max_sec=1,
+            continuation_token=" job-batch-1 ",
+        )
+        next_batch = jobs.build_request_key(
+            material_id="material-1",
+            concept_id="concept-1",
+            content_fingerprint=fingerprint,
+            learner_id="learner-1",
+            knowledge_level="beginner",
+            generation_mode="slow",
+            creative_commons_only=False,
+            source_duration="medium",
+            target_clip_duration_sec=55,
+            target_clip_duration_min_sec=20,
+            target_clip_duration_max_sec=55,
+            continuation_token="job-batch-2",
+        )
+        assert continued_batch != base
+        assert repeated_continuation == continued_batch
+        assert next_batch != continued_batch
+
+        other_learner = jobs.build_request_key(
+            material_id="material-1",
+            concept_id="concept-1",
+            content_fingerprint=fingerprint,
+            learner_id="learner-2",
+            knowledge_level="beginner",
+            generation_mode="slow",
+            creative_commons_only=False,
+            source_duration="medium",
+            target_clip_duration_sec=55,
+            target_clip_duration_min_sec=20,
+            target_clip_duration_max_sec=55,
+        )
+        assert other_learner != base
 
         conn.execute("UPDATE concepts SET summary = 'Changed content' WHERE id = 'concept-1'")
         assert jobs.material_content_fingerprint(conn, "material-1", "concept-1") != fingerprint
@@ -316,6 +383,7 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
         "quality_silence_v29",
         "quality_silence_v30",
         "quality_silence_v31",
+        "quality_silence_v32",
     ],
 )
 def test_request_key_version_invalidates_stale_inventory(
@@ -326,6 +394,7 @@ def test_request_key_version_invalidates_stale_inventory(
         "material_id": "material-1",
         "concept_id": "concept-1",
         "content_fingerprint": "fingerprint-1",
+        "learner_id": "learner-1",
         "knowledge_level": "beginner",
         "generation_mode": "slow",
         "creative_commons_only": False,
@@ -334,7 +403,7 @@ def test_request_key_version_invalidates_stale_inventory(
         "target_clip_duration_min_sec": 20,
         "target_clip_duration_max_sec": 55,
     }
-    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v32"
+    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v33"
     verified_key = jobs.build_request_key(**params)
     monkeypatch.setattr(jobs, "REQUEST_SCHEMA_VERSION", stale_version)
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import random
+import re
 import threading
 import time
 from collections.abc import Mapping
@@ -334,7 +335,7 @@ def _gemini3_json_schema(schema) -> dict:
 
 def generate_json_v3(
     system: str,
-    user: str,
+    user: str | list,
     schema,
     *,
     model: str,
@@ -601,6 +602,36 @@ def image_part(jpeg_bytes: bytes):
 def text_part(text: str):
     """A Gemini text Part."""
     return types.Part.from_text(text=text)
+
+
+def youtube_video_part(url: str, *, end_offset_sec: float | None = None):
+    """A bounded Gemini FileData Part for one canonical public YouTube video."""
+    canonical_url = str(url or "").strip()
+    if re.fullmatch(
+        r"https://www\.youtube\.com/watch\?v=[A-Za-z0-9_-]{11}",
+        canonical_url,
+    ) is None:
+        raise ValueError("expected a canonical public YouTube watch URL")
+    video_metadata = None
+    if end_offset_sec is not None:
+        try:
+            end = float(end_offset_sec)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("video end offset must be a positive finite number") from exc
+        if not math.isfinite(end) or end <= 0.0:
+            raise ValueError("video end offset must be a positive finite number")
+        try:
+            bounded_end = math.ceil(end * 1_000.0) / 1_000.0
+        except OverflowError as exc:
+            raise ValueError(
+                "video end offset must be a positive finite number"
+            ) from exc
+        end_offset = f"{bounded_end:.3f}".rstrip("0").rstrip(".") + "s"
+        video_metadata = types.VideoMetadata(end_offset=end_offset)
+    return types.Part(
+        file_data=types.FileData(file_uri=canonical_url),
+        video_metadata=video_metadata,
+    )
 
 
 # ── video (Wave 4 edge-probe / render-audit) ─────────────────────────────────

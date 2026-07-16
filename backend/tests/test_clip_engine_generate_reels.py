@@ -882,7 +882,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertEqual(len(feed), 2)
         self.assertTrue(all(
-            reel.get("selection_contract_version") == "quality_silence_v32"
+            reel.get("selection_contract_version") == "quality_silence_v33"
             for reel in feed
         ))
 
@@ -1049,7 +1049,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             service._normalize_retrieval_profile("bootstrap"), "bootstrap"
         )
 
-    def test_material_inventory_never_exceeds_300_reels(self) -> None:
+    def test_new_batch_can_extend_material_inventory_beyond_legacy_cap(self) -> None:
         existing_video_id = "inventory-video"
         with db_module.get_conn(transactional=True) as conn:
             conn.execute(
@@ -1098,8 +1098,8 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 "SELECT COUNT(*) AS count FROM reels WHERE generation_id = ?",
                 ("gen-inventory-limit",),
             )
-        self.assertEqual(int(total["count"]), 300)
-        self.assertEqual(int(added["count"]), 1)
+        self.assertEqual(int(total["count"]), 301)
+        self.assertEqual(int(added["count"]), 2)
 
     # ------------------------------------------------------------------ #
     # Complete teaching spans are not rejected because of their duration.
@@ -1166,9 +1166,9 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertEqual(len(rows), 0)
 
     # ------------------------------------------------------------------ #
-    # Finding #3: refinement/extension excludes prior-generation video ids
+    # Continuations consume prior provider sources without banning their clips.
     # ------------------------------------------------------------------ #
-    def test_excludes_prior_generation_video_ids_from_discover(self) -> None:
+    def test_prior_generation_sources_are_consumed_not_user_excluded(self) -> None:
         search, _run = self._patched_engine(_multi_clip_engine_out())
 
         # gen-1: persist reels for VIDEO_ID (stored as yt:<id>).
@@ -1189,7 +1189,8 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
 
         search.discover.reset_mock()
 
-        # gen-2 excludes gen-1 → discover must receive gen-1's BARE video id.
+        # The prior source advances provider discovery, while clip-level novelty
+        # still permits unseen sibling ranges from that same video.
         with db_module.get_conn() as conn:
             main_module.reel_service.generate_reels(
                 conn,
@@ -1202,9 +1203,11 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
 
         self.assertTrue(search.discover.called)
-        passed = search.discover.call_args.kwargs.get("exclude_video_ids") or []
-        self.assertIn(VIDEO_ID, passed)
-        self.assertNotIn(f"yt:{VIDEO_ID}", passed)
+        excluded = search.discover.call_args.kwargs.get("exclude_video_ids") or []
+        consumed = search.discover.call_args.kwargs.get("consumed_video_ids") or []
+        self.assertNotIn(VIDEO_ID, excluded)
+        self.assertIn(VIDEO_ID, consumed)
+        self.assertNotIn(f"yt:{VIDEO_ID}", consumed)
 
     # ------------------------------------------------------------------ #
     # Finding #4a: one concept's engine failure must not abort the run
@@ -1351,10 +1354,10 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
     def test_cache_version_includes_recall_and_stored_details(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 39)
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 40)
         self.assertEqual(
             main_module.reel_service.RANKED_FEED_CACHE_CONTRACT_VERSION,
-            "quality_silence_v32",
+            "quality_silence_v33",
         )
         self.assertIn(
             "quality_silence_v27",
@@ -1378,6 +1381,10 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         )
         self.assertIn(
             "quality_silence_v32",
+            main_module.reel_service.DIFFICULTY_FALLBACK_CONTRACTS,
+        )
+        self.assertIn(
+            "quality_silence_v33",
             main_module.reel_service.DIFFICULTY_FALLBACK_CONTRACTS,
         )
 

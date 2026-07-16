@@ -80,6 +80,34 @@ class RankedExclusionNormalizationTests(unittest.TestCase):
             "both the bare legacy row and the prefixed clip-engine row must be excluded",
         )
 
+    def test_server_progress_excludes_reels_the_learner_already_scrolled(self) -> None:
+        ranked = [
+            {"video_id": "yt:SOURCEONE01", "reel_id": "r-seen"},
+            {"video_id": "yt:SOURCEONE01", "reel_id": "r-unseen-sibling"},
+        ]
+        with (
+            mock.patch.object(main_module.reel_service, "ranked_feed", return_value=ranked),
+            mock.patch.object(main_module, "_shape_request_page_reels", side_effect=lambda r, **kw: r),
+            mock.patch.object(main_module, "_learner_seen_reel_ids", return_value={"r-seen"}),
+            db_module.get_conn() as conn,
+        ):
+            result = main_module._ranked_request_reels(
+                conn,
+                material_id="mat-seen",
+                fast_mode=False,
+                generation_id=None,
+                min_relevance=None,
+                preferred_video_duration="any",
+                target_clip_duration_sec=0,
+                target_clip_duration_min_sec=None,
+                target_clip_duration_max_sec=None,
+                learner_id="learner-seen",
+                page=1,
+                limit=5,
+            )
+
+        self.assertEqual([row["reel_id"] for row in result], ["r-unseen-sibling"])
+
     def test_reel_exclusion_keeps_other_clips_from_same_source(self) -> None:
         ranked = [
             {"video_id": "yt:SAMEVIDEO1", "reel_id": "r-watched", "t_start": 10.0, "t_end": 30.0},

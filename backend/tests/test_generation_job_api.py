@@ -42,8 +42,8 @@ def test_fresh_inventory_and_selector_cache_share_current_contract() -> None:
         main.SELECTION_CONTRACT_VERSION,
         generation_jobs.REQUEST_SCHEMA_VERSION,
         ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
-    } == {"quality_silence_v32"}
-    assert segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v32"
+    } == {"quality_silence_v33"}
+    assert segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v33"
     assert "quality_silence_v18" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v19" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v20" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
@@ -59,6 +59,7 @@ def test_fresh_inventory_and_selector_cache_share_current_contract() -> None:
     assert "quality_silence_v30" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v31" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v32" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
+    assert "quality_silence_v33" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
 
 
 def test_reel_response_schema_retains_v3_source_and_selector_metadata() -> None:
@@ -158,7 +159,7 @@ def _insert_generation_reel(
             json.dumps({
                 "surface_eligible": True,
                 "boundary_status": "verified",
-                "selection_contract_version": "quality_silence_v32",
+                "selection_contract_version": "quality_silence_v33",
                 "speech_corridor_verified": True,
                 "directly_teaches_topic": True,
                 "substantive": True,
@@ -192,7 +193,7 @@ def _insert_generation_reel(
         "video_id": video_id,
         "t_start": 0.0,
         "t_end": 30.0,
-        "selection_contract_version": "quality_silence_v32",
+        "selection_contract_version": "quality_silence_v33",
     }
 
 
@@ -259,7 +260,7 @@ def _set_reel_boundary_state(
                 "speech_corridor_verified": True,
                 "selection_caption_cues": caption_cues,
                 "boundary_diagnostics": boundary_diagnostics,
-                "selection_contract_version": "quality_silence_v32",
+                "selection_contract_version": "quality_silence_v33",
                 "directly_teaches_topic": True,
                 "substantive": True,
                 "factually_grounded": True,
@@ -330,7 +331,7 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
             "takeaways": [],
             "score": 0.93,
             "relevance_score": 0.13,
-            "_selection_contract_version": "quality_silence_v32",
+            "_selection_contract_version": "quality_silence_v33",
             "_selection_topic_relevance": 0.93,
             "_selection_source_rank": 0,
         }],
@@ -352,10 +353,62 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
 
         assert len(reels) == 1
         assert reels[0]["video_id"] == "AbCdEf12345"
-        assert reels[0]["selection_contract_version"] == "quality_silence_v32"
+        assert reels[0]["selection_contract_version"] == "quality_silence_v33"
         assert reels[0]["relevance_score"] == 0.93
         assert reels[0]["topic_relevance"] == 0.93
         assert not any(key.startswith("_selection_") for key in reels[0])
+    finally:
+        conn.close()
+
+
+def test_generation_job_reels_reuses_unseen_source_inventory_without_redelivery(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    observed: dict[str, object] = {}
+
+    def ranked(*_args, **kwargs):
+        observed.update(kwargs)
+        return []
+
+    monkeypatch.setattr(main, "_ranked_request_reels", ranked)
+    monkeypatch.setattr(
+        main,
+        "get_generation_job",
+        lambda _conn, job_id: {
+            "id": job_id,
+            "request_params_json": "{}",
+        } if job_id == "previous-job" else None,
+    )
+    monkeypatch.setattr(
+        main,
+        "replay_generation_events",
+        lambda *_args, **_kwargs: [{
+            "type": "final",
+            "payload": {"reels": [{"reel_id": "already-delivered"}]},
+        }],
+    )
+    try:
+        reels = main._generation_job_reels(
+            conn,
+            {
+                "id": "continued-job",
+                "result_generation_id": "continued-generation",
+                "material_id": "m1",
+                "concept_id": "c1",
+                "learner_id": "learner-1",
+                "request_params_json": json.dumps({
+                    "generation_mode": "slow",
+                    "num_reels": 4,
+                    "continuation_token": "previous-job",
+                }),
+            },
+        )
+
+        assert reels == []
+        assert observed["generation_id"] == "continued-generation"
+        assert observed["include_source_chain"] is True
+        assert observed["exclude_reel_ids"] == ["already-delivered"]
     finally:
         conn.close()
 
@@ -1024,7 +1077,7 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
                 json.dumps({
                         "surface_eligible": True,
                         "boundary_status": "verified",
-                        "selection_contract_version": "quality_silence_v32",
+                        "selection_contract_version": "quality_silence_v33",
                         "speech_corridor_verified": True,
                         "directly_teaches_topic": True,
                         "substantive": True,
@@ -1292,7 +1345,7 @@ def test_generation_worker_finalizes_a_rankable_nearest_level_fallback(
         conn.close()
 
 
-def test_deferred_only_slow_reservoir_reuses_after_level_change_without_top_up(
+def test_deferred_only_slow_reservoir_queues_current_batch_after_level_change(
     monkeypatch,
 ) -> None:
     conn = _conn()
@@ -1393,7 +1446,7 @@ def test_deferred_only_slow_reservoir_reuses_after_level_change_without_top_up(
             autofill=True,
             generation_mode="slow",
         )
-        direct_response = asyncio.run(main.generate_reels(
+        generation_response = asyncio.run(main.generate_reels(
             object(),
             ReelsGenerateRequest(
                 material_id="m1",
@@ -1406,19 +1459,23 @@ def test_deferred_only_slow_reservoir_reuses_after_level_change_without_top_up(
             "advanced-deferred-reel"
         ]
         assert feed_response["generation_id"] == source_generation_id
-        assert feed_response["generation_job_id"] is None
-        assert [reel["reel_id"] for reel in direct_response["reels"]] == [
-            "advanced-deferred-reel"
-        ]
-        assert direct_response["generation_id"] == source_generation_id
+        assert feed_response["generation_job_id"]
+        assert isinstance(generation_response, JSONResponse)
+        assert generation_response.status_code == 202
+        current_job_id = json.loads(generation_response.body)["job_id"]
+        assert current_job_id == feed_response["generation_job_id"]
+        current_job = generation_jobs.get_job(conn, current_job_id)
+        assert current_job is not None
+        assert current_job["source_generation_id"] == source_generation_id
+        assert main._job_request_params(current_job)["fresh_source_budget"] is True
         assert conn.execute(
             "SELECT COUNT(*) FROM reel_generation_jobs"
-        ).fetchone()[0] == initial_jobs
+        ).fetchone()[0] == initial_jobs + 1
         assert conn.execute(
             "SELECT COUNT(*) FROM generation_provider_usage"
         ).fetchone()[0] == initial_provider_rows
         provider.assert_not_called()
-        wake.assert_not_called()
+        assert wake.call_args_list == [mock.call(), mock.call()]
     finally:
         conn.close()
 
@@ -1478,6 +1535,258 @@ def test_cross_request_current_level_reservoir_does_not_force_fresh_top_up(
 
         assert calls == []
         assert generation_jobs.get_job(conn, job["id"])["status"] == "completed"
+    finally:
+        conn.close()
+
+
+def test_partial_cross_request_startup_uses_fresh_bounded_source_budget(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="partial-startup-source",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="partial-startup-current",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={
+            "generation_mode": "fast",
+            "num_reels": 9,
+            "fresh_source_budget": True,
+        },
+        source_generation_id=source_generation_id,
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="worker-partial-startup",
+        now=now,
+    )
+    assert leased
+    calls: list[dict] = []
+
+    monkeypatch.setattr(
+        main,
+        "_current_level_reusable_generation_reel_count",
+        lambda *_args, **_kwargs: 3,
+    )
+    monkeypatch.setattr(
+        main,
+        "_generation_chain_analyzed_source_budget",
+        lambda *_args, **_kwargs: main.GENERATION_SOURCE_BUDGETS["fast"],
+    )
+    monkeypatch.setattr(
+        main.reel_service,
+        "generate_reels",
+        lambda _worker_conn, **kwargs: calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        main,
+        "_generation_job_reels",
+        lambda *_args, **_kwargs: [
+            {"reel_id": f"strict-cached-reel-{index}"}
+            for index in range(3)
+        ],
+    )
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        assert len(calls) == 1
+        assert calls[0]["num_reels"] == 9
+        assert calls[0]["max_generation_videos"] == main.GENERATION_SOURCE_BUDGETS["fast"]
+        assert calls[0]["max_new_reels"] == 6
+        assert generation_jobs.get_job(conn, job["id"])["status"] == "partial"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("reusable_count", "expected_new_reels", "expected_status"),
+    [(3, 0, "completed"), (1, 0, "partial"), (0, 3, "completed")],
+)
+def test_continuation_returns_any_unseen_cache_before_a_fresh_source_budget(
+    monkeypatch,
+    reusable_count: int,
+    expected_new_reels: int,
+    expected_status: str,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="continuation-source",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    prior_job = _terminal_job_for_generation(
+        conn,
+        request_key="continuation-source",
+        generation_id=source_generation_id,
+        completed_at=now.isoformat(),
+        content_fingerprint="fingerprint",
+        request_params={"generation_mode": "slow", "num_reels": 3},
+    )
+    conn.execute(
+        "UPDATE reel_generation_jobs SET usage_json = ? WHERE id = ?",
+        (json.dumps({"counters": {"analyzed_sources": 3}}), prior_job["id"]),
+    )
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="continuation-batch",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={
+            "generation_mode": "slow",
+            "num_reels": 3,
+            "continuation_token": prior_job["id"],
+        },
+        source_generation_id=source_generation_id,
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="worker-continuation",
+        now=now,
+    )
+    assert leased
+    calls: list[dict] = []
+    generated_count = 0
+
+    def generate_stage(_worker_conn, **kwargs) -> None:
+        nonlocal generated_count
+        calls.append(kwargs)
+        generated_count += int(kwargs["max_new_reels"])
+
+    monkeypatch.setattr(
+        main,
+        "_current_level_reusable_generation_reel_count",
+        lambda *_args, **_kwargs: reusable_count,
+    )
+    monkeypatch.setattr(
+        main,
+        "_count_generation_reels",
+        lambda _conn, generation_id: (
+            0 if generation_id == source_generation_id else generated_count
+        ),
+    )
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_generation_job_reels",
+        lambda *_args, **_kwargs: [
+            {"reel_id": f"continued-reel-{index}"}
+            for index in range(reusable_count + generated_count)
+        ],
+    )
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        assert [call["max_new_reels"] for call in calls] == (
+            [expected_new_reels] if expected_new_reels else []
+        )
+        if calls:
+            assert calls[0]["max_generation_videos"] == 3
+            assert source_generation_id in calls[0]["exclude_generation_ids"]
+        assert generation_jobs.get_job(conn, job["id"])["status"] == expected_status
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("provider_cursor_open", "expected_status"),
+    [(False, "exhausted"), (True, "partial")],
+)
+def test_empty_continuation_status_reflects_provider_exhaustion(
+    monkeypatch, provider_cursor_open: bool, expected_status: str,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="continuation-inventory-source",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    _insert_generation_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel_id="prior-batch-reel",
+        video_id="prior-batch-video",
+        created_at=now.isoformat(),
+    )
+    prior_job = _terminal_job_for_generation(
+        conn,
+        request_key="continuation-inventory-source",
+        generation_id=source_generation_id,
+        completed_at=now.isoformat(),
+        content_fingerprint="fingerprint",
+        request_params={"generation_mode": "slow", "num_reels": 1},
+    )
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="empty-continuation",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={
+            "generation_mode": "slow",
+            "num_reels": 1,
+            "continuation_token": prior_job["id"],
+        },
+        source_generation_id=source_generation_id,
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="worker-empty-continuation",
+        now=now,
+    )
+    assert leased
+
+    def generate_reels(*_args, **kwargs) -> None:
+        if provider_cursor_open:
+            kwargs["generation_context"].increment_counter("provider_cursor_open")
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_reels)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        completed = generation_jobs.get_job(conn, job["id"])
+        assert completed and completed["status"] == expected_status
+        events = generation_jobs.replay_events(conn, job_id=job["id"])
+        terminal = events[-1]
+        assert terminal["payload"]["status"] == expected_status
+        final = next(event for event in events if event["type"] == "final")
+        assert bool(final["payload"]["generation_id"]) is provider_cursor_open
+        generation = main._fetch_generation_row(
+            conn, str(completed["result_generation_id"])
+        )
+        assert generation and generation["status"] == (
+            "partial" if provider_cursor_open else "failed"
+        )
     finally:
         conn.close()
 
@@ -1669,7 +1978,7 @@ def test_slow_generation_uses_one_deep_retrieval_with_three_source_cap(monkeypat
         assert [call["max_new_reels"] for call in calls] == [3]
         assert calls[0]["max_generation_videos"] == 3
         assert all(
-            not call["generation_context"].require_acoustic_boundaries
+            call["generation_context"].require_acoustic_boundaries
             for call in calls
         )
         assert calls[0]["exclude_video_ids"] == ["manual-exclusion"]
@@ -1711,7 +2020,7 @@ def test_slow_generation_uses_one_deep_retrieval_with_three_source_cap(monkeypat
 
 @pytest.mark.parametrize(
     ("mode", "expected_reel_cap", "expected_source_cap"),
-    [("fast", 8, 2), ("slow", 12, 3)],
+    [("fast", 9, 2), ("slow", 9, 3)],
 )
 def test_generation_mode_uses_one_deep_stage_and_mode_caps(
     monkeypatch,
@@ -1762,7 +2071,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
                 "video_id": f"{mode}-video-{index % expected_source_cap}",
                 "t_start": float(index * 10),
                 "t_end": float(index * 10 + 8),
-                "selection_contract_version": "quality_silence_v32",
+                "selection_contract_version": "quality_silence_v33",
             }
             kwargs["on_reel_created"](reel)
         generated_count += int(kwargs["max_new_reels"])
@@ -1779,7 +2088,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
         lambda *_args, **_kwargs: [
             {
                 "reel_id": f"{mode}-reel-{index}",
-                "selection_contract_version": "quality_silence_v32",
+                "selection_contract_version": "quality_silence_v33",
             }
             for index in range(expected_reel_cap)
         ],
@@ -1792,6 +2101,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
         assert calls[0]["num_reels"] == expected_reel_cap
         assert calls[0]["max_generation_videos"] == expected_source_cap
         assert calls[0]["max_new_reels"] == expected_reel_cap
+        assert calls[0]["generation_context"].require_acoustic_boundaries is True
         gemini_budget = calls[0]["generation_context"].budget.snapshot()["gemini"]
         assert gemini_budget["flash_selector_calls"] == expected_source_cap
         assert gemini_budget["flash_selector_limit"] == expected_source_cap
@@ -2047,6 +2357,40 @@ def test_status_and_stream_terminalize_stale_queue_without_duplicate_events(
         conn.close()
 
 
+def test_generation_job_endpoints_hide_other_learners_jobs(monkeypatch) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="learner-one-private-job",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={},
+    )
+    monkeypatch.setattr(
+        main,
+        "_resolve_learner_identity",
+        lambda *_args, **_kwargs: "learner-2",
+    )
+    try:
+        with pytest.raises(main.HTTPException) as status_error:
+            main.generation_status(object(), job["id"])
+        assert status_error.value.status_code == 404
+
+        with pytest.raises(main.HTTPException) as stream_error:
+            asyncio.run(main.generation_stream(object(), job["id"]))
+        assert stream_error.value.status_code == 404
+
+        with pytest.raises(main.HTTPException) as cancel_error:
+            main.cancel_generation_job(object(), job["id"])
+        assert cancel_error.value.status_code == 404
+        assert generation_jobs.get_job(conn, job["id"])["status"] == "queued"
+    finally:
+        conn.close()
+
+
 def test_generate_returns_202_and_idempotently_reuses_active_job(monkeypatch) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
@@ -2083,6 +2427,91 @@ def test_generate_returns_202_and_idempotently_reuses_active_job(monkeypatch) ->
             "SELECT COUNT(*) FROM reel_generation_jobs WHERE status IN ('queued', 'running')"
         ).fetchone()[0] == 1
         assert wake.call_count == 2
+    finally:
+        conn.close()
+
+
+def test_generate_does_not_coalesce_jobs_across_learners(monkeypatch) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    current_learner = ["learner-1"]
+    monkeypatch.setattr(
+        main,
+        "_resolve_learner_identity",
+        lambda *_args, **_kwargs: current_learner[0],
+    )
+    payload = ReelsGenerateRequest(material_id="m1", concept_id="c1", num_reels=3)
+    try:
+        first = asyncio.run(main.generate_reels(object(), payload))
+        current_learner[0] = "learner-2"
+        second = asyncio.run(main.generate_reels(object(), payload))
+
+        first_job_id = json.loads(first.body)["job_id"]
+        second_job_id = json.loads(second.body)["job_id"]
+        assert first_job_id != second_job_id
+        jobs_by_id = {
+            row["id"]: row["learner_id"]
+            for row in conn.execute(
+                "SELECT id, learner_id FROM reel_generation_jobs ORDER BY created_at, id"
+            ).fetchall()
+        }
+        assert jobs_by_id == {
+            first_job_id: "learner-1",
+            second_job_id: "learner-2",
+        }
+    finally:
+        conn.close()
+
+
+def test_generate_continuation_queues_one_new_batch_from_the_previous_job(monkeypatch) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    root_payload = ReelsGenerateRequest(material_id="m1", concept_id="c1", num_reels=3)
+    try:
+        root_response = asyncio.run(main.generate_reels(object(), root_payload))
+        root_job_id = json.loads(root_response.body)["job_id"]
+        root_job = generation_jobs.get_job(conn, root_job_id)
+        assert root_job
+        root_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=str(root_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        completed_at = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE reel_generation_jobs SET status = 'completed', phase = 'terminal', "
+            "progress = 1.0, result_generation_id = ?, completed_at = ?, updated_at = ? "
+            "WHERE id = ?",
+            (root_generation_id, completed_at, completed_at, root_job_id),
+        )
+
+        continuation_payload = ReelsGenerateRequest(
+            material_id="m1",
+            concept_id="c1",
+            num_reels=3,
+            continuation_token=root_job_id,
+        )
+        first = asyncio.run(main.generate_reels(object(), continuation_payload))
+        repeated = asyncio.run(main.generate_reels(object(), continuation_payload))
+
+        first_body = json.loads(first.body)
+        repeated_body = json.loads(repeated.body)
+        assert first.status_code == repeated.status_code == 202
+        assert first_body["job_id"] == repeated_body["job_id"]
+        assert first_body["job_id"] != root_job_id
+        continuation_job = generation_jobs.get_job(conn, first_body["job_id"])
+        assert continuation_job
+        assert continuation_job["source_generation_id"] == root_generation_id
+        continuation_params = json.loads(continuation_job["request_params_json"])
+        assert continuation_params["continuation_token"] == root_job_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs"
+        ).fetchone()[0] == 2
     finally:
         conn.close()
 
@@ -2271,7 +2700,7 @@ def test_generation_stream_replays_monotonic_persisted_events(monkeypatch) -> No
         payload={
             "reel": {
                 "reel_id": "provisional",
-                "selection_contract_version": "quality_silence_v32",
+                "selection_contract_version": "quality_silence_v33",
             },
             "provisional": True,
         },
@@ -2346,7 +2775,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
                 "video_id": "streamed-video",
                 "t_start": 10.0,
                 "t_end": 40.0,
-                "selection_contract_version": "quality_silence_v32",
+                "selection_contract_version": "quality_silence_v33",
             },
             "provisional": True,
         },
@@ -2371,7 +2800,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
         "_ranked_request_reels",
         lambda *_args, **_kwargs: [{
             "reel_id": "ranked-reel",
-            "selection_contract_version": "quality_silence_v32",
+            "selection_contract_version": "quality_silence_v33",
         }],
     )
     monkeypatch.setattr(
@@ -2432,7 +2861,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
                 "video_id": f"ranked-video-{index}",
                 "t_start": float(index * 30),
                 "t_end": float(index * 30 + 20),
-                "selection_contract_version": "quality_silence_v32",
+                "selection_contract_version": "quality_silence_v33",
             }
             for index in range(4)
         ],
@@ -2550,7 +2979,7 @@ def test_completed_job_status_and_replay_drop_currently_invalid_candidate(monkey
         "audio_refinement_deadline_exceeded",
     ],
 )
-def test_boundary_only_failure_survives_persistence_feed_and_authoritative_replay(
+def test_boundary_only_failure_is_persisted_but_omitted_from_feed_and_replay(
     monkeypatch,
     fallback_reason: str,
 ) -> None:
@@ -2596,7 +3025,8 @@ def test_boundary_only_failure_survives_persistence_feed_and_authoritative_repla
     search_context = {
         "selection_candidate_id": f"candidate-{fallback_reason}",
         "selection_contract_version": main.SELECTION_CONTRACT_VERSION,
-        "surface_eligible": True,
+        "surface_eligible": False,
+        "surface_reason": "acoustic_boundary_unverified",
         "speech_corridor_verified": True,
         "boundary_confidence": 0.9,
         "boundary_status": "context_aligned",
@@ -2685,7 +3115,7 @@ def test_boundary_only_failure_survives_persistence_feed_and_authoritative_repla
         learner_id="learner-1",
         require_verified_boundaries=True,
     )
-    assert [reel["reel_id"] for reel in ranked_feed] == [persisted.reel_id]
+    assert ranked_feed == []
 
     job, _ = generation_jobs.submit_or_get_active(
         conn,
@@ -2738,17 +3168,15 @@ def test_boundary_only_failure_survives_persistence_feed_and_authoritative_repla
         terminal,
         generation_jobs.replay_events(conn, job_id=job["id"]),
     )
-    assert [reel["reel_id"] for reel in status["reels"]] == [persisted.reel_id]
+    assert status["reels"] == []
     assert [
         event["payload"]["reel"]["reel_id"]
         for event in replay
         if event["type"] == "candidate"
-    ] == [persisted.reel_id]
+    ] == []
     final = next(event for event in replay if event["type"] == "final")
     assert final["payload"]["authoritative"] is True
-    assert [reel["reel_id"] for reel in final["payload"]["reels"]] == [
-        persisted.reel_id
-    ]
+    assert final["payload"]["reels"] == []
     stored_context = json.loads(conn.execute(
         "SELECT search_context_json FROM reels WHERE id = ?",
         (persisted.reel_id,),
@@ -2840,12 +3268,86 @@ def test_feed_autofill_false_never_submits_and_true_submits_before_return(monkey
         assert queued["generation_job_id"]
         assert queued["generation_job_status"] == "queued"
         assert conn.execute("SELECT COUNT(*) FROM reel_generation_jobs").fetchone()[0] == 1
+        queued_job = generation_jobs.get_job(conn, queued["generation_job_id"])
+        assert queued_job is not None
+        assert json.loads(queued_job["request_params_json"])["num_reels"] == 9
+        assert main.GENERATION_OUTPUT_CEILINGS == {"fast": 9, "slow": 9}
         wake.assert_called_once_with()
         assert rate_calls == [
             ("feed", 36),
             ("feed", 36),
             ("generation-submit", 6),
         ]
+    finally:
+        conn.close()
+
+
+def test_feed_does_not_top_up_a_full_three_batch_startup_reservoir(monkeypatch) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(
+        main,
+        "_fetch_active_generation_row",
+        lambda *_args, **_kwargs: {"id": "nine-ready-generation"},
+    )
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: [
+            {"reel_id": f"ready-{index}"} for index in range(9)
+        ],
+    )
+    wake = mock.Mock()
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    try:
+        response = main.feed(
+            object(),
+            material_id="m1",
+            page=1,
+            limit=5,
+            prefetch=9,
+            autofill=True,
+        )
+
+        assert len(response["reels"]) == 5
+        assert response["generation_job_id"] is None
+        assert conn.execute("SELECT COUNT(*) FROM reel_generation_jobs").fetchone()[0] == 0
+        wake.assert_not_called()
+    finally:
+        conn.close()
+
+
+def test_feed_page_two_never_starts_provider_generation(monkeypatch) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(
+        main,
+        "_fetch_active_generation_row",
+        lambda *_args, **_kwargs: {"id": "partial-ready-generation"},
+    )
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: [
+            {"reel_id": f"ready-{index}"} for index in range(5)
+        ],
+    )
+    wake = mock.Mock()
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    try:
+        response = main.feed(
+            object(),
+            material_id="m1",
+            page=2,
+            limit=3,
+            prefetch=9,
+            autofill=True,
+        )
+
+        assert len(response["reels"]) == 2
+        assert response["generation_job_id"] is None
+        assert conn.execute("SELECT COUNT(*) FROM reel_generation_jobs").fetchone()[0] == 0
+        wake.assert_not_called()
     finally:
         conn.close()
 
@@ -2880,7 +3382,169 @@ def test_feed_reload_reports_the_successful_terminal_job(
 
         assert response["generation_job_id"] == terminal["id"]
         assert response["generation_job_status"] == status
+        assert response["continuation_token"] == terminal["id"]
         wake.assert_not_called()
+    finally:
+        conn.close()
+
+
+def test_feed_reload_reports_the_latest_continuation_batch(monkeypatch) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    monkeypatch.setattr(main, "_ranked_request_reels", lambda *_args, **_kwargs: [])
+    try:
+        queued = main.feed(object(), material_id="m1", autofill=True)
+        root_job = generation_jobs.get_job(conn, queued["generation_job_id"])
+        assert root_job
+        root_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id=None,
+            request_key=str(root_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        completed_at = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE reel_generation_jobs SET status = 'completed', phase = 'terminal', "
+            "progress = 1.0, result_generation_id = ?, completed_at = ?, updated_at = ? "
+            "WHERE id = ?",
+            (root_generation_id, completed_at, completed_at, root_job["id"]),
+        )
+        root_params = json.loads(root_job["request_params_json"])
+        continuation_job, _ = generation_jobs.submit_or_get_active(
+            conn,
+            material_id="m1",
+            concept_id=None,
+            request_key="feed-continuation-request",
+            content_fingerprint=str(root_job["content_fingerprint"]),
+            learner_id="learner-1",
+            request_params={
+                **root_params,
+                "continuation_token": root_job["id"],
+            },
+            source_generation_id=root_generation_id,
+            now=datetime.now(timezone.utc) + timedelta(seconds=1),
+        )
+        continuation_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id=None,
+            request_key="feed-continuation-request",
+            generation_mode="slow",
+            retrieval_profile="unified",
+            source_generation_id=root_generation_id,
+        )
+        later = (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat()
+        conn.execute(
+            "UPDATE reel_generation_jobs SET status = 'partial', phase = 'terminal', "
+            "progress = 1.0, result_generation_id = ?, completed_at = ?, updated_at = ? "
+            "WHERE id = ?",
+            (
+                continuation_generation_id,
+                later,
+                later,
+                continuation_job["id"],
+            ),
+        )
+
+        response = main.feed(object(), material_id="m1", autofill=False)
+
+        assert response["generation_job_id"] == continuation_job["id"]
+        assert response["generation_job_status"] == "partial"
+        assert response["continuation_token"] == continuation_job["id"]
+        assert response["generation_id"] == continuation_generation_id
+    finally:
+        conn.close()
+
+
+def test_feed_page_two_keeps_unseen_rows_after_page_one_is_scrolled(monkeypatch) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    try:
+        queued = main.feed(object(), material_id="m1", page=1, limit=3, autofill=True)
+        job = generation_jobs.get_job(conn, queued["generation_job_id"])
+        assert job
+        generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id=None,
+            request_key=str(job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        created_at = datetime.now(timezone.utc)
+        for index in range(6):
+            _insert_generation_reel(
+                conn,
+                generation_id=generation_id,
+                reel_id=f"paged-reel-{index}",
+                video_id=f"paged-video-{index}",
+                created_at=(created_at + timedelta(seconds=index)).isoformat(),
+            )
+        main._complete_generation(
+            conn,
+            generation_id=generation_id,
+            retrieval_profile="unified",
+            status="completed",
+        )
+        completed_at = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE reel_generation_jobs SET status = 'completed', phase = 'terminal', "
+            "progress = 1.0, result_generation_id = ?, completed_at = ?, updated_at = ? "
+            "WHERE id = ?",
+            (generation_id, completed_at, completed_at, job["id"]),
+        )
+        ranked_rows = [
+            {
+                "reel_id": f"paged-reel-{index}",
+                "video_id": f"paged-video-{index}",
+                "t_start": 0.0,
+                "t_end": 30.0,
+                "selection_contract_version": main.SELECTION_CONTRACT_VERSION,
+                "_selection_ordered": True,
+            }
+            for index in range(6)
+        ]
+        monkeypatch.setattr(
+            main.reel_service,
+            "ranked_feed",
+            lambda *_args, **_kwargs: [dict(row) for row in ranked_rows],
+        )
+        monkeypatch.setattr(
+            main,
+            "_shape_request_page_reels",
+            lambda rows, **_kwargs: list(rows),
+        )
+        monkeypatch.setattr(
+            main,
+            "_finalize_request_reel_order",
+            lambda _conn, **kwargs: kwargs["rows"],
+        )
+
+        first = main.feed(object(), material_id="m1", page=1, limit=3, autofill=False)
+        normal_second = main.feed(
+            object(), material_id="m1", page=2, limit=3, autofill=False
+        )
+        first_ids = {reel["reel_id"] for reel in first["reels"]}
+        normal_second_ids = {reel["reel_id"] for reel in normal_second["reels"]}
+        assert len(first_ids) == len(normal_second_ids) == 3
+        assert first_ids.isdisjoint(normal_second_ids)
+
+        for reel_id in first_ids:
+            main.assessment_service.record_scroll(
+                conn,
+                learner_id="learner-1",
+                reel_id=reel_id,
+            )
+
+        continued_second = main.feed(
+            object(), material_id="m1", page=2, limit=3, autofill=False
+        )
+        continued_ids = {reel["reel_id"] for reel in continued_second["reels"]}
+        assert continued_ids == normal_second_ids
     finally:
         conn.close()
 
@@ -3010,6 +3674,83 @@ def test_feed_slow_reservoir_immediately_satisfies_fast_without_queuing(
             "ORDER BY created_at DESC, id DESC LIMIT 1"
         ).fetchone()
         assert queued is None
+    finally:
+        conn.close()
+
+
+def test_feed_partial_cross_request_reservoir_queues_fresh_startup_budget(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    completed_at = datetime.now(timezone.utc).isoformat()
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id=None,
+        request_key="prior-partial-startup-request",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    for index in range(3):
+        _insert_generation_reel(
+            conn,
+            generation_id=source_generation_id,
+            reel_id=f"strict-cached-reel-{index}",
+            video_id=f"strict-cached-video-{index}",
+            created_at=completed_at,
+        )
+    _terminal_job_for_generation(
+        conn,
+        request_key="prior-partial-startup-request",
+        generation_id=source_generation_id,
+        completed_at=completed_at,
+        concept_id=None,
+        content_fingerprint=generation_jobs.material_content_fingerprint(
+            conn, "m1", None
+        ),
+        request_params={
+            "generation_mode": "slow",
+            "num_reels": 9,
+            "exclude_video_ids": [],
+            "creative_commons_only": False,
+            "min_relevance": None,
+            "preferred_video_duration": "any",
+            "knowledge_level": "beginner",
+            "language": "en",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: [
+            {"reel_id": f"strict-cached-reel-{index}"}
+            for index in range(3)
+        ],
+    )
+    wake = mock.Mock()
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    try:
+        response = main.feed(
+            object(),
+            material_id="m1",
+            limit=9,
+            prefetch=9,
+            autofill=True,
+            generation_mode="fast",
+        )
+
+        assert [reel["reel_id"] for reel in response["reels"]] == [
+            f"strict-cached-reel-{index}" for index in range(3)
+        ]
+        assert response["generation_id"] == source_generation_id
+        queued = generation_jobs.get_job(conn, response["generation_job_id"])
+        assert queued is not None
+        assert queued["source_generation_id"] == source_generation_id
+        queued_params = main._job_request_params(queued)
+        assert queued_params["num_reels"] == 9
+        assert queued_params["fresh_source_budget"] is True
+        wake.assert_called_once_with()
     finally:
         conn.close()
 
@@ -3357,7 +4098,7 @@ def test_v7_feed_merges_value_ranked_batches_without_breaking_batch_topology(
             "_selection_topic_relevance": relevance,
             "_selection_source_rank": source_rank,
             "_selection_ordered": True,
-            "selection_contract_version": "quality_silence_v32",
+            "selection_contract_version": "quality_silence_v33",
         }
 
     root_reels = [
@@ -3488,7 +4229,7 @@ def test_generation_chain_uses_nearest_difficulty_across_all_batches(
             "_selection_topic_relevance": 0.9,
             "_selection_source_rank": 0,
             "_selection_ordered": True,
-            "selection_contract_version": "quality_silence_v32",
+            "selection_contract_version": "quality_silence_v33",
         }
 
     monkeypatch.setattr(
@@ -3655,7 +4396,7 @@ def test_cross_level_reservoir_ignores_invalid_rows_when_valid_inventory_remains
         conn.close()
 
 
-def test_generate_slow_reservoir_immediately_satisfies_fast_without_queuing(
+def test_generate_cross_request_reservoir_is_owned_by_current_batch(
     monkeypatch,
 ) -> None:
     conn = _conn()
@@ -3703,38 +4444,67 @@ def test_generate_slow_reservoir_immediately_satisfies_fast_without_queuing(
             {
                 "reel_id": "verified-concept-reel",
                 "video_id": "verified-concept-video-0",
-                "selection_contract_version": "quality_silence_v32",
+                "selection_contract_version": "quality_silence_v33",
             }
         ],
     )
-    monkeypatch.setattr(
-        main,
-        "submit_generation_job",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("compatible current-level reservoir queued generation")
-        ),
-    )
+    wake = mock.Mock()
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
     try:
-        response = asyncio.run(main.generate_reels(
+        payload = ReelsGenerateRequest(
+            material_id="m1",
+            concept_id="c1",
+            generation_mode="fast",
+            num_reels=5,
+        )
+        queued_response = asyncio.run(main.generate_reels(
             object(),
-            ReelsGenerateRequest(
-                material_id="m1",
-                concept_id="c1",
-                generation_mode="fast",
-                num_reels=5,
-            ),
+            payload,
         ))
-        assert response["generation_id"] == source_generation_id
+
+        assert isinstance(queued_response, JSONResponse)
+        assert queued_response.status_code == 202
+        current_job_id = json.loads(queued_response.body)["job_id"]
+        current_job = generation_jobs.get_job(conn, current_job_id)
+        assert current_job is not None
+        assert current_job["source_generation_id"] == source_generation_id
+        assert main._job_request_params(current_job)["fresh_source_budget"] is True
+
+        current_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=str(current_job["request_key"]),
+            generation_mode="fast",
+            retrieval_profile="unified",
+            source_generation_id=source_generation_id,
+        )
+        completed_at = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE reel_generation_jobs SET status = 'completed', phase = 'terminal', "
+            "progress = 1.0, result_generation_id = ?, completed_at = ?, updated_at = ? "
+            "WHERE id = ?",
+            (current_generation_id, completed_at, completed_at, current_job_id),
+        )
+
+        response = asyncio.run(main.generate_reels(object(), payload))
+
+        assert response["generation_id"] == current_generation_id
+        assert response["batch_id"] == current_job_id
+        assert response["batch_size"] == 1
+        assert response["continuation_token"] == current_job_id
+        assert response["terminal_status"] == "completed"
         assert response["reels"] == [
             {
                 "reel_id": "verified-concept-reel",
                 "video_id": "verified-concept-video-0",
-                "selection_contract_version": "quality_silence_v32",
+                "selection_contract_version": "quality_silence_v33",
             }
         ]
         assert conn.execute(
             "SELECT COUNT(*) FROM reel_generation_jobs"
-        ).fetchone()[0] == 1
+        ).fetchone()[0] == 2
+        wake.assert_called_once_with()
     finally:
         conn.close()
 

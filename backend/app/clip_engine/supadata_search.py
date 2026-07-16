@@ -299,6 +299,7 @@ def search_all(
     queries: list[str],
     filters: dict[str, Any] | None = None,
     *,
+    page_tokens: list[str | None] | None = None,
     request_filters: list[dict[str, Any] | None] | None = None,
     minimum_queries: int = 0,
     stop_when: Callable[[list[dict]], bool] | None = None,
@@ -323,6 +324,11 @@ def search_all(
                     if request_filters is not None and index < len(request_filters)
                     else filters
                 )
+                page_token = (
+                    page_tokens[index]
+                    if page_tokens is not None and index < len(page_tokens)
+                    else None
+                )
                 futures.append(
                     executor.submit(
                         search_one,
@@ -330,6 +336,7 @@ def search_all(
                         effective_filters,
                         should_cancel,
                         language=language,
+                        page_token=page_token,
                         context=context,
                         cache_store=cache_store,
                         deadline_monotonic=deadline_monotonic,
@@ -356,12 +363,18 @@ def search_all(
             if request_filters is not None and index < len(request_filters)
             else filters
         )
+        page_token = (
+            page_tokens[index]
+            if page_tokens is not None and index < len(page_tokens)
+            else None
+        )
         try:
             result = search_one(
                 query,
                 effective_filters,
                 should_cancel,
                 language=language,
+                page_token=page_token,
                 context=context,
                 cache_store=cache_store,
                 deadline_monotonic=deadline_monotonic,

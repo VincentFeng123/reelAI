@@ -64,3 +64,11 @@ def test_prompt_documents_difficulty_scale():
     system, user = _prompts("[0] 00:00 hi", 1)
     assert "difficulty on a 0..1 scale" in system
     assert "difficulty" in user
+
+
+def test_prompt_documents_latex_assessment_contract():
+    system, _ = _prompts("[0] 00:00 hi", 1)
+    assert r"\( ... \)" in system
+    assert r"\[ ... \]" in system
+    assert "only when it improves mathematical clarity" in system
+    assert "Escape every LaTeX backslash in JSON" in system

@@ -134,28 +134,44 @@ test("generation submission timeout remains active after response headers", TEST
   }
 });
 
-test("generation and feed requests omit deprecated clip-duration preferences", TEST_OPTIONS, async () => {
+test("generation honors the requested count within the mode ceiling and omits deprecated duration preferences", TEST_OPTIONS, async () => {
   const originalFetch = global.fetch;
   const requests = [];
   global.fetch = async (url, init = {}) => {
     requests.push({ url: String(url), init });
     if (String(url).includes("/reels/generate")) {
-      return new Response(JSON.stringify({ reels: [], response_profile: "unified" }), {
+      return new Response(JSON.stringify({
+        reels: [],
+        response_profile: "unified",
+        batch_id: "server-batch",
+        batch_size: 0,
+        continuation_token: "server-batch",
+        terminal_status: "completed",
+      }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
     }
-    return new Response(JSON.stringify({ reels: [], total: 0, page: 1, limit: 5 }), {
+    return new Response(JSON.stringify({
+      reels: [],
+      total: 0,
+      page: 1,
+      limit: 5,
+      continuation_token: "feed-batch",
+    }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
   };
 
+  let firstGeneration;
+  let feedResponse;
   try {
-    await generateReels({
+    firstGeneration = await generateReels({
       materialId: "material-duration-compat",
       generationMode: "fast",
       numReels: 2,
+      continuationToken: " previous-batch ",
       targetClipDurationSec: 55,
       targetClipDurationMinSec: 20,
       targetClipDurationMaxSec: 90,
@@ -165,6 +181,11 @@ test("generation and feed requests omit deprecated clip-duration preferences", T
       generationMode: "slow",
       numReels: 2,
     });
+    await generateReels({
+      materialId: "material-duration-compat",
+      generationMode: "fast",
+      numReels: 99,
+    });
     await checkReelsCanGenerate({
       materialId: "material-duration-compat",
       generationMode: "fast",
@@ -173,7 +194,7 @@ test("generation and feed requests omit deprecated clip-duration preferences", T
       materialId: "material-duration-compat",
       generationMode: "slow",
     });
-    await fetchFeed({
+    feedResponse = await fetchFeed({
       materialId: "material-duration-compat",
       page: 1,
       limit: 5,
@@ -188,18 +209,28 @@ test("generation and feed requests omit deprecated clip-duration preferences", T
 
   const generationBody = JSON.parse(requests[0].init.body);
   const slowGenerationBody = JSON.parse(requests[1].init.body);
-  const fastAvailabilityBody = JSON.parse(requests[2].init.body);
-  const slowAvailabilityBody = JSON.parse(requests[3].init.body);
-  assert.equal(generationBody.num_reels, 8);
+  const clampedGenerationBody = JSON.parse(requests[2].init.body);
+  const fastAvailabilityBody = JSON.parse(requests[3].init.body);
+  const slowAvailabilityBody = JSON.parse(requests[4].init.body);
+  assert.equal(generationBody.num_reels, 2);
   assert.equal(generationBody.generation_mode, "fast");
-  assert.equal(slowGenerationBody.num_reels, 12);
+  assert.equal(generationBody.continuation_token, "previous-batch");
+  assert.equal(Object.hasOwn(generationBody, "exclude_video_ids"), false);
+  assert.equal(slowGenerationBody.num_reels, 2);
   assert.equal(slowGenerationBody.generation_mode, "slow");
-  assert.equal(fastAvailabilityBody.num_reels, 8);
-  assert.equal(slowAvailabilityBody.num_reels, 12);
+  assert.equal(clampedGenerationBody.num_reels, 9);
+  assert.equal(fastAvailabilityBody.num_reels, 9);
+  assert.equal(slowAvailabilityBody.num_reels, 9);
   assert.equal(Object.hasOwn(generationBody, "target_clip_duration_sec"), false);
   assert.equal(Object.hasOwn(generationBody, "target_clip_duration_min_sec"), false);
   assert.equal(Object.hasOwn(generationBody, "target_clip_duration_max_sec"), false);
-  assert.doesNotMatch(requests[4].url, /target_clip_duration/);
+  assert.doesNotMatch(requests[5].url, /target_clip_duration/);
+  assert.equal(new URL(requests[5].url, "http://test").searchParams.get("prefetch"), "9");
+  assert.equal(firstGeneration.batch_id, "server-batch");
+  assert.equal(firstGeneration.batch_size, 0);
+  assert.equal(firstGeneration.continuation_token, "server-batch");
+  assert.equal(firstGeneration.terminal_status, "completed");
+  assert.equal(feedResponse.continuation_token, "feed-batch");
 });
 
 test("generation status timeout remains active after response headers", TEST_OPTIONS, async () => {
@@ -467,6 +498,10 @@ test("transient stream and status failures reconnect to the durable job", TEST_O
   try {
     const response = await generateReelsStream({ materialId: "material-stream-test" });
     assert.deepEqual(response.reels, []);
+    assert.equal(response.batch_id, "job-stream-test");
+    assert.equal(response.batch_size, 0);
+    assert.equal(response.continuation_token, "job-stream-test");
+    assert.equal(response.terminal_status, "completed");
     assert.equal(streamCalls, 2);
     assert.equal(statusCalls, 1);
   } finally {
@@ -476,6 +511,57 @@ test("transient stream and status failures reconnect to the durable job", TEST_O
     } else {
       global.window = originalWindow;
     }
+  }
+});
+
+test("status fallback attaches durable continuation metadata to a terminal batch", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  let statusCalls = 0;
+
+  global.fetch = async (url) => {
+    if (String(url).includes("/reels/generate")) {
+      return queuedGenerationResponse();
+    }
+    if (String(url).includes("/reels/generation-status/")) {
+      statusCalls += 1;
+      return new Response(JSON.stringify({
+        job_id: "job-stream-test",
+        status: "partial",
+        material_id: "material-stream-test",
+        request_key: "request-stream-test",
+        result_generation_id: "generation-partial",
+        reels: [{ reel_id: "fallback-reel" }],
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (!String(url).includes("/reels/generation-stream/")) {
+      throw new Error(`Unexpected request: ${url}`);
+    }
+    const terminal = {
+      job_id: "job-stream-test",
+      seq: 1,
+      timestamp: "2026-07-15T00:00:00Z",
+      type: "terminal",
+      payload: { status: "partial" },
+    };
+    return new Response(`${JSON.stringify(terminal)}\n`, {
+      status: 200,
+      headers: { "Content-Type": "application/x-ndjson" },
+    });
+  };
+
+  try {
+    const response = await generateReelsStream({ materialId: "material-stream-test" });
+    assert.deepEqual(response.reels.map((reel) => reel.reel_id), ["fallback-reel"]);
+    assert.equal(response.batch_id, "job-stream-test");
+    assert.equal(response.batch_size, 1);
+    assert.equal(response.continuation_token, "job-stream-test");
+    assert.equal(response.terminal_status, "partial");
+    assert.equal(statusCalls, 1);
+  } finally {
+    global.fetch = originalFetch;
   }
 });
 

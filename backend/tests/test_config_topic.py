@@ -25,8 +25,8 @@ def test_authoring_model_is_flash_topic_model_is_pro():
     assert config.TOPIC_MODEL == "gemini-3.1-pro-preview"
 
 
-def test_segment_router_defaults_to_flash_first_with_pro_fallback():
-    assert config.SEGMENT_ROUTING_MODE == "hybrid"
+def test_segment_router_defaults_to_pro_only_for_clip_selection():
+    assert config.SEGMENT_ROUTING_MODE == "pro_only"
     assert config.SEGMENT_FLASH_MODEL == "gemini-3.5-flash"
     assert config.SEGMENT_FLASH_FALLBACK_MODEL == "gemini-3.1-flash-lite"
     assert config.SEGMENT_PRO_MODEL == "gemini-3.1-pro-preview"

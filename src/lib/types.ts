@@ -1,3 +1,5 @@
+export const CURRENT_SELECTION_CONTRACT_VERSION = "quality_silence_v33";
+
 export type Concept = {
   id: string;
   title: string;
@@ -68,7 +70,13 @@ export type ReelsGenerateResponse = {
   response_profile?: string | null;
   model_used?: string | null;
   quality_degraded?: boolean;
+  batch_id?: string | null;
+  batch_size?: number;
+  continuation_token?: string | null;
+  terminal_status?: GenerationBatchTerminalStatus | null;
 };
+
+export type GenerationBatchTerminalStatus = "completed" | "partial" | "exhausted";
 
 export type GenerationJobStatus =
   | "queued"
@@ -176,6 +184,7 @@ export type FeedResponse = {
   response_profile?: string | null;
   generation_job_id?: string | null;
   generation_job_status?: GenerationJobStatus | null;
+  continuation_token?: string | null;
   knowledge_level?: string | null;
   effective_level_target?: number | null;
 };

@@ -70,8 +70,8 @@ const GENERATION_MODE_OPTIONS: Array<{
   label: string;
   detail: string;
 }> = [
-  { value: "fast", label: "Fast", detail: "2 sources · up to 8 clips" },
-  { value: "slow", label: "Slow", detail: "3 sources · up to 12 clips" },
+  { value: "fast", label: "Fast", detail: "2 sources · up to 9 clips" },
+  { value: "slow", label: "Slow", detail: "3 sources · up to 9 clips" },
 ];
 
 const durationSummaryLabel: Record<PreferredVideoDuration, string> = {

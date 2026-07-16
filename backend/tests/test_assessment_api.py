@@ -122,7 +122,7 @@ class TestAssessmentApi:
                 break
         assert scrolls[-1]["assessment_ready"] is True
         assert scrolls[-1]["scroll_count"] == scrolls[-1]["cadence_target"]
-        assert 2 <= scrolls[-1]["cadence_target"] <= 5
+        assert 3 <= scrolls[-1]["cadence_target"] <= 5
         assert {
             "reel_id",
             "material_id",
@@ -146,7 +146,7 @@ class TestAssessmentApi:
         assert created.status_code == 200
         body = created.json()
         assert body["status"] == "ready"
-        assert body["session"]["question_count"] == 2
+        assert body["session"]["question_count"] == 3
         for question in body["session"]["questions"]:
             assert "correct_index" not in question
             assert "explanation" not in question
@@ -175,7 +175,7 @@ class TestAssessmentApi:
         assert result is not None
         assert result["session"]["status"] == "completed"
         assert result["session"]["score"] == 1.0
-        assert len(result["session"]["understood_concepts"]) == 2
+        assert len(result["session"]["understood_concepts"]) == 3
         with db_module.get_conn() as conn:
             progress = db_module.fetch_one(
                 conn,
@@ -184,7 +184,7 @@ class TestAssessmentApi:
                 (MATERIAL,),
             )
         assert progress is not None
-        assert float(progress["global_adjustment"]) == 0.16
+        assert float(progress["global_adjustment"]) == 0.2
 
     def test_other_learner_cannot_resume_or_answer_session(self) -> None:
         ready = False

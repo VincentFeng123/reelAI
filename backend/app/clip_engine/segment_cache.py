@@ -17,9 +17,9 @@ from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 
 logger = logging.getLogger(__name__)
 
-SEGMENT_CACHE_VERSION = 22
+SEGMENT_CACHE_VERSION = 32
 SEGMENT_CACHE_TTL_SEC = 30 * 24 * 60 * 60
-SELECTION_CONTRACT_VERSION = "quality_silence_v32"
+SELECTION_CONTRACT_VERSION = "quality_silence_v33"
 
 
 def _objective_tokens(clip: Mapping[str, Any]) -> set[str]:
@@ -62,6 +62,19 @@ def _canonical_json(value: Any) -> str:
 
 def _relevant_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     fine_snap = settings.get("segment_fine_snap")
+    learner_level = " ".join(str(
+        settings.get("_knowledge_level")
+        or settings.get("knowledge_level")
+        or settings.get("learner_level")
+        or ""
+    ).split()).lower()
+    video_grounding_required = bool(
+        settings.get("_segment_video_grounding_required")
+    )
+    video_url = " ".join(str(
+        settings.get("_segment_video_url") or ""
+    ).split())
+    video_grounding_enabled = video_grounding_required or bool(video_url)
     return {
         "fine_snap": (
             bool(pipeline_config.SEGMENT_FINE_SNAP)
@@ -69,6 +82,26 @@ def _relevant_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             else bool(fine_snap)
         ),
         "language": " ".join(str(settings.get("language") or "en").split()).lower(),
+        "learner_level": learner_level,
+        "routing_mode": " ".join(str(
+            settings.get("_segment_routing_mode")
+            or pipeline_config.SEGMENT_ROUTING_MODE
+        ).split()).lower(),
+        "thinking_level": " ".join(str(
+            settings.get("_segment_thinking_level") or "medium"
+        ).split()).lower(),
+        "video_grounding": {
+            "enabled": video_grounding_enabled,
+            "required": video_grounding_required,
+            "url": video_url if video_grounding_enabled else "",
+            "media_resolution": (
+                " ".join(str(
+                    settings.get("_segment_media_resolution") or "low"
+                ).split()).lower()
+                if video_grounding_enabled
+                else ""
+            ),
+        },
     }
 
 
@@ -123,6 +156,7 @@ def segment_cache_key(
         ).hexdigest(),
         "flash_model": pipeline_config.SEGMENT_FLASH_MODEL,
         "flash_fallback_model": pipeline_config.SEGMENT_FLASH_FALLBACK_MODEL,
+        "pro_model": pipeline_config.SEGMENT_PRO_MODEL,
         "segmenter_source_sha256": _segmenter_source_signature(),
         "settings": _relevant_settings(settings),
     }

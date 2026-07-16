@@ -526,16 +526,16 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
         self.assertNotEqual(learner_a_revision_1, learner_b_revision_1)
         self.assertNotEqual(learner_a_revision_1, learner_a_revision_2)
 
-    def test_ranked_feed_cache_version_is_39(self) -> None:
-        """Cache rows must require the v32 post-closure selector contract."""
+    def test_ranked_feed_cache_version_is_40(self) -> None:
+        """Cache rows must require the v33 grounded-claim selector contract."""
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_VERSION,
-            39,
+            40,
             "Current feeds must not reuse rows missing public selector metadata.",
         )
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
-            "quality_silence_v32",
+            "quality_silence_v33",
         )
 
 

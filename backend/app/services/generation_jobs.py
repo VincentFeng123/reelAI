@@ -43,7 +43,7 @@ DEFAULT_LEASE_SECONDS = 90
 DEFAULT_DEADLINE_SECONDS = 60 * 60
 DEFAULT_QUEUE_TTL_SECONDS = 8 * 60
 # Request-key version doubles as a production inventory compatibility gate.
-REQUEST_SCHEMA_VERSION = "quality_silence_v32"
+REQUEST_SCHEMA_VERSION = "quality_silence_v33"
 GENERATION_SUBMIT_ADVISORY_LOCK_ID = 0x5354554459524545
 
 
@@ -183,6 +183,7 @@ def build_request_key(
     material_id: str,
     concept_id: str | None,
     content_fingerprint: str,
+    learner_id: str,
     knowledge_level: str,
     generation_mode: Literal["slow", "fast"],
     creative_commons_only: bool,
@@ -193,6 +194,7 @@ def build_request_key(
     language: str = "en",
     min_relevance: float | None = None,
     exclude_video_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+    continuation_token: str | None = None,
 ) -> str:
     """Build the normalized request key; deprecated clip-duration fields are inert."""
     payload = {
@@ -200,6 +202,7 @@ def build_request_key(
         "material_id": str(material_id),
         "concept_id": str(concept_id or ""),
         "content_fingerprint": str(content_fingerprint),
+        "learner_id": _normalize_text(learner_id),
         "knowledge_level": _normalize_text(knowledge_level).lower(),
         "generation_mode": generation_mode,
         "creative_commons_only": bool(creative_commons_only),
@@ -215,6 +218,7 @@ def build_request_key(
                 if _normalize_text(video_id)
             }
         ),
+        "continuation_token": _normalize_text(continuation_token),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

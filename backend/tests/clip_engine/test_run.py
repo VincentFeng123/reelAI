@@ -1,4 +1,6 @@
 # backend/tests/clip_engine/test_run.py
+from types import SimpleNamespace
+
 import pytest
 from backend.app.clip_engine import expand, run
 from backend.app.clip_engine.errors import (
@@ -32,6 +34,13 @@ def test_clip_builds_embed_urls_and_forwards_topic(monkeypatch):
         seen["topic"] = topic
         seen["video_id"] = video_id
         seen["accept_partial_flash"] = settings.get("segment_accept_partial_flash")
+        seen["segment_video_url"] = settings.get("_segment_video_url")
+        seen["video_grounding_required"] = settings.get(
+            "_segment_video_grounding_required"
+        )
+        seen["segment_media_resolution"] = settings.get(
+            "_segment_media_resolution"
+        )
         return ([{"start": 1.0, "end": 4.0, "cut_end": 4.15, "title": "Bit",
                   "facet": "concept", "reason": "", "sequence_index": 1}], "1 clip")
 
@@ -51,14 +60,44 @@ def test_clip_builds_embed_urls_and_forwards_topic(monkeypatch):
     assert seen["video_id"] == "dQw4w9WgXcQ"
     assert seen["accept_partial_flash"] is True
     assert seen["transcript_url"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    assert seen["segment_video_url"] == seen["transcript_url"]
+    assert seen["video_grounding_required"] is True
+    assert seen["segment_media_resolution"] == "low"
 
 
 def test_live_runner_uses_the_canonical_practice_segmenter():
     assert run.gemini_segment.__name__ == "backend.pipeline.gemini_segment"
 
 
+def test_pro_boundary_fallback_forwards_canonical_video_grounding(monkeypatch):
+    seen = {}
+
+    def fake_fallback(transcript, settings, **kwargs):
+        seen.update(settings)
+        seen.update(kwargs)
+        return SimpleNamespace(clips=[], notes="none", route="pro")
+
+    monkeypatch.setattr(
+        run.gemini_segment,
+        "pro_boundary_fallback_detailed",
+        fake_fallback,
+    )
+    output = run.pro_boundary_fallback(
+        {"segments": [{"start": 0.0, "end": 5.0, "text": "lesson"}]},
+        topic="calculus",
+        video_id="dQw4w9WgXcQ",
+    )
+
+    assert output["route"] == "pro"
+    assert seen["_segment_video_url"] == (
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    )
+    assert seen["_segment_video_grounding_required"] is True
+    assert seen["_segment_media_resolution"] == "low"
+
+
 def test_direct_url_segment_cache_hit_skips_all_gemini_and_budget(monkeypatch):
-    assert run.segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v32"
+    assert run.segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v33"
     transcript = {
         "segments": [{
             "cue_id": "cached-cue",

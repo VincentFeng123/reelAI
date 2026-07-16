@@ -195,6 +195,10 @@ class ClipEngineTopicCutTests(unittest.TestCase):
 
         mock_verify.assert_called_once()
         self.assertIsNone(mock_verify.call_args.kwargs["limit"])
+        self.assertTrue(
+            mock_verify.call_args.kwargs["require_acoustic_boundaries"]
+        )
+        self.assertTrue(mock_verify.call_args.kwargs["prepared_audio"].ready)
         self.assertEqual(mock_verify.call_args.kwargs["exact_topic"], "chain rule")
         self.assertIs(
             mock_verify.call_args.kwargs["embedding_service"],

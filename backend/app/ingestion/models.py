@@ -153,6 +153,8 @@ class ReelOutWithAttribution(ReelOut):
 
     source_attribution: str | None = None
     selection_contract_version: str | None = None
+    boundary_status: str = ""
+    acoustic_verified: bool = False
     boundary_confidence: float | None = None
     is_standalone: bool = True
     chain_id: str = ""

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from . import expand, rank, supadata_search
 from .cancellation import raise_if_cancelled
-from .errors import SearchError
+from .errors import ProviderBudgetExceededError, SearchError
 from .metadata import normalize_youtube_video_id
 from .provider_cache import ProviderCacheStore, normalize_filters
 from .provider_runtime import GenerationContext
@@ -284,6 +284,92 @@ def _consensus_count(per_query: list[dict], excluded: set[str]) -> int:
     return sum(1 for families in appearances.values() if len(families) >= 2)
 
 
+def _provider_page_frontier(
+    result_sets: list[dict],
+    *,
+    fallback_filters: dict | None,
+    seen: set[tuple[str, str, str]],
+) -> list[tuple[str, str, dict | None]]:
+    frontier: list[tuple[str, str, dict | None]] = []
+    for result_set in result_sets:
+        query = " ".join(str(result_set.get("query") or "").split())
+        token = str(result_set.get("next_page_token") or "").strip()
+        effective_filters = result_set.get("filters_applied")
+        if not isinstance(effective_filters, dict):
+            effective_filters = fallback_filters
+        normalized_filters = normalize_filters(effective_filters)
+        filter_key = repr(sorted(normalized_filters.items()))
+        key = (query.casefold(), filter_key, token)
+        if not query or not token or key in seen:
+            continue
+        seen.add(key)
+        frontier.append((query, token, effective_filters))
+    return frontier
+
+
+def _continue_provider_pages(
+    result_sets: list[dict],
+    *,
+    filters: dict | None,
+    search_runtime: dict[str, object],
+    enough: Callable[[], bool],
+    annotate: Callable[[list[dict]], None],
+) -> tuple[int, str | None, bool]:
+    """Replay cached cursors and fetch only until useful unseen inventory exists.
+
+    Supadata's opaque cursor is already stored beside each cached page. Walking
+    that chain on every continuation is deterministic: old pages are cache hits,
+    and only the first not-yet-cached page costs another provider request.
+    """
+    seen: set[tuple[str, str, str]] = set()
+    frontier = _provider_page_frontier(
+        result_sets,
+        fallback_filters=filters,
+        seen=seen,
+    )
+    credits_used = 0
+    warning: str | None = None
+    while frontier and not enough():
+        page_queries = [query for query, _token, _filters in frontier]
+        page_tokens = [token for _query, token, _filters in frontier]
+        page_filters = [entry_filters for _query, _token, entry_filters in frontier]
+        try:
+            page_result = supadata_search.search_all(
+                page_queries,
+                filters,
+                page_tokens=page_tokens,
+                request_filters=page_filters,
+                **search_runtime,
+            )
+        except ProviderBudgetExceededError:
+            warning = "Search budget exhausted with provider pages remaining."
+            break
+
+        page_sets = list(page_result.get("per_query") or [])
+        credits_used += int(page_result.get("credits_used") or 0)
+        warning = str(page_result.get("warning") or "").strip() or warning
+        if not page_sets:
+            break
+        annotate(page_sets)
+        result_sets.extend(page_sets)
+
+        # A budget-limited search_all may complete only a prefix. Keep every
+        # unrequested cursor open instead of falsely declaring exhaustion.
+        unprocessed = frontier[len(page_sets) :]
+        frontier = [
+            *_provider_page_frontier(
+                page_sets,
+                fallback_filters=filters,
+                seen=seen,
+            ),
+            *unprocessed,
+        ]
+        if page_result.get("warning"):
+            break
+
+    return credits_used, warning, not frontier
+
+
 def _load_query_plan(
     literal_topic: str,
     should_cancel: Callable[[], bool] | None,
@@ -317,6 +403,7 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
              literal_topic: str | None = None,
              use_query_planner: bool = True,
              query_plan: "SearchQueryPlan | None" = None,
+             consumed_video_ids: list[str] | None = None,
              practice_fast: bool = False,
              retrieval_profile: str = "deep",
              deadline_monotonic: float | None = None) -> dict:
@@ -335,6 +422,7 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
             literal_topic=literal_topic,
             use_query_planner=use_query_planner,
             query_plan=query_plan,
+            consumed_video_ids=consumed_video_ids,
             retrieval_profile=retrieval_profile,
             deadline_monotonic=deadline_monotonic,
         )
@@ -365,7 +453,7 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
         planned_queries = list(effective_plan.queries)
     exclude = {
         normalize_youtube_video_id(video_id) or str(video_id)
-        for video_id in (exclude_video_ids or [])
+        for video_id in [*(exclude_video_ids or []), *(consumed_video_ids or [])]
     }
     from ..services.search_query_plan import normalize_query, semantic_query_family
 
@@ -468,7 +556,30 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
         requests.append({**primary_metadata, "hd_preferred": True})
 
     def annotate_result_sets(per_query: list[dict]) -> None:
-        for result_set, request in zip(per_query, requests):
+        for result_set in per_query:
+            result_query = normalize_query(result_set.get("query") or "")
+            result_features = set(
+                normalize_filters(result_set.get("filters_applied"))[
+                    "features"
+                ]
+            )
+            request = next(
+                (
+                    candidate
+                    for candidate in requests
+                    if normalize_query(candidate["query"]) == result_query
+                    and bool(candidate["hd_preferred"])
+                    == ("hd" in result_features)
+                ),
+                next(
+                    (
+                        candidate
+                        for candidate in requests
+                        if normalize_query(candidate["query"]) == result_query
+                    ),
+                    primary_metadata,
+                ),
+            )
             result_set.update(
                 query_family=request["query_family"],
                 query_trust=request["query_trust"],
@@ -500,6 +611,37 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
     )
     raise_if_cancelled(should_cancel)
     annotate_result_sets(res["per_query"])
+    analysis_target = max(0, int(limit))
+    if context is not None:
+        analysis_target = min(
+            analysis_target,
+            max(0, context.budget.remaining("segmentation")),
+        )
+
+    def enough_ranked_videos() -> bool:
+        ranked_now = rank.merge_and_rank(res["per_query"], level=level)
+        return len(
+            _select_ranked_candidates(
+                ranked_now,
+                limit=max(0, int(limit)),
+                excluded=exclude,
+                analysis_prefix=analysis_target or None,
+            )[:analysis_target]
+        ) >= analysis_target
+
+    extra_credits, pagination_warning, provider_exhausted = _continue_provider_pages(
+        res["per_query"],
+        filters=filters,
+        search_runtime={
+            "should_cancel": should_cancel,
+            "language": language,
+            "context": context,
+            "cache_store": cache_store,
+            "deadline_monotonic": deadline_monotonic,
+        },
+        enough=enough_ranked_videos,
+        annotate=annotate_result_sets,
+    )
     ranked = rank.merge_and_rank(res["per_query"], level=level)
     videos = _select_ranked_candidates(
         ranked,
@@ -512,7 +654,9 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
         ),
     )
     return {"corrected": topic, "videos": videos,
-            "credits_used": res["credits_used"], "warning": res["warning"],
+            "credits_used": int(res["credits_used"] or 0) + extra_credits,
+            "warning": pagination_warning or res["warning"],
+            "provider_exhausted": provider_exhausted,
             "query_plan": effective_plan}
 
 
@@ -531,6 +675,7 @@ def discover_practice_fast(
     literal_topic: str | None = None,
     use_query_planner: bool = True,
     query_plan: "SearchQueryPlan | None" = None,
+    consumed_video_ids: list[str] | None = None,
     retrieval_profile: str = "deep",
     deadline_monotonic: float | None = None,
 ) -> dict:
@@ -642,8 +787,38 @@ def discover_practice_fast(
     )
     excluded = {
         normalize_youtube_video_id(video_id) or str(video_id or "").strip()
-        for video_id in (exclude_video_ids or [])
+        for video_id in [*(exclude_video_ids or []), *(consumed_video_ids or [])]
     }
+    analysis_target = max(0, int(limit))
+    if context is not None:
+        analysis_target = min(
+            analysis_target,
+            max(0, context.budget.remaining("segmentation")),
+        )
+
+    def enough_ranked_videos() -> bool:
+        ranked_now = rank.merge_and_rank(
+            per_query,
+            level=level if bootstrap else None,
+        )
+        return len(
+            _select_ranked_candidates(
+                ranked_now,
+                limit=max(0, int(limit)),
+                excluded=excluded,
+                analysis_prefix=analysis_target or None,
+            )[:analysis_target]
+        ) >= analysis_target
+
+    pagination_credits, pagination_warning, provider_exhausted = (
+        _continue_provider_pages(
+            per_query,
+            filters=filters,
+            search_runtime=search_runtime,
+            enough=enough_ranked_videos,
+            annotate=annotate,
+        )
+    )
     initial_ranked = rank.merge_and_rank(
         per_query,
         level=level if bootstrap else None,
@@ -751,6 +926,7 @@ def discover_practice_fast(
             "videos": videos,
             "credits_used": (
                 int(initial.get("credits_used") or 0)
+                + pagination_credits
                 + int(niche_result.get("credits_used") or 0)
                 + int(fallback_result.get("credits_used") or 0)
                 + int(component_result.get("credits_used") or 0)
@@ -759,7 +935,16 @@ def discover_practice_fast(
                 component_result.get("warning")
                 or fallback_result.get("warning")
                 or niche_result.get("warning")
+                or pagination_warning
                 or initial.get("warning")
+            ),
+            "provider_exhausted": (
+                provider_exhausted
+                and not any(
+                    str(result_set.get("next_page_token") or "").strip()
+                    for result in (niche_result, fallback_result, component_result)
+                    for result_set in (result.get("per_query") or [])
+                )
             ),
             "query_plan": query_plan,
         }
@@ -790,7 +975,9 @@ def discover_practice_fast(
         "videos": videos,
         "credits_used": (
             int(initial.get("credits_used") or 0)
+            + pagination_credits
         ),
-        "warning": initial.get("warning"),
+        "warning": pagination_warning or initial.get("warning"),
+        "provider_exhausted": provider_exhausted,
         "query_plan": query_plan,
     }

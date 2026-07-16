@@ -168,7 +168,7 @@ def _build_engine_out(video_id: str) -> dict:
 
 
 def _discover_side_effect(topic, limit, exclude_video_ids=None, **kw):
-    excl = set(exclude_video_ids or [])
+    excl = set(exclude_video_ids or []) | set(kw.get("consumed_video_ids") or [])
     videos = [v for v in POOL if v["id"] not in excl][:limit]
     return {"corrected": topic, "videos": videos, "credits_used": 0, "warning": None}
 
@@ -324,6 +324,32 @@ class IngestTopicTests(unittest.TestCase):
         # Only vidA's 2 clips survive
         self.assertEqual(len(reels), 2)
 
+    def test_open_provider_cursor_is_recorded_for_resumable_generation(self) -> None:
+        context = GenerationContext("slow")
+        with _Patched() as (mock_search, mock_run):
+            mock_search.discover.side_effect = None
+            mock_search.discover.return_value = {
+                "corrected": TOPIC,
+                "videos": [],
+                "credits_used": 0,
+                "warning": None,
+                "provider_exhausted": False,
+            }
+            reels, resolved = main_module.ingestion_pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="mat-2",
+                concept_id="con-2",
+                generation_id="gen-open-cursor",
+                max_videos=1,
+                max_reels=1,
+                generation_context=context,
+            )
+
+        self.assertEqual(reels, [])
+        self.assertEqual(resolved, [])
+        self.assertEqual(context.counters()["provider_cursor_open"], 1)
+        mock_run.clip.assert_not_called()
+
     # ---- 3. max_reels global cap ---- #
 
     def test_max_reels_global_cap(self) -> None:
@@ -347,6 +373,58 @@ class IngestTopicTests(unittest.TestCase):
         self.assertTrue(all("vidAAAAAAAA" in r.video_url for r in reels))
         rows = self._reels_for_generation("gen-3")
         self.assertEqual(len(rows), 3)
+
+    def test_fourth_sibling_is_cached_beyond_three_reel_surface_batch(self) -> None:
+        four_windows = [
+            (30.0, 75.0),
+            (120.0, 165.0),
+            (210.0, 255.0),
+            (300.0, 345.0),
+        ]
+        surfaced: list[ReelOutWithAttribution] = []
+        with mock.patch.dict(CLIP_WINDOWS, {"vidAAAAAAAA": four_windows}):
+            with _Patched() as (mock_search, mock_run):
+                mock_search.discover.side_effect = (
+                    lambda topic, limit, exclude_video_ids=None, **kw: {
+                        "corrected": topic,
+                        "videos": [VID_A],
+                        "credits_used": 0,
+                        "warning": None,
+                        "provider_exhausted": False,
+                    }
+                )
+                first_batch, _ = main_module.ingestion_pipeline.ingest_topic(
+                    topic=TOPIC,
+                    material_id="mat-3",
+                    concept_id="con-3",
+                    generation_id="gen-four-siblings",
+                    max_videos=1,
+                    max_reels=3,
+                    max_persisted_reels=None,
+                    on_reel_created=surfaced.append,
+                )
+                selector_calls = mock_run.clip.call_count
+
+                with db_module.get_conn() as conn:
+                    reservoir = main_module.reel_service.ranked_feed(
+                        conn,
+                        "mat-3",
+                        generation_id="gen-four-siblings",
+                    )
+                surfaced_ids = {reel.reel_id for reel in first_batch}
+                cached_continuation = [
+                    reel
+                    for reel in reservoir
+                    if reel["reel_id"] not in surfaced_ids
+                ]
+
+        self.assertEqual(len(first_batch), 3)
+        self.assertEqual(len(surfaced), 3)
+        self.assertEqual(len(self._reels_for_generation("gen-four-siblings")), 4)
+        self.assertEqual(len(cached_continuation), 1)
+        self.assertEqual(float(cached_continuation[0]["t_start"]), 300.0)
+        self.assertEqual(selector_calls, 1)
+        self.assertEqual(mock_run.clip.call_count, 1)
 
     def test_retry_reuse_does_not_consume_remaining_persistence_capacity(self) -> None:
         first_result = _build_engine_out("vidAAAAAAAA")
@@ -814,7 +892,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
             )
 
         self.assertEqual(len(reels), 1)
-        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v32")
+        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v33")
         self.assertEqual(reels[0].t_start, 12.001)
         self.assertEqual(reels[0].t_end, 433.012)
         self.assertGreater(reels[0].t_end - reels[0].t_start, 180.0)
@@ -877,7 +955,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
 
         self.assertEqual(len(beginner_feed), 1)
         self.assertEqual(
-            beginner_feed[0]["selection_contract_version"], "quality_silence_v32"
+            beginner_feed[0]["selection_contract_version"], "quality_silence_v33"
         )
         self.assertIsInstance(beginner_feed[0]["t_start"], float)
         self.assertIsInstance(beginner_feed[0]["t_end"], float)

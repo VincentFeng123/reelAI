@@ -769,6 +769,36 @@ def test_video_and_multimodal_gemini3_paths_omit_sampling(monkeypatch):
     assert video_cfg.media_resolution == media
 
 
+def test_youtube_video_part_bounds_media_to_the_timestamped_transcript() -> None:
+    part = gc.youtube_video_part(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        end_offset_sec=600.25,
+    )
+
+    assert part.file_data.file_uri == (
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    )
+    assert part.video_metadata.end_offset == "600.25s"
+
+
+def test_youtube_video_part_rounds_fractional_end_outward() -> None:
+    part = gc.youtube_video_part(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        end_offset_sec=600.2501,
+    )
+
+    assert part.video_metadata.end_offset == "600.251s"
+
+
+@pytest.mark.parametrize("end_offset", [0, -1, float("inf"), "invalid"])
+def test_youtube_video_part_rejects_invalid_media_bounds(end_offset) -> None:
+    with pytest.raises(ValueError, match="end offset"):
+        gc.youtube_video_part(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            end_offset_sec=end_offset,
+        )
+
+
 @pytest.mark.parametrize("model", ["", "gemini-2.5-flash"])
 def test_dedicated_gemini3_api_requires_explicit_gemini3_model(monkeypatch, model):
     fake = _FakeClient(_FakeResponse())

@@ -258,6 +258,41 @@ def test_terminal_now_sometimes_completes_the_following_teaching_sentence() -> N
     [clip] = report.clips
     assert clip["cue_ids"][-1] == "YNstP0ESndU:cue:43"
     assert clip["_clip_text"].endswith("you have to use other techniques to get the answer")
+
+
+def test_short_prepositional_caption_tail_completes_the_derivative_claim() -> None:
+    segments = [
+        _cue(
+            "derivative:0", 0.0, 6.0,
+            "A derivative takes the limit of change in y over change in x as x approaches zero,",
+        ),
+        _cue(
+            "derivative:1", 6.0, 10.0,
+            "and we are not just going to be able to figure it out",
+        ),
+        _cue("derivative:2", 10.0, 12.0, "for a point."),
+        _cue(
+            "derivative:3", 12.0, 18.0,
+            "Next we will derive a general equation for every point.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="limit-definition-of-derivative",
+        start_line=0,
+        end_line=1,
+        start_quote="A derivative takes the limit",
+        end_quote="able to figure it out",
+        evidence="limit of change in y over change in x",
+        objective="Explain how a limit defines the derivative at a point",
+    )
+
+    report = _report(segments, proposal, topic="calculus derivative from a limit")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"][-1] == "derivative:2"
+    assert clip["_clip_text"].endswith("for a point.")
+    assert "general equation" not in clip["_clip_text"]
     assert "in this particular example" not in clip["_clip_text"].casefold()
 
 
@@ -1580,6 +1615,7 @@ def test_compact_comparison_uses_relationship_evidence_and_stops_at_third_unit()
                 end_line=4,
                 start_quote="Find the derivative of x squared",
                 end_quote="derivative of tangent of x cubed",
+                claim_quote=relationship_evidence,
                 title="Power rule versus chain rule",
                 learning_objective=(
                     "Compare the power rule example with the chain rule example"
@@ -2135,7 +2171,7 @@ def test_procedural_numerator_step_stays_with_its_problem_and_answer() -> None:
     ]
 
 
-def test_live_style_fraction_intuition_recovers_setup_and_formal_conclusion() -> None:
+def test_live_style_fraction_intuition_rejects_unspliceable_internal_aside() -> None:
     segments = [
         _cue(
             "live:0",
@@ -2199,14 +2235,10 @@ def test_live_style_fraction_intuition_recovers_setup_and_formal_conclusion() ->
 
     report = _report(segments, proposal, topic="chain rule worked example")
 
-    assert report.rejected_reasons == []
-    [clip] = report.clips
-    assert clip["cue_ids"] == [f"live:{index}" for index in range(1, 8)]
-    assert clip["_clip_text"].startswith("For h of x equals sine")
-    assert clip["_clip_text"].endswith("derivative of x squared.")
-    assert "A quick aside" in clip["_clip_text"]
-    assert "quotient rule" not in clip["_clip_text"].casefold()
-    assert "product rule" not in clip["_clip_text"].casefold()
+    assert report.clips == []
+    assert report.rejected_reasons == [
+        "proposal_0:internal_structural_filler"
+    ]
 
 
 def test_dependent_preposition_and_terminal_then_are_not_complete_edges() -> None:
@@ -2689,6 +2721,9 @@ def test_live_coarse_captions_isolate_sine_six_x_worked_unit() -> None:
             end_line=5,
             start_quote="let's move on to the chain",
             end_quote="6 cosine",
+            claim_quote=(
+                "derivative of s of 6X the derivative of the outside"
+            ),
             title="Chain Rule Worked Example for Trigonometric Functions",
             learning_objective=(
                 "Show how to differentiate a sine function with a linear inner "
@@ -2734,7 +2769,7 @@ def test_live_coarse_captions_isolate_sine_six_x_worked_unit() -> None:
         "find the derivative of s of 6x"
     )
     assert compact_clip["topic_evidence_quote"].casefold().startswith(
-        "find the derivative of s of 6x"
+        "derivative of s of 6x"
     )
     assert compact_clip["intent_evidence"][1]["evidence_quote"].casefold().startswith(
         "find the derivative of s of 6x"
@@ -2938,6 +2973,7 @@ def test_live_coarse_captions_isolate_first_power_example_and_complete_answer() 
             end_line=3,
             start_quote="derivative of 5x + 3 raised to the 4th power",
             end_quote="20 * 5x + 3 ra the thir",
+            claim_quote="derivative of 5x + 3 raised to the 4th power",
             title="Derivative of a polynomial to a power",
             learning_objective=(
                 "Differentiate a polynomial function raised to a power using the chain rule."
@@ -3624,6 +3660,7 @@ def test_live_compact_selector_evidence_isolates_rational_worked_unit() -> None:
                 end_line=5,
                 start_quote="X What is the dtive of",
                 end_quote="find the Der of this uh",
+                claim_quote="1 / x^2 + 8 raised to the 3 power",
                 title="Derivative of 1/(x^2+8)^3",
                 learning_objective=(
                     "Differentiate a rational function using the chain rule by "

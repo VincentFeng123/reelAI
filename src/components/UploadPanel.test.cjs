@@ -4,7 +4,7 @@ const path = require("node:path");
 const test = require("node:test");
 const ts = require("typescript");
 
-test("topic submission starts at the hidden beginner level", () => {
+test("topic, text, and file submissions use the selected learner level", () => {
   const filePath = path.join(__dirname, "UploadPanel.tsx");
   const source = fs.readFileSync(filePath, "utf8");
   const sourceFile = ts.createSourceFile(
@@ -36,27 +36,33 @@ test("topic submission starts at the hidden beginner level", () => {
   const callbackText = submitCallback.arguments[0].getText(sourceFile);
   assert.match(
     source,
-    /const DEFAULT_KNOWLEDGE_LEVEL = "beginner" as const;/,
-    "the hidden initial level must stay beginner",
+    /const \[knowledgeLevel, setKnowledgeLevel\] = useState<KnowledgeLevel>\("beginner"\)/,
+    "the visible selector must default to beginner",
   );
   assert.match(
     callbackText,
-    /topicList\.map\([\s\S]*knowledgeLevel: DEFAULT_KNOWLEDGE_LEVEL/,
-    "multi-topic upload must preserve the hidden starting level",
+    /topicList\.map\([\s\S]*knowledgeLevel,/,
+    "multi-topic upload must use the selected level",
   );
   assert.match(
     callbackText,
-    /knowledgeLevel: inputMode === "topic" \? DEFAULT_KNOWLEDGE_LEVEL : undefined/,
-    "single-topic upload must preserve the hidden starting level",
+    /const material = await uploadMaterial\(\{[\s\S]*knowledgeLevel,/,
+    "topic, text, and file uploads must all use the selected level",
   );
   const dependencies = submitCallback.arguments[1];
   assert.ok(
     dependencies && ts.isArrayLiteralExpression(dependencies),
     "onSubmit must declare its hook dependencies",
   );
-  assert.ok(!source.includes('aria-label="How well do you know this topic?"'));
-  assert.ok(!source.includes('role="radiogroup"'));
-  assert.doesNotMatch(source, /setKnowledgeLevel/);
+  assert.ok(
+    dependencies.elements.some((element) => element.getText(sourceFile) === "knowledgeLevel"),
+    "onSubmit must refresh when the selected level changes",
+  );
+  assert.match(source, /type="radio"/);
+  assert.match(source, /name="knowledge-level"/);
+  assert.match(source, /knowledgeLevel\?: KnowledgeLevel;/);
+  assert.match(callbackText, /knowledgeLevel,\s*title: topic,/);
+  assert.match(callbackText, /knowledgeLevel,\s*title,/);
   assert.doesNotMatch(
     callbackText,
     /targetClipDuration/,
@@ -132,4 +138,67 @@ test("URL ingestion primes every returned reel with a legacy single-reel fallbac
     /primeFeedSessionSnapshot\(ingestMaterialId, ingestedReels, ingestedReel\.reel_id, activeSettings\)/,
     "the feed snapshot must receive the complete verified URL inventory",
   );
+});
+
+test("URL ingestion primes feed snapshots with the current v33 selection contract", () => {
+  const filePath = path.join(__dirname, "UploadPanel.tsx");
+  const source = fs.readFileSync(filePath, "utf8");
+  const sourceFile = ts.createSourceFile(
+    filePath,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TSX,
+  );
+  let declaration;
+  function visit(node) {
+    if (ts.isFunctionDeclaration(node) && node.name?.text === "primeFeedSessionSnapshot") {
+      declaration = node;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+  assert.ok(declaration, "snapshot priming helper must remain discoverable");
+  const compiled = ts.transpile(
+    declaration.getText(sourceFile),
+    { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  );
+  const writes = [];
+  const localStorage = {
+    getItem: () => JSON.stringify({ existing: { reels: [] } }),
+    setItem: (key, value) => writes.push({ key, value }),
+  };
+  const primeFeedSessionSnapshot = new Function(
+    "window",
+    "CURRENT_SELECTION_CONTRACT_VERSION",
+    "FEED_SESSION_STORAGE_KEY",
+    "safeStorageSetItem",
+    `${compiled}\nreturn primeFeedSessionSnapshot;`,
+  )(
+    { localStorage },
+    "quality_silence_v33",
+    "studyreels-feed-sessions",
+    (storage, key, value) => {
+      storage.setItem(key, value);
+      return true;
+    },
+  );
+
+  primeFeedSessionSnapshot(
+    "ingest-search:abc",
+    [
+      { reel_id: "reel-1" },
+      { reel_id: "reel-2" },
+    ],
+    "reel-2",
+    { generationMode: "slow", startMuted: true, autoplayNextReel: true },
+  );
+
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].key, "studyreels-feed-sessions");
+  const stored = JSON.parse(writes[0].value);
+  assert.equal(stored["ingest-search:abc"].selectionContractVersion, "quality_silence_v33");
+  assert.equal(stored["ingest-search:abc"].activeIndex, 1);
+  assert.deepEqual(stored.existing, { reels: [] });
 });

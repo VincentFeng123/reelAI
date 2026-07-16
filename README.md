@@ -38,9 +38,9 @@ Every event includes `job_id`, a monotonic `seq`, and a timestamp. Status and ca
 
 Only canonical YouTube video, playlist, and channel URLs are accepted by ingestion surfaces. Topic materials use the practice retrieval flow: Gemini Flash expands the literal topic into eight level-aware educational queries, Supadata searches them sequentially, and candidates are merged by repeated-query matches, provider rank, and views. Creative Commons and source-duration filters map directly to Supadata when selected. Transcripts use `mode=auto`: native captions are used when available and Supadata generates hosted timestamped cues otherwise.
 
-Clip duration is a preference. Valid self-contained clips are persisted inside the global 1–180 second safety envelope. Serving ranks requested-range clips first, then fills shortages with the nearest shorter/longer clips and reports `duration_preference_met` plus `duration_fit`.
+Production clip selection has no duration target or maximum. It keeps the shortest range that contains the necessary setup, one complete teaching claim, and a clean silent ending—even when a worked explanation legitimately runs longer than 180 seconds.
 
-Fast jobs retain the small three-search/three-video path. Quality-first slow jobs evaluate up to 12 videos initially and may make two four-video continuation passes. Retry-aware ceilings allow 72 search attempts, 60 transcript attempts, and 20 segmentation routes so transient provider failures do not starve later sources. Practice-valid clips are persisted up to the 300-reel material inventory ceiling; ReelAI only reorders them for topic relevance, informativeness, and learner level.
+Each generation job remains provider- and output-bounded. When a learner approaches the end of a batch, a continuation job searches for another unseen batch; there is no terminal material-wide reel ceiling. Valid sibling clips from the same source video remain eligible when their timestamp ranges are new, and ReelAI preserves the server's topic-, quality-, and level-aware order.
 
 ### Local development
 

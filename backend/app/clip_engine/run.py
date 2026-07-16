@@ -179,6 +179,9 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
     settings["should_cancel"] = should_cancel
 
     canonical_url = f"https://www.youtube.com/watch?v={video_id}"
+    settings["_segment_video_url"] = canonical_url
+    settings["_segment_video_grounding_required"] = True
+    settings["_segment_media_resolution"] = "low"
     transcript = _transcribe(canonical_url, video_id, settings)
     raise_if_cancelled(should_cancel)
     if not (transcript.get("segments")):
@@ -306,6 +309,11 @@ def pro_boundary_fallback(
     raise_if_cancelled(should_cancel)
     runtime_settings = dict(settings or {})
     runtime_settings["should_cancel"] = should_cancel
+    runtime_settings["_segment_video_url"] = (
+        f"https://www.youtube.com/watch?v={video_id}"
+    )
+    runtime_settings["_segment_video_grounding_required"] = True
+    runtime_settings["_segment_media_resolution"] = "low"
     _wire_segment_runtime(
         runtime_settings,
         video_id,

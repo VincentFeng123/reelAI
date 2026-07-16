@@ -9,6 +9,7 @@ import type {
   CommunitySet,
   CommunityReelPlatform,
   FeedResponse,
+  GenerationBatchTerminalStatus,
   GenerationJobCancelResponse,
   GenerationJobStatusResponse,
   GenerationQueuedResponse,
@@ -765,7 +766,7 @@ type GenerateReelsParams = {
   materialId: string;
   numReels?: number;
   conceptId?: string;
-  excludeVideoIds?: string[];
+  continuationToken?: string;
   generationMode?: "slow" | "fast";
   minRelevance?: number;
   creativeCommonsOnly?: boolean;
@@ -828,16 +829,25 @@ function normalizeReelIdList(values: string[] | undefined): string[] {
     : normalized;
 }
 
-function generationModeCeiling(mode: "slow" | "fast" | undefined): number {
-  return mode === "fast" ? 8 : 12;
+function generationModeCeiling(_mode: "slow" | "fast" | undefined): number {
+  return 9;
+}
+
+function requestedReelCount(params: Pick<GenerateReelsParams, "generationMode" | "numReels">): number {
+  const ceiling = generationModeCeiling(params.generationMode);
+  const requested = params.numReels;
+  if (typeof requested !== "number" || !Number.isFinite(requested)) {
+    return ceiling;
+  }
+  return Math.min(ceiling, Math.max(1, Math.trunc(requested)));
 }
 
 function buildGenerateReelsRequestBody(params: GenerateReelsParams): Record<string, unknown> {
   return {
     material_id: params.materialId,
     concept_id: params.conceptId,
-    num_reels: generationModeCeiling(params.generationMode),
-    exclude_video_ids: normalizeVideoIdList(params.excludeVideoIds),
+    num_reels: requestedReelCount(params),
+    continuation_token: String(params.continuationToken || "").trim() || undefined,
     creative_commons_only: params.creativeCommonsOnly === true,
     generation_mode: params.generationMode ?? "slow",
     min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
@@ -968,6 +978,20 @@ function terminalResponseFromStatus(status: GenerationJobStatusResponse): ReelsG
     response_profile: "unified",
     model_used: status.model_used,
     quality_degraded: status.quality_degraded,
+  };
+}
+
+function withDurableBatchMetadata(
+  response: ReelsGenerateResponse,
+  jobId: string,
+  terminalStatus: GenerationBatchTerminalStatus,
+): ReelsGenerateResponse {
+  return {
+    ...response,
+    batch_id: jobId,
+    batch_size: response.reels.length,
+    continuation_token: jobId,
+    terminal_status: terminalStatus,
   };
 }
 
@@ -1146,8 +1170,11 @@ async function consumeGenerationJob(
       if (terminalStatus === "failed" || terminalStatus === "cancelled") {
         throwTerminalGenerationError(terminalError, terminalStatus);
       }
-      if (finalResponse) {
-        return finalResponse;
+      if (
+        finalResponse
+        && (terminalStatus === "completed" || terminalStatus === "partial" || terminalStatus === "exhausted")
+      ) {
+        return withDurableBatchMetadata(finalResponse, job.job_id, terminalStatus);
       }
     }
 
@@ -1175,7 +1202,7 @@ async function consumeGenerationJob(
       options.onTerminal?.(status.status);
       const response = finalResponse ?? terminalResponseFromStatus(status);
       if (response) {
-        return response;
+        return withDurableBatchMetadata(response, job.job_id, status.status);
       }
       throw new ApiError("Generation completed without a final inventory.", 502, "generation_missing_final");
     }
@@ -1300,7 +1327,7 @@ export async function fetchFeed(params: {
     page: String(params.page),
     limit: String(params.limit),
     autofill: String(params.autofill ?? true),
-    prefetch: String(params.prefetch ?? 7),
+    prefetch: String(params.prefetch ?? 9),
     creative_commons_only: String(params.creativeCommonsOnly === true),
     generation_mode: params.generationMode ?? "slow",
     preferred_video_duration: params.preferredVideoDuration ?? "any",

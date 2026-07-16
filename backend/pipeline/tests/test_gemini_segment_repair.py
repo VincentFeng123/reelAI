@@ -2900,3 +2900,391 @@ def test_clean_fast_path_never_dispatches_boundary_repair(monkeypatch):
     assert calls == [G._CompactBoundaryPlan]
     assert result.classification == "green"
     assert result.accepted_count == 1
+
+
+def _atomic_topic(
+    candidate_id: str,
+    start_line: int,
+    end_line: int,
+    *,
+    start_quote: str,
+    end_quote: str,
+    evidence_quote: str,
+    objective: str,
+    facet: str,
+) -> G._BoundaryTopic:
+    return G._BoundaryTopic(
+        candidate_id=candidate_id,
+        start_line=start_line,
+        end_line=end_line,
+        start_quote=start_quote,
+        end_quote=end_quote,
+        title=objective,
+        learning_objective=objective,
+        facet=facet,
+        reason=objective,
+        informativeness=0.92,
+        topic_relevance=0.95,
+        educational_importance=0.9,
+        difficulty=0.4,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        topic_evidence_quote=evidence_quote,
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+        uncertainty="low",
+        uncertainty_reasons=[],
+    )
+
+
+def test_live_style_area_unit_starts_after_prior_tangent_problem() -> None:
+    texts = [
+        "The secant slopes approach the tangent slope, which completes that problem.",
+        "Now the next thing we got to talk about is a different problem.",
+        "Okay so the area problem asks how to measure the region under a curve.",
+        "We approximate the area under the curve by adding narrow rectangles.",
+        "As their widths shrink, the rectangle sum approaches the exact area.",
+    ]
+    segments = [
+        {
+            "cue_id": f"area-{index}",
+            "start": index * 8.0,
+            "end": (index + 1) * 8.0,
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+    proposal = _atomic_topic(
+        "area-rectangles",
+        0,
+        4,
+        start_quote="The secant slopes approach",
+        end_quote="approaches the exact area",
+        evidence_quote=(
+            "We approximate the area under the curve by adding narrow rectangles"
+        ),
+        objective="Explain how rectangles approximate area under a curve",
+        facet="area approximation",
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="calculus",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_start_line"] == 2
+    assert clip["_clip_text"].startswith("the area problem")
+    assert "secant" not in clip["_clip_text"].casefold()
+
+
+def test_dangling_transitive_ending_expands_through_its_answer() -> None:
+    segments = [
+        {
+            "cue_id": "derivative-head",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "A derivative can tell you",
+        },
+        {
+            "cue_id": "derivative-answer",
+            "start": 4.0,
+            "end": 10.0,
+            "text": "the instantaneous rate at which a function changes.",
+        },
+    ]
+
+    assert G._terminal_content_is_explicitly_incomplete(
+        "A derivative can tell you"
+    )
+    assert G._close_cue_context(
+        segments,
+        0,
+        0,
+        ignore_caption_case=True,
+    ) == (0, 1, None)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "A derivative tells you",
+        "This shows us",
+        "The equation gives you",
+        "A derivative can explain",
+        "This method can demonstrate",
+        "The graph tells us",
+    ],
+)
+def test_general_dangling_transitive_endings_require_completion(text: str) -> None:
+    assert G._terminal_content_is_explicitly_incomplete(text)
+    assert G._cue_has_explicit_dangling_end(text, "the missing explanation")
+
+
+def test_compact_selector_expands_a_dangling_transitive_claim_ending() -> None:
+    segments = [
+        {
+            "cue_id": "derivative-head",
+            "start": 0.0,
+            "end": 5.0,
+            "text": (
+                "A derivative measures instantaneous rate of change, and this tells you"
+            ),
+        },
+        {
+            "cue_id": "derivative-answer",
+            "start": 5.0,
+            "end": 10.0,
+            "text": "how steep the graph is at a point.",
+        },
+    ]
+    proposal = G._CompactBoundaryTopic(
+        candidate_id="derivative-dangling-end",
+        start_line=0,
+        end_line=0,
+        start_quote="A derivative measures instantaneous rate",
+        end_quote="and this tells you",
+        claim_quote="A derivative measures instantaneous rate of change",
+        title="Derivative as slope",
+        learning_objective="Explain how a derivative measures graph steepness",
+        facet="derivative slope meaning",
+        informativeness=0.9,
+        topic_relevance=0.9,
+        educational_importance=0.9,
+        difficulty=0.3,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        self_contained=True,
+        is_standalone=True,
+        intent_evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": "A derivative measures instantaneous rate of change",
+        }],
+    )
+    plan = G._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": "derivative slope meaning",
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": "derivative slope meaning",
+                "requirement": "Explain derivative slope meaning",
+            }],
+        },
+        topics=[proposal],
+    )
+
+    report = G._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="derivative slope meaning",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_end_line"] == 1
+    assert report.clips[0]["_clip_text"].endswith("how steep the graph is at a point.")
+
+
+def test_atomic_units_survive_without_rejecting_a_complete_outer_candidate() -> None:
+    texts = [
+        "A limit describes the value a function approaches near an input.",
+        "A derivative measures a function's instantaneous rate of change.",
+        "An integral accumulates quantities across an interval.",
+    ]
+    segments = [
+        {
+            "cue_id": f"calculus-{index}",
+            "start": index * 8.0,
+            "end": (index + 1) * 8.0,
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+    umbrella = _atomic_topic(
+        "three-areas",
+        0,
+        2,
+        start_quote="A limit describes",
+        end_quote="across an interval",
+        evidence_quote="A limit describes the value a function approaches near an input",
+        objective="Explain three core areas of calculus",
+        facet="three calculus areas",
+    )
+    atomic = [
+        _atomic_topic(
+            "limit",
+            0,
+            0,
+            start_quote="A limit describes",
+            end_quote="near an input",
+            evidence_quote=texts[0].rstrip("."),
+            objective="Define a function limit",
+            facet="limits",
+        ),
+        _atomic_topic(
+            "derivative",
+            1,
+            1,
+            start_quote="A derivative measures",
+            end_quote="rate of change",
+            evidence_quote=texts[1].rstrip("."),
+            objective="Define a derivative",
+            facet="derivatives",
+        ),
+        _atomic_topic(
+            "integral",
+            2,
+            2,
+            start_quote="An integral accumulates",
+            end_quote="across an interval",
+            evidence_quote=texts[2].rstrip("."),
+            objective="Define an integral",
+            facet="integrals",
+        ),
+    ]
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[umbrella, *atomic]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="calculus",
+    )
+
+    assert report.rejected_reasons == []
+    assert [
+        clip["selection_candidate_id"] for clip in report.clips
+    ] == ["limit", "derivative", "integral"]
+    assert [clip["_clip_text"] for clip in report.clips] == texts
+
+
+def test_terminal_disfluency_is_edge_only_incompleteness() -> None:
+    text = "The first conclusion is important okay great uh"
+    assert not G._terminal_content_is_explicitly_incomplete(text)
+    trimmed_quote, trimmed = G._trim_end_quote_before_edge_noise(
+        text,
+        "conclusion is important okay great uh",
+    )
+    assert trimmed is True
+    assert trimmed_quote == "The first conclusion is important"
+    assert not G._terminal_content_is_explicitly_incomplete(
+        "The derivative, um, measures instantaneous change."
+    )
+    assert G._terminal_content_is_explicitly_incomplete("The result is, um")
+
+
+@pytest.mark.parametrize(
+    ("texts", "evidence", "objective"),
+    [
+        (
+            [
+                "We factor the expression first.",
+                "So the derivative problem becomes simple after cancellation.",
+            ],
+            "derivative problem becomes simple after cancellation",
+            "Explain why factoring simplifies the derivative problem",
+        ),
+        (
+            [
+                "Energy remains conserved in the closed system.",
+                "The first principle of thermodynamics states this conservation law.",
+            ],
+            "first principle of thermodynamics states this conservation law",
+            "Explain conservation through the first principle of thermodynamics",
+        ),
+        (
+            [
+                "The curves enclose a finite region.",
+                "The first area between curves is evaluated by integration.",
+            ],
+            "first area between curves is evaluated by integration",
+            "Explain the first area between the curves",
+        ),
+    ],
+)
+def test_named_teaching_subjects_are_not_mistaken_for_section_resets(
+    texts: list[str],
+    evidence: str,
+    objective: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": f"same-unit-{index}",
+            "start": index * 6.0,
+            "end": (index + 1) * 6.0,
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    transitions = G._candidate_topic_transitions(
+        segments,
+        0,
+        len(segments) - 1,
+        evidence_quote=evidence,
+        learning_objective=objective,
+        relationship_bridge_allowed=False,
+    )
+
+    assert transitions == []
+
+
+def test_true_named_problem_handoff_remains_a_topic_boundary() -> None:
+    text = (
+        "The tangent problem is complete. Okay so the area problem asks how to "
+        "measure the region under a curve."
+    )
+
+    transitions = G._candidate_topic_transitions(
+        [{"cue_id": "handoff", "start": 0.0, "end": 12.0, "text": text}],
+        0,
+        0,
+        evidence_quote="area problem asks how to measure the region",
+        learning_objective="Explain area under a curve",
+        relationship_bridge_allowed=False,
+    )
+
+    assert len(transitions) == 1
+    assert text[transitions[0].new_side_left:].startswith("the area problem")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "We will show that every continuous function on a compact interval is bounded.",
+        "First we'll cover the interval with finitely many open sets.",
+        "We'll introduce x as the unknown and solve the equation.",
+        "I will show why the derivative is negative.",
+    ],
+)
+def test_substantive_proof_setup_is_not_an_opening_agenda(text: str) -> None:
+    assert G._OPENING_AGENDA_RE.match(text) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Today we're going to cover limits and derivatives.",
+        "In this lecture, we will cover limits and derivatives.",
+        "This lecture explains limits and derivatives.",
+        "Our goal today is to understand limits and derivatives.",
+        "By the end of this lesson, you'll understand limits and derivatives.",
+    ],
+)
+def test_explicit_lesson_agenda_variants_are_recognized(text: str) -> None:
+    assert G._OPENING_AGENDA_RE.match(text) is not None
+
+
+def test_difference_between_is_an_explicit_comparison_objective() -> None:
+    objective = "Explain the difference between derivatives and integrals"
+    assert G._objective_explicitly_relates_sections(objective)
+    assert G._EXPLICIT_COMPARISON_OBJECTIVE_RE.search(objective)

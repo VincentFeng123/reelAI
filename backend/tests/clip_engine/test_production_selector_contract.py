@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from types import SimpleNamespace
 
@@ -70,6 +71,7 @@ def _compact_plan(
         if key in gemini_segment._CompactBoundaryTopic.model_fields
         and key != "intent_evidence"
     }
+    data["claim_quote"] = proposal.topic_evidence_quote
     data["intent_evidence"] = evidence
     return gemini_segment._CompactBoundaryPlan(
         request_intent={
@@ -104,6 +106,277 @@ def test_selector_contract_allows_short_exact_edges_without_padding() -> None:
     assert "one-word quote" in user
     assert "never pad" in user
     assert "4-8" not in f"{system}\n{user}"
+
+
+def test_explicit_comparison_prompt_requires_every_named_side_in_each_clip() -> None:
+    _system, user = gemini_segment._boundary_prompts(
+        "[0] 00:00 Opportunity cost differs from sunk cost.",
+        1,
+        "opportunity cost versus sunk cost",
+    )
+
+    assert "every named side" in user
+    assert "requested relationship between them" in user
+    assert "Do not return a one-sided definition" in user
+
+
+def test_video_grounded_boundary_prompt_uses_both_streams_and_keeps_quotes_exact() -> None:
+    system, user = gemini_segment._boundary_prompts(
+        "[0] 00:00 This curve approaches zero as x increases.",
+        1,
+        "limits",
+        learner_level="advanced",
+        video_grounded=True,
+    )
+    prompt = f"{system}\n{user}".casefold()
+
+    assert "inspect the audio and visual streams jointly" in prompt
+    assert "formulas, diagrams, on-screen text, gestures, or deictic speech" in prompt
+    assert "absent or illegible" in prompt
+    assert "factually_grounded" in prompt
+    assert "both the transcript and any required visual evidence" in prompt
+    assert "current level is advanced" in prompt
+    assert "target-level preference" in prompt
+    assert "difficulty is metadata, not an eligibility filter" in prompt
+    assert "return qualifying units at every difficulty" in prompt
+    assert "sq=start_quote" in prompt
+    assert "eq=end_quote" in prompt
+    assert "cq=claim_quote" in prompt
+    assert "q is an exact consecutive 5-16 word transcript quote" in prompt
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [gemini_segment.FLASH_SPLIT_PROFILE, gemini_segment.PRO_BOUNDARY_PROFILE],
+)
+def test_video_grounded_boundary_selector_sends_one_youtube_part_before_text(
+    monkeypatch,
+    profile,
+) -> None:
+    calls: list[dict] = []
+    reservations: list[dict] = []
+
+    def fake_generate(system, user, schema, **kwargs):
+        calls.append({"system": system, "user": user, "schema": schema, **kwargs})
+        return SimpleNamespace(
+            text=(
+                '{"request_intent":{"exact_request":"photosynthesis",'
+                '"constraints":[{"constraint_id":"subject","kind":"subject",'
+                '"source_phrase":"photosynthesis","requirement":'
+                '"Teach photosynthesis"}]},"topics":[]}'
+            ),
+            telemetry={
+                "model": kwargs["model"],
+                "prompt_tokens": 100,
+                "candidate_tokens": 10,
+                "total_tokens": 110,
+            },
+        )
+
+    monkeypatch.setattr(gemini_client, "generate_json_v3", fake_generate)
+
+    def reserve(**kwargs):
+        reservations.append(kwargs)
+        return {}
+
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Plants convert light into stored chemical energy.",
+            }],
+            "words": [],
+            "duration": 600.0,
+        },
+        {
+            "_segment_video_grounding_required": True,
+            "_segment_video_url": (
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+            ),
+            "_segment_media_resolution": "low",
+            "_knowledge_level": "beginner",
+            "_segment_budget_reserve": reserve,
+        },
+        profile,
+        topic="photosynthesis",
+    )
+
+    assert result.error is None
+    assert len(calls) == 1
+    [call] = calls
+    contents = call["user"]
+    assert len(contents) == 2
+    assert contents[0].file_data.file_uri == (
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    )
+    assert contents[0].video_metadata.end_offset == "600s"
+    assert contents[0].text is None
+    assert contents[1].file_data is None
+    assert "Transcript (1 lines" in contents[1].text
+    assert "current level is beginner" in contents[1].text
+    assert call["media_resolution"] == (
+        gemini_client.types.MediaResolution.MEDIA_RESOLUTION_LOW
+    )
+    if profile == gemini_segment.PRO_BOUNDARY_PROFILE:
+        assert call["max_retries"] == 1
+        assert call["retry_status_codes"] == frozenset({503})
+    else:
+        assert call["max_retries"] == 0
+        assert call["retry_status_codes"] is None
+    [reservation] = reservations
+    text_estimate = (
+        math.ceil(len(f"{call['system']}\n\n{contents[1].text}") / 3) + 1_000
+    )
+    assert reservation["estimated_input_tokens"] == (
+        text_estimate
+        + 600 * gemini_segment._LOW_RESOLUTION_VIDEO_TOKENS_PER_SECOND
+    )
+
+
+def test_required_video_grounding_fails_closed_before_transcript_only_dispatch(
+    monkeypatch,
+) -> None:
+    calls = []
+    monkeypatch.setattr(
+        gemini_client,
+        "generate_json_v3",
+        lambda *_args, **_kwargs: calls.append(True),
+    )
+
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Plants convert light into stored chemical energy.",
+            }],
+            "words": [],
+        },
+        {"_segment_video_grounding_required": True},
+        gemini_segment.FLASH_SPLIT_PROFILE,
+        topic="photosynthesis",
+    )
+
+    assert calls == []
+    assert result.clips == []
+    assert result.error is not None
+    assert result.classification_reasons == ["request_failure:ValueError"]
+
+
+def test_video_grounding_accepts_duration_sec_and_never_underbounds_last_cue() -> None:
+    assert gemini_segment._video_grounding_duration_seconds(
+        {"duration_sec": 600.2501},
+        [{"start": 0.0, "end": 5.0, "text": "A complete lesson."}],
+    ) == pytest.approx(600.2501)
+    assert gemini_segment._video_grounding_duration_seconds(
+        {"duration_sec": 4.0},
+        [{"start": 0.0, "end": 5.25, "text": "A complete lesson."}],
+    ) == pytest.approx(5.25)
+
+
+def test_long_video_pro_reservation_fails_before_provider_dispatch(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("slow", generation_id="selector-long-context")
+    calls: list[object] = []
+    monkeypatch.setattr(
+        gemini_client,
+        "generate_json_v3",
+        lambda *_args, **_kwargs: calls.append(True),
+    )
+
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Plants convert light into stored chemical energy.",
+            }],
+            "words": [],
+            "duration": 2_001.0,
+        },
+        {
+            "_segment_video_grounding_required": True,
+            "_segment_video_url": (
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+            ),
+            "_segment_media_resolution": "low",
+            "_segment_operation": "pro_authoritative",
+            "_segment_budget_reserve": context.reserve_gemini_call,
+            "_segment_budget_reconcile": context.reconcile_gemini_call,
+        },
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic="photosynthesis",
+    )
+
+    assert calls == []
+    assert result.clips == []
+    assert result.classification_reasons == [
+        "request_failure:ProviderBudgetExceededError"
+    ]
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["selector_calls"] == 0
+    assert budget["inflight_reserved_cost_usd"] == 0.0
+
+
+def test_video_grounded_flash_transport_failure_never_dispatches_a_second_model(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def fail_once(*_args, **kwargs):
+        calls.append(kwargs["model"])
+        model = str(kwargs["model"])
+        raise gemini_client.GeminiTransportError(
+            "provider overloaded",
+            gemini_client.GeminiCallTelemetry(
+                model=model,
+                operation="flash_boundary_selector",
+                prompt_version=gemini_segment.FLASH_SPLIT_PROFILE,
+                thinking_level="low",
+                latency_ms=5.0,
+                retries=0,
+                finish_reason=None,
+                prompt_tokens=None,
+                candidate_tokens=None,
+                thought_tokens=None,
+                total_tokens=None,
+                provider_error_type="ServerError",
+                provider_status_code=503,
+                retryable=True,
+                error_history=({
+                    "provider_error_type": "ServerError",
+                    "provider_status_code": 503,
+                    "retryable": True,
+                },),
+            ),
+        )
+
+    monkeypatch.setattr(gemini_client, "generate_json_v3", fail_once)
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Plants convert light into stored chemical energy.",
+            }],
+            "words": [],
+        },
+        {
+            "_segment_video_grounding_required": True,
+            "_segment_video_url": (
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+            ),
+            "_segment_media_resolution": "low",
+        },
+        gemini_segment.FLASH_SPLIT_PROFILE,
+        topic="photosynthesis",
+    )
+
+    assert calls == [gemini_segment.config.SEGMENT_FLASH_MODEL]
+    assert result.clips == []
+    assert result.error is not None
 
 
 def test_selector_reconciles_actual_usage_before_conversion(
@@ -669,6 +942,9 @@ def test_compact_selector_aliases_preserve_canonical_fields_and_supporting_rank(
         end_line=0,
         start_quote="A derivative measures instantaneous change",
         end_quote="with respect to its input",
+        claim_quote=(
+            "A derivative measures instantaneous change in a function with respect"
+        ),
         title="Derivative definition",
         learning_objective="Define a derivative before a worked example",
         facet="derivative definition",
@@ -737,6 +1013,1108 @@ def test_compact_selector_aliases_preserve_canonical_fields_and_supporting_rank(
     assert report.clips[0]["topic_evidence_quote"].startswith(
         "A derivative measures instantaneous change"
     )
+
+
+@pytest.mark.parametrize(
+    "topic,constraints,text,claim,evidence",
+    [
+        (
+            "opportunity cost versus sunk cost",
+            [
+                {
+                    "constraint_id": "opportunity",
+                    "kind": "subject",
+                    "source_phrase": "opportunity cost",
+                    "requirement": "Teach opportunity cost",
+                },
+                {
+                    "constraint_id": "comparison",
+                    "kind": "relationship",
+                    "source_phrase": "versus",
+                    "requirement": "Compare the two costs",
+                },
+                {
+                    "constraint_id": "sunk",
+                    "kind": "subject",
+                    "source_phrase": "sunk cost",
+                    "requirement": "Teach sunk cost",
+                },
+            ],
+            (
+                "Opportunity cost is the value of the next best alternative "
+                "forgone when choosing."
+            ),
+            "Opportunity cost is the value of the next best alternative",
+            [
+                "opportunity",
+                "comparison",
+                "sunk",
+            ],
+        ),
+        (
+            "precision and recall",
+            [
+                {
+                    "constraint_id": "precision",
+                    "kind": "subject",
+                    "source_phrase": "precision",
+                    "requirement": "Teach precision",
+                },
+                {
+                    "constraint_id": "recall",
+                    "kind": "subject",
+                    "source_phrase": "recall",
+                    "requirement": "Teach recall",
+                },
+            ],
+            "Precision is the share of predicted positives that are actually positive.",
+            "Precision is the share of predicted positives that are actually positive",
+            ["precision"],
+        ),
+    ],
+)
+def test_compound_request_rejects_one_sided_clips_even_when_model_marks_relevance(
+    topic: str,
+    constraints: list[dict],
+    text: str,
+    claim: str,
+    evidence: list[str],
+) -> None:
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={"exact_request": topic, "constraints": constraints},
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="one-sided",
+            start_line=0,
+            end_line=0,
+            start_quote=" ".join(text.split()[:5]),
+            end_quote=" ".join(text.split()[-5:]),
+            claim_quote=claim,
+            title="One-sided explanation",
+            learning_objective="Explain only one requested side",
+            facet="single requested side",
+            informativeness=0.95,
+            topic_relevance=0.95,
+            educational_importance=0.95,
+            difficulty=0.2,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[
+                {
+                    "constraint_id": constraint_id,
+                    "evidence_quote": claim,
+                }
+                for constraint_id in evidence
+            ],
+        )],
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "one-sided", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic=topic,
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == [
+        "proposal_0:incomplete_joint_request_coverage"
+    ]
+
+
+@pytest.mark.parametrize(
+    "topic,constraints",
+    [
+        (
+            "alpha versus beta",
+            [
+                {
+                    "constraint_id": "alpha",
+                    "kind": "subject",
+                    "source_phrase": "alpha",
+                    "requirement": "Teach alpha",
+                },
+                {
+                    "constraint_id": "relation",
+                    "kind": "relationship",
+                    "source_phrase": "versus",
+                    "requirement": "Compare alpha with beta",
+                },
+                {
+                    "constraint_id": "beta",
+                    "kind": "subject",
+                    "source_phrase": "beta",
+                    "requirement": "Teach beta",
+                },
+            ],
+        ),
+        (
+            "alpha transition to beta",
+            [
+                {
+                    "constraint_id": "alpha",
+                    "kind": "subject",
+                    "source_phrase": "alpha",
+                    "requirement": "Teach alpha",
+                },
+                {
+                    "constraint_id": "relation",
+                    "kind": "relationship",
+                    "source_phrase": "transition to",
+                    "requirement": "Explain the transition",
+                },
+                {
+                    "constraint_id": "beta",
+                    "kind": "outcome",
+                    "source_phrase": "beta",
+                    "requirement": "Reach beta",
+                },
+            ],
+        ),
+    ],
+)
+def test_joint_relationship_evidence_rejects_adjacent_definitions(
+    topic: str,
+    constraints: list[dict],
+) -> None:
+    text = (
+        "Alpha is a stable source quantity; beta is a separate target quantity."
+    )
+    evidence_quote = (
+        "Alpha is a stable source quantity beta is a separate target quantity"
+    )
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={"exact_request": topic, "constraints": constraints},
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="adjacent-definitions",
+            start_line=0,
+            end_line=0,
+            start_quote="Alpha is a stable source quantity",
+            end_quote="beta is a separate target quantity",
+            claim_quote=evidence_quote,
+            title="Two adjacent definitions",
+            learning_objective="Define alpha and beta separately",
+            facet="definitions",
+            informativeness=0.95,
+            topic_relevance=0.95,
+            educational_importance=0.95,
+            difficulty=0.2,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[
+                {
+                    "constraint_id": "alpha",
+                    "evidence_quote": "Alpha is a stable source quantity",
+                },
+                {
+                    "constraint_id": "relation",
+                    "evidence_quote": evidence_quote,
+                },
+                {
+                    "constraint_id": "beta",
+                    "evidence_quote": "beta is a separate target quantity",
+                },
+            ],
+        )],
+    )
+
+    validated, error = gemini_segment._validated_intent_constraints(plan, topic)
+    assert error is None
+    assert not gemini_segment._joint_relationship_evidence_matches(
+        evidence_quote,
+        topic,
+        validated,
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "definitions", "start": 0.0, "end": 8.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic=topic,
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == [
+        "proposal_0:incomplete_joint_request_coverage"
+    ]
+
+
+@pytest.mark.parametrize(
+    "topic,constraints,text",
+    [
+        (
+            "alpha versus beta",
+            [
+                {
+                    "constraint_id": "alpha",
+                    "kind": "subject",
+                    "source_phrase": "alpha",
+                    "requirement": "Teach alpha",
+                },
+                {
+                    "constraint_id": "relation",
+                    "kind": "relationship",
+                    "source_phrase": "versus",
+                    "requirement": "Compare alpha with beta",
+                },
+                {
+                    "constraint_id": "beta",
+                    "kind": "subject",
+                    "source_phrase": "beta",
+                    "requirement": "Teach beta",
+                },
+            ],
+            "Alpha differs from beta because alpha retains heat while beta releases it.",
+        ),
+        (
+            "alpha transition to beta",
+            [
+                {
+                    "constraint_id": "alpha",
+                    "kind": "subject",
+                    "source_phrase": "alpha",
+                    "requirement": "Teach alpha",
+                },
+                {
+                    "constraint_id": "relation",
+                    "kind": "relationship",
+                    "source_phrase": "transition to",
+                    "requirement": "Explain the transition",
+                },
+                {
+                    "constraint_id": "beta",
+                    "kind": "outcome",
+                    "source_phrase": "beta",
+                    "requirement": "Reach beta",
+                },
+            ],
+            "Alpha converts into beta when additional energy enters the system.",
+        ),
+    ],
+)
+def test_joint_relationship_evidence_accepts_one_spoken_relation(
+    topic: str,
+    constraints: list[dict],
+    text: str,
+) -> None:
+    quote = " ".join(text.rstrip(".").split())
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={"exact_request": topic, "constraints": constraints},
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="spoken-relation",
+            start_line=0,
+            end_line=0,
+            start_quote=" ".join(quote.split()[:5]),
+            end_quote=" ".join(quote.split()[-5:]),
+            claim_quote=quote,
+            title="A spoken relationship",
+            learning_objective="Explain the relationship between alpha and beta",
+            facet="relationship",
+            informativeness=0.95,
+            topic_relevance=0.95,
+            educational_importance=0.95,
+            difficulty=0.2,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[
+                {"constraint_id": item["constraint_id"], "evidence_quote": quote}
+                for item in constraints
+            ],
+        )],
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "relation", "start": 0.0, "end": 8.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic=topic,
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["intent_role"] == "primary"
+
+
+def test_bare_directional_path_is_joint_but_ordinary_to_phrase_is_not() -> None:
+    path_topic = "source state to target state"
+    path_plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": path_topic,
+            "constraints": [
+                {
+                    "constraint_id": "source",
+                    "kind": "subject",
+                    "source_phrase": "source state",
+                    "requirement": "Teach the source state",
+                },
+                {
+                    "constraint_id": "path",
+                    "kind": "relationship",
+                    "source_phrase": "to",
+                    "requirement": "Explain the path",
+                },
+                {
+                    "constraint_id": "target",
+                    "kind": "outcome",
+                    "source_phrase": "target state",
+                    "requirement": "Reach the target state",
+                },
+            ],
+        },
+        topics=[],
+    )
+    path_constraints, path_error = gemini_segment._validated_intent_constraints(
+        path_plan,
+        path_topic,
+    )
+
+    ordinary_topic = "introduction to calculus"
+    ordinary_plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": ordinary_topic,
+            "constraints": [
+                {
+                    "constraint_id": "left_noun",
+                    "kind": "subject",
+                    "source_phrase": "introduction",
+                    "requirement": "Treat introduction as a subject",
+                },
+                {
+                    "constraint_id": "connector",
+                    "kind": "relationship",
+                    "source_phrase": "to",
+                    "requirement": "Connect the request wording",
+                },
+                {
+                    "constraint_id": "right_noun",
+                    "kind": "outcome",
+                    "source_phrase": "calculus",
+                    "requirement": "Teach calculus",
+                },
+            ],
+        },
+        topics=[],
+    )
+    ordinary_constraints, ordinary_error = (
+        gemini_segment._validated_intent_constraints(
+            ordinary_plan,
+            ordinary_topic,
+        )
+    )
+
+    assert path_error is None
+    assert ordinary_error is None
+    assert gemini_segment._request_requires_joint_intent_coverage(
+        path_topic,
+        path_constraints,
+    )
+    assert not gemini_segment._request_requires_joint_intent_coverage(
+        ordinary_topic,
+        ordinary_constraints,
+    )
+
+    path_text = (
+        "The source state converts into the target state when energy is added."
+    )
+    path_quote = path_text.rstrip(".")
+    path_topic_candidate = gemini_segment._CompactBoundaryTopic(
+        candidate_id="complete-path",
+        start_line=0,
+        end_line=0,
+        start_quote="The source state converts into",
+        end_quote="state when energy is added",
+        claim_quote=path_quote,
+        title="Source to target path",
+        learning_objective="Explain how the source becomes the target",
+        facet="path",
+        informativeness=0.95,
+        topic_relevance=0.95,
+        educational_importance=0.95,
+        difficulty=0.2,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        self_contained=True,
+        is_standalone=True,
+        intent_evidence=[
+            {"constraint_id": item, "evidence_quote": path_quote}
+            for item in ("source", "path", "target")
+        ],
+    )
+    complete_report = gemini_segment._plan_to_report(
+        path_plan.model_copy(update={"topics": [path_topic_candidate]}),
+        [{"cue_id": "path", "start": 0.0, "end": 8.0, "text": path_text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic=path_topic,
+    )
+
+    assert complete_report.rejected_reasons == []
+    assert complete_report.clips[0]["intent_role"] == "primary"
+
+    one_sided_text = "The source state remains stable under ordinary conditions."
+    one_sided_quote = one_sided_text.rstrip(".")
+    one_sided_candidate = path_topic_candidate.model_copy(update={
+        "candidate_id": "one-sided-path",
+        "start_quote": "The source state remains stable",
+        "end_quote": "remains stable under ordinary conditions",
+        "claim_quote": one_sided_quote,
+        "intent_evidence": [
+            {"constraint_id": item, "evidence_quote": one_sided_quote}
+            for item in ("source", "path", "target")
+        ],
+    })
+    one_sided_report = gemini_segment._plan_to_report(
+        path_plan.model_copy(update={"topics": [one_sided_candidate]}),
+        [{
+            "cue_id": "one-sided-path",
+            "start": 0.0,
+            "end": 8.0,
+            "text": one_sided_text,
+        }],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic=path_topic,
+    )
+
+    assert one_sided_report.clips == []
+    assert one_sided_report.rejected_reasons == [
+        "proposal_0:incomplete_joint_request_coverage"
+    ]
+
+
+@pytest.mark.parametrize(
+    "exact_request,model_constraints,expected_phrases",
+    [
+        (
+            "precision versus recall",
+            [{
+                "constraint_id": "combined",
+                "kind": "subject",
+                "source_phrase": "precision versus recall",
+                "requirement": "Compare precision with recall",
+            }],
+            ["precision", "versus", "recall"],
+        ),
+        (
+            "mitosis vs. meiosis",
+            [
+                {
+                    "constraint_id": "mitosis",
+                    "kind": "subject",
+                    "source_phrase": "mitosis",
+                    "requirement": "Teach mitosis",
+                },
+                {
+                    "constraint_id": "merged_relationship",
+                    "kind": "relationship",
+                    "source_phrase": "vs. meiosis",
+                    "requirement": "Compare mitosis with meiosis",
+                },
+            ],
+            ["mitosis", "vs.", "meiosis"],
+        ),
+    ],
+)
+def test_binary_comparison_contract_normalizes_merged_model_constraints(
+    exact_request: str,
+    model_constraints: list[dict],
+    expected_phrases: list[str],
+) -> None:
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": exact_request,
+            "constraints": model_constraints,
+        },
+        topics=[],
+    )
+
+    constraints, error = gemini_segment._validated_intent_constraints(
+        plan,
+        exact_request,
+    )
+
+    assert error is None
+    assert [
+        constraint.kind for constraint in constraints.values()
+    ] == [
+        gemini_segment._IntentConstraintKind.SUBJECT,
+        gemini_segment._IntentConstraintKind.RELATIONSHIP,
+        gemini_segment._IntentConstraintKind.SUBJECT,
+    ]
+    assert [
+        constraint.source_phrase for constraint in constraints.values()
+    ] == expected_phrases
+
+
+def test_repaired_binary_comparison_is_regrounded_before_acceptance() -> None:
+    exact_request = "precision versus recall"
+    text = (
+        "Precision and recall are two different measures: precision checks predicted "
+        "positives, while recall checks actual positives."
+    )
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": exact_request,
+            "constraints": [{
+                "constraint_id": "combined",
+                "kind": "subject",
+                "source_phrase": exact_request,
+                "requirement": "Compare precision with recall",
+            }],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="precision-recall-comparison",
+            start_line=0,
+            end_line=0,
+            start_quote="Precision and recall are two different measures",
+            end_quote="recall checks actual positives",
+            claim_quote="Precision and recall are two different measures",
+            title="Precision versus recall",
+            learning_objective="Distinguish precision from recall",
+            facet="comparison",
+            informativeness=0.95,
+            topic_relevance=0.95,
+            educational_importance=0.95,
+            difficulty=0.4,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[{
+                "constraint_id": "combined",
+                "evidence_quote": (
+                    "Precision and recall are two different measures"
+                ),
+            }],
+        )],
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "comparison", "start": 0.0, "end": 10.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic=exact_request,
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert [
+        evidence["constraint_id"] for evidence in clip["intent_evidence"]
+    ] == ["joint_subject_1", "joint_relationship", "joint_subject_2"]
+
+
+def test_compact_selector_never_uses_an_agenda_as_its_teaching_claim() -> None:
+    plan = _compact_plan(
+        exact_request="calculus",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "calculus",
+            "requirement": "Teach calculus",
+        }],
+        evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": "Today we'll cover calculus examples and applications",
+        }],
+    )
+    plan.topics[0] = plan.topics[0].model_copy(update={
+        "start_line": 0,
+        "end_line": 0,
+        "start_quote": "Today we'll cover calculus examples",
+        "end_quote": "a function changes",
+        "claim_quote": "Today we'll cover calculus examples",
+    })
+    segments = [{
+        "cue_id": "agenda-and-teaching",
+        "start": 0.0,
+        "end": 12.0,
+        "text": (
+            "Today we'll cover calculus examples and applications. "
+            "A derivative measures the instantaneous rate at which a function changes."
+        ),
+    }]
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="calculus",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == [
+        "proposal_0:non_substantive_claim_quote"
+    ]
+
+
+def test_compact_selector_rejects_short_claim_omitting_agenda_prefix() -> None:
+    plan = _compact_plan(
+        exact_request="calculus",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "calculus",
+            "requirement": "Teach calculus",
+        }],
+        evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": "cover calculus examples and useful applications",
+        }],
+    )
+    plan.topics[0] = plan.topics[0].model_copy(update={
+        "start_line": 0,
+        "end_line": 0,
+        "start_quote": "Today we'll cover calculus examples",
+        "end_quote": "examples and useful applications",
+        "claim_quote": "cover calculus examples and useful applications",
+    })
+    segments = [{
+        "cue_id": "short-agenda-claim",
+        "start": 0.0,
+        "end": 8.0,
+        "text": "Today we'll cover calculus examples and useful applications.",
+    }]
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="calculus",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == [
+        "proposal_0:non_substantive_claim_quote"
+    ]
+
+
+def test_compact_selector_trims_peerless_overview_to_claimed_atomic_unit() -> None:
+    evidence_quote = "A derivative measures instantaneous rate of change"
+    plan = _compact_plan(
+        exact_request="calculus",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "calculus",
+            "requirement": "Teach calculus",
+        }],
+        evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": evidence_quote,
+        }],
+    )
+    plan.topics[0] = plan.topics[0].model_copy(update={
+        "candidate_id": "calculus-foundations",
+        "start_line": 0,
+        "end_line": 2,
+        "start_quote": "A limit describes",
+        "end_quote": "quantities across an interval",
+        "claim_quote": evidence_quote,
+        "title": "Calculus foundations",
+        "learning_objective": "Explain foundational calculus ideas",
+        "facet": "calculus foundations",
+    })
+    segments = [
+        {
+            "cue_id": "limit",
+            "start": 0.0,
+            "end": 8.0,
+            "text": "A limit describes what a function approaches near an input.",
+        },
+        {
+            "cue_id": "derivative",
+            "start": 8.0,
+            "end": 16.0,
+            "text": "A derivative measures instantaneous rate of change at an input.",
+        },
+        {
+            "cue_id": "integral",
+            "start": 16.0,
+            "end": 24.0,
+            "text": "An integral accumulates quantities across an interval.",
+        },
+    ]
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="calculus",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"] == segments[1]["text"]
+    assert clip["_start_line"] == clip["_end_line"] == 1
+    assert clip["intent_role"] == "primary"
+    assert "limit describes" not in clip["_clip_text"].casefold()
+    assert "integral accumulates" not in clip["_clip_text"].casefold()
+
+
+def test_compact_selector_projects_same_cue_overview_around_atomic_claim() -> None:
+    evidence_quote = "A derivative measures instantaneous rate of change"
+    plan = _compact_plan(
+        exact_request="calculus",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "calculus",
+            "requirement": "Teach calculus",
+        }],
+        evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": evidence_quote,
+        }],
+    )
+    plan.topics[0] = plan.topics[0].model_copy(update={
+        "candidate_id": "same-cue-foundations",
+        "start_line": 0,
+        "end_line": 0,
+        "start_quote": "A limit describes",
+        "end_quote": "quantities across an interval",
+        "claim_quote": evidence_quote,
+        "title": "Calculus foundations",
+        "learning_objective": "Explain foundational calculus ideas",
+        "facet": "calculus foundations",
+    })
+    source = (
+        "A limit describes what a function approaches near an input. "
+        "A derivative measures instantaneous rate of change at an input. "
+        "An integral accumulates quantities across an interval."
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "same-cue", "start": 0.0, "end": 24.0, "text": source}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="calculus",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"] == (
+        "A derivative measures instantaneous rate of change at an input."
+    )
+    assert clip["start_quote"].startswith("A derivative")
+    assert clip["end_quote"].endswith("an input.")
+
+
+def test_compact_selector_splits_a_plain_two_topic_umbrella() -> None:
+    claim = "A derivative measures instantaneous rate of change"
+    plan = _compact_plan(
+        exact_request="calculus",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "calculus",
+            "requirement": "Teach calculus",
+        }],
+        evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": claim,
+        }],
+    )
+    plan.topics[0] = plan.topics[0].model_copy(update={
+        "candidate_id": "plain-calculus-umbrella",
+        "start_line": 0,
+        "end_line": 1,
+        "start_quote": "A limit describes",
+        "end_quote": "change at an input",
+        "claim_quote": claim,
+        "title": "Calculus",
+        "learning_objective": "Explain calculus",
+        "facet": "calculus",
+    })
+    segments = [
+        {
+            "cue_id": "limit",
+            "start": 0.0,
+            "end": 7.0,
+            "text": "A limit describes what a function approaches near an input.",
+        },
+        {
+            "cue_id": "derivative",
+            "start": 7.0,
+            "end": 14.0,
+            "text": "A derivative measures instantaneous rate of change at an input.",
+        },
+    ]
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="calculus",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"] == segments[1]["text"]
+
+
+def test_claim_atomicity_preserves_a_contextual_causal_explanation() -> None:
+    claim = "Greenhouse gases absorb that energy and reemit it"
+    plan = _compact_plan(
+        exact_request="greenhouse warming",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "greenhouse warming",
+            "requirement": "Explain greenhouse warming",
+        }],
+        evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": claim,
+        }],
+    )
+    plan.topics[0] = plan.topics[0].model_copy(update={
+        "candidate_id": "greenhouse-causal-chain",
+        "start_line": 0,
+        "end_line": 3,
+        "start_quote": "Sunlight passes through the atmosphere",
+        "end_quote": "warming the lower atmosphere",
+        "claim_quote": claim,
+        "title": "How greenhouse gases warm Earth",
+        "learning_objective": "Explain how greenhouse gases warm Earth",
+        "facet": "greenhouse warming mechanism",
+    })
+    texts = [
+        "Sunlight passes through the atmosphere and reaches Earth's surface.",
+        "Earth's surface absorbs that light and becomes warm.",
+        "The warm surface emits infrared energy back upward.",
+        "Greenhouse gases absorb that energy and reemit it, warming the lower atmosphere.",
+    ]
+    segments = [
+        {
+            "cue_id": f"greenhouse-{index}",
+            "start": index * 7.0,
+            "end": (index + 1) * 7.0,
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="greenhouse warming",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"] == " ".join(texts)
+
+
+def test_claim_atomicity_preserves_a_complete_worked_example() -> None:
+    claim = "The factorization is x minus two times x minus three"
+    plan = _compact_plan(
+        exact_request="quadratic equation worked example",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "quadratic equation worked example",
+            "requirement": "Solve a quadratic equation",
+        }],
+        evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": claim,
+        }],
+    )
+    plan.topics[0] = plan.topics[0].model_copy(update={
+        "candidate_id": "quadratic-factoring-example",
+        "start_line": 0,
+        "end_line": 2,
+        "start_quote": "The equation is x squared",
+        "end_quote": "roots are two and three",
+        "claim_quote": claim,
+        "title": "Factor a quadratic equation",
+        "learning_objective": "Solve a quadratic equation worked example",
+        "facet": "quadratic factoring example",
+    })
+    texts = [
+        "The equation is x squared minus five x plus six equals zero.",
+        "The factorization is x minus two times x minus three.",
+        "Therefore the roots are two and three.",
+    ]
+    segments = [
+        {
+            "cue_id": f"quadratic-{index}",
+            "start": index * 7.0,
+            "end": (index + 1) * 7.0,
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="quadratic equation worked example",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"] == " ".join(texts)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "Today, we are going to discuss limits. A limit describes the value a function approaches.",
+        "In this video, we discuss limits. A limit describes the value a function approaches.",
+        "First we discuss limits. A limit describes the value a function approaches.",
+    ],
+)
+def test_compact_selector_trims_a_complete_agenda_sentence(source: str) -> None:
+    claim = "A limit describes the value a function approaches"
+    plan = _compact_plan(
+        exact_request="limits",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "limits",
+            "requirement": "Teach limits",
+        }],
+        evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": claim,
+        }],
+    )
+    plan.topics[0] = plan.topics[0].model_copy(update={
+        "candidate_id": "agenda-then-limit",
+        "start_line": 0,
+        "end_line": 0,
+        "start_quote": source.split(".", 1)[0],
+        "end_quote": "value a function approaches",
+        "claim_quote": claim,
+        "title": "What a limit describes",
+        "learning_objective": "Define a function limit",
+        "facet": "limit definition",
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "agenda", "start": 0.0, "end": 12.0, "text": source}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="limits",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"] == (
+        "A limit describes the value a function approaches."
+    )
+
+
+def test_compact_selector_accepts_a_repeated_grounded_claim_in_one_cue() -> None:
+    claim = "A derivative measures instantaneous rate of change"
+    source = (
+        "A derivative measures instantaneous rate of change. "
+        "This definition describes slope at a point. "
+        "A derivative measures instantaneous rate of change."
+    )
+    plan = _compact_plan(
+        exact_request="derivative definition",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "derivative definition",
+            "requirement": "Define a derivative",
+        }],
+        evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": claim,
+        }],
+    )
+    plan.topics[0] = plan.topics[0].model_copy(update={
+        "candidate_id": "repeated-derivative-definition",
+        "start_line": 0,
+        "end_line": 0,
+        "start_quote": "A derivative measures instantaneous",
+        "end_quote": "instantaneous rate of change.",
+        "claim_quote": claim,
+        "title": "Derivative definition",
+        "learning_objective": "Define a derivative",
+        "facet": "derivative definition",
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "repeated", "start": 0.0, "end": 12.0, "text": source}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="derivative definition",
+    )
+
+    assert report.rejected_reasons == []
+    assert len(report.clips) == 1
+
+
+def test_compact_selector_keeps_substantive_enumerated_exact_topic_claim() -> None:
+    claim = "Three branches of government divide authority among institutions"
+    plan = _compact_plan(
+        exact_request="three branches of government",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "three branches of government",
+            "requirement": "Teach the three branches of government",
+        }],
+        evidence=[{
+            "constraint_id": "subject",
+            "evidence_quote": claim,
+        }],
+    )
+    plan.topics[0] = plan.topics[0].model_copy(update={
+        "start_line": 0,
+        "end_line": 0,
+        "start_quote": "Three branches of government divide",
+        "end_quote": "prevent concentrated political power",
+        "claim_quote": claim,
+        "title": "Three branches of government",
+        "learning_objective": "Explain how three branches divide authority",
+        "facet": "three branches of government",
+    })
+    segments = [{
+        "cue_id": "branches",
+        "start": 0.0,
+        "end": 12.0,
+        "text": (
+            "Three branches of government divide authority among institutions "
+            "to prevent concentrated political power."
+        ),
+    }]
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="three branches of government",
+    )
+
+    assert report.rejected_reasons == []
+    assert len(report.clips) == 1
+    assert report.clips[0]["_clip_text"] == segments[0]["text"]
 
 
 def test_compact_selector_rejects_a_retrieval_expansion_as_exact_request() -> None:
@@ -1253,10 +2631,14 @@ def test_selector_prompt_is_exhaustive_and_allows_one_listed_component() -> None
     assert "unseen visual" in user
     assert "every qualifying related unit" in (_system + user)
     assert "internal interruption" in (_system + user)
+    assert "internal filler may never remain" in (_system + user).lower()
+    assert "otherwise keep it" not in (_system + user).lower()
+    assert "may remain when cutting around it" not in (_system + user).lower()
     assert "prioritize them within difficulty stages" in (_system + user)
     assert "title (at most 12 words)" in user
     assert "learning_objective (at most 24 words)" in user
     assert "facet (at most 12 words)" in user
+    assert "explicitly distinguishing two named sides" in user
     assert user.index("Transcript (") < user.index("Exact user request:")
     assert "1. Interpret the exact request" in user
     assert "request_intent" in user
@@ -1629,7 +3011,7 @@ def test_trailing_preview_repair_fails_closed_on_incomplete_teaching_prefix() ->
     assert report.rejected_reasons == ["proposal_0:unresolved_weak_end"]
 
 
-def test_same_cue_preview_inside_teaching_is_tolerated_unchanged() -> None:
+def test_same_cue_preview_inside_teaching_is_not_shipped_as_filler() -> None:
     text = (
         "Chlorophyll captures light energy for photosynthesis. But we'll talk more "
         "about that next time. Carbon fixation then converts carbon dioxide into sugar."
@@ -1650,9 +3032,10 @@ def test_same_cue_preview_inside_teaching_is_tolerated_unchanged() -> None:
         topic="photosynthesis",
     )
 
-    assert report.rejected_reasons == []
-    [clip] = report.clips
-    assert "talk more about that next time" in clip["_clip_text"]
+    assert report.clips == []
+    assert report.rejected_reasons == [
+        "proposal_0:internal_structural_filler"
+    ]
 
 
 def test_real_course_logistics_opening_is_trimmed_before_biology_teaching() -> None:
@@ -1938,6 +3321,37 @@ def test_look_at_visual_noun_remains_visual_dependent() -> None:
     assert report.rejected_reasons == ["proposal_0:requires_visual_context"]
 
 
+def test_video_grounded_selector_may_keep_a_legible_required_diagram() -> None:
+    text = (
+        "Look at the diagram. Chlorophyll captures photons, and the arrows show "
+        "how electron flow helps cells make ATP."
+    )
+    proposal = _proposal().model_copy(update={
+        "start_quote": "Look at the diagram",
+        "end_quote": "helps cells make ATP",
+        "topic_evidence_quote": (
+            "Chlorophyll captures photons and the arrows show how electron flow"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "cue-0", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_video_grounding_required": True,
+            "_segment_video_url": (
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+            ),
+        },
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    assert len(report.clips) == 1
+
+
 def test_articleless_look_at_visual_noun_remains_visual_dependent() -> None:
     text = (
         "Look at diagram. Chlorophyll captures photons, and the arrows show how "
@@ -2176,9 +3590,10 @@ def test_real_calculus_example_intro_expands_past_dangling_or_even() -> None:
 
     assert report.rejected_reasons == []
     [clip] = report.clips
-    assert clip["_end_line"] == 12
+    assert clip["_end_line"] == 11
     assert "how to make the perfect soup can" in clip["_clip_text"]
-    assert clip["_clip_text"].endswith("related to one another.")
+    assert clip["_clip_text"].endswith("how to make the perfect soup can.")
+    assert "One of the most fascinating aspects" not in clip["_clip_text"]
 
 
 def test_demonstrative_calculus_opening_expands_to_its_cold_viewer_setup() -> None:

@@ -644,6 +644,110 @@ def test_topic_generation_streams_independent_acoustic_passes_immediately_but_re
     assert context.counters()["persisted_clips"] == 3
 
 
+def test_verified_fourth_sibling_is_persisted_beyond_three_clip_surface_limit(
+    monkeypatch,
+) -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:four-acoustic-siblings",
+        "duration": 40.0,
+        "segments": [
+            {
+                "cue_id": f"unit-{index}",
+                "start": float(index * 10),
+                "end": float((index + 1) * 10),
+                "text": f"Python teaching unit {index} explains one distinct concept.",
+            }
+            for index in range(4)
+        ],
+    }
+    clips = [
+        _quality_clip(
+            cue_id=f"unit-{index}",
+            start=float(index * 10),
+            end=float((index + 1) * 10),
+            quote=f"Python teaching unit {index} explains one distinct concept.",
+            candidate_id=f"unit-{index}",
+            score=0.9 - index * 0.01,
+        )
+        for index in range(4)
+    ]
+    engine_out = {"clips": clips, "transcript": transcript, "notes": ""}
+    run_clip = mock.Mock(return_value=engine_out)
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: _discovery(),
+    )
+    monkeypatch.setattr(pipeline_module, "_run_clip", run_clip)
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=mock.sentinel.prepared_audio),
+    )
+
+    def verify_audio(_source, start_sec, end_sec, **_kwargs):
+        start_handoff = start_sec > 0.0
+        end_handoff = end_sec < 40.0
+        return mock.Mock(
+            verified=True,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            diagnostics={
+                "threshold_dbfs": -38.0,
+                "start_quiet": [start_sec, start_sec + 0.2],
+                "end_quiet": [end_sec - 0.2, end_sec + 0.1],
+                "start_speech_handoff_verified": start_handoff,
+                "end_speech_handoff_verified": end_handoff,
+                "start_two_sided_required": start_handoff,
+                "end_two_sided_required": end_handoff,
+                "semantic_start_limit_sec": start_sec,
+                "semantic_end_limit_sec": end_sec,
+            },
+        )
+
+    verify = mock.Mock(side_effect=verify_audio)
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify,
+    )
+    persisted: list[str] = []
+    pipeline = _pipeline()
+
+    def persist(*, clip, **_kwargs):
+        candidate_id = str(clip["selection_candidate_id"]).split("::")[-1]
+        persisted.append(candidate_id)
+        return f"reel-{candidate_id}", mock.sentinel.metadata
+
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+    emitted: list[str] = []
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext(
+            "slow",
+            require_acoustic_boundaries=True,
+        ),
+        max_videos=1,
+        max_reels=3,
+        max_persisted_reels=None,
+        on_reel_created=emitted.append,
+        retrieval_profile="deep",
+    )
+
+    assert reels == ["reel-unit-0", "reel-unit-1", "reel-unit-2"]
+    assert sorted(emitted) == sorted(reels)
+    assert len(persisted) == 4
+    assert set(persisted) == {"unit-0", "unit-1", "unit-2", "unit-3"}
+    assert "reel-unit-3" not in emitted
+    assert verify.call_count == 4
+    run_clip.assert_called_once()
+
+
 def test_many_queued_acoustic_candidates_share_source_deadline_and_cancel(
     monkeypatch,
 ) -> None:
@@ -755,12 +859,15 @@ def test_many_queued_acoustic_candidates_share_source_deadline_and_cancel(
     )
     elapsed = time.monotonic() - started_at
 
-    assert len(reels) == candidate_count
+    assert reels == []
     assert elapsed < 0.3
     assert verify.call_count == 3
     assert len(started) == 3
     assert all(0.0 < timeout <= 0.05 for timeout in timeouts)
     assert context.counters()["boundary_unavailable"] == 0
+    assert context.counters()["stored_clips"] == candidate_count
+    assert context.counters()["deferred_clips"] == candidate_count
+    assert context.counters()["verified_clips"] == 0
     assert context.counters()["permanently_rejected_clips"] == 0
 
 
@@ -987,7 +1094,7 @@ def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
     assert persisted[0]["end"] == 20.0
 
 
-def test_acoustic_result_crossing_unselected_speech_falls_back_to_transcript(
+def test_acoustic_result_crossing_unselected_speech_is_stored_but_deferred(
     monkeypatch,
 ) -> None:
     transcript = _transcript()
@@ -1042,15 +1149,20 @@ def test_acoustic_result_crossing_unselected_speech_falls_back_to_transcript(
         max_reels=1,
     )
 
-    assert reels == ["stored-crossing"]
+    assert reels == []
     assert verify.call_args.kwargs["search_end_limit_sec"] == 10.0
     assert len(persisted) == 1
     assert (persisted[0]["start"], persisted[0]["end"]) == (0.0, 10.0)
     assert persisted[0]["search_context"]["boundary_status"] == "context_aligned"
+    assert persisted[0]["search_context"]["surface_eligible"] is False
+    assert persisted[0]["search_context"]["surface_reason"] == (
+        "acoustic_boundary_unverified"
+    )
+    assert context.counters()["deferred_clips"] == 1
     assert context.counters()["permanently_rejected_clips"] == 0
 
 
-def test_acoustic_result_crossing_prior_unselected_speech_falls_back_to_transcript(
+def test_acoustic_result_crossing_prior_speech_is_stored_but_deferred(
     monkeypatch,
 ) -> None:
     transcript = {
@@ -1124,11 +1236,16 @@ def test_acoustic_result_crossing_prior_unselected_speech_falls_back_to_transcri
         max_reels=1,
     )
 
-    assert reels == ["stored-start-crossing"]
+    assert reels == []
     assert verify.call_args.kwargs["search_start_limit_sec"] == 10.0
     assert len(persisted) == 1
     assert (persisted[0]["start"], persisted[0]["end"]) == (10.0, 20.0)
     assert persisted[0]["search_context"]["boundary_status"] == "context_aligned"
+    assert persisted[0]["search_context"]["surface_eligible"] is False
+    assert persisted[0]["search_context"]["surface_reason"] == (
+        "acoustic_boundary_unverified"
+    )
+    assert context.counters()["deferred_clips"] == 1
     assert context.counters()["permanently_rejected_clips"] == 0
 
 
@@ -2076,7 +2193,7 @@ def test_selected_caption_snapshot_clamps_every_overlapping_cue_to_lexical_end()
     assert cues[-1]["text"] == "which is exactly what dhdx is"
 
     context = {
-        "selection_contract_version": "quality_silence_v32",
+        "selection_contract_version": "quality_silence_v33",
         "boundary_status": "context_aligned",
         "speech_corridor_verified": True,
         "selection_caption_cues": [
@@ -2878,7 +2995,7 @@ def test_transcript_edge_speech_inside_media_uses_one_sided_handoffs() -> None:
         },
     ],
 )
-def test_unsafe_acoustic_success_falls_back_without_rejecting_good_clip(
+def test_unsafe_acoustic_success_is_stored_but_deferred(
     monkeypatch,
     verification: dict,
 ) -> None:
@@ -2922,14 +3039,18 @@ def test_unsafe_acoustic_success_falls_back_without_rejecting_good_clip(
         on_reel_created=emitted.append,
     )
 
-    assert reels == ["deferred-reel"]
-    assert emitted == ["deferred-reel"]
+    assert reels == []
+    assert emitted == []
     assert len(stored) == 1
     assert (stored[0]["start"], stored[0]["end"]) == (0.0, 10.0)
     assert stored[0]["search_context"]["boundary_status"] == "context_aligned"
+    assert stored[0]["search_context"]["surface_eligible"] is False
+    assert stored[0]["search_context"]["surface_reason"] == (
+        "acoustic_boundary_unverified"
+    )
     assert context.counters()["stored_clips"] == 1
-    assert context.counters()["deferred_clips"] == 0
-    assert context.counters()["persisted_clips"] == 1
+    assert context.counters()["deferred_clips"] == 1
+    assert context.counters()["persisted_clips"] == 0
     assert context.counters()["verified_clips"] == 0
     assert context.counters()["level_deferred_clips"] == 0
     assert context.counters()["permanently_rejected_clips"] == 0
@@ -2996,7 +3117,7 @@ def test_production_transcript_boundary_surfaces_without_audio_work(
     assert context.counters()["permanently_rejected_clips"] == 0
 
 
-def test_unsafe_refinement_fallback_surfaces_before_later_level_reservoir(
+def test_unsafe_refinement_fallback_is_stored_but_deferred(
     monkeypatch,
 ) -> None:
     transcript = _transcript()
@@ -3096,14 +3217,15 @@ def test_unsafe_refinement_fallback_surfaces_before_later_level_reservoir(
         max_persisted_reels=1,
     )
 
-    assert reels == ["advanced-reservoir-reel"]
+    assert reels == []
     assert len(stored) == 1
     boundary = stored[0]["search_context"]
     assert boundary["boundary_status"] == "context_aligned"
-    assert boundary["surface_eligible"] is True
+    assert boundary["surface_eligible"] is False
+    assert boundary["surface_reason"] == "acoustic_boundary_unverified"
     assert context.counters()["stored_clips"] == 1
-    assert context.counters()["deferred_clips"] == 0
-    assert context.counters()["persisted_clips"] == 1
+    assert context.counters()["deferred_clips"] == 1
+    assert context.counters()["persisted_clips"] == 0
     assert context.counters()["verified_clips"] == 0
     assert context.counters()["level_deferred_clips"] == 0
     assert context.counters()["permanently_rejected_clips"] == 0
@@ -3114,7 +3236,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
 ) -> None:
     strict_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v32",
+        "selection_contract_version": "quality_silence_v33",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -3124,7 +3246,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
     }
     transcript_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v32",
+        "selection_contract_version": "quality_silence_v33",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -3182,12 +3304,12 @@ def test_failed_boundary_storage_does_not_consume_ready_material_cap(
                 '{"surface_eligible": false, "boundary_status": "unavailable"}'
             )
         }
-        for _ in range(main.MAX_REELS_PER_MATERIAL + 5)
+        for _ in range(305)
     ]
     deferred.append({
         "search_context_json": json.dumps({
             "surface_eligible": True,
-            "selection_contract_version": "quality_silence_v32",
+            "selection_contract_version": "quality_silence_v33",
             "speech_corridor_verified": True,
             "boundary_status": "verified",
             "boundary_diagnostics": {
@@ -3951,7 +4073,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v32"
+        assert context["selection_contract_version"] == "quality_silence_v33"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"
@@ -4080,7 +4202,7 @@ def test_multiple_flash_source_results_never_trigger_pro_fallback(
     pro_fallback.assert_not_called()
 
 
-def test_acoustic_unavailable_uses_context_without_pro_repair(
+def test_missing_start_silence_is_stored_but_not_surfaced(
     monkeypatch,
 ) -> None:
     first = _video()
@@ -4135,43 +4257,66 @@ def test_acoustic_unavailable_uses_context_without_pro_repair(
         "pro_boundary_fallback",
         pro_fallback,
     )
+    prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+        "ready",
+        source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a",
+            duration_sec=20.0,
+        ),
+    )
     monkeypatch.setattr(
         pipeline_module.clip_engine_silence,
         "prepare_audio_source",
-        mock.Mock(return_value=mock.sentinel.prepared_audio),
+        mock.Mock(return_value=prepared),
     )
+    verify_acoustic = mock.Mock(return_value=(
+        pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "unavailable",
+            0.0,
+            10.0,
+            diagnostics={"stage": "start", "reason": "start_silence_not_found"},
+        )
+    ))
     monkeypatch.setattr(
         pipeline_module.clip_engine_silence,
         "verify_acoustic_boundaries",
-        mock.Mock(return_value=mock.Mock(
-            verified=False,
-            start_sec=0.0,
-            end_sec=10.0,
-            diagnostics={"reason": "start_silence_not_found"},
-        )),
+        verify_acoustic,
     )
+    persist_clip = mock.Mock(side_effect=lambda **kwargs: (
+        f"{kwargs['v']['id']}:{kwargs['clip']['start']}",
+        mock.sentinel.metadata,
+    ))
     monkeypatch.setattr(
         pipeline,
         "_persist_engine_clip",
-        mock.Mock(side_effect=lambda **kwargs: (
-            f"{kwargs['v']['id']}:{kwargs['clip']['start']}",
-            mock.sentinel.metadata,
-        )),
+        persist_clip,
     )
 
+    context = GenerationContext(
+        "slow",
+        require_acoustic_boundaries=True,
+    )
     reels, _ = pipeline.ingest_topic(
         topic="Intro to Python",
         material_id="material",
         concept_id="concept",
         max_videos=2,
         max_reels=3,
-        generation_context=GenerationContext(
-            "slow",
-            require_acoustic_boundaries=True,
-        ),
+        generation_context=context,
     )
 
-    assert len(reels) == 3
+    assert reels == []
+    assert verify_acoustic.call_count == 4
+    assert persist_clip.call_count == 4
+    for call in persist_clip.call_args_list:
+        search_context = call.kwargs["clip"]["search_context"]
+        assert search_context["boundary_status"] == "context_aligned"
+        assert search_context["surface_eligible"] is False
+        assert search_context["surface_reason"] == "acoustic_boundary_unverified"
+        assert search_context["boundary_diagnostics"]["acoustic_verified"] is False
+    assert context.counters()["stored_clips"] == 4
+    assert context.counters()["verified_clips"] == 0
+    assert context.counters()["deferred_clips"] == 4
     pro_fallback.assert_not_called()
 
 
@@ -4232,7 +4377,7 @@ def test_generation_skips_pro_repair_and_synchronous_enrichment(monkeypatch) -> 
     assert context.counters()["pro_fallbacks"] == 0
 
 
-def test_clip_call_uses_one_low_thinking_flash_selector_and_ignores_duration(
+def test_clip_call_uses_one_medium_thinking_pro_selector_and_ignores_duration(
     monkeypatch,
 ) -> None:
     captured: dict = {}
@@ -4258,8 +4403,8 @@ def test_clip_call_uses_one_low_thinking_flash_selector_and_ignores_duration(
     fallback_gate = captured.get("_segment_pro_fallback_gate")
     assert callable(fallback_gate)
     assert fallback_gate(accepted_count=0, video_id="dQw4w9WgXcQ") is False
-    assert captured["_segment_routing_mode"] == "flash_only"
-    assert captured["_segment_thinking_level"] == "low"
+    assert captured["_segment_routing_mode"] == "pro_only"
+    assert captured["_segment_thinking_level"] == "medium"
     assert "_segment_target_sec" not in captured
     assert "_segment_target_min_sec" not in captured
     assert "_segment_target_max_sec" not in captured
@@ -4287,8 +4432,8 @@ def test_fast_and_slow_clip_calls_use_identical_quality_routing(
         retrieval_profile="deep",
     )
 
-    assert captured["_segment_thinking_level"] == "low"
-    assert captured["_segment_routing_mode"] == "flash_only"
+    assert captured["_segment_thinking_level"] == "medium"
+    assert captured["_segment_routing_mode"] == "pro_only"
     assert captured["_segment_pro_fallback_gate"](
         accepted_count=0,
         video_id="dQw4w9WgXcQ",

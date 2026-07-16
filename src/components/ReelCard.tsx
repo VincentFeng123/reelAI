@@ -120,6 +120,10 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+function hasReachedVerifiedClipEnd(playerTime: number, clipEnd: number): boolean {
+  return Number.isFinite(playerTime) && playerTime + 0.01 >= clipEnd;
+}
+
 function formatClock(seconds: number): string {
   const s = Math.max(0, Math.floor(seconds));
   const m = Math.floor(s / 60);
@@ -341,7 +345,7 @@ export function ReelCard({
       }
       // The iframe's integer `end` parameter is only a safety net. Enforce the
       // authoritative floating-point boundary ourselves, including at 2x.
-      if (playerTime + 0.01 >= clipEnd) {
+      if (hasReachedVerifiedClipEnd(playerTime, clipEnd)) {
         onPlaybackProgress?.(1, true);
         if (!didHandleClipEndRef.current) {
           didHandleClipEndRef.current = true;

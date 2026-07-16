@@ -182,6 +182,28 @@ def test_search_all_applies_per_request_filters_without_extra_calls(monkeypatch)
     ]
 
 
+def test_search_all_threads_each_provider_page_token(monkeypatch):
+    calls = []
+
+    def fake_one(query, filters=None, *args, **kwargs):
+        calls.append((query, filters, kwargs.get("page_token")))
+        return {"query": query, "videos": [], "billed": 0}
+
+    monkeypatch.setattr(ss, "search_one", fake_one)
+    monkeypatch.setattr(ss, "wait_with_probe", lambda *_args: None)
+
+    ss.search_all(
+        ["literal", "expanded"],
+        request_filters=[{"features": []}, {"features": ["hd"]}],
+        page_tokens=["literal-page-2", "expanded-page-3"],
+    )
+
+    assert calls == [
+        ("literal", {"features": []}, "literal-page-2"),
+        ("expanded", {"features": ["hd"]}, "expanded-page-3"),
+    ]
+
+
 def test_search_all_returns_primary_result_when_optional_query_exhausts_budget(monkeypatch):
     calls = []
 

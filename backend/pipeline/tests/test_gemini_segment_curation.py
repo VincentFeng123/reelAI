@@ -261,6 +261,9 @@ def test_forty_realistic_boundary_candidates_fit_bounded_output_reservation():
         }
         data.update(
             candidate_id=f"candidate-{index}",
+            claim_quote=(
+                f"line {index} explains informational mechanism"
+            ),
             title=f"Informational facet {index}",
             learning_objective=(
                 f"Explain the complete mechanism and educational conclusion for facet {index}."
@@ -297,7 +300,7 @@ def test_forty_realistic_boundary_candidates_fit_bounded_output_reservation():
     assert estimated_tokens + 1_024 < G._BOUNDARY_OUTPUT_TOKENS
 
 
-def test_complete_teaching_survives_a_long_internal_structural_aside():
+def test_long_internal_structural_aside_is_removed_from_the_teaching_clip():
     segments = [
         {
             "cue_id": "setup",
@@ -348,7 +351,11 @@ def test_complete_teaching_survives_a_long_internal_structural_aside():
 
     assert report.rejected_reasons == []
     assert len(report.clips) == 1
-    assert report.clips[0]["cue_ids"] == ["setup", "aside", "conclusion"]
+    assert report.clips[0]["cue_ids"] == ["setup"]
+    assert "sponsor" not in report.clips[0]["_clip_text"].casefold()
+    assert "trimmed_around_internal_structural_filler" in (
+        report.clips[0]["_boundary_fallback_reasons"]
+    )
 
 
 @pytest.mark.parametrize("field", ["start_line", "end_line"])
@@ -500,7 +507,7 @@ def test_long_incomplete_range_is_rejected_for_context_not_duration():
     assert report.rejected_reasons == ["proposal_0:unresolved_weak_end"]
 
 
-def test_brief_internal_channel_bump_does_not_discard_complete_teaching():
+def test_internal_channel_bump_is_never_shipped_inside_teaching():
     raw_cues = [
         (354.960, 359.240, "Cool! There's just one issue: Your DNA and its information is in the nucleus,"),
         (359.240, 362.680, "but proteins are made in organelles called the ribosomes. How do we get the"),
@@ -566,14 +573,10 @@ def test_brief_internal_channel_bump_does_not_discard_complete_teaching():
         topic="biology",
     )
 
-    assert len(report.clips) == 1
-    assert report.clips[0]["cue_ids"] == [
-        f"3tisOnOkwzo:cue:{index + 78}" for index in range(len(segments))
+    assert report.clips == []
+    assert report.rejected_reasons == [
+        "proposal_0:internal_structural_filler"
     ]
-    assert report.clips[0]["_clip_text"].startswith(
-        "Your DNA and its information is in the nucleus"
-    )
-    assert "Welcome to Biology Pro Tips" in report.clips[0]["_clip_text"]
 
 
 def test_production_biology_fragment_rebinds_to_grounded_cell_unit():
@@ -987,7 +990,7 @@ def test_trailing_non_speech_marker_is_trimmed_after_teaching():
     )
 
 
-def test_brief_internal_non_speech_marker_remains_between_teaching():
+def test_brief_internal_non_speech_marker_is_never_shipped():
     text = (
         "Gravity attracts masses [Applause] and the force weakens as distance "
         "increases."
@@ -1006,8 +1009,10 @@ def test_brief_internal_non_speech_marker_remains_between_teaching():
         topic="gravity",
     )
 
-    assert len(report.clips) == 1
-    assert "[Applause]" in report.clips[0]["_clip_text"]
+    assert report.clips == []
+    assert report.rejected_reasons == [
+        "proposal_0:internal_structural_filler"
+    ]
 
 
 def test_same_cue_leading_filler_emits_semantic_edge_projection():
@@ -1280,7 +1285,7 @@ def test_topic_evidence_in_omitted_hook_cannot_ground_projected_clip():
     assert report.rejected_reasons == ["proposal_0:ungrounded_topic_evidence_quote"]
 
 
-def test_same_cue_internal_filler_remains_between_semantic_quotes():
+def test_same_cue_internal_filler_rejects_an_unspliceable_candidate():
     text = (
         "A hash maps an input to a fixed-size digest. A quick aside about the name. "
         "Changing the input usually changes the digest."
@@ -1299,8 +1304,10 @@ def test_same_cue_internal_filler_remains_between_semantic_quotes():
         topic="hash functions",
     )
 
-    assert len(report.clips) == 1
-    assert "A quick aside about the name" in report.clips[0]["_clip_text"]
+    assert report.clips == []
+    assert report.rejected_reasons == [
+        "proposal_0:internal_structural_filler"
+    ]
 
 
 def test_ambiguous_projected_edge_quote_falls_back_without_rejection():
@@ -1676,7 +1683,7 @@ def test_visual_dependency_inside_semantic_projection_is_rejected():
     assert report.rejected_reasons == ["proposal_0:requires_visual_context"]
 
 
-def test_long_same_cue_internal_sponsor_block_does_not_discard_teaching():
+def test_long_same_cue_internal_sponsor_block_is_never_retained():
     text = (
         "Photosynthesis converts light energy into chemical energy. "
         "Today's sponsor is Acme, whose premium study platform gives every learner "
@@ -1699,18 +1706,13 @@ def test_long_same_cue_internal_sponsor_block_does_not_discard_teaching():
         topic="photosynthesis",
     )
 
-    assert report.rejected_reasons == []
-    assert len(report.clips) == 1
-    assert "Photosynthesis converts light energy" in report.clips[0]["_clip_text"]
-    assert "Chlorophyll captures photons" in report.clips[0]["_clip_text"]
-    assert "Today's sponsor is Acme" in report.clips[0]["_clip_text"]
-    assert (
-        "retained_long_internal_filler_block"
-        in report.clips[0]["_boundary_fallback_reasons"]
-    )
+    assert report.clips == []
+    assert report.rejected_reasons == [
+        "proposal_0:internal_structural_filler"
+    ]
 
 
-def test_brief_same_cue_internal_aside_is_tolerated():
+def test_brief_same_cue_internal_aside_is_never_retained():
     text = (
         "Photosynthesis converts light energy into chemical energy. "
         "A quick aside: chlorophyll is green. "
@@ -1730,7 +1732,10 @@ def test_brief_same_cue_internal_aside_is_tolerated():
         topic="photosynthesis",
     )
 
-    assert len(report.clips) == 1
+    assert report.clips == []
+    assert report.rejected_reasons == [
+        "proposal_0:internal_structural_filler"
+    ]
 
 
 @pytest.mark.parametrize("topic", ["biology", "biology myths", "Gothic architecture"])
@@ -2060,7 +2065,7 @@ def test_course_logistics_suffix_is_trimmed_after_complete_teaching():
     assert report.clips[0]["end"] == 26.0
 
 
-def test_brief_internal_aside_is_tolerated_inside_complete_teaching():
+def test_brief_internal_aside_keeps_only_the_grounded_complete_side():
     segments = [
         {
             "start": 0.0,
@@ -2095,10 +2100,11 @@ def test_brief_internal_aside_is_tolerated_inside_complete_teaching():
     )
 
     assert len(report.clips) == 1
-    assert report.clips[0]["cue_ids"] == ["cue-0", "cue-1", "cue-2"]
+    assert report.clips[0]["cue_ids"] == ["cue-2"]
+    assert "quick aside" not in report.clips[0]["_clip_text"].casefold()
 
 
-def test_long_internal_sponsor_block_does_not_discard_the_candidate():
+def test_long_internal_sponsor_keeps_only_the_grounded_complete_side():
     segments = [
         {
             "start": 0.0,
@@ -2137,14 +2143,11 @@ def test_long_internal_sponsor_block_does_not_discard_the_candidate():
 
     assert report.rejected_reasons == []
     assert len(report.clips) == 1
-    assert report.clips[0]["cue_ids"] == ["cue-0", "cue-1", "cue-2"]
-    assert (
-        "retained_long_internal_filler_block"
-        in report.clips[0]["_boundary_fallback_reasons"]
-    )
+    assert report.clips[0]["cue_ids"] == ["cue-0"]
+    assert "sponsor" not in report.clips[0]["_clip_text"].casefold()
 
 
-def test_multiple_brief_internal_admin_and_tangent_blocks_are_tolerated():
+def test_multiple_internal_admin_and_tangent_blocks_are_removed():
     segments = [
         {
             "start": 0.0,
@@ -2189,8 +2192,9 @@ def test_multiple_brief_internal_admin_and_tangent_blocks_are_tolerated():
     )
 
     assert len(report.clips) == 1
-    assert "Administrative note" in report.clips[0]["_clip_text"]
-    assert "brief tangent" in report.clips[0]["_clip_text"]
+    assert report.clips[0]["cue_ids"] == ["cue-0"]
+    assert "Administrative note" not in report.clips[0]["_clip_text"]
+    assert "brief tangent" not in report.clips[0]["_clip_text"]
 
 
 def test_explicit_max_clips_is_respected_below_forty_ceiling():
@@ -2339,7 +2343,9 @@ def test_boundary_prompt_selects_all_difficulties_and_rejects_course_framing():
         topic="biology",
         learner_level="advanced",
     )
-    assert "current level is advanced" not in user
+    assert "current level is advanced" in user
+    assert "target-level preference" in user
+    assert "return qualifying units at every difficulty" in user
     assert "0.00-0.33 means beginner" in user
     assert "return units across that entire scale" in user.lower()
     assert "course logistics" in user

@@ -244,6 +244,8 @@ class ClipEngineSearchTests(unittest.TestCase):
         )
         self.assertIn("start=", item.reel.video_url)
         self.assertIn("end=", item.reel.video_url)
+        self.assertEqual(item.reel.boundary_status, "verified")
+        self.assertTrue(item.reel.acoustic_verified)
 
         # DB sanity
         with db_module.get_conn() as conn:
@@ -276,6 +278,46 @@ class ClipEngineSearchTests(unittest.TestCase):
             retrieval_profile="deep",
             breadth=3,
         )
+
+    def test_ingest_search_does_not_surface_unverified_acoustic_clip(self) -> None:
+        unavailable = pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "unavailable",
+            20.0,
+            65.0,
+            {"stage": "analyze", "reason": "end_silence_not_found"},
+        )
+        with (
+            mock.patch.object(pipeline_module, "clip_engine_search") as mock_search,
+            mock.patch.object(pipeline_module, "clip_engine_run") as mock_run,
+            mock.patch.object(
+                pipeline_module.clip_engine_silence,
+                "verify_acoustic_boundaries",
+                return_value=unavailable,
+            ),
+        ):
+            mock_search.discover.return_value = _FAKE_DISCOVER
+            mock_run.clip.return_value = _FAKE_ENGINE_OUT
+
+            result = main_module.ingestion_pipeline.ingest_search(
+                query="calc",
+                platforms=["yt"],
+                max_per_platform=5,
+                material_id="m1",
+                concept_id=None,
+                language="en",
+                exclude_video_ids=[],
+            )
+
+        self.assertEqual(result.succeeded, 0)
+        self.assertEqual(result.failed, 0)
+        self.assertEqual(len(result.items), 1)
+        self.assertEqual(result.items[0].status, "skipped")
+        self.assertIsNone(result.items[0].reel)
+        with db_module.get_conn() as conn:
+            self.assertEqual(
+                db_module.fetch_one(conn, "SELECT COUNT(*) AS cnt FROM reels")["cnt"],
+                0,
+            )
 
     # --------------------------------------------------------------------- #
     # No clips → status="skipped"

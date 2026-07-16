@@ -32,6 +32,7 @@ GenerationCounter = Literal[
     "level_deferred_clips",
     "permanently_rejected_clips",
     "provider_failures",
+    "provider_cursor_open",
     "segmentation_cache_hits",
     "expansion_cache_hits",
     "boundary_rejections",
@@ -55,6 +56,7 @@ GENERATION_COUNTERS: tuple[GenerationCounter, ...] = (
     "level_deferred_clips",
     "permanently_rejected_clips",
     "provider_failures",
+    "provider_cursor_open",
     "segmentation_cache_hits",
     "expansion_cache_hits",
     "boundary_rejections",
@@ -130,16 +132,20 @@ class GenerationBudget:
     }
     _GEMINI_COST_LIMIT_USD: dict[GenerationMode, float] = {
         # Worst-case response reservations plus buffered input estimates cover
-        # one Flash-Lite expansion and two/three audited 3.5 Flash selectors.
+        # one Flash-Lite expansion and a bounded number of Pro clip selectors.
         # These are job ceilings, not expected spend; billed usage is recorded
         # from provider telemetry and is normally much lower.
-        "fast": 0.20,
-        "slow": 0.30,
+        "fast": 0.45,
+        "slow": 0.70,
     }
-    _FLASH_SELECTOR_LIMIT: dict[GenerationMode, int] = {
+    _SELECTOR_CALL_LIMIT: dict[GenerationMode, int] = {
         "fast": 2,
         "slow": 3,
     }
+    # Compatibility alias for older diagnostics/tests.  The active production
+    # selector may now be Flash or Pro, but the bounded per-source call count is
+    # shared so upgrading the model cannot multiply provider spend.
+    _FLASH_SELECTOR_LIMIT = _SELECTOR_CALL_LIMIT
     _PRO_FALLBACK_CALL_LIMIT = 0
 
     def __init__(self, mode: GenerationMode) -> None:
@@ -159,7 +165,9 @@ class GenerationBudget:
         self._gemini_committed_cost_usd = 0.0
         self._gemini_inflight: dict[int, float] = {}
         self._next_gemini_reservation_id = 1
+        self._selector_calls = 0
         self._flash_selector_calls = 0
+        self._pro_selector_calls = 0
         self._pro_fallback_calls = 0
         self._lock = threading.Lock()
         self._gemini_condition = threading.Condition(self._lock)
@@ -218,6 +226,7 @@ class GenerationBudget:
         normalized_operation = str(operation or "").casefold()
         is_pro = "pro" in normalized_model or normalized_operation.startswith("pro_")
         is_pro_fallback = normalized_operation == "pro_fallback"
+        is_pro_selector = is_pro and normalized_operation == "pro_authoritative"
         is_flash_selector = (
             not is_pro
             and normalized_operation
@@ -227,6 +236,7 @@ class GenerationBudget:
                 "boundary_selection",
             }
         )
+        is_selector = is_flash_selector or is_pro_selector
         reservation = max(0.0, float(estimated_cost_usd))
         cost_limit = self._GEMINI_COST_LIMIT_USD[self.mode]
 
@@ -258,9 +268,9 @@ class GenerationBudget:
                 )
 
             with self._gemini_condition:
-                if is_pro:
+                if is_pro and not (is_pro_selector or is_pro_fallback):
                     raise ProviderBudgetExceededError(
-                        "Gemini Pro is disabled for generation.",
+                        "This Gemini Pro operation is disabled for generation.",
                         provider="gemini",
                         operation=operation,
                     )
@@ -274,13 +284,13 @@ class GenerationBudget:
                         operation=operation,
                     )
                 if (
-                    is_flash_selector
-                    and self._flash_selector_calls
-                    >= self._FLASH_SELECTOR_LIMIT[self.mode]
+                    is_selector
+                    and self._selector_calls
+                    >= self._SELECTOR_CALL_LIMIT[self.mode]
                 ):
                     raise ProviderBudgetExceededError(
                         "Gemini transcript selector budget exhausted "
-                        f"({self._FLASH_SELECTOR_LIMIT[self.mode]} maximum).",
+                        f"({self._SELECTOR_CALL_LIMIT[self.mode]} maximum).",
                         provider="gemini",
                         operation=operation,
                     )
@@ -293,8 +303,12 @@ class GenerationBudget:
                     self._gemini_reserved_cost_usd += reservation
                     if is_pro_fallback:
                         self._pro_fallback_calls += 1
+                    if is_selector:
+                        self._selector_calls += 1
                     if is_flash_selector:
                         self._flash_selector_calls += 1
+                    if is_pro_selector:
+                        self._pro_selector_calls += 1
                     return reservation_id
 
                 # Settling in-flight work cannot reduce already committed
@@ -382,8 +396,12 @@ class GenerationBudget:
                         + sum(self._gemini_inflight.values()),
                         8,
                     ),
+                    "selector_calls": self._selector_calls,
+                    "selector_limit": self._SELECTOR_CALL_LIMIT[self.mode],
                     "flash_selector_calls": self._flash_selector_calls,
-                    "flash_selector_limit": self._FLASH_SELECTOR_LIMIT[self.mode],
+                    "flash_selector_limit": self._SELECTOR_CALL_LIMIT[self.mode],
+                    "pro_selector_calls": self._pro_selector_calls,
+                    "pro_selector_limit": self._SELECTOR_CALL_LIMIT[self.mode],
                     # Keep the older names as compatibility aliases. These
                     # counters have always represented the fallback allowance,
                     # not ordinary authoritative Pro selectors.
@@ -416,7 +434,11 @@ def _usage_field(usage: Any, name: str) -> Any:
     return getattr(usage, name, None)
 
 
-def _gemini_token_rates(model: str) -> tuple[float, float, float]:
+def _gemini_token_rates(
+    model: str,
+    *,
+    input_tokens: int = 0,
+) -> tuple[float, float, float]:
     """Return current per-million uncached/cached-input/output rates."""
     normalized = str(model or "").casefold()
     if "flash-lite" in normalized:
@@ -424,6 +446,8 @@ def _gemini_token_rates(model: str) -> tuple[float, float, float]:
     if "gemini-3-flash" in normalized and "gemini-3.5-flash" not in normalized:
         return 0.50, 0.05, 3.00
     if "pro" in normalized:
+        if max(0, int(input_tokens)) > 200_000:
+            return 4.00, 0.40, 18.00
         return 2.00, 0.20, 12.00
     return 1.50, 0.15, 9.00
 
@@ -491,7 +515,10 @@ class GenerationContext:
             else max(1, math.ceil(len(str(prompt_text or "")) / 4))
         )
         output_tokens = max(1, int(max_output_tokens))
-        input_rate, _cached_input_rate, output_rate = _gemini_token_rates(model)
+        input_rate, _cached_input_rate, output_rate = _gemini_token_rates(
+            model,
+            input_tokens=prompt_tokens,
+        )
         estimated_cost = (
             prompt_tokens * input_rate + output_tokens * output_rate
         ) / 1_000_000.0
@@ -546,6 +573,23 @@ class GenerationContext:
             if candidate_tokens or thought_tokens
             else _usage_value(usage, "output_tokens")
         )
+        candidate_usage_present = any(
+            _usage_field(usage, name) is not None
+            for name in (
+                "candidate_tokens",
+                "candidates_token_count",
+                "candidatesTokenCount",
+            )
+        )
+        thought_usage_present = any(
+            _usage_field(usage, name) is not None
+            for name in (
+                "thought_tokens",
+                "thoughts_token_count",
+                "thoughtsTokenCount",
+            )
+        )
+        aggregate_output_present = _usage_field(usage, "output_tokens") is not None
         cached_tokens = min(
             input_tokens,
             _usage_value(
@@ -557,7 +601,14 @@ class GenerationContext:
         )
         # A total without the input/output split cannot be priced correctly;
         # retain the full reservation rather than reopening the budget at $0.
-        usage_known = bool(input_tokens or output_tokens)
+        # Every Gemini call has a non-empty prompt. Price actual usage only
+        # when both sides of the split are present. Present zero-valued output
+        # counters are complete; absent input/output counters are partial
+        # telemetry and must retain the full fail-closed reservation.
+        usage_known = input_tokens > 0 and (
+            aggregate_output_present
+            or (candidate_usage_present and thought_usage_present)
+        )
         dispatched_value = (
             bool(_usage_field(usage, "dispatched"))
             if dispatched is None
@@ -566,7 +617,8 @@ class GenerationContext:
         actual_cost: float | None
         if usage_known:
             input_rate, cached_input_rate, output_rate = _gemini_token_rates(
-                model_used
+                model_used,
+                input_tokens=input_tokens,
             )
             actual_cost = (
                 (input_tokens - cached_tokens) * input_rate
@@ -911,12 +963,11 @@ class GenerationContext:
         )
         self.reconcile_gemini_call(
             model_used=model_used,
-            usage={
-                **record_metadata,
-                "input_tokens": record.input_tokens,
-                "output_tokens": record.output_tokens,
-                "total_tokens": record.total_tokens,
-            },
+            # Reconcile from the original provider payload so absent split
+            # fields remain distinguishable from explicit zero counters. The
+            # normalized ledger intentionally stores zeros for aggregation,
+            # but those synthesized zeros are not billing evidence.
+            usage=usage,
             dispatched=(
                 bool(record_metadata.get("dispatched"))
                 if "dispatched" in record_metadata
@@ -931,10 +982,11 @@ class GenerationContext:
 
     @staticmethod
     def _gemini_cost(record: Mapping[str, Any]) -> float:
-        input_rate, cached_input_rate, output_rate = _gemini_token_rates(
-            str(record.get("model_used") or "")
-        )
         input_tokens = max(0, int(record.get("input_tokens") or 0))
+        input_rate, cached_input_rate, output_rate = _gemini_token_rates(
+            str(record.get("model_used") or ""),
+            input_tokens=input_tokens,
+        )
         cached_tokens = min(
             input_tokens,
             max(0, int((record.get("metadata") or {}).get("cached_tokens") or 0)),

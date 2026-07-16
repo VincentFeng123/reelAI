@@ -59,11 +59,12 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 TOPIC_MODEL = os.environ.get("TOPIC_MODEL", "gemini-3.1-pro-preview")
 
 # ── Gemini-segment clip engine (default) ────────────────────────────────────
-# A single Flash pass reads the complete timestamped Supadata transcript and returns
-# substantive topic clips. Production generation never falls back to Pro; deterministic
-# discourse checks refine transcript context and sentence edges without turning boundary
-# uncertainty into a rejection of otherwise valuable teaching.
-_segment_routing_mode = os.environ.get("SEGMENT_ROUTING_MODE", "hybrid").strip().lower()
+# Clip selection is the one quality-critical Gemini operation.  Production uses
+# the stronger Pro model for that compact timestamp/evidence response while
+# search, transcript retrieval, enrichment, chat, and embeddings keep their
+# existing cheaper paths.  The bounded selector budget prevents a model upgrade
+# from multiplying calls per batch.
+_segment_routing_mode = os.environ.get("SEGMENT_ROUTING_MODE", "pro_only").strip().lower()
 SEGMENT_ROUTING_MODE = (
     _segment_routing_mode
     if _segment_routing_mode in {"pro_only", "shadow", "hybrid"}

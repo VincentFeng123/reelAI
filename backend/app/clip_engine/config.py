@@ -25,6 +25,15 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 TOPIC_MODEL = os.environ.get("TOPIC_MODEL", "gemini-3.1-pro-preview")
 SEGMENT_MODEL = os.environ.get("SEGMENT_MODEL", GEMINI_MODEL)
 SEGMENT_FALLBACK_MODEL = os.environ.get("SEGMENT_FALLBACK_MODEL", TOPIC_MODEL).strip()
+_assessment_model = (
+    os.environ.get("ASSESSMENT_MODEL", "gemini-3.5-flash").strip()
+    or "gemini-3.5-flash"
+)
+# Assessment authoring is intentionally outside the Pro-only clip selector. A
+# stale or mistaken Pro override fails safely back to the dedicated Flash model.
+ASSESSMENT_MODEL = (
+    "gemini-3.5-flash" if "pro" in _assessment_model.casefold() else _assessment_model
+)
 # Query-expansion uses the cheaper lite tier; segmentation keeps its own model.
 EXPAND_MODEL = os.environ.get("EXPAND_MODEL", "gemini-2.5-flash-lite")
 

@@ -256,8 +256,8 @@ def _run_clip(
     if deadline_monotonic is not None:
         settings["deadline_monotonic"] = float(deadline_monotonic)
     settings["_segment_pro_fallback_gate"] = lambda **_kwargs: False
-    settings["_segment_routing_mode"] = "flash_only"
-    settings["_segment_thinking_level"] = "low"
+    settings["_segment_routing_mode"] = "pro_only"
+    settings["_segment_thinking_level"] = "medium"
     kwargs = {
         "topic": topic,
         "settings": settings,
@@ -272,6 +272,7 @@ def _discover(
     *,
     limit: int,
     exclude_video_ids: list[str],
+    consumed_video_ids: list[str] | None = None,
     level: str | None,
     should_cancel: Callable[[], bool] | None,
     creative_commons_only: bool = False,
@@ -299,6 +300,8 @@ def _discover(
         "practice_fast": True,
         "retrieval_profile": retrieval_profile,
     }
+    if consumed_video_ids:
+        kwargs["consumed_video_ids"] = consumed_video_ids
     if deadline_monotonic is not None:
         kwargs["deadline_monotonic"] = float(deadline_monotonic)
     if breadth is not None:
@@ -538,7 +541,7 @@ def _boundary_evidence_grade(
     if (
         not isinstance(context, dict)
         or str(context.get("selection_contract_version") or "").strip()
-        != "quality_silence_v32"
+        != "quality_silence_v33"
     ):
         return 0
     if (
@@ -1715,10 +1718,11 @@ def _verified_direct_adapter_clips(
     should_cancel: Callable[[], bool] | None,
     limit: int | None = None,
     prepared_audio: clip_engine_silence.AudioPreparationResult | None = None,
+    require_acoustic_boundaries: bool = False,
     exact_topic: str = "",
     embedding_service: Any = None,
 ) -> list[dict[str, Any]]:
-    """Return difficulty-ranked candidates with complete transcript cuts."""
+    """Return difficulty-ranked candidates with validated boundary evidence."""
     transcript = dict(engine_out.get("transcript") or {})
     segments = list(transcript.get("segments") or [])
     transcript_end = max(
@@ -1804,9 +1808,9 @@ def _verified_direct_adapter_clips(
         )
     )
 
-    # Audio lookup is intentionally not started here. Production boundaries are
-    # transcript-authoritative; callers may still supply an already prepared
-    # source for an opt-in acoustic refinement without changing the fallback.
+    # Audio lookup is intentionally owned by callers so it can run alongside
+    # selection. Public ingest callers require strict measured silence; internal
+    # transcript-only callers may retain the explicit context-aligned fallback.
     prepared = prepared_audio
     media_end = _prepared_media_end_sec(
         prepared,
@@ -2073,6 +2077,8 @@ def _verified_direct_adapter_clips(
             )
         if not boundary_range_is_safe:
             continue
+        if require_acoustic_boundaries and not strict_acoustic:
+            continue
         clip = dict(raw_clip)
         clip.pop("_quality_scores", None)
         clip.pop("_grounded_topic_evidence_quote", None)
@@ -2092,7 +2098,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v32",
+            selection_contract_version="quality_silence_v33",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -2158,12 +2164,16 @@ def _verified_direct_adapter_clip(
     source_url: str,
     engine_out: dict[str, Any],
     should_cancel: Callable[[], bool] | None,
+    prepared_audio: clip_engine_silence.AudioPreparationResult | None = None,
+    require_acoustic_boundaries: bool = False,
 ) -> dict[str, Any] | None:
     clips = _verified_direct_adapter_clips(
         source_url=source_url,
         engine_out=engine_out,
         should_cancel=should_cancel,
         limit=1,
+        prepared_audio=prepared_audio,
+        require_acoustic_boundaries=require_acoustic_boundaries,
     )
     return clips[0] if clips else None
 
@@ -2419,7 +2429,7 @@ class IngestionPipeline:
             generation_context = GenerationContext(
                 "fast",
                 generation_id=f"url:{video_id}",
-                require_acoustic_boundaries=False,
+                require_acoustic_boundaries=True,
             )
             engine_out = _run_direct_clip(
                 source_url,
@@ -2440,16 +2450,22 @@ class IngestionPipeline:
         except _ClipError as exc:
             raise SegmentationError(str(exc)) from exc
 
+        prepared_audio = clip_engine_silence.prepare_audio_source(
+            source_url,
+            cancel_check=should_cancel,
+            language=language,
+        )
         verified = _verified_direct_adapter_clips(
             source_url=source_url,
             engine_out=engine_out,
             should_cancel=should_cancel,
             limit=None,
-            prepared_audio=None,
+            prepared_audio=prepared_audio,
+            require_acoustic_boundaries=True,
         )
         if not verified:
             raise SegmentationError(
-                "no quality clip with complete transcript boundaries could be produced"
+                "no quality clip with verified acoustic boundaries could be produced"
             )
 
         raise_if_cancelled(should_cancel)
@@ -2577,7 +2593,7 @@ class IngestionPipeline:
             generation_context = GenerationContext(
                 "fast",
                 generation_id=f"topic-cut:{video_id}",
-                require_acoustic_boundaries=False,
+                require_acoustic_boundaries=True,
             )
             engine_out = _run_direct_clip(
                 source_url,
@@ -2595,12 +2611,18 @@ class IngestionPipeline:
         except _ClipError as exc:
             raise SegmentationError(str(exc)) from exc
 
+        prepared_audio = clip_engine_silence.prepare_audio_source(
+            source_url,
+            cancel_check=should_cancel,
+            language=language,
+        )
         kept = _verified_direct_adapter_clips(
             source_url=source_url,
             engine_out=engine_out,
             should_cancel=should_cancel,
             limit=None,
-            prepared_audio=None,
+            prepared_audio=prepared_audio,
+            require_acoustic_boundaries=True,
             exact_topic=(query or ""),
             embedding_service=self._embedding_service,
         )
@@ -2712,7 +2734,7 @@ class IngestionPipeline:
                 generation_context = GenerationContext(
                     "fast",
                     generation_id=f"feed:{video_id}",
-                    require_acoustic_boundaries=False,
+                    require_acoustic_boundaries=True,
                 )
                 engine_out = _run_clip(
                     url,
@@ -2721,10 +2743,17 @@ class IngestionPipeline:
                     should_cancel=should_cancel,
                     generation_context=generation_context,
                 )
+                prepared_audio = clip_engine_silence.prepare_audio_source(
+                    url,
+                    cancel_check=should_cancel,
+                    language=language,
+                )
                 best = _verified_direct_adapter_clip(
                     source_url=url,
                     engine_out=engine_out,
                     should_cancel=should_cancel,
+                    prepared_audio=prepared_audio,
+                    require_acoustic_boundaries=True,
                 )
                 if best is None:
                     items.append(IngestFeedItem(source_url=url, status="skipped"))
@@ -2876,10 +2905,17 @@ class IngestionPipeline:
                     ))
                     continue
 
+                prepared_audio = clip_engine_silence.prepare_audio_source(
+                    str(v["url"]),
+                    cancel_check=should_cancel,
+                    language=language,
+                )
                 best = _verified_direct_adapter_clip(
                     source_url=str(v["url"]),
                     engine_out={**engine_out, "clips": eligible_clips},
                     should_cancel=should_cancel,
+                    prepared_audio=prepared_audio,
+                    require_acoustic_boundaries=True,
                 )
                 if best is None:
                     items.append(IngestSearchItem(
@@ -2950,6 +2986,7 @@ class IngestionPipeline:
         concept_id: str,
         generation_id: str | None = None,
         exclude_video_ids: list[str] | None = None,
+        consumed_video_ids: list[str] | None = None,
         target_clip_duration_sec: int = 45,
         target_clip_duration_min_sec: int = 15,
         target_clip_duration_max_sec: int = 60,
@@ -3031,7 +3068,15 @@ class IngestionPipeline:
 
         try:
             disc = _discover(
-                topic, limit=discovery_limit, exclude_video_ids=bare_exclusions, level=None,
+                topic,
+                limit=discovery_limit,
+                exclude_video_ids=bare_exclusions,
+                consumed_video_ids=[
+                    str(value or "").strip().split(":", 1)[-1]
+                    for value in (consumed_video_ids or [])
+                    if str(value or "").strip()
+                ],
+                level=None,
                 should_cancel=should_cancel,
                 creative_commons_only=creative_commons_only,
                 preferred_video_duration=preferred_video_duration,
@@ -3051,6 +3096,8 @@ class IngestionPipeline:
         warning = disc.get("warning")
         if warning:
             log_event(logger, logging.WARNING, "ingest_topic_warning", warning=warning)
+        if generation_context is not None and disc.get("provider_exhausted") is False:
+            generation_context.increment_counter("provider_cursor_open")
 
         authoritative_topic = " ".join(str(literal_topic or topic).split()) or topic
         corrected_topic = " ".join(str(disc.get("corrected") or authoritative_topic).split()) or authoritative_topic
@@ -3866,6 +3913,14 @@ class IngestionPipeline:
                 else:
                     search_context.setdefault("boundary_status", "caption_aligned")
 
+                if (
+                    surface_eligible
+                    and require_acoustic_boundaries
+                    and not boundary_verified_for_storage
+                ):
+                    surface_eligible = False
+                    search_context["surface_reason"] = "acoustic_boundary_unverified"
+
                 if surface_eligible and bool(search_context.get("deferred_level")):
                     surface_eligible = False
                     search_context["surface_reason"] = "level_mismatch"
@@ -4450,7 +4505,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v32",
+                    selection_contract_version="quality_silence_v33",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,
@@ -5105,6 +5160,14 @@ class IngestionPipeline:
             selection_contract_version=(
                 str(selection_context.get("selection_contract_version") or "").strip()
                 or None
+            ),
+            boundary_status=str(
+                selection_context.get("boundary_status") or ""
+            ).strip().lower(),
+            acoustic_verified=bool(
+                isinstance(selection_context.get("boundary_diagnostics"), dict)
+                and selection_context["boundary_diagnostics"].get("acoustic_verified")
+                is True
             ),
             boundary_confidence=(
                 float(selection_context["boundary_confidence"])
