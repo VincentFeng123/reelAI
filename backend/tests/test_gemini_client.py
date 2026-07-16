@@ -823,54 +823,78 @@ def test_generic_generate_json_preserves_gemini25_thinking_off_then_on(monkeypat
     assert second.temperature == 0.2 and second.thinking_config is None
 
 
-def test_video_and_multimodal_gemini3_paths_omit_sampling(monkeypatch):
-    fake = _FakeClient(_FakeResponse(), _FakeResponse())
+def test_multimodal_gemini3_image_path_omits_sampling(monkeypatch):
+    fake = _FakeClient(_FakeResponse())
     monkeypatch.setattr(gc, "get_client", lambda: fake)
-    monkeypatch.setattr(gc.config, "VIDEO_JUDGE_MODEL", "gemini-3.5-flash")
-    media = gc.types.MediaResolution.MEDIA_RESOLUTION_LOW
-
-    assert gc.generate_json_video(
-        "system", ["video"], _Schema, media_resolution=media,
-    ) == '{"ok": true}'
     monkeypatch.setattr(gc.config, "GEMINI_MODEL", "gemini-3.5-flash")
-    assert gc.generate_json_mm("system", ["image"], _Schema) == '{"ok": true}'
+    image = gc.image_part(b"jpeg")
+    assert gc.generate_json_mm("system", [image], _Schema) == '{"ok": true}'
 
-    video_cfg, mm_cfg = [call["config"] for call in fake.models.calls]
-    for cfg in (video_cfg, mm_cfg):
-        assert cfg.temperature is None and cfg.top_p is None and cfg.top_k is None
-        assert cfg.thinking_config.thinking_budget is None
-        assert _enum_value(cfg.thinking_config.thinking_level).endswith("medium")
-    assert video_cfg.media_resolution == media
-
-
-def test_youtube_video_part_bounds_media_to_the_timestamped_transcript() -> None:
-    part = gc.youtube_video_part(
-        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-        end_offset_sec=600.25,
-    )
-
-    assert part.file_data.file_uri == (
-        "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    )
-    assert part.video_metadata.end_offset == "600.25s"
+    [mm_cfg] = [call["config"] for call in fake.models.calls]
+    assert mm_cfg.temperature is None and mm_cfg.top_p is None and mm_cfg.top_k is None
+    assert mm_cfg.thinking_config.thinking_budget is None
+    assert _enum_value(mm_cfg.thinking_config.thinking_level).endswith("medium")
 
 
-def test_youtube_video_part_rounds_fractional_end_outward() -> None:
-    part = gc.youtube_video_part(
-        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-        end_offset_sec=600.2501,
-    )
-
-    assert part.video_metadata.end_offset == "600.251s"
-
-
-@pytest.mark.parametrize("end_offset", [0, -1, float("inf"), "invalid"])
-def test_youtube_video_part_rejects_invalid_media_bounds(end_offset) -> None:
-    with pytest.raises(ValueError, match="end offset"):
+@pytest.mark.parametrize("end_offset", [None, 600.25, 0, -1, float("inf")])
+def test_youtube_video_part_is_hard_disabled(end_offset) -> None:
+    with pytest.raises(ValueError, match="video input is disabled"):
         gc.youtube_video_part(
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
             end_offset_sec=end_offset,
         )
+
+
+def test_inline_and_manually_constructed_video_are_rejected_before_dispatch(
+    monkeypatch,
+) -> None:
+    with pytest.raises(ValueError, match="video input is disabled"):
+        gc.video_part_inline(b"mp4")
+
+    fake = _FakeClient(_FakeResponse())
+    monkeypatch.setattr(gc, "get_client", lambda: fake)
+    manual_video = gc.types.Part.from_bytes(data=b"mp4", mime_type="video/mp4")
+    with pytest.raises(ValueError, match="video input is disabled"):
+        gc.generate_json_v3(
+            "system",
+            [manual_video],
+            _Schema,
+            model="gemini-3-flash-preview",
+            thinking_level="low",
+            max_output_tokens=100,
+            timeout_s=45,
+            deadline_monotonic=None,
+            operation="op",
+            prompt_version="v1",
+        )
+    wrapped_video = gc.types.Content(role="user", parts=[manual_video])
+    with pytest.raises(ValueError, match="video input is disabled"):
+        gc.generate_json_v3(
+            "system",
+            [wrapped_video],
+            _Schema,
+            model="gemini-3-flash-preview",
+            thinking_level="low",
+            max_output_tokens=100,
+            timeout_s=45,
+            deadline_monotonic=None,
+            operation="op",
+            prompt_version="v1",
+        )
+    with pytest.raises(ValueError, match="video input is disabled"):
+        gc.generate_json_v3(
+            "system",
+            [{"inline_data": {"mime_type": "video/mp4", "data": "AAAA"}}],
+            _Schema,
+            model="gemini-3-flash-preview",
+            thinking_level="low",
+            max_output_tokens=100,
+            timeout_s=45,
+            deadline_monotonic=None,
+            operation="op",
+            prompt_version="v1",
+        )
+    assert fake.models.calls == []
 
 
 @pytest.mark.parametrize("model", ["", "gemini-2.5-flash"])

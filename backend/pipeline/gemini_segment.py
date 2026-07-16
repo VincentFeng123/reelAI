@@ -379,6 +379,12 @@ _OPENING_UNRESOLVED_EDGE_REFERENCE_RE = re.compile(
     r"(?:a|an|the|your)\b",
     re.IGNORECASE,
 )
+_OPENING_CONTEXT_ONLY_TRANSITION_RE = re.compile(
+    r"^\s*(?:and\s+)?(?:on\s+the\s+other\s+hand|"
+    r"(?:now|then)\s+the\s+next\s+(?:step|thing)|"
+    r"so\s+step\s+(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+))",
+    re.IGNORECASE,
+)
 _EXISTENTIAL_OPENING_RE = re.compile(
     r"^\s*there\s+(?:is|are|was|were)\s+"
     r"(?:(?:(?:a|an|no|some|many|several|multiple|numerous|few)|"
@@ -868,8 +874,9 @@ _CLAIM_PROMISSORY_FRAGMENT_RE = re.compile(
 _ATOMIC_DECLARATIVE_ONSET_RE = re.compile(
     r"^\s*(?:(?:all\s+right|alright|okay|ok|now|so)\s*[,;:]?\s+)*"
     r"(?P<subject>"
-    r"(?!(?:although|because|but|he|how|i|if|it|she|that|these|they|this|"
-    r"those|we|what|when|where|which|while|why|you)\b)"
+    r"(?!(?:after|although|as|assuming|because|before|but|during|given|he|"
+    r"how|i|if|it|once|provided|she|since|suppose|that|these|they|this|"
+    r"those|unless|until|we|what|when|where|which|while|why|you)\b)"
     r"(?:[a-z0-9][\w'’-]*\s+){1,6}?"
     r")(?P<predicate>are|is|means?|refers?\s+to|describes?|measures?|"
     r"absorbs?|accumulates?|affects?|approaches?|captures?|carries?|causes?|"
@@ -1905,22 +1912,24 @@ class _CompactBoundaryTopic(_StrictModel):
         alias="sq",
         description=(
             "Shortest unique exact transcript quote whose first spoken word is the "
-            "first word required by this complete one-topic unit; ignore acoustic "
-            "silence and never include earlier speech for a pause."
+            "first word required by this complete one-topic unit. It must occur uniquely "
+            "inside the s:e range and may continue across adjacent caption lines; ignore "
+            "acoustic silence and never include earlier speech for a pause."
         ),
     )
     end_quote: _CompactBoundaryQuote = Field(
         alias="eq",
         description=(
             "Shortest unique exact transcript quote whose final spoken word is the "
-            "final word of this unit's first complete conclusion; ignore acoustic "
-            "silence and never include later speech for a pause."
+            "final word of this unit's first complete conclusion. It must occur uniquely "
+            "inside the s:e range and may begin across adjacent caption lines; ignore "
+            "acoustic silence and never include later speech for a pause."
         ),
     )
     claim_quote: _CompactEvidenceQuote = Field(
         alias="cq",
         description=(
-            "Five to twelve exact consecutive transcript words containing the "
+            "Five to sixteen exact consecutive transcript words containing the "
             "unit's substantive educational claim, explanation, or answer. It cannot "
             "be an agenda, outline, topic mention, promise, or unanswered question."
         ),
@@ -2091,12 +2100,13 @@ _POLICY_AND_EXAMPLES = """Policy:
   atmospheric hook, scene-setting flourish, or opening joke. end_quote must be the last
   words of its complete conclusion, before audience banter, a next-topic setup, or a
   post-conclusion joke. Quotes may begin or end inside a coarse transcript line. Copy the
-  shortest unique 1-12 consecutive words that land exactly on the semantic edge, preserve
-  the transcript spelling, and keep the quote wholly inside its cited edge line. A clean
+  shortest unique 1-16 consecutive words that land exactly on the semantic edge, preserve
+  the transcript spelling, and keep the quote wholly inside the selected s:e range. An exact
+  phrase may cross directly adjacent caption lines, but never skip, stitch, or reorder words. A clean
   one-word edge is better than padding it with a transition, next topic, recap, or outro.
-  Never pad to satisfy a preferred quote length. Never paraphrase, correct, stitch, or cross
-  transcript lines. topic_evidence_quote must be the
-  shortest useful 5-12 consecutive words wholly between those chosen edges, copied with the
+  Never pad to satisfy a preferred quote length. Never paraphrase or correct transcript words.
+  topic_evidence_quote must be the
+  shortest useful 5-16 consecutive words wholly between those chosen edges, copied with the
   same exactness.
 - A worked example cannot end at its question, setup, or first substituted value. Either
   include its reasoning and answer through end_quote or end the candidate before that
@@ -2208,11 +2218,11 @@ def _learner_rule(level: str) -> str:
 
 def _selection_fields(*, enriched: bool, compact: bool = False) -> str:
     fields = (
-        "candidate_id (a short unique slug), start_line, end_line, start_quote and "
-        "end_quote (each the shortest unique 1-12 exact consecutive words wholly inside its "
-        "cited line, preserving transcript spelling and marking the first required teaching "
-        "words and last complete conclusion, even inside a coarse line; never pad with nearby "
-        "speech, paraphrase, stitch, or cross lines), "
+        "candidate_id (a short unique slug), start_line and end_line (the enclosing cue range), "
+        "start_quote and end_quote (each the shortest unique 1-16 exact consecutive words "
+        "inside that range, preserving transcript spelling; the first word of start_quote and "
+        "last word of end_quote are the authoritative semantic edges, even when an exact phrase "
+        "crosses directly adjacent caption lines; never pad, paraphrase, skip, stitch, or reorder), "
         "title (at most 12 words), "
         "learning_objective (at most 24 words), facet (at most 12 words), "
         "informativeness, topic_relevance, "
@@ -2221,7 +2231,7 @@ def _selection_fields(*, enriched: bool, compact: bool = False) -> str:
     )
     if not compact:
         fields += (
-            ", topic_evidence_quote (the shortest exact 5-12 consecutive-word quote copied "
+            ", topic_evidence_quote (the shortest exact 5-16 consecutive-word quote copied "
             "wholly between the chosen edges that proves the clip teaches the topic; preserve "
             "spelling and never paraphrase or stitch), self_contained, is_standalone"
             ", prerequisite_candidate_ids (omit it or return []), uncertainty "
@@ -2231,7 +2241,7 @@ def _selection_fields(*, enriched: bool, compact: bool = False) -> str:
         fields += (
             ", self_contained, is_standalone"
             ". Use the compact schema keys: id=candidate_id, s=start_line, e=end_line, "
-            "sq=start_quote, eq=end_quote, cq=claim_quote (the shortest exact 5-12 word "
+            "sq=start_quote, eq=end_quote, cq=claim_quote (the shortest exact 5-16 word "
             "substantive educational assertion, explanation, or answer inside the unit; "
             "never an agenda, outline/list header, promise, mere topic mention, or "
             "unanswered question; a sentence explicitly distinguishing two named sides is "
@@ -2258,6 +2268,68 @@ def _intent_selection_fields() -> str:
         "each containing constraint_id and a 5-16 word exact consecutive evidence_quote "
         "copied from inside the candidate)"
     )
+
+
+def _compact_output_guide() -> str:
+    """Explain every compact selector key and demonstrate exact edge semantics."""
+    return """Compact topic schema — use these exact keys:
+- id = candidate_id: a short unique slug for this one educational moment. Never reuse an id.
+- s = start_line: the zero-based, inclusive index of the first transcript line enclosing the
+  desired start. This is a caption-line index, not seconds and not necessarily the exact start.
+- e = end_line: the zero-based, inclusive index of the last transcript line enclosing the
+  desired end. The enclosing caption range is every line from s through e.
+- sq = start_quote: 1-16 exact consecutive transcript words inside s:e. Its FIRST spoken word
+  is the exact first word the viewer should hear. sq may cross adjacent lines. Do not include
+  earlier greeting, filler, transition, or context solely to make the quote longer or unique.
+- eq = end_quote: 1-16 exact consecutive transcript words inside s:e. Its LAST spoken word is
+  the exact final word the viewer should hear. eq may cross adjacent lines. Do not include a
+  later transition, recap, outro, joke, or next topic.
+- cq = claim_quote: 5-16 exact consecutive transcript words between the chosen semantic edges
+  containing the core educational claim, explanation, result, or answer. cq proves where the
+  teaching is; it does not define the start or end and cannot be mere agenda or topic mention.
+- title = a clear viewer-facing title of at most 12 words.
+- obj = learning_objective: one precise sentence, at most 24 words, stating what the viewer
+  will understand or be able to do after this clip. Give exactly one objective.
+- facet = the narrow subtopic taught here, at most 12 words; be more specific than the broad
+  user request whenever possible.
+- info = informativeness, 0.0-1.0: how much concrete, useful teaching the selected span contains.
+- rel = topic_relevance, 0.0-1.0: how strongly this exact unit serves the exact user request.
+- imp = educational_importance, 0.0-1.0: how valuable this unit is for learning that request.
+- diff = difficulty, 0.0-1.0: required prior knowledge only; 0.00-0.33 beginner,
+  0.34-0.66 intermediate, 0.67-1.00 advanced. Difficulty never disqualifies a unit.
+- direct = directly_teaches_topic: true only when the span actually teaches the requested
+  subject or an explicitly connected supporting facet, rather than merely naming it.
+- sub = substantive: true only for real teaching, reasoning, explanation, demonstration, or
+  an answer—not greetings, administration, promotion, navigation, or empty framing.
+- fact = factually_grounded: true only when the educational claim is supported by the supplied
+  spoken transcript. No video is supplied, so never assume an unseen visual proves the claim.
+- self = self_contained: true when all setup, referents, reasoning, and conclusion needed to
+  understand the objective are included inside sq-through-eq.
+- stand = is_standalone: true when a cold viewer can understand and use the clip independently,
+  without first watching another part of the source. self concerns included context; stand
+  concerns independence from the surrounding lesson or another prerequisite clip.
+- ie = intent_evidence: a nonempty list of {id, q} objects. Each id must exactly equal one
+  request_intent constraint_id that this unit fulfills. Each q must be an exact consecutive
+  5-16-word quote inside the candidate proving that fulfillment. ie proves request fit; cq
+  independently proves substantive teaching.
+
+Worked format example — understand the boundary logic, but never copy its content or scores:
+Example transcript:
+[18] 02:10 Welcome back. A small p value
+[19] 02:15 provides stronger evidence against the null hypothesis. Next, confidence intervals measure uncertainty.
+Example exact user request: Explain p-values
+Example output:
+{"request_intent":{"exact_request":"Explain p-values","constraints":[{"constraint_id":"subject","kind":"subject","source_phrase":"p-values","requirement":"Explain p-values"}]},"topics":[{"id":"small-p-value-evidence","s":18,"e":19,"sq":"A small p value","eq":"against the null hypothesis.","cq":"small p value provides stronger evidence against the null hypothesis","title":"What a Small P-Value Means","obj":"Explain how a small p-value bears on the null hypothesis","facet":"small p-values","info":0.95,"rel":0.99,"imp":0.93,"diff":0.42,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"subject","q":"small p value provides stronger evidence against the null hypothesis"}]}]}
+Why: s remains 18 even though sq starts after "Welcome back" inside line 18. e remains 19
+even though eq ends before "Next, confidence intervals" inside line 19. sq's first word "A"
+is the semantic start; eq's last word "hypothesis" is the semantic end; cq anchors the claim.
+
+Context example:
+[31] 04:00 To calculate acceleration, first find the change in velocity.
+[32] 04:06 Divide that change by elapsed time to obtain acceleration.
+Do not start at line 32 with "Divide that change" because "that change" depends on omitted
+setup. Include line 31 and begin sq at "To calculate acceleration" so self and stand are true.
+"""
 
 
 def _prompts(
@@ -2293,8 +2365,15 @@ def _boundary_prompts(
     learner_level: str = "",
     video_grounded: bool = False,
 ) -> tuple[str, str]:
+    # Kept in the signature for compatibility with older callers, but selector
+    # prompts are permanently transcript-only to prevent video-token charges.
+    video_grounded = False
     system = (
         "You select self-contained educational clip boundaries from timestamped transcripts.\n\n"
+        "INPUT CONTRACT: You receive transcript text only. No video, image, audio file, "
+        "frames, thumbnails, or visual metadata are attached. Judge only the supplied "
+        "transcript and never infer that an unseen visual supplies missing context or "
+        "evidence.\n\n"
         + _POLICY_AND_EXAMPLES
     )
     if video_grounded:
@@ -2316,7 +2395,7 @@ def _boundary_prompts(
     cold_start_basis = (
         "the selected span's spoken audio together with its visible, legible video"
         if video_grounded
-        else "only the spoken audio"
+        else "only the supplied spoken transcript"
     )
     visual_rule = (
         "Use required visuals only when they are present and legible inside the selected "
@@ -2346,7 +2425,8 @@ def _boundary_prompts(
         "named subjects, requested operations or tasks, relationships, scope qualifiers, "
         "formats, and outcomes. Do not substitute retrieval expansions or a broader topic. "
         "Treat course, exam, grade, learner-level, and curriculum labels as scope constraints, "
-        "not spoken subject constraints; the source and video establish those qualifiers. "
+        "not spoken subject constraints; the exact request and supplied transcript establish "
+        "those qualifiers. "
         "Then scan the whole transcript from first to last and understand it before selecting. "
         "Internally distinguish required setup and teaching from administration, promotion, "
         "navigation, repetition, and visual-dependent speech; do not output that section map.\n"
@@ -2373,7 +2453,10 @@ def _boundary_prompts(
         "Never combine the end of one objective with the beginning of another: end before "
         "the transition for the old unit and start after it for the new unit. When a coarse "
         "line contains the old conclusion, transition, and new opening, place the exact edge "
-        "quotes inside that line on the correct side of the transition. "
+        "quotes inside the selected range on the correct side of the transition. "
+        "Never start a candidate with context-only handoff language such as 'on the other "
+        "hand', 'now/then the next step', or 'so step five'; include the "
+        "missing setup or begin at the first independently understandable teaching sentence. "
         f"Apply a cold-start and cold-stop test using {cold_start_basis}: never begin at a "
         "dependent tail, tag question, unresolved 'other one' reformulation, or the "
         "consequence of an analogy whose actors and mapping were omitted. Never end inside "
@@ -2383,9 +2466,14 @@ def _boundary_prompts(
         "non-speech markers. Split around an internal interruption when separate complete "
         "units remain and return only contiguous complete sides. If no clean side is "
         "independently complete, omit the candidate; internal filler may never remain. "
-        "Never omit a substantive grounded unit solely because its boundary is uncertain: "
-        "return the best complete cue span and let deterministic post-processing refine it. "
-        "Omit only when content, context, or topic meaning is too uncertain to support grounded "
+        "Before returning, verify every sq and eq token-for-token inside its selected s:e range, "
+        "including the 1-16 word limit, and verify every cq is 5-16 exact words. The backend "
+        "treats every topic you return as semantically approved: it will not second-guess or "
+        "reject that topic, and will only repair or expand transcript boundaries when needed. "
+        "Do not omit an otherwise good, complete, relevant unit solely because coarse captions "
+        "make the exact cut uncertain; return your closest grounded s:e, sq, and eq so the "
+        "backend can repair the cut. Omit only when content, context, or "
+        "topic meaning is too uncertain to support grounded "
         "teaching; severe transcript noise counts as content uncertainty. "
         f"{visual_rule}"
         "4. Score topic relevance, information density, educational value, and difficulty "
@@ -2401,6 +2489,7 @@ def _boundary_prompts(
         "course logistics and institutional framing are "
         "not teaching units. Each unit must be standalone, use a unique "
         "candidate_id, and include required setup inside its span.\n"
+        f"{_compact_output_guide()}\n"
         f"Return only the object {{request_intent, topics}}. Every topic must contain "
         f"{_selection_fields(enriched=False, compact=True)}. The ie list must be nonempty and "
         "contain one {id, q} item per non-scope request constraint the unit fulfills, where id is the "
@@ -4168,9 +4257,58 @@ def _quote_character_spans(text: str, quote: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _quote_character_span(text: str, quote: str) -> tuple[int, int] | None:
+def _quote_character_span(
+    text: str,
+    quote: str,
+    *,
+    preferred_span: tuple[int, int] | None = None,
+) -> tuple[int, int] | None:
     spans = _quote_character_spans(text, quote)
+    if preferred_span is not None and preferred_span in spans:
+        return preferred_span
     return spans[0] if spans else None
+
+
+@dataclass(frozen=True)
+class _ModelBoundaryAnchor:
+    first_line: int
+    last_line: int
+    first_span: tuple[int, int]
+    last_span: tuple[int, int]
+
+    @property
+    def first_word_position(self) -> tuple[int, int]:
+        return self.first_line, self.first_span[0]
+
+    @property
+    def last_word_position(self) -> tuple[int, int]:
+        return self.last_line, self.last_span[1]
+
+
+def _unique_boundary_anchor(
+    segments: list[dict],
+    quote: str,
+    start_line: int,
+    end_line: int,
+) -> _ModelBoundaryAnchor | None:
+    """Locate one exact model edge inside its proposed contiguous cue range."""
+    matches: list[_ModelBoundaryAnchor] = []
+    for line in range(start_line, end_line + 1):
+        text = str(segments[line].get("text") or "")
+        matches.extend(
+            _ModelBoundaryAnchor(line, line, span, span)
+            for span in _quote_character_spans(text, quote)
+        )
+    for cross in _cross_cue_token_windows(
+        segments, quote, start_line, end_line,
+    ):
+        matches.append(_ModelBoundaryAnchor(
+            first_line=cross[0],
+            last_line=cross[1],
+            first_span=(cross[2], cross[3]),
+            last_span=(cross[4], cross[5]),
+        ))
+    return matches[0] if len(matches) == 1 else None
 
 
 def _cross_cue_token_windows(
@@ -4487,12 +4625,28 @@ def _literal_source_quote(
     return source[start:end]
 
 
+def _lexical_span(
+    text: str,
+    span: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    """Return first/last word offsets, excluding display punctuation."""
+    if span is None:
+        return None
+    words = [
+        word
+        for word in _WORD_RE.finditer(str(text or ""))
+        if word.start() < span[1] and word.end() > span[0]
+    ]
+    return (words[0].start(), words[-1].end()) if words else None
+
+
 def _semantic_edge_quote(
     text: str,
     quote: str,
     *,
     want: str,
     occurrence: str | None = None,
+    preferred_span: tuple[int, int] | None = None,
 ) -> tuple[tuple[int, int] | None, bool, str | None]:
     """Ground one semantic edge without inventing a timestamp.
 
@@ -4504,7 +4658,11 @@ def _semantic_edge_quote(
     spans = _quote_character_spans(text, quote)
     if not word_matches or not spans:
         return None, False, "ungrounded_boundary_quote"
-    if occurrence == "first":
+    if preferred_span is not None:
+        if preferred_span not in spans:
+            return None, False, "ungrounded_boundary_quote"
+        span = preferred_span
+    elif occurrence == "first":
         span = spans[0]
     elif occurrence == "last":
         span = spans[-1]
@@ -4525,7 +4683,12 @@ def _semantic_edge_quote(
         if want == "start"
         else _WORD_RE.search(text[span[1]:])
     )
-    if projected and len(spans) != 1 and occurrence not in {"first", "last"}:
+    if (
+        projected
+        and len(spans) != 1
+        and occurrence not in {"first", "last"}
+        and preferred_span is None
+    ):
         return None, True, f"ambiguous_{want}_quote"
     return span, projected, None
 
@@ -4699,13 +4862,19 @@ def _replace_structural_edge_quote(
     quote: str,
     *,
     want: str,
+    preferred_span: tuple[int, int] | None = None,
 ) -> tuple[str, bool, str | None]:
     """Replace a model quote that includes removable filler at a cue edge."""
     if _cue_is_only_structural_filler(text):
         # The existing cue-level pass can remove this cue without projecting a
         # boundary inside it. Same-cue repair is only for mixed teaching/filler.
         return quote, False, None
-    quote_span, _projected, error = _semantic_edge_quote(text, quote, want=want)
+    quote_span, _projected, error = _semantic_edge_quote(
+        text,
+        quote,
+        want=want,
+        preferred_span=preferred_span,
+    )
     if error or quote_span is None:
         # Preserve the normal grounding/ambiguity failure emitted downstream.
         return quote, False, None
@@ -4860,6 +5029,7 @@ def _opening_clause_is_standalone(text: str) -> bool:
         or _OPENING_CONTEXTUAL_REFORMULATION_RE.match(opening_clause)
         or _OPENING_CONTEXTUAL_MODIFIER_SUBJECT_RE.match(opening_clause)
         or _OPENING_UNRESOLVED_EDGE_REFERENCE_RE.match(opening_clause)
+        or _OPENING_CONTEXT_ONLY_TRANSITION_RE.match(opening_clause)
         or _opening_contextual_example_needs_context(opening_clause)
         or _opening_has_context_dependent_subject(opening_clause)
         or _OPENING_RELATIVE_WHERE_FRAGMENT_RE.match(opening_clause)
@@ -5485,6 +5655,7 @@ def _trim_end_quote_before_edge_noise(
     *,
     evidence_quote: str = "",
     learning_objective: str = "",
+    preferred_span: tuple[int, int] | None = None,
 ) -> tuple[str, bool]:
     """Shorten a grounded end quote before an inline next-topic or outro tail."""
     spans = _quote_character_spans(text, quote)
@@ -5492,7 +5663,7 @@ def _trim_end_quote_before_edge_noise(
         return quote, False
     # End projection is authoritative at the final grounded occurrence. This
     # matters for intentionally short one-word quotes such as "energy".
-    span = spans[-1]
+    span = preferred_span if preferred_span in spans else spans[-1]
     selected = str(text or "")[:span[1]]
     noise_start = _trailing_edge_noise_start(
         selected,
@@ -9581,6 +9752,457 @@ def _drop_unmet_prerequisite_clips(report: _Conversion) -> None:
         clip["sequence_index"] = index + 1
 
 
+def _best_effort_evidence_quote(text: str) -> str:
+    """Return one literal local quote when model evidence cannot be anchored."""
+    words = list(_WORD_RE.finditer(str(text or "")))
+    if not words:
+        return ""
+    chosen = words[:min(16, len(words))]
+    return str(text or "")[chosen[0].start():chosen[-1].end()]
+
+
+def _trusted_compact_plan_to_report(
+    plan: _CompactBoundaryPlan,
+    segments: list[dict],
+    settings: dict,
+) -> _Conversion:
+    """Keep every schema-valid Gemini topic and repair only transcript edges."""
+    report = _Conversion(proposed_count=len(plan.topics))
+    n = len(segments)
+    if not n:
+        report.rejected_reasons.append("missing_segments")
+        return report
+
+    ignore_caption_case = bool(settings.get("_segment_ignore_caption_case", True))
+    used_candidate_ids: set[str] = set()
+
+    def boundary_anchor(
+        quote: str,
+        start_line: int,
+        end_line: int,
+    ) -> _ModelBoundaryAnchor | None:
+        anchor = _unique_boundary_anchor(
+            segments, quote, start_line, end_line,
+        )
+        if anchor is None and (start_line != 0 or end_line != n - 1):
+            anchor = _unique_boundary_anchor(segments, quote, 0, n - 1)
+        return anchor
+
+    for index, proposal in enumerate(plan.topics):
+        diagnostics: list[str] = []
+        proposed_range_valid = (
+            0 <= proposal.start_line <= proposal.end_line < n
+        )
+        a = min(max(proposal.start_line, 0), n - 1)
+        b = min(max(proposal.end_line, 0), n - 1)
+        if a > b:
+            a, b = b, a
+        if not proposed_range_valid:
+            diagnostics.append("bad_index")
+
+        model_claim_quote = " ".join(str(proposal.claim_quote or "").split())
+        claim_location = _unique_evidence_location(
+            segments, model_claim_quote, 0, n - 1,
+        )
+        if claim_location is not None and (
+            not proposed_range_valid
+            or claim_location[0] < a
+            or claim_location[2] > b
+        ):
+            a, b = claim_location[0], claim_location[2]
+            diagnostics.append("range_recovered_from_claim")
+
+        model_start_quote = str(proposal.start_quote or "").strip()
+        model_end_quote = str(proposal.end_quote or "").strip()
+        start_anchor = boundary_anchor(model_start_quote, a, b)
+        end_anchor = boundary_anchor(model_end_quote, a, b)
+        if start_anchor is None:
+            diagnostics.append("bad_start_quote")
+        if end_anchor is None:
+            diagnostics.append("bad_end_quote")
+
+        start_span: tuple[int, int] | None = None
+        end_span: tuple[int, int] | None = None
+        if start_anchor is not None and end_anchor is not None:
+            if (
+                start_anchor.first_word_position
+                < end_anchor.last_word_position
+            ):
+                a, b = start_anchor.first_line, end_anchor.last_line
+                start_span = start_anchor.first_span
+                end_span = end_anchor.last_span
+            else:
+                diagnostics.append("reversed_model_boundary")
+        else:
+            if start_anchor is not None:
+                a = start_anchor.first_line
+                start_span = start_anchor.first_span
+            if end_anchor is not None:
+                b = end_anchor.last_line
+                end_span = end_anchor.last_span
+
+        if claim_location is not None:
+            claim_start_line, claim_left, claim_end_line, claim_right = (
+                claim_location
+            )
+            if claim_start_line < a:
+                a = claim_location[0]
+                start_span = None
+                diagnostics.append("start_expanded_to_claim")
+            elif (
+                claim_start_line == a
+                and start_span is not None
+                and claim_left < start_span[0]
+            ):
+                start_span = None
+                diagnostics.append("start_expanded_to_claim")
+            if claim_end_line > b:
+                b = claim_location[2]
+                end_span = None
+                diagnostics.append("end_expanded_to_claim")
+            elif (
+                claim_end_line == b
+                and end_span is not None
+                and claim_right > end_span[1]
+            ):
+                end_span = None
+                diagnostics.append("end_expanded_to_claim")
+        if a > b:
+            if claim_location is not None:
+                a, b = claim_location[0], claim_location[2]
+            else:
+                a, b = sorted((a, b))
+            start_span = end_span = None
+            diagnostics.append("reversed_range_repaired")
+
+        trimmed = _trim_structural_filler_edges(
+            segments,
+            a,
+            b,
+            ignore_caption_case=ignore_caption_case,
+        )
+        if trimmed is not None:
+            trimmed_a, trimmed_b = trimmed
+            if trimmed_a != a:
+                start_span = None
+                diagnostics.append("trimmed_start_filler_cue")
+            if trimmed_b != b:
+                end_span = None
+                diagnostics.append("trimmed_end_filler_cue")
+            a, b = trimmed_a, trimmed_b
+
+        start_text = str(segments[a].get("text") or "")
+        end_text = str(segments[b].get("text") or "")
+        start_quote = (
+            _literal_source_quote(start_text, model_start_quote, start_span)
+            if start_span is not None
+            else _exact_boundary_quote(start_text, want="start")
+        )
+        end_quote = (
+            _literal_source_quote(end_text, model_end_quote, end_span)
+            if end_span is not None
+            else _exact_boundary_quote(end_text, want="end")
+        )
+
+        if start_span is not None:
+            replacement, replaced, _error = _replace_structural_edge_quote(
+                start_text,
+                start_quote,
+                want="start",
+                preferred_span=start_span,
+            )
+            if replaced and replacement:
+                repaired_span, _projected, repair_error = _semantic_edge_quote(
+                    start_text, replacement, want="start",
+                )
+                if repair_error is None and repaired_span is not None:
+                    start_quote, start_span = replacement, repaired_span
+                    diagnostics.append("trimmed_start_filler")
+
+        if start_span is not None:
+            selected_tail = start_text[start_span[0]:]
+            transition = _OPENING_CONTEXT_ONLY_TRANSITION_RE.match(selected_tail)
+            if transition is not None:
+                retained = selected_tail[transition.end():].lstrip(" ,;:—-")
+                if retained and _opening_clause_is_standalone(retained):
+                    replacement = _exact_boundary_quote(retained, want="start")
+                    repaired_span, _projected, repair_error = _semantic_edge_quote(
+                        start_text, replacement, want="start",
+                    )
+                    if repair_error is None and repaired_span is not None:
+                        start_quote, start_span = replacement, repaired_span
+                        diagnostics.append("trimmed_context_only_handoff")
+
+        if end_span is not None:
+            replacement, replaced, _error = _replace_structural_edge_quote(
+                end_text,
+                end_quote,
+                want="end",
+                preferred_span=end_span,
+            )
+            if replaced and replacement:
+                repaired_span, _projected, repair_error = _semantic_edge_quote(
+                    end_text, replacement, want="end",
+                )
+                if repair_error is None and repaired_span is not None:
+                    end_quote, end_span = replacement, repaired_span
+                    diagnostics.append("trimmed_end_filler")
+
+        if (
+            a == b
+            and start_span is not None
+            and end_span is not None
+            and start_span[0] >= end_span[1]
+        ):
+            start_span = end_span = None
+            diagnostics.append("reversed_semantic_boundary")
+
+        provisional_text, _spans = _semantic_clip_slice(
+            segments,
+            a,
+            b,
+            start_span=start_span,
+            end_span=end_span,
+        )
+        following_text = (
+            str(segments[b + 1].get("text") or "") if b + 1 < n else ""
+        )
+        opening_complete = bool(
+            provisional_text and _opening_clause_is_standalone(provisional_text)
+        )
+        ending_complete = bool(
+            provisional_text
+            and not _cue_has_weak_end(
+                provisional_text,
+                following_text,
+                ignore_caption_case=ignore_caption_case,
+            )
+            and not _next_cue_completes_embedded_predicate(
+                provisional_text, following_text,
+            )
+        )
+        if not opening_complete:
+            start_span = None
+            diagnostics.append("expanded_incomplete_start")
+        if not ending_complete:
+            end_span = None
+            diagnostics.append("expanded_incomplete_end")
+        force_full_start = not opening_complete
+        force_full_end = not ending_complete
+
+        original_a, original_b = a, b
+        a, b, close_error = _close_cue_context(
+            segments,
+            a,
+            b,
+            ignore_caption_case=ignore_caption_case,
+            start_boundary_verified=opening_complete,
+            end_boundary_verified=ending_complete,
+            protected_quote=model_claim_quote,
+            learning_objective=str(proposal.learning_objective or ""),
+        )
+        if close_error:
+            diagnostics.append(close_error)
+        if a != original_a:
+            start_span = None
+            diagnostics.append("context_expanded_start")
+        if b != original_b:
+            end_span = None
+            diagnostics.append("context_repaired_end")
+        if claim_location is not None:
+            if claim_location[0] < a:
+                a = claim_location[0]
+                start_span = None
+                diagnostics.append("retained_claim_start")
+            if claim_location[2] > b:
+                b = claim_location[2]
+                end_span = None
+                diagnostics.append("retained_claim_end")
+
+        start_text = str(segments[a].get("text") or "")
+        end_text = str(segments[b].get("text") or "")
+        if start_span is None:
+            start_quote, edge_error = _expanded_context_edge_quote(
+                start_text, want="start",
+            )
+            if edge_error or not start_quote:
+                start_quote = _exact_boundary_quote(start_text, want="start")
+            start_span, start_projected, edge_error = _semantic_edge_quote(
+                start_text, start_quote, want="start",
+            )
+            if edge_error:
+                start_span, start_projected = None, False
+        else:
+            start_projected = bool(_WORD_RE.search(start_text[:start_span[0]]))
+        if end_span is None:
+            end_quote, edge_error = _expanded_context_edge_quote(
+                end_text, want="end",
+            )
+            if edge_error or not end_quote:
+                end_quote = _exact_boundary_quote(end_text, want="end")
+            end_span, end_projected, edge_error = _semantic_edge_quote(
+                end_text, end_quote, want="end",
+            )
+            if edge_error:
+                end_span, end_projected = None, False
+        else:
+            end_projected = bool(_WORD_RE.search(end_text[end_span[1]:]))
+
+        if force_full_start:
+            start_span = None
+            start_projected = False
+        if force_full_end:
+            end_span = None
+            end_projected = False
+        if claim_location is not None:
+            claim_start_line, claim_left, claim_end_line, claim_right = (
+                claim_location
+            )
+            if (
+                start_projected
+                and start_span is not None
+                and claim_start_line == a
+                and claim_left < start_span[0]
+            ):
+                start_span = None
+                start_projected = False
+                diagnostics.append("start_expanded_to_claim")
+            if (
+                end_projected
+                and end_span is not None
+                and claim_end_line == b
+                and claim_right > end_span[1]
+            ):
+                end_span = None
+                end_projected = False
+                diagnostics.append("end_expanded_to_claim")
+
+        if (
+            a == b
+            and start_span is not None
+            and end_span is not None
+            and start_span[0] >= end_span[1]
+        ):
+            start_span = end_span = None
+            start_projected = end_projected = False
+            diagnostics.append("full_cue_boundary_fallback")
+        clip_text, semantic_spans_by_cue = _semantic_clip_slice(
+            segments,
+            a,
+            b,
+            start_span=start_span if start_projected else None,
+            end_span=end_span if end_projected else None,
+        )
+        if not clip_text:
+            start_projected = end_projected = False
+            clip_text, semantic_spans_by_cue = _semantic_clip_slice(
+                segments, a, b, start_span=None, end_span=None,
+            )
+            diagnostics.append("full_cue_boundary_fallback")
+
+        topic_evidence_quote = (
+            model_claim_quote
+            if _contains_quote(clip_text, model_claim_quote)
+            else _best_effort_evidence_quote(clip_text)
+        )
+        if topic_evidence_quote != model_claim_quote:
+            diagnostics.append("claim_quote_reanchored")
+
+        base_id = str(proposal.candidate_id or f"candidate-{index + 1}")
+        candidate_id = base_id
+        suffix = 2
+        while candidate_id in used_candidate_ids:
+            candidate_id = f"{base_id}-{suffix}"
+            suffix += 1
+        used_candidate_ids.add(candidate_id)
+        cue_ids = [
+            str(segments[line].get("cue_id") or f"cue-{line}")
+            for line in range(a, b + 1)
+        ]
+        start, end = _padded_cue_bounds(segments, a, b)
+        edge_projection: dict[str, dict[str, object]] = {}
+        if start_projected and start_span is not None:
+            edge_projection["start"] = {
+                "required": True,
+                "cue_id": cue_ids[0],
+                "quote": start_quote,
+            }
+        if end_projected and end_span is not None:
+            edge_projection["end"] = {
+                "required": True,
+                "cue_id": cue_ids[-1],
+                "quote": end_quote,
+            }
+
+        diagnostics = list(dict.fromkeys(diagnostics))
+        clip = {
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "start_quote": start_quote,
+            "end_quote": end_quote,
+            "title": str(proposal.title or "").strip(),
+            "learning_objective": str(proposal.learning_objective or "").strip(),
+            "facet": str(proposal.facet or "").strip(),
+            "reason": str(proposal.learning_objective or "").strip(),
+            "kind": "educational",
+            "informativeness": float(proposal.informativeness),
+            "topic_relevance": float(proposal.topic_relevance),
+            "educational_importance": float(proposal.educational_importance),
+            "difficulty": float(proposal.difficulty),
+            "directly_teaches_topic": bool(proposal.directly_teaches_topic),
+            "substantive": bool(proposal.substantive),
+            "factually_grounded": bool(proposal.factually_grounded),
+            "self_contained": bool(proposal.self_contained),
+            "is_standalone": bool(proposal.is_standalone),
+            "topic_evidence_quote": topic_evidence_quote,
+            "model_claim_quote": model_claim_quote,
+            "boundary_confidence": (
+                0.75 if diagnostics else _cue_boundary_confidence(
+                    end_text, ignore_caption_case=ignore_caption_case,
+                )
+            ),
+            "boundary_repair_mode": "best_effort" if diagnostics else "exact",
+            "selection_authority": "gemini",
+            "surface_eligible": True,
+            "selection_candidate_id": candidate_id,
+            "cue_ids": cue_ids,
+            "start_cue_id": cue_ids[0],
+            "end_cue_id": cue_ids[-1],
+            "chain_id": "",
+            "chain_position": 0,
+            "prerequisite_ids": [],
+            "uncertainty": "low",
+            "uncertainty_reasons": [],
+            "intent_role": "primary",
+            "intent_coverage": 1.0,
+            "intent_evidence": [
+                {
+                    "constraint_id": str(item.constraint_id),
+                    "evidence_quote": str(item.evidence_quote),
+                }
+                for item in proposal.intent_evidence
+            ],
+            "summary": "",
+            "takeaways": [],
+            "match_reason": "",
+            "assessment": None,
+            "sequence_index": index + 1,
+            "_start_line": a,
+            "_end_line": b,
+            "_clip_id": f"clip-{index + 1:03d}-{a}-{b}",
+            "_clip_text": clip_text,
+            "_proposal_index": index,
+            "_semantic_spans_by_cue": semantic_spans_by_cue,
+            "_quote_repaired": bool(diagnostics),
+            "_boundary_fallback_reasons": diagnostics,
+        }
+        if edge_projection:
+            clip["edge_projection"] = edge_projection
+        report.clips.append(clip)
+
+    return report
+
+
 def _plan_to_report(
     plan: _Plan | _BoundaryPlan | _CompactBoundaryPlan | _IntentBoundaryPlan |
     _LegacyPlan | _ProductionPlan,
@@ -9592,6 +10214,12 @@ def _plan_to_report(
     require_enrichment: bool = False,
     context_cue_limit: int | None = None,
 ) -> _Conversion:
+    if (
+        isinstance(plan, _CompactBoundaryPlan)
+        and settings.get("_segment_trust_gemini_semantics") is True
+    ):
+        return _trusted_compact_plan_to_report(plan, segments, settings)
+
     report = _Conversion(proposed_count=len(plan.topics))
     n = len(segments)
     if not n:
@@ -9653,45 +10281,67 @@ def _plan_to_report(
             isinstance(proposal, _CompactBoundaryTopic)
             and settings.get("_segment_model_boundary_authoritative") is True
         )
+        model_start_line = a
+        model_end_line = b
         model_start_span: tuple[int, int] | None = None
         model_end_span: tuple[int, int] | None = None
         if model_boundary_is_authoritative:
-            if not 1 <= len(_toks(start_quote)) <= 12:
+            if not 1 <= len(_toks(start_quote)) <= 16:
                 report.rejected_reasons.append(
                     f"{prefix}:invalid_model_start_quote_length"
                 )
                 continue
-            if not 1 <= len(_toks(end_quote)) <= 12:
+            if not 1 <= len(_toks(end_quote)) <= 16:
                 report.rejected_reasons.append(
                     f"{prefix}:invalid_model_end_quote_length"
                 )
                 continue
-            model_start_matches = _quote_character_spans(
-                str(segments[a].get("text") or ""), start_quote
+            model_start_anchor = _unique_boundary_anchor(
+                segments, start_quote, a, b,
             )
-            model_end_matches = _quote_character_spans(
-                str(segments[b].get("text") or ""), end_quote
-            )
-            if len(model_start_matches) != 1:
+            if model_start_anchor is None:
                 report.rejected_reasons.append(
                     f"{prefix}:ungrounded_model_start_quote"
                 )
                 continue
-            if len(model_end_matches) != 1:
+            model_end_anchor = _unique_boundary_anchor(
+                segments, end_quote, a, b,
+            )
+            if model_end_anchor is None:
                 report.rejected_reasons.append(
                     f"{prefix}:ungrounded_model_end_quote"
                 )
                 continue
-            model_start_span = model_start_matches[0]
-            model_end_span = model_end_matches[0]
-            if a == b and (
-                model_start_span[0] > model_end_span[0]
-                or model_start_span[1] > model_end_span[1]
+            if (
+                model_start_anchor.first_word_position
+                > model_end_anchor.first_word_position
+                or model_start_anchor.last_word_position
+                > model_end_anchor.last_word_position
             ):
                 report.rejected_reasons.append(
                     f"{prefix}:reversed_model_boundary"
                 )
                 continue
+            model_start_line = model_start_anchor.first_line
+            model_start_span = model_start_anchor.first_span
+            model_end_line = model_end_anchor.last_line
+            model_end_span = model_end_anchor.last_span
+            a, b = model_start_line, model_end_line
+            start_text = str(segments[a].get("text") or "").strip()
+            end_text = str(segments[b].get("text") or "").strip()
+            # A caption provider may split one exact model anchor across adjacent
+            # cues. Keep the model's first/last word and project only the literal
+            # portion inside the cited edge cue; no semantic speech is moved.
+            start_quote = _literal_source_quote(
+                str(segments[a].get("text") or ""),
+                start_quote,
+                model_start_span,
+            )
+            end_quote = _literal_source_quote(
+                str(segments[b].get("text") or ""),
+                end_quote,
+                model_end_span,
+            )
         quote_repaired = False
         fallback_start_edge = False
         fallback_end_edge = False
@@ -9821,7 +10471,7 @@ def _plan_to_report(
         )
         if isinstance(proposal, _CompactBoundaryTopic):
             claim_word_count = len(_toks(evidence_quote_for_section))
-            if not 5 <= claim_word_count <= 12:
+            if not 5 <= claim_word_count <= 16:
                 report.rejected_reasons.append(
                     f"{prefix}:invalid_claim_quote_length"
                 )
@@ -10241,6 +10891,11 @@ def _plan_to_report(
             start_text,
             start_quote,
             want="start",
+            preferred_span=(
+                model_start_span
+                if model_boundary_is_authoritative and a == model_start_line
+                else None
+            ),
         )
         repaired_start_edge = bool(
             repaired_start_edge
@@ -10252,13 +10907,17 @@ def _plan_to_report(
             fallback_start_edge = True
             boundary_fallback_reasons.append(edge_error)
             quote_repaired = True
-        navigation_recovery = _recover_start_after_edge_navigation(
-            start_text,
-            evidence_quote=evidence_quote_for_section,
-            learning_objective=objective_for_section,
-            following_text=(
-                _cue_clip_text(segments, a + 1, b) if a < b else ""
-            ),
+        navigation_recovery = (
+            ""
+            if model_boundary_is_authoritative
+            else _recover_start_after_edge_navigation(
+                start_text,
+                evidence_quote=evidence_quote_for_section,
+                learning_objective=objective_for_section,
+                following_text=(
+                    _cue_clip_text(segments, a + 1, b) if a < b else ""
+                ),
+            )
         )
         if navigation_recovery:
             start_quote = navigation_recovery
@@ -10266,7 +10925,15 @@ def _plan_to_report(
             quote_repaired = True
             boundary_fallback_reasons.append("trimmed_opening_edge_navigation")
         if not repaired_start_edge:
-            selected_start_span = _quote_character_span(start_text, start_quote)
+            selected_start_span = _quote_character_span(
+                start_text,
+                start_quote,
+                preferred_span=(
+                    model_start_span
+                    if model_boundary_is_authoritative and a == model_start_line
+                    else None
+                ),
+            )
             required_setup_bridge = bool(
                 selected_start_span is not None
                 and selected_start_span[0] == 0
@@ -10393,6 +11060,11 @@ def _plan_to_report(
             end_text,
             end_quote,
             want="end",
+            preferred_span=(
+                model_end_span
+                if model_boundary_is_authoritative and b == model_end_line
+                else None
+            ),
         )
         if edge_error:
             end_quote = _exact_boundary_quote(end_text, want="end")
@@ -10404,12 +11076,25 @@ def _plan_to_report(
             end_quote,
             evidence_quote=evidence_quote_for_section,
             learning_objective=objective_for_section,
+            preferred_span=(
+                model_end_span
+                if model_boundary_is_authoritative and b == model_end_line
+                else None
+            ),
         )
         if trimmed_edge_noise:
             repaired_end_edge = True
             quote_repaired = True
             boundary_fallback_reasons.append("trimmed_trailing_edge_noise")
-        selected_end_span = _quote_character_span(end_text, end_quote)
+        selected_end_span = _quote_character_span(
+            end_text,
+            end_quote,
+            preferred_span=(
+                model_end_span
+                if model_boundary_is_authoritative and b == model_end_line
+                else None
+            ),
+        )
         following_end_text = (
             str(segments[b + 1].get("text") or "")
             if b + 1 < len(segments)
@@ -10510,7 +11195,19 @@ def _plan_to_report(
         closure_segments = segments
         preliminary_start_spans = _quote_character_spans(start_text, start_quote)
         preliminary_end_spans = _quote_character_spans(end_text, end_quote)
-        if end_quote_occurrence == "first" and preliminary_end_spans:
+        if (
+            model_boundary_is_authoritative
+            and a == model_start_line
+            and model_start_span in preliminary_start_spans
+        ):
+            preliminary_start_spans = [model_start_span]
+        if (
+            model_boundary_is_authoritative
+            and b == model_end_line
+            and model_end_span in preliminary_end_spans
+        ):
+            preliminary_end_spans = [model_end_span]
+        elif end_quote_occurrence == "first" and preliminary_end_spans:
             preliminary_end_spans = [preliminary_end_spans[0]]
         elif end_quote_occurrence == "last" and preliminary_end_spans:
             preliminary_end_spans = [preliminary_end_spans[-1]]
@@ -10701,6 +11398,12 @@ def _plan_to_report(
             current_start_span = _quote_character_span(
                 current_start_text,
                 start_quote,
+                preferred_span=(
+                    model_start_span
+                    if model_boundary_is_authoritative
+                    and a == model_start_line
+                    else None
+                ),
             )
             if current_start_span is not None:
                 selected_opening_has_local_setup = (
@@ -10724,8 +11427,23 @@ def _plan_to_report(
                 start_span=_quote_character_span(
                     selected_start_text,
                     selected_start_quote_before_context,
+                    preferred_span=(
+                        model_start_span
+                        if model_boundary_is_authoritative
+                        and selected_start_before_context == model_start_line
+                        else None
+                    ),
                 ),
-                end_span=_quote_character_span(selected_end_text, end_quote),
+                end_span=_quote_character_span(
+                    selected_end_text,
+                    end_quote,
+                    preferred_span=(
+                        model_end_span
+                        if model_boundary_is_authoritative
+                        and b == model_end_line
+                        else None
+                    ),
+                ),
             )
             recovered_setup = (
                 _cue_clip_text(
@@ -10936,7 +11654,14 @@ def _plan_to_report(
                 "trimmed_opening_pedagogical_meta"
             )
         start_span, start_projected, edge_error = _semantic_edge_quote(
-            start_text, start_quote, want="start"
+            start_text,
+            start_quote,
+            want="start",
+            preferred_span=(
+                model_start_span
+                if model_boundary_is_authoritative and a == model_start_line
+                else None
+            ),
         )
         if edge_error:
             start_quote = _exact_boundary_quote(
@@ -11017,6 +11742,11 @@ def _plan_to_report(
                 end_quote,
                 evidence_quote=evidence_quote_for_section,
                 learning_objective=objective_for_section,
+                preferred_span=(
+                    model_end_span
+                    if model_boundary_is_authoritative and b == model_end_line
+                    else None
+                ),
             )
         else:
             final_edge_noise_trimmed = False
@@ -11028,6 +11758,11 @@ def _plan_to_report(
             end_quote,
             want="end",
             occurrence=end_quote_occurrence,
+            preferred_span=(
+                model_end_span
+                if model_boundary_is_authoritative and b == model_end_line
+                else None
+            ),
         )
         if edge_error:
             end_quote_occurrence = None
@@ -11116,19 +11851,27 @@ def _plan_to_report(
 
         if model_boundary_is_authoritative:
             assert model_start_span is not None and model_end_span is not None
+            start_lexical_span = _lexical_span(
+                str(segments[a].get("text") or ""),
+                start_span,
+            )
+            end_lexical_span = _lexical_span(
+                str(segments[b].get("text") or ""),
+                end_span,
+            )
             if (
-                a != proposed_start
-                or b != proposed_end
-                or start_span is None
-                or end_span is None
-                or start_span[0] != model_start_span[0]
-                or end_span[1] != model_end_span[1]
+                a != model_start_line
+                or b != model_end_line
+                or start_lexical_span is None
+                or end_lexical_span is None
+                or start_lexical_span[0] != model_start_span[0]
+                or end_lexical_span[1] != model_end_span[1]
             ):
                 report.rejected_reasons.append(
                     f"{prefix}:model_boundary_rewrite_forbidden"
                 )
                 continue
-            a, b = proposed_start, proposed_end
+            a, b = model_start_line, model_end_line
             start_text = str(segments[a].get("text") or "")
             end_text = str(segments[b].get("text") or "")
             start_span = model_start_span
@@ -11858,7 +12601,7 @@ def _flash_failover_reason(
         operation == "flash_boundary_selector"
         and type(primary_exception).__name__ == "GeminiTransportError"
         and primary_leaf == configured_primary_leaf
-        and primary_leaf == "gemini-3.5-flash"
+        and primary_leaf in {"gemini-3-flash-preview", "gemini-3.5-flash"}
         and primary_leaf != failover_leaf
         and re.fullmatch(
             r"gemini-3(?:\.\d+)?-flash-lite", failover_leaf
@@ -12364,36 +13107,9 @@ def _boundary_selector_content(
     *,
     media_end_sec: float,
 ) -> tuple[str | list, object | None, bool]:
-    """Attach public YouTube media only for explicit video-grounding requests."""
-    required = bool(settings.get("_segment_video_grounding_required"))
-    video_url = str(settings.get("_segment_video_url") or "").strip()
-    if not required:
-        return transcript_prompt, None, False
-    if not video_url:
-        raise ValueError("video-grounded boundary selection requires a YouTube URL")
-    media_resolution_name = str(
-        settings.get("_segment_media_resolution") or "low"
-    ).strip().lower()
-    if media_resolution_name != "low":
-        raise ValueError("video-grounded boundary selection requires low resolution")
-
-    from ..gemini_client import (
-        media_resolution_from_name,
-        text_part,
-        youtube_video_part,
-    )
-
-    media_resolution = media_resolution_from_name("low")
-    if media_resolution is None:
-        raise ValueError("Gemini low media resolution is unavailable")
-    return (
-        [
-            youtube_video_part(video_url, end_offset_sec=media_end_sec),
-            text_part(transcript_prompt),
-        ],
-        media_resolution,
-        True,
-    )
+    """Return transcript-only selector content; production never uploads video."""
+    del settings, media_end_sec
+    return transcript_prompt, None, False
 
 
 def _run_selection_profile(
@@ -12415,9 +13131,10 @@ def _run_selection_profile(
         or ""
     )
     boundary_profile = profile in {FLASH_SPLIT_PROFILE, PRO_BOUNDARY_PROFILE}
-    video_grounding_requested = boundary_profile and bool(
-        settings.get("_segment_video_grounding_required")
-    )
+    # Video input is intentionally disabled for selection. Gemini receives only
+    # the indexed transcript and exact user request, regardless of stale caller
+    # flags, so an old setting cannot silently consume video-token quota.
+    video_grounding_requested = False
     if profile == PRODUCTION_PRO_PROFILE:
         system, user = _legacy_prompts(rendered, len(segments), topic)
         schema: type[BaseModel] = _LegacyPlan
@@ -12546,6 +13263,7 @@ def _run_selection_profile(
     conversion_settings["_segment_model_boundary_authoritative"] = (
         profile == FLASH_SPLIT_PROFILE
     )
+    conversion_settings["_segment_trust_gemini_semantics"] = boundary_profile
     conversion_settings.setdefault(
         "_segment_ignore_caption_case",
         str(transcript.get("source") or "").casefold() == "supadata",
@@ -12570,7 +13288,10 @@ def _run_selection_profile(
         report.proposed_count += len(clean_rejections)
         report.rejected_reasons = clean_rejections + report.rejected_reasons
     calls = [call]
-    if profile in {FLASH_SPLIT_PROFILE, PRO_BOUNDARY_PROFILE}:
+    if (
+        profile in {FLASH_SPLIT_PROFILE, PRO_BOUNDARY_PROFILE}
+        and not conversion_settings.get("_segment_trust_gemini_semantics")
+    ):
         _drop_unmet_prerequisite_clips(report)
     if profile.startswith("flash_"):
         classification = _classify_flash(

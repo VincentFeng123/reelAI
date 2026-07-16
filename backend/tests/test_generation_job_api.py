@@ -594,6 +594,83 @@ def test_reusable_generation_requires_every_quality_score_at_threshold(
         conn.close()
 
 
+def test_gemini_authority_reuse_bypasses_semantics_but_keeps_boundary_safety() -> None:
+    conn = _conn()
+    generation_id = "gemini-authority-generation"
+    created_at = "2026-07-10T00:00:00+00:00"
+    conn.execute(
+        "INSERT INTO reel_generations "
+        "(id, material_id, concept_id, request_key, generation_mode, "
+        "retrieval_profile, status, reel_count, created_at) "
+        "VALUES (?, 'm1', 'c1', 'gemini-authority', 'fast', 'deep', "
+        "'completed', 1, ?)",
+        (generation_id, created_at),
+    )
+    _insert_generation_reel(
+        conn,
+        generation_id=generation_id,
+        reel_id="gemini-authority-reel",
+        video_id="gemini-authority-video",
+        created_at=created_at,
+    )
+    try:
+        row = conn.execute(
+            "SELECT search_context_json FROM reels WHERE id = 'gemini-authority-reel'"
+        ).fetchone()
+        context = json.loads(str(row["search_context_json"]))
+        context.update({
+            "selection_authority": "gemini",
+            "informativeness": 0.1,
+            "topic_relevance": 0.2,
+            "educational_importance": 0.3,
+            "directly_teaches_topic": False,
+            "substantive": False,
+            "factually_grounded": False,
+            "self_contained": False,
+            "is_standalone": False,
+            "topic_evidence_quote": "",
+            "surface_eligible": False,
+            "surface_reason": "semantic_rejection",
+            "deferred_level": True,
+        })
+        conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = 'gemini-authority-reel'",
+            (json.dumps(context),),
+        )
+
+        assert main._verified_reusable_generation_chain(
+            conn,
+            generation_id=generation_id,
+            material_id="m1",
+        ) is True
+        assert main._count_generation_reels(conn, generation_id) == 1
+        assert main._count_material_ready_reels(conn, "m1") == 1
+        assert main._usable_boundary_reel_ids(
+            conn, ["gemini-authority-reel"]
+        ) == {"gemini-authority-reel"}
+
+        context.update({
+            "boundary_status": "failed",
+            "boundary_diagnostics": {"acoustic_verified": False},
+        })
+        conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = 'gemini-authority-reel'",
+            (json.dumps(context),),
+        )
+        assert main._verified_reusable_generation_chain(
+            conn,
+            generation_id=generation_id,
+            material_id="m1",
+        ) is False
+        assert main._count_generation_reels(conn, generation_id) == 0
+        assert main._count_material_ready_reels(conn, "m1") == 0
+        assert main._usable_boundary_reel_ids(
+            conn, ["gemini-authority-reel"]
+        ) == set()
+    finally:
+        conn.close()
+
+
 def test_transcript_aligned_inventory_counts_reuses_and_replays_only_current_surface_rows() -> None:
     conn = _conn()
     generation_id = "transcript-boundary-generation"

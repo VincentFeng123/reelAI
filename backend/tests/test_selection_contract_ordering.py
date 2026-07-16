@@ -231,6 +231,19 @@ class SelectionContractOrderingTests(unittest.TestCase):
         self.assertEqual(metadata["_selection_intent_role"], "supporting")
         self.assertEqual(metadata["_selection_intent_coverage"], 0.5)
 
+    def test_persisted_selection_metadata_decodes_selection_authority(self) -> None:
+        versioned = self.service._selection_metadata({
+            "selection_contract_version": "quality_silence_v38",
+            "selection_authority": " Gemini ",
+        })
+        operational = self.service._selection_metadata({
+            "selection_authority": " Gemini ",
+            "boundary_status": "unavailable",
+        })
+
+        self.assertEqual(versioned["_selection_authority"], "gemini")
+        self.assertEqual(operational["_selection_authority"], "gemini")
+
     def test_explicit_chain_and_prerequisite_edges_remain_ordered(self) -> None:
         items = [
             self._selection_item(
@@ -532,6 +545,117 @@ class SelectionContractOrderingTests(unittest.TestCase):
             [item["reel_id"] for item in self._ranked(require_verified_boundaries=True)],
             ["v6-quality"],
         )
+
+    def test_gemini_authority_bypasses_semantic_gates_but_keeps_boundary_safety(
+        self,
+    ) -> None:
+        self._insert_versioned_reel(
+            reel_id="gemini-authoritative",
+            video_id="video-a",
+            start=10,
+            difficulty=0.15,
+            base_score=0.8,
+        )
+        row = self.conn.execute(
+            "SELECT search_context_json FROM reels WHERE id = 'gemini-authoritative'"
+        ).fetchone()
+        context = json.loads(row[0])
+        context.update({
+            "selection_contract_version": "quality_silence_v38",
+            "selection_authority": "gemini",
+            "informativeness": 0.10,
+            "topic_relevance": 0.10,
+            "educational_importance": 0.10,
+            "directly_teaches_topic": False,
+            "substantive": False,
+            "factually_grounded": False,
+            "self_contained": False,
+            "is_standalone": False,
+            "topic_evidence_quote": "",
+            "uncertainty": "high",
+            "surface_eligible": False,
+            "surface_reason": "semantic_rejection",
+            "boundary_confidence": 0.75,
+            "speech_corridor_verified": True,
+            "boundary_status": "verified",
+            "boundary_diagnostics": {
+                "acoustic_verified": True,
+                "final_range": [10.0, 30.0],
+                "acoustic": {
+                    "threshold_dbfs": -38.0,
+                    "start_quiet": [9.9, 10.1],
+                    "end_quiet": [29.9, 30.1],
+                },
+            },
+        })
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? "
+            "WHERE id = 'gemini-authoritative'",
+            (json.dumps(context),),
+        )
+        self.conn.execute(
+            "UPDATE materials SET source_type = 'document' WHERE id = ?",
+            (self.MATERIAL,),
+        )
+        off_topic = {
+            "score": 0.0,
+            "concept_overlap": 0.0,
+            "context_overlap": 0.0,
+            "matched_terms": [],
+            "off_topic_penalty": 1.0,
+            "reason": "no deterministic match",
+        }
+
+        with mock.patch.object(
+            self.service, "_score_text_relevance", return_value=off_topic,
+        ), mock.patch.object(
+            self.service, "_is_hard_blocked_low_value_video", return_value=True,
+        ), mock.patch.object(
+            self.service, "_build_caption_cues", return_value=[],
+        ):
+            ranked = self.service.ranked_feed(
+                self.conn,
+                material_id=self.MATERIAL,
+                generation_id="selection-generation",
+                fast_mode=True,
+                learner_id=self.LEARNER,
+                require_verified_boundaries=True,
+            )
+
+        self.assertEqual(
+            [item["reel_id"] for item in ranked],
+            ["gemini-authoritative"],
+        )
+
+        context["boundary_status"] = "unavailable"
+        context["boundary_diagnostics"] = {
+            "acoustic_verified": False,
+            "reason": "media_unavailable",
+        }
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? "
+            "WHERE id = 'gemini-authoritative'",
+            (json.dumps(context),),
+        )
+        self.conn.execute("DELETE FROM ranked_feed_cache")
+
+        with mock.patch.object(
+            self.service, "_score_text_relevance", return_value=off_topic,
+        ), mock.patch.object(
+            self.service, "_is_hard_blocked_low_value_video", return_value=True,
+        ), mock.patch.object(
+            self.service, "_build_caption_cues", return_value=[],
+        ):
+            unsafe = self.service.ranked_feed(
+                self.conn,
+                material_id=self.MATERIAL,
+                generation_id="selection-generation",
+                fast_mode=True,
+                learner_id=self.LEARNER,
+                require_verified_boundaries=True,
+            )
+
+        self.assertEqual(unsafe, [])
 
     def test_ranked_feed_order_is_difficulty_first_and_stable(self) -> None:
         self._insert_versioned_reel(

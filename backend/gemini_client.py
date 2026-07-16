@@ -90,6 +90,58 @@ class GeminiTransportError(GeminiCallError):
     pass
 
 
+def _reject_video_content(value: object) -> None:
+    """Fail before dispatch when any Gemini request contains video media."""
+    if isinstance(value, Mapping):
+        normalized = {
+            str(key).replace("_", "").casefold(): item
+            for key, item in value.items()
+        }
+        mime_type = str(normalized.get("mimetype") or "").casefold()
+        file_uri = str(normalized.get("fileuri") or "").casefold()
+        if (
+            mime_type.startswith("video/")
+            or normalized.get("videometadata") is not None
+            or "youtube.com/" in file_uri
+            or "youtu.be/" in file_uri
+            or re.search(
+                r"\.(?:m4v|mkv|mov|mp4|webm)(?:$|[?#])", file_uri,
+            )
+        ):
+            raise ValueError("Gemini video input is disabled")
+        for item in value.values():
+            _reject_video_content(item)
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _reject_video_content(item)
+        return
+    content_parts = getattr(value, "parts", None)
+    if isinstance(content_parts, (list, tuple)):
+        _reject_video_content(content_parts)
+    inline_data = getattr(value, "inline_data", None)
+    inline_mime = str(getattr(inline_data, "mime_type", "") or "").casefold()
+    file_data = getattr(value, "file_data", None)
+    file_mime = str(getattr(file_data, "mime_type", "") or "").casefold()
+    file_uri = str(getattr(file_data, "file_uri", "") or "").casefold()
+    direct_mime = str(getattr(value, "mime_type", "") or "").casefold()
+    direct_uri = str(getattr(value, "file_uri", "") or "").casefold()
+    video_metadata = getattr(value, "video_metadata", None)
+    if (
+        inline_mime.startswith("video/")
+        or file_mime.startswith("video/")
+        or direct_mime.startswith("video/")
+        or video_metadata is not None
+        or "youtube.com/" in file_uri
+        or "youtu.be/" in file_uri
+        or "youtube.com/" in direct_uri
+        or "youtu.be/" in direct_uri
+        or re.search(r"\.(?:m4v|mkv|mov|mp4|webm)(?:$|[?#])", file_uri)
+        or re.search(r"\.(?:m4v|mkv|mov|mp4|webm)(?:$|[?#])", direct_uri)
+    ):
+        raise ValueError("Gemini video input is disabled")
+
+
 def get_client() -> genai.Client:
     global _client
     if _client is None:
@@ -425,6 +477,7 @@ def generate_json_v3(
     ``time.monotonic()`` deadline shared by the caller's complete workflow.
     Cancellation is cooperative between in-flight HTTP requests.
     """
+    _reject_video_content(user)
     mdl = str(model or "").strip()
     level = str(thinking_level or "").strip().lower()
     if not _is_gemini3_model(mdl):
@@ -610,6 +663,7 @@ def generate_json(system: str, user: str, schema, temperature: float = 0.2,
     or that use a thinking model because thinking tokens share the same budget. Gemini 3
     uses a thinking level; the legacy Gemini 2.5 path retains its thinking-budget behavior.
     """
+    _reject_video_content(user)
     mdl = model or config.GEMINI_MODEL
 
     if _is_gemini3_model(mdl):
@@ -670,33 +724,9 @@ def text_part(text: str):
 
 
 def youtube_video_part(url: str, *, end_offset_sec: float | None = None):
-    """A bounded Gemini FileData Part for one canonical public YouTube video."""
-    canonical_url = str(url or "").strip()
-    if re.fullmatch(
-        r"https://www\.youtube\.com/watch\?v=[A-Za-z0-9_-]{11}",
-        canonical_url,
-    ) is None:
-        raise ValueError("expected a canonical public YouTube watch URL")
-    video_metadata = None
-    if end_offset_sec is not None:
-        try:
-            end = float(end_offset_sec)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("video end offset must be a positive finite number") from exc
-        if not math.isfinite(end) or end <= 0.0:
-            raise ValueError("video end offset must be a positive finite number")
-        try:
-            bounded_end = math.ceil(end * 1_000.0) / 1_000.0
-        except OverflowError as exc:
-            raise ValueError(
-                "video end offset must be a positive finite number"
-            ) from exc
-        end_offset = f"{bounded_end:.3f}".rstrip("0").rstrip(".") + "s"
-        video_metadata = types.VideoMetadata(end_offset=end_offset)
-    return types.Part(
-        file_data=types.FileData(file_uri=canonical_url),
-        video_metadata=video_metadata,
-    )
+    """Retired: production never sends YouTube video to Gemini."""
+    del url, end_offset_sec
+    raise ValueError("Gemini video input is disabled")
 
 
 # ── video (Wave 4 edge-probe / render-audit) ─────────────────────────────────
@@ -714,70 +744,16 @@ def media_resolution_from_name(name):
 
 
 def video_part_inline(data: bytes, media_resolution=None):
-    """A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is small,
-    < ~20MB — the 8s edge probe). ``media_resolution`` is a ``types.MediaResolution`` enum
-    (pass ``types.MediaResolution.MEDIA_RESOLUTION_LOW`` for LOW). Files-API upload +
-    video_metadata offsets (Tier 2 / VID3) are intentionally NOT implemented here."""
-    if media_resolution is not None:
-        return types.Part.from_bytes(data=data, mime_type="video/mp4",
-                                     media_resolution=media_resolution)
-    return types.Part.from_bytes(data=data, mime_type="video/mp4")
+    """Retired: production never sends inline video to Gemini."""
+    del data, media_resolution
+    raise ValueError("Gemini video input is disabled")
 
 
 def generate_json_video(system: str, parts: list, schema, media_resolution=None,
                         temperature: float = 0.2, model: Optional[str] = None) -> str:
-    """Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.
-
-    ``parts`` is a list of ``types.Part`` (interleaved text + inline video bytes), sent as the
-    single user turn. Gemini 2.5 retains the thinking-off compatibility path; Gemini 3
-    uses its model-appropriate thinking level without custom sampling.
-    Gemini-only (Groq has no video input); the caller invokes this directly, never through
-    llm.py/llm_json. Defaults to ``config.VIDEO_JUDGE_MODEL`` (flash-lite)."""
-    mdl = model or config.VIDEO_JUDGE_MODEL
-    if _is_gemini3_model(mdl):
-        return generate_json_v3(
-            system,
-            parts,
-            schema,
-            model=mdl,
-            thinking_level=_default_gemini3_thinking_level(mdl),
-            max_output_tokens=8192,
-            timeout_s=120.0,
-            deadline_monotonic=None,
-            operation="generate_json_video",
-            prompt_version="legacy",
-            max_retries=1,
-            media_resolution=media_resolution,
-        ).text
-
-    client = get_client()
-
-    def _make_config(thinking: bool):
-        kwargs = dict(
-            system_instruction=system,
-            response_mime_type="application/json",
-            response_schema=schema,
-            temperature=temperature,
-            max_output_tokens=8192,
-        )
-        if media_resolution is not None:
-            kwargs["media_resolution"] = media_resolution
-        if not thinking:
-            kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-        return types.GenerateContentConfig(**kwargs)
-
-    def _call():
-        try:
-            resp = client.models.generate_content(
-                model=mdl, contents=parts, config=_make_config(thinking=False)
-            )
-        except Exception:
-            resp = client.models.generate_content(
-                model=mdl, contents=parts, config=_make_config(thinking=True)
-            )
-        return resp.text
-
-    return _retry(_call)
+    """Retired: production never sends video to Gemini."""
+    del system, parts, schema, media_resolution, temperature, model
+    raise ValueError("Gemini video input is disabled")
 
 
 def generate_json_mm(system: str, parts: list, schema, temperature: float = 0.2) -> str:
@@ -787,6 +763,7 @@ def generate_json_mm(system: str, parts: list, schema, temperature: float = 0.2)
     single user turn. Gemini 2.5 retains the legacy thinking-budget behavior; Gemini 3
     uses a thinking level and default sampling.
     """
+    _reject_video_content(parts)
     if _is_gemini3_model(config.GEMINI_MODEL):
         return generate_json_v3(
             system,

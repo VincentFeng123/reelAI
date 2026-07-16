@@ -5730,6 +5730,9 @@ class ReelService:
         if isinstance(nested, dict):
             parsed = {**parsed, **nested}
         version = str(parsed.get("selection_contract_version") or "").strip()
+        selection_authority = str(
+            parsed.get("selection_authority") or ""
+        ).strip().lower()
         if not version or version.lower() in {"0", "legacy", "none"}:
             # Acoustic eligibility is an operational serving guard, not a
             # selector-version feature. Preserve it for legacy cached selector
@@ -5756,6 +5759,7 @@ class ReelService:
             operational["_selection_surface_reason"] = str(
                 parsed.get("surface_reason") or ""
             ).strip().lower()
+            operational["_selection_authority"] = selection_authority
             return operational
 
         prerequisites = parsed.get("prerequisite_ids")
@@ -5778,6 +5782,7 @@ class ReelService:
 
         metadata: dict[str, Any] = {
             "_selection_contract_version": version,
+            "_selection_authority": selection_authority,
             "_selection_boundary_confidence": cls._selection_number(
                 parsed.get("boundary_confidence"), 0.0
             ),
@@ -6036,10 +6041,18 @@ class ReelService:
                 eligible = [
                     node_id
                     for node_id in eligible
-                    if bool(nodes[node_id].get("_selection_is_standalone"))
-                    and self._selection_number(
-                        nodes[node_id].get("_selection_boundary_confidence"), 0.0
-                    ) >= 0.80
+                    if (
+                        nodes[node_id].get("_selection_authority") == "gemini"
+                        or (
+                            bool(nodes[node_id].get("_selection_is_standalone"))
+                            and self._selection_number(
+                                nodes[node_id].get(
+                                    "_selection_boundary_confidence"
+                                ),
+                                0.0,
+                            ) >= 0.80
+                        )
+                    )
                 ]
                 if not eligible:
                     return []
@@ -7368,6 +7381,9 @@ class ReelService:
             selection_version = str(
                 selection_metadata.get("_selection_contract_version") or ""
             ).strip()
+            gemini_selection_authoritative = (
+                selection_metadata.get("_selection_authority") == "gemini"
+            )
             surface_eligible = selection_metadata.get(
                 "_selection_surface_eligible", True
             )
@@ -7431,8 +7447,12 @@ class ReelService:
                 surface_reason == "prerequisite_not_surfaceable"
                 and difficulty_matches_level
             )
-            if surface_eligible is False and not (
+            if (
+                not gemini_selection_authoritative
+                and surface_eligible is False
+                and not (
                 deferred_level_candidate or prerequisite_may_become_ready
+                )
             ):
                 continue
             boundary_status = selection_metadata.get(
@@ -7494,7 +7514,7 @@ class ReelService:
                     continue
             elif boundary_status == "unavailable":
                 continue
-            if selection_metadata:
+            if selection_metadata and not gemini_selection_authoritative:
                 if selection_version in {
                     "quality_silence_v2",
                     "quality_silence_v3",
@@ -7635,11 +7655,15 @@ class ReelService:
                 concept_embedding=concept_embedding,
                 subject_tag=subject_tag,
             )
-            if not strict_topic_only and self._is_hard_blocked_low_value_video(
-                title=video_title,
-                description=video_description,
-                channel_title=str(row.get("video_channel_title") or ""),
-                subject_tag=subject_tag,
+            if (
+                not gemini_selection_authoritative
+                and not strict_topic_only
+                and self._is_hard_blocked_low_value_video(
+                    title=video_title,
+                    description=video_description,
+                    channel_title=str(row.get("video_channel_title") or ""),
+                    subject_tag=subject_tag,
+                )
             ):
                 continue
             relevance["passes"] = self._passes_relevance_gate(
@@ -7648,7 +7672,8 @@ class ReelService:
                 fast_mode=fast_mode,
             )
             if (
-                not strict_topic_only
+                not gemini_selection_authoritative
+                and not strict_topic_only
                 and context_terms
                 and self._is_short_leaf_topic(concept_title)
                 and not relevance["passes"]
@@ -7657,9 +7682,14 @@ class ReelService:
                 # but ambiguous in isolation. Cached rows must still demonstrate
                 # the parent material context before they can surface.
                 continue
-            if not strict_topic_only and not relevance["passes"] and (
-                float(relevance.get("off_topic_penalty") or 0.0) >= 0.24
-                or float(relevance.get("score") or -1.0) < 0.02
+            if (
+                not gemini_selection_authoritative
+                and not strict_topic_only
+                and not relevance["passes"]
+                and (
+                    float(relevance.get("off_topic_penalty") or 0.0) >= 0.24
+                    or float(relevance.get("score") or -1.0) < 0.02
+                )
             ):
                 # Hide strongly off-topic clips that can still exist from older generations.
                 continue

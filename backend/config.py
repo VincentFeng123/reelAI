@@ -60,8 +60,9 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 TOPIC_MODEL = os.environ.get("TOPIC_MODEL", "gemini-3.1-pro-preview")
 
 # ── Gemini-segment clip engine (default) ────────────────────────────────────
-# Clip selection is the one quality-critical Gemini operation. Production uses
-# one normal Flash call for the compact timestamp/evidence response; search,
+# Clip selection is the one quality-critical Gemini operation. Production
+# adapters force the validated Pro boundary profile; this routing setting keeps
+# the other profiles available to explicit evaluation callers. Search,
 # transcript retrieval, enrichment, chat, and embeddings retain their existing
 # cheaper paths. The bounded selector budget prevents duplicate calls per batch.
 _segment_routing_mode = os.environ.get(
@@ -72,9 +73,9 @@ SEGMENT_ROUTING_MODE = (
     if _segment_routing_mode in {"flash_only", "pro_only", "shadow", "hybrid"}
     else "flash_only"
 )
-# Production is intentionally pinned: stale Railway variables cannot silently
-# move clip selection to an older Flash generation or another model tier.
-SEGMENT_FLASH_MODEL = "gemini-3.5-flash"
+# Flash remains an evaluation baseline. Pin the available model so stale
+# environment variables cannot silently change that benchmark tier.
+SEGMENT_FLASH_MODEL = "gemini-3-flash-preview"
 # Optional evaluation-only emergency failover. Hosted production does not set
 # this: a failed normal-Flash call must not silently downgrade clip quality.
 SEGMENT_FLASH_FALLBACK_MODEL = os.environ.get(
@@ -467,17 +468,13 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "") or os.environ.get("HUGGINGFACE_TOKEN",
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
 DIARIZATION_ENABLED = os.environ.get("DIARIZATION", "0") not in ("0", "false", "")
 
-# ── Video judge (Wave 4 item 21; ADVISORY-only, Gemini-only — Groq has no video) ──
-# Tier 1 EDGE PROBE (VID2): after boundaries are final, cut the first/last ~N seconds of each
-# SHIPPED clip locally (cut.build_cmd) and ask a video-capable Gemini (inline mp4 bytes, LOW
-# media resolution) whether the audio starts/ends cleanly — catching the F7 mid-sentence-audio
-# blind spot. It only adds WARNINGS + a tiny final_quality dock; it NEVER kills a clip and
-# NEVER creates a Rejection. Default OFF (mirrors DIARIZATION_ENABLED): with it off, behavior is
-# byte-identical. Per-job override via settings["edge_probe"] (DEFAULTS key None → inherit).
-EDGE_PROBE_ENABLED = os.environ.get("EDGE_PROBE", "0") not in ("0", "false", "")
+# ── Video judge (retired) ───────────────────────────────────────────────────
+# Source videos and rendered clip fragments are never uploaded to Gemini. These
+# constants remain for old settings/config readers but cannot enable video input.
+EDGE_PROBE_ENABLED = False
 EDGE_PROBE_SECONDS = float(os.environ.get("EDGE_PROBE_SECONDS", "8"))   # head/tail probe length
 # Tier 2 RENDER AUDIT (VID3): reserved — NOT implemented yet (Files-upload + per-clip offsets).
-VIDEO_JUDGE_ENABLED = os.environ.get("VIDEO_JUDGE", "0") not in ("0", "false", "")
+VIDEO_JUDGE_ENABLED = False
 # The Gemini model both tiers judge video with (Groq cannot serve video regardless of
 # JUDGE_PROVIDER). flash-lite keeps cost/throughput sane under free-tier limits.
 VIDEO_JUDGE_MODEL = os.environ.get("VIDEO_JUDGE_MODEL", "gemini-2.5-flash-lite")

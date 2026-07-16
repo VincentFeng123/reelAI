@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from google.genai import types
 from pydantic import BaseModel
 
 from backend.app.clip_engine.clipper import gemini_client, llm
@@ -94,6 +95,38 @@ def test_gemini_uses_developer_json_schema_field(monkeypatch) -> None:
     assert result.text == '{"value":"ok"}'
     assert configs[0].response_schema is None
     assert configs[0].response_json_schema == Payload.model_json_schema()
+
+
+@pytest.mark.parametrize(
+    "user",
+    [
+        types.Content(
+            role="user",
+            parts=[types.Part.from_bytes(data=b"mp4", mime_type="video/mp4")],
+        ),
+        {"file_data": {"file_uri": "https://cdn.example.test/clip.mp4"}},
+    ],
+)
+def test_nested_gemini_client_rejects_wrapped_video_before_dispatch(
+    monkeypatch,
+    user,
+) -> None:
+    created = []
+    monkeypatch.setattr(
+        gemini_client,
+        "_create_client",
+        lambda: created.append(True),
+    )
+
+    with pytest.raises(ValueError, match="video input is disabled"):
+        gemini_client.generate_json_result(
+            "system",
+            user,
+            Payload,
+            model="primary",
+        )
+
+    assert created == []
 
 
 def test_only_explicit_fallback_model_can_degrade(monkeypatch) -> None:

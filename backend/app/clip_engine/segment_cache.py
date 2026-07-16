@@ -234,6 +234,10 @@ def _valid_clips(
     for index, raw in enumerate(value, start=1):
         if not isinstance(raw, dict):
             return None
+        gemini_authoritative = (
+            str(raw.get("selection_authority") or "").strip().casefold()
+            == "gemini"
+        )
         score_values = (
             raw.get("informativeness"),
             raw.get("topic_relevance"),
@@ -302,6 +306,8 @@ def _valid_clips(
         for evidence in intent_evidence:
             if not isinstance(evidence, Mapping):
                 return None
+            if gemini_authoritative:
+                continue
             constraint_id = " ".join(
                 str(evidence.get("constraint_id") or "").split()
             )
@@ -350,7 +356,11 @@ def _valid_clips(
             )
             or start < transcript_start - 0.001
             or end > transcript_end + 0.001
-            or (previous_order is not None and order_key < previous_order)
+            or (
+                not gemini_authoritative
+                and previous_order is not None
+                and order_key < previous_order
+            )
             or end <= start
             or required_start < start
             or required_end > end
@@ -358,22 +368,27 @@ def _valid_clips(
             or not 0 <= informativeness <= 1
             or not 0 <= topic_relevance <= 1
             or not 0 <= educational_importance <= 1
-            or quality_floor < 0.75
+            or (not gemini_authoritative and quality_floor < 0.75)
             or not 0 <= difficulty <= 1
             or intent_role not in {"primary", "supporting"}
             or not math.isfinite(intent_coverage)
             or not 0 <= intent_coverage <= 1
-            or (intent_role == "supporting" and not intent_evidence)
-            or raw.get("self_contained") is not True
-            or raw.get("is_standalone") is not True
-            or raw.get("directly_teaches_topic") is not True
-            or raw.get("substantive") is not True
-            or raw.get("factually_grounded") is not True
-            or not evidence_grounded
-            or raw.get("kind") != "educational"
-            or not (
-                uncertainty in {"low", "medium"}
-                or boundary_only_high_uncertainty
+            or (
+                not gemini_authoritative
+                and (
+                    (intent_role == "supporting" and not intent_evidence)
+                    or raw.get("self_contained") is not True
+                    or raw.get("is_standalone") is not True
+                    or raw.get("directly_teaches_topic") is not True
+                    or raw.get("substantive") is not True
+                    or raw.get("factually_grounded") is not True
+                    or not evidence_grounded
+                    or raw.get("kind") != "educational"
+                    or not (
+                        uncertainty in {"low", "medium"}
+                        or boundary_only_high_uncertainty
+                    )
+                )
             )
             or not isinstance(uncertainty_reasons, list)
             or any(
@@ -386,7 +401,10 @@ def _valid_clips(
             or not _valid_assessment(raw.get("assessment"))
         ):
             return None
-        if any(_semantic_restatement(raw, prior) for prior in clips):
+        if (
+            not gemini_authoritative
+            and any(_semantic_restatement(raw, prior) for prior in clips)
+        ):
             return None
         clips.append(dict(raw))
         previous_order = order_key

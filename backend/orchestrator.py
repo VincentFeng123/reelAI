@@ -205,12 +205,9 @@ def _want_multimodal(settings: dict) -> bool:
 
 
 def _edge_probe_enabled(settings: dict) -> bool:
-    """VID2 edge probe on/off (per-job setting overrides the config default; default OFF).
-    Mirrors _want_multimodal's None → inherit-config resolution."""
-    ep = settings.get("edge_probe")
-    if ep is None:
-        ep = config.EDGE_PROBE_ENABLED
-    return bool(ep)
+    """Video uploads to Gemini are disabled for every production job."""
+    del settings
+    return False
 
 
 async def _run_full(job: Job, transcript: dict, video_id: str, sentences, run, emit,

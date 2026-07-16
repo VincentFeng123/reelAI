@@ -314,7 +314,7 @@ def test_chat_endpoint_prefers_configured_dedicated_key(monkeypatch) -> None:
 
 
 def test_admin_health_reports_callable_text_and_embedding_backends(monkeypatch) -> None:
-    monkeypatch.setattr(main.pipeline_config, "SEGMENT_FLASH_MODEL", "gemini-3.5-flash")
+    monkeypatch.setattr(main.pipeline_config, "SEGMENT_PRO_MODEL", "gemini-3.1-pro-preview")
     monkeypatch.setattr(main.pipeline_config, "SEGMENT_FLASH_FALLBACK_MODEL", "")
     monkeypatch.setattr(
         llm_router,
@@ -340,7 +340,7 @@ def test_admin_health_reports_callable_text_and_embedding_backends(monkeypatch) 
     assert health["chat_model"] == "gemini-health-test"
     assert health["embedding_backend"] == "hash"
     assert health["text_llm_providers"]["groq"] is False
-    assert health["gemini_clip_selector_model"] == "gemini-3.5-flash"
+    assert health["gemini_clip_selector_model"] == "gemini-3.1-pro-preview"
     assert health["gemini_fallback_model"] is None
 
 

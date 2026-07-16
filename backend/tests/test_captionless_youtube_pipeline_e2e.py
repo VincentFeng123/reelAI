@@ -288,8 +288,8 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
             "chunkSize": "50",
         }
         assert provider_calls[1][0].endswith("/transcript/captionless-job")
-        assert gemini_calls[0]["prompt_version"] == gemini_segment.FLASH_SPLIT_PROFILE
-        assert gemini_calls[0]["model"] == gemini_segment.config.SEGMENT_FLASH_MODEL
+        assert gemini_calls[0]["prompt_version"] == gemini_segment.PRO_BOUNDARY_PROFILE
+        assert gemini_calls[0]["model"] == gemini_segment.config.SEGMENT_PRO_MODEL
         assert gemini_calls[0]["thinking_level"] == "medium"
         assert "timestamped transcripts" in gemini_calls[0]["system"]
         assert isinstance(gemini_calls[0]["user"], str)

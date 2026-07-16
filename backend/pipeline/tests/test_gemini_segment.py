@@ -722,9 +722,9 @@ def test_production_flash_is_compact_exhaustive_boundary_first():
         "informativeness, topic_relevance, and educational_importance\n"
         "  are each at least 0.75"
     ) in prompt
-    assert "let deterministic post-processing refine it" in prompt
+    assert "backend can repair the cut" in prompt
     assert (
-        "never omit a substantive grounded unit solely because its boundary is uncertain"
+        "do not omit an otherwise good, complete, relevant unit solely because coarse captions"
         in prompt
     )
     assert G._BOUNDARY_OUTPUT_TOKENS == 6_000

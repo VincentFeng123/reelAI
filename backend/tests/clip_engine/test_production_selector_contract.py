@@ -148,7 +148,7 @@ def test_selector_contract_allows_short_exact_edges_without_padding() -> None:
         "photosynthesis",
     )
 
-    assert "shortest unique 1-12" in system
+    assert "shortest unique 1-16" in system
     assert "one-word quote" in user
     assert "never pad" in user
     assert "ignore acoustic silence" in user
@@ -210,6 +210,297 @@ def test_compact_selector_preserves_the_models_exact_word_interval() -> None:
             "quote": "chemical reactions of photosynthesis",
         },
     }
+
+
+def test_compact_selector_preserves_exact_edges_across_caption_cues() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "Photosynthesis begins when cells",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 4.0,
+            "end": 8.0,
+            "text": "capture light energy and convert it into",
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "stored chemical energy for later use.",
+        },
+    ]
+    plan = _compact_plan(
+        exact_request="photosynthesis",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "photosynthesis",
+            "requirement": "Teach photosynthesis",
+        }],
+        evidence=[{
+            "id": "subject",
+            "q": "capture light energy and convert it into",
+        }],
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 0,
+            "end_line": 2,
+            "start_quote": (
+                "Photosynthesis begins when cells capture light"
+            ),
+            "end_quote": "convert it into stored chemical energy for later use",
+            "claim_quote": "capture light energy and convert it into",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_model_boundary_authoritative": True,
+        },
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"] == (
+        "Photosynthesis begins when cells capture light energy and convert it "
+        "into stored chemical energy for later use."
+    )
+    assert clip["start_quote"].startswith("Photosynthesis")
+    assert clip["end_quote"].endswith("for later use")
+
+
+def test_compact_selector_uses_exact_quote_inside_coarse_cue_range() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 3.0,
+            "text": "Before that, recall the null hypothesis.",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 3.0,
+            "end": 7.0,
+            "text": "A p-value is the probability of results at least this extreme",
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 7.0,
+            "end": 11.0,
+            "text": "assuming the null hypothesis is true.",
+        },
+    ]
+    plan = _compact_plan(
+        exact_request="p-values",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "p-values",
+            "requirement": "Teach p-values",
+        }],
+        evidence=[{
+            "id": "subject",
+            "q": "probability of results at least this extreme",
+        }],
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            # Gemini may cite a coarse enclosing range. Its exact words—not the
+            # caption provider's line boundary—are the semantic authority.
+            "start_line": 0,
+            "end_line": 2,
+            "start_quote": "A p-value is the probability",
+            "end_quote": "assuming the null hypothesis is true",
+            "claim_quote": "probability of results at least this extreme",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_model_boundary_authoritative": True,
+        },
+        topic="p-values",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-1", "cue-2"]
+    assert clip["_clip_text"] == (
+        "A p-value is the probability of results at least this extreme "
+        "assuming the null hypothesis is true."
+    )
+
+
+def test_authoritative_cross_cue_anchor_keeps_its_unique_full_occurrence() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "A p value means something else. A p value means",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 4.0,
+            "end": 8.0,
+            "text": (
+                "evidence under the null hypothesis. "
+                "This conclusion is complete."
+            ),
+        },
+    ]
+    model_start = "A p value means evidence under the null hypothesis"
+    plan = _compact_plan(
+        exact_request="p value",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "p value",
+            "requirement": "Teach p value",
+        }],
+        evidence=[{
+            "id": "subject",
+            "q": model_start,
+        }],
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 0,
+            "end_line": 1,
+            "start_quote": model_start,
+            "end_quote": "This conclusion is complete",
+            "claim_quote": model_start,
+            "title": "P value meaning",
+            "learning_objective": "Explain p value meaning",
+            "facet": "p value",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_model_boundary_authoritative": True,
+        },
+        topic="p value",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"] == (
+        "A p value means evidence under the null hypothesis. "
+        "This conclusion is complete."
+    )
+    assert "something else" not in clip["_clip_text"]
+
+
+def test_authoritative_start_anchor_cannot_extend_past_end_anchor() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "A p value means",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 4.0,
+            "end": 8.0,
+            "text": "evidence under the null. This conclusion is complete.",
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "with final anchor words.",
+        },
+    ]
+    claim = "A p value means evidence under the null"
+    plan = _compact_plan(
+        exact_request="p value",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "p value",
+            "requirement": "Teach p value",
+        }],
+        evidence=[{
+            "id": "subject",
+            "q": claim,
+        }],
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 0,
+            "end_line": 2,
+            "start_quote": (
+                "A p value means evidence under the null This conclusion is "
+                "complete with final anchor words"
+            ),
+            "end_quote": "This conclusion is complete",
+            "claim_quote": claim,
+            "title": "P value meaning",
+            "learning_objective": "Explain p value meaning",
+            "facet": "p value",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_model_boundary_authoritative": True,
+        },
+        topic="p value",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:reversed_model_boundary"]
+
+
+def test_authoritative_quotes_preserve_matching_boundary_punctuation() -> None:
+    text = "“A p value means evidence under the null.”"
+    plan = _compact_custom_plan(
+        request="p value",
+        start_quote="“A p value means",
+        end_quote="under the null.”",
+        claim_quote="A p value means evidence under the null",
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 5.0, "text": text}],
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_model_boundary_authoritative": True,
+        },
+        topic="p value",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"] == text
+    assert clip["start_quote"] == "“A p value means"
+    assert clip["end_quote"] == "under the null.”"
 
 
 def test_compact_selector_rejects_instead_of_contracting_a_dirty_model_cut() -> None:
@@ -298,6 +589,235 @@ def test_compact_selector_never_falls_back_from_an_ungrounded_model_quote() -> N
     ]
 
 
+def test_production_trusts_gemini_candidate_and_repairs_ungrounded_edge() -> None:
+    plan = _compact_plan(
+        exact_request="photosynthesis",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "photosynthesis",
+            "requirement": "Teach photosynthesis",
+        }],
+        evidence=[{
+            "id": "subject",
+            "q": "power the chemical reactions of photosynthesis",
+        }],
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_quote": "words that are not in the transcript",
+            "informativeness": 0.1,
+            "topic_relevance": 0.1,
+            "educational_importance": 0.1,
+            "directly_teaches_topic": False,
+            "substantive": False,
+            "factually_grounded": False,
+            "self_contained": False,
+            "is_standalone": False,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 10.0,
+            "text": (
+                "Cells use chlorophyll to capture light energy and power the chemical "
+                "reactions of photosynthesis."
+            ),
+        }],
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_model_boundary_authoritative": True,
+            "_segment_trust_gemini_semantics": True,
+        },
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["selection_authority"] == "gemini"
+    assert clip["topic_relevance"] == 0.1
+    assert clip["directly_teaches_topic"] is False
+    assert clip["_clip_text"].startswith("Cells use chlorophyll")
+    assert "bad_start_quote" in clip["_boundary_fallback_reasons"]
+
+
+def test_production_preserves_every_schema_valid_gemini_candidate() -> None:
+    text = (
+        "A p value measures evidence against the null hypothesis. "
+        "A small p value indicates stronger evidence against it."
+    )
+    first = _compact_custom_plan(
+        request="p value",
+        start_quote="A p value measures",
+        end_quote="against the null hypothesis",
+        claim_quote="A p value measures evidence against the null hypothesis",
+    ).topics[0]
+    second = first.model_copy(update={
+        "start_line": 99,
+        "end_line": 100,
+        "start_quote": "missing model start edge",
+        "end_quote": "missing model end edge",
+        "claim_quote": "A small p value indicates stronger evidence against it",
+        # Duplicate IDs are malformed selection metadata, not permission to lose a clip.
+        "candidate_id": first.candidate_id,
+    })
+    third = second.model_copy(update={"candidate_id": "authoritative-model-cut-2"})
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent=_compact_custom_plan(
+            request="p value",
+            start_quote="A p value measures",
+            end_quote="against the null hypothesis",
+            claim_quote="A p value measures evidence against the null hypothesis",
+        ).request_intent,
+        topics=[first, second, third],
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_trust_gemini_semantics": True,
+        },
+        topic="p value",
+    )
+
+    assert report.proposed_count == report.accepted_count == 3
+    assert report.rejected_reasons == []
+    assert [clip["selection_candidate_id"] for clip in report.clips] == [
+        "authoritative-model-cut",
+        "authoritative-model-cut-2",
+        "authoritative-model-cut-2-2",
+    ]
+    assert all(clip["selection_authority"] == "gemini" for clip in report.clips)
+
+
+def test_production_expands_dependent_start_and_incomplete_end_without_drop() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "The null hypothesis says there is no effect.",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 4.0,
+            "end": 8.0,
+            "text": "This means a small p value gives evidence against it and",
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "supports rejecting the null hypothesis.",
+        },
+    ]
+    claim = (
+        "small p value gives evidence against it and supports rejecting"
+    )
+    plan = _compact_custom_plan(
+        request="p value",
+        start_quote="This means a small p value",
+        end_quote="evidence against it and",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 1,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_trust_gemini_semantics": True,
+        },
+        topic="p value",
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-0", "cue-1", "cue-2"]
+    assert clip["_clip_text"] == " ".join(
+        segment["text"] for segment in segments
+    )
+    assert "range_recovered_from_claim" in clip["_boundary_fallback_reasons"]
+    assert "context_expanded_start" in clip["_boundary_fallback_reasons"]
+
+
+def test_production_same_cue_repair_never_excludes_gemini_claim() -> None:
+    text = (
+        "Plants use sunlight to make sugar during photosynthesis. "
+        "Respiration releases energy from sugar."
+    )
+    claim = "Plants use sunlight to make sugar during photosynthesis"
+    plan = _compact_custom_plan(
+        request="photosynthesis",
+        start_quote="Respiration releases energy",
+        end_quote="energy from sugar",
+        claim_quote=claim,
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 10.0, "text": text}],
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_trust_gemini_semantics": True,
+        },
+        topic="photosynthesis",
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    [clip] = report.clips
+    assert claim in clip["_clip_text"]
+    assert clip["topic_evidence_quote"] == claim
+    assert "start_expanded_to_claim" in clip["_boundary_fallback_reasons"]
+
+
+def test_production_incomplete_opening_cannot_regain_fragment_projection() -> None:
+    text = (
+        "Welcome back. and its enclosing scope makes the definition precise."
+    )
+    claim = "its enclosing scope makes the definition precise"
+    plan = _compact_custom_plan(
+        request="scope",
+        start_quote="and its enclosing scope",
+        end_quote="makes the definition precise",
+        claim_quote=claim,
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 8.0, "text": text}],
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_trust_gemini_semantics": True,
+        },
+        topic="scope",
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    [clip] = report.clips
+    assert clip["_clip_text"] == text
+    assert "start" not in clip.get("edge_projection", {})
+    assert "expanded_incomplete_start" in clip["_boundary_fallback_reasons"]
+
+
 @pytest.mark.parametrize(
     ("topic_request", "text", "start_quote", "end_quote", "claim_quote"),
     [
@@ -332,6 +852,14 @@ def test_compact_selector_never_falls_back_from_an_ungrounded_model_quote() -> N
             "A significance test compares evidence",
             "some problems will specify",
             "A significance test compares evidence against the null hypothesis",
+        ),
+        (
+            "p value",
+            "On the other hand, a large p value means the observed result is reasonably "
+            "compatible with the null hypothesis.",
+            "On the other hand a large p value",
+            "compatible with the null hypothesis",
+            "large p value means the observed result is reasonably compatible",
         ),
     ],
 )
@@ -378,7 +906,55 @@ def test_explicit_comparison_prompt_requires_every_named_side_in_each_clip() -> 
     assert "Do not return a one-sided definition" in user
 
 
-def test_video_grounded_boundary_prompt_uses_both_streams_and_keeps_quotes_exact() -> None:
+def test_compact_prompt_defines_every_key_and_demonstrates_exact_edges() -> None:
+    _system, user = gemini_segment._boundary_prompts(
+        "[0] 00:00 A complete educational statement.",
+        1,
+        "statistics",
+    )
+
+    definitions = {
+        "id": "candidate_id",
+        "s": "start_line",
+        "e": "end_line",
+        "sq": "start_quote",
+        "eq": "end_quote",
+        "cq": "claim_quote",
+        "title": "a clear viewer-facing title",
+        "obj": "learning_objective",
+        "facet": "the narrow subtopic",
+        "info": "informativeness",
+        "rel": "topic_relevance",
+        "imp": "educational_importance",
+        "diff": "difficulty",
+        "direct": "directly_teaches_topic",
+        "sub": "substantive",
+        "fact": "factually_grounded",
+        "self": "self_contained",
+        "stand": "is_standalone",
+        "ie": "intent_evidence",
+    }
+    for key, meaning in definitions.items():
+        assert f"- {key} = {meaning}" in user
+    normalized = " ".join(user.split())
+    assert "caption-line index, not seconds" in normalized
+    assert "Its FIRST spoken word" in normalized
+    assert "Its LAST spoken word" in normalized
+    assert (
+        "cq proves where the teaching is; it does not define the start or end"
+        in normalized
+    )
+    assert "self concerns included context; stand" in normalized
+    assert "No video is supplied" in normalized
+    assert '"s":18,"e":19' in user
+    assert '"sq":"A small p value"' in user
+    assert '"eq":"against the null hypothesis."' in user
+    assert 'starts after "Welcome back"' in normalized
+    assert 'ends before "Next, confidence intervals"' in normalized
+    assert 'Do not start at line 32 with "Divide that change"' in normalized
+
+
+def test_boundary_prompt_stays_transcript_only_when_video_is_requested() -> None:
     system, user = gemini_segment._boundary_prompts(
         "[0] 00:00 This curve approaches zero as x increases.",
         1,
@@ -388,11 +964,17 @@ def test_video_grounded_boundary_prompt_uses_both_streams_and_keeps_quotes_exact
     )
     prompt = f"{system}\n{user}".casefold()
 
-    assert "inspect the audio and visual streams jointly" in prompt
-    assert "formulas, diagrams, on-screen text, gestures, or deictic speech" in prompt
-    assert "absent or illegible" in prompt
+    assert "you receive transcript text only" in prompt
+    assert (
+        "no video, image, audio file, frames, thumbnails, or visual metadata are attached"
+        in prompt
+    )
+    assert "judge only the supplied transcript" in prompt
+    assert "only the supplied spoken transcript" in prompt
+    assert "inspect the audio and visual streams jointly" not in prompt
+    assert "attached-video grounding" not in prompt
+    assert "omit material that requires an unseen visual" in prompt
     assert "factually_grounded" in prompt
-    assert "both the transcript and any required visual evidence" in prompt
     assert "current level is advanced" in prompt
     assert "target-level preference" in prompt
     assert "difficulty is metadata, not an eligibility filter" in prompt
@@ -407,7 +989,7 @@ def test_video_grounded_boundary_prompt_uses_both_streams_and_keeps_quotes_exact
     "profile",
     [gemini_segment.FLASH_SPLIT_PROFILE, gemini_segment.PRO_BOUNDARY_PROFILE],
 )
-def test_video_grounded_boundary_selector_sends_one_youtube_part_before_text(
+def test_boundary_selector_never_attaches_video_even_when_requested(
     monkeypatch,
     profile,
 ) -> None:
@@ -469,51 +1051,48 @@ def test_video_grounded_boundary_selector_sends_one_youtube_part_before_text(
     assert len(calls) == 1
     [call] = calls
     contents = call["user"]
-    assert len(contents) == 2
-    assert contents[0].file_data.file_uri == (
-        "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    )
-    assert contents[0].video_metadata.end_offset == "600s"
-    assert contents[0].text is None
-    assert contents[1].file_data is None
-    assert "Transcript (1 lines" in contents[1].text
-    assert "current level is beginner" in contents[1].text
-    assert call["media_resolution"] == (
-        gemini_client.types.MediaResolution.MEDIA_RESOLUTION_LOW
-    )
-    if profile == gemini_segment.PRO_BOUNDARY_PROFILE:
+    assert isinstance(contents, str)
+    assert "Transcript (1 lines" in contents
+    assert "current level is beginner" in contents
+    assert "youtube.com" not in contents
+    assert call["media_resolution"] is None
+    assert call.get("estimated_media_tokens", 0) == 0
+    if profile == gemini_segment.FLASH_SPLIT_PROFILE:
         assert call["max_retries"] == 1
         assert call["retry_status_codes"] == frozenset({503})
     else:
         assert call["max_retries"] == 0
         assert call["retry_status_codes"] is None
     [reservation] = reservations
-    prompt_text = f"{call['system']}\n\n{contents[1].text}"
+    prompt_text = f"{call['system']}\n\n{contents}"
     schema_bytes = len(json.dumps(
         gemini_segment._CompactBoundaryPlan.model_json_schema(),
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8"))
     text_estimate = math.ceil((len(prompt_text) + schema_bytes) / 3) + 1_000
-    expected_text_tokens = (
-        1_000
-        if profile == gemini_segment.PRO_BOUNDARY_PROFILE
-        else text_estimate
-    )
-    assert reservation["estimated_input_tokens"] == (
-        expected_text_tokens
-        + 600 * gemini_segment._LOW_RESOLUTION_VIDEO_TOKENS_PER_SECOND
-    )
+    assert reservation["estimated_input_tokens"] == text_estimate
 
 
-def test_required_video_grounding_fails_closed_before_transcript_only_dispatch(
+def test_required_video_grounding_flag_cannot_block_transcript_only_dispatch(
     monkeypatch,
 ) -> None:
     calls = []
     monkeypatch.setattr(
         gemini_client,
         "generate_json_v3",
-        lambda *_args, **_kwargs: calls.append(True),
+        lambda _system, user, _schema, **_kwargs: (
+            calls.append(user)
+            or SimpleNamespace(
+                text=(
+                    '{"request_intent":{"exact_request":"photosynthesis",'
+                    '"constraints":[{"constraint_id":"subject","kind":"subject",'
+                    '"source_phrase":"photosynthesis","requirement":'
+                    '"Teach photosynthesis"}]},"topics":[]}'
+                ),
+                telemetry={},
+            )
+        ),
     )
 
     result = gemini_segment.run_segment_profile(
@@ -530,10 +1109,10 @@ def test_required_video_grounding_fails_closed_before_transcript_only_dispatch(
         topic="photosynthesis",
     )
 
-    assert calls == []
+    assert len(calls) == 1
+    assert isinstance(calls[0], str)
     assert result.clips == []
-    assert result.error is not None
-    assert result.classification_reasons == ["request_failure:ValueError"]
+    assert result.error is None
 
 
 def test_video_grounding_accepts_duration_sec_and_never_underbounds_last_cue() -> None:
@@ -547,7 +1126,7 @@ def test_video_grounding_accepts_duration_sec_and_never_underbounds_last_cue() -
     ) == pytest.approx(5.25)
 
 
-def test_long_video_pro_reservation_fails_before_provider_dispatch(
+def test_long_video_metadata_does_not_create_media_budget_or_block_dispatch(
     monkeypatch,
 ) -> None:
     context = GenerationContext("slow", generation_id="selector-long-context")
@@ -555,7 +1134,23 @@ def test_long_video_pro_reservation_fails_before_provider_dispatch(
     monkeypatch.setattr(
         gemini_client,
         "generate_json_v3",
-        lambda *_args, **_kwargs: calls.append(True),
+        lambda *_args, **_kwargs: (
+            calls.append(_kwargs)
+            or SimpleNamespace(
+                text=(
+                    '{"request_intent":{"exact_request":"photosynthesis",'
+                    '"constraints":[{"constraint_id":"subject","kind":"subject",'
+                    '"source_phrase":"photosynthesis","requirement":'
+                    '"Teach photosynthesis"}]},"topics":[]}'
+                ),
+                telemetry={
+                    "model": _kwargs["model"],
+                    "prompt_tokens": 100,
+                    "candidate_tokens": 10,
+                    "total_tokens": 110,
+                },
+            )
+        ),
     )
     monkeypatch.setattr(
         gemini_client,
@@ -587,13 +1182,13 @@ def test_long_video_pro_reservation_fails_before_provider_dispatch(
         topic="photosynthesis",
     )
 
-    assert calls == []
+    assert len(calls) == 1
+    assert calls[0]["media_resolution"] is None
+    assert calls[0].get("estimated_media_tokens", 0) == 0
     assert result.clips == []
-    assert result.classification_reasons == [
-        "request_failure:ProviderBudgetExceededError"
-    ]
+    assert result.error is None
     budget = context.budget.snapshot()["gemini"]
-    assert budget["selector_calls"] == 0
+    assert budget["selector_calls"] == 1
     assert budget["inflight_reserved_cost_usd"] == 0.0
 
 
@@ -1109,6 +1704,11 @@ def test_flash_profile_retries_one_confirmed_503_on_the_same_model(monkeypatch) 
 
 def test_flash_selector_fails_over_immediately_after_one_503(monkeypatch) -> None:
     models: list[str] = []
+    monkeypatch.setattr(
+        gemini_segment.config,
+        "SEGMENT_FLASH_MODEL",
+        "gemini-3.5-flash",
+    )
 
     def fake_generate(*_args, **kwargs):
         model = str(kwargs["model"])

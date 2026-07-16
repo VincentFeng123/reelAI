@@ -10,7 +10,7 @@ import asyncio
 import random
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Optional
 
@@ -244,6 +244,7 @@ def generate_json_result(system: str, user: str, schema, temperature: float = 0.
     ``max_output_tokens`` bounds the response; raise it for calls whose JSON is large
     OR that use a thinking model (thinking tokens share this budget, so an 8192 cap can
     truncate the JSON on a preview/pro model that ignores thinking_budget=0)."""
+    _reject_video_content(user)
     mdl = model or config.GEMINI_MODEL
 
     def _make_config():
@@ -328,53 +329,70 @@ def media_resolution_from_name(name):
 
 
 def video_part_inline(data: bytes, media_resolution=None):
-    """A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is small,
-    < ~20MB — the 8s edge probe). ``media_resolution`` is a ``types.MediaResolution`` enum
-    (pass ``types.MediaResolution.MEDIA_RESOLUTION_LOW`` for LOW). Files-API upload +
-    video_metadata offsets (Tier 2 / VID3) are intentionally NOT implemented here."""
-    if media_resolution is not None:
-        return types.Part.from_bytes(data=data, mime_type="video/mp4",
-                                     media_resolution=media_resolution)
-    return types.Part.from_bytes(data=data, mime_type="video/mp4")
+    """Retired: production never sends inline video to Gemini."""
+    del data, media_resolution
+    raise ValueError("Gemini video input is disabled")
+
+
+def _reject_video_content(value: object) -> None:
+    """Reject video Parts, Content wrappers, and raw media dictionaries."""
+    if isinstance(value, Mapping):
+        normalized = {
+            str(key).replace("_", "").casefold(): item
+            for key, item in value.items()
+        }
+        mime_type = str(normalized.get("mimetype") or "").casefold()
+        file_uri = str(normalized.get("fileuri") or "").casefold()
+        clean_uri = file_uri.split("?", 1)[0].split("#", 1)[0]
+        if (
+            mime_type.startswith("video/")
+            or normalized.get("videometadata") is not None
+            or "youtube.com/" in file_uri
+            or "youtu.be/" in file_uri
+            or clean_uri.endswith((".m4v", ".mkv", ".mov", ".mp4", ".webm"))
+        ):
+            raise ValueError("Gemini video input is disabled")
+        for item in value.values():
+            _reject_video_content(item)
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _reject_video_content(item)
+        return
+    content_parts = getattr(value, "parts", None)
+    if isinstance(content_parts, (list, tuple)):
+        _reject_video_content(content_parts)
+    inline_data = getattr(value, "inline_data", None)
+    file_data = getattr(value, "file_data", None)
+    mime_types = (
+        str(getattr(inline_data, "mime_type", "") or "").casefold(),
+        str(getattr(file_data, "mime_type", "") or "").casefold(),
+        str(getattr(value, "mime_type", "") or "").casefold(),
+    )
+    uris = (
+        str(getattr(file_data, "file_uri", "") or "").casefold(),
+        str(getattr(value, "file_uri", "") or "").casefold(),
+    )
+    if (
+        any(mime_type.startswith("video/") for mime_type in mime_types)
+        or getattr(value, "video_metadata", None) is not None
+        or any(
+            "youtube.com/" in uri
+            or "youtu.be/" in uri
+            or uri.split("?", 1)[0].split("#", 1)[0].endswith(
+                (".m4v", ".mkv", ".mov", ".mp4", ".webm")
+            )
+            for uri in uris
+        )
+    ):
+        raise ValueError("Gemini video input is disabled")
 
 
 def generate_json_video(system: str, parts: list, schema, media_resolution=None,
                         temperature: float = 0.2, model: Optional[str] = None) -> str:
-    """Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.
-
-    ``parts`` is a list of ``types.Part`` (interleaved text + inline video bytes), sent as the
-    single user turn — same thinking-off-then-on + backoff machinery as ``generate_json_mm``.
-    Gemini-only; the caller invokes this directly, never through
-    llm.py/llm_json. Defaults to ``config.VIDEO_JUDGE_MODEL`` (flash-lite)."""
-    client = get_client()
-    mdl = model or config.VIDEO_JUDGE_MODEL
-
-    def _make_config(thinking: bool):
-        kwargs = dict(
-            system_instruction=system,
-            response_mime_type="application/json",
-            response_schema=schema,
-            temperature=temperature,
-            max_output_tokens=8192,
-        )
-        if media_resolution is not None:
-            kwargs["media_resolution"] = media_resolution
-        if not thinking:
-            kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-        return types.GenerateContentConfig(**kwargs)
-
-    def _call():
-        try:
-            resp = client.models.generate_content(
-                model=mdl, contents=parts, config=_make_config(thinking=False)
-            )
-        except Exception:
-            resp = client.models.generate_content(
-                model=mdl, contents=parts, config=_make_config(thinking=True)
-            )
-        return resp.text
-
-    return _retry(_call)
+    """Retired: production never sends video to Gemini."""
+    del system, parts, schema, media_resolution, temperature, model
+    raise ValueError("Gemini video input is disabled")
 
 
 def generate_json_mm(system: str, parts: list, schema, temperature: float = 0.2) -> str:
@@ -383,6 +401,7 @@ def generate_json_mm(system: str, parts: list, schema, temperature: float = 0.2)
     ``parts`` is a list of ``types.Part`` (interleaved text + image bytes), sent as the
     single user turn. Same thinking-off-then-on + backoff dance as ``generate_json``.
     """
+    _reject_video_content(parts)
     client = get_client()
 
     def _make_config(thinking: bool):

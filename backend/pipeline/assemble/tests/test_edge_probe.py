@@ -7,6 +7,8 @@ LLM error, and that the SDK enablers exist + call generate_content as expected.
 """
 from __future__ import annotations
 
+import pytest
+
 import backend.config as config
 import backend.gemini_client as gc
 import backend.pipeline.assemble.edge_probe as ep
@@ -36,9 +38,9 @@ def test_edge_probe_disabled_by_default_and_flag_gate(monkeypatch):
     assert config.DEFAULTS["edge_probe"] is None
     assert _edge_probe_enabled(dict(config.DEFAULTS)) is False
     assert _edge_probe_enabled({"edge_probe": None}) is False
-    assert _edge_probe_enabled({"edge_probe": True}) is True      # explicit per-job dial
+    assert _edge_probe_enabled({"edge_probe": True}) is False
     monkeypatch.setattr(config, "EDGE_PROBE_ENABLED", True)
-    assert _edge_probe_enabled({}) is True                        # inherits config when unset
+    assert _edge_probe_enabled({}) is False
 
 
 def test_run_edge_probe_noop_without_video_path(monkeypatch):
@@ -50,78 +52,26 @@ def test_run_edge_probe_noop_without_video_path(monkeypatch):
     assert "starts_clean_audio" not in specs[0]                   # untouched
 
 
-# ── (2) advisory mapping: False → warning; clean → none; never a kill/Rejection ──
-def test_starts_not_clean_adds_only_a_warning(monkeypatch):
-    monkeypatch.setattr(ep, "_cut_segment", lambda *a, **k: b"fake-mp4-bytes")
-    monkeypatch.setattr(ep, "generate_json_video",
-                        lambda *a, **k: _verdict(starts=False, ends=True).model_dump_json(),
-                        raising=False)
-    spec = _spec()
-    ep.run_edge_probe([spec], video_path="/tmp/v.mp4", settings={})
-    assert "starts_mid_sentence_audio" in spec["warnings"]
-    assert "ends_mid_sentence_audio" not in spec["warnings"]
-    assert spec["starts_clean_audio"] is False and spec["ends_clean_audio"] is True
-    # advisory dock only — final_quality docked below the 0.84 baseline but the clip still SHIPS
-    # (no drop, no Rejection). boundary weight 0.20 × 0.05 penalty ⇒ 0.84 → 0.83.
-    assert spec["final_quality"] == 0.83 and spec["final_quality"] < 0.84
-
-
-def test_both_edges_flagged(monkeypatch):
-    monkeypatch.setattr(ep, "_cut_segment", lambda *a, **k: b"bytes")
-    monkeypatch.setattr(ep, "generate_json_video",
-                        lambda *a, **k: _verdict(starts=False, ends=False).model_dump_json(),
-                        raising=False)
-    spec = _spec()
-    ep.run_edge_probe([spec], "/tmp/v.mp4", {})
-    assert {"starts_mid_sentence_audio", "ends_mid_sentence_audio"} <= set(spec["warnings"])
-
-
-def test_clean_verdict_adds_no_warning_and_no_dock(monkeypatch):
-    monkeypatch.setattr(ep, "_cut_segment", lambda *a, **k: b"bytes")
-    monkeypatch.setattr(ep, "generate_json_video",
-                        lambda *a, **k: _verdict(True, True).model_dump_json(), raising=False)
-    spec = _spec()
-    ep.run_edge_probe([spec], "/tmp/v.mp4", {})
-    assert spec["warnings"] == ()                                 # no edge warnings
-    assert spec["final_quality"] == 0.84                          # no dock on a clean verdict
-    assert spec["starts_clean_audio"] is True and spec["ends_clean_audio"] is True
-
-
-def test_probe_never_kills_or_rejects(monkeypatch):
-    # run_edge_probe returns the SAME list object, mutated in place — it can only add fields,
-    # never drop a clip or emit a Rejection (it has no rejections channel at all).
-    monkeypatch.setattr(ep, "_cut_segment", lambda *a, **k: b"bytes")
-    monkeypatch.setattr(ep, "generate_json_video",
-                        lambda *a, **k: _verdict(False, False).model_dump_json(), raising=False)
+# ── (2) hard-disabled: even explicit settings cannot upload video ────────────
+def test_run_edge_probe_never_cuts_or_calls_gemini(monkeypatch):
+    monkeypatch.setattr(
+        ep,
+        "_probe_clip",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("video probe must remain disabled")
+        ),
+    )
     specs = [_spec(), _spec(start=200.0, end=260.0)]
-    out = ep.run_edge_probe(specs, "/tmp/v.mp4", {})
-    assert out is specs and len(out) == 2                         # nothing dropped
+    before = [dict(spec) for spec in specs]
 
+    out = ep.run_edge_probe(
+        specs,
+        "/tmp/v.mp4",
+        {"edge_probe": True},
+    )
 
-# ── (3) fail-soft: an LLM error leaves the clip untouched, never raises ───────
-def test_llm_error_is_fail_soft(monkeypatch):
-    monkeypatch.setattr(ep, "_cut_segment", lambda *a, **k: b"bytes")
-
-    def boom(*a, **k):
-        raise RuntimeError("gemini 503")
-
-    monkeypatch.setattr(ep, "generate_json_video", boom, raising=False)
-    spec = _spec()
-    out = ep.run_edge_probe([spec], "/tmp/v.mp4", {})             # must NOT raise
-    assert out[0] is spec
-    assert "starts_clean_audio" not in spec                       # untouched
-    assert spec["warnings"] == () and spec["final_quality"] == 0.84
-
-
-def test_ffmpeg_cut_failure_is_fail_soft(monkeypatch):
-    # both head+tail cuts fail → _probe_clip returns None → clip untouched, no exception.
-    monkeypatch.setattr(ep, "_cut_segment", lambda *a, **k: None)
-    monkeypatch.setattr(ep, "generate_json_video",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call LLM")),
-                        raising=False)
-    spec = _spec()
-    ep.run_edge_probe([spec], "/tmp/v.mp4", {})
-    assert "starts_clean_audio" not in spec and spec["warnings"] == ()
+    assert out is specs
+    assert specs == before
 
 
 def test_cut_segment_no_real_ffmpeg(monkeypatch):
@@ -157,13 +107,9 @@ class _FakeClient:
         self.models = _FakeModels()
 
 
-def test_video_part_inline_builds_video_mp4_part():
-    from google.genai import types
-    p = gc.video_part_inline(b"abc", media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW)
-    assert p.inline_data.mime_type == "video/mp4"
-    assert p.media_resolution is not None                         # media_resolution attached
-    p2 = gc.video_part_inline(b"abc")
-    assert p2.inline_data.mime_type == "video/mp4" and p2.media_resolution is None
+def test_video_helpers_are_hard_disabled():
+    with pytest.raises(ValueError, match="video input is disabled"):
+        gc.video_part_inline(b"abc")
 
 
 # ── embed-record threading: edge booleans surface only when the probe ran ────
@@ -180,18 +126,9 @@ def test_build_embed_clips_surfaces_edge_booleans_when_present():
     assert c["starts_clean_audio"] is False and c["ends_clean_audio"] is True
 
 
-def test_generate_json_video_calls_sdk_with_schema_and_video_model(monkeypatch):
+def test_generate_json_video_never_calls_sdk(monkeypatch):
     fake = _FakeClient()
     monkeypatch.setattr(gc, "get_client", lambda: fake)
-    parts = [gc.text_part("beginning"), gc.video_part_inline(b"vid")]
-    out = gc.generate_json_video("SYS", parts, ep.EdgeVerdict,
-                                 media_resolution=gc.media_resolution_from_name("low"))
-    assert out == _FakeResp.text
-    call = fake.models.calls[0]
-    assert call["model"] == config.VIDEO_JUDGE_MODEL              # flash-lite, not GEMINI_MODEL
-    assert call["contents"] is parts
-    cfg = call["config"]
-    assert cfg.response_schema is ep.EdgeVerdict
-    assert cfg.response_mime_type == "application/json"
-    assert cfg.media_resolution is not None
-    assert cfg.thinking_config is not None                       # thinking-off first attempt
+    with pytest.raises(ValueError, match="video input is disabled"):
+        gc.generate_json_video("SYS", [], ep.EdgeVerdict)
+    assert fake.models.calls == []

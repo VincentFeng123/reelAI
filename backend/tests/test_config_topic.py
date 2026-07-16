@@ -26,9 +26,9 @@ def test_authoring_model_is_flash_topic_model_is_pro():
     assert config.TOPIC_MODEL == "gemini-3.1-pro-preview"
 
 
-def test_segment_router_defaults_to_normal_flash_only_for_clip_selection():
+def test_segment_router_keeps_flash_only_as_the_evaluation_default():
     assert config.SEGMENT_ROUTING_MODE == "flash_only"
-    assert config.SEGMENT_FLASH_MODEL == "gemini-3.5-flash"
+    assert config.SEGMENT_FLASH_MODEL == "gemini-3-flash-preview"
     assert config.SEGMENT_FLASH_FALLBACK_MODEL == ""
     assert config.SEGMENT_PRO_MODEL == "gemini-3.1-pro-preview"
     assert config.SEGMENT_MODEL == config.SEGMENT_PRO_MODEL
@@ -69,7 +69,7 @@ def test_segment_router_rejects_invalid_values_and_clamps_percent(monkeypatch):
     )
     assert invalid == {
         "mode": "flash_only",
-        "flash": "gemini-3.5-flash",
+        "flash": "gemini-3-flash-preview",
         "flash_fallback": "",
         "pro": "gemini-3.1-pro-preview",
         "legacy": "gemini-3.1-pro-preview",
@@ -100,7 +100,7 @@ def test_authoritative_flash_model_is_pinned_against_environment_overrides(
         monkeypatch,
         SEGMENT_FLASH_MODEL=model,
     )
-    assert loaded["flash"] == "gemini-3.5-flash"
+    assert loaded["flash"] == "gemini-3-flash-preview"
 
 
 def test_explicit_pro_override_wins_then_legacy_pro_model_is_fallback(monkeypatch):

@@ -2570,6 +2570,14 @@ def _search_context_has_usable_boundary(
     )
 
 
+def _gemini_selection_is_authoritative(context: object) -> bool:
+    return bool(
+        isinstance(context, dict)
+        and str(context.get("selection_authority") or "").strip().casefold()
+        == "gemini"
+    )
+
+
 def _count_generation_reels(conn, generation_id: str) -> int:
     try:
         rows = fetch_all(
@@ -2595,7 +2603,11 @@ def _count_generation_reels(conn, generation_id: str) -> int:
                 "1", "true", "yes", "on",
             }
         surface_reason = str(context.get("surface_reason") or "").strip().lower()
-        if surface_eligible is not True and surface_reason != "level_mismatch":
+        if (
+            not _gemini_selection_is_authoritative(context)
+            and surface_eligible is not True
+            and surface_reason != "level_mismatch"
+        ):
             continue
         if not _search_context_has_usable_boundary(
             context, t_start=row.get("t_start"), t_end=row.get("t_end")
@@ -2628,7 +2640,9 @@ def _count_material_ready_reels(conn, material_id: str) -> int:
             else ""
         )
         if (
-            surface_eligible is True or surface_reason == "level_mismatch"
+            _gemini_selection_is_authoritative(context)
+            or surface_eligible is True
+            or surface_reason == "level_mismatch"
         ) and _search_context_has_usable_boundary(
             context, t_start=row.get("t_start"), t_end=row.get("t_end")
         ):
@@ -2666,7 +2680,11 @@ def _usable_boundary_reel_ids(conn, reel_ids: list[str]) -> set[str]:
             if isinstance(context, dict)
             else ""
         )
-        if (surface_eligible is True or surface_reason == "level_mismatch") and (
+        if (
+            _gemini_selection_is_authoritative(context)
+            or surface_eligible is True
+            or surface_reason == "level_mismatch"
+        ) and (
             _search_context_has_usable_boundary(
                 context, t_start=row.get("t_start"), t_end=row.get("t_end")
             )
@@ -3013,6 +3031,12 @@ def _verified_reusable_generation_chain(
             str(context.get("selection_contract_version") or "").strip()
             != SELECTION_CONTRACT_VERSION
         ):
+            continue
+        if _gemini_selection_is_authoritative(context):
+            if _search_context_has_usable_boundary(
+                context, t_start=row.get("t_start"), t_end=row.get("t_end")
+            ):
+                verified_reusable_count += 1
             continue
         try:
             quality_scores = (
@@ -4942,7 +4966,7 @@ def admin_health() -> dict:
         "supadata_configured": bool(os.getenv("SUPADATA_API_KEY", "").strip()),
         "gemini_primary_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
         "gemini_chat_configured": bool(os.getenv("GEMINI_API_KEY_2", "").strip()),
-        "gemini_clip_selector_model": pipeline_config.SEGMENT_FLASH_MODEL,
+        "gemini_clip_selector_model": pipeline_config.SEGMENT_PRO_MODEL,
         # Preserve the health field while reporting only the selector's actual
         # optional failover. Hosted production leaves it disabled.
         "gemini_fallback_model": (

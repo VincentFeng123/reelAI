@@ -2505,6 +2505,62 @@ def test_transcript_only_adapter_preserves_same_cue_filler_projection() -> None:
     assert projection["caption_projection_verified"] is True
 
 
+def test_direct_gemini_authority_bypasses_semantic_regating() -> None:
+    transcript = _transcript()
+    clip = _quality_clip(
+        score=0.1,
+        selection_authority="gemini",
+        kind="admin",
+        directly_teaches_topic=False,
+        substantive=False,
+        factually_grounded=False,
+        self_contained=False,
+        is_standalone=False,
+        topic_evidence_quote="words absent from this transcript entirely",
+    )
+
+    verified = pipeline_module._verified_direct_adapter_clips(
+        source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        engine_out={"clips": [clip], "transcript": transcript},
+        should_cancel=None,
+        exact_topic="unrelated topic",
+    )
+
+    assert len(verified) == 1
+    context = verified[0]["search_context"]
+    assert context["selection_authority"] == "gemini"
+    assert context["surface_eligible"] is True
+    assert context["deferred_level"] is False
+    assert context["directly_teaches_topic"] is False
+    assert context["self_contained"] is False
+
+
+def test_direct_gemini_authority_recovers_malformed_cut_from_grounded_quote() -> None:
+    transcript = _transcript()
+    clip = _quality_clip(
+        cue_id="missing-cue",
+        start=99.0,
+        end=100.0,
+        selection_authority="gemini",
+        quote="Python functions package reusable instructions.",
+    )
+
+    verified = pipeline_module._verified_direct_adapter_clips(
+        source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        engine_out={"clips": [clip], "transcript": transcript},
+        should_cancel=None,
+        exact_topic="Python",
+    )
+
+    assert len(verified) == 1
+    assert (verified[0]["start"], verified[0]["end"]) == (0.0, 10.0)
+    assert verified[0]["cue_ids"] == ["python"]
+    assert (
+        verified[0]["boundary_repair_reason"]
+        == "gemini_grounded_cue_recovery"
+    )
+
+
 @pytest.mark.parametrize(
     (
         "segments",
@@ -3578,6 +3634,48 @@ def test_hard_gemini_contract_rejects_off_topic_candidates(
     assert clips == []
 
 
+def test_gemini_authority_bypasses_material_semantic_and_level_filters(
+    monkeypatch,
+) -> None:
+    engine_out = _one_cue_selector_result(
+        "evidence words absent from the selected transcript",
+        clip_text="Python functions package reusable instructions.",
+        score=0.1,
+        selection_authority="gemini",
+        directly_teaches_topic=False,
+        substantive=False,
+        factually_grounded=False,
+        self_contained=False,
+        is_standalone=False,
+        difficulty=0.9,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_clip",
+        lambda *_args, **_kwargs: engine_out,
+    )
+
+    _video_row, clips, _engine = _pipeline()._clip_and_filter(
+        {
+            **_video(),
+            "_knowledge_level": "beginner",
+            "_topic_terms": ["unrelated topic"],
+        },
+        "unrelated topic",
+        "en",
+    )
+
+    assert len(clips) == 1
+    context = clips[0]["search_context"]
+    assert context["selection_authority"] == "gemini"
+    assert context["surface_eligible"] is True
+    assert context["deferred_level"] is False
+    assert context["directly_teaches_topic"] is False
+    assert context["topic_evidence_quote"] == (
+        "evidence words absent from the selected transcript"
+    )
+
+
 def test_topic_mention_elsewhere_cannot_rescue_an_unrelated_evidence_quote(
     monkeypatch,
 ) -> None:
@@ -3908,6 +4006,66 @@ def test_all_deferred_source_streams_nearest_valid_level_immediately(
     assert context.counters()["deferred_clips"] == 1
     assert context.counters()["level_deferred_clips"] == 1
     assert context.counters()["persisted_clips"] == 1
+
+
+def test_gemini_authority_is_not_level_deferred_during_persistence(
+    monkeypatch,
+) -> None:
+    engine_out = {
+        "clips": [
+            _quality_clip(
+                candidate_id="authoritative-advanced",
+                score=0.1,
+                difficulty=0.9,
+                selection_authority="gemini",
+                directly_teaches_topic=False,
+                substantive=False,
+                factually_grounded=False,
+                self_contained=False,
+                is_standalone=False,
+                topic_evidence_quote="not grounded in this transcript",
+            )
+        ],
+        "transcript": _transcript(),
+        "notes": "",
+    }
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: _discovery(),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_clip",
+        lambda *_args, **_kwargs: engine_out,
+    )
+    stored: list[dict] = []
+    pipeline = _pipeline()
+
+    def persist(*, clip, **_kwargs):
+        stored.append(clip)
+        return "authoritative-reel", mock.sentinel.metadata
+
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+
+    reels, _ = pipeline.ingest_topic(
+        topic="unrelated topic",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext("fast"),
+        retrieval_profile="deep",
+        knowledge_level="beginner",
+        max_videos=1,
+        max_reels=1,
+        max_persisted_reels=1,
+    )
+
+    assert reels == ["authoritative-reel"]
+    context = stored[0]["search_context"]
+    assert context["selection_authority"] == "gemini"
+    assert context["surface_eligible"] is True
+    assert context["deferred_level"] is False
+    assert "surface_reason" not in context
 
 
 def test_all_deferred_source_streams_all_valid_clips_by_difficulty_proximity(
@@ -4503,7 +4661,7 @@ def test_generation_skips_pro_repair_and_synchronous_enrichment(monkeypatch) -> 
     assert context.counters()["pro_fallbacks"] == 0
 
 
-def test_clip_call_uses_one_medium_thinking_flash_selector_and_ignores_duration(
+def test_clip_call_uses_one_medium_thinking_pro_selector_and_ignores_duration(
     monkeypatch,
 ) -> None:
     captured: dict = {}
@@ -4529,7 +4687,7 @@ def test_clip_call_uses_one_medium_thinking_flash_selector_and_ignores_duration(
     fallback_gate = captured.get("_segment_pro_fallback_gate")
     assert callable(fallback_gate)
     assert fallback_gate(accepted_count=0, video_id="dQw4w9WgXcQ") is False
-    assert captured["_segment_routing_mode"] == "flash_only"
+    assert captured["_segment_routing_mode"] == "pro_only"
     assert captured["_segment_thinking_level"] == "medium"
     assert captured["_segment_allow_flash_lite_failover"] is False
     assert "_segment_target_sec" not in captured
@@ -4565,7 +4723,7 @@ def test_fast_and_slow_clip_calls_use_identical_quality_routing(
     )
 
     assert captured["_segment_thinking_level"] == "medium"
-    assert captured["_segment_routing_mode"] == "flash_only"
+    assert captured["_segment_routing_mode"] == "pro_only"
     assert captured["_segment_allow_flash_lite_failover"] is False
     assert captured["_segment_pro_fallback_gate"](
         accepted_count=0,

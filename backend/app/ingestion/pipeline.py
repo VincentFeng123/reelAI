@@ -256,7 +256,7 @@ def _run_clip(
     if deadline_monotonic is not None:
         settings["deadline_monotonic"] = float(deadline_monotonic)
     settings["_segment_pro_fallback_gate"] = lambda **_kwargs: False
-    settings["_segment_routing_mode"] = "flash_only"
+    settings["_segment_routing_mode"] = "pro_only"
     settings["_segment_thinking_level"] = "medium"
     settings["_segment_allow_flash_lite_failover"] = False
     kwargs = {
@@ -479,6 +479,172 @@ def _transcript_boundary_seed(
         "fallback_from_strict_caption_diagnostics": True,
         "recovered_from_timestamp_range": recovered_from_timestamps,
     }, (start, end)
+
+
+def _gemini_selection_is_authoritative(clip: dict[str, Any]) -> bool:
+    """Return whether Gemini already made the semantic selection decision."""
+
+    search_context = clip.get("search_context")
+    context_authority = (
+        search_context.get("selection_authority")
+        if isinstance(search_context, dict)
+        else None
+    )
+    return str(
+        clip.get("selection_authority") or context_authority or ""
+    ).strip().casefold() == "gemini"
+
+
+def _best_effort_gemini_transcript_clip(
+    transcript: dict[str, Any],
+    raw_clip: dict[str, Any],
+) -> dict[str, Any]:
+    """Recover a Gemini selection onto a locally provable transcript cue range.
+
+    Semantic fields are intentionally left untouched. Only invalid cue/timestamp
+    metadata is repaired, first through the normal boundary seed and then through
+    one uniquely grounded selector quote. If neither proves a local range, the
+    original clip remains unchanged so the existing media-safety gate can reject
+    it rather than inventing a cut.
+    """
+
+    clip = dict(raw_clip)
+    if not _gemini_selection_is_authoritative(clip):
+        return clip
+    search_context = dict(clip.get("search_context") or {})
+    search_context["selection_authority"] = "gemini"
+    clip["search_context"] = search_context
+    clip["selection_authority"] = "gemini"
+    if not _is_valid_timestamped_supadata_transcript(transcript):
+        return clip
+
+    segments = [
+        segment
+        for segment in (transcript.get("segments") or [])
+        if isinstance(segment, dict)
+    ]
+    if not segments:
+        return clip
+
+    diagnostics, complete_bounds = _transcript_boundary_seed(transcript, clip)
+    if diagnostics is not None:
+        try:
+            start_sec = float(clip.get("start"))
+            end_sec = float(clip.get("end"))
+        except (TypeError, ValueError, OverflowError):
+            start_sec = end_sec = float("nan")
+        if not (
+            math.isfinite(start_sec)
+            and math.isfinite(end_sec)
+            and start_sec <= complete_bounds[0] + SPEECH_OWNERSHIP_EPSILON_SEC
+            and end_sec + SPEECH_OWNERSHIP_EPSILON_SEC >= complete_bounds[1]
+        ):
+            clip["start"], clip["end"] = complete_bounds
+            clip.pop("required_first_speech_sec", None)
+            clip.pop("required_last_speech_sec", None)
+            clip["boundary_repair_reason"] = "gemini_complete_cue_bounds"
+        return clip
+
+    grounded_indices: list[int] = []
+    for field in ("topic_evidence_quote", "start_quote", "end_quote"):
+        quote = str(clip.get(field) or "").strip()
+        if not quote:
+            continue
+        matches = [
+            index
+            for index, segment in enumerate(segments)
+            for _span in _quote_character_spans(
+                str(segment.get("text") or ""), quote
+            )
+        ]
+        if len(matches) == 1:
+            grounded_indices.append(matches[0])
+
+    selected_indices: list[int] = []
+    if grounded_indices:
+        selected_indices = list(
+            range(min(grounded_indices), max(grounded_indices) + 1)
+        )
+    else:
+        try:
+            selected_start = float(clip.get("start"))
+            selected_end = float(clip.get("end"))
+        except (TypeError, ValueError, OverflowError):
+            selected_start = selected_end = float("nan")
+        if (
+            math.isfinite(selected_start)
+            and math.isfinite(selected_end)
+            and selected_start >= 0.0
+            and selected_end > selected_start
+        ):
+            selected_indices = [
+                index
+                for index, segment in enumerate(segments)
+                if float(segment.get("end") or 0.0)
+                > selected_start + SPEECH_OWNERSHIP_EPSILON_SEC
+                and float(segment.get("start") or 0.0)
+                < selected_end - SPEECH_OWNERSHIP_EPSILON_SEC
+            ]
+            if selected_indices:
+                selected_indices = list(
+                    range(selected_indices[0], selected_indices[-1] + 1)
+                )
+    if not selected_indices:
+        return clip
+
+    selected = [segments[index] for index in selected_indices]
+    cue_ids = [
+        str(segment.get("cue_id") or f"cue-{selected_indices[offset]}")
+        for offset, segment in enumerate(selected)
+    ]
+    start_sec = float(selected[0].get("start") or 0.0)
+    end_sec = float(selected[-1].get("end") or start_sec)
+    if not (
+        cue_ids
+        and all(cue_ids)
+        and math.isfinite(start_sec)
+        and math.isfinite(end_sec)
+        and start_sec >= 0.0
+        and end_sec > start_sec
+    ):
+        return clip
+
+    clip["cue_ids"] = cue_ids
+    clip["start"] = start_sec
+    clip["end"] = end_sec
+    clip.pop("required_first_speech_sec", None)
+    clip.pop("required_last_speech_sec", None)
+    raw_projection = clip.get("edge_projection")
+    if isinstance(raw_projection, dict):
+        segment_by_id = {
+            str(segment.get("cue_id") or f"cue-{index}"): segment
+            for index, segment in enumerate(segments)
+        }
+        repaired_projection: dict[str, Any] = {}
+        for side in ("start", "end"):
+            details = raw_projection.get(side)
+            if not isinstance(details, dict):
+                continue
+            cue_id = str(details.get("cue_id") or "").strip()
+            quote = str(details.get("quote") or "").strip()
+            segment = segment_by_id.get(cue_id)
+            if (
+                cue_id in cue_ids
+                and segment is not None
+                and len(
+                    _quote_character_spans(
+                        str(segment.get("text") or ""), quote
+                    )
+                )
+                == 1
+            ):
+                repaired_projection[side] = dict(details)
+        if repaired_projection:
+            clip["edge_projection"] = repaired_projection
+        else:
+            clip.pop("edge_projection", None)
+    clip["boundary_repair_reason"] = "gemini_grounded_cue_recovery"
+    return clip
 
 
 def _required_speech_bounds(
@@ -2236,41 +2402,56 @@ def _verified_direct_adapter_clips(
     for raw_clip in list(engine_out.get("clips") or []):
         if not isinstance(raw_clip, dict):
             continue
+        candidate = _best_effort_gemini_transcript_clip(
+            transcript, raw_clip
+        )
+        gemini_authoritative = _gemini_selection_is_authoritative(candidate)
         try:
             quality_scores = (
-                float(raw_clip.get("informativeness")),
-                float(raw_clip.get("topic_relevance")),
-                float(raw_clip.get("educational_importance")),
+                float(candidate.get("informativeness")),
+                float(candidate.get("topic_relevance")),
+                float(candidate.get("educational_importance")),
             )
         except (TypeError, ValueError, OverflowError):
-            continue
-        clip_text = clip_engine_bridge.cue_text(transcript, raw_clip.get("cue_ids"))
-        if not clip_text:
-            clip_text = clip_engine_bridge.window_text(
-                transcript,
-                float(raw_clip.get("start") or 0.0),
-                float(raw_clip.get("end") or 0.0),
+            if not gemini_authoritative:
+                continue
+            quality_scores = (0.0, 0.0, 0.0)
+        if gemini_authoritative:
+            quality_scores = tuple(
+                score if math.isfinite(score) else 0.0
+                for score in quality_scores
             )
-        grounded_evidence_quote = _grounded_topic_evidence_quote(
-            clip_text, raw_clip.get("topic_evidence_quote")
+        clip_text = clip_engine_bridge.cue_text(
+            transcript, candidate.get("cue_ids")
         )
-        if (
+        if not clip_text:
+            try:
+                clip_text = clip_engine_bridge.window_text(
+                    transcript,
+                    float(candidate.get("start") or 0.0),
+                    float(candidate.get("end") or 0.0),
+                )
+            except (TypeError, ValueError, OverflowError):
+                clip_text = ""
+        grounded_evidence_quote = _grounded_topic_evidence_quote(
+            clip_text, candidate.get("topic_evidence_quote")
+        )
+        if not gemini_authoritative and (
             any(not math.isfinite(score) for score in quality_scores)
             or any(score < 0.75 for score in quality_scores)
-            or raw_clip.get("kind") != "educational"
-            or raw_clip.get("directly_teaches_topic") is not True
-            or raw_clip.get("substantive") is not True
-            or raw_clip.get("factually_grounded") is not True
-            or raw_clip.get("self_contained") is not True
-            or raw_clip.get("is_standalone") is not True
+            or candidate.get("kind") != "educational"
+            or candidate.get("directly_teaches_topic") is not True
+            or candidate.get("substantive") is not True
+            or candidate.get("factually_grounded") is not True
+            or candidate.get("self_contained") is not True
+            or candidate.get("is_standalone") is not True
             or any(
-                not str(raw_clip.get(field) or "").strip()
+                not str(candidate.get(field) or "").strip()
                 for field in ("title", "learning_objective", "facet", "reason")
             )
             or not grounded_evidence_quote
         ):
             continue
-        candidate = dict(raw_clip)
         candidate["_quality_scores"] = quality_scores
         candidate["_grounded_topic_evidence_quote"] = grounded_evidence_quote
         candidates.append(candidate)
@@ -2639,20 +2820,48 @@ def _verified_direct_adapter_clips(
         quality_mean = (
             informativeness + topic_relevance + educational_importance
         ) / 3.0
+        gemini_authoritative = _gemini_selection_is_authoritative(clip)
         search_context = dict(clip.get("search_context") or {})
+        if gemini_authoritative:
+            search_context.pop("surface_reason", None)
         search_context.update(
             selection_contract_version="quality_silence_v38",
+            **(
+                {"selection_authority": "gemini"}
+                if gemini_authoritative
+                else {}
+            ),
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
             informativeness=informativeness,
             topic_relevance=topic_relevance,
             educational_importance=educational_importance,
-            directly_teaches_topic=True,
-            substantive=True,
-            factually_grounded=True,
-            self_contained=True,
-            is_standalone=True,
+            directly_teaches_topic=(
+                bool(clip.get("directly_teaches_topic"))
+                if gemini_authoritative
+                else True
+            ),
+            substantive=(
+                bool(clip.get("substantive"))
+                if gemini_authoritative
+                else True
+            ),
+            factually_grounded=(
+                bool(clip.get("factually_grounded"))
+                if gemini_authoritative
+                else True
+            ),
+            self_contained=(
+                bool(clip.get("self_contained"))
+                if gemini_authoritative
+                else True
+            ),
+            is_standalone=(
+                bool(clip.get("is_standalone"))
+                if gemini_authoritative
+                else True
+            ),
             speech_corridor_verified=True,
             transcript_artifact_key=str(
                 transcript.get("artifact_key") or ""
@@ -2681,6 +2890,7 @@ def _verified_direct_adapter_clips(
             ).strip(),
             source_rank=0,
             surface_eligible=True,
+            deferred_level=False,
             boundary_status=("verified" if strict_acoustic else "context_aligned"),
             boundary_diagnostics={
                 "method": "energy_silence" if strict_acoustic else "transcript_context",
@@ -4025,7 +4235,11 @@ class IngestionPipeline:
                 transcript_end_sec=transcript_end,
             )
 
-            def verify_boundary(raw_clip: dict[str, Any]):
+            def verify_boundary(
+                raw_clip: dict[str, Any],
+                *,
+                allow_audio: bool = True,
+            ):
                 caption, complete_cue_bounds = _transcript_boundary_seed(
                     engine_out["transcript"], raw_clip
                 )
@@ -4148,7 +4362,12 @@ class IngestionPipeline:
                     start_two_sided,
                     end_two_sided,
                 ) = boundary_plan
-                if not require_acoustic_boundaries:
+                if not require_acoustic_boundaries or not allow_audio:
+                    fallback_reason = (
+                        "audio_refinement_deadline_exceeded"
+                        if require_acoustic_boundaries
+                        else "complete_discourse_boundary"
+                    )
                     transcript_boundary = _transcript_aligned_result(
                         clip_engine_silence.SilenceVerificationResult(
                             "unavailable",
@@ -4156,7 +4375,7 @@ class IngestionPipeline:
                             end_target,
                             {
                                 "stage": "transcript",
-                                "reason": "complete_discourse_boundary",
+                                "reason": fallback_reason,
                             },
                         ),
                         speech_bounds=speech_bounds,
@@ -4310,28 +4529,9 @@ class IngestionPipeline:
                             future.cancel()
                         for _future, index in unfinished:
                             clip = candidate_clips[index]
-                            caption, speech_bounds = _transcript_boundary_seed(
-                                engine_out["transcript"], clip
-                            )
-                            timeout_result = _transcript_aligned_result(
-                                clip_engine_silence.SilenceVerificationResult(
-                                    "unavailable",
-                                    speech_bounds[0],
-                                    speech_bounds[1],
-                                    {
-                                        "stage": "transcript",
-                                        "reason": "audio_refinement_deadline_exceeded",
-                                    },
-                                ),
-                                speech_bounds=speech_bounds,
-                                search_limits=speech_bounds,
-                                projection_diagnostics={},
-                            )
-                            yield index, (
-                                caption,
-                                timeout_result,
-                                {},
-                                speech_bounds,
+                            yield index, verify_boundary(
+                                clip,
+                                allow_audio=False,
                             )
                 finally:
                     boundary_executor.shutdown(wait=False, cancel_futures=True)
@@ -4348,13 +4548,23 @@ class IngestionPipeline:
                 raw_clip = candidate_clips[candidate_index]
                 clip = dict(raw_clip)
                 search_context = dict(clip.get("search_context") or {})
-                semantic_eligible = search_context.get("surface_eligible") is not False
+                gemini_authoritative = _gemini_selection_is_authoritative(clip)
+                if gemini_authoritative:
+                    search_context["selection_authority"] = "gemini"
+                    search_context.pop("surface_reason", None)
+                semantic_eligible = bool(
+                    gemini_authoritative
+                    or search_context.get("surface_eligible") is not False
+                )
                 prerequisite_ids = {
                     str(value or "").strip()
                     for value in (clip.get("prerequisite_ids") or [])
                     if str(value or "").strip()
                 }
-                prerequisites_ready = prerequisite_ids.issubset(surfaceable_candidate_ids)
+                prerequisites_ready = bool(
+                    gemini_authoritative
+                    or prerequisite_ids.issubset(surfaceable_candidate_ids)
+                )
                 surface_eligible = semantic_eligible and prerequisites_ready
                 boundary_verified_for_storage = False
                 permanently_rejected = False
@@ -4510,9 +4720,17 @@ class IngestionPipeline:
                 else:
                     search_context.setdefault("boundary_status", "caption_aligned")
 
-                if surface_eligible and bool(search_context.get("deferred_level")):
+                if (
+                    surface_eligible
+                    and not gemini_authoritative
+                    and bool(search_context.get("deferred_level"))
+                ):
                     surface_eligible = False
                     search_context["surface_reason"] = "level_mismatch"
+
+                if gemini_authoritative and surface_eligible:
+                    search_context["deferred_level"] = False
+                    search_context.pop("surface_reason", None)
 
                 search_context["surface_eligible"] = bool(surface_eligible)
                 clip["search_context"] = search_context
@@ -4898,7 +5116,13 @@ class IngestionPipeline:
             elif query_plan is not None or v.get("_topic_terms"):
                 generation_context.increment_counter("transcript_failures")
 
-        raw_clips = list(engine_out["clips"])
+        raw_clips = [
+            _best_effort_gemini_transcript_clip(transcript, clip)
+            if isinstance(clip, dict)
+            else clip
+            for clip in list(engine_out["clips"])
+        ]
+        engine_out = {**engine_out, "clips": raw_clips}
         if not raw_clips:
             if generation_context is not None:
                 generation_context.increment_counter("gemini_empty_results")
@@ -4913,17 +5137,22 @@ class IngestionPipeline:
                 return default
             return max(0.0, min(1.0, parsed)) if math.isfinite(parsed) else default
 
-        transcript_texts = [
-            (
-                clip_engine_bridge.cue_text(transcript, clip.get("cue_ids"))
-                or clip_engine_bridge.window_text(
+        def transcript_text(clip: dict[str, Any]) -> str:
+            cue_text = clip_engine_bridge.cue_text(
+                transcript, clip.get("cue_ids")
+            )
+            if cue_text:
+                return cue_text
+            try:
+                return clip_engine_bridge.window_text(
                     transcript,
                     float(clip.get("start") or 0.0),
                     float(clip.get("end") or 0.0),
                 )
-            )
-            for clip in raw_clips
-        ]
+            except (TypeError, ValueError, OverflowError):
+                return ""
+
+        transcript_texts = [transcript_text(clip) for clip in raw_clips]
         selector_topic_contracts = [
             any(
                 key in clip
@@ -4967,6 +5196,7 @@ class IngestionPipeline:
 
         kept: list[dict[str, Any]] = []
         for index, clip in enumerate(raw_clips):
+            gemini_authoritative = _gemini_selection_is_authoritative(clip)
             lexical_relevance = clip_engine_bridge.relevance_score(
                 clip, engine_out["transcript"], topic
             )
@@ -4981,7 +5211,7 @@ class IngestionPipeline:
             educational_importance = unit(
                 clip.get("educational_importance"), 0.0
             )
-            if (
+            if not gemini_authoritative and (
                 min(
                     informativeness,
                     topic_relevance,
@@ -4996,7 +5226,15 @@ class IngestionPipeline:
                 continue
             selector_topic_contract = selector_topic_contracts[index]
             grounded_evidence_quote = ""
-            if selector_topic_contract:
+            if gemini_authoritative:
+                grounded_evidence_quote = grounded_selector_quotes[index]
+                raw_evidence_quote = str(
+                    clip.get("topic_evidence_quote") or ""
+                ).strip()
+                evidence = [
+                    grounded_evidence_quote or raw_evidence_quote
+                ] if (grounded_evidence_quote or raw_evidence_quote) else []
+            elif selector_topic_contract:
                 grounded_evidence_quote = grounded_selector_quotes[index]
                 if (
                     clip.get("directly_teaches_topic") is not True
@@ -5016,7 +5254,7 @@ class IngestionPipeline:
                     topic_terms,
                     semantic_score=semantic_scores[index],
                 ) if topic_terms and trusted_transcript else []
-            if topic_terms and not evidence:
+            if not gemini_authoritative and topic_terms and not evidence:
                 if generation_context is not None:
                     generation_context.increment_counter("topic_rejections")
                 continue
@@ -5034,6 +5272,11 @@ class IngestionPipeline:
             )
             search_context = {
                 **dict(v.get("_search_context") or {}),
+                **(
+                    {"selection_authority": "gemini"}
+                    if gemini_authoritative
+                    else {}
+                ),
                 "topic_evidence_terms": evidence[:8],
                 "directly_teaches_topic": bool(
                     clip.get("directly_teaches_topic", bool(evidence))
@@ -5041,7 +5284,14 @@ class IngestionPipeline:
                 "substantive": bool(clip.get("substantive", bool(evidence))),
                 "factually_grounded": bool(clip.get("factually_grounded")),
                 "self_contained": bool(clip.get("self_contained")),
-                "topic_evidence_quote": grounded_evidence_quote,
+                "topic_evidence_quote": (
+                    grounded_evidence_quote
+                    or (
+                        str(clip.get("topic_evidence_quote") or "").strip()
+                        if gemini_authoritative
+                        else ""
+                    )
+                ),
                 "transcript_artifact_key": str(
                     engine_out["transcript"].get("artifact_key") or ""
                 ).strip(),
@@ -5049,11 +5299,17 @@ class IngestionPipeline:
                     engine_out["transcript"], clip
                 ),
                 "surface_eligible": True,
-                "deferred_level": not difficulty_matches_knowledge_level(
-                    difficulty,
-                    str(v.get("_knowledge_level") or ""),
+                "deferred_level": (
+                    False
+                    if gemini_authoritative
+                    else not difficulty_matches_knowledge_level(
+                        difficulty,
+                        str(v.get("_knowledge_level") or ""),
+                    )
                 ),
             }
+            if gemini_authoritative:
+                search_context.pop("surface_reason", None)
             if has_selector_metadata:
                 importance = educational_importance
                 boundary_confidence = unit(clip.get("boundary_confidence"), 0.5)
@@ -5152,6 +5408,8 @@ class IngestionPipeline:
                 aliases[candidate_id] = node_id
         dependencies: dict[str, set[str]] = {node_id: set() for node_id in nodes}
         for node_id, clip in nodes.items():
+            if _gemini_selection_is_authoritative(clip):
+                continue
             for prerequisite in clip.get("prerequisite_ids") or []:
                 prerequisite_id = str(prerequisite or "").strip()
                 if prerequisite_id:
@@ -5182,7 +5440,8 @@ class IngestionPipeline:
                     node_id
                     for node_id in eligible_nodes
                     if (
-                        not nodes[node_id].get("search_context", {}).get(
+                        _gemini_selection_is_authoritative(nodes[node_id])
+                        or not nodes[node_id].get("search_context", {}).get(
                             "selection_contract_version"
                         )
                         or (

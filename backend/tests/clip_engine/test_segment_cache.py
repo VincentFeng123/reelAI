@@ -255,6 +255,40 @@ def test_segment_cache_revalidates_public_clip_contract() -> None:
     ) is None
 
 
+def test_segment_cache_gemini_authority_bypasses_only_semantic_rejection() -> None:
+    transcript = _transcript()
+    authoritative = _clip()
+    authoritative.update({
+        "selection_authority": "gemini",
+        "informativeness": 0.1,
+        "topic_relevance": 0.2,
+        "educational_importance": 0.3,
+        "directly_teaches_topic": False,
+        "substantive": False,
+        "factually_grounded": False,
+        "topic_evidence_quote": "not grounded in this transcript",
+        "self_contained": False,
+        "is_standalone": False,
+        "kind": "intro",
+        "uncertainty": "high",
+        "uncertainty_reasons": ["topic_ambiguous"],
+        "intent_role": "supporting",
+        "intent_evidence": [],
+    })
+    duplicate = deepcopy(authoritative)
+    duplicate["sequence_index"] = 2
+
+    assert segment_cache._valid_clips(
+        [authoritative, duplicate], transcript=transcript, settings={}
+    ) == [authoritative, duplicate]
+
+    outside_media = deepcopy(authoritative)
+    outside_media["end"] = 11.0
+    assert segment_cache._valid_clips(
+        [outside_media], transcript=transcript, settings={}
+    ) is None
+
+
 def test_segment_cache_keeps_distinct_facets_inside_one_coarse_cue() -> None:
     transcript = _transcript()
     first = _clip()
