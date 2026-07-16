@@ -22,6 +22,7 @@ import time
 import wave
 from array import array
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, Mapping, Sequence
@@ -1004,6 +1005,7 @@ def _decode_window(
     ffmpeg_bin: str,
     deadline: float,
     cancel_check: CancelCheck | None,
+    max_duration_sec: float = EDGE_WINDOW_SEC,
 ) -> None:
     source_acquired = False
     while not source_acquired:
@@ -1021,7 +1023,7 @@ def _decode_window(
             timeout=min(0.1, remaining)
         )
     try:
-        duration = min(EDGE_WINDOW_SEC, max(0.01, window_duration_sec))
+        duration = min(max_duration_sec, max(0.01, window_duration_sec))
         transient_failures = 0
         transient_generation = -1
         while True:
@@ -1130,6 +1132,58 @@ def _decode_window(
             source._decode_state.slots.release()
     if not output_path.is_file() or output_path.stat().st_size <= 44:
         raise _Unavailable("decode", "empty_audio_window")
+
+
+@contextmanager
+def decode_audio_window(
+    source: PreparedAudioSource,
+    *,
+    window_start_sec: float,
+    window_end_sec: float,
+    max_duration_sec: float,
+    timeout_sec: float,
+    cancel_check: CancelCheck | None = None,
+    ffmpeg_bin: str = "ffmpeg",
+) -> Iterator[Path]:
+    """Yield one bounded 16 kHz mono PCM WAV and remove it on exit."""
+
+    try:
+        start = float(window_start_sec)
+        end = float(window_end_sec)
+        maximum = float(max_duration_sec)
+        timeout = float(timeout_sec)
+    except (TypeError, ValueError, OverflowError):
+        raise _Unavailable("decode", "invalid_audio_window") from None
+    if (
+        not all(math.isfinite(value) for value in (start, end, maximum, timeout))
+        or start < 0
+        or end <= start
+        or maximum <= 0
+        or end - start > maximum
+        or timeout <= 0
+    ):
+        raise _Unavailable("decode", "invalid_audio_window")
+    source_duration = source.duration_sec
+    if (
+        source_duration is not None
+        and math.isfinite(source_duration)
+        and end > source_duration + HANDOFF_TIMESTAMP_TOLERANCE_SEC
+    ):
+        raise _Unavailable("decode", "invalid_audio_window")
+
+    with tempfile.TemporaryDirectory(prefix="reelai_audio_window_") as temp_dir:
+        output_path = Path(temp_dir) / "window.wav"
+        _decode_window(
+            source,
+            window_start_sec=start,
+            window_duration_sec=end - start,
+            output_path=output_path,
+            ffmpeg_bin=ffmpeg_bin,
+            deadline=time.monotonic() + timeout,
+            cancel_check=cancel_check,
+            max_duration_sec=maximum,
+        )
+        yield output_path
 
 
 def _quiet_intervals(

@@ -33,6 +33,7 @@ import unicodedata
 import uuid
 from concurrent.futures import (
     FIRST_COMPLETED,
+    Future,
     ThreadPoolExecutor,
     TimeoutError as FutureTimeoutError,
     as_completed,
@@ -85,6 +86,7 @@ from .persistence import (
 from ..clip_engine import (  # noqa: F401
     bridge as clip_engine_bridge,
     config as clip_engine_config,
+    groq_boundary_asr as clip_engine_groq_boundary_asr,
     metadata as clip_engine_meta,
     run as clip_engine_run,
     search as clip_engine_search,
@@ -126,6 +128,9 @@ SPEECH_OWNERSHIP_EPSILON_SEC = 0.001
 MAX_PLAUSIBLE_CAPTION_WORDS_PER_SEC = 8.0
 CAPTION_PROJECTION_START_PREROLL_SEC = 0.15
 PROJECTED_END_COVERAGE_SEC = 0.002
+GROQ_BOUNDARY_WINDOW_SEC = 12.0
+GROQ_BOUNDARY_WINDOW_MARGIN_SEC = 2.0
+GROQ_BOUNDARY_TIMEOUT_SEC = 8.0
 _QUOTE_WORD_RE = re.compile(
     r"[\w+#]+(?:['\u2018\u2019\u02bc-][\w+#]+)*",
     re.UNICODE,
@@ -890,6 +895,9 @@ def _projected_speech_bounds(
     raw_clip: dict[str, Any],
     caption_diagnostics: dict[str, Any],
     prepared: object,
+    *,
+    lexical_words: tuple[object, ...] | None = None,
+    lexical_timing_source: str = "",
 ) -> tuple[tuple[float, float], dict[str, Any], str | None]:
     """Resolve selected speech edges from explicit native word onsets when available."""
     fallback = _required_speech_bounds(raw_clip, caption_diagnostics)
@@ -897,7 +905,11 @@ def _projected_speech_bounds(
     projections = edge_projection if isinstance(edge_projection, dict) else {}
 
     source = getattr(prepared, "source", None)
-    words = tuple(getattr(source, "lexical_words", ()) or ())
+    words = (
+        tuple(lexical_words)
+        if lexical_words is not None
+        else tuple(getattr(source, "lexical_words", ()) or ())
+    )
     if not words:
         if projections:
             segments = [
@@ -1132,7 +1144,12 @@ def _projected_speech_bounds(
                 )
                 context_start = float(selected.get("start") or 0.0)
                 context_end = float(following.get("end") or 0.0)
-        anchor = lexical_timing.align_edge_anchor(
+        edge_aligner = (
+            clip_engine_groq_boundary_asr.align_groq_edge_anchor
+            if lexical_timing_source == "groq_boundary_asr"
+            else lexical_timing.align_edge_anchor
+        )
+        anchor = edge_aligner(
             words,
             cue_text=context_text,
             quote=quote,
@@ -1217,6 +1234,11 @@ def _projected_speech_bounds(
             "mode": projection_mode,
             "required_speech_sec": round(required_sec, 3),
             "excluded_neighbor_onset_sec": round(excluded_sec, 3),
+            **(
+                {"timing_source": lexical_timing_source}
+                if anchor is not None and lexical_timing_source
+                else {}
+            ),
         }
 
     if (
@@ -1275,6 +1297,319 @@ def _projected_speech_bounds(
             ),
         },
         None,
+    )
+
+
+class _GroqBoundaryWordCache:
+    """Deduplicate short Groq ASR windows shared by concurrent clip edges."""
+
+    def __init__(self, prepared: object, *, source_end_sec: float) -> None:
+        self._prepared = prepared
+        self._source_end_sec = max(0.0, float(source_end_sec))
+        self._lock = threading.Lock()
+        self._entries: dict[
+            str,
+            list[tuple[float, float, Future[tuple[object, ...]]]],
+        ] = collections.defaultdict(list)
+
+    def _window(self, target_sec: float) -> tuple[float, float] | None:
+        if (
+            not math.isfinite(target_sec)
+            or self._source_end_sec <= 0.0
+            or target_sec < 0.0
+            or target_sec > self._source_end_sec + SPEECH_OWNERSHIP_EPSILON_SEC
+        ):
+            return None
+        duration = min(GROQ_BOUNDARY_WINDOW_SEC, self._source_end_sec)
+        start = max(0.0, target_sec - duration / 2.0)
+        end = min(self._source_end_sec, start + duration)
+        start = max(0.0, end - duration)
+        return (start, end) if end > start else None
+
+    def words_for_edge(
+        self,
+        *,
+        cue_id: str,
+        target_sec: float,
+        timeout_sec: float,
+        cancel_check: Callable[[], bool] | None,
+    ) -> tuple[object, ...]:
+        window = self._window(target_sec)
+        if window is None or not cue_id or timeout_sec <= 0.0:
+            return ()
+        window_start, window_end = window
+        owner = False
+        with self._lock:
+            future: Future[tuple[object, ...]] | None = None
+            for cached_start, cached_end, cached_future in self._entries[cue_id]:
+                same_window = (
+                    abs(cached_start - window_start)
+                    <= SPEECH_OWNERSHIP_EPSILON_SEC
+                    and abs(cached_end - window_end)
+                    <= SPEECH_OWNERSHIP_EPSILON_SEC
+                )
+                reusable_window = (
+                    cached_start <= target_sec <= cached_end
+                    and min(
+                        target_sec - cached_start,
+                        cached_end - target_sec,
+                    )
+                    >= min(
+                        GROQ_BOUNDARY_WINDOW_MARGIN_SEC,
+                        (cached_end - cached_start) / 4.0,
+                    )
+                )
+                if same_window or reusable_window:
+                    future = cached_future
+                    break
+            if future is None:
+                future = Future()
+                self._entries[cue_id].append((window_start, window_end, future))
+                owner = True
+        if owner:
+            try:
+                words = tuple(
+                    clip_engine_groq_boundary_asr.transcribe_boundary_words(
+                        self._prepared,
+                        window_start_sec=window_start,
+                        window_end_sec=window_end,
+                        timeout_sec=timeout_sec,
+                        cancel_check=cancel_check,
+                    )
+                    or ()
+                )
+            except Exception:
+                words = ()
+            future.set_result(words)
+            return words
+        try:
+            return tuple(future.result(timeout=timeout_sec) or ())
+        except Exception:
+            return ()
+
+    def words_for_clip(
+        self,
+        *,
+        raw_clip: dict[str, Any],
+        caption_diagnostics: dict[str, Any],
+        speech_bounds: tuple[float, float],
+        timeout_sec: float,
+        cancel_check: Callable[[], bool] | None,
+    ) -> tuple[object, ...]:
+        edge_projection = raw_clip.get("edge_projection")
+        projections = edge_projection if isinstance(edge_projection, dict) else {}
+        requests: list[tuple[str, float]] = []
+        for edge, target_sec in zip(("start", "end"), speech_bounds, strict=True):
+            marker = projections.get(edge)
+            quote = (
+                str(marker.get("quote") or "").strip()
+                if isinstance(marker, dict)
+                else str(raw_clip.get(f"{edge}_quote") or "").strip()
+            )
+            cue_id = (
+                str(marker.get("cue_id") or "").strip()
+                if isinstance(marker, dict)
+                else str(caption_diagnostics.get(f"{edge}_cue_id") or "").strip()
+            )
+            if quote and cue_id:
+                requests.append((cue_id, float(target_sec)))
+        if not requests:
+            return ()
+
+        deadline = time.monotonic() + timeout_sec
+        words: list[object] = []
+        for index, (cue_id, target_sec) in enumerate(requests):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            requests_left = len(requests) - index
+            edge_timeout = min(
+                GROQ_BOUNDARY_TIMEOUT_SEC,
+                remaining / requests_left,
+            )
+            words.extend(
+                self.words_for_edge(
+                    cue_id=cue_id,
+                    target_sec=target_sec,
+                    timeout_sec=edge_timeout,
+                    cancel_check=cancel_check,
+                )
+            )
+        unique: dict[tuple[str, float], object] = {}
+        for word in words:
+            try:
+                key = (
+                    str(getattr(word, "text")),
+                    round(float(getattr(word, "onset_sec")), 6),
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            unique[key] = word
+        return tuple(
+            sorted(
+                unique.values(),
+                key=lambda word: float(getattr(word, "onset_sec")),
+            )
+        )
+
+
+def _groq_boundary_request_count(raw_clip: dict[str, Any]) -> int:
+    edge_projection = raw_clip.get("edge_projection")
+    projections = edge_projection if isinstance(edge_projection, dict) else {}
+    return sum(
+        bool(
+            (
+                str(projections[edge].get("quote") or "").strip()
+                if isinstance(projections.get(edge), dict)
+                else str(raw_clip.get(f"{edge}_quote") or "").strip()
+            )
+        )
+        for edge in ("start", "end")
+    )
+
+
+def _groq_refine_without_silence(
+    acoustic: object,
+    *,
+    transcript: dict[str, Any],
+    raw_clip: dict[str, Any],
+    caption_diagnostics: dict[str, Any],
+    prepared: object,
+    speech_bounds: tuple[float, float],
+    projection_diagnostics: dict[str, Any],
+    search_limits: tuple[float, float],
+    source_end_sec: float,
+    sibling_clips: list[dict[str, Any]],
+    cache: _GroqBoundaryWordCache,
+    timeout_sec: float,
+    cancel_check: Callable[[], bool] | None,
+) -> tuple[object, tuple[float, float], dict[str, Any], tuple[float, float]]:
+    """Use short-window Groq word timing only when measured silence is absent."""
+
+    if bool(getattr(acoustic, "verified", False)) or not bool(
+        getattr(prepared, "ready", False)
+    ):
+        return acoustic, speech_bounds, projection_diagnostics, search_limits
+    words = cache.words_for_clip(
+        raw_clip=raw_clip,
+        caption_diagnostics=caption_diagnostics,
+        speech_bounds=speech_bounds,
+        timeout_sec=timeout_sec,
+        cancel_check=cancel_check,
+    )
+    attempt = {
+        "attempted": True,
+        "applied": False,
+        "word_count": len(words),
+    }
+    if not words:
+        return (
+            acoustic,
+            speech_bounds,
+            {**projection_diagnostics, "groq_boundary_asr": attempt},
+            search_limits,
+        )
+
+    refined_bounds, refined_projection, projection_error = _projected_speech_bounds(
+        transcript,
+        raw_clip,
+        caption_diagnostics,
+        prepared,
+        lexical_words=words,
+        lexical_timing_source="groq_boundary_asr",
+    )
+    applied_edges = [
+        edge
+        for edge in ("start", "end")
+        if isinstance(refined_projection.get(edge), dict)
+        and refined_projection[edge].get("timing_source") == "groq_boundary_asr"
+    ]
+    if projection_error or not applied_edges:
+        attempt["reason"] = projection_error or "quote_alignment_unavailable"
+        return (
+            acoustic,
+            speech_bounds,
+            {**projection_diagnostics, "groq_boundary_asr": attempt},
+            search_limits,
+        )
+
+    merged_bounds = (
+        refined_bounds[0] if "start" in applied_edges else speech_bounds[0],
+        refined_bounds[1] if "end" in applied_edges else speech_bounds[1],
+    )
+    merged_projection = {
+        **projection_diagnostics,
+        **{
+            edge: refined_projection[edge]
+            for edge in applied_edges
+        },
+        "lexical_boundary_verified": True,
+        **(
+            {"lexical_projection_verified": True}
+            if any(
+                refined_projection[edge].get("mode") == "projected"
+                for edge in applied_edges
+            )
+            else {}
+        ),
+    }
+
+    refined_bounds, refined_projection, context_error = _apply_selector_acoustic_context(
+        transcript,
+        raw_clip,
+        merged_projection,
+        merged_bounds,
+        sibling_clips=sibling_clips,
+    )
+    if context_error:
+        attempt["reason"] = context_error
+        return (
+            acoustic,
+            speech_bounds,
+            {**projection_diagnostics, "groq_boundary_asr": attempt},
+            search_limits,
+        )
+    refined_start_limit, refined_end_limit, corridor_error = _selected_speech_corridor(
+        transcript,
+        raw_clip,
+        caption_diagnostics,
+        source_end_sec=source_end_sec,
+        required_speech_bounds=refined_bounds,
+        projection_diagnostics=refined_projection,
+    )
+    if corridor_error:
+        attempt["reason"] = corridor_error
+        return (
+            acoustic,
+            speech_bounds,
+            {**projection_diagnostics, "groq_boundary_asr": attempt},
+            search_limits,
+        )
+
+    attempt.update({"applied": True, "edges": applied_edges})
+    refined_projection = {
+        **refined_projection,
+        "groq_boundary_asr": attempt,
+    }
+    prior = dict(getattr(acoustic, "diagnostics", {}) or {})
+    refined_acoustic = clip_engine_silence.SilenceVerificationResult(
+        "unavailable",
+        refined_bounds[0],
+        refined_bounds[1],
+        {
+            **prior,
+            "pre_groq_stage": str(prior.get("stage") or ""),
+            "pre_groq_reason": str(prior.get("reason") or ""),
+            "stage": "groq_boundary_asr",
+            "reason": "silence_not_detected_word_timing",
+            "groq_boundary_asr": attempt,
+        },
+    )
+    return (
+        refined_acoustic,
+        refined_bounds,
+        refined_projection,
+        (refined_start_limit, refined_end_limit),
     )
 
 
@@ -2819,6 +3154,13 @@ def _verified_direct_adapter_clips(
         prepared,
         transcript_end_sec=transcript_end,
     )
+    groq_boundary_cache = _GroqBoundaryWordCache(
+        prepared,
+        source_end_sec=media_end,
+    )
+    direct_verification_deadline = (
+        time.monotonic() + clip_engine_silence.DEEP_PHASE_TIMEOUT_SEC
+    )
 
     def verify(raw_clip: dict[str, Any]):
         diagnostics, complete_cue_bounds = _transcript_boundary_seed(
@@ -2943,7 +3285,14 @@ def _verified_direct_adapter_clips(
             start_two_sided,
             end_two_sided,
         ) = boundary_plan
-        if bool(getattr(prepared, "ready", False)):
+        remaining_verification_sec = direct_verification_deadline - time.monotonic()
+        groq_request_count = _groq_boundary_request_count(raw_clip)
+        groq_reserve_sec = min(
+            max(0.0, remaining_verification_sec) / 2.0,
+            groq_request_count * GROQ_BOUNDARY_TIMEOUT_SEC,
+        )
+        acoustic_timeout_sec = remaining_verification_sec - groq_reserve_sec
+        if bool(getattr(prepared, "ready", False)) and acoustic_timeout_sec > 0.0:
             acoustic = clip_engine_silence.verify_acoustic_boundaries(
                 source_url,
                 start_target,
@@ -2956,6 +3305,7 @@ def _verified_direct_adapter_clips(
                 require_start_two_sided=start_two_sided,
                 require_end_two_sided=end_two_sided,
                 prepared=prepared,
+                timeout_sec=acoustic_timeout_sec,
                 cancel_check=should_cancel,
             )
         else:
@@ -2965,7 +3315,11 @@ def _verified_direct_adapter_clips(
                 end_target,
                 {
                     "stage": "transcript",
-                    "reason": "complete_discourse_boundary",
+                    "reason": (
+                        "audio_refinement_deadline_exceeded"
+                        if bool(getattr(prepared, "ready", False))
+                        else "complete_discourse_boundary"
+                    ),
                 },
             )
         if (
@@ -3001,6 +3355,31 @@ def _verified_direct_adapter_clips(
                     "stage": "semantic_corridor",
                     "reason": "acoustic_refinement_unsafe",
                 },
+            )
+        remaining_for_groq = direct_verification_deadline - time.monotonic()
+        if remaining_for_groq > 0.0:
+            (
+                acoustic,
+                speech_bounds,
+                projection,
+                (search_start_limit, search_end_limit),
+            ) = _groq_refine_without_silence(
+                acoustic,
+                transcript=transcript,
+                raw_clip=raw_clip,
+                caption_diagnostics=diagnostics,
+                prepared=prepared,
+                speech_bounds=speech_bounds,
+                projection_diagnostics=projection,
+                search_limits=(search_start_limit, search_end_limit),
+                source_end_sec=media_end,
+                sibling_clips=candidates,
+                cache=groq_boundary_cache,
+                timeout_sec=min(
+                    max(1, groq_request_count) * GROQ_BOUNDARY_TIMEOUT_SEC,
+                    remaining_for_groq,
+                ),
+                cancel_check=should_cancel,
             )
         acoustic = _transcript_aligned_result(
             acoustic,
@@ -4561,11 +4940,18 @@ class IngestionPipeline:
                 source_key = str(v.get("id") or "")
                 verification_deadline = acoustic_verification_deadlines.setdefault(
                     source_key,
-                    time.monotonic() + acoustic_phase_timeout_sec,
+                    min(
+                        deadline,
+                        time.monotonic() + acoustic_phase_timeout_sec,
+                    ),
                 )
             media_end = _prepared_media_end_sec(
                 prepared_audio,
                 transcript_end_sec=transcript_end,
+            )
+            groq_boundary_cache = _GroqBoundaryWordCache(
+                prepared_audio,
+                source_end_sec=media_end,
             )
 
             def verify_boundary(
@@ -4720,7 +5106,15 @@ class IngestionPipeline:
                 remaining_verification_sec = (
                     verification_deadline - time.monotonic()
                 )
-                if remaining_verification_sec <= 0:
+                groq_request_count = _groq_boundary_request_count(raw_clip)
+                groq_reserve_sec = min(
+                    remaining_verification_sec / 2.0,
+                    groq_request_count * GROQ_BOUNDARY_TIMEOUT_SEC,
+                )
+                acoustic_timeout_sec = (
+                    remaining_verification_sec - groq_reserve_sec
+                )
+                if acoustic_timeout_sec <= 0:
                     transcript_boundary = _transcript_aligned_result(
                         clip_engine_silence.SilenceVerificationResult(
                             "unavailable",
@@ -4748,7 +5142,7 @@ class IngestionPipeline:
                     require_start_two_sided=start_two_sided,
                     require_end_two_sided=end_two_sided,
                     prepared=prepared_audio,
-                    timeout_sec=remaining_verification_sec,
+                    timeout_sec=acoustic_timeout_sec,
                     cancel_check=should_cancel,
                 )
                 if (
@@ -4785,6 +5179,38 @@ class IngestionPipeline:
                             "reason": "acoustic_refinement_unsafe",
                         },
                     )
+                remaining_for_groq = verification_deadline - time.monotonic()
+                if remaining_for_groq <= 0.0:
+                    acoustic = _transcript_aligned_result(
+                        acoustic,
+                        speech_bounds=speech_bounds,
+                        search_limits=(search_start_limit, search_end_limit),
+                        projection_diagnostics=projection,
+                    )
+                    return caption, acoustic, projection, speech_bounds
+                (
+                    acoustic,
+                    speech_bounds,
+                    projection,
+                    (search_start_limit, search_end_limit),
+                ) = _groq_refine_without_silence(
+                    acoustic,
+                    transcript=engine_out["transcript"],
+                    raw_clip=raw_clip,
+                    caption_diagnostics=caption,
+                    prepared=prepared_audio,
+                    speech_bounds=speech_bounds,
+                    projection_diagnostics=projection,
+                    search_limits=(search_start_limit, search_end_limit),
+                    source_end_sec=media_end,
+                    sibling_clips=candidate_clips,
+                    cache=groq_boundary_cache,
+                    timeout_sec=min(
+                        max(1, groq_request_count) * GROQ_BOUNDARY_TIMEOUT_SEC,
+                        remaining_for_groq,
+                    ),
+                    cancel_check=should_cancel,
+                )
                 acoustic = _transcript_aligned_result(
                     acoustic,
                     speech_bounds=speech_bounds,
