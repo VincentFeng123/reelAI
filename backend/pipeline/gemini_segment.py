@@ -9066,7 +9066,11 @@ def _plan_to_report(
         )
 
     ignore_caption_case = bool(settings.get("_segment_ignore_caption_case", True))
-    video_grounded = bool(str(settings.get("_segment_video_url") or "").strip())
+    video_grounded = (
+        bool(settings.get("_segment_video_grounded"))
+        if "_segment_video_grounded" in settings
+        else bool(settings.get("_segment_video_grounding_required"))
+    )
     raw: list[dict] = []
     seen_candidate_ids: set[str] = set()
 
@@ -11551,10 +11555,10 @@ def _boundary_selector_content(
     *,
     media_end_sec: float,
 ) -> tuple[str | list, object | None, bool]:
-    """Build one public-YouTube video Part followed by its transcript prompt."""
+    """Attach public YouTube media only for explicit video-grounding requests."""
     required = bool(settings.get("_segment_video_grounding_required"))
     video_url = str(settings.get("_segment_video_url") or "").strip()
-    if not required and not video_url:
+    if not required:
         return transcript_prompt, None, False
     if not video_url:
         raise ValueError("video-grounded boundary selection requires a YouTube URL")
@@ -11604,7 +11608,6 @@ def _run_selection_profile(
     boundary_profile = profile in {FLASH_SPLIT_PROFILE, PRO_BOUNDARY_PROFILE}
     video_grounding_requested = boundary_profile and bool(
         settings.get("_segment_video_grounding_required")
-        or str(settings.get("_segment_video_url") or "").strip()
     )
     if profile == PRODUCTION_PRO_PROFILE:
         system, user = _legacy_prompts(rendered, len(segments), topic)
@@ -11702,10 +11705,9 @@ def _run_selection_profile(
         cancelled=cancelled,
         budget_reserve=settings.get("_segment_budget_reserve"),
         budget_reconcile=settings.get("_segment_budget_reconcile"),
-        # Normal production still dispatches one Pro request. A confirmed 503
-        # capacity failure may retry that same request once inside the existing
-        # deadline; every other failure stays single-attempt and there is no
-        # lower-quality model failover.
+        # Production transcript selection is single-attempt. Only an explicit
+        # video-grounded Pro evaluation may retry one confirmed 503 inside the
+        # existing deadline; there is no lower-quality model failover.
         max_retries=1 if retry_pro_capacity_once else 0,
         retry_status_codes=(
             frozenset({503}) if retry_pro_capacity_once else None
@@ -11718,8 +11720,10 @@ def _run_selection_profile(
         media_resolution=media_resolution,
         estimated_media_tokens=estimated_media_tokens,
     )
+    call["video_grounded"] = video_grounded
     require_enrichment = profile in {CORRECTED_PRO_PROFILE, FLASH_SINGLE_PROFILE}
     conversion_settings = dict(settings)
+    conversion_settings["_segment_video_grounded"] = video_grounded
     conversion_settings.setdefault(
         "_segment_ignore_caption_case",
         str(transcript.get("source") or "").casefold() == "supadata",

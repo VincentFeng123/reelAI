@@ -292,10 +292,9 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
         assert gemini_calls[0]["model"] == gemini_segment.config.SEGMENT_PRO_MODEL
         assert gemini_calls[0]["thinking_level"] == "medium"
         assert "timestamped transcripts" in gemini_calls[0]["system"]
-        selector_text = "\n".join(
-            str(getattr(part, "text", "") or "")
-            for part in gemini_calls[0]["user"]
-        )
+        assert isinstance(gemini_calls[0]["user"], str)
+        assert gemini_calls[0]["media_resolution"] is None
+        selector_text = gemini_calls[0]["user"]
         assert "[0] 00:05 Python variables store values" in selector_text
 
         artifacts = list(cache.transcript_rows.values())

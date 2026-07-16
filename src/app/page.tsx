@@ -8,7 +8,7 @@ import { FullscreenLoadingScreen } from "@/components/FullscreenLoadingScreen";
 import { ViewportModalPortal } from "@/components/ViewportModalPortal";
 import {
   COMMUNITY_AUTH_CHANGED_EVENT,
-  clearCommunityAuthSession,
+  expireCommunityAuthSession,
   fetchCommunityAccount,
   fetchCommunityHistory,
   fetchCommunitySettings,
@@ -442,7 +442,7 @@ function HomePageContent() {
           return;
         }
         if (isSessionExpiredError(error)) {
-          clearCommunityAuthSession();
+          expireCommunityAuthSession();
           setCommunityAccount(null);
         }
       }
@@ -485,7 +485,7 @@ function HomePageContent() {
           return;
         }
         if (isSessionExpiredError(error)) {
-          clearCommunityAuthSession();
+          expireCommunityAuthSession();
           setCommunityAccount(null);
         }
       }
@@ -656,7 +656,7 @@ function HomePageContent() {
     }
     void queueCommunityHistorySync(next).catch((error) => {
       if (isSessionExpiredError(error)) {
-        clearCommunityAuthSession();
+        expireCommunityAuthSession();
         setCommunityAccount(null);
       }
     });
@@ -669,7 +669,7 @@ function HomePageContent() {
     }
     void queueCommunitySettingsSync(settings).catch((error) => {
       if (isSessionExpiredError(error)) {
-        clearCommunityAuthSession();
+        expireCommunityAuthSession();
         setCommunityAccount(null);
       }
     });
@@ -726,7 +726,7 @@ function HomePageContent() {
         writeScopedHistorySnapshot(scopedAccountId, JSON.stringify([]));
         void queueCommunityHistorySync([]).catch((error) => {
           if (isSessionExpiredError(error)) {
-            clearCommunityAuthSession();
+            expireCommunityAuthSession();
             setCommunityAccount(null);
           }
         });

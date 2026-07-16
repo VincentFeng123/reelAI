@@ -230,8 +230,7 @@ function readCommunitySessionToken(): string {
   }
 }
 
-function communitySessionHeaders(): HeadersInit {
-  const sessionToken = readCommunitySessionToken();
+function communitySessionHeaders(sessionToken = readCommunitySessionToken()): HeadersInit {
   return sessionToken ? { [COMMUNITY_SESSION_HEADER]: sessionToken } : {};
 }
 
@@ -304,6 +303,10 @@ function saveCommunityAuthSessionStorage(session: StoredCommunityAuthSession | n
 
 export function clearCommunityAuthSession(): void {
   clearCommunityOwnerKey();
+  expireCommunityAuthSession();
+}
+
+export function expireCommunityAuthSession(): void {
   saveCommunityAuthSessionStorage(null);
 }
 
@@ -329,6 +332,58 @@ export function readCommunityAuthSession(): CommunityAuthSession | null {
     };
   } catch {
     return null;
+  }
+}
+
+export type CommunitySessionContext = Readonly<{
+  accountId: string;
+  sessionToken: string;
+}>;
+
+function normalizeCommunitySessionContext(
+  context: CommunitySessionContext | null | undefined,
+): CommunitySessionContext | null {
+  const accountId = (context?.accountId || "").trim();
+  const sessionToken = (context?.sessionToken || "").trim();
+  if (!accountId || sessionToken.length < 24) {
+    return null;
+  }
+  return { accountId, sessionToken };
+}
+
+export function captureCommunitySessionContext(): CommunitySessionContext | null {
+  const stored = readCommunityAuthSession();
+  return normalizeCommunitySessionContext(stored
+    ? {
+        accountId: stored.account.id,
+        sessionToken: stored.sessionToken,
+      }
+    : null);
+}
+
+function isCurrentCommunitySession(context: CommunitySessionContext): boolean {
+  const current = captureCommunitySessionContext();
+  return current?.accountId === context.accountId && current.sessionToken === context.sessionToken;
+}
+
+class CommunitySessionSupersededError extends Error {
+  constructor() {
+    super("Community session changed while the request was in flight.");
+    this.name = "CommunitySessionSupersededError";
+  }
+}
+
+function requireCurrentCommunitySession(context: CommunitySessionContext): void {
+  if (!isCurrentCommunitySession(context)) {
+    throw new CommunitySessionSupersededError();
+  }
+}
+
+function invalidateCurrentCommunitySession(context: CommunitySessionContext): void {
+  if (isCurrentCommunitySession(context)) {
+    // A stale community login must not rotate the device owner identity used by
+    // anonymous generation and ownership-scoped requests.
+    saveCommunityAuthSessionStorage(null);
   }
 }
 
@@ -630,29 +685,31 @@ export async function changeCommunityVerificationEmail(params: {
 }
 
 export async function fetchCommunityAccount(): Promise<CommunityAccount | null> {
-  const stored = readCommunityAuthSession();
-  if (!stored?.sessionToken) {
+  const sessionContext = captureCommunitySessionContext();
+  if (!sessionContext) {
     return null;
   }
   try {
     const res = await safeFetch(apiUrl("/community/auth/me"), {
       cache: "no-store",
-      headers: { ...communitySessionHeaders() },
+      headers: { ...communitySessionHeaders(sessionContext.sessionToken) },
     });
     const json = await parseJsonResponse<{ account?: unknown }>(res);
+    requireCurrentCommunitySession(sessionContext);
     const account = normalizeCommunityAccount(json?.account);
-    if (!account) {
-      clearCommunityAuthSession();
+    if (!account || account.id !== sessionContext.accountId) {
+      invalidateCurrentCommunitySession(sessionContext);
       return null;
     }
     saveCommunityAuthSessionStorage({
       account,
-      sessionToken: stored.sessionToken,
+      sessionToken: sessionContext.sessionToken,
     });
     return account;
   } catch (error) {
     if (isSessionExpiredError(error)) {
-      clearCommunityAuthSession();
+      requireCurrentCommunitySession(sessionContext);
+      invalidateCurrentCommunitySession(sessionContext);
       return null;
     }
     throw error;
@@ -690,7 +747,7 @@ export async function deleteCommunityAccount(params: {
   } catch (error) {
     if (error instanceof Error && /session expired|sign in/i.test(error.message)) {
       clearOwnedCommunitySetIds();
-      clearCommunityAuthSession();
+      expireCommunityAuthSession();
     }
     throw error;
   }
@@ -1787,29 +1844,41 @@ function normalizeCommunitySettings(raw: unknown): StudyReelsSettings {
 }
 
 export async function fetchCommunityHistory(): Promise<StoredHistoryItem[]> {
-  const stored = readCommunityAuthSession();
-  if (!stored?.sessionToken) {
+  const sessionContext = captureCommunitySessionContext();
+  if (!sessionContext) {
     return [];
   }
-  const res = await safeFetch(apiUrl("/community/history"), {
-    cache: "no-store",
-    headers: { ...communitySessionHeaders() },
-  });
-  const json = await parseJsonResponse<{ items?: unknown[] }>(res);
-  const rows = Array.isArray(json?.items) ? json.items : [];
-  return rows.map(normalizeStoredHistoryItem).filter(Boolean) as StoredHistoryItem[];
+  try {
+    const res = await safeFetch(apiUrl("/community/history"), {
+      cache: "no-store",
+      headers: { ...communitySessionHeaders(sessionContext.sessionToken) },
+    });
+    const json = await parseJsonResponse<{ items?: unknown[] }>(res);
+    requireCurrentCommunitySession(sessionContext);
+    const rows = Array.isArray(json?.items) ? json.items : [];
+    return rows.map(normalizeStoredHistoryItem).filter(Boolean) as StoredHistoryItem[];
+  } catch (error) {
+    if (isSessionExpiredError(error)) {
+      requireCurrentCommunitySession(sessionContext);
+      invalidateCurrentCommunitySession(sessionContext);
+      throw new CommunitySessionSupersededError();
+    }
+    throw error;
+  }
 }
 
-export async function replaceCommunityHistory(items: StoredHistoryItem[]): Promise<StoredHistoryItem[]> {
-  const stored = readCommunityAuthSession();
-  if (!stored?.sessionToken) {
+async function replaceCommunityHistoryForSession(
+  items: StoredHistoryItem[],
+  sessionContext: CommunitySessionContext,
+): Promise<StoredHistoryItem[]> {
+  if (!isCurrentCommunitySession(sessionContext)) {
     return items;
   }
   const res = await safeFetch(apiUrl("/community/history"), {
     method: "PUT",
     headers: {
       "Content-Type": "application/json",
-      ...communitySessionHeaders(),
+      ...communitySessionHeaders(sessionContext.sessionToken),
     },
     body: JSON.stringify({
       items: items.map((item) => ({
@@ -1839,11 +1908,29 @@ export async function replaceCommunityHistory(items: StoredHistoryItem[]): Promi
     }),
   });
   const json = await parseJsonResponse<{ items?: unknown[] }>(res);
+  if (!isCurrentCommunitySession(sessionContext)) {
+    return items;
+  }
   const rows = Array.isArray(json?.items) ? json.items : [];
   return rows.map(normalizeStoredHistoryItem).filter(Boolean) as StoredHistoryItem[];
 }
 
-export function queueCommunityHistorySync(items: StoredHistoryItem[]): Promise<void> {
+export async function replaceCommunityHistory(items: StoredHistoryItem[]): Promise<StoredHistoryItem[]> {
+  const sessionContext = captureCommunitySessionContext();
+  if (!sessionContext) {
+    return items;
+  }
+  return replaceCommunityHistoryForSession(items, sessionContext);
+}
+
+export function queueCommunityHistorySync(
+  items: StoredHistoryItem[],
+  expectedSession: CommunitySessionContext | null = captureCommunitySessionContext(),
+): Promise<void> {
+  const sessionContext = normalizeCommunitySessionContext(expectedSession);
+  if (!sessionContext) {
+    return Promise.resolve();
+  }
   const snapshot = items.map((item) => ({ ...item }));
   const syncVersion = communityHistorySyncVersion + 1;
   communityHistorySyncVersion = syncVersion;
@@ -1852,36 +1939,57 @@ export function queueCommunityHistorySync(items: StoredHistoryItem[]): Promise<v
       // Keep the queue alive after a prior failed sync.
     })
     .then(async () => {
-      if (syncVersion !== communityHistorySyncVersion) {
+      if (syncVersion !== communityHistorySyncVersion || !isCurrentCommunitySession(sessionContext)) {
         return;
       }
-      await replaceCommunityHistory(snapshot);
+      try {
+        await replaceCommunityHistoryForSession(snapshot, sessionContext);
+      } catch (error) {
+        if (isSessionExpiredError(error)) {
+          invalidateCurrentCommunitySession(sessionContext);
+          return;
+        }
+        throw error;
+      }
     });
   return communityHistorySyncChain;
 }
 
 export async function fetchCommunitySettings(): Promise<StudyReelsSettings | null> {
-  const stored = readCommunityAuthSession();
-  if (!stored?.sessionToken) {
+  const sessionContext = captureCommunitySessionContext();
+  if (!sessionContext) {
     return null;
   }
-  const res = await safeFetch(apiUrl("/community/settings"), {
-    cache: "no-store",
-    headers: { ...communitySessionHeaders() },
-  });
-  return normalizeCommunitySettings(await parseJsonResponse<unknown>(res));
+  try {
+    const res = await safeFetch(apiUrl("/community/settings"), {
+      cache: "no-store",
+      headers: { ...communitySessionHeaders(sessionContext.sessionToken) },
+    });
+    const json = await parseJsonResponse<unknown>(res);
+    requireCurrentCommunitySession(sessionContext);
+    return normalizeCommunitySettings(json);
+  } catch (error) {
+    if (isSessionExpiredError(error)) {
+      requireCurrentCommunitySession(sessionContext);
+      invalidateCurrentCommunitySession(sessionContext);
+      throw new CommunitySessionSupersededError();
+    }
+    throw error;
+  }
 }
 
-export async function replaceCommunitySettings(settings: StudyReelsSettings): Promise<StudyReelsSettings> {
-  const stored = readCommunityAuthSession();
-  if (!stored?.sessionToken) {
+async function replaceCommunitySettingsForSession(
+  settings: StudyReelsSettings,
+  sessionContext: CommunitySessionContext,
+): Promise<StudyReelsSettings> {
+  if (!isCurrentCommunitySession(sessionContext)) {
     return settings;
   }
   const res = await safeFetch(apiUrl("/community/settings"), {
     method: "PUT",
     headers: {
       "Content-Type": "application/json",
-      ...communitySessionHeaders(),
+      ...communitySessionHeaders(sessionContext.sessionToken),
     },
     body: JSON.stringify({
       generation_mode: settings.generationMode,
@@ -1892,13 +2000,26 @@ export async function replaceCommunitySettings(settings: StudyReelsSettings): Pr
       preferred_video_duration: settings.preferredVideoDuration,
     }),
   });
-  return normalizeCommunitySettings(await parseJsonResponse<unknown>(res));
+  const normalized = normalizeCommunitySettings(await parseJsonResponse<unknown>(res));
+  return isCurrentCommunitySession(sessionContext) ? normalized : settings;
+}
+
+export async function replaceCommunitySettings(settings: StudyReelsSettings): Promise<StudyReelsSettings> {
+  const sessionContext = captureCommunitySessionContext();
+  if (!sessionContext) {
+    return settings;
+  }
+  return replaceCommunitySettingsForSession(settings, sessionContext);
 }
 
 let communitySettingsSyncVersion = 0;
 let communitySettingsSyncChain: Promise<void> = Promise.resolve();
 
 export function queueCommunitySettingsSync(settings: StudyReelsSettings): Promise<void> {
+  const sessionContext = captureCommunitySessionContext();
+  if (!sessionContext) {
+    return Promise.resolve();
+  }
   const snapshot = { ...settings };
   const syncVersion = communitySettingsSyncVersion + 1;
   communitySettingsSyncVersion = syncVersion;
@@ -1907,10 +2028,18 @@ export function queueCommunitySettingsSync(settings: StudyReelsSettings): Promis
       // Keep the queue alive after a prior failed sync.
     })
     .then(async () => {
-      if (syncVersion !== communitySettingsSyncVersion) {
+      if (syncVersion !== communitySettingsSyncVersion || !isCurrentCommunitySession(sessionContext)) {
         return;
       }
-      await replaceCommunitySettings(snapshot);
+      try {
+        await replaceCommunitySettingsForSession(snapshot, sessionContext);
+      } catch (error) {
+        if (isSessionExpiredError(error)) {
+          invalidateCurrentCommunitySession(sessionContext);
+          return;
+        }
+        throw error;
+      }
     });
   return communitySettingsSyncChain;
 }

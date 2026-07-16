@@ -7,7 +7,7 @@ import { useRouter } from "next/navigation";
 import {
   COMMUNITY_AUTH_CHANGED_EVENT,
   COMMUNITY_OWNED_SET_IDS_STORAGE_KEY,
-  clearCommunityAuthSession,
+  expireCommunityAuthSession,
   createCommunitySet,
   deleteCommunitySet,
   fetchCommunityAccount,
@@ -1174,7 +1174,7 @@ export function CommunityReelsPanel({
           return;
         }
         if (isSessionExpiredError(error)) {
-          clearCommunityAuthSession();
+          expireCommunityAuthSession();
           setCommunityAccount(null);
           ownedSetsAccountIdRef.current = null;
           clearOwnedCommunityState();
@@ -2343,7 +2343,7 @@ export function CommunityReelsPanel({
     } catch (error) {
       const message = error instanceof Error ? error.message : isFormEditMode ? "Could not update community set." : "Could not post community set.";
       if (isSessionExpiredError(error)) {
-        clearCommunityAuthSession();
+        expireCommunityAuthSession();
         setCommunityAccount(null);
         ownedSetsAccountIdRef.current = null;
         clearOwnedCommunityState();
@@ -2742,7 +2742,7 @@ export function CommunityReelsPanel({
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not delete this set.";
       if (isSessionExpiredError(error)) {
-        clearCommunityAuthSession();
+        expireCommunityAuthSession();
         setCommunityAccount(null);
         ownedSetsAccountIdRef.current = null;
         clearOwnedCommunityState();

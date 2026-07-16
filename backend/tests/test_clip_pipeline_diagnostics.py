@@ -599,7 +599,11 @@ def test_topic_generation_streams_independent_acoustic_passes_immediately_but_re
     boundary = persisted_by_candidate["one"]["search_context"]
     assert boundary["boundary_status"] == "verified"
     assert boundary["surface_eligible"] is True
-    assert boundary["boundary_diagnostics"] == {
+    boundary_diagnostics = dict(boundary["boundary_diagnostics"])
+    lexical_projection = boundary_diagnostics.pop("lexical_projection")
+    assert lexical_projection["acoustic_context"]["context_cue_ids"] == ["one"]
+    assert lexical_projection["acoustic_context"]["search_end_limit_sec"] == 13.0
+    assert boundary_diagnostics == {
         "method": "energy_silence",
         "acoustic_verified": True,
         "final_range": [0.0, 10.0],
@@ -638,10 +642,135 @@ def test_topic_generation_streams_independent_acoustic_passes_immediately_but_re
     assert {
         (call.kwargs["search_start_limit_sec"], call.kwargs["search_end_limit_sec"])
         for call in verify_audio_mock.call_args_list
-    } == {(0.0, 10.0), (10.0, 20.0), (20.0, 30.0)}
+    } == {(0.0, 13.0), (7.0, 23.0), (17.0, 30.0)}
     assert context.counters()["stored_clips"] == 3
     assert context.counters()["deferred_clips"] == 0
     assert context.counters()["persisted_clips"] == 3
+
+
+def test_ingest_topic_persists_expanded_same_objective_acoustic_context(
+    monkeypatch,
+) -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:durable-acoustic-context",
+        "duration": 20.0,
+        "segments": [
+            {
+                "cue_id": "setup",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "A Python closure retains its enclosing scope, making",
+            },
+            {
+                "cue_id": "core",
+                "start": 10.0,
+                "end": 20.0,
+                "text": "its enclosing scope available to later calls.",
+            },
+        ],
+    }
+    clip = _quality_clip(
+        cue_id="core",
+        start=10.0,
+        end=20.0,
+        quote="its enclosing scope available to later calls",
+        candidate_id="closure-scope",
+        title="Python closure scope",
+        learning_objective=(
+            "Explain how a Python closure retains its enclosing scope."
+        ),
+        facet="closure scope",
+        reason="Explains how closure scope remains available to later calls.",
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: _discovery(),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_clip",
+        lambda *_args, **_kwargs: {
+            "clips": [clip],
+            "transcript": transcript,
+            "notes": "",
+        },
+    )
+    prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+        "ready",
+        source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a",
+            duration_sec=20.0,
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=prepared),
+    )
+    verify = mock.Mock(
+        return_value=pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "verified",
+            0.0,
+            20.0,
+            {
+                "threshold_dbfs": -38.0,
+                "start_quiet": [0.0, 0.2],
+                "end_quiet": [19.9, 20.1],
+                "start_speech_handoff_verified": False,
+                "end_speech_handoff_verified": False,
+                "start_two_sided_required": True,
+                "end_two_sided_required": False,
+                "semantic_start_limit_sec": 0.0,
+                "semantic_end_limit_sec": 20.0,
+            },
+        )
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify,
+    )
+    persisted: list[dict] = []
+    pipeline = _pipeline()
+
+    def persist(*, clip, **_kwargs):
+        persisted.append(clip)
+        return "verified-closure", mock.sentinel.metadata
+
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+
+    reels, resolved = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext(
+            "slow",
+            require_acoustic_boundaries=True,
+        ),
+        max_videos=1,
+        max_reels=1,
+        retrieval_profile="deep",
+    )
+
+    assert reels == ["verified-closure"]
+    assert resolved == ["dQw4w9WgXcQ"]
+    assert verify.call_args.args[1:] == (0.0, 20.0)
+    assert len(persisted) == 1
+    assert persisted[0]["cue_ids"] == ["setup", "core"]
+    context = persisted[0]["search_context"]
+    assert context["selection_core_cue_ids"] == ["core"]
+    assert [
+        cue["cue_id"] for cue in context["selection_caption_cues"]
+    ] == ["setup", "core"]
+    assert [
+        cue["text"] for cue in context["selection_caption_cues"]
+    ] == [
+        "A Python closure retains its enclosing scope, making",
+        "its enclosing scope available to later calls.",
+    ]
 
 
 def test_verified_fourth_sibling_is_persisted_beyond_three_clip_surface_limit(
@@ -917,7 +1046,7 @@ def test_final_caption_clip_verifies_last_speech_without_forcing_source_outro(
                 "threshold_dbfs": -38.0,
                 "start_quiet": [0.0, 0.2],
                 "end_quiet": [9.8, 10.2],
-                "end_speech_handoff_verified": True,
+                "end_speech_handoff_verified": False,
                 "end_two_sided_required": False,
                 "semantic_start_limit_sec": 0.0,
                 "semantic_end_limit_sec": 12.0,
@@ -970,7 +1099,7 @@ def test_final_caption_clip_verifies_last_speech_without_forcing_source_outro(
     assert verify.call_args.args[1:] == (0.0, 10.0)
     assert verify.call_args.kwargs["search_end_limit_sec"] == 12.0
     assert verify.call_args.kwargs["require_speech_handoff"] is False
-    assert verify.call_args.kwargs["require_end_speech_handoff"] is True
+    assert verify.call_args.kwargs["require_end_speech_handoff"] is False
     assert verify.call_args.kwargs["require_end_two_sided"] is False
     assert persisted[0]["search_context"]["boundary_status"] == "verified"
     assert persisted[0]["search_context"]["boundary_diagnostics"]["acoustic"][
@@ -1026,8 +1155,8 @@ def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
             end_sec=20.0,
             diagnostics={
                 "threshold_dbfs": -38.0,
-                "start_speech_handoff_verified": True,
-                "end_speech_handoff_verified": False,
+                "start_speech_handoff_verified": False,
+                "end_speech_handoff_verified": True,
                 "start_two_sided_required": True,
                 "end_two_sided_required": True,
                 "semantic_start_limit_sec": 10.0,
@@ -1086,7 +1215,7 @@ def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
     assert reels == ["verified-padded-speech"]
     assert verify.call_args.args[1:] == (10.0, 20.0)
     assert verify.call_args.kwargs["require_speech_handoff"] is False
-    assert verify.call_args.kwargs["require_start_speech_handoff"] is True
+    assert verify.call_args.kwargs["require_start_speech_handoff"] is False
     assert verify.call_args.kwargs["require_end_speech_handoff"] is False
     assert verify.call_args.kwargs["require_start_two_sided"] is True
     assert verify.call_args.kwargs["require_end_two_sided"] is True
@@ -1150,7 +1279,7 @@ def test_acoustic_result_crossing_unselected_speech_is_stored_but_deferred(
     )
 
     assert reels == []
-    assert verify.call_args.kwargs["search_end_limit_sec"] == 10.0
+    assert verify.call_args.kwargs["search_end_limit_sec"] == 13.0
     assert len(persisted) == 1
     assert (persisted[0]["start"], persisted[0]["end"]) == (0.0, 10.0)
     assert persisted[0]["search_context"]["boundary_status"] == "context_aligned"
@@ -1237,7 +1366,7 @@ def test_acoustic_result_crossing_prior_speech_is_stored_but_deferred(
     )
 
     assert reels == []
-    assert verify.call_args.kwargs["search_start_limit_sec"] == 10.0
+    assert verify.call_args.kwargs["search_start_limit_sec"] == 7.0
     assert len(persisted) == 1
     assert (persisted[0]["start"], persisted[0]["end"]) == (10.0, 20.0)
     assert persisted[0]["search_context"]["boundary_status"] == "context_aligned"
@@ -1809,8 +1938,8 @@ def test_production_boundary_path_mixes_projected_start_with_last_speech_end(
     assert reels == ["stored-mixed-edge"]
     assert persisted[0]["start"] == 12.0
     assert persisted[0]["end"] == 30.0
-    assert verify.call_args.kwargs["require_start_speech_handoff"] is False
-    assert verify.call_args.kwargs["require_end_speech_handoff"] is True
+    assert verify.call_args.kwargs["require_start_speech_handoff"] is True
+    assert verify.call_args.kwargs["require_end_speech_handoff"] is False
     assert verify.call_args.kwargs["require_start_two_sided"] is True
     assert verify.call_args.kwargs["require_end_two_sided"] is False
     acoustic = persisted[0]["search_context"]["boundary_diagnostics"]["acoustic"]
@@ -2193,7 +2322,7 @@ def test_selected_caption_snapshot_clamps_every_overlapping_cue_to_lexical_end()
     assert cues[-1]["text"] == "which is exactly what dhdx is"
 
     context = {
-        "selection_contract_version": "quality_silence_v33",
+        "selection_contract_version": "quality_silence_v34",
         "boundary_status": "context_aligned",
         "speech_corridor_verified": True,
         "selection_caption_cues": [
@@ -2391,7 +2520,7 @@ def test_transcript_only_adapter_preserves_same_cue_filler_projection() -> None:
                 {"cue_id": "selected", "start": 10.0, "end": 20.0, "text": "Selected."},
             ],
             (10.0, 20.0),
-            (True, False),
+            (False, False),
             (True, False),
         ),
         (
@@ -2405,7 +2534,7 @@ def test_transcript_only_adapter_preserves_same_cue_filler_projection() -> None:
         ),
     ],
 )
-def test_rolling_caption_overlap_uses_cue_onset_handoffs(
+def test_rolling_caption_overlap_uses_progressive_coarse_edges(
     segments, expected_corridor, expected_handoffs, expected_two_sided,
 ) -> None:
     transcript = {
@@ -2488,7 +2617,7 @@ def test_nonlexical_start_corridor_includes_only_the_preceding_caption_gap() -> 
 
     assert error is None
     assert (start, end) == (4.0, 20.0)
-    assert plan == (10.0, 20.0, True, False, True, False)
+    assert plan == (10.0, 20.0, False, False, True, False)
 
 
 def test_nonlexical_end_progresses_from_required_speech_to_next_cue_fence() -> None:
@@ -2934,7 +3063,7 @@ def test_acoustic_boundary_plan_fails_closed_for_missing_cue_ids() -> None:
     ) is None
 
 
-def test_transcript_edge_speech_inside_media_uses_one_sided_handoffs() -> None:
+def test_transcript_edge_speech_inside_media_uses_progressive_edges() -> None:
     transcript = {
         "source": "supadata",
         "native_mode": False,
@@ -2969,7 +3098,7 @@ def test_transcript_edge_speech_inside_media_uses_one_sided_handoffs() -> None:
 
     assert error is None
     assert (start_limit, end_limit) == (0.0, 100.0)
-    assert plan == (10.0, 20.0, True, True, False, False)
+    assert plan == (10.0, 20.0, False, False, False, False)
 
 
 @pytest.mark.parametrize(
@@ -3236,7 +3365,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
 ) -> None:
     strict_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v33",
+        "selection_contract_version": "quality_silence_v34",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -3246,7 +3375,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
     }
     transcript_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v33",
+        "selection_contract_version": "quality_silence_v34",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -3309,7 +3438,7 @@ def test_failed_boundary_storage_does_not_consume_ready_material_cap(
     deferred.append({
         "search_context_json": json.dumps({
             "surface_eligible": True,
-            "selection_contract_version": "quality_silence_v33",
+            "selection_contract_version": "quality_silence_v34",
             "speech_corridor_verified": True,
             "boundary_status": "verified",
             "boundary_diagnostics": {
@@ -4073,7 +4202,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v33"
+        assert context["selection_contract_version"] == "quality_silence_v34"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"

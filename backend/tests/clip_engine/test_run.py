@@ -2,10 +2,12 @@
 from types import SimpleNamespace
 
 import pytest
+from backend import gemini_client
 from backend.app.clip_engine import expand, run
 from backend.app.clip_engine.errors import (
     CancellationError,
     ProviderAuthenticationError,
+    ProviderBudgetExceededError,
     ProviderQuotaError,
     ProviderRequestError,
     ProviderTransientError,
@@ -61,15 +63,84 @@ def test_clip_builds_embed_urls_and_forwards_topic(monkeypatch):
     assert seen["accept_partial_flash"] is True
     assert seen["transcript_url"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     assert seen["segment_video_url"] == seen["transcript_url"]
-    assert seen["video_grounding_required"] is True
+    assert seen["video_grounding_required"] is False
     assert seen["segment_media_resolution"] == "low"
+
+
+def test_production_url_records_one_text_only_pro_selector_call(monkeypatch):
+    transcript = {
+        "segments": [{
+            "cue_id": "supadata-cue-0",
+            "start": 0.0,
+            "end": 7.0,
+            "text": "Plants convert captured light into stored chemical energy.",
+        }],
+        "words": [],
+        "duration": 7.0,
+        "source": "supadata",
+        "artifact_key": "supadata-transcript:v2:text-only-pro",
+        "native_mode": False,
+    }
+    provider_calls: list[dict] = []
+
+    def fake_generate(_system, user, _schema, **kwargs):
+        provider_calls.append({"user": user, **kwargs})
+        return SimpleNamespace(
+            text=(
+                '{"request_intent":{"exact_request":"photosynthesis",'
+                '"constraints":[{"constraint_id":"subject","kind":"subject",'
+                '"source_phrase":"photosynthesis","requirement":'
+                '"Teach photosynthesis"}]},"topics":[]}'
+            ),
+            telemetry={
+                "model": kwargs["model"],
+                "prompt_tokens": 1_200,
+                "candidate_tokens": 30,
+                "thought_tokens": 20,
+                "total_tokens": 1_250,
+            },
+        )
+
+    context = GenerationContext("slow", generation_id="production-text-only-pro")
+    monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(gemini_client, "generate_json_v3", fake_generate)
+    monkeypatch.setattr(
+        run.gemini_segment.config,
+        "SEGMENT_ROUTING_MODE",
+        "flash_only",
+    )
+
+    output = run.clip(
+        "https://youtu.be/dQw4w9WgXcQ",
+        "photosynthesis",
+        settings={
+            "generation_context": context,
+            "_segment_routing_mode": "hybrid",
+        },
+    )
+
+    assert output["clips"] == []
+    assert len(provider_calls) == 1
+    [provider_call] = provider_calls
+    assert provider_call["model"] == "gemini-3.1-pro-preview"
+    assert isinstance(provider_call["user"], str)
+    assert provider_call["media_resolution"] is None
+    usage = context.usage()
+    assert len(usage) == 1
+    assert usage[0]["model_used"] == "gemini-3.1-pro-preview"
+    assert usage[0]["billable_requests"] == 1
+    assert usage[0]["input_tokens"] == 1_200
+    assert usage[0]["output_tokens"] == 50
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["selector_calls"] == 1
+    assert budget["pro_selector_calls"] == 1
 
 
 def test_live_runner_uses_the_canonical_practice_segmenter():
     assert run.gemini_segment.__name__ == "backend.pipeline.gemini_segment"
 
 
-def test_pro_boundary_fallback_forwards_canonical_video_grounding(monkeypatch):
+def test_pro_boundary_fallback_preserves_canonical_video_cache_identity(monkeypatch):
     seen = {}
 
     def fake_fallback(transcript, settings, **kwargs):
@@ -92,12 +163,12 @@ def test_pro_boundary_fallback_forwards_canonical_video_grounding(monkeypatch):
     assert seen["_segment_video_url"] == (
         "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     )
-    assert seen["_segment_video_grounding_required"] is True
+    assert seen["_segment_video_grounding_required"] is False
     assert seen["_segment_media_resolution"] == "low"
 
 
 def test_direct_url_segment_cache_hit_skips_all_gemini_and_budget(monkeypatch):
-    assert run.segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v33"
+    assert run.segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v34"
     transcript = {
         "segments": [{
             "cue_id": "cached-cue",
@@ -326,6 +397,42 @@ def test_selector_outage_preserves_transcript_success_and_typed_failure(monkeypa
     assert exc_info.value.status_code == 503
     assert exc_info.value.operation == "segmentation"
     assert context.counters()["usable_transcripts"] == 1
+
+
+def test_internal_selector_budget_is_not_reported_as_gemini_rejection(monkeypatch):
+    transcript = {
+        "segments": [{
+            "cue_id": "budget-cue",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "A complete educational explanation.",
+        }],
+        "words": [],
+        "duration": 5.0,
+        "source": "supadata",
+        "artifact_key": "supadata-transcript:v2:budget",
+        "native_mode": False,
+    }
+    failure = RuntimeError("segmentation provider call failed")
+    failure.telemetry = {
+        "error_type": "ProviderBudgetExceededError",
+        "provider_status_code": None,
+        "retryable": False,
+    }
+    monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(
+        run.gemini_segment,
+        "segment_clips",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(ProviderBudgetExceededError) as exc_info:
+        run.clip("https://youtu.be/dQw4w9WgXcQ", "topic")
+
+    assert exc_info.value.code == "provider_budget_exceeded"
+    assert "selection budget" in str(exc_info.value).casefold()
+    assert "cost budget" not in str(exc_info.value).casefold()
+    assert "rejected" not in str(exc_info.value).casefold()
 
 
 def test_explicit_nonretryable_selector_error_without_status_is_request_failure(

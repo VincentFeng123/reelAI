@@ -317,7 +317,7 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
         self.assertEqual(
             clips[0]["search_context"]["boundary_status"], "context_aligned"
         )
-        self.assertEqual(verify.call_args.kwargs["search_end_limit_sec"], 10.0)
+        self.assertEqual(verify.call_args.kwargs["search_end_limit_sec"], 13.0)
 
     def test_direct_adapter_requires_each_quality_score_at_green_threshold(self) -> None:
         prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(

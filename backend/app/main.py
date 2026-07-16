@@ -353,7 +353,7 @@ GENERATION_OUTPUT_CEILINGS = {
     "slow": INITIAL_READY_REEL_TARGET,
 }
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v33"
+SELECTION_CONTRACT_VERSION = "quality_silence_v34"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}

@@ -320,6 +320,157 @@ def test_long_video_pro_reservation_fails_before_provider_dispatch(
     assert budget["inflight_reserved_cost_usd"] == 0.0
 
 
+def test_long_preferred_video_url_dispatches_one_pro_transcript_only_call(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("slow", generation_id="selector-long-preferred")
+    calls: list[dict] = []
+
+    def fake_generate(_system, user, _schema, **kwargs):
+        calls.append({"user": user, **kwargs})
+        return SimpleNamespace(
+            text=(
+                '{"request_intent":{"exact_request":"photosynthesis",'
+                '"constraints":[{"constraint_id":"subject","kind":"subject",'
+                '"source_phrase":"photosynthesis","requirement":'
+                '"Teach photosynthesis"}]},"topics":[]}'
+            ),
+            telemetry={
+                "model": kwargs["model"],
+                "prompt_tokens": 40_000,
+                "candidate_tokens": 200,
+                "thought_tokens": 100,
+                "total_tokens": 40_300,
+            },
+        )
+
+    monkeypatch.setattr(gemini_client, "generate_json_v3", fake_generate)
+    segments = [
+        {
+            "cue_id": f"supadata-cue-{index}",
+            "start": index * 7.0,
+            "end": (index + 1) * 7.0,
+            "text": (
+                "Photosynthesis section "
+                f"{index} explains how captured light energy supports electron "
+                "transport, a proton gradient, and ATP synthesis."
+            ),
+        }
+        for index in range(600)
+    ]
+
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": segments,
+            "words": [],
+            "duration": 4_200.0,
+            "source": "supadata",
+        },
+        {
+            "_segment_video_grounding_required": False,
+            "_segment_video_url": (
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+            ),
+            "_segment_media_resolution": "low",
+            "_segment_operation": "pro_authoritative",
+            "_segment_budget_reserve": context.reserve_gemini_call,
+            "_segment_budget_reconcile": context.reconcile_gemini_call,
+        },
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic="photosynthesis",
+    )
+
+    assert result.error is None
+    assert len(calls) == 1
+    [call] = calls
+    assert call["model"] == "gemini-3.1-pro-preview"
+    assert isinstance(call["user"], str)
+    assert call["media_resolution"] is None
+    assert "inspect the audio and visual streams jointly" not in call["user"]
+    assert "Photosynthesis section 0 explains" in call["user"]
+    assert "Photosynthesis section 599 explains" in call["user"]
+    assert len(result.calls) == 1
+    assert result.calls[0]["video_grounded"] is False
+    assert result.calls[0]["reserved_input_tokens"] < 200_000
+    assert result.calls[0]["reserved_cost_usd"] < 0.70
+    assert "video_grounding_fallback_reason" not in result.calls[0]
+    assert "skipped_media_tokens" not in result.calls[0]
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["selector_calls"] == 1
+    assert budget["committed_cost_usd"] == pytest.approx(
+        (40_000 * 2.0 + 300 * 12.0) / 1_000_000.0
+    )
+    assert budget["committed_cost_usd"] < budget["cost_limit_usd"]
+    assert budget["inflight_reserved_cost_usd"] == 0.0
+
+
+def test_preferred_video_url_failure_never_dispatches_a_media_retry(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("slow", generation_id="selector-text-failure")
+    calls: list[dict] = []
+
+    def fail_generate(*_args, **kwargs):
+        calls.append(kwargs)
+        raise gemini_client.GeminiTransportError(
+            "provider timed out",
+            gemini_client.GeminiCallTelemetry(
+                model=str(kwargs["model"]),
+                operation="pro_authoritative",
+                prompt_version=gemini_segment.PRO_BOUNDARY_PROFILE,
+                thinking_level="medium",
+                latency_ms=10.0,
+                retries=0,
+                finish_reason=None,
+                prompt_tokens=None,
+                candidate_tokens=None,
+                thought_tokens=None,
+                total_tokens=None,
+                provider_error_type="ServerError",
+                provider_status_code=504,
+                retryable=True,
+            ),
+        )
+
+    monkeypatch.setattr(gemini_client, "generate_json_v3", fail_generate)
+
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Plants convert light into stored chemical energy.",
+            }],
+            "words": [],
+            "duration": 4_200.0,
+        },
+        {
+            "_segment_video_grounding_required": False,
+            "_segment_video_url": (
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+            ),
+            "_segment_media_resolution": "low",
+            "_segment_operation": "pro_authoritative",
+            "_segment_budget_reserve": context.reserve_gemini_call,
+            "_segment_budget_reconcile": context.reconcile_gemini_call,
+        },
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic="photosynthesis",
+    )
+
+    assert result.error is not None
+    assert len(calls) == 1
+    assert calls[0]["model"] == "gemini-3.1-pro-preview"
+    assert calls[0]["max_retries"] == 0
+    assert calls[0]["media_resolution"] is None
+    assert "video_grounding_fallback_reason" not in result.calls[0]
+    assert "skipped_media_tokens" not in result.calls[0]
+    assert result.calls[0]["provider_status_code"] == 504
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["selector_calls"] == 1
+    assert budget["inflight_reserved_cost_usd"] == 0.0
+
+
 def test_video_grounded_flash_transport_failure_never_dispatches_a_second_model(
     monkeypatch,
 ) -> None:
@@ -3281,6 +3432,41 @@ def test_bare_look_at_this_remains_visual_dependent() -> None:
 
     assert report.clips == []
     assert report.rejected_reasons == ["proposal_0:requires_visual_context"]
+
+
+def test_preserved_video_url_does_not_claim_unseen_visual_grounding() -> None:
+    text = (
+        "Look at this. Chlorophyll captures photons, and the arrows show how "
+        "electron flow helps cells make ATP."
+    )
+    proposal = _proposal().model_copy(update={
+        "start_quote": "Look at this",
+        "end_quote": "helps cells make ATP",
+        "topic_evidence_quote": (
+            "Chlorophyll captures photons and the arrows show how electron"
+        ),
+    })
+
+    for grounding_state in (
+        {},
+        {"_segment_video_grounded": False},
+    ):
+        report = gemini_segment._plan_to_report(
+            gemini_segment._BoundaryPlan(topics=[proposal]),
+            [{"cue_id": "cue-0", "start": 0.0, "end": 12.0, "text": text}],
+            [],
+            {
+                "_segment_ignore_caption_case": True,
+                "_segment_video_url": (
+                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+                ),
+                **grounding_state,
+            },
+            topic="photosynthesis",
+        )
+
+        assert report.clips == []
+        assert report.rejected_reasons == ["proposal_0:requires_visual_context"]
 
 
 @pytest.mark.parametrize(

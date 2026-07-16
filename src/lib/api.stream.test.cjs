@@ -14,13 +14,56 @@ require("sucrase/register/ts");
 
 const {
   checkReelsCanGenerate,
+  clearCommunityAuthSession,
+  expireCommunityAuthSession,
+  fetchCommunityAccount,
+  fetchCommunityHistory,
+  fetchCommunitySettings,
   fetchFeed,
   fetchGenerationStatus,
   generateReels,
   generateReelsStream,
+  queueCommunityHistorySync,
+  queueCommunitySettingsSync,
+  readCommunityAuthSession,
   reportReelScroll,
 } = require("./api.ts");
 const TEST_OPTIONS = { timeout: 1_000 };
+
+function installCommunitySessionTestWindow() {
+  const localValues = new Map();
+  const sessionValues = new Map();
+  const storage = (values) => ({
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, String(value)),
+    removeItem: (key) => values.delete(key),
+  });
+  const accountKey = "studyreels-community-account";
+  const sessionKey = "studyreels-community-session-token";
+  const ownerKey = "studyreels-community-owner-key";
+  const ownerValue = `owner-${"o".repeat(32)}`;
+  const setSession = (id, token) => {
+    localValues.set(accountKey, JSON.stringify({ id, username: id, isVerified: true }));
+    sessionValues.set(sessionKey, token);
+  };
+
+  localValues.set(ownerKey, ownerValue);
+  global.window = {
+    location: { hostname: "localhost" },
+    localStorage: storage(localValues),
+    sessionStorage: storage(sessionValues),
+    dispatchEvent: () => true,
+  };
+  return {
+    localValues,
+    sessionValues,
+    accountKey,
+    sessionKey,
+    ownerKey,
+    ownerValue,
+    setSession,
+  };
+}
 
 function queuedGenerationResponse() {
   return new Response(JSON.stringify({
@@ -764,4 +807,378 @@ test("terminal stream events cancel and release an unfinished response body", TE
   }
 
   assert.equal(streamBody.locked, false);
+});
+
+test("community reads never return or apply a superseded session response", TEST_OPTIONS, async (t) => {
+  const tokenA = `session-a-${"a".repeat(32)}`;
+  const tokenB = `session-b-${"b".repeat(32)}`;
+  const scenarios = [
+    {
+      name: "account success",
+      read: fetchCommunityAccount,
+      response: { account: { id: "account-a", username: "alice", is_verified: true } },
+      status: 200,
+    },
+    {
+      name: "account 401",
+      read: fetchCommunityAccount,
+      response: { detail: "Session expired" },
+      status: 401,
+    },
+    {
+      name: "history success",
+      read: fetchCommunityHistory,
+      response: { items: [{ material_id: "material-a", title: "Account A", updated_at: 1 }] },
+      status: 200,
+    },
+    {
+      name: "history 401",
+      read: fetchCommunityHistory,
+      response: { detail: "Session expired" },
+      status: 401,
+    },
+    {
+      name: "settings success",
+      read: fetchCommunitySettings,
+      response: {
+        generation_mode: "slow",
+        default_input_mode: "topic",
+        min_relevance_threshold: 0.3,
+        start_muted: true,
+        creative_commons_only: false,
+        preferred_video_duration: "any",
+      },
+      status: 200,
+    },
+    {
+      name: "settings 401",
+      read: fetchCommunitySettings,
+      response: { detail: "Session expired" },
+      status: 401,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const originalFetch = global.fetch;
+      const originalWindow = global.window;
+      const state = installCommunitySessionTestWindow();
+      const requests = [];
+      let resolveRequest;
+      state.setSession("account-a", tokenA);
+      global.fetch = async (url, init = {}) => {
+        requests.push({ url: String(url), init });
+        return new Promise((resolve) => {
+          resolveRequest = resolve;
+        });
+      };
+
+      try {
+        const pending = scenario.read();
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(requests.length, 1);
+
+        state.setSession("account-b", tokenB);
+        resolveRequest(new Response(JSON.stringify(scenario.response), {
+          status: scenario.status,
+          headers: { "Content-Type": "application/json" },
+        }));
+
+        await assert.rejects(pending, /Community session changed while the request was in flight/);
+        assert.equal(new Headers(requests[0].init.headers).get("X-StudyReels-Session-Token"), tokenA);
+        assert.equal(readCommunityAuthSession()?.account.id, "account-b");
+        assert.equal(readCommunityAuthSession()?.sessionToken, tokenB);
+        assert.equal(state.localValues.get(state.ownerKey), state.ownerValue);
+      } finally {
+        global.fetch = originalFetch;
+        if (originalWindow === undefined) {
+          delete global.window;
+        } else {
+          global.window = originalWindow;
+        }
+      }
+    });
+  }
+});
+
+test("community read expiry invalidates only login state", TEST_OPTIONS, async (t) => {
+  const scenarios = [fetchCommunityAccount, fetchCommunityHistory, fetchCommunitySettings];
+
+  for (const read of scenarios) {
+    await t.test(read.name, async () => {
+      const originalFetch = global.fetch;
+      const originalWindow = global.window;
+      const state = installCommunitySessionTestWindow();
+      state.setSession("account-current", `session-current-${"c".repeat(32)}`);
+      global.fetch = async () => new Response(JSON.stringify({ detail: "Session expired" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+
+      try {
+        await read().catch(() => null);
+        assert.equal(readCommunityAuthSession(), null);
+        assert.equal(state.localValues.has(state.accountKey), false);
+        assert.equal(state.sessionValues.has(state.sessionKey), false);
+        assert.equal(state.localValues.get(state.ownerKey), state.ownerValue);
+      } finally {
+        global.fetch = originalFetch;
+        if (originalWindow === undefined) {
+          delete global.window;
+        } else {
+          global.window = originalWindow;
+        }
+      }
+    });
+  }
+});
+
+test("queued history sync never crosses community sessions", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  const originalWindow = global.window;
+  const localValues = new Map();
+  const sessionValues = new Map();
+  const storage = (values) => ({
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, String(value)),
+    removeItem: (key) => values.delete(key),
+  });
+  const accountKey = "studyreels-community-account";
+  const sessionKey = "studyreels-community-session-token";
+  const ownerKey = "studyreels-community-owner-key";
+  const ownerValue = `owner-${"x".repeat(32)}`;
+  const tokenA = `session-a-${"a".repeat(32)}`;
+  const tokenB = `session-b-${"b".repeat(32)}`;
+  const setSession = (id, username, token) => {
+    localValues.set(accountKey, JSON.stringify({ id, username, isVerified: true }));
+    sessionValues.set(sessionKey, token);
+  };
+  const requests = [];
+  let resolveFirstRequest;
+
+  localValues.set(ownerKey, ownerValue);
+  setSession("account-a", "alice", tokenA);
+  global.window = {
+    location: { hostname: "localhost" },
+    localStorage: storage(localValues),
+    sessionStorage: storage(sessionValues),
+    dispatchEvent: () => true,
+  };
+  global.fetch = async (url, init = {}) => {
+    requests.push({ url: String(url), init });
+    if (requests.length === 1) {
+      return new Promise((resolve) => {
+        resolveFirstRequest = resolve;
+      });
+    }
+    return new Response(JSON.stringify({ items: [] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  try {
+    const first = queueCommunityHistorySync([{ materialId: "first", title: "First", updatedAt: 1 }]);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(requests.length, 1);
+
+    const queuedForA = queueCommunityHistorySync([{ materialId: "second", title: "Second", updatedAt: 2 }]);
+    setSession("account-b", "bob", tokenB);
+    resolveFirstRequest(new Response(JSON.stringify({ detail: "Session expired" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    }));
+    await Promise.all([first, queuedForA]);
+
+    assert.equal(requests.length, 1, "queued account-A data must not dispatch after account B signs in");
+    assert.equal(new Headers(requests[0].init.headers).get("X-StudyReels-Session-Token"), tokenA);
+    assert.equal(readCommunityAuthSession()?.account.id, "account-b", "A's late 401 must not clear account B");
+    assert.equal(localValues.get(ownerKey), ownerValue);
+
+    await queueCommunityHistorySync([{ materialId: "third", title: "Third", updatedAt: 3 }]);
+    assert.equal(requests.length, 2);
+    assert.equal(new Headers(requests[1].init.headers).get("X-StudyReels-Session-Token"), tokenB);
+  } finally {
+    global.fetch = originalFetch;
+    if (originalWindow === undefined) {
+      delete global.window;
+    } else {
+      global.window = originalWindow;
+    }
+  }
+});
+
+test("queued settings sync never crosses community sessions", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  const originalWindow = global.window;
+  const localValues = new Map();
+  const sessionValues = new Map();
+  const storage = (values) => ({
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, String(value)),
+    removeItem: (key) => values.delete(key),
+  });
+  const accountKey = "studyreels-community-account";
+  const sessionKey = "studyreels-community-session-token";
+  const ownerKey = "studyreels-community-owner-key";
+  const ownerValue = `owner-${"q".repeat(32)}`;
+  const tokenA = `session-a-${"a".repeat(32)}`;
+  const tokenB = `session-b-${"b".repeat(32)}`;
+  const settings = {
+    generationMode: "slow",
+    defaultInputMode: "topic",
+    minRelevanceThreshold: 0.3,
+    startMuted: true,
+    creativeCommonsOnly: false,
+    preferredVideoDuration: "any",
+  };
+  const responseSettings = {
+    generation_mode: "slow",
+    default_input_mode: "topic",
+    min_relevance_threshold: 0.3,
+    start_muted: true,
+    creative_commons_only: false,
+    preferred_video_duration: "any",
+  };
+  const setSession = (id, token) => {
+    localValues.set(accountKey, JSON.stringify({ id, username: id, isVerified: true }));
+    sessionValues.set(sessionKey, token);
+  };
+  const requests = [];
+  let resolveFirstRequest;
+
+  localValues.set(ownerKey, ownerValue);
+  setSession("account-a", tokenA);
+  global.window = {
+    location: { hostname: "localhost" },
+    localStorage: storage(localValues),
+    sessionStorage: storage(sessionValues),
+    dispatchEvent: () => true,
+  };
+  global.fetch = async (url, init = {}) => {
+    requests.push({ url: String(url), init });
+    if (requests.length === 1) {
+      return new Promise((resolve) => {
+        resolveFirstRequest = resolve;
+      });
+    }
+    return new Response(JSON.stringify(responseSettings), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  try {
+    const first = queueCommunitySettingsSync(settings);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(requests.length, 1);
+
+    const queuedForA = queueCommunitySettingsSync({ ...settings, startMuted: false });
+    setSession("account-b", tokenB);
+    resolveFirstRequest(new Response(JSON.stringify(responseSettings), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+    await Promise.all([first, queuedForA]);
+
+    assert.equal(requests.length, 1, "queued account-A settings must not dispatch after account B signs in");
+    assert.equal(new Headers(requests[0].init.headers).get("X-StudyReels-Session-Token"), tokenA);
+
+    await queueCommunitySettingsSync(settings);
+    assert.equal(requests.length, 2);
+    assert.equal(new Headers(requests[1].init.headers).get("X-StudyReels-Session-Token"), tokenB);
+    assert.equal(localValues.get(ownerKey), ownerValue);
+  } finally {
+    global.fetch = originalFetch;
+    if (originalWindow === undefined) {
+      delete global.window;
+    } else {
+      global.window = originalWindow;
+    }
+  }
+});
+
+test("history 401 clears only the current community session", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  const originalWindow = global.window;
+  const localValues = new Map();
+  const sessionValues = new Map();
+  const storage = (values) => ({
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, String(value)),
+    removeItem: (key) => values.delete(key),
+  });
+  const accountKey = "studyreels-community-account";
+  const sessionKey = "studyreels-community-session-token";
+  const ownerKey = "studyreels-community-owner-key";
+  const ownerValue = `owner-${"y".repeat(32)}`;
+
+  localValues.set(accountKey, JSON.stringify({ id: "account-current", username: "current", isVerified: true }));
+  localValues.set(ownerKey, ownerValue);
+  sessionValues.set(sessionKey, `session-current-${"c".repeat(32)}`);
+  global.window = {
+    location: { hostname: "localhost" },
+    localStorage: storage(localValues),
+    sessionStorage: storage(sessionValues),
+    dispatchEvent: () => true,
+  };
+  global.fetch = async () => new Response(JSON.stringify({ detail: "Session expired" }), {
+    status: 401,
+    headers: { "Content-Type": "application/json" },
+  });
+
+  try {
+    await queueCommunityHistorySync([{ materialId: "current", title: "Current", updatedAt: 1 }]);
+    assert.equal(readCommunityAuthSession(), null);
+    assert.equal(localValues.has(accountKey), false);
+    assert.equal(sessionValues.has(sessionKey), false);
+    assert.equal(localValues.get(ownerKey), ownerValue, "device owner identity must survive stale login cleanup");
+  } finally {
+    global.fetch = originalFetch;
+    if (originalWindow === undefined) {
+      delete global.window;
+    } else {
+      global.window = originalWindow;
+    }
+  }
+});
+
+test("session expiry preserves the device owner while explicit logout clears it", TEST_OPTIONS, () => {
+  const originalWindow = global.window;
+  const localValues = new Map();
+  const sessionValues = new Map();
+  const storage = (values) => ({
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, String(value)),
+    removeItem: (key) => values.delete(key),
+  });
+  const accountKey = "studyreels-community-account";
+  const sessionKey = "studyreels-community-session-token";
+  const ownerKey = "studyreels-community-owner-key";
+  const ownerValue = `owner-${"z".repeat(32)}`;
+
+  localValues.set(accountKey, JSON.stringify({ id: "account", username: "user" }));
+  localValues.set(ownerKey, ownerValue);
+  sessionValues.set(sessionKey, `session-${"s".repeat(32)}`);
+  global.window = {
+    localStorage: storage(localValues),
+    sessionStorage: storage(sessionValues),
+    dispatchEvent: () => true,
+  };
+
+  try {
+    expireCommunityAuthSession();
+    assert.equal(localValues.has(accountKey), false);
+    assert.equal(sessionValues.has(sessionKey), false);
+    assert.equal(localValues.get(ownerKey), ownerValue);
+
+    clearCommunityAuthSession();
+    assert.equal(localValues.has(ownerKey), false);
+  } finally {
+    if (originalWindow === undefined) {
+      delete global.window;
+    } else {
+      global.window = originalWindow;
+    }
+  }
 });

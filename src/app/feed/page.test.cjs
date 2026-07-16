@@ -72,11 +72,69 @@ function compileFunctionDeclaration(name, bindings = {}) {
   return factory(...names.map((key) => bindings[key]));
 }
 
-test("feed session restore accepts v33 and rejects v32 or unversioned snapshots", () => {
-  const currentContract = "quality_silence_v33";
+test("debounced history sync retains its originating community session", () => {
+  const sessionA = { accountId: "account-a", sessionToken: `session-a-${"a".repeat(32)}` };
+  const sessionB = { accountId: "account-b", sessionToken: `session-b-${"b".repeat(32)}` };
+  const pendingHistorySyncRef = { current: null };
+  const historySyncTimerRef = { current: null };
+  const timerCallbacks = [];
+  const syncCalls = [];
+  let currentSession = sessionA;
+  const clearHistorySyncTimer = () => {
+    historySyncTimerRef.current = null;
+  };
+  const queueCommunityHistorySync = (items, sessionContext) => {
+    syncCalls.push({ items, sessionContext });
+    return Promise.resolve();
+  };
+  const scheduleRemoteHistorySync = compileUseCallback("scheduleRemoteHistorySync", {
+    captureCommunitySessionContext: () => currentSession,
+    pendingHistorySyncRef,
+    clearHistorySyncTimer,
+    historySyncTimerRef,
+    setTimeout: (callback, delay) => {
+      assert.equal(delay, 900);
+      timerCallbacks.push(callback);
+      return timerCallbacks.length;
+    },
+    queueCommunityHistorySync,
+  });
+  const flushPendingHistorySync = compileUseCallback("flushPendingHistorySync", {
+    clearHistorySyncTimer,
+    pendingHistorySyncRef,
+    queueCommunityHistorySync,
+  });
+  const firstItems = [{
+    materialId: "material-a",
+    title: "Original title",
+    updatedAt: 1,
+    starred: false,
+    generationMode: "slow",
+    source: "search",
+  }];
+
+  scheduleRemoteHistorySync(firstItems);
+  firstItems[0].title = "Mutated after scheduling";
+  currentSession = sessionB;
+  timerCallbacks.shift()();
+
+  assert.equal(syncCalls.length, 1);
+  assert.deepEqual(syncCalls[0].sessionContext, sessionA);
+  assert.equal(syncCalls[0].items[0].title, "Original title");
+
+  scheduleRemoteHistorySync([{ ...firstItems[0], materialId: "material-b" }]);
+  currentSession = sessionA;
+  flushPendingHistorySync();
+
+  assert.equal(syncCalls.length, 2);
+  assert.deepEqual(syncCalls[1].sessionContext, sessionB, "unmount flush must not recapture account A");
+});
+
+test("feed session restore accepts v34 and rejects v33, v32, or unversioned snapshots", () => {
+  const currentContract = "quality_silence_v34";
   assert.match(
     typesSource,
-    /CURRENT_SELECTION_CONTRACT_VERSION = "quality_silence_v33"/,
+    /CURRENT_SELECTION_CONTRACT_VERSION = "quality_silence_v34"/,
     "the client contract must remain explicit and shared",
   );
   const parseFeedSessions = compileFunctionDeclaration("parseFeedSessions", {
@@ -101,6 +159,7 @@ test("feed session restore accepts v33 and rejects v32 or unversioned snapshots"
 
   const restored = parseFeedSessions(JSON.stringify({
     current: { ...snapshot, selectionContractVersion: currentContract },
+    predecessor: { ...snapshot, selectionContractVersion: "quality_silence_v33" },
     previous: { ...snapshot, selectionContractVersion: "quality_silence_v32" },
     missing: snapshot,
   }));
@@ -117,7 +176,7 @@ test("feed session restore accepts v33 and rejects v32 or unversioned snapshots"
 
 test("feed snapshot persistence always stamps the current selection contract", () => {
   const writes = [];
-  const currentContract = "quality_silence_v33";
+  const currentContract = "quality_silence_v34";
   const persistFeedSessionSnapshot = compileFunctionDeclaration("persistFeedSessionSnapshot", {
     window: { localStorage: { getItem: () => null } },
     FEED_SESSION_STORAGE_KEY: "studyreels-feed-sessions",

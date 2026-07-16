@@ -10,7 +10,8 @@ import {
   COMMUNITY_AUTH_CHANGED_EVENT,
   answerAssessmentQuestion,
   askStudyChat,
-  clearCommunityAuthSession,
+  captureCommunitySessionContext,
+  expireCommunityAuthSession,
   fetchCommunitySettings,
   fetchFeed,
   fetchPendingAssessment,
@@ -25,6 +26,7 @@ import {
   sendFeedback,
   snoozeAssessment,
   startNextAssessment,
+  type CommunitySessionContext,
   uploadMaterial,
 } from "@/lib/api";
 import { applySearchFeedSettingsToParams, mergeSearchFeedQuerySettings, readSearchFeedQuerySettings } from "@/lib/feedQuery";
@@ -1120,7 +1122,10 @@ function FeedPageInner() {
   const settingsLoadSequenceRef = useRef(0);
   const adaptiveExcludeReelIdsRef = useRef<string[]>([]);
   const isRefreshingFeedRef = useRef(false);
-  const pendingHistorySyncRef = useRef<StoredHistoryItem[] | null>(null);
+  const pendingHistorySyncRef = useRef<{
+    items: StoredHistoryItem[];
+    sessionContext: CommunitySessionContext;
+  } | null>(null);
   const historySyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const generationJobByMaterialRef = useRef<Map<string, ActiveGenerationJob>>(new Map());
@@ -1661,7 +1666,7 @@ function FeedPageInner() {
           return;
         }
         if (isSessionExpiredError(error)) {
-          clearCommunityAuthSession();
+          expireCommunityAuthSession();
           setAuthAccountId(null);
         }
       } finally {
@@ -1687,33 +1692,36 @@ function FeedPageInner() {
     clearHistorySyncTimer();
     const pending = pendingHistorySyncRef.current;
     pendingHistorySyncRef.current = null;
-    if (!pending || pending.length === 0) {
+    if (!pending || pending.items.length === 0) {
       return;
     }
-    void queueCommunityHistorySync(pending).catch(() => {
+    void queueCommunityHistorySync(pending.items, pending.sessionContext).catch(() => {
       // Keep the local history state even if cross-device sync fails.
     });
   }, [clearHistorySyncTimer]);
 
   const scheduleRemoteHistorySync = useCallback((items: StoredHistoryItem[]) => {
-    const accountId = authAccountId || readCommunityAuthSession()?.account?.id?.trim() || null;
-    if (!accountId) {
+    const sessionContext = captureCommunitySessionContext();
+    if (!sessionContext) {
       return;
     }
-    pendingHistorySyncRef.current = items.map((item) => ({ ...item }));
+    pendingHistorySyncRef.current = {
+      items: items.map((item) => ({ ...item })),
+      sessionContext,
+    };
     clearHistorySyncTimer();
     historySyncTimerRef.current = setTimeout(() => {
       const snapshot = pendingHistorySyncRef.current;
       pendingHistorySyncRef.current = null;
       historySyncTimerRef.current = null;
-      if (!snapshot || snapshot.length === 0) {
+      if (!snapshot || snapshot.items.length === 0) {
         return;
       }
-      void queueCommunityHistorySync(snapshot).catch(() => {
+      void queueCommunityHistorySync(snapshot.items, snapshot.sessionContext).catch(() => {
         // Keep the local history state even if cross-device sync fails.
       });
     }, 900);
-  }, [authAccountId, clearHistorySyncTimer]);
+  }, [clearHistorySyncTimer]);
 
   const buildPersistedSearchFeedQuery = useCallback(() => {
     if (!materialId) {

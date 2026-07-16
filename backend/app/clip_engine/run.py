@@ -13,6 +13,7 @@ from ...pipeline import gemini_segment
 from .errors import (
     CancellationError,
     ClipError,
+    ProviderBudgetExceededError,
     ProviderError,
     ProviderRequestError,
     ProviderTransientError,
@@ -176,11 +177,14 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
     settings.setdefault("segment_fine_snap", config.SEGMENT_FINE_SNAP)
     # Candidates are independently gated; one weak proposal must not poison others.
     settings.setdefault("segment_accept_partial_flash", True)
+    # This adapter is the production selector boundary. Flash/hybrid modes are
+    # benchmark-only and must not be activated by stale env or request settings.
+    settings["_segment_routing_mode"] = "pro_only"
     settings["should_cancel"] = should_cancel
 
     canonical_url = f"https://www.youtube.com/watch?v={video_id}"
     settings["_segment_video_url"] = canonical_url
-    settings["_segment_video_grounding_required"] = True
+    settings["_segment_video_grounding_required"] = False
     settings["_segment_media_resolution"] = "low"
     transcript = _transcribe(canonical_url, video_id, settings)
     raise_if_cancelled(should_cancel)
@@ -259,6 +263,13 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
                 telemetry.get("provider_error_type") or ""
             )
             raw_retryable = telemetry.get("retryable")
+            if error_type == "ProviderBudgetExceededError":
+                raise ProviderBudgetExceededError(
+                    "Clip selection budget was exhausted before dispatch.",
+                    provider="gemini",
+                    operation="segmentation",
+                    detail=error_type,
+                ) from exc
             if isinstance(raw_retryable, bool):
                 transient = raw_retryable
             else:
@@ -309,10 +320,11 @@ def pro_boundary_fallback(
     raise_if_cancelled(should_cancel)
     runtime_settings = dict(settings or {})
     runtime_settings["should_cancel"] = should_cancel
+    runtime_settings["_segment_routing_mode"] = "pro_only"
     runtime_settings["_segment_video_url"] = (
         f"https://www.youtube.com/watch?v={video_id}"
     )
-    runtime_settings["_segment_video_grounding_required"] = True
+    runtime_settings["_segment_video_grounding_required"] = False
     runtime_settings["_segment_media_resolution"] = "low"
     _wire_segment_runtime(
         runtime_settings,
