@@ -648,6 +648,36 @@ def test_topic_generation_streams_independent_acoustic_passes_immediately_but_re
     assert context.counters()["persisted_clips"] == 3
 
 
+def test_gemini_authority_never_receives_backend_semantic_context_expansion(
+    monkeypatch,
+) -> None:
+    semantic_context = mock.Mock(
+        side_effect=AssertionError("Gemini boundaries must remain authoritative")
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_selector_authorized_acoustic_context",
+        semantic_context,
+    )
+    bounds = (12.25, 37.75)
+    diagnostics = {
+        "end": {
+            "mode": "caption_token_interpolation",
+            "required_speech_sec": 37.75,
+        }
+    }
+
+    result = pipeline_module._apply_selector_acoustic_context(
+        {"segments": []},
+        {"selection_authority": "gemini"},
+        diagnostics,
+        bounds,
+    )
+
+    assert result == (bounds, diagnostics, None)
+    semantic_context.assert_not_called()
+
+
 def test_ingest_topic_persists_expanded_same_objective_acoustic_context(
     monkeypatch,
 ) -> None:

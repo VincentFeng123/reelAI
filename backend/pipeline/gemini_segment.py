@@ -1622,6 +1622,11 @@ _EDGE_ONLY_FRAMING_RE = re.compile(
     r"\s*[.!?]?\s*$",
     re.IGNORECASE,
 )
+_GENERIC_MODEL_START_RE = re.compile(
+    r"^\s*in\s+this\s+(?:video|lesson|course)\s*[,]?\s+"
+    r"we(?:['’]re|\s+are)\s+going\s+to\s*[,.!?;:]*\s*$",
+    re.IGNORECASE,
+)
 _TERMINAL_EXEMPLIFICATION_RE = re.compile(
     r"(?:^|[.!?;,]\s+)(?P<so>so\s*[,]?\s+)?"
     r"(?:for\s+(?:example|instance)|such\s+as)\s*[,]?\s*"
@@ -1650,7 +1655,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v1"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v1"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v2"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -1896,7 +1901,10 @@ class _CompactIntentEvidence(_StrictModel):
     constraint_id: _IntentConstraintId = Field(alias="id")
     evidence_quote: _CompactEvidenceQuote = Field(
         alias="q",
-        description="Five to sixteen exact consecutive transcript words in this candidate.",
+        description=(
+            "Five to sixteen exact consecutive transcript words in this candidate that "
+            "prove the named required request constraint."
+        ),
     )
 
 
@@ -1950,7 +1958,10 @@ class _CompactBoundaryTopic(_StrictModel):
         alias="ie",
         min_length=1,
         max_length=8,
-        description="One grounded item for each exact-request constraint this unit fulfills.",
+        description=(
+            "One grounded item for every required non-scope exact-request constraint. "
+            "Do not return the topic when any required constraint lacks evidence."
+        ),
     )
 
 
@@ -2049,13 +2060,17 @@ class _ProductionPlan(BaseModel):
 
 _POLICY_AND_EXAMPLES = """Policy:
 - First understand the whole transcript and the viewer's exact request. Return only
-  related, complete, substantive teaching units that make sense to a cold viewer hearing
-  the clip without seeing the original video. Related includes the requested subject and
-  clearly useful prerequisite or supporting facets, not merely adjacent material.
+  complete, substantive teaching units that directly serve that request and make sense to a
+  cold viewer hearing the clip without seeing the original video. For a simple broad-subject
+  request, distinct facets of that subject qualify. When the request names a particular task,
+  object, relationship, scope, format, or outcome, a merely related prerequisite or supporting
+  facet is context for a qualifying unit, not a separate qualifying clip.
 - Include every necessary setup or prerequisite through the explanation's natural
   conclusion. For a worked example, include the question or setup, reasoning, and answer.
-- Give each candidate exactly one coherent learning objective. When adjacent speech teaches
-  independent facets, return separate candidates for those facets instead of bundling them.
+- Give each candidate exactly one coherent learning objective. For a broad-subject request,
+  return separate candidates when adjacent speech teaches independent qualifying facets.
+  For a constrained request, omit an adjacent facet unless it independently fulfills the
+  whole request; never broaden the request just to fill the feed.
 - An outline such as "three areas of calculus" or "two goals of this lesson" is navigation,
   not a teaching unit and not valid evidence. Return the substantive atomic units it names as
   separate candidates. Keep two concepts together only when their spoken relationship or
@@ -2080,18 +2095,19 @@ _POLICY_AND_EXAMPLES = """Policy:
   educational context for the subject. Exclude them from clip openings and endings.
 - Omit teaching that depends on a diagram, screen, gesture, drawing, or other missing
   visual context. Mark self_contained and is_standalone false for such material.
-- Exhaustively enumerate every distinct related teaching unit, up to 40 per source. Prefer an empty
-  slot to filler or an incomplete idea. Do not shorten a complete idea to fit a target
-  length; clip duration is never a selection criterion.
+- Exhaustively enumerate every distinct teaching unit that qualifies for the exact request,
+  up to 40 per source. Prefer an empty slot to a merely related, filler, or incomplete idea.
+  Do not shorten a complete idea to fit a target length; clip duration is never a selection
+  criterion.
 - Keep distinct informational facets from the same source. Do not return two clips that
   teach the same learning objective in different words.
-- Return every qualifying related unit, while scoring the densest, most useful, and most
+- Return every qualifying request-fulfilling unit, while scoring the densest, most useful, and most
   central units highest so the application can prioritize them within difficulty stages.
 - Treat subject relevance and fulfillment of the user's requested operation, relationship,
-  scope, format, and outcome as separate facts. A definition or prerequisite can remain a
-  useful supporting unit, but it is not primary fulfillment of a requested example,
-  comparison, causal explanation, misconception correction, identification, derivation,
-  application, or other task. Never label or rank a supporting facet as primary fulfillment.
+  scope, format, and outcome as separate facts. A definition or prerequisite may be included
+  inside a complete unit when needed for context, but it is not a separate clip for a requested
+  example, comparison, causal explanation, misconception correction, identification,
+  derivation, application, or other task unless that same span fulfills the entire request.
 - Return a candidate only when informativeness, topic_relevance, and educational_importance
   are each at least 0.75 and the spoken unit satisfies every substantive, grounding,
   context, and filler rule.
@@ -2149,10 +2165,10 @@ def _topic_rule(topic: str) -> str:
         )
     elif "," in topic or ";" in topic:
         compound_rule = (
-            "When the topic lists multiple requested ideas, a span directly matches when "
-            "it deeply teaches any one requested component. Require a relationship between "
-            "components only when the viewer explicitly asks to compare, connect, relate, "
-            "or apply them together. "
+            "When the request lists multiple required ideas, each candidate must fulfill all "
+            "of them unless the user's wording explicitly presents alternatives. Require a "
+            "relationship between components when the viewer asks to compare, connect, "
+            "relate, or apply them together. "
         )
     elif _EXPLICIT_TRANSITION_REQUEST_RE.search(topic):
         compound_rule = (
@@ -2169,33 +2185,27 @@ def _topic_rule(topic: str) -> str:
         )
     else:
         compound_rule = (
-            "When the topic names multiple linked ideas, deeply teaching any one requested "
-            "component or a useful prerequisite facet is relevant. The selected speech or "
-            "its exact evidence quote must still anchor that facet to the named subject; a "
-            "broad word used in an unrelated domain is not enough. "
+            "When the request names multiple linked ideas, tasks, objects, formats, or "
+            "outcomes, every candidate must fulfill every required part rather than merely "
+            "touching one component. A simple broad-subject request may still yield distinct "
+            "facets that directly teach that subject. "
         )
     return (
-        f"The viewer is studying {topic!r}. Return only units that teach that topic or a "
-        "clearly useful prerequisite/supporting facet, and make each learning objective name "
-        "the relevant idea. Set directly_teaches_topic=true for either a direct unit or an "
-        "explicitly topic-linked prerequisite/supporting unit. Set it false when the span "
+        f"The viewer is studying {topic!r}. Return only units that directly fulfill that exact "
+        "request, and make each learning objective name the requested task and object. For a "
+        "simple broad-subject request, a concrete facet directly teaching that subject counts "
+        "as fulfillment. Set directly_teaches_topic=false when the span "
         "merely names the subject, course, institution, or speaker, or belongs to an adjacent "
         "field without a useful connection to the request. "
         f"{compound_rule}"
         "When the topic requests "
         "identification, recognition, diagnosis, derivation, comparison, or application, "
-        "include units that teach or perform that task for the named object as well as "
-        "separate, explicitly topic-anchored prerequisite facets. A history or definition "
-        "alone is not a direct match to the complete requested task and is not primary "
-        "fulfillment; return it only as a "
-        "supporting facet when exact evidence anchors it to the named subject. Task "
-        "fulfillment raises educational importance and centrality; it does not exclude a "
-        "genuinely related, topic-anchored supporting facet. Shared vocabulary, a loose "
-        "analogy, or general "
-        "systems thinking alone is not a useful prerequisite. Include supporting material "
-        "when it has a clear educational connection to the exact requested topic, even if "
-        "it is not strictly required background. Exclude only adjacent broad-field material "
-        "whose connection is generic or incidental."
+        "return only units that actually perform that task for the named object and reach any "
+        "requested result. A history, definition, formula recital, prerequisite, alternate "
+        "example, or general concept explanation alone does not fulfill that request. Include "
+        "necessary setup inside the qualifying span, but do not return it as a separate clip. "
+        "Shared vocabulary, a loose analogy, or general systems thinking is not request "
+        "fulfillment."
         " Exclude fictional, supernatural, pseudoscientific, or invented mechanisms unless "
         "the viewer explicitly requested that fictional subject. Borrowing real academic "
         "terminology does not make an invented claim educational evidence."
@@ -2297,8 +2307,8 @@ def _compact_output_guide() -> str:
 - imp = educational_importance, 0.0-1.0: how valuable this unit is for learning that request.
 - diff = difficulty, 0.0-1.0: required prior knowledge only; 0.00-0.33 beginner,
   0.34-0.66 intermediate, 0.67-1.00 advanced. Difficulty never disqualifies a unit.
-- direct = directly_teaches_topic: true only when the span actually teaches the requested
-  subject or an explicitly connected supporting facet, rather than merely naming it.
+- direct = directly_teaches_topic: true only when the span actually fulfills the requested
+  subject, task, relationship, format, and outcome rather than merely naming or supporting it.
 - sub = substantive: true only for real teaching, reasoning, explanation, demonstration, or
   an answer—not greetings, administration, promotion, navigation, or empty framing.
 - fact = factually_grounded: true only when the educational claim is supported by the supplied
@@ -2308,10 +2318,13 @@ def _compact_output_guide() -> str:
 - stand = is_standalone: true when a cold viewer can understand and use the clip independently,
   without first watching another part of the source. self concerns included context; stand
   concerns independence from the surrounding lesson or another prerequisite clip.
-- ie = intent_evidence: a nonempty list of {id, q} objects. Each id must exactly equal one
-  request_intent constraint_id that this unit fulfills. Each q must be an exact consecutive
-  5-16-word quote inside the candidate proving that fulfillment. ie proves request fit; cq
-  independently proves substantive teaching.
+- ie = intent_evidence: a nonempty list of {id, q} objects covering every required non-scope
+  request_intent constraint_id. Each q must be an exact consecutive 5-16-word quote inside
+  the candidate proving that fulfillment. If any required constraint cannot be evidenced,
+  do not return the topic. ie proves complete request fit; cq independently proves teaching.
+  When a format constraint spans multiple transformations, q anchors that ordered sequence;
+  verify every requested transformation across the entire sq-through-eq span. One q never
+  replaces the whole-span completeness check.
 
 Worked format example — understand the boundary logic, but never copy its content or scores:
 Example transcript:
@@ -2329,6 +2342,25 @@ Context example:
 [32] 04:06 Divide that change by elapsed time to obtain acceleration.
 Do not start at line 32 with "Divide that change" because "that change" depends on omitted
 setup. Include line 31 and begin sq at "To calculate acceleration" so self and stand are true.
+
+Named worked-example boundary example:
+[40] 06:00 The derivative of five x minus four is five. Now try another example.
+[41] 06:08 Let f of x equal x squared. Use the limit definition of the derivative.
+[42] 06:16 Substitute x plus h to get open parenthesis x plus h close parenthesis squared minus x squared over h.
+[43] 06:26 Expand the square to x squared plus two x h plus h squared, then cancel x squared.
+[44] 06:36 Divide by h and cancel the common h to obtain two x plus h.
+[45] 06:44 Taking h to zero gives two x, so the derivative of x squared is two x.
+Exact request: Use the limit definition to derive f of x equal x squared, include every
+algebra step, and finish at two x.
+The earlier five x minus four example is a different objective: do not include it and do not
+return it as a separate clip. Begin at the x-squared setup in line 41 and end at its final
+two-x result in line 45. Lines 42-44 are required reasoning, so never replace them with a
+formula-only clip, a summary, another function, or a general derivative explanation.
+Example output boundaries: s=41, e=45, sq="Let f of x equal x squared",
+eq="the derivative of x squared is two x". The topic's ie must evidence the named function,
+limit-definition task, algebra-step requirement, and final two-x outcome.
+Example compact output:
+{"request_intent":{"exact_request":"Use the limit definition to derive f of x equal x squared, include every algebra step, and finish at two x.","constraints":[{"constraint_id":"object","kind":"subject","source_phrase":"f of x equal x squared","requirement":"Derive f of x equal x squared"},{"constraint_id":"method","kind":"task","source_phrase":"Use the limit definition","requirement":"Use the limit definition"},{"constraint_id":"steps","kind":"format","source_phrase":"include every algebra step","requirement":"Include every spoken algebra step"},{"constraint_id":"result","kind":"outcome","source_phrase":"finish at two x","requirement":"Reach the final result two x"}]},"topics":[{"id":"x-squared-limit-derivation","s":41,"e":45,"sq":"Let f of x equal x squared","eq":"the derivative of x squared is two x","cq":"Taking h to zero gives two x","title":"Derive x Squared from the Limit Definition","obj":"Derive the derivative of x squared through every algebra step","facet":"x-squared limit derivation","info":0.99,"rel":1.0,"imp":0.99,"diff":0.45,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"object","q":"Let f of x equal x squared"},{"id":"method","q":"Use the limit definition of the derivative"},{"id":"steps","q":"Expand the square to x squared plus two x h"},{"id":"result","q":"Taking h to zero gives two x"}]}]}
 """
 
 
@@ -2426,20 +2458,31 @@ def _boundary_prompts(
         "formats, and outcomes. Do not substitute retrieval expansions or a broader topic. "
         "Treat course, exam, grade, learner-level, and curriculum labels as scope constraints, "
         "not spoken subject constraints; the exact request and supplied transcript establish "
-        "those qualifiers. "
+        "those qualifiers. Words such as 'every', 'each', 'all', 'step-by-step', 'including "
+        "every algebra step', and 'final result' are required FORMAT or OUTCOME constraints, "
+        "never optional SCOPE constraints. A candidate fulfills such a request only when one "
+        "contiguous span contains the named setup, every spoken transformation, and the "
+        "requested final result. "
         "Then scan the whole transcript from first to last and understand it before selecting. "
         "Internally distinguish required setup and teaching from administration, promotion, "
         "navigation, repetition, and visual-dependent speech; do not output that section map.\n"
-        "2. Map every distinct educational unit related to the exact request, including "
-        "niche facts, useful prerequisite facets, examples, mechanisms, comparisons, and "
-        f"conclusions. Return every distinct qualifying moment, up to "
+        "2. Map every distinct educational unit that fulfills the exact request. Selection "
+        "breadth follows the request, not the breadth of the source. If request_intent has "
+        "multiple required non-scope constraints—especially a named task or operation, "
+        "object, relationship, format, or outcome—each returned unit must contain grounded "
+        "evidence for every required non-scope constraint. Include a needed prerequisite, "
+        "formula, definition, or setup inside that complete unit, but do not return it as a "
+        "separate clip. Only a simple broad-subject request with one content constraint may "
+        "return multiple directly connected subject facets. Return every distinct qualifying "
+        f"moment, up to "
         f"{_MAX_SELECTOR_CANDIDATES} for this source; "
         "do not stop after the first few units or at an arbitrary count below that cap.\n"
         "3. For every qualifying unit, verify its timestamps and choose the minimum complete "
         "span containing necessary setup, reasoning, and the natural conclusion. Choose the "
-        "shortest concise span that remains self-contained; duration is unrestricted and "
-        "duration is never a selection criterion, so keep the complete unit regardless of "
-        "its duration. Preserve all necessary setup and context, "
+        "shortest concise span that remains self-contained. There is no numeric duration cap. "
+        "Duration must be the consequence of the exact semantic scope; it is not permission "
+        "to include an earlier completed example or a later adjacent topic. Preserve all "
+        "necessary setup and context, "
         "even when that makes the clip longer. End immediately after the first complete "
         "conclusion of that one learning objective and before a new concept begins. Choose "
         "the exact semantic first and final required spoken words and ignore acoustic silence "
@@ -2492,11 +2535,11 @@ def _boundary_prompts(
         f"{_compact_output_guide()}\n"
         f"Return only the object {{request_intent, topics}}. Every topic must contain "
         f"{_selection_fields(enriched=False, compact=True)}. The ie list must be nonempty and "
-        "contain one {id, q} item per non-scope request constraint the unit fulfills, where id is the "
+        "contain one {id, q} item for every required non-scope request constraint, where id is the "
         "constraint_id and q is an exact consecutive 5-16 word transcript quote wholly inside "
-        "the candidate. Omit scope constraints from ie unless the selected speech states them "
-        "exactly. Do not output a role: the backend derives primary only when grounded "
-        "evidence covers every required non-scope constraint, and supporting otherwise. cq independently "
+        "the candidate. If the candidate cannot ground every required non-scope constraint, "
+        "do not return it. Omit scope constraints from ie unless the selected speech states "
+        "them exactly. Do not output a role. cq independently "
         "proves that the candidate teaches a substantive atomic claim; ie proves only relevance "
         "to the exact request and must never substitute for cq. Learning details and "
         "assessments are generated later. Do not include them, chain-of-thought, or hidden "
@@ -9766,14 +9809,27 @@ def _trusted_compact_plan_to_report(
     segments: list[dict],
     settings: dict,
 ) -> _Conversion:
-    """Keep every schema-valid Gemini topic and repair only transcript edges."""
+    """Pass every schema-valid Gemini topic; reconcile only literal transcript edges."""
+    del settings
     report = _Conversion(proposed_count=len(plan.topics))
     n = len(segments)
     if not n:
         report.rejected_reasons.append("missing_segments")
         return report
 
-    ignore_caption_case = bool(settings.get("_segment_ignore_caption_case", True))
+    all_constraint_ids = [
+        str(constraint.constraint_id)
+        for constraint in plan.request_intent.constraints
+    ]
+    constraint_kinds = {
+        str(constraint.constraint_id): constraint.kind
+        for constraint in plan.request_intent.constraints
+    }
+    required_constraint_ids = {
+        str(constraint.constraint_id)
+        for constraint in plan.request_intent.constraints
+        if constraint.kind is not _IntentConstraintKind.SCOPE
+    }
     used_candidate_ids: set[str] = set()
 
     def boundary_anchor(
@@ -9790,9 +9846,7 @@ def _trusted_compact_plan_to_report(
 
     for index, proposal in enumerate(plan.topics):
         diagnostics: list[str] = []
-        proposed_range_valid = (
-            0 <= proposal.start_line <= proposal.end_line < n
-        )
+        proposed_range_valid = 0 <= proposal.start_line <= proposal.end_line < n
         a = min(max(proposal.start_line, 0), n - 1)
         b = min(max(proposal.end_line, 0), n - 1)
         if a > b:
@@ -9804,31 +9858,43 @@ def _trusted_compact_plan_to_report(
         claim_location = _unique_evidence_location(
             segments, model_claim_quote, 0, n - 1,
         )
-        if claim_location is not None and (
-            not proposed_range_valid
-            or claim_location[0] < a
-            or claim_location[2] > b
-        ):
-            a, b = claim_location[0], claim_location[2]
-            diagnostics.append("range_recovered_from_claim")
-
+        grounded_intent_locations: list[
+            tuple[str, str, tuple[int, int, int, int]]
+        ] = []
+        for item in proposal.intent_evidence:
+            constraint_id = str(item.constraint_id)
+            if constraint_id not in constraint_kinds:
+                continue
+            location = _unique_evidence_location(
+                segments, str(item.evidence_quote), 0, n - 1,
+            )
+            if location is None:
+                diagnostics.append(
+                    f"unanchored_intent_evidence:{constraint_id}"
+                )
+                continue
+            grounded_intent_locations.append(
+                (constraint_id, str(item.evidence_quote), location)
+            )
         model_start_quote = str(proposal.start_quote or "").strip()
+        effective_start_quote = model_start_quote
         model_end_quote = str(proposal.end_quote or "").strip()
         start_anchor = boundary_anchor(model_start_quote, a, b)
         end_anchor = boundary_anchor(model_end_quote, a, b)
+        start_span: tuple[int, int] | None = None
+        end_span: tuple[int, int] | None = None
+
         if start_anchor is None:
             diagnostics.append("bad_start_quote")
         if end_anchor is None:
             diagnostics.append("bad_end_quote")
-
-        start_span: tuple[int, int] | None = None
-        end_span: tuple[int, int] | None = None
         if start_anchor is not None and end_anchor is not None:
-            if (
-                start_anchor.first_word_position
-                < end_anchor.last_word_position
-            ):
-                a, b = start_anchor.first_line, end_anchor.last_line
+            if start_anchor.first_word_position < end_anchor.last_word_position:
+                recovered_a = start_anchor.first_line
+                recovered_b = end_anchor.last_line
+                if recovered_a != a or recovered_b != b:
+                    diagnostics.append("range_recovered_from_edges")
+                a, b = recovered_a, recovered_b
                 start_span = start_anchor.first_span
                 end_span = end_anchor.last_span
             else:
@@ -9842,11 +9908,9 @@ def _trusted_compact_plan_to_report(
                 end_span = end_anchor.last_span
 
         if claim_location is not None:
-            claim_start_line, claim_left, claim_end_line, claim_right = (
-                claim_location
-            )
+            claim_start_line, claim_left, claim_end_line, claim_right = claim_location
             if claim_start_line < a:
-                a = claim_location[0]
+                a = claim_start_line
                 start_span = None
                 diagnostics.append("start_expanded_to_claim")
             elif (
@@ -9857,7 +9921,7 @@ def _trusted_compact_plan_to_report(
                 start_span = None
                 diagnostics.append("start_expanded_to_claim")
             if claim_end_line > b:
-                b = claim_location[2]
+                b = claim_end_line
                 end_span = None
                 diagnostics.append("end_expanded_to_claim")
             elif (
@@ -9867,6 +9931,78 @@ def _trusted_compact_plan_to_report(
             ):
                 end_span = None
                 diagnostics.append("end_expanded_to_claim")
+
+        for constraint_id, _evidence_quote, evidence_location in (
+            grounded_intent_locations
+        ):
+            if constraint_kinds[constraint_id] is _IntentConstraintKind.SCOPE:
+                continue
+            evidence_start, evidence_left, evidence_end, evidence_right = (
+                evidence_location
+            )
+            if evidence_start < a:
+                a = evidence_start
+                start_span = None
+                diagnostics.append("start_expanded_to_intent_evidence")
+            elif (
+                evidence_start == a
+                and start_span is not None
+                and evidence_left < start_span[0]
+            ):
+                start_span = None
+                diagnostics.append("start_expanded_to_intent_evidence")
+            if evidence_end > b:
+                b = evidence_end
+                end_span = None
+                diagnostics.append("end_expanded_to_intent_evidence")
+            elif (
+                evidence_end == b
+                and end_span is not None
+                and evidence_right > end_span[1]
+            ):
+                end_span = None
+                diagnostics.append("end_expanded_to_intent_evidence")
+
+        required_intent_locations = [
+            (evidence_quote, location)
+            for constraint_id, evidence_quote, location in grounded_intent_locations
+            if constraint_kinds[constraint_id] is not _IntentConstraintKind.SCOPE
+        ]
+        if (
+            _GENERIC_MODEL_START_RE.fullmatch(model_start_quote)
+            and required_intent_locations
+        ):
+            evidence_quote, grounded_location = min(
+                required_intent_locations,
+                key=lambda item: (item[1][0], item[1][1]),
+            )
+            grounded_start, grounded_left, grounded_end, grounded_right = (
+                grounded_location
+            )
+            claim_starts_before_grounded_intent = bool(
+                claim_location is not None
+                and (claim_location[0], claim_location[1])
+                < (grounded_start, grounded_left)
+            )
+            current_start = (
+                a,
+                start_span[0] if start_span is not None else 0,
+            )
+            if (
+                (grounded_start, grounded_left) > current_start
+                and not claim_starts_before_grounded_intent
+            ):
+                a = grounded_start
+                start_text_for_evidence = str(segments[a].get("text") or "")
+                start_span = (
+                    grounded_left,
+                    grounded_right
+                    if grounded_start == grounded_end
+                    else len(start_text_for_evidence),
+                )
+                effective_start_quote = evidence_quote
+                diagnostics.append("generic_start_advanced_to_intent_evidence")
+
         if a > b:
             if claim_location is not None:
                 a, b = claim_location[0], claim_location[2]
@@ -9875,26 +10011,10 @@ def _trusted_compact_plan_to_report(
             start_span = end_span = None
             diagnostics.append("reversed_range_repaired")
 
-        trimmed = _trim_structural_filler_edges(
-            segments,
-            a,
-            b,
-            ignore_caption_case=ignore_caption_case,
-        )
-        if trimmed is not None:
-            trimmed_a, trimmed_b = trimmed
-            if trimmed_a != a:
-                start_span = None
-                diagnostics.append("trimmed_start_filler_cue")
-            if trimmed_b != b:
-                end_span = None
-                diagnostics.append("trimmed_end_filler_cue")
-            a, b = trimmed_a, trimmed_b
-
         start_text = str(segments[a].get("text") or "")
         end_text = str(segments[b].get("text") or "")
         start_quote = (
-            _literal_source_quote(start_text, model_start_quote, start_span)
+            _literal_source_quote(start_text, effective_start_quote, start_span)
             if start_span is not None
             else _exact_boundary_quote(start_text, want="start")
         )
@@ -9904,50 +10024,6 @@ def _trusted_compact_plan_to_report(
             else _exact_boundary_quote(end_text, want="end")
         )
 
-        if start_span is not None:
-            replacement, replaced, _error = _replace_structural_edge_quote(
-                start_text,
-                start_quote,
-                want="start",
-                preferred_span=start_span,
-            )
-            if replaced and replacement:
-                repaired_span, _projected, repair_error = _semantic_edge_quote(
-                    start_text, replacement, want="start",
-                )
-                if repair_error is None and repaired_span is not None:
-                    start_quote, start_span = replacement, repaired_span
-                    diagnostics.append("trimmed_start_filler")
-
-        if start_span is not None:
-            selected_tail = start_text[start_span[0]:]
-            transition = _OPENING_CONTEXT_ONLY_TRANSITION_RE.match(selected_tail)
-            if transition is not None:
-                retained = selected_tail[transition.end():].lstrip(" ,;:—-")
-                if retained and _opening_clause_is_standalone(retained):
-                    replacement = _exact_boundary_quote(retained, want="start")
-                    repaired_span, _projected, repair_error = _semantic_edge_quote(
-                        start_text, replacement, want="start",
-                    )
-                    if repair_error is None and repaired_span is not None:
-                        start_quote, start_span = replacement, repaired_span
-                        diagnostics.append("trimmed_context_only_handoff")
-
-        if end_span is not None:
-            replacement, replaced, _error = _replace_structural_edge_quote(
-                end_text,
-                end_quote,
-                want="end",
-                preferred_span=end_span,
-            )
-            if replaced and replacement:
-                repaired_span, _projected, repair_error = _semantic_edge_quote(
-                    end_text, replacement, want="end",
-                )
-                if repair_error is None and repaired_span is not None:
-                    end_quote, end_span = replacement, repaired_span
-                    diagnostics.append("trimmed_end_filler")
-
         if (
             a == b
             and start_span is not None
@@ -9955,151 +10031,28 @@ def _trusted_compact_plan_to_report(
             and start_span[0] >= end_span[1]
         ):
             start_span = end_span = None
-            diagnostics.append("reversed_semantic_boundary")
+            diagnostics.append("full_cue_boundary_fallback")
 
-        provisional_text, _spans = _semantic_clip_slice(
+        clip_text, semantic_spans_by_cue = _semantic_clip_slice(
             segments,
             a,
             b,
             start_span=start_span,
             end_span=end_span,
         )
-        following_text = (
-            str(segments[b + 1].get("text") or "") if b + 1 < n else ""
-        )
-        opening_complete = bool(
-            provisional_text and _opening_clause_is_standalone(provisional_text)
-        )
-        ending_complete = bool(
-            provisional_text
-            and not _cue_has_weak_end(
-                provisional_text,
-                following_text,
-                ignore_caption_case=ignore_caption_case,
-            )
-            and not _next_cue_completes_embedded_predicate(
-                provisional_text, following_text,
-            )
-        )
-        if not opening_complete:
-            start_span = None
-            diagnostics.append("expanded_incomplete_start")
-        if not ending_complete:
-            end_span = None
-            diagnostics.append("expanded_incomplete_end")
-        force_full_start = not opening_complete
-        force_full_end = not ending_complete
-
-        original_a, original_b = a, b
-        a, b, close_error = _close_cue_context(
-            segments,
-            a,
-            b,
-            ignore_caption_case=ignore_caption_case,
-            start_boundary_verified=opening_complete,
-            end_boundary_verified=ending_complete,
-            protected_quote=model_claim_quote,
-            learning_objective=str(proposal.learning_objective or ""),
-        )
-        if close_error:
-            diagnostics.append(close_error)
-        if a != original_a:
-            start_span = None
-            diagnostics.append("context_expanded_start")
-        if b != original_b:
-            end_span = None
-            diagnostics.append("context_repaired_end")
-        if claim_location is not None:
-            if claim_location[0] < a:
-                a = claim_location[0]
-                start_span = None
-                diagnostics.append("retained_claim_start")
-            if claim_location[2] > b:
-                b = claim_location[2]
-                end_span = None
-                diagnostics.append("retained_claim_end")
-
-        start_text = str(segments[a].get("text") or "")
-        end_text = str(segments[b].get("text") or "")
-        if start_span is None:
-            start_quote, edge_error = _expanded_context_edge_quote(
-                start_text, want="start",
-            )
-            if edge_error or not start_quote:
-                start_quote = _exact_boundary_quote(start_text, want="start")
-            start_span, start_projected, edge_error = _semantic_edge_quote(
-                start_text, start_quote, want="start",
-            )
-            if edge_error:
-                start_span, start_projected = None, False
-        else:
-            start_projected = bool(_WORD_RE.search(start_text[:start_span[0]]))
-        if end_span is None:
-            end_quote, edge_error = _expanded_context_edge_quote(
-                end_text, want="end",
-            )
-            if edge_error or not end_quote:
-                end_quote = _exact_boundary_quote(end_text, want="end")
-            end_span, end_projected, edge_error = _semantic_edge_quote(
-                end_text, end_quote, want="end",
-            )
-            if edge_error:
-                end_span, end_projected = None, False
-        else:
-            end_projected = bool(_WORD_RE.search(end_text[end_span[1]:]))
-
-        if force_full_start:
-            start_span = None
-            start_projected = False
-        if force_full_end:
-            end_span = None
-            end_projected = False
-        if claim_location is not None:
-            claim_start_line, claim_left, claim_end_line, claim_right = (
-                claim_location
-            )
-            if (
-                start_projected
-                and start_span is not None
-                and claim_start_line == a
-                and claim_left < start_span[0]
-            ):
-                start_span = None
-                start_projected = False
-                diagnostics.append("start_expanded_to_claim")
-            if (
-                end_projected
-                and end_span is not None
-                and claim_end_line == b
-                and claim_right > end_span[1]
-            ):
-                end_span = None
-                end_projected = False
-                diagnostics.append("end_expanded_to_claim")
-
-        if (
-            a == b
-            and start_span is not None
-            and end_span is not None
-            and start_span[0] >= end_span[1]
-        ):
-            start_span = end_span = None
-            start_projected = end_projected = False
-            diagnostics.append("full_cue_boundary_fallback")
-        clip_text, semantic_spans_by_cue = _semantic_clip_slice(
-            segments,
-            a,
-            b,
-            start_span=start_span if start_projected else None,
-            end_span=end_span if end_projected else None,
-        )
         if not clip_text:
-            start_projected = end_projected = False
+            start_span = end_span = None
             clip_text, semantic_spans_by_cue = _semantic_clip_slice(
                 segments, a, b, start_span=None, end_span=None,
             )
             diagnostics.append("full_cue_boundary_fallback")
 
+        start_projected = bool(
+            start_span is not None and _WORD_RE.search(start_text[:start_span[0]])
+        )
+        end_projected = bool(
+            end_span is not None and _WORD_RE.search(end_text[end_span[1]:])
+        )
         topic_evidence_quote = (
             model_claim_quote
             if _contains_quote(clip_text, model_claim_quote)
@@ -10115,24 +10068,43 @@ def _trusted_compact_plan_to_report(
             candidate_id = f"{base_id}-{suffix}"
             suffix += 1
         used_candidate_ids.add(candidate_id)
+
         cue_ids = [
             str(segments[line].get("cue_id") or f"cue-{line}")
             for line in range(a, b + 1)
         ]
         start, end = _padded_cue_bounds(segments, a, b)
         edge_projection: dict[str, dict[str, object]] = {}
-        if start_projected and start_span is not None:
+        if start_projected:
             edge_projection["start"] = {
                 "required": True,
                 "cue_id": cue_ids[0],
                 "quote": start_quote,
             }
-        if end_projected and end_span is not None:
+        if end_projected:
             edge_projection["end"] = {
                 "required": True,
                 "cue_id": cue_ids[-1],
                 "quote": end_quote,
             }
+
+        grounded_constraint_ids = {
+            str(item.constraint_id)
+            for item in proposal.intent_evidence
+            if str(item.constraint_id) in all_constraint_ids
+            and _contains_quote(clip_text, str(item.evidence_quote))
+        }
+        intent_coverage = (
+            len(grounded_constraint_ids & required_constraint_ids)
+            / len(required_constraint_ids)
+            if required_constraint_ids
+            else 1.0
+        )
+        intent_role = (
+            "primary"
+            if required_constraint_ids.issubset(grounded_constraint_ids)
+            else "supporting"
+        )
 
         diagnostics = list(dict.fromkeys(diagnostics))
         clip = {
@@ -10156,12 +10128,8 @@ def _trusted_compact_plan_to_report(
             "is_standalone": bool(proposal.is_standalone),
             "topic_evidence_quote": topic_evidence_quote,
             "model_claim_quote": model_claim_quote,
-            "boundary_confidence": (
-                0.75 if diagnostics else _cue_boundary_confidence(
-                    end_text, ignore_caption_case=ignore_caption_case,
-                )
-            ),
-            "boundary_repair_mode": "best_effort" if diagnostics else "exact",
+            "boundary_confidence": 1.0 if not diagnostics else 0.75,
+            "boundary_repair_mode": "exact" if not diagnostics else "best_effort",
             "selection_authority": "gemini",
             "surface_eligible": True,
             "selection_candidate_id": candidate_id,
@@ -10173,8 +10141,8 @@ def _trusted_compact_plan_to_report(
             "prerequisite_ids": [],
             "uncertainty": "low",
             "uncertainty_reasons": [],
-            "intent_role": "primary",
-            "intent_coverage": 1.0,
+            "intent_role": intent_role,
+            "intent_coverage": round(intent_coverage, 6),
             "intent_evidence": [
                 {
                     "constraint_id": str(item.constraint_id),

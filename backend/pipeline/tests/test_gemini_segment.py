@@ -717,7 +717,8 @@ def test_production_flash_is_compact_exhaustive_boundary_first():
     prompt = f"{system}\n{user}".casefold()
 
     assert G.PRODUCTION_FLASH_PROFILE == G.FLASH_SPLIT_PROFILE
-    assert "duration is never a selection criterion" in prompt
+    assert "there is no numeric duration cap" in prompt
+    assert "duration must be the consequence of the exact semantic scope" in prompt
     assert (
         "informativeness, topic_relevance, and educational_importance\n"
         "  are each at least 0.75"
@@ -778,10 +779,10 @@ def test_production_flash_has_no_requested_duration_contract():
     assert "requested 10 to 55 second range" not in prompt
     assert "40-second target" not in prompt
     assert "180-second safety ceiling" not in prompt
-    assert "regardless of its duration" in prompt
+    assert "there is no numeric duration cap" in prompt.casefold()
 
 
-def test_compound_topic_allows_grounded_related_facets():
+def test_compound_topic_requires_every_named_part():
     _system, user = G._boundary_prompts(
         "[0] 00:00 lesson",
         1,
@@ -789,16 +790,14 @@ def test_compound_topic_allows_grounded_related_facets():
     )
 
     assert "multiple linked ideas" in user
-    assert "useful prerequisite facet is relevant" in user
-    assert "unrelated domain is not enough" in user
+    assert "every candidate must fulfill every required part" in user
     assert (
-        "shared vocabulary, a loose analogy, or general systems thinking alone"
+        "shared vocabulary, a loose analogy, or general systems thinking is not request"
         in user.casefold()
     )
     assert (
-        "clear educational connection to the exact requested topic" in user.casefold()
+        "do not return it as a separate clip" in user.casefold()
     )
-    assert "even if it is not strictly required background" in user.casefold()
 
 
 def test_budget_is_reserved_once_and_default_call_allows_one_transient_retry(monkeypatch):

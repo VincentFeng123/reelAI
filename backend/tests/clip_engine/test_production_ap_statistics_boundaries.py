@@ -304,8 +304,8 @@ def test_boundary_prompt_demands_shortest_complete_unit_without_duration_cap() -
     assert "decision rules" in prompt
     assert "misconceptions" in prompt
     assert "error cases" in prompt
-    assert "duration is unrestricted" in prompt
-    assert "duration is never a selection criterion" in prompt
+    assert "there is no numeric duration cap" in prompt
+    assert "duration must be the consequence of the exact semantic scope" in prompt
 
 
 def test_joint_request_subject_matching_handles_plural_query_and_singular_evidence() -> None:

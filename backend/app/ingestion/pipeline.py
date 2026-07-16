@@ -1704,6 +1704,8 @@ def _apply_selector_acoustic_context(
     *,
     sibling_clips: list[dict[str, Any]] | None = None,
 ) -> tuple[tuple[float, float], dict[str, Any], str | None]:
+    if _gemini_selection_is_authoritative(raw_clip):
+        return speech_bounds, projection_diagnostics, None
     context = _selector_authorized_acoustic_context(
         transcript,
         raw_clip,

@@ -698,7 +698,290 @@ def test_production_preserves_every_schema_valid_gemini_candidate() -> None:
     assert all(clip["selection_authority"] == "gemini" for clip in report.clips)
 
 
-def test_production_expands_dependent_start_and_incomplete_end_without_drop() -> None:
+def test_production_labels_partial_gemini_intent_without_dropping_candidate() -> None:
+    plan = _compact_custom_plan(
+        request="derive x squared with the limit definition and finish at two x",
+        start_quote="A derivative measures",
+        end_quote="instantaneous change",
+        claim_quote="A derivative measures instantaneous change in a function",
+    )
+    plan = plan.model_copy(update={
+        "request_intent": gemini_segment._RequestIntent.model_validate({
+            "exact_request": plan.request_intent.exact_request,
+            "constraints": [
+                {
+                    "constraint_id": "subject",
+                    "kind": "subject",
+                    "source_phrase": "x squared",
+                    "requirement": "Use x squared",
+                },
+                {
+                    "constraint_id": "task",
+                    "kind": "task",
+                    "source_phrase": "limit definition",
+                    "requirement": "Use the limit definition",
+                },
+                {
+                    "constraint_id": "outcome",
+                    "kind": "outcome",
+                    "source_phrase": "two x",
+                    "requirement": "Finish at two x",
+                },
+            ],
+        }),
+        "topics": [plan.topics[0].model_copy(update={
+            "intent_evidence": [gemini_segment._CompactIntentEvidence(
+                id="task",
+                q="A derivative measures instantaneous change in a function",
+            )],
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": "A derivative measures instantaneous change in a function.",
+        }],
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    [clip] = report.clips
+    assert clip["intent_role"] == "supporting"
+    assert clip["intent_coverage"] == pytest.approx(1 / 3, abs=1e-6)
+
+
+def test_production_unanchored_gemini_intent_is_metadata_only() -> None:
+    plan = _compact_custom_plan(
+        request="derive x squared with the limit definition",
+        start_quote="A derivative measures",
+        end_quote="instantaneous change",
+        claim_quote="A derivative measures instantaneous change",
+    )
+    plan = plan.model_copy(update={
+        "request_intent": gemini_segment._RequestIntent.model_validate({
+            "exact_request": plan.request_intent.exact_request,
+            "constraints": [
+                {
+                    "constraint_id": "subject",
+                    "kind": "subject",
+                    "source_phrase": "x squared",
+                    "requirement": "Use x squared",
+                },
+                {
+                    "constraint_id": "task",
+                    "kind": "task",
+                    "source_phrase": "limit definition",
+                    "requirement": "Use the limit definition",
+                },
+            ],
+        }),
+        "topics": [plan.topics[0].model_copy(update={
+            "intent_evidence": [
+                gemini_segment._CompactIntentEvidence(
+                    id="subject", q="x squared appears only in invented evidence",
+                ),
+                gemini_segment._CompactIntentEvidence(
+                    id="task", q="the missing limit definition is also invented",
+                ),
+            ],
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": "A derivative measures instantaneous change.",
+        }],
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["intent_role"] == "supporting"
+    assert clip["intent_coverage"] == 0.0
+    assert len(clip["intent_evidence"]) == 2
+
+
+def test_production_scope_only_intent_does_not_require_spoken_scope_evidence() -> None:
+    plan = _compact_custom_plan(
+        request="AP Statistics",
+        start_quote="A p value measures",
+        end_quote="under the null hypothesis",
+        claim_quote="A p value measures extremeness under the null hypothesis",
+    )
+    plan = plan.model_copy(update={
+        "request_intent": gemini_segment._RequestIntent.model_validate({
+            "exact_request": plan.request_intent.exact_request,
+            "constraints": [{
+                "constraint_id": "course",
+                "kind": "scope",
+                "source_phrase": "AP Statistics",
+                "requirement": "Use AP Statistics scope",
+            }],
+        }),
+        "topics": [plan.topics[0].model_copy(update={
+            "intent_evidence": [gemini_segment._CompactIntentEvidence(
+                id="course", q="this course name is not spoken",
+            )],
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": "A p value measures extremeness under the null hypothesis.",
+        }],
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    [clip] = report.clips
+    assert clip["intent_role"] == "primary"
+    assert clip["intent_coverage"] == 1.0
+
+
+def test_production_keeps_grounded_intent_quote_inside_repaired_range() -> None:
+    plan = _compact_custom_plan(
+        request="derive x squared",
+        start_quote="The derivative is two x",
+        end_quote="derivative is two x",
+        claim_quote="The derivative is two x",
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 1,
+            "intent_evidence": [gemini_segment._CompactIntentEvidence(
+                id="subject", q="Let f of x equal x squared",
+            )],
+        })],
+    })
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "Let f of x equal x squared.",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 5.0,
+            "end": 10.0,
+            "text": "The derivative is two x.",
+        },
+    ]
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-0", "cue-1"]
+    assert clip["intent_role"] == "primary"
+    assert clip["intent_coverage"] == 1.0
+    assert "start_expanded_to_intent_evidence" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_production_advances_generic_intro_only_to_gemini_intent_evidence() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 20.0,
+            "text": (
+                "In this video, we're going to derive functions with limits."
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 20.0,
+            "end": 60.0,
+            "text": (
+                "First, for five x minus four, the limit definition gives five."
+            ),
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 60.0,
+            "end": 105.0,
+            "text": (
+                "The derivative of five x minus four is five. Now let f of x equal "
+                "x squared. Substitute x plus h into the limit definition."
+            ),
+        },
+        {
+            "cue_id": "cue-3",
+            "start": 105.0,
+            "end": 150.0,
+            "text": (
+                "Expand, cancel x squared, divide by h, and set h to zero. The "
+                "derivative of x squared is two x."
+            ),
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="derive x squared with the limit definition",
+        start_quote="In this video, we're going to",
+        end_quote="derivative of x squared is two x",
+        claim_quote="derivative of x squared is two x",
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 0,
+            "end_line": 3,
+            "intent_evidence": [gemini_segment._CompactIntentEvidence(
+                id="subject", q="Now let f of x equal x squared",
+            )],
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-2", "cue-3"]
+    assert clip["_clip_text"].startswith("Now let f of x equal x squared")
+    assert "five x minus four" not in clip["_clip_text"]
+    assert clip["edge_projection"]["start"]["quote"] == (
+        "Now let f of x equal x squared"
+    )
+    assert "generic_start_advanced_to_intent_evidence" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_production_preserves_gemini_range_without_semantic_expansion() -> None:
     segments = [
         {
             "cue_id": "cue-0",
@@ -749,12 +1032,131 @@ def test_production_expands_dependent_start_and_incomplete_end_without_drop() ->
     assert report.accepted_count == report.proposed_count == 1
     assert report.rejected_reasons == []
     [clip] = report.clips
-    assert clip["cue_ids"] == ["cue-0", "cue-1", "cue-2"]
+    assert clip["cue_ids"] == ["cue-1", "cue-2"]
     assert clip["_clip_text"] == " ".join(
-        segment["text"] for segment in segments
+        segment["text"] for segment in segments[1:]
     )
-    assert "range_recovered_from_claim" in clip["_boundary_fallback_reasons"]
-    assert "context_expanded_start" in clip["_boundary_fallback_reasons"]
+    assert "end_expanded_to_claim" in clip["_boundary_fallback_reasons"]
+    assert "context_expanded_start" not in clip["_boundary_fallback_reasons"]
+
+
+def test_production_preserves_restated_worked_example_start_inside_coarse_cue() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 45.0,
+            "text": (
+                "First derive the linear function five x minus four with the limit "
+                "definition."
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 45.0,
+            "end": 100.0,
+            "text": (
+                "The h terms cancel, so the derivative of five x minus four is five."
+            ),
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 100.0,
+            "end": 155.0,
+            "text": (
+                "Now let's try another example. So let's say if f of x is equal to x "
+                "squared, what is the derivative? Use the limit definition and replace "
+                "x with x plus h."
+            ),
+        },
+        {
+            "cue_id": "cue-3",
+            "start": 155.0,
+            "end": 205.0,
+            "text": (
+                "Expanding gives x squared plus two x h plus h squared. Cancel x "
+                "squared, factor h, and substitute zero. The derivative of x squared "
+                "is two x."
+            ),
+        },
+    ]
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": (
+                "Use the limit definition to derive the derivative of x squared as two x"
+            ),
+            "constraints": [
+                {
+                    "constraint_id": "object",
+                    "kind": "subject",
+                    "source_phrase": "x squared",
+                    "requirement": "Use f of x equal to x squared",
+                },
+                {
+                    "constraint_id": "task",
+                    "kind": "task",
+                    "source_phrase": "limit definition",
+                    "requirement": "Derive with the limit definition",
+                },
+                {
+                    "constraint_id": "outcome",
+                    "kind": "outcome",
+                    "source_phrase": "two x",
+                    "requirement": "Reach the final result two x",
+                },
+            ],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="x-squared-limit-derivation",
+            start_line=2,
+            end_line=3,
+            start_quote="So let's say if f of x is equal to x squared",
+            end_quote="The derivative of x squared is two x",
+            claim_quote="The derivative of x squared is two x",
+            title="Derive the derivative of x squared",
+            learning_objective=(
+                "Derive the derivative of x squared with the limit definition"
+            ),
+            facet="x squared limit derivation",
+            informativeness=0.99,
+            topic_relevance=0.99,
+            educational_importance=0.99,
+            difficulty=0.4,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[
+                {"id": "object", "q": "f of x is equal to x squared"},
+                {"id": "task", "q": "Use the limit definition and replace x"},
+                {"id": "outcome", "q": "The derivative of x squared is two x"},
+            ],
+        )],
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_trust_gemini_semantics": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-2", "cue-3"]
+    assert clip["_clip_text"].startswith(
+        "So let's say if f of x is equal to x squared"
+    )
+    assert "five x minus four" not in clip["_clip_text"]
+    assert clip["edge_projection"]["start"]["quote"] == (
+        "So let's say if f of x is equal to x squared"
+    )
 
 
 def test_production_same_cue_repair_never_excludes_gemini_claim() -> None:
@@ -788,7 +1190,7 @@ def test_production_same_cue_repair_never_excludes_gemini_claim() -> None:
     assert "start_expanded_to_claim" in clip["_boundary_fallback_reasons"]
 
 
-def test_production_incomplete_opening_cannot_regain_fragment_projection() -> None:
+def test_production_preserves_gemini_fragment_projection_without_rejection() -> None:
     text = (
         "Welcome back. and its enclosing scope makes the definition precise."
     )
@@ -813,9 +1215,13 @@ def test_production_incomplete_opening_cannot_regain_fragment_projection() -> No
 
     assert report.accepted_count == report.proposed_count == 1
     [clip] = report.clips
-    assert clip["_clip_text"] == text
-    assert "start" not in clip.get("edge_projection", {})
-    assert "expanded_incomplete_start" in clip["_boundary_fallback_reasons"]
+    assert clip["_clip_text"] == (
+        "and its enclosing scope makes the definition precise"
+    )
+    assert clip["edge_projection"]["start"]["quote"] == (
+        "and its enclosing scope"
+    )
+    assert "expanded_incomplete_start" not in clip["_boundary_fallback_reasons"]
 
 
 @pytest.mark.parametrize(
@@ -952,6 +1358,30 @@ def test_compact_prompt_defines_every_key_and_demonstrates_exact_edges() -> None
     assert 'starts after "Welcome back"' in normalized
     assert 'ends before "Next, confidence intervals"' in normalized
     assert 'Do not start at line 32 with "Divide that change"' in normalized
+
+
+def test_specific_request_prompt_excludes_partial_supporting_units_and_prior_examples() -> None:
+    _system, user = gemini_segment._boundary_prompts(
+        "\n".join([
+            "[0] 00:00 First derive five x minus four; its derivative is five.",
+            "[1] 00:10 Now try x squared with the limit definition.",
+            "[2] 00:20 Expanding and cancelling gives the final derivative two x.",
+        ]),
+        3,
+        (
+            "Use the limit definition to derive f'(x)=2x for f(x)=x², including "
+            "every algebra step and the final result"
+        ),
+    )
+    normalized = " ".join(user.split())
+
+    assert "every required non-scope constraint" in normalized
+    assert "do not return it as a separate clip" in normalized.casefold()
+    assert "the earlier five x minus four example" in normalized.casefold()
+    assert "begin at the x-squared setup" in normalized.casefold()
+    assert "end at its final two-x result" in normalized.casefold()
+    assert "one q never" in normalized.casefold()
+    assert "whole-span completeness check" in normalized.casefold()
 
 
 def test_boundary_prompt_stays_transcript_only_when_video_is_requested() -> None:
@@ -4563,7 +4993,7 @@ def test_boundary_quote_reanchoring_remains_exact_unique_and_in_range(
     assert "bad_start_quote" in report.clips[0]["_boundary_fallback_reasons"]
 
 
-def test_selector_prompt_is_exhaustive_and_allows_one_listed_component() -> None:
+def test_selector_prompt_is_exhaustive_and_requires_full_constrained_request() -> None:
     _system, user = gemini_segment._boundary_prompts(
         "[0] 00:00 Cells use chlorophyll to capture light energy.",
         1,
@@ -4571,7 +5001,9 @@ def test_selector_prompt_is_exhaustive_and_allows_one_listed_component() -> None
         learner_level="beginner",
     )
 
-    assert "deeply teaches any one requested component" in user
+    assert "each returned unit must contain grounded evidence" in user
+    assert "every required non-scope constraint" in user
+    assert "do not return it as a separate clip" in user
     assert "every distinct educational unit" in user
     assert "whole transcript" in (_system + user).lower()
     assert (
@@ -4580,7 +5012,7 @@ def test_selector_prompt_is_exhaustive_and_allows_one_listed_component() -> None
     ) in (_system + user)
     assert "return units across that entire scale" in user.lower()
     assert "unseen visual" in user
-    assert "every qualifying related unit" in (_system + user)
+    assert "Return every distinct qualifying moment" in user
     assert "internal interruption" in (_system + user)
     assert "internal filler may never remain" in (_system + user).lower()
     assert "otherwise keep it" not in (_system + user).lower()
