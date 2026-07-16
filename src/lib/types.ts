@@ -1,4 +1,4 @@
-export const CURRENT_SELECTION_CONTRACT_VERSION = "quality_silence_v36";
+export const CURRENT_SELECTION_CONTRACT_VERSION = "quality_silence_v37";
 
 export type Concept = {
   id: string;

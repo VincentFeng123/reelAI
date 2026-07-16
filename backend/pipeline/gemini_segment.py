@@ -91,6 +91,7 @@ _NON_SPEECH_MARKER_PATTERN = (
 _NON_SPEECH_MARKER_RE = re.compile(_NON_SPEECH_MARKER_PATTERN, re.IGNORECASE)
 _STRUCTURAL_FILLER_RE = re.compile(
     rf"(?:{_NON_SPEECH_MARKER_PATTERN}|\b(?:thanks? for watching|have a great day|see you next time|"
+    r"(?:got\s+it\s+)?easy\s+peasy(?:\s+lemon\s+squeezy)?|"
     r"like and subscribe|please subscribe|"
     r"subscribe to (?:this|the|my|our) channel|today'?s sponsor|"
     r"check out (?:our|the) video|"
@@ -768,6 +769,19 @@ _NAMED_UNIT_LABEL_RESET_RE = re.compile(
     r":\s*(?:how|what|when|where|which|why)\b))",
     re.IGNORECASE,
 )
+_NAMED_METHOD_CONTRAST_RESET_RE = re.compile(
+    r"(?<!\w)(?P<navigation>"
+    r"(?:(?:does|did)\s+that\s+make\s+sense\s+)?"
+    r"(?:(?:and|but|so)\s+)?(?:now|next)\s+)"
+    r"(?P<subject>(?:(?:a|an|our|that|the|this)\s+)?"
+    r"(?:(?!(?:a|an|our|the|this|that)\b)"
+    r"[a-z0-9][\w'’]*(?:\s+|-)){1,5}"
+    r"(?:distribution|method|model|procedure|test))\s+"
+    r"(?:is|works?|uses?|requires?)\s+"
+    r"(?:(?:a|an)\s+)?(?:(?:fundamentally|meaningfully|slightly|very)\s+|"
+    r"a\s+little\s+)?(?:different|distinct)\b",
+    re.IGNORECASE,
+)
 _NEXT_DISTINCT_UNIT_RESET_RE = re.compile(
     r"(?:^|(?<=[.!?])\s+)(?P<navigation>"
     r"(?:(?:all\s+right|alright|okay|ok|so|now)\s*[,;:]?\s+)*"
@@ -948,6 +962,11 @@ _OPENING_CONTEXTUAL_MODIFIER_SUBJECT_RE = re.compile(
 _OPENING_BARE_RELATIONAL_PREDICATE_RE = re.compile(
     r"^\s*(?:is|are|was|were)\s+(?:equal|equivalent|proportional|related|"
     r"similar|connected|dependent)\b",
+    re.IGNORECASE,
+)
+_OPENING_SUBJECTLESS_ADJECTIVE_COMPLEMENT_RE = re.compile(
+    r"^\s*(?:(?:extremely|highly|quite|really|so|too|very)\s+)*"
+    r"(?:clear|likely|possible|probable|unlikely)\s+that\b",
     re.IGNORECASE,
 )
 _OPENING_DEPENDENT_PREPOSITION_FRAGMENT_RE = re.compile(
@@ -2620,6 +2639,7 @@ def _cue_opens_mid_thought(text: str, *, ignore_caption_case: bool) -> bool:
         _OPENING_RELATIVE_WHERE_FRAGMENT_RE.match(str(text or ""))
         or _OPENING_SUBORDINATE_PRONOUN_REFERENCE_RE.match(str(text or ""))
         or _OPENING_RELATIVE_BRIDGE_RE.match(str(text or ""))
+        or _OPENING_SUBJECTLESS_ADJECTIVE_COMPLEMENT_RE.match(str(text or ""))
     ):
         return True
     guarded = _guard_text(text, ignore_caption_case=ignore_caption_case)
@@ -6223,6 +6243,55 @@ class _TopicTransition:
     worked_unit: bool = False
     recap: bool = False
     clears_recap: bool = False
+    reset_subject: str = ""
+    named_method_handoff: bool = False
+
+
+def _named_method_handoff_misgrounds_objective(
+    transitions: list[_TopicTransition],
+    segments: list[dict],
+    start_line: int,
+    *,
+    evidence_location: tuple[int, int, int, int] | None,
+    learning_objective: str,
+) -> bool:
+    """Reject evidence from an old method when the objective names the new one."""
+    if evidence_location is None:
+        return False
+    evidence_end = evidence_location[2], evidence_location[3]
+    generic_subject_tokens = {
+        "a", "an", "distribution", "method", "model", "our", "procedure",
+        "test", "that", "the", "this",
+    }
+    objective_tokens = set(_toks(learning_objective)) - generic_subject_tokens
+    for transition in transitions:
+        if (
+            not transition.named_method_handoff
+            or evidence_end > (
+                transition.navigation_line,
+                transition.navigation_left,
+            )
+        ):
+            continue
+        distinctive_subject = (
+            set(_toks(transition.reset_subject)) - generic_subject_tokens
+        )
+        objective_subject = objective_tokens & distinctive_subject
+        if not objective_subject:
+            continue
+        prior_parts = [
+            str(segments[line].get("text") or "")
+            for line in range(start_line, transition.navigation_line)
+        ]
+        prior_parts.append(
+            str(segments[transition.navigation_line].get("text") or "")[
+                :transition.navigation_left
+            ]
+        )
+        prior_tokens = set(_toks(" ".join(prior_parts))) - generic_subject_tokens
+        if not (objective_subject & prior_tokens):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -7411,6 +7480,7 @@ def _candidate_topic_transitions(
         _HARD_TOPIC_RESET_RE,
         _INDEPENDENT_UNIT_RESET_RE,
         _NAMED_UNIT_LABEL_RESET_RE,
+        _NAMED_METHOD_CONTRAST_RESET_RE,
         _NEXT_DISTINCT_UNIT_RESET_RE,
     )
     has_hard_reset = any(
@@ -7695,6 +7765,10 @@ def _candidate_topic_transitions(
                         reset_pattern,
                         _reset_navigation_prefix(reset),
                     ),
+                    reset_subject=subject,
+                    named_method_handoff=(
+                        reset_pattern is _NAMED_METHOD_CONTRAST_RESET_RE
+                    ),
                 ))
 
     for line in range(start_line, end_line):
@@ -7799,6 +7873,10 @@ def _candidate_topic_transitions(
                         reset_pattern,
                         _reset_navigation_prefix(reset),
                     ),
+                    reset_subject=subject,
+                    named_method_handoff=(
+                        reset_pattern is _NAMED_METHOD_CONTRAST_RESET_RE
+                    ),
                 ))
     if has_worked_unit_onset:
         transitions.extend(_worked_unit_transitions(
@@ -7828,6 +7906,14 @@ def _candidate_topic_transitions(
             clears_recap=(
                 transition.clears_recap
                 or bool(previous and previous.clears_recap)
+            ),
+            reset_subject=(
+                transition.reset_subject
+                or (previous.reset_subject if previous is not None else "")
+            ),
+            named_method_handoff=(
+                transition.named_method_handoff
+                or bool(previous and previous.named_method_handoff)
             ),
         )
     return sorted(
@@ -7874,6 +7960,20 @@ def _objective_explicitly_relates_sections(learning_objective: str) -> bool:
         _EXPLICIT_RELATIONAL_OBJECTIVE_RE.search(
             " ".join(str(learning_objective or "").split())
         )
+    )
+
+
+def _compact_evidence_explicitly_relates_sections(evidence_quote: str) -> bool:
+    """Accept a spoken comparison marker without treating a bare ``but`` as one."""
+    normalized = " ".join(str(evidence_quote or "").split())
+    if (
+        _EXPLICIT_RELATIONAL_OBJECTIVE_RE.search(normalized)
+        or _DIRECT_COMPARISON_CLAUSE_RE.search(normalized)
+    ):
+        return True
+    return any(
+        match.group(0).strip().casefold() != "but"
+        for match in _SPOKEN_COMPARISON_RELATION_RE.finditer(normalized)
     )
 
 
@@ -9669,7 +9769,7 @@ def _plan_to_report(
                 continue
         relationship_bridge_allowed: bool | None = (
             bool(
-                _objective_explicitly_relates_sections(
+                _compact_evidence_explicitly_relates_sections(
                     evidence_quote_for_section
                 )
                 and (
@@ -9791,6 +9891,17 @@ def _plan_to_report(
             atomic_scope_text=atomic_scope_text,
             comparison_subject_anchors=comparison_subject_anchors,
         )
+        if _named_method_handoff_misgrounds_objective(
+            topic_transitions_for_section,
+            segments,
+            transition_scan_start,
+            evidence_location=evidence_location_for_section,
+            learning_objective=objective_for_section,
+        ):
+            report.rejected_reasons.append(
+                f"{prefix}:topic_evidence_precedes_named_method"
+            )
+            continue
         if evidence_location_for_section is not None:
             evidence_start = (
                 evidence_location_for_section[0],
@@ -11739,6 +11850,8 @@ def _call_model(
                             schema,
                             model=model,
                             timeout_s=min(10.0, remaining_s),
+                            thinking_level=thinking_level,
+                            max_output_tokens=max_output_tokens,
                         )
                     except Exception as exc:
                         # Raw UTF-8 bytes are not tokens. Treating them as such
@@ -11754,10 +11867,10 @@ def _call_model(
                             retryable=_transient_gemini_error(exc),
                             status_code=_gemini_status_code(exc),
                         ) from exc
-                    # countTokens receives the same system instruction, user
-                    # content, and response schema as generateContent. Its exact
-                    # result must choose the pricing tier without an artificial
-                    # post-count buffer that could push 199.5k over 200k.
+                    # CountTokens receives the complete GenerateContentRequest,
+                    # including its system instruction and response schema. Its
+                    # server-side count chooses the price tier without a local
+                    # byte/token guess or an artificial post-count buffer.
                     estimate_buffer_tokens = 0
                 else:
                     raise GeminiTokenPreflightError(
@@ -12644,6 +12757,39 @@ def segment_clips_detailed(
     if not segments:
         return SegmentResult([], "No transcript segments to segment.", "none", "invalid",
                              ["missing_segments"])
+
+    # Cost safety belongs at the public selector boundary, not only in the web
+    # orchestration layer. Hosted jobs arrive with a shared context; CLI,
+    # evaluation, and future direct callers receive one bounded local ledger.
+    # Copy the mapping so installing the private hooks never mutates caller
+    # configuration or leaks one transcript's budget into another invocation.
+    settings = dict(settings or {})
+    reserve_hook = settings.get("_segment_budget_reserve")
+    reconcile_hook = settings.get("_segment_budget_reconcile")
+    if not (callable(reserve_hook) and callable(reconcile_hook)):
+        generation_context = (
+            settings.get("generation_context")
+            or settings.get("provider_context")
+        )
+        reserve_hook = getattr(generation_context, "reserve_gemini_call", None)
+        reconcile_hook = getattr(generation_context, "reconcile_gemini_call", None)
+        if not (callable(reserve_hook) and callable(reconcile_hook)):
+            from ..app.clip_engine.provider_runtime import GenerationContext
+
+            generation_mode = (
+                "slow"
+                if str(settings.get("generation_mode") or "").casefold() == "slow"
+                else "fast"
+            )
+            generation_context = GenerationContext(
+                generation_mode,
+                generation_id=f"selector:{video_id or 'direct'}",
+            )
+            settings["_segment_local_budget_context"] = generation_context
+            reserve_hook = generation_context.reserve_gemini_call
+            reconcile_hook = generation_context.reconcile_gemini_call
+        settings["_segment_budget_reserve"] = reserve_hook
+        settings["_segment_budget_reconcile"] = reconcile_hook
 
     # Production defaults to the single Pro boundary selector. Explicit Flash,
     # hybrid, and shadow modes remain available only to evaluation callers.

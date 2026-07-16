@@ -279,7 +279,7 @@ class ClipEngineSearchTests(unittest.TestCase):
             breadth=3,
         )
 
-    def test_ingest_search_does_not_surface_unverified_acoustic_clip(self) -> None:
+    def test_ingest_search_surfaces_safe_transcript_fallback_without_silence(self) -> None:
         unavailable = pipeline_module.clip_engine_silence.SilenceVerificationResult(
             "unavailable",
             20.0,
@@ -308,15 +308,17 @@ class ClipEngineSearchTests(unittest.TestCase):
                 exclude_video_ids=[],
             )
 
-        self.assertEqual(result.succeeded, 0)
+        self.assertEqual(result.succeeded, 1)
         self.assertEqual(result.failed, 0)
         self.assertEqual(len(result.items), 1)
-        self.assertEqual(result.items[0].status, "skipped")
-        self.assertIsNone(result.items[0].reel)
+        self.assertEqual(result.items[0].status, "ok")
+        self.assertIsNotNone(result.items[0].reel)
+        self.assertEqual(result.items[0].reel.boundary_status, "context_aligned")
+        self.assertFalse(result.items[0].reel.acoustic_verified)
         with db_module.get_conn() as conn:
             self.assertEqual(
                 db_module.fetch_one(conn, "SELECT COUNT(*) AS cnt FROM reels")["cnt"],
-                0,
+                1,
             )
 
     # --------------------------------------------------------------------- #

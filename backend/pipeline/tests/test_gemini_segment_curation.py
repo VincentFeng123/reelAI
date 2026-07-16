@@ -2688,6 +2688,232 @@ def test_complete_local_if_proform_is_not_a_dangling_clause(text):
     assert not G._cue_has_explicit_dangling_end(text, "")
 
 
+def test_production_chi_square_candidate_rejects_prior_test_tail_and_method_mix():
+    texts = [
+        "was exactly the same it would be very",
+        "unlikely the P value",
+        "very unlikely that we would have seen",
+        "the difference that we did in our sample",
+        "so we can reject the null hypothesis and",
+        "we can accept the fact that there is a",
+        "difference does that make sense now the",
+        "Ki Square test is a little different and",
+        "the difference is because in the Ki Square test you've got a different combination of variable types right",
+        "you've got two categorical variables in other words two variables in which the data can be put into buckets",
+        "for the T Test you had one categorical variable and the other variable was numeric",
+        "everything about inferential statistics is exactly the same as the T Test in Anova",
+        "we've seen that there's some sort of association between sex and height category",
+        "we do the Ki Square test and it gives us the P value if the P value is very small",
+        "we reject the null hypothesis and accept that there is an association between sex and height category got it easy peasy lemon squeezy",
+        "let's keep going boom shakalaka and for",
+        "the correlation test the exact same principles apply",
+    ]
+    segments = [
+        {
+            "cue_id": f"FmUJSbo_z74:cue:{155 + index}",
+            "start": float(index * 4),
+            "end": float((index + 1) * 4),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+    proposal = _boundary_topic(
+        2,
+        14,
+        candidate_id="FmUJSbo_z74::chisquare_application",
+        start_quote="very unlikely that we would have",
+        end_quote="got it easy peasy lemon squeezy",
+        title="Hypothesis Testing with Chi-Square",
+        learning_objective=(
+            "Interpret a p-value for a Chi-Square test of association."
+        ),
+        facet="chi-square p-value application",
+        topic_evidence_quote="reject the null hypothesis and we can accept",
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="AP Statistics hypothesis tests and p-values",
+    )
+
+    assert report.clips == []
+    assert (
+        "proposal_0:topic_evidence_precedes_named_method"
+        in report.rejected_reasons
+    )
+
+
+def test_standalone_adjective_subject_is_not_a_subjectless_opening_fragment():
+    assert not G._cue_opens_mid_thought(
+        "Very unlikely events still deserve careful study.",
+        ignore_caption_case=True,
+    )
+
+
+def test_named_method_comparison_objective_bridges_explicit_handoff():
+    segments = [
+        {
+            "cue_id": "method-compare:cue:1",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "A linear regression model predicts a numeric response.",
+        },
+        {
+            "cue_id": "method-compare:cue:2",
+            "start": 5.0,
+            "end": 10.0,
+            "text": (
+                "Now the chi square test is different from linear regression: "
+                "it evaluates categorical counts."
+            ),
+        },
+    ]
+
+    relational_claim = (
+        "chi square test is different from linear regression it evaluates categorical counts"
+    )
+    proposal = G._CompactBoundaryTopic(
+        candidate_id="method-compare",
+        start_line=0,
+        end_line=1,
+        start_quote="A linear regression model predicts a numeric response",
+        end_quote="it evaluates categorical counts",
+        claim_quote=relational_claim,
+        title="Linear Regression and Chi-Square",
+        learning_objective=(
+            "Compare a linear regression model with a chi-square test by explaining that "
+            "chi-square is different because it evaluates categorical counts."
+        ),
+        facet="linear regression versus chi-square data types",
+        informativeness=0.95,
+        topic_relevance=0.95,
+        educational_importance=0.95,
+        difficulty=0.5,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        self_contained=True,
+        is_standalone=True,
+        intent_evidence=[
+            {
+                "id": "left",
+                "q": "A linear regression model predicts a numeric response",
+            },
+            {
+                "id": "relationship",
+                "q": relational_claim,
+            },
+            {
+                "id": "right",
+                "q": relational_claim,
+            },
+        ],
+    )
+
+    report = G._plan_to_report(
+        G._CompactBoundaryPlan(
+            request_intent={
+                "exact_request": "linear regression model versus chi-square test",
+                "constraints": [
+                    {
+                        "constraint_id": "left",
+                        "kind": "subject",
+                        "source_phrase": "linear regression model",
+                        "requirement": "Teach linear regression models",
+                    },
+                    {
+                        "constraint_id": "relationship",
+                        "kind": "relationship",
+                        "source_phrase": "versus",
+                        "requirement": "Compare both methods",
+                    },
+                    {
+                        "constraint_id": "right",
+                        "kind": "subject",
+                        "source_phrase": "chi-square test",
+                        "requirement": "Teach chi-square tests",
+                    },
+                ],
+            },
+            topics=[proposal],
+        ),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="linear regression model versus chi-square test",
+    )
+
+    assert G._compact_evidence_explicitly_relates_sections(relational_claim)
+    assert not G._compact_evidence_explicitly_relates_sections(
+        "The first method works, but the next section starts here."
+    )
+    assert len(report.clips) == 1
+    assert report.clips[0]["cue_ids"] == [
+        "method-compare:cue:1",
+        "method-compare:cue:2",
+    ]
+    assert G._NAMED_METHOD_CONTRAST_RESET_RE.search(
+        "Now the test is a little different."
+    ) is None
+
+
+def test_named_z_test_handoff_rejects_prior_generic_p_value_evidence():
+    segments = [
+        {
+            "cue_id": "z-handoff:cue:1",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "A small p-value is evidence against the null hypothesis.",
+        },
+        {
+            "cue_id": "z-handoff:cue:2",
+            "start": 5.0,
+            "end": 10.0,
+            "text": "Now our z-test is different because its statistic is standardized.",
+        },
+    ]
+    proposal = _boundary_topic(
+        0,
+        1,
+        candidate_id="z-handoff",
+        start_quote="A small p-value is evidence",
+        end_quote="its statistic is standardized",
+        title="Interpreting a Z-Test",
+        learning_objective="Interpret a p-value from a z-test.",
+        facet="z-test p-value interpretation",
+        topic_evidence_quote="small p-value is evidence against the null hypothesis",
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="z-test p-values",
+    )
+
+    assert report.clips == []
+    assert "proposal_0:topic_evidence_precedes_named_method" in report.rejected_reasons
+
+
+def test_casual_easy_peasy_tail_is_trimmed_as_edge_filler():
+    text = (
+        "The chi-square result supports an association, "
+        "got it easy peasy lemon squeezy"
+    )
+
+    replacement, error = G._expanded_context_edge_quote(
+        text,
+        want="end",
+    )
+
+    assert error is None
+    assert "easy peasy" not in replacement
+
+
 def _selection_task_tail(user: str) -> str:
     return user[user.index("Based on the preceding transcript"):]
 

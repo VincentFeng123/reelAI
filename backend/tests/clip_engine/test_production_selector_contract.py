@@ -533,8 +533,10 @@ def test_exact_token_preflight_admits_affordable_long_unicode_text(
     assert reservations[0]["estimated_input_tokens"] == 60_000
 
 
-def test_exact_token_preflight_does_not_push_affordable_prompt_into_long_context_tier(
+@pytest.mark.parametrize("exact_tokens", [199_500, 200_000])
+def test_exact_token_preflight_keeps_affordable_tier_through_its_exact_boundary(
     monkeypatch,
+    exact_tokens,
 ) -> None:
     context = GenerationContext("slow", generation_id="selector-exact-tier")
     reservations: list[dict] = []
@@ -543,7 +545,7 @@ def test_exact_token_preflight_does_not_push_affordable_prompt_into_long_context
     monkeypatch.setattr(
         gemini_client,
         "count_request_tokens",
-        lambda *_args, **_kwargs: 199_500,
+        lambda *_args, **_kwargs: exact_tokens,
     )
 
     def generate(_system, _user, _schema, **kwargs):
@@ -552,10 +554,10 @@ def test_exact_token_preflight_does_not_push_affordable_prompt_into_long_context
             text='{"topics": []}',
             telemetry={
                 "model": kwargs["model"],
-                "prompt_tokens": 199_500,
+                "prompt_tokens": exact_tokens,
                 "candidate_tokens": 10,
                 "thought_tokens": 10,
-                "total_tokens": 199_520,
+                "total_tokens": exact_tokens + 20,
             },
         )
 
@@ -583,9 +585,9 @@ def test_exact_token_preflight_does_not_push_affordable_prompt_into_long_context
 
     assert parsed.topics == []
     assert len(calls) == len(reservations) == 1
-    assert reservations[0]["estimated_input_tokens"] == 199_500
+    assert reservations[0]["estimated_input_tokens"] == exact_tokens
     assert context.budget.snapshot()["gemini"]["committed_cost_usd"] == pytest.approx(
-        (199_500 * 2.0 + 20 * 12.0) / 1_000_000.0
+        (exact_tokens * 2.0 + 20 * 12.0) / 1_000_000.0
     )
 
 

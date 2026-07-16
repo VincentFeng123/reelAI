@@ -310,6 +310,7 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
                 engine_out=engine_out,
                 should_cancel=None,
                 prepared_audio=prepared,
+                require_acoustic_boundaries=True,
             )
 
         self.assertEqual(len(clips), 1)
@@ -318,6 +319,47 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
             clips[0]["search_context"]["boundary_status"], "context_aligned"
         )
         self.assertEqual(verify.call_args.kwargs["search_end_limit_sec"], 13.0)
+
+    def test_direct_adapter_keeps_good_clip_when_silence_is_unavailable(self) -> None:
+        prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+            "ready",
+            source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+                "https://audio.invalid/no-silence",
+                format_id="140",
+                duration_sec=10.0,
+            ),
+        )
+        unavailable = pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "unavailable",
+            0.0,
+            10.0,
+            {"stage": "start", "reason": "start_silence_not_found"},
+        )
+
+        with mock.patch.object(
+            pipeline_module.clip_engine_silence,
+            "verify_acoustic_boundaries",
+            return_value=unavailable,
+        ) as verify:
+            clips = pipeline_module._verified_direct_adapter_clips(
+                source_url=SOURCE_URL,
+                engine_out=_media_tail_engine_out(),
+                should_cancel=None,
+                prepared_audio=prepared,
+                require_acoustic_boundaries=True,
+            )
+
+        self.assertEqual(len(clips), 1)
+        self.assertEqual((clips[0]["start"], clips[0]["end"]), (0.0, 10.0))
+        context = clips[0]["search_context"]
+        self.assertEqual(context["boundary_status"], "context_aligned")
+        self.assertTrue(context["surface_eligible"])
+        self.assertFalse(context["boundary_diagnostics"]["acoustic_verified"])
+        self.assertEqual(
+            context["boundary_diagnostics"]["transcript"]["reason"],
+            "start_silence_not_found",
+        )
+        verify.assert_called_once()
 
     def test_direct_adapter_requires_each_quality_score_at_green_threshold(self) -> None:
         prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(

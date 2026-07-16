@@ -1218,9 +1218,9 @@ class ReelService:
     # v38: require the v31 repeated-caption boundary contract.
     # v39: require the v32 post-closure edge-preview contract.
     # v40: require the v33 grounded atomic-claim selector contract.
-    # The separate contract key below invalidates prior inventory under v36.
+    # The separate contract key below invalidates prior inventory under v37.
     RANKED_FEED_CACHE_VERSION = 40
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v36"
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v37"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
         "quality_silence_v4",
@@ -1255,6 +1255,7 @@ class ReelService:
         "quality_silence_v34",
         "quality_silence_v35",
         "quality_silence_v36",
+        "quality_silence_v37",
     })
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
@@ -2508,6 +2509,7 @@ class ReelService:
                 "quality_silence_v32",
                 "quality_silence_v35",
                 "quality_silence_v36",
+                "quality_silence_v37",
             }
             for reel in generated
         ):
@@ -5858,6 +5860,7 @@ class ReelService:
                 "quality_silence_v32",
                 "quality_silence_v35",
                 "quality_silence_v36",
+                "quality_silence_v37",
             },
         )
         metadata["_selection_substantive"] = selection_bool(
@@ -5896,6 +5899,7 @@ class ReelService:
                 "quality_silence_v32",
                 "quality_silence_v35",
                 "quality_silence_v36",
+                "quality_silence_v37",
             },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
@@ -7406,6 +7410,7 @@ class ReelService:
                     "quality_silence_v32",
                     "quality_silence_v35",
                     "quality_silence_v36",
+                    "quality_silence_v37",
                 }
                 else legacy_difficulty_matches_level
             )
@@ -7428,10 +7433,17 @@ class ReelService:
                 "_selection_boundary_status"
             )
             if require_verified_boundaries:
+                # The legacy argument name now means "require a proven usable
+                # boundary". Prefer measured silence, but do not discard a
+                # high-quality clip merely because YouTube audio is blocked or
+                # has no qualifying quiet edge. A context-aligned row still has
+                # to contain every required word inside the validated semantic
+                # corridor; malformed/unavailable fallbacks fail closed in
+                # persisted_boundary_is_usable().
                 if (
-                    boundary_status != "verified"
-                    or selection_metadata.get("_selection_acoustic_verified") is not True
-                    or selection_metadata.get("_selection_boundary_usable") is not True
+                    boundary_status not in {"verified", "context_aligned"}
+                    or selection_metadata.get("_selection_boundary_usable")
+                    is not True
                     or (
                         selection_version
                         in {
@@ -7465,6 +7477,7 @@ class ReelService:
                             "quality_silence_v32",
                             "quality_silence_v35",
                             "quality_silence_v36",
+                            "quality_silence_v37",
                         }
                         and selection_metadata.get(
                             "_selection_speech_corridor_verified"
@@ -7509,6 +7522,7 @@ class ReelService:
                     "quality_silence_v32",
                     "quality_silence_v35",
                     "quality_silence_v36",
+                    "quality_silence_v37",
                 } and (
                     (
                         min(
@@ -7554,6 +7568,7 @@ class ReelService:
                             "quality_silence_v32",
                             "quality_silence_v35",
                             "quality_silence_v36",
+                            "quality_silence_v37",
                         }
                         else self._selection_number(
                             selection_metadata.get("_selection_topic_relevance"), 0.0
@@ -7908,6 +7923,7 @@ class ReelService:
                 "quality_silence_v32",
                 "quality_silence_v35",
                 "quality_silence_v36",
+                "quality_silence_v37",
             }:
                 # V5+ captions must be immutable selection-time evidence. A
                 # provider artifact key identifies a retrieval profile and may
@@ -7957,6 +7973,7 @@ class ReelService:
                         "quality_silence_v32",
                         "quality_silence_v35",
                         "quality_silence_v36",
+                        "quality_silence_v37",
                     }
                     or transcript_artifact_key
                     else str(clean_item.get("transcript_snippet") or "")

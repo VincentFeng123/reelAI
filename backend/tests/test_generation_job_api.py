@@ -42,8 +42,8 @@ def test_fresh_inventory_and_selector_cache_share_current_contract() -> None:
         main.SELECTION_CONTRACT_VERSION,
         generation_jobs.REQUEST_SCHEMA_VERSION,
         ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
-    } == {"quality_silence_v36"}
-    assert segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v36"
+    } == {"quality_silence_v37"}
+    assert segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v37"
     assert "quality_silence_v18" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v19" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v20" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
@@ -59,7 +59,22 @@ def test_fresh_inventory_and_selector_cache_share_current_contract() -> None:
     assert "quality_silence_v30" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v31" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v32" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
-    assert "quality_silence_v36" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
+    assert "quality_silence_v37" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
+
+
+def test_current_request_filter_rejects_stale_or_unversioned_inventory() -> None:
+    current = {"reel_id": "current", "selection_contract_version": "quality_silence_v37"}
+    internal_current = {
+        "reel_id": "internal-current",
+        "_selection_contract_version": "quality_silence_v37",
+    }
+
+    assert main._current_selection_contract_reels([
+        {"reel_id": "stale", "selection_contract_version": "quality_silence_v36"},
+        {"reel_id": "missing"},
+        current,
+        internal_current,
+    ]) == [current, internal_current]
 
 
 def test_reel_response_schema_retains_v3_source_and_selector_metadata() -> None:
@@ -159,7 +174,7 @@ def _insert_generation_reel(
             json.dumps({
                 "surface_eligible": True,
                 "boundary_status": "verified",
-                "selection_contract_version": "quality_silence_v36",
+                "selection_contract_version": "quality_silence_v37",
                 "speech_corridor_verified": True,
                 "directly_teaches_topic": True,
                 "substantive": True,
@@ -193,7 +208,7 @@ def _insert_generation_reel(
         "video_id": video_id,
         "t_start": 0.0,
         "t_end": 30.0,
-        "selection_contract_version": "quality_silence_v36",
+        "selection_contract_version": "quality_silence_v37",
     }
 
 
@@ -260,7 +275,7 @@ def _set_reel_boundary_state(
                 "speech_corridor_verified": True,
                 "selection_caption_cues": caption_cues,
                 "boundary_diagnostics": boundary_diagnostics,
-                "selection_contract_version": "quality_silence_v36",
+                "selection_contract_version": "quality_silence_v37",
                 "directly_teaches_topic": True,
                 "substantive": True,
                 "factually_grounded": True,
@@ -331,7 +346,7 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
             "takeaways": [],
             "score": 0.93,
             "relevance_score": 0.13,
-            "_selection_contract_version": "quality_silence_v36",
+            "_selection_contract_version": "quality_silence_v37",
             "_selection_topic_relevance": 0.93,
             "_selection_source_rank": 0,
         }],
@@ -353,7 +368,7 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
 
         assert len(reels) == 1
         assert reels[0]["video_id"] == "AbCdEf12345"
-        assert reels[0]["selection_contract_version"] == "quality_silence_v36"
+        assert reels[0]["selection_contract_version"] == "quality_silence_v37"
         assert reels[0]["relevance_score"] == 0.93
         assert reels[0]["topic_relevance"] == 0.93
         assert not any(key.startswith("_selection_") for key in reels[0])
@@ -1077,7 +1092,7 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
                 json.dumps({
                         "surface_eligible": True,
                         "boundary_status": "verified",
-                        "selection_contract_version": "quality_silence_v36",
+                        "selection_contract_version": "quality_silence_v37",
                         "speech_corridor_verified": True,
                         "directly_teaches_topic": True,
                         "substantive": True,
@@ -2212,7 +2227,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
                 "video_id": f"{mode}-video-{index % expected_source_cap}",
                 "t_start": float(index * 10),
                 "t_end": float(index * 10 + 8),
-                "selection_contract_version": "quality_silence_v36",
+                "selection_contract_version": "quality_silence_v37",
             }
             kwargs["on_reel_created"](reel)
         generated_count += int(kwargs["max_new_reels"])
@@ -2229,7 +2244,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
         lambda *_args, **_kwargs: [
             {
                 "reel_id": f"{mode}-reel-{index}",
-                "selection_contract_version": "quality_silence_v36",
+                "selection_contract_version": "quality_silence_v37",
             }
             for index in range(expected_reel_cap)
         ],
@@ -2847,7 +2862,7 @@ def test_generation_stream_replays_monotonic_persisted_events(monkeypatch) -> No
         payload={
             "reel": {
                 "reel_id": "provisional",
-                "selection_contract_version": "quality_silence_v36",
+                "selection_contract_version": "quality_silence_v37",
             },
             "provisional": True,
         },
@@ -2922,7 +2937,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
                 "video_id": "streamed-video",
                 "t_start": 10.0,
                 "t_end": 40.0,
-                "selection_contract_version": "quality_silence_v36",
+                "selection_contract_version": "quality_silence_v37",
             },
             "provisional": True,
         },
@@ -2947,7 +2962,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
         "_ranked_request_reels",
         lambda *_args, **_kwargs: [{
             "reel_id": "ranked-reel",
-            "selection_contract_version": "quality_silence_v36",
+            "selection_contract_version": "quality_silence_v37",
         }],
     )
     monkeypatch.setattr(
@@ -3008,7 +3023,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
                 "video_id": f"ranked-video-{index}",
                 "t_start": float(index * 30),
                 "t_end": float(index * 30 + 20),
-                "selection_contract_version": "quality_silence_v36",
+                "selection_contract_version": "quality_silence_v37",
             }
             for index in range(4)
         ],
@@ -3126,7 +3141,7 @@ def test_completed_job_status_and_replay_drop_currently_invalid_candidate(monkey
         "audio_refinement_deadline_exceeded",
     ],
 )
-def test_boundary_only_failure_is_persisted_but_omitted_from_feed_and_replay(
+def test_boundary_only_failure_surfaces_strict_transcript_fallback_in_feed_and_replay(
     monkeypatch,
     fallback_reason: str,
 ) -> None:
@@ -3172,8 +3187,7 @@ def test_boundary_only_failure_is_persisted_but_omitted_from_feed_and_replay(
     search_context = {
         "selection_candidate_id": f"candidate-{fallback_reason}",
         "selection_contract_version": main.SELECTION_CONTRACT_VERSION,
-        "surface_eligible": False,
-        "surface_reason": "acoustic_boundary_unverified",
+        "surface_eligible": True,
         "speech_corridor_verified": True,
         "boundary_confidence": 0.9,
         "boundary_status": "context_aligned",
@@ -3262,7 +3276,7 @@ def test_boundary_only_failure_is_persisted_but_omitted_from_feed_and_replay(
         learner_id="learner-1",
         require_verified_boundaries=True,
     )
-    assert ranked_feed == []
+    assert [item["reel_id"] for item in ranked_feed] == [persisted.reel_id]
 
     job, _ = generation_jobs.submit_or_get_active(
         conn,
@@ -3315,15 +3329,17 @@ def test_boundary_only_failure_is_persisted_but_omitted_from_feed_and_replay(
         terminal,
         generation_jobs.replay_events(conn, job_id=job["id"]),
     )
-    assert status["reels"] == []
+    assert [item["reel_id"] for item in status["reels"]] == [persisted.reel_id]
     assert [
         event["payload"]["reel"]["reel_id"]
         for event in replay
         if event["type"] == "candidate"
-    ] == []
+    ] == [persisted.reel_id]
     final = next(event for event in replay if event["type"] == "final")
     assert final["payload"]["authoritative"] is True
-    assert final["payload"]["reels"] == []
+    assert [item["reel_id"] for item in final["payload"]["reels"]] == [
+        persisted.reel_id
+    ]
     stored_context = json.loads(conn.execute(
         "SELECT search_context_json FROM reels WHERE id = ?",
         (persisted.reel_id,),
@@ -3441,7 +3457,11 @@ def test_feed_does_not_top_up_a_full_three_batch_startup_reservoir(monkeypatch) 
         main,
         "_ranked_request_reels",
         lambda *_args, **_kwargs: [
-            {"reel_id": f"ready-{index}"} for index in range(9)
+            {
+                "reel_id": f"ready-{index}",
+                "selection_contract_version": main.SELECTION_CONTRACT_VERSION,
+            }
+            for index in range(9)
         ],
     )
     wake = mock.Mock()
@@ -3464,6 +3484,39 @@ def test_feed_does_not_top_up_a_full_three_batch_startup_reservoir(monkeypatch) 
         conn.close()
 
 
+def test_feed_drops_stale_ranked_rows_before_returning_current_inventory(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(
+        main,
+        "_fetch_active_generation_row",
+        lambda *_args, **_kwargs: {"id": "current-generation"},
+    )
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: [
+            {
+                "reel_id": "stale-v36",
+                "selection_contract_version": "quality_silence_v36",
+            },
+            {
+                "reel_id": "current-v37",
+                "selection_contract_version": main.SELECTION_CONTRACT_VERSION,
+            },
+        ],
+    )
+    try:
+        response = main.feed(object(), material_id="m1", autofill=False)
+
+        assert [reel["reel_id"] for reel in response["reels"]] == ["current-v37"]
+        assert response["total"] == 1
+    finally:
+        conn.close()
+
+
 def test_feed_page_two_never_starts_provider_generation(monkeypatch) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
@@ -3476,7 +3529,11 @@ def test_feed_page_two_never_starts_provider_generation(monkeypatch) -> None:
         main,
         "_ranked_request_reels",
         lambda *_args, **_kwargs: [
-            {"reel_id": f"ready-{index}"} for index in range(5)
+            {
+                "reel_id": f"ready-{index}",
+                "selection_contract_version": main.SELECTION_CONTRACT_VERSION,
+            }
+            for index in range(5)
         ],
     )
     wake = mock.Mock()
@@ -3606,6 +3663,54 @@ def test_feed_reload_reports_the_latest_continuation_batch(monkeypatch) -> None:
         conn.close()
 
 
+def test_feed_ignores_prior_contract_job_and_starts_current_generation(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    wake = mock.Mock()
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    content_fingerprint = generation_jobs.material_content_fingerprint(conn, "m1", None)
+    stale_job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id=None,
+        request_key="quality-silence-v36-request",
+        content_fingerprint=content_fingerprint,
+        learner_id="learner-1",
+        request_params={
+            "knowledge_level": "beginner",
+            "generation_mode": "slow",
+            "creative_commons_only": False,
+            "preferred_video_duration": "any",
+            "language": "en",
+            "exclude_video_ids": [],
+            "min_relevance": None,
+        },
+    )
+    stale_params = json.loads(stale_job["request_params_json"])
+    stale_params["request_schema_version"] = "quality_silence_v36"
+    conn.execute(
+        "UPDATE reel_generation_jobs SET status = 'completed', "
+        "result_generation_id = ?, request_params_json = ? WHERE id = ?",
+        ("stale-v36-generation", json.dumps(stale_params), stale_job["id"]),
+    )
+
+    response = main.feed(object(), material_id="m1", autofill=True)
+
+    assert response["reels"] == []
+    assert response["generation_job_id"] != stale_job["id"]
+    assert response["generation_job_status"] == "queued"
+    current_job = generation_jobs.get_job(conn, response["generation_job_id"])
+    assert current_job is not None
+    assert json.loads(current_job["request_params_json"])[
+        "request_schema_version"
+    ] == generation_jobs.REQUEST_SCHEMA_VERSION
+    assert conn.execute("SELECT COUNT(*) FROM reel_generation_jobs").fetchone()[0] == 2
+    wake.assert_called_once_with()
+    conn.close()
+
+
 def test_feed_page_two_keeps_unseen_rows_after_page_one_is_scrolled(monkeypatch) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
@@ -3713,7 +3818,11 @@ def test_feed_returns_ranked_reels_when_autofill_is_throttled(
         main,
         "_ranked_request_reels",
         lambda *_args, **_kwargs: [
-            {"reel_id": f"ranked-{index}"} for index in range(5)
+            {
+                "reel_id": f"ranked-{index}",
+                "selection_contract_version": main.SELECTION_CONTRACT_VERSION,
+            }
+            for index in range(5)
         ],
     )
     wake = mock.Mock()
@@ -3800,7 +3909,10 @@ def test_feed_slow_reservoir_immediately_satisfies_fast_without_queuing(
     def ranked(*_args, **kwargs):
         ranked_generation_ids.append(kwargs.get("generation_id"))
         return [
-            {"reel_id": f"verified-prior-reel-{index}"}
+            {
+                "reel_id": f"verified-prior-reel-{index}",
+                "selection_contract_version": main.SELECTION_CONTRACT_VERSION,
+            }
             for index in range(12)
         ]
 
@@ -3871,7 +3983,10 @@ def test_feed_partial_cross_request_reservoir_queues_fresh_startup_budget(
         main,
         "_ranked_request_reels",
         lambda *_args, **_kwargs: [
-            {"reel_id": f"strict-cached-reel-{index}"}
+            {
+                "reel_id": f"strict-cached-reel-{index}",
+                "selection_contract_version": main.SELECTION_CONTRACT_VERSION,
+            }
             for index in range(3)
         ],
     )
@@ -3948,7 +4063,10 @@ def test_feed_fast_reservoir_queues_slow_top_up_despite_full_ranked_page(
         main,
         "_ranked_request_reels",
         lambda *_args, **_kwargs: [
-            {"reel_id": f"prior-fast-feed-reel-{index}"}
+            {
+                "reel_id": f"prior-fast-feed-reel-{index}",
+                "selection_contract_version": main.SELECTION_CONTRACT_VERSION,
+            }
             for index in range(12)
         ],
     )
@@ -4245,7 +4363,7 @@ def test_v7_feed_merges_value_ranked_batches_without_breaking_batch_topology(
             "_selection_topic_relevance": relevance,
             "_selection_source_rank": source_rank,
             "_selection_ordered": True,
-            "selection_contract_version": "quality_silence_v36",
+            "selection_contract_version": "quality_silence_v37",
         }
 
     root_reels = [
@@ -4376,7 +4494,7 @@ def test_generation_chain_uses_nearest_difficulty_across_all_batches(
             "_selection_topic_relevance": 0.9,
             "_selection_source_rank": 0,
             "_selection_ordered": True,
-            "selection_contract_version": "quality_silence_v36",
+            "selection_contract_version": "quality_silence_v37",
         }
 
     monkeypatch.setattr(
@@ -4591,7 +4709,7 @@ def test_generate_cross_request_reservoir_is_owned_by_current_batch(
             {
                 "reel_id": "verified-concept-reel",
                 "video_id": "verified-concept-video-0",
-                "selection_contract_version": "quality_silence_v36",
+                "selection_contract_version": "quality_silence_v37",
             }
         ],
     )
@@ -4645,7 +4763,7 @@ def test_generate_cross_request_reservoir_is_owned_by_current_batch(
             {
                 "reel_id": "verified-concept-reel",
                 "video_id": "verified-concept-video-0",
-                "selection_contract_version": "quality_silence_v36",
+                "selection_contract_version": "quality_silence_v37",
             }
         ]
         assert conn.execute(

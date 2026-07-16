@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from backend import gemini_client as GC
+from backend.app.clip_engine.errors import ProviderBudgetExceededError
 from backend.app.clip_engine.provider_runtime import GenerationContext
 from backend.pipeline import gemini_segment as G
 
@@ -37,6 +38,73 @@ def _transcript(duration: float = 100.0) -> dict:
         {"word": "closes", "start": duration - 1.0, "end": duration - 0.5},
         {"word": "cleanly", "start": duration - 0.5, "end": duration},
     ]}
+
+
+def test_public_selector_installs_a_local_cost_guard_for_direct_callers(monkeypatch):
+    captured = {}
+    original_settings = {}
+
+    def authoritative(transcript, settings, topic, deadline, cancelled):
+        del transcript, topic, deadline, cancelled
+        captured.update(settings)
+        return G.SegmentResult([], "No matching clips.", "pro", "valid", [])
+
+    monkeypatch.setattr(G, "_authoritative_pro", authoritative)
+
+    result = G.segment_clips_detailed(
+        _transcript(),
+        original_settings,
+        routing_mode="pro_only",
+        video_id="direct-source",
+    )
+
+    assert result.error is None
+    assert original_settings == {}
+    assert callable(captured["_segment_budget_reserve"])
+    assert callable(captured["_segment_budget_reconcile"])
+    with pytest.raises(ProviderBudgetExceededError, match=r"\$0\.45 maximum"):
+        captured["_segment_budget_reserve"](
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=200_001,
+            max_output_tokens=6_000,
+        )
+
+
+def test_direct_long_transcript_is_rejected_before_pro_dispatch(monkeypatch):
+    count_calls = []
+    dispatched = False
+
+    def count_tokens(*args, **kwargs):
+        count_calls.append((args, kwargs))
+        return 200_001
+
+    def generate(*args, **kwargs):
+        nonlocal dispatched
+        dispatched = True
+        raise AssertionError("Pro generation must not run over the local cost ceiling")
+
+    monkeypatch.setattr(GC, "count_request_tokens", count_tokens)
+    monkeypatch.setattr(GC, "generate_json_v3", generate)
+    transcript = {
+        "segments": [{
+            "start": 0.0,
+            "end": 600.0,
+            "text": "concept explanation " * 8_000,
+        }],
+        "words": [],
+    }
+
+    result = G.segment_clips_detailed(
+        transcript,
+        {},
+        routing_mode="pro_only",
+        video_id="direct-long-source",
+    )
+
+    assert len(count_calls) == 1
+    assert dispatched is False
+    assert "ProviderBudgetExceededError" in str(result.error)
 
 
 def _empty_plan(schema: type, *, topic: str = ""):

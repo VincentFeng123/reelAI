@@ -159,30 +159,59 @@ def count_request_tokens(
     *,
     model: str,
     timeout_s: float = 10.0,
+    thinking_level: str = "",
+    max_output_tokens: int | None = None,
 ) -> int:
-    """Count one pathological long structured request without generating output."""
+    """Count the exact structured GenerateContent request without generation."""
     mdl = str(model or "").strip()
     timeout = float(timeout_s)
     if not _is_gemini3_model(mdl):
         raise ValueError("count_request_tokens requires an explicit Gemini 3 model")
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout_s must be positive")
-    response = get_client().models.count_tokens(
-        model=mdl,
-        contents=str(user_text or ""),
-        config=types.CountTokensConfig(
-            system_instruction=str(system or ""),
-            generation_config=types.GenerationConfig(
-                response_mime_type="application/json",
-                response_json_schema=_gemini3_json_schema(schema),
-            ),
-            http_options=types.HttpOptions(
-                timeout=max(1, int(timeout * 1_000.0)),
-                retry_options=types.HttpRetryOptions(attempts=1),
-            ),
+    if not config.GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+    model_name = mdl.rsplit("/", 1)[-1]
+    generation_config: dict[str, object] = {
+        "responseMimeType": "application/json",
+        "responseJsonSchema": _gemini3_json_schema(schema),
+    }
+    if max_output_tokens is not None:
+        generation_config["maxOutputTokens"] = max(1, int(max_output_tokens))
+    level = str(thinking_level or "").strip().upper()
+    if level:
+        if level.casefold() not in _GEMINI3_THINKING_LEVELS:
+            raise ValueError(f"unsupported Gemini 3 thinking level: {thinking_level}")
+        generation_config["thinkingConfig"] = {"thinkingLevel": level}
+    request_body = {
+        "generateContentRequest": {
+            "model": f"models/{model_name}",
+            "contents": [{
+                "role": "user",
+                "parts": [{"text": str(user_text or "")}],
+            }],
+            "systemInstruction": {
+                "role": "user",
+                "parts": [{"text": str(system or "")}],
+            },
+            "generationConfig": generation_config,
+        }
+    }
+    response = httpx.post(
+        (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_name}:countTokens"
         ),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": config.GEMINI_API_KEY,
+        },
+        json=request_body,
+        timeout=timeout,
     )
-    total = int(_field(response, "total_tokens") or 0)
+    response.raise_for_status()
+    payload = response.json()
+    total = int(_field(payload, "totalTokens") or 0)
     if total <= 0:
         raise RuntimeError("Gemini token count was unavailable")
     return total

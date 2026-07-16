@@ -269,6 +269,7 @@ def test_flash_lite_expansion_uses_its_lower_reservation_and_usage_rates() -> No
             **reservation,
             "prompt_tokens": 1_000,
             "candidate_tokens": 100,
+            "thought_tokens": 0,
             "cached_content_token_count": 400,
             "total_tokens": 1_100,
         },
@@ -302,6 +303,7 @@ def test_pro_usage_uses_the_documented_long_context_price_tier(
         usage={
             "prompt_tokens": input_tokens,
             "candidate_tokens": 100,
+            "thought_tokens": 0,
             "total_tokens": input_tokens + 100,
         },
     )
@@ -445,6 +447,15 @@ def test_unknown_dispatched_usage_keeps_full_reservation_fail_closed() -> None:
         reservation["reserved_cost_usd"]
     )
     assert budget["inflight_reserved_cost_usd"] == 0.0
+    context.increment_counter("persisted_clips")
+    payload = context.usage_payload()
+    assert payload["summary"]["billing_unknown_calls"] == 1
+    assert payload["summary"]["known_billed_cost_usd"] == 0.0
+    assert payload["summary"]["billing_unknown_reserved_cost_usd"] == pytest.approx(
+        reservation["reserved_cost_usd"]
+    )
+    assert payload["summary"]["cost_per_accepted_clip_usd"] is None
+    assert payload["by_stage"]["segmentation"]["billing_unknown_calls"] == 1
     with pytest.raises(ProviderBudgetExceededError, match="cost budget"):
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
@@ -479,6 +490,12 @@ def test_total_only_dispatched_usage_keeps_full_reservation_fail_closed() -> Non
         reservation["reserved_cost_usd"]
     )
     assert budget["inflight_reserved_cost_usd"] == 0.0
+    payload = context.usage_payload()
+    assert payload["summary"]["billing_unknown_calls"] == 1
+    assert payload["summary"]["known_billed_cost_usd"] == 0.0
+    assert payload["summary"]["billing_unknown_reserved_cost_usd"] == pytest.approx(
+        reservation["reserved_cost_usd"]
+    )
 
 
 def test_output_only_dispatched_usage_keeps_full_reservation_fail_closed() -> None:

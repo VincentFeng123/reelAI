@@ -91,16 +91,19 @@ def _call_v3(monkeypatch, fake, **overrides):
 def test_count_text_tokens_uses_one_bounded_non_generation_request(monkeypatch):
     calls = []
 
-    class Models:
-        def count_tokens(self, **kwargs):
-            calls.append(kwargs)
-            return SimpleNamespace(total_tokens=123)
+    class Response:
+        def raise_for_status(self):
+            return None
 
-    monkeypatch.setattr(
-        gc,
-        "get_client",
-        lambda: SimpleNamespace(models=Models()),
-    )
+        def json(self):
+            return {"totalTokens": 123}
+
+    def post(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return Response()
+
+    monkeypatch.setattr(gc.config, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(gc.httpx, "post", post)
 
     assert gc.count_request_tokens(
         "system",
@@ -108,14 +111,55 @@ def test_count_text_tokens_uses_one_bounded_non_generation_request(monkeypatch):
         _Schema,
         model="gemini-3.1-pro-preview",
         timeout_s=4.0,
+        thinking_level="medium",
+        max_output_tokens=6_000,
     ) == 123
     assert len(calls) == 1
-    assert calls[0]["contents"] == "long transcript"
-    assert calls[0]["config"].system_instruction == "system"
-    assert calls[0]["config"].generation_config.response_json_schema["required"] == [
-        "ok"
-    ]
-    assert calls[0]["config"].http_options.retry_options.attempts == 1
+    assert "test-key" not in calls[0]["url"]
+    assert calls[0]["headers"]["x-goog-api-key"] == "test-key"
+    request = calls[0]["json"]["generateContentRequest"]
+    assert request["model"] == "models/gemini-3.1-pro-preview"
+    assert request["contents"][0]["parts"][0]["text"] == "long transcript"
+    assert request["systemInstruction"]["parts"][0]["text"] == "system"
+    assert request["generationConfig"]["responseJsonSchema"]["required"] == ["ok"]
+    assert request["generationConfig"]["maxOutputTokens"] == 6_000
+    assert request["generationConfig"]["thinkingConfig"] == {
+        "thinkingLevel": "MEDIUM"
+    }
+    assert calls[0]["timeout"] == 4.0
+
+
+def test_count_request_tokens_uses_generate_content_request_not_plain_contents(
+    monkeypatch,
+):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"totalTokens": 321}
+
+    def post(_url, **kwargs):
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr(gc.config, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(gc.httpx, "post", post)
+
+    assert gc.count_request_tokens(
+        "system",
+        "long transcript",
+        _Schema,
+        model="gemini-3.1-pro-preview",
+        timeout_s=4.0,
+    ) == 321
+    assert "contents" not in captured["json"]
+    request = captured["json"]["generateContentRequest"]
+    assert request["contents"][0]["parts"] == [{"text": "long transcript"}]
+    assert request["systemInstruction"]["parts"] == [{"text": "system"}]
+    assert request["generationConfig"]["responseMimeType"] == "application/json"
 
 
 @pytest.mark.parametrize(

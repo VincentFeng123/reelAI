@@ -43,7 +43,7 @@ DEFAULT_LEASE_SECONDS = 90
 DEFAULT_DEADLINE_SECONDS = 60 * 60
 DEFAULT_QUEUE_TTL_SECONDS = 8 * 60
 # Request-key version doubles as a production inventory compatibility gate.
-REQUEST_SCHEMA_VERSION = "quality_silence_v36"
+REQUEST_SCHEMA_VERSION = "quality_silence_v37"
 GENERATION_SUBMIT_ADVISORY_LOCK_ID = 0x5354554459524545
 
 
@@ -351,6 +351,10 @@ def submit_or_get_active(
             )
     if before_create is not None:
         before_create()
+    stored_request_params = {
+        **request_params,
+        "request_schema_version": REQUEST_SCHEMA_VERSION,
+    }
     for attempt in range(3):
         candidate_id = requested_id if attempt == 0 and requested_id else str(uuid.uuid4())
         row = {
@@ -363,7 +367,7 @@ def submit_or_get_active(
             "source_generation_id": str(source_generation_id or ""),
             "result_generation_id": None,
             "target_profile": target_profile,
-            "request_params_json": dumps_json(request_params),
+            "request_params_json": dumps_json(stored_request_params),
             "status": "queued",
             "phase": "queued",
             "progress": 0.0,

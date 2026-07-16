@@ -152,6 +152,7 @@ from .ingestion.pipeline import IngestionPipeline
 from .services.generation_jobs import (
     DEFAULT_HEARTBEAT_SECONDS,
     DEFAULT_LEASE_SECONDS,
+    REQUEST_SCHEMA_VERSION as GENERATION_REQUEST_SCHEMA_VERSION,
     GenerationQueueFullError,
     JobLeaseLostError,
     TERMINAL_STATUSES as GENERATION_TERMINAL_STATUSES,
@@ -355,7 +356,7 @@ GENERATION_OUTPUT_CEILINGS = {
     "slow": INITIAL_READY_REEL_TARGET,
 }
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v36"
+SELECTION_CONTRACT_VERSION = "quality_silence_v37"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -2853,6 +2854,22 @@ def _public_generation_reel(reel: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _current_selection_contract_reels(
+    reels: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Fail closed when stale inventory reaches a current request path."""
+    return [
+        reel
+        for reel in reels
+        if str(
+            reel.get("_selection_contract_version")
+            or reel.get("selection_contract_version")
+            or ""
+        ).strip()
+        == SELECTION_CONTRACT_VERSION
+    ]
+
+
 def _reel_identity_key(reel: dict[str, Any]) -> tuple[str, str]:
     reel_id = str(reel.get("reel_id") or "").strip()
     video_identity = _reel_source_video_id(reel)
@@ -3205,7 +3222,9 @@ def _latest_compatible_generation_job(
     for row in rows:
         prior_params = _job_request_params(row)
         if (
-            str(prior_params.get("knowledge_level") or "beginner")
+            str(prior_params.get("request_schema_version") or "")
+            != GENERATION_REQUEST_SCHEMA_VERSION
+            or str(prior_params.get("knowledge_level") or "beginner")
             != str(request_params.get("knowledge_level") or "beginner")
             or str(prior_params.get("generation_mode") or "slow")
             != str(request_params.get("generation_mode") or "slow")
@@ -3439,7 +3458,7 @@ def _ranked_request_reels(
             {
                 "video_ids": sorted({_bare_video_id(value) for value in (exclude_video_ids or []) if _bare_video_id(value)}),
                 "reel_ids": sorted({str(value) for value in (exclude_reel_ids or []) if str(value)}),
-                "verified_acoustic_boundaries": True,
+                "usable_boundaries": True,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -3819,12 +3838,7 @@ def _generation_job_reels(
         include_source_chain=True,
     )
     public_reels = [_public_generation_reel(reel) for reel in ranked]
-    return [
-        reel
-        for reel in public_reels
-        if str(reel.get("selection_contract_version") or "").strip()
-        == SELECTION_CONTRACT_VERSION
-    ][:requested]
+    return _current_selection_contract_reels(public_reels)[:requested]
 
 
 def _reused_generation_reels(
@@ -6671,21 +6685,23 @@ def feed(
                         generation_mode=generation_mode,
                     )
                 )
-        ranked = [] if generation_id is None else _ranked_request_reels(
-            conn,
-            material_id=material_id,
-            fast_mode=generation_mode == "fast",
-            generation_id=generation_id,
-            min_relevance=safe_relevance,
-            preferred_video_duration=safe_duration,
-            target_clip_duration_sec=safe_clip_target,
-            target_clip_duration_min_sec=safe_clip_min,
-            target_clip_duration_max_sec=safe_clip_max,
-            exclude_video_ids=excluded_videos,
-            page=page,
-            limit=limit,
-            learner_id=learner_id,
-            exclude_reel_ids=excluded_reels,
+        ranked = [] if generation_id is None else _current_selection_contract_reels(
+            _ranked_request_reels(
+                conn,
+                material_id=material_id,
+                fast_mode=generation_mode == "fast",
+                generation_id=generation_id,
+                min_relevance=safe_relevance,
+                preferred_video_duration=safe_duration,
+                target_clip_duration_sec=safe_clip_target,
+                target_clip_duration_min_sec=safe_clip_min,
+                target_clip_duration_max_sec=safe_clip_max,
+                exclude_video_ids=excluded_videos,
+                page=page,
+                limit=limit,
+                learner_id=learner_id,
+                exclude_reel_ids=excluded_reels,
+            )
         )
         legacy_page_start = (page - 1) * limit
         cursor_reel_ids = set(excluded_reels)

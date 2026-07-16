@@ -443,6 +443,59 @@ def _usage_field(usage: Any, name: str) -> Any:
     return getattr(usage, name, None)
 
 
+def _gemini_billing_usage_known(usage: Any) -> bool:
+    """Return whether provider telemetry has a priceable input/output split."""
+    input_tokens = _usage_value(
+        usage,
+        "prompt_tokens",
+        "prompt_token_count",
+        "promptTokenCount",
+        "input_tokens",
+    )
+    aggregate_output_present = _usage_field(usage, "output_tokens") is not None
+    candidate_usage_present = any(
+        _usage_field(usage, name) is not None
+        for name in (
+            "candidate_tokens",
+            "candidates_token_count",
+            "candidatesTokenCount",
+        )
+    )
+    thought_usage_present = any(
+        _usage_field(usage, name) is not None
+        for name in (
+            "thought_tokens",
+            "thoughts_token_count",
+            "thoughtsTokenCount",
+        )
+    )
+    return bool(
+        input_tokens > 0
+        and (
+            aggregate_output_present
+            or (candidate_usage_present and thought_usage_present)
+        )
+    )
+
+
+def _gemini_record_billing_known(record: Mapping[str, Any]) -> bool:
+    metadata = record.get("metadata") or {}
+    if "billing_usage_known" in metadata:
+        return metadata.get("billing_usage_known") is True
+    # Conservative compatibility for ledgers created before the explicit flag.
+    return bool(
+        int(record.get("input_tokens") or 0) > 0
+        and int(record.get("output_tokens") or 0) > 0
+    )
+
+
+def _gemini_record_billing_unknown(record: Mapping[str, Any]) -> bool:
+    metadata = record.get("metadata") or {}
+    return bool(metadata.get("dispatched")) and not _gemini_record_billing_known(
+        record
+    )
+
+
 def _gemini_token_rates(
     model: str,
     *,
@@ -582,23 +635,6 @@ class GenerationContext:
             if candidate_tokens or thought_tokens
             else _usage_value(usage, "output_tokens")
         )
-        candidate_usage_present = any(
-            _usage_field(usage, name) is not None
-            for name in (
-                "candidate_tokens",
-                "candidates_token_count",
-                "candidatesTokenCount",
-            )
-        )
-        thought_usage_present = any(
-            _usage_field(usage, name) is not None
-            for name in (
-                "thought_tokens",
-                "thoughts_token_count",
-                "thoughtsTokenCount",
-            )
-        )
-        aggregate_output_present = _usage_field(usage, "output_tokens") is not None
         cached_tokens = min(
             input_tokens,
             _usage_value(
@@ -614,10 +650,7 @@ class GenerationContext:
         # when both sides of the split are present. Present zero-valued output
         # counters are complete; absent input/output counters are partial
         # telemetry and must retain the full fail-closed reservation.
-        usage_known = input_tokens > 0 and (
-            aggregate_output_present
-            or (candidate_usage_present and thought_usage_present)
-        )
+        usage_known = _gemini_billing_usage_known(usage)
         dispatched_value = (
             bool(_usage_field(usage, "dispatched"))
             if dispatched is None
@@ -926,6 +959,7 @@ class GenerationContext:
             "candidate_tokens": candidate_tokens,
             "thought_tokens": thought_tokens,
             "cached_tokens": cached_tokens,
+            "billing_usage_known": _gemini_billing_usage_known(usage),
         }
         if stage:
             record_metadata["stage"] = str(stage)
@@ -993,6 +1027,8 @@ class GenerationContext:
 
     @staticmethod
     def _gemini_cost(record: Mapping[str, Any]) -> float:
+        if not _gemini_record_billing_known(record):
+            return 0.0
         input_tokens = max(0, int(record.get("input_tokens") or 0))
         input_rate, cached_input_rate, output_rate = _gemini_token_rates(
             str(record.get("model_used") or ""),
@@ -1033,8 +1069,11 @@ class GenerationContext:
                     "thought_tokens": 0,
                     "cached_tokens": 0,
                     "estimated_cost_usd": 0.0,
+                    "known_billed_cost_usd": 0.0,
+                    "telemetry_priced_cost_usd": 0.0,
                     "reserved_cost_usd": 0.0,
                     "billing_unknown_calls": 0,
+                    "billing_unknown_reserved_cost_usd": 0.0,
                 },
             )
             bucket["calls"] = int(bucket["calls"]) + 1
@@ -1056,23 +1095,38 @@ class GenerationContext:
             bucket["estimated_cost_usd"] = (
                 float(bucket["estimated_cost_usd"]) + self._gemini_cost(row)
             )
+            bucket["known_billed_cost_usd"] = bucket["estimated_cost_usd"]
+            bucket["telemetry_priced_cost_usd"] = bucket["estimated_cost_usd"]
             bucket["reserved_cost_usd"] = (
                 float(bucket["reserved_cost_usd"])
                 + float(metadata.get("reserved_cost_usd") or 0.0)
             )
-            if bool(metadata.get("dispatched")) and not int(row.get("total_tokens") or 0):
+            if _gemini_record_billing_unknown(row):
                 bucket["billing_unknown_calls"] = int(
                     bucket["billing_unknown_calls"]
                 ) + 1
+                bucket["billing_unknown_reserved_cost_usd"] = float(
+                    bucket["billing_unknown_reserved_cost_usd"]
+                ) + float(metadata.get("reserved_cost_usd") or 0.0)
         for bucket in by_stage.values():
-            bucket["estimated_cost_usd"] = round(
-                float(bucket["estimated_cost_usd"]), 8
-            )
-            bucket["reserved_cost_usd"] = round(
-                float(bucket["reserved_cost_usd"]), 8
-            )
+            for cost_field in (
+                "estimated_cost_usd",
+                "known_billed_cost_usd",
+                "telemetry_priced_cost_usd",
+                "reserved_cost_usd",
+                "billing_unknown_reserved_cost_usd",
+            ):
+                bucket[cost_field] = round(float(bucket[cost_field]), 8)
 
         estimated_cost = sum(self._gemini_cost(row) for row in gemini_calls)
+        billing_unknown_rows = [
+            row for row in gemini_calls if _gemini_record_billing_unknown(row)
+        ]
+        billing_unknown_count = len(billing_unknown_rows)
+        billing_unknown_reserved_cost = sum(
+            float((row.get("metadata") or {}).get("reserved_cost_usd") or 0.0)
+            for row in billing_unknown_rows
+        )
         accepted = int(counters.get("persisted_clips") or 0)
         with self._lock:
             fallback_reasons = list(self._fallback_reasons)
@@ -1111,6 +1165,8 @@ class GenerationContext:
                 for row in gemini_calls
             ),
             "estimated_cost_usd": round(estimated_cost, 8),
+            "known_billed_cost_usd": round(estimated_cost, 8),
+            "telemetry_priced_cost_usd": round(estimated_cost, 8),
             "current_cost_exposure_usd": budget_snapshot[
                 "cost_exposure_usd"
             ],
@@ -1124,15 +1180,15 @@ class GenerationContext:
             "lifetime_reserved_worst_case_cost_usd": budget_snapshot[
                 "lifetime_reserved_worst_case_cost_usd"
             ],
-            "billing_unknown_calls": sum(
-                1
-                for row in gemini_calls
-                if bool((row.get("metadata") or {}).get("dispatched"))
-                and not int(row.get("total_tokens") or 0)
+            "billing_unknown_calls": billing_unknown_count,
+            "billing_unknown_reserved_cost_usd": round(
+                billing_unknown_reserved_cost, 8
             ),
             "accepted_clips": accepted,
             "cost_per_accepted_clip_usd": (
-                round(estimated_cost / accepted, 8) if accepted else None
+                round(estimated_cost / accepted, 8)
+                if accepted and not billing_unknown_count
+                else None
             ),
             "cache_hits": cache_hits,
             "fallback_reasons": fallback_reasons,

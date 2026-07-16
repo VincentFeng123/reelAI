@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 SEGMENT_CACHE_VERSION = 32
 SEGMENT_CACHE_TTL_SEC = 30 * 24 * 60 * 60
-SELECTION_CONTRACT_VERSION = "quality_silence_v36"
+SELECTION_CONTRACT_VERSION = "quality_silence_v37"
 
 
 def _objective_tokens(clip: Mapping[str, Any]) -> set[str]:

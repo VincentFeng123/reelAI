@@ -988,14 +988,15 @@ def test_many_queued_acoustic_candidates_share_source_deadline_and_cancel(
     )
     elapsed = time.monotonic() - started_at
 
-    assert reels == []
+    assert reels == [f"unit-{index}" for index in range(candidate_count)]
     assert elapsed < 0.3
     assert verify.call_count == 3
     assert len(started) == 3
     assert all(0.0 < timeout <= 0.05 for timeout in timeouts)
     assert context.counters()["boundary_unavailable"] == 0
     assert context.counters()["stored_clips"] == candidate_count
-    assert context.counters()["deferred_clips"] == candidate_count
+    assert context.counters()["deferred_clips"] == 0
+    assert context.counters()["persisted_clips"] == candidate_count
     assert context.counters()["verified_clips"] == 0
     assert context.counters()["permanently_rejected_clips"] == 0
 
@@ -1223,7 +1224,7 @@ def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
     assert persisted[0]["end"] == 20.0
 
 
-def test_acoustic_result_crossing_unselected_speech_is_stored_but_deferred(
+def test_acoustic_result_crossing_unselected_speech_surfaces_transcript_fallback(
     monkeypatch,
 ) -> None:
     transcript = _transcript()
@@ -1278,20 +1279,19 @@ def test_acoustic_result_crossing_unselected_speech_is_stored_but_deferred(
         max_reels=1,
     )
 
-    assert reels == []
+    assert reels == ["stored-crossing"]
     assert verify.call_args.kwargs["search_end_limit_sec"] == 13.0
     assert len(persisted) == 1
     assert (persisted[0]["start"], persisted[0]["end"]) == (0.0, 10.0)
     assert persisted[0]["search_context"]["boundary_status"] == "context_aligned"
-    assert persisted[0]["search_context"]["surface_eligible"] is False
-    assert persisted[0]["search_context"]["surface_reason"] == (
-        "acoustic_boundary_unverified"
-    )
-    assert context.counters()["deferred_clips"] == 1
+    assert persisted[0]["search_context"]["surface_eligible"] is True
+    assert persisted[0]["search_context"].get("surface_reason") is None
+    assert context.counters()["deferred_clips"] == 0
+    assert context.counters()["persisted_clips"] == 1
     assert context.counters()["permanently_rejected_clips"] == 0
 
 
-def test_acoustic_result_crossing_prior_speech_is_stored_but_deferred(
+def test_acoustic_result_crossing_prior_speech_surfaces_transcript_fallback(
     monkeypatch,
 ) -> None:
     transcript = {
@@ -1365,16 +1365,15 @@ def test_acoustic_result_crossing_prior_speech_is_stored_but_deferred(
         max_reels=1,
     )
 
-    assert reels == []
+    assert reels == ["stored-start-crossing"]
     assert verify.call_args.kwargs["search_start_limit_sec"] == 7.0
     assert len(persisted) == 1
     assert (persisted[0]["start"], persisted[0]["end"]) == (10.0, 20.0)
     assert persisted[0]["search_context"]["boundary_status"] == "context_aligned"
-    assert persisted[0]["search_context"]["surface_eligible"] is False
-    assert persisted[0]["search_context"]["surface_reason"] == (
-        "acoustic_boundary_unverified"
-    )
-    assert context.counters()["deferred_clips"] == 1
+    assert persisted[0]["search_context"]["surface_eligible"] is True
+    assert persisted[0]["search_context"].get("surface_reason") is None
+    assert context.counters()["deferred_clips"] == 0
+    assert context.counters()["persisted_clips"] == 1
     assert context.counters()["permanently_rejected_clips"] == 0
 
 
@@ -2322,7 +2321,7 @@ def test_selected_caption_snapshot_clamps_every_overlapping_cue_to_lexical_end()
     assert cues[-1]["text"] == "which is exactly what dhdx is"
 
     context = {
-        "selection_contract_version": "quality_silence_v36",
+        "selection_contract_version": "quality_silence_v37",
         "boundary_status": "context_aligned",
         "speech_corridor_verified": True,
         "selection_caption_cues": [
@@ -3124,7 +3123,7 @@ def test_transcript_edge_speech_inside_media_uses_progressive_edges() -> None:
         },
     ],
 )
-def test_unsafe_acoustic_success_is_stored_but_deferred(
+def test_unsafe_acoustic_success_surfaces_transcript_fallback(
     monkeypatch,
     verification: dict,
 ) -> None:
@@ -3168,18 +3167,16 @@ def test_unsafe_acoustic_success_is_stored_but_deferred(
         on_reel_created=emitted.append,
     )
 
-    assert reels == []
-    assert emitted == []
+    assert reels == ["deferred-reel"]
+    assert emitted == ["deferred-reel"]
     assert len(stored) == 1
     assert (stored[0]["start"], stored[0]["end"]) == (0.0, 10.0)
     assert stored[0]["search_context"]["boundary_status"] == "context_aligned"
-    assert stored[0]["search_context"]["surface_eligible"] is False
-    assert stored[0]["search_context"]["surface_reason"] == (
-        "acoustic_boundary_unverified"
-    )
+    assert stored[0]["search_context"]["surface_eligible"] is True
+    assert stored[0]["search_context"].get("surface_reason") is None
     assert context.counters()["stored_clips"] == 1
-    assert context.counters()["deferred_clips"] == 1
-    assert context.counters()["persisted_clips"] == 0
+    assert context.counters()["deferred_clips"] == 0
+    assert context.counters()["persisted_clips"] == 1
     assert context.counters()["verified_clips"] == 0
     assert context.counters()["level_deferred_clips"] == 0
     assert context.counters()["permanently_rejected_clips"] == 0
@@ -3246,7 +3243,7 @@ def test_production_transcript_boundary_surfaces_without_audio_work(
     assert context.counters()["permanently_rejected_clips"] == 0
 
 
-def test_unsafe_refinement_fallback_is_stored_but_deferred(
+def test_unsafe_refinement_fallback_surfaces_transcript_boundary(
     monkeypatch,
 ) -> None:
     transcript = _transcript()
@@ -3346,15 +3343,15 @@ def test_unsafe_refinement_fallback_is_stored_but_deferred(
         max_persisted_reels=1,
     )
 
-    assert reels == []
+    assert reels == ["advanced-reservoir-reel"]
     assert len(stored) == 1
     boundary = stored[0]["search_context"]
     assert boundary["boundary_status"] == "context_aligned"
-    assert boundary["surface_eligible"] is False
-    assert boundary["surface_reason"] == "acoustic_boundary_unverified"
+    assert boundary["surface_eligible"] is True
+    assert boundary.get("surface_reason") is None
     assert context.counters()["stored_clips"] == 1
-    assert context.counters()["deferred_clips"] == 1
-    assert context.counters()["persisted_clips"] == 0
+    assert context.counters()["deferred_clips"] == 0
+    assert context.counters()["persisted_clips"] == 1
     assert context.counters()["verified_clips"] == 0
     assert context.counters()["level_deferred_clips"] == 0
     assert context.counters()["permanently_rejected_clips"] == 0
@@ -3365,7 +3362,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
 ) -> None:
     strict_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v36",
+        "selection_contract_version": "quality_silence_v37",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -3375,7 +3372,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
     }
     transcript_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v36",
+        "selection_contract_version": "quality_silence_v37",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -3438,7 +3435,7 @@ def test_failed_boundary_storage_does_not_consume_ready_material_cap(
     deferred.append({
         "search_context_json": json.dumps({
             "surface_eligible": True,
-            "selection_contract_version": "quality_silence_v36",
+            "selection_contract_version": "quality_silence_v37",
             "speech_corridor_verified": True,
             "boundary_status": "verified",
             "boundary_diagnostics": {
@@ -4202,7 +4199,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v36"
+        assert context["selection_contract_version"] == "quality_silence_v37"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"
@@ -4331,7 +4328,7 @@ def test_multiple_flash_source_results_never_trigger_pro_fallback(
     pro_fallback.assert_not_called()
 
 
-def test_missing_start_silence_is_stored_but_not_surfaced(
+def test_missing_start_silence_surfaces_strict_transcript_fallback(
     monkeypatch,
 ) -> None:
     first = _video()
@@ -4434,18 +4431,18 @@ def test_missing_start_silence_is_stored_but_not_surfaced(
         generation_context=context,
     )
 
-    assert reels == []
+    assert len(reels) == 3
     assert verify_acoustic.call_count == 4
     assert persist_clip.call_count == 4
     for call in persist_clip.call_args_list:
         search_context = call.kwargs["clip"]["search_context"]
         assert search_context["boundary_status"] == "context_aligned"
-        assert search_context["surface_eligible"] is False
-        assert search_context["surface_reason"] == "acoustic_boundary_unverified"
+        assert search_context["surface_eligible"] is True
+        assert search_context.get("surface_reason") is None
         assert search_context["boundary_diagnostics"]["acoustic_verified"] is False
     assert context.counters()["stored_clips"] == 4
     assert context.counters()["verified_clips"] == 0
-    assert context.counters()["deferred_clips"] == 4
+    assert context.counters()["deferred_clips"] == 0
     pro_fallback.assert_not_called()
 
 

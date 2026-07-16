@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -53,6 +54,30 @@ def _submit(conn: sqlite3.Connection, *, request_key: str = "request-1", now=BAS
         request_params={"generation_mode": "slow"},
         now=now,
     )
+
+
+def test_submitted_job_stamps_current_request_schema_without_mutating_input() -> None:
+    conn = _memory_conn()
+    params = {"generation_mode": "slow"}
+    try:
+        row, created = jobs.submit_or_get_active(
+            conn,
+            material_id="material-1",
+            concept_id="concept-1",
+            request_key="schema-stamp",
+            content_fingerprint="fingerprint-1",
+            learner_id="learner-1",
+            request_params=params,
+            now=BASE_TIME,
+        )
+
+        assert created is True
+        assert params == {"generation_mode": "slow"}
+        assert json.loads(row["request_params_json"])["request_schema_version"] == (
+            jobs.REQUEST_SCHEMA_VERSION
+        )
+    finally:
+        conn.close()
 
 
 def test_active_capacity_coalesces_identical_requests_before_rejecting_new_work() -> None:
@@ -404,7 +429,7 @@ def test_request_key_version_invalidates_stale_inventory(
         "target_clip_duration_min_sec": 20,
         "target_clip_duration_max_sec": 55,
     }
-    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v36"
+    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v37"
     verified_key = jobs.build_request_key(**params)
     monkeypatch.setattr(jobs, "REQUEST_SCHEMA_VERSION", stale_version)
 

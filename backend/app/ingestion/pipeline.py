@@ -541,7 +541,7 @@ def _boundary_evidence_grade(
     if (
         not isinstance(context, dict)
         or str(context.get("selection_contract_version") or "").strip()
-        != "quality_silence_v36"
+        != "quality_silence_v37"
     ):
         return 0
     if (
@@ -2301,8 +2301,9 @@ def _verified_direct_adapter_clips(
     )
 
     # Audio lookup is intentionally owned by callers so it can run alongside
-    # selection. Public ingest callers require strict measured silence; internal
-    # transcript-only callers may retain the explicit context-aligned fallback.
+    # selection. Measured silence improves a cut when available; a strict,
+    # complete transcript-context boundary remains surfaceable when audio is
+    # blocked or contains no qualifying quiet edge.
     prepared = prepared_audio
     media_end = _prepared_media_end_sec(
         prepared,
@@ -2613,8 +2614,6 @@ def _verified_direct_adapter_clips(
             )
         if not boundary_range_is_safe:
             continue
-        if require_acoustic_boundaries and not strict_acoustic:
-            continue
         clip = dict(raw_clip)
         clip.pop("_quality_scores", None)
         clip.pop("_grounded_topic_evidence_quote", None)
@@ -2641,7 +2640,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v36",
+            selection_contract_version="quality_silence_v37",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -3009,7 +3008,7 @@ class IngestionPipeline:
         )
         if not verified:
             raise SegmentationError(
-                "no quality clip with verified acoustic boundaries could be produced"
+                "no high-quality clip with a usable complete boundary could be produced"
             )
 
         raise_if_cancelled(should_cancel)
@@ -4510,14 +4509,6 @@ class IngestionPipeline:
                 else:
                     search_context.setdefault("boundary_status", "caption_aligned")
 
-                if (
-                    surface_eligible
-                    and require_acoustic_boundaries
-                    and not boundary_verified_for_storage
-                ):
-                    surface_eligible = False
-                    search_context["surface_reason"] = "acoustic_boundary_unverified"
-
                 if surface_eligible and bool(search_context.get("deferred_level")):
                     surface_eligible = False
                     search_context["surface_reason"] = "level_mismatch"
@@ -5102,7 +5093,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v36",
+                    selection_contract_version="quality_silence_v37",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,

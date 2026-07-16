@@ -223,7 +223,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
 
     def test_persisted_selection_metadata_decodes_intent_role_and_coverage(self) -> None:
         metadata = self.service._selection_metadata({
-            "selection_contract_version": "quality_silence_v36",
+            "selection_contract_version": "quality_silence_v37",
             "intent_role": "supporting",
             "intent_coverage": 0.5,
         })
@@ -618,7 +618,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ).fetchone()
             context = json.loads(row[0])
             context.update({
-                "selection_contract_version": "quality_silence_v36",
+                "selection_contract_version": "quality_silence_v37",
                 "self_contained": True,
                 "topic_evidence_quote": (
                     "Chemical bonding explains how atoms share or transfer electrons"
@@ -671,7 +671,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             return {
                 "reel_id": reel_id,
                 "difficulty": difficulty,
-                "selection_contract_version": "quality_silence_v36",
+                "selection_contract_version": "quality_silence_v37",
             }
 
         easy = item("easy", 0.15)
@@ -705,7 +705,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             return {
                 "reel_id": reel_id,
                 "difficulty": 0.50,
-                "selection_contract_version": "quality_silence_v36",
+                "selection_contract_version": "quality_silence_v37",
                 "_selection_informativeness": quality,
                 "_selection_topic_relevance": quality,
                 "_selection_educational_importance": quality,
@@ -854,7 +854,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         ).fetchone()
         context = json.loads(row[0])
         context.update({
-            "selection_contract_version": "quality_silence_v36",
+            "selection_contract_version": "quality_silence_v37",
             "topic_relevance": 0.93,
             "self_contained": True,
             "topic_evidence_quote": (
@@ -899,7 +899,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         for result in (fresh, cached):
             self.assertEqual(len(result), 1)
             self.assertEqual(
-                result[0]["selection_contract_version"], "quality_silence_v36"
+                result[0]["selection_contract_version"], "quality_silence_v37"
             )
             self.assertAlmostEqual(result[0]["relevance_score"], 0.93)
             self.assertAlmostEqual(result[0]["topic_relevance"], 0.93)
@@ -1138,7 +1138,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
 
         self.assertEqual(self._ranked(), [])
 
-    def test_production_feed_accepts_only_strict_acoustic_boundaries(self) -> None:
+    def test_production_feed_accepts_strict_or_safe_transcript_boundaries(self) -> None:
         states = [
             ("missing", "", {"acoustic_verified": None}),
             ("caption", "caption_aligned", {"acoustic_verified": False}),
@@ -1218,7 +1218,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ).fetchone()
             context = json.loads(row[0])
             context.update({
-                "selection_contract_version": "quality_silence_v36",
+                "selection_contract_version": "quality_silence_v37",
                 "self_contained": True,
                 "topic_evidence_quote": (
                     "Chemical bonding explains how atoms share or transfer electrons"
@@ -1250,7 +1250,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
 
         self.assertEqual(
             {item["reel_id"] for item in ranked},
-            {"strict-verified"},
+            {"strict-verified", "transcript-aligned"},
         )
 
     def test_level_mismatched_verified_clip_surfaces_without_level_rejection(self) -> None:
@@ -1266,7 +1266,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         ).fetchone()
         context = json.loads(row[0])
         context.update({
-            "selection_contract_version": "quality_silence_v36",
+            "selection_contract_version": "quality_silence_v37",
             "self_contained": True,
             "topic_evidence_quote": (
                 "Chemical bonding explains how atoms share or transfer electrons"
