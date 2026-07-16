@@ -2372,8 +2372,10 @@ def test_boundary_prompt_requires_the_requested_identification_task():
         topic="Carolingian minuscule ligature identification",
     )
     assert "identification, recognition, diagnosis" in user
-    assert "history, definition, formula recital, prerequisite" in user
-    assert "alone does not fulfill that request" in user
+    assert "a primary unit must actually perform that task" in user
+    assert "complete supporting units" in user
+    assert "bare history, definition, formula recital" in user
+    assert "without substantive explanation" in user
 
 
 def test_production_two_sided_p_value_clip_trims_unfinished_next_sentence():

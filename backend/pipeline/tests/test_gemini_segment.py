@@ -731,7 +731,7 @@ def test_production_flash_is_compact_exhaustive_boundary_first():
     assert G._BOUNDARY_OUTPUT_TOKENS == 6_000
     assert "scan the whole transcript from first to last" in prompt
     assert "every distinct" in prompt
-    assert "return every distinct qualifying moment" in prompt
+    assert "every distinct qualifying primary and supporting moment" in prompt
     assert "arbitrary count" in prompt
     assert "up to 40" in prompt
     assert "never add filler or incomplete material" in prompt
@@ -782,7 +782,7 @@ def test_production_flash_has_no_requested_duration_contract():
     assert "there is no numeric duration cap" in prompt.casefold()
 
 
-def test_compound_topic_requires_every_named_part():
+def test_compound_topic_returns_primary_and_related_supporting_units():
     _system, user = G._boundary_prompts(
         "[0] 00:00 lesson",
         1,
@@ -790,13 +790,16 @@ def test_compound_topic_requires_every_named_part():
     )
 
     assert "multiple linked ideas" in user
-    assert "every candidate must fulfill every required part" in user
+    assert "primary candidate fulfills every required part" in user
+    assert "Supporting candidates" in user
+    assert "directly connected example" in user
     assert (
         "shared vocabulary, a loose analogy, or general systems thinking is not request"
         in user.casefold()
     )
     assert (
-        "do not return it as a separate clip" in user.casefold()
+        "supporting unit has a substantive educational connection"
+        in user.casefold()
     )
 
 

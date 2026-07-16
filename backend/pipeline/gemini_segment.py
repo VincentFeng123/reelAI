@@ -1655,7 +1655,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v1"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v4"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v5"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -1902,8 +1902,9 @@ class _CompactIntentEvidence(_StrictModel):
     evidence_quote: _CompactEvidenceQuote = Field(
         alias="q",
         description=(
-            "Five to sixteen exact consecutive transcript words in this candidate that "
-            "prove the named required request constraint."
+            "Five to sixteen exact consecutive transcript words that prove a primary "
+            "unit fulfills the named constraint or ground a supporting unit's substantive "
+            "educational connection to that constraint."
         ),
     )
 
@@ -1959,8 +1960,9 @@ class _CompactBoundaryTopic(_StrictModel):
         min_length=1,
         max_length=8,
         description=(
-            "One grounded item for every required non-scope exact-request constraint. "
-            "Do not return the topic when any required constraint lacks evidence."
+            "For a primary unit, one grounded item proving fulfillment of every required "
+            "non-scope constraint. For a supporting unit, at least one item grounding its "
+            "substantive educational connection to a required non-scope constraint."
         ),
     )
 
@@ -2059,18 +2061,19 @@ class _ProductionPlan(BaseModel):
 # Prompt construction
 
 _POLICY_AND_EXAMPLES = """Policy:
-- First understand the whole transcript and the viewer's exact request. Return only
-  complete, substantive teaching units that directly serve that request and make sense to a
-  cold viewer hearing the clip without seeing the original video. For a simple broad-subject
-  request, distinct facets of that subject qualify. When the request names a particular task,
-  object, relationship, scope, format, or outcome, a merely related prerequisite or supporting
-  facet is context for a qualifying unit, not a separate qualifying clip.
+- The TOPIC is the viewer's original exact request copied verbatim. Never replace TOPIC with a
+  search expansion, inferred broader subject, normalized paraphrase, or retrieval query.
+- First understand the whole transcript and use that original exact request as the topical
+  center. Return every distinct complete, substantive teaching unit that either fulfills the
+  whole request or is genuinely related to its subject, method, mechanism, relationship,
+  prerequisite, application, or worked-example family. Every unit must make sense to a cold
+  viewer hearing the clip without seeing the original video.
 - Include every necessary setup or prerequisite through the explanation's natural
   conclusion. For a worked example, include the question or setup, reasoning, and answer.
-- Give each candidate exactly one coherent learning objective. For a broad-subject request,
-  return separate candidates when adjacent speech teaches independent qualifying facets.
-  For a constrained request, omit an adjacent facet unless it independently fulfills the
-  whole request; never broaden the request just to fill the feed.
+- Give each candidate exactly one coherent learning objective. Split every independent,
+  genuinely related facet or worked example into its own candidate. For a constrained
+  request, distinguish exact PRIMARY units from related SUPPORTING units; do not collapse the
+  source to one literal match.
 - An outline such as "three areas of calculus" or "two goals of this lesson" is navigation,
   not a teaching unit and not valid evidence. Return the substantive atomic units it names as
   separate candidates. Keep two concepts together only when their spoken relationship or
@@ -2095,19 +2098,27 @@ _POLICY_AND_EXAMPLES = """Policy:
   educational context for the subject. Exclude them from clip openings and endings.
 - Omit teaching that depends on a diagram, screen, gesture, drawing, or other missing
   visual context. Mark self_contained and is_standalone false for such material.
-- Exhaustively enumerate every distinct teaching unit that qualifies for the exact request,
-  up to 40 per source. Prefer an empty slot to a merely related, filler, or incomplete idea.
+- Exhaustively enumerate every distinct teaching unit genuinely related to the topical center,
+  up to 40 per source. Prefer an empty slot to a merely broad-field, filler, or incomplete idea.
   Do not shorten a complete idea to fit a target length; clip duration is never a selection
   criterion.
 - Keep distinct informational facets from the same source. Do not return two clips that
   teach the same learning objective in different words.
-- Return every qualifying request-fulfilling unit, while scoring the densest, most useful, and most
-  central units highest so the application can prioritize them within difficulty stages.
+- Return every qualifying primary and supporting unit. Never stop after one exact match when
+  the source contains other complete related units. When at least three distinct qualifying
+  units exist, return all of them, not an arbitrary one. Never invent or fragment content to
+  reach a count.
 - Treat subject relevance and fulfillment of the user's requested operation, relationship,
-  scope, format, and outcome as separate facts. A definition or prerequisite may be included
-  inside a complete unit when needed for context, but it is not a separate clip for a requested
-  example, comparison, causal explanation, misconception correction, identification,
-  derivation, application, or other task unless that same span fulfills the entire request.
+  object, scope, format, and outcome as separate facts. A PRIMARY unit fulfills every required
+  non-scope constraint. A SUPPORTING unit has a substantive educational connection to at least
+  one required non-scope constraint and materially prepares, explains, verifies, applies, or
+  deepens the requested topic. A
+  supporting unit may use a different example object when it accurately teaches the same
+  requested method or concept; title and objective must name the actual object, and intent
+  evidence must never claim fulfillment of the mismatched object or outcome.
+- A supporting unit must contain substantive explanation or a complete worked example. A bare
+  formula, definition, topic name, result, generic background statement, or shared vocabulary
+  is not enough. Shared broad-field relevance is not a topical connection.
 - Return a candidate only when informativeness, topic_relevance, and educational_importance
   are each at least 0.75 and the spoken unit satisfies every substantive, grounding,
   context, and filler rule.
@@ -2158,58 +2169,61 @@ def _topic_rule(topic: str) -> str:
         flags=re.IGNORECASE,
     ):
         compound_rule = (
-            "For an explicit comparison request, a candidate qualifies only when that same "
-            "self-contained unit directly teaches every named side and the requested "
-            "relationship between them. Do not return a one-sided definition, example, or "
-            "prerequisite as a clip for the comparison request. "
+            "For an explicit comparison request, a primary unit must teach every named side "
+            "and the requested relationship in one self-contained span. Also return complete "
+            "supporting units that substantively teach a named side or comparison mechanism. "
         )
     elif "," in topic or ";" in topic:
         compound_rule = (
-            "When the request lists multiple required ideas, each candidate must fulfill all "
-            "of them unless the user's wording explicitly presents alternatives. Require a "
-            "relationship between components when the viewer asks to compare, connect, "
-            "relate, or apply them together. "
+            "When the request lists multiple required ideas, a primary unit must fulfill all "
+            "of them unless the wording presents alternatives. Also return complete supporting "
+            "units that substantively teach any listed idea. Require the relationship between "
+            "components only for primary comparison, connection, or joint-application units. "
         )
     elif _EXPLICIT_TRANSITION_REQUEST_RE.search(topic):
         compound_rule = (
-            "For an explicit transition request, a candidate qualifies only when that same "
-            "self-contained unit names both the source and destination concepts and directly "
-            "teaches the transition between them. Do not return a one-sided definition, "
-            "preview, or prerequisite as fulfillment of the transition request. "
+            "For an explicit transition request, a primary unit must name both endpoints and "
+            "teach the transition between them. Also return substantive supporting units about "
+            "either named endpoint or a mechanism used in that transition. "
         )
     elif _EXPLICIT_CONJUNCTIVE_REQUEST_RE.search(topic):
         compound_rule = (
-            "For an explicit conjunctive request, a candidate qualifies only when that same "
-            "self-contained unit fulfills every named component and constraint. Do not return "
-            "a clip that teaches only one side of the conjunction. "
+            "For an explicit conjunctive request, a primary unit fulfills every named "
+            "component and constraint. Also return complete supporting units that substantively "
+            "teach one or more named components. "
         )
     else:
         compound_rule = (
             "When the request names multiple linked ideas, tasks, objects, formats, or "
-            "outcomes, every candidate must fulfill every required part rather than merely "
-            "touching one component. A simple broad-subject request may still yield distinct "
-            "facets that directly teach that subject. "
+            "outcomes, a primary candidate fulfills every required part. Supporting candidates "
+            "may substantively teach one required part or a directly connected example, "
+            "mechanism, prerequisite, verification, or application. "
         )
     return (
-        f"The viewer is studying {topic!r}. Return only units that directly fulfill that exact "
-        "request, and make each learning objective name the requested task and object. For a "
-        "simple broad-subject request, a concrete facet directly teaching that subject counts "
-        "as fulfillment. Set directly_teaches_topic=false when the span "
+        f"The TOPIC is the user's original prompt, exactly {topic!r}. Never substitute a "
+        "retrieval expansion, search query, broader category, or inferred replacement topic. "
+        "Return every complete unit that either fulfills this original prompt or has a direct "
+        "educational connection to at least one of its actual subjects, tasks, methods, "
+        "relationships, formats, or outcomes. Make each learning objective name what that "
+        "specific clip truly teaches. Set directly_teaches_topic=true only for a primary unit "
+        "that fulfills the full original prompt; use false for an honest supporting unit. Set "
+        "it false as well when the span "
         "merely names the subject, course, institution, or speaker, or belongs to an adjacent "
         "field without a useful connection to the request. "
         f"{compound_rule}"
         "When the topic requests "
         "identification, recognition, diagnosis, derivation, comparison, or application, "
-        "return only units that actually perform that task for the named object and reach any "
-        "requested result. A history, definition, formula recital, prerequisite, alternate "
-        "example, or general concept explanation alone does not fulfill that request. Include "
-        "necessary setup inside the qualifying span, but do not return it as a separate clip. "
+        "a primary unit must actually perform that task for the named object and reach any "
+        "requested result. Also return complete supporting units that teach the requested "
+        "method or concept on another example, or materially explain a required mechanism, "
+        "prerequisite, application, or verification. Do not return a bare history, definition, "
+        "formula recital, or generic concept mention without substantive explanation. "
         "Treat a named mathematical function, equation, expression, chemical formula, code "
         "identifier, or other structured object as atomic. Any added, removed, or changed "
         "term, coefficient, exponent, sign, constant, variable, or condition makes it a "
-        "different object. Do not accept a different object merely because it produces the "
-        "same requested outcome. For a request about f(x)=x squared, examples using x squared "
-        "minus three, x squared plus x, two x squared, or x cubed do not qualify. "
+        "different object. A different object cannot be primary and must never be mislabeled "
+        "as the requested object, but a complete example using the same requested method may "
+        "be an honestly labeled supporting unit. "
         "Shared vocabulary, a loose analogy, or general systems thinking is not request "
         "fulfillment."
         " Exclude fictional, supernatural, pseudoscientific, or invented mechanisms unless "
@@ -2331,8 +2345,9 @@ def _compact_output_guide() -> str:
 - diff = difficulty, 0.0-1.0: required prior knowledge only; 0.00-0.33 beginner,
   0.34-0.66 intermediate, 0.67-1.00 advanced. When a learner level is supplied, obey its
   explicit eligibility band; without one, difficulty alone never disqualifies a unit.
-- direct = directly_teaches_topic: true only when the span actually fulfills the requested
-  subject, task, relationship, format, and outcome rather than merely naming or supporting it.
+- direct = directly_teaches_topic: true only for a PRIMARY unit that fulfills every required
+  non-scope constraint in the original prompt. Use false for a valid SUPPORTING unit; false is
+  honest metadata and does not mean omit the supporting unit.
 - sub = substantive: true only for real teaching, reasoning, explanation, demonstration, or
   an answer—not greetings, administration, promotion, navigation, or empty framing.
 - fact = factually_grounded: true only when the educational claim is supported by the supplied
@@ -2342,14 +2357,18 @@ def _compact_output_guide() -> str:
 - stand = is_standalone: true when a cold viewer can understand and use the clip independently,
   without first watching another part of the source. self concerns included context; stand
   concerns independence from the surrounding lesson or another prerequisite clip.
-- ie = intent_evidence: a nonempty list of {id, q} objects covering every required non-scope
-  request_intent constraint_id. Each q must be an exact consecutive 5-16-word quote inside
-  the candidate proving that fulfillment. If any required constraint cannot be evidenced,
-  do not return the topic. ie proves complete request fit; cq independently proves teaching.
-  For a named expression or formula, q must include its complete spoken expression, including
-  trailing terms; a prefix such as "x squared" cannot evidence "x squared minus three" as an
-  exact x-squared object.
-  When a format constraint spans multiple transformations, q anchors that ordered sequence;
+- ie = intent_evidence: a nonempty list of {id, q} objects. Each q must be an exact consecutive
+  5-16-word quote inside the candidate. For a PRIMARY unit, ie covers every required non-scope
+  id and each q proves fulfillment of that constraint. For a SUPPORTING unit, ie contains at
+  least one id and each q grounds the unit's substantive educational connection to that
+  constraint; it need not claim full fulfillment. Never use supporting ie to falsely claim a
+  mismatched object or outcome. Do not output a role; the backend mechanically derives primary
+  only from direct=true plus full grounded coverage, otherwise supporting, and never rejects a
+  unit based on that role.
+  For a named expression or formula, q may claim its object id only when it includes the full
+  spoken expression, including trailing terms. A different expression may still support a
+  method id, but must not claim or masquerade as the requested object.
+  When a fulfilled format constraint spans multiple transformations, q anchors that sequence;
   verify every requested transformation across the entire sq-through-eq span. One q never
   replaces the whole-span completeness check.
 
@@ -2390,13 +2409,25 @@ WRONG: s=40 and sq="This is simply equal to five".
 WRONG: s=41, because that omits the named x-squared setup.
 End at the final two-x result in line 45. Lines 42-44 are required reasoning, so never replace
 them with a formula-only clip, a summary, another function, or a general derivative explanation.
-An x-squared-minus-three example is also a different function and does not qualify, even
-though its derivative also simplifies to two x.
+An x-squared-minus-three example is also a different function and does not qualify as the
+primary x-squared unit even though its derivative also simplifies to two x. It cannot
+claim the object id. If it contains a complete limit-definition derivation, it may be a
+supporting unit for the method only, accurately titled for x squared minus three.
 Example output boundaries: s=40, e=45, sq="So let's say if f of x is equal to x squared",
 eq="the derivative of x squared is two x". The topic's ie must evidence the named function,
 limit-definition task, algebra-step requirement, and final two-x outcome.
 Example compact output:
 {"request_intent":{"exact_request":"Use the limit definition to derive f of x equal x squared, include every algebra step, and finish at two x.","constraints":[{"constraint_id":"object","kind":"subject","source_phrase":"f of x equal x squared","requirement":"Derive f of x equal x squared"},{"constraint_id":"method","kind":"task","source_phrase":"Use the limit definition","requirement":"Use the limit definition"},{"constraint_id":"steps","kind":"format","source_phrase":"include every algebra step","requirement":"Include every spoken algebra step"},{"constraint_id":"result","kind":"outcome","source_phrase":"finish at two x","requirement":"Reach the final result two x"}]},"topics":[{"id":"x-squared-limit-derivation","s":40,"e":45,"sq":"So let's say if f of x is equal to x squared","eq":"the derivative of x squared is two x","cq":"Taking h to zero gives two x","title":"Derive x Squared from the Limit Definition","obj":"Derive the derivative of x squared through every algebra step","facet":"x-squared limit derivation","info":0.99,"rel":1.0,"imp":0.99,"diff":0.45,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"object","q":"f of x is equal to x squared"},{"id":"method","q":"Use the limit definition of the derivative"},{"id":"steps","q":"Expand the square to x squared plus two x h"},{"id":"result","q":"Taking h to zero gives two x"}]}]}
+
+Same-source breadth for that original prompt:
+If the same transcript also completely derives five x minus four, one over x, square root of
+x, eight over square root of x, or another function by the limit definition, return EACH as
+its own SUPPORTING clip. Give every clip its actual function and actual result in title and
+objective, set direct=false, and include method/format ie only when grounded. Do not claim the
+x-squared object or two-x result for a different function. Also return complete explanatory
+units about what h means, substitution, expansion, cancellation, or direct substitution when
+they materially teach a required part. Omit formula-only recitals, fragments, generic calculus
+statements, and duplicate restatements. Never stop after returning the primary x-squared clip.
 """
 
 
@@ -2491,7 +2522,8 @@ def _boundary_prompts(
         "requirement, and source_phrase copied as exact consecutive words from that request. "
         "Together the source phrases must cover every content-bearing request term. Preserve "
         "named subjects, requested operations or tasks, relationships, scope qualifiers, "
-        "formats, and outcomes. Do not substitute retrieval expansions or a broader topic. "
+        "formats, and outcomes. This verbatim exact_request is TOPIC for all selection and "
+        "relevance decisions. Do not substitute retrieval expansions or a broader topic. "
         "When a request contains a function, equation, expression, formula, identifier, or "
         "other structured object, keep the complete object in one atomic constraint; never "
         "reduce it to one shared term. "
@@ -2499,21 +2531,26 @@ def _boundary_prompts(
         "not spoken subject constraints; the exact request and supplied transcript establish "
         "those qualifiers. Words such as 'every', 'each', 'all', 'step-by-step', 'including "
         "every algebra step', and 'final result' are required FORMAT or OUTCOME constraints, "
-        "never optional SCOPE constraints. A candidate fulfills such a request only when one "
-        "contiguous span contains the named setup, every spoken transformation, and the "
-        "requested final result. "
+        "never optional SCOPE constraints. A PRIMARY candidate fulfills such a request only "
+        "when one contiguous span contains the named setup, every spoken transformation, and "
+        "the requested final result. A supporting candidate may connect to only the constraints "
+        "its grounded ie honestly identifies. "
         "Then scan the whole transcript from first to last and understand it before selecting. "
         "Internally distinguish required setup and teaching from administration, promotion, "
         "navigation, repetition, and visual-dependent speech; do not output that section map.\n"
-        "2. Map every distinct educational unit that fulfills the exact request. Selection "
-        "breadth follows the request, not the breadth of the source. If request_intent has "
-        "multiple required non-scope constraints—especially a named task or operation, "
-        "object, relationship, format, or outcome—each returned unit must contain grounded "
-        "evidence for every required non-scope constraint. Include a needed prerequisite, "
-        "formula, definition, or setup inside that complete unit, but do not return it as a "
-        "separate clip. Only a simple broad-subject request with one content constraint may "
-        "return multiple directly connected subject facets. Return every distinct qualifying "
-        f"moment, up to "
+        "2. Map every distinct educational unit genuinely related to TOPIC across the whole "
+        "transcript. A PRIMARY unit fulfills every required non-scope constraint in one "
+        "complete span. A SUPPORTING unit has a substantive educational connection to at "
+        "least one required non-scope constraint and materially teaches a related example, "
+        "method, mechanism, prerequisite, "
+        "application, verification, comparison side, or explanatory facet. Return supporting "
+        "units even when this source contains no primary unit. A different example object may "
+        "support the same requested method, but its title, objective, cq, and ie must describe "
+        "what it actually teaches and must not claim the requested object or outcome. Return "
+        "every distinct qualifying primary and supporting moment, not merely the closest or "
+        "first exact match. If one transcript contains six complete related worked examples, "
+        "return six separate candidates. Never invent, duplicate, fragment, or lower the "
+        "quality bar merely to produce more clips. Return qualifying moments up to "
         f"{_MAX_SELECTOR_CANDIDATES} for this source; "
         "do not stop after the first few units or at an arbitrary count below that cap.\n"
         "3. For every qualifying unit, verify its timestamps and choose the minimum complete "
@@ -2579,13 +2616,16 @@ def _boundary_prompts(
         f"{_compact_output_guide()}\n"
         f"Return only the object {{request_intent, topics}}. Every topic must contain "
         f"{_selection_fields(enriched=False, compact=True)}. The ie list must be nonempty and "
-        "contain one {id, q} item for every required non-scope request constraint, where id is the "
-        "constraint_id and q is an exact consecutive 5-16 word transcript quote wholly inside "
-        "the candidate. If the candidate cannot ground every required non-scope constraint, "
-        "do not return it. Omit scope constraints from ie unless the selected speech states "
-        "them exactly. Do not output a role. cq independently "
-        "proves that the candidate teaches a substantive atomic claim; ie proves only relevance "
-        "to the exact request and must never substitute for cq. Learning details and "
+        "use {id, q} items where id is the constraint_id and q is an exact consecutive 5-16 "
+        "word transcript quote wholly inside the candidate. For a primary topic, ground every "
+        "required non-scope constraint and prove its fulfillment. For a supporting topic, "
+        "include at least one non-scope id whose q grounds the substantive educational "
+        "connection; it need not prove full fulfillment, but it must never falsely claim a "
+        "mismatched object or outcome. Use direct=true for primary and direct=false for supporting. "
+        "Do not output a role. Omit scope constraints from ie unless the selected speech states "
+        "them exactly. cq independently proves that the candidate teaches a substantive atomic "
+        "claim; ie proves its connection to the original prompt and must never substitute for "
+        "cq. Learning details and "
         "assessments are generated later. Do not include them, chain-of-thought, or hidden "
         "reasoning."
     )
@@ -10164,7 +10204,10 @@ def _trusted_compact_plan_to_report(
         )
         intent_role = (
             "primary"
-            if required_constraint_ids.issubset(grounded_constraint_ids)
+            if (
+                proposal.directly_teaches_topic is True
+                and required_constraint_ids.issubset(grounded_constraint_ids)
+            )
             else "supporting"
         )
 

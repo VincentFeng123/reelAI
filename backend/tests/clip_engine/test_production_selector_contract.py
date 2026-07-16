@@ -756,6 +756,159 @@ def test_production_labels_partial_gemini_intent_without_dropping_candidate() ->
     assert clip["intent_coverage"] == pytest.approx(1 / 3, abs=1e-6)
 
 
+def test_production_keeps_direct_false_topic_supporting_at_full_coverage() -> None:
+    plan = _compact_custom_plan(
+        request="the role of h in the limit definition",
+        start_quote="The symbol h represents",
+        end_quote="approaches zero",
+        claim_quote="The symbol h represents the input change that approaches zero",
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "directly_teaches_topic": False,
+        })],
+    })
+    text = "The symbol h represents the input change that approaches zero."
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 8.0, "text": text}],
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    [clip] = report.clips
+    assert clip["intent_role"] == "supporting"
+    assert clip["intent_coverage"] == pytest.approx(1.0)
+
+
+def test_production_passes_primary_and_multiple_supporting_units_from_one_source() -> None:
+    request = "derive x squared using the limit definition to two x"
+    constraints = [
+        {
+            "constraint_id": "object",
+            "kind": "subject",
+            "source_phrase": "x squared",
+            "requirement": "Use x squared",
+        },
+        {
+            "constraint_id": "method",
+            "kind": "task",
+            "source_phrase": "limit definition",
+            "requirement": "Use the limit definition",
+        },
+        {
+            "constraint_id": "result",
+            "kind": "outcome",
+            "source_phrase": "two x",
+            "requirement": "Reach two x",
+        },
+    ]
+    segment_texts = [
+        "For five x minus four, use the limit definition and the answer is five.",
+        "For x squared, use the limit definition and the final derivative is two x.",
+        (
+            "For one over x, use the limit definition and the result is negative one "
+            "over x squared."
+        ),
+    ]
+    topics = []
+    specifications = [
+        (
+            "linear-support",
+            0,
+            "For five x minus four",
+            "the answer is five",
+            "use the limit definition and the answer",
+            False,
+            [{"id": "method", "q": "use the limit definition and the answer"}],
+        ),
+        (
+            "x-squared-primary",
+            1,
+            "For x squared",
+            "derivative is two x",
+            "the final derivative is two x",
+            True,
+            [
+                {"id": "object", "q": "For x squared, use the limit definition"},
+                {"id": "method", "q": "use the limit definition and the final"},
+                {"id": "result", "q": "the final derivative is two x"},
+            ],
+        ),
+        (
+            "reciprocal-support",
+            2,
+            "For one over x",
+            "negative one over x squared",
+            "use the limit definition and the result",
+            False,
+            [{"id": "method", "q": "use the limit definition and the result"}],
+        ),
+    ]
+    for candidate_id, line, start_quote, end_quote, claim, direct, evidence in specifications:
+        topics.append(gemini_segment._CompactBoundaryTopic.model_validate({
+            "id": candidate_id,
+            "s": line,
+            "e": line,
+            "sq": start_quote,
+            "eq": end_quote,
+            "cq": claim,
+            "title": candidate_id,
+            "obj": candidate_id,
+            "facet": candidate_id,
+            "info": 0.95,
+            "rel": 0.95,
+            "imp": 0.95,
+            "diff": 0.25,
+            "direct": direct,
+            "sub": True,
+            "fact": True,
+            "self": True,
+            "stand": True,
+            "ie": evidence,
+        }))
+    plan = gemini_segment._CompactBoundaryPlan.model_validate({
+        "request_intent": {
+            "exact_request": request,
+            "constraints": constraints,
+        },
+        "topics": topics,
+    })
+    segments = [
+        {
+            "cue_id": f"cue-{index}",
+            "start": index * 10.0,
+            "end": (index + 1) * 10.0,
+            "text": text,
+        }
+        for index, text in enumerate(segment_texts)
+    ]
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 3
+    assert report.rejected_reasons == []
+    assert [clip["intent_role"] for clip in report.clips] == [
+        "supporting",
+        "primary",
+        "supporting",
+    ]
+    assert [clip["intent_coverage"] for clip in report.clips] == pytest.approx([
+        1 / 3,
+        1.0,
+        1 / 3,
+    ])
+
+
 def test_production_unanchored_gemini_intent_is_metadata_only() -> None:
     plan = _compact_custom_plan(
         request="derive x squared with the limit definition",
@@ -1379,16 +1532,16 @@ def test_compact_selector_rejects_real_fragmentary_model_edges(
     )
 
 
-def test_explicit_comparison_prompt_requires_every_named_side_in_each_clip() -> None:
+def test_explicit_comparison_prompt_distinguishes_primary_and_supporting() -> None:
     _system, user = gemini_segment._boundary_prompts(
         "[0] 00:00 Opportunity cost differs from sunk cost.",
         1,
         "opportunity cost versus sunk cost",
     )
 
-    assert "every named side" in user
-    assert "requested relationship between them" in user
-    assert "Do not return a one-sided definition" in user
+    assert "primary unit must teach every named side" in user
+    assert "requested relationship" in user
+    assert "supporting units that substantively teach a named side" in user
 
 
 def test_compact_prompt_defines_every_key_and_demonstrates_exact_edges() -> None:
@@ -1439,7 +1592,7 @@ def test_compact_prompt_defines_every_key_and_demonstrates_exact_edges() -> None
     assert 'Do not start at line 32 with "Divide that change"' in normalized
 
 
-def test_specific_request_prompt_excludes_partial_supporting_units_and_prior_examples() -> None:
+def test_specific_request_prompt_returns_primary_and_complete_supporting_units() -> None:
     _system, user = gemini_segment._boundary_prompts(
         "\n".join([
             "[0] 00:00 First derive five x minus four; its derivative is five.",
@@ -1455,7 +1608,12 @@ def test_specific_request_prompt_excludes_partial_supporting_units_and_prior_exa
     normalized = " ".join(user.split())
 
     assert "every required non-scope constraint" in normalized
-    assert "do not return it as a separate clip" in normalized.casefold()
+    assert "this verbatim exact_request is topic" in normalized.casefold()
+    assert "A PRIMARY unit fulfills every required non-scope constraint" in normalized
+    assert "A SUPPORTING unit has a substantive educational connection" in normalized
+    assert "Return supporting units even when this source contains no primary unit" in normalized
+    assert "If one transcript contains six complete related worked examples" in normalized
+    assert "return six separate candidates" in normalized
     assert "earlier five-x-minus-four objective" in normalized.casefold()
     assert "begin at the x-squared setup" in normalized.casefold()
     assert "end at the final two-x result" in normalized.casefold()
@@ -1469,10 +1627,14 @@ def test_specific_request_prompt_excludes_partial_supporting_units_and_prior_exa
     assert "x-squared-minus-three example is also a different function" in (
         normalized.casefold()
     )
-    assert "different object merely because it produces the same requested outcome" in (
+    assert "does not qualify as the primary x-squared unit" in (
         normalized.casefold()
     )
-    assert "q must include its complete spoken expression" in normalized.casefold()
+    assert "it may be a supporting unit for the method only" in normalized.casefold()
+    assert "same-source breadth for that original prompt" in normalized.casefold()
+    assert "return each as its own supporting clip" in normalized.casefold()
+    assert "give every clip its actual function and actual result" in normalized.casefold()
+    assert "never stop after returning the primary x-squared clip" in normalized.casefold()
     assert "all examples below assume no learner-level restriction" in (
         normalized.casefold()
     )
@@ -5093,7 +5255,7 @@ def test_boundary_quote_reanchoring_remains_exact_unique_and_in_range(
     assert "bad_start_quote" in report.clips[0]["_boundary_fallback_reasons"]
 
 
-def test_selector_prompt_is_exhaustive_and_requires_full_constrained_request() -> None:
+def test_selector_prompt_is_exhaustive_for_primary_and_supporting_units() -> None:
     _system, user = gemini_segment._boundary_prompts(
         "[0] 00:00 Cells use chlorophyll to capture light energy.",
         1,
@@ -5101,9 +5263,10 @@ def test_selector_prompt_is_exhaustive_and_requires_full_constrained_request() -
         learner_level="beginner",
     )
 
-    assert "each returned unit must contain grounded evidence" in user
-    assert "every required non-scope constraint" in user
-    assert "do not return it as a separate clip" in user
+    assert "genuinely related to TOPIC" in user
+    assert "PRIMARY unit fulfills every required non-scope constraint" in user
+    assert "SUPPORTING unit has a substantive educational connection" in user
+    assert "Return supporting units even when this source contains no primary unit" in user
     assert "keep the complete object in one atomic constraint" in user
     assert "every distinct educational unit" in user
     assert "whole transcript" in (_system + user).lower()
@@ -5114,12 +5277,12 @@ def test_selector_prompt_is_exhaustive_and_requires_full_constrained_request() -
     assert "difficulty band 0.00-0.40" in user
     assert "level fit is a gemini selection eligibility rule" in user.lower()
     assert "unseen visual" in user
-    assert "Return every distinct qualifying moment" in user
+    assert "every distinct qualifying primary and supporting moment" in user
     assert "internal interruption" in (_system + user)
     assert "internal filler may never remain" in (_system + user).lower()
     assert "otherwise keep it" not in (_system + user).lower()
     assert "may remain when cutting around it" not in (_system + user).lower()
-    assert "prioritize them within difficulty stages" in (_system + user)
+    assert "never stop after one exact match" in (_system + user).lower()
     assert "title (at most 12 words)" in user
     assert "learning_objective (at most 24 words)" in user
     assert "facet (at most 12 words)" in user

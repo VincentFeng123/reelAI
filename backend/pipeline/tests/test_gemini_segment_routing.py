@@ -1390,7 +1390,10 @@ def test_production_boundary_selector_keeps_every_candidate_beyond_sixteen(monke
 
     assert classification.status == "green"
     assert len(report.clips) == 17
-    assert "return every distinct qualifying moment" in captured["user"].casefold()
+    assert (
+        "every distinct qualifying primary and supporting moment"
+        in captured["user"].casefold()
+    )
     assert "up to 16" not in captured["user"].casefold()
     assert "T0" in {clip["title"] for clip in report.clips}
     assert "T16" in {clip["title"] for clip in report.clips}
