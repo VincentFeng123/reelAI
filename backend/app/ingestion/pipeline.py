@@ -1146,28 +1146,55 @@ def _projected_speech_bounds(
             )
             or None,
         )
+        projection_mode = "projected" if is_projected else "cue_edge"
         if anchor is None:
-            if is_projected:
-                return fallback, {}, f"{edge}_lexical_alignment_unavailable"
-            continue
-        excluded_sec = float(anchor.excluded_neighbor_onset_sec)
-        required_sec = (
-            float(anchor.quote_start_sec)
-            if edge == "start"
-            else (
-                min(
-                    float(anchor.quote_last_onset_sec)
-                    + PROJECTED_END_COVERAGE_SEC,
-                    (
-                        float(anchor.quote_last_onset_sec)
-                        + excluded_sec
+            if not is_projected:
+                continue
+            caption_end = context_end
+            if selected_index + 1 < len(segments):
+                try:
+                    following_start = float(
+                        segments[selected_index + 1].get("start")
                     )
-                    / 2.0,
-                )
-                if is_projected
-                else float(anchor.quote_last_onset_sec)
+                except (TypeError, ValueError, OverflowError):
+                    following_start = caption_end
+                if (
+                    math.isfinite(following_start)
+                    and context_start < following_start < caption_end
+                ):
+                    caption_end = following_start
+            interpolated = _interpolated_caption_edge_anchor(
+                cue_text=context_text,
+                quote=quote,
+                edge=edge,
+                cue_start_sec=context_start,
+                cue_end_sec=caption_end,
+                occurrence=str(marker.get("occurrence") or "").strip()
+                or None,
             )
-        )
+            if interpolated is None:
+                return fallback, {}, f"{edge}_lexical_alignment_unavailable"
+            required_sec, excluded_sec = interpolated
+            projection_mode = "caption_token_interpolation"
+        else:
+            excluded_sec = float(anchor.excluded_neighbor_onset_sec)
+            required_sec = (
+                float(anchor.quote_start_sec)
+                if edge == "start"
+                else (
+                    min(
+                        float(anchor.quote_last_onset_sec)
+                        + PROJECTED_END_COVERAGE_SEC,
+                        (
+                            float(anchor.quote_last_onset_sec)
+                            + excluded_sec
+                        )
+                        / 2.0,
+                    )
+                    if is_projected
+                    else float(anchor.quote_last_onset_sec)
+                )
+            )
         if (
             not math.isfinite(required_sec)
             or not math.isfinite(excluded_sec)
@@ -1187,7 +1214,7 @@ def _projected_speech_bounds(
         verified[edge] = {
             "cue_id": expected_cue_ids[edge],
             "quote": quote,
-            "mode": "projected" if is_projected else "cue_edge",
+            "mode": projection_mode,
             "required_speech_sec": round(required_sec, 3),
             "excluded_neighbor_onset_sec": round(excluded_sec, 3),
         }
@@ -1226,7 +1253,18 @@ def _projected_speech_bounds(
                         for details in verified.values()
                     ),
                 }
-                if verified
+                if any(
+                    details.get("mode") in {"projected", "cue_edge"}
+                    for details in verified.values()
+                )
+                else {}
+            ),
+            **(
+                {"caption_projection_verified": True}
+                if any(
+                    details.get("mode") == "caption_token_interpolation"
+                    for details in verified.values()
+                )
                 else {}
             ),
             **verified,
@@ -2118,6 +2156,294 @@ def _context_result_range_is_safe(
     )
 
 
+_BoundaryVerificationResult = tuple[
+    dict[str, Any] | None,
+    object | None,
+    dict[str, Any],
+    tuple[float, float],
+]
+_AdjacentGeminiHandoff = tuple[str, int, int]
+
+
+def _adjacent_gemini_shared_cue_pairs(
+    transcript: dict[str, Any],
+    candidates: list[dict[str, Any]],
+) -> list[_AdjacentGeminiHandoff]:
+    """Return unambiguous chronological Gemini neighbors sharing one edge cue."""
+
+    segments = [
+        segment
+        for segment in (transcript.get("segments") or [])
+        if isinstance(segment, dict)
+    ]
+    owners: dict[
+        str,
+        dict[str, list[tuple[int, tuple[int, int]]]],
+    ] = collections.defaultdict(
+        lambda: {"start": [], "end": []}
+    )
+    for index, candidate in enumerate(candidates):
+        if not _gemini_selection_is_authoritative(candidate):
+            continue
+        span = _candidate_line_span(segments, candidate)
+        cue_ids = [
+            str(value or "").strip()
+            for value in (candidate.get("cue_ids") or [])
+        ]
+        if span is None or not cue_ids or any(not value for value in cue_ids):
+            continue
+        owners[cue_ids[0]]["start"].append((index, span))
+        owners[cue_ids[-1]]["end"].append((index, span))
+
+    ordered_pairs: list[tuple[int, _AdjacentGeminiHandoff]] = []
+    for cue_id, cue_owners in owners.items():
+        if len(cue_owners["end"]) != 1 or len(cue_owners["start"]) != 1:
+            continue
+        left_index, left_span = cue_owners["end"][0]
+        right_index, right_span = cue_owners["start"][0]
+        shared_index = left_span[1]
+        if (
+            left_index == right_index
+            or (
+                left_span == (shared_index, shared_index)
+                and right_span == (shared_index, shared_index)
+            )
+        ):
+            continue
+        try:
+            left_range = tuple(
+                float(candidates[left_index].get(key))
+                for key in ("start", "end")
+            )
+            right_range = tuple(
+                float(candidates[right_index].get(key))
+                for key in ("start", "end")
+            )
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if left_range[0] < right_range[0] and left_range[1] < right_range[1]:
+            ordered_pairs.append(
+                (shared_index, (cue_id, left_index, right_index))
+            )
+    return [pair for _shared_index, pair in sorted(ordered_pairs)]
+
+
+def _reconcile_adjacent_gemini_handoffs(
+    transcript: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    verification_results: list[_BoundaryVerificationResult],
+    *,
+    handoff_pairs: list[_AdjacentGeminiHandoff] | None = None,
+) -> list[_BoundaryVerificationResult]:
+    """Fence unresolved Gemini edges with independently resolved sibling edges.
+
+    Donors come only from the immutable original results. Repairs only shrink
+    ranges and never reject candidates or become evidence for another repair.
+    A resolved caption start may move by at most its explicit 150 ms preroll.
+    """
+
+    if len(candidates) != len(verification_results):
+        return list(verification_results)
+    pairs = (
+        _adjacent_gemini_shared_cue_pairs(transcript, candidates)
+        if handoff_pairs is None
+        else handoff_pairs
+    )
+    if not pairs:
+        return list(verification_results)
+    segment_ends = [
+        float(segment.get("end") or 0.0)
+        for segment in (transcript.get("segments") or [])
+        if isinstance(segment, dict)
+    ]
+    source_end = max(
+        [float(transcript.get("duration") or 0.0), *segment_ends],
+        default=0.0,
+    )
+    if not segment_ends or source_end <= 0.0:
+        return list(verification_results)
+
+    reconciled = list(verification_results)
+
+    def safe_range(result: _BoundaryVerificationResult) -> tuple[float, float] | None:
+        acoustic = result[1]
+        if acoustic is None:
+            return None
+        try:
+            start = float(getattr(acoustic, "start_sec"))
+            end = float(getattr(acoustic, "end_sec"))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        safe = bool(
+            math.isfinite(start)
+            and math.isfinite(end)
+            and 0.0 <= start < end <= source_end + 1e-3
+            and (
+                bool(getattr(acoustic, "verified", False))
+                or _context_result_range_is_safe(acoustic, source_end_sec=source_end)
+            )
+        )
+        return (start, end) if safe else None
+
+    donor_edges: dict[tuple[int, str, str], tuple[float, str]] = {}
+    for cue_id, left_index, right_index in pairs:
+        for index, side in ((left_index, "end"), (right_index, "start")):
+            result = verification_results[index]
+            bounds = safe_range(result)
+            projection = result[2]
+            if (
+                bounds is None
+                or not isinstance(projection, dict)
+                or isinstance(projection.get("context_fallback"), dict)
+            ):
+                continue
+            details = projection.get(side)
+            if (
+                not isinstance(details, dict)
+                or str(details.get("cue_id") or "").strip() != cue_id
+            ):
+                continue
+            mode = str(details.get("mode") or "").strip()
+            if mode not in {"projected", "caption_token_interpolation"}:
+                continue
+            donor_edges[(index, side, cue_id)] = (
+                bounds[0] if side == "start" else bounds[1],
+                mode,
+            )
+
+    def clamp_target(
+        target_index: int,
+        target_side: str,
+        donor_index: int,
+        donor_side: str,
+        cue_id: str,
+    ) -> None:
+        current_range = safe_range(reconciled[target_index])
+        donor = donor_edges.get((donor_index, donor_side, cue_id))
+        raw_projection = candidates[target_index].get("edge_projection")
+        marker = (
+            raw_projection.get(target_side)
+            if isinstance(raw_projection, dict)
+            else None
+        )
+        if (
+            current_range is None
+            or donor is None
+            or not isinstance(marker, dict)
+            or str(marker.get("cue_id") or "").strip() != cue_id
+        ):
+            return
+        target_projection = reconciled[target_index][2]
+        target_details = target_projection.get(target_side)
+        caption_preroll_overlap = bool(
+            target_side == "start"
+            and donor_side == "end"
+            and isinstance(target_details, dict)
+            and target_details.get("mode") == "caption_token_interpolation"
+        )
+        if isinstance(target_details, dict) and not caption_preroll_overlap:
+            return
+        donor_time, donor_mode = donor
+        if caption_preroll_overlap:
+            try:
+                required_start = float(target_details["required_speech_sec"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return
+            if (
+                not math.isfinite(required_start)
+                or donor_time
+                > required_start
+                + CAPTION_PROJECTION_START_PREROLL_SEC
+                + SPEECH_OWNERSHIP_EPSILON_SEC
+            ):
+                return
+        caption, acoustic, projection, _speech_bounds = reconciled[target_index]
+        assert acoustic is not None
+        old_start, old_end = current_range
+        new_start, new_end = (
+            (donor_time, old_end)
+            if target_side == "start"
+            else (old_start, donor_time)
+        )
+        if (
+            not all(math.isfinite(value) for value in (new_start, new_end))
+            or new_start < old_start - SPEECH_OWNERSHIP_EPSILON_SEC
+            or new_end > old_end + SPEECH_OWNERSHIP_EPSILON_SEC
+            or (
+                target_side == "start"
+                and donor_time <= old_start + SPEECH_OWNERSHIP_EPSILON_SEC
+            )
+            or (
+                target_side == "end"
+                and donor_time >= old_end - SPEECH_OWNERSHIP_EPSILON_SEC
+            )
+            or new_end - new_start <= PARTIAL_CUE_MATERIALITY_SEC
+        ):
+            return
+
+        prior_diagnostics = dict(getattr(acoustic, "diagnostics", {}) or {})
+        prior_required = prior_diagnostics.get("required_speech_range")
+        prior_semantic = prior_diagnostics.get("semantic_range")
+        prior_handoffs = prior_diagnostics.get("adjacent_clip_handoff")
+        handoffs = (
+            [dict(value) for value in prior_handoffs if isinstance(value, dict)]
+            if isinstance(prior_handoffs, list)
+            else []
+        )
+        handoffs.append({
+            "target_side": target_side,
+            "shared_cue_id": cue_id,
+            "donor_candidate_id": str(
+                candidates[donor_index].get("selection_candidate_id") or ""
+            ),
+            "donor_side": donor_side,
+            "donor_mode": donor_mode,
+            "donor_time_sec": round(donor_time, 3),
+            "original_range": [round(old_start, 3), round(old_end, 3)],
+        })
+        final_range = [round(new_start, 3), round(new_end, 3)]
+        reconciled[target_index] = (
+            caption,
+            clip_engine_silence.SilenceVerificationResult(
+                "context_aligned",
+                final_range[0],
+                final_range[1],
+                {
+                    **prior_diagnostics,
+                    "stage": "transcript",
+                    "reason": "adjacent_clip_handoff",
+                    "context_aligned": True,
+                    **(
+                        {"pre_handoff_required_speech_range": prior_required}
+                        if isinstance(prior_required, (list, tuple))
+                        else {}
+                    ),
+                    **(
+                        {"pre_handoff_semantic_range": prior_semantic}
+                        if isinstance(prior_semantic, (list, tuple))
+                        else {}
+                    ),
+                    "required_speech_range": final_range,
+                    "semantic_range": (
+                        prior_semantic
+                        if isinstance(prior_semantic, (list, tuple))
+                        else final_range
+                    ),
+                    "final_range": final_range,
+                    "adjacent_clip_handoff": handoffs,
+                },
+            ),
+            projection,
+            (final_range[0], final_range[1]),
+        )
+
+    for cue_id, left_index, right_index in pairs:
+        clamp_target(left_index, "end", right_index, "start", cue_id)
+        clamp_target(right_index, "start", left_index, "end", cue_id)
+
+    return reconciled
+
+
 def _acoustic_observation_shift_is_safe(
     acoustic: object,
     prepared: object,
@@ -2695,6 +3021,11 @@ def _verified_direct_adapter_clips(
         # them inline avoids thread scheduling overhead on the small Railway
         # instance without changing candidate order or delaying any I/O.
         verification_results = [verify(candidate) for candidate in candidates]
+    verification_results = _reconcile_adjacent_gemini_handoffs(
+        transcript,
+        candidates,
+        verification_results,
+    )
 
     verified: list[dict[str, Any]] = []
     for raw_clip, (caption, acoustic, projection, speech_bounds) in zip(
@@ -4538,12 +4869,51 @@ class IngestionPipeline:
                 finally:
                     boundary_executor.shutdown(wait=False, cancel_futures=True)
 
+            handoff_pairs = _adjacent_gemini_shared_cue_pairs(
+                engine_out["transcript"],
+                candidate_clips,
+            )
+            if handoff_pairs:
+                boundary_items = list(boundary_results())
+                boundary_by_index = {
+                    candidate_index: result
+                    for candidate_index, result in boundary_items
+                }
+                boundary_order = [
+                    candidate_index
+                    for candidate_index, _result in boundary_items
+                ]
+                for candidate_index, clip in enumerate(candidate_clips):
+                    if candidate_index in boundary_by_index:
+                        continue
+                    boundary_by_index[candidate_index] = verify_boundary(
+                        clip,
+                        allow_audio=False,
+                    )
+                    boundary_order.append(candidate_index)
+                aligned_boundary_results = [
+                    boundary_by_index[candidate_index]
+                    for candidate_index in range(len(candidate_clips))
+                ]
+                aligned_boundary_results = _reconcile_adjacent_gemini_handoffs(
+                    engine_out["transcript"],
+                    candidate_clips,
+                    aligned_boundary_results,
+                    handoff_pairs=handoff_pairs,
+                )
+                resolved_boundary_results = (
+                    (candidate_index, aligned_boundary_results[candidate_index])
+                    for candidate_index in boundary_order
+                )
+            else:
+                resolved_boundary_results = boundary_results()
+
             for candidate_index, (
                 caption_diagnostics,
                 acoustic,
                 projection_diagnostics,
                 speech_bounds,
-            ) in boundary_results():
+            ) in resolved_boundary_results:
                 raise_if_cancelled(should_cancel)
                 if persistence_cap is not None and stored_count >= persistence_cap:
                     break

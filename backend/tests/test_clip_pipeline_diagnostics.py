@@ -161,6 +161,114 @@ def _quality_clip(
     return clip
 
 
+def _shared_gemini_engine_out(*, reverse_clips: bool = False) -> dict:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:production-shared-cue",
+        "duration": 30.0,
+        "segments": [
+            {
+                "cue_id": "left",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "The first Python example begins with a reusable function.",
+            },
+            {
+                "cue_id": "shared",
+                "start": 8.0,
+                "end": 20.0,
+                "text": "The left answer is five. The next Python example starts here.",
+            },
+            {
+                "cue_id": "right",
+                "start": 18.0,
+                "end": 30.0,
+                "text": "The next example uses that Python function in a loop.",
+            },
+        ],
+    }
+    left = _quality_clip(
+        candidate_id="preferred-left",
+        start=0.0,
+        end=20.0,
+        cue_ids=["left", "shared"],
+        quote="The first Python example begins with a reusable function.",
+        difficulty=0.2,
+        selection_authority="gemini",
+        edge_projection={
+            "end": {"cue_id": "shared", "quote": "The left answer is five"},
+        },
+    )
+    right = _quality_clip(
+        candidate_id="secondary-right",
+        start=8.0,
+        end=30.0,
+        cue_ids=["shared", "right"],
+        quote="The next example uses that Python function in a loop.",
+        difficulty=0.8,
+        selection_authority="gemini",
+        edge_projection={
+            "start": {
+                "cue_id": "shared",
+                "quote": "The next Python example starts here",
+            },
+        },
+    )
+    clips = [right, left] if reverse_clips else [left, right]
+    return {"clips": clips, "transcript": transcript, "notes": ""}
+
+
+def _stub_shared_gemini_boundaries(monkeypatch) -> list[tuple[float, float]]:
+    verification_calls: list[tuple[float, float]] = []
+
+    def projected_bounds(_transcript, clip, _caption, _prepared):
+        candidate_id = str(clip["selection_candidate_id"])
+        if candidate_id.endswith("::preferred-left"):
+            return (
+                (0.0, 12.0),
+                {
+                    "caption_projection_verified": True,
+                    "end": {
+                        "cue_id": "shared",
+                        "mode": "projected",
+                        "required_speech_sec": 12.0,
+                        "excluded_neighbor_onset_sec": 20.0,
+                    },
+                },
+                None,
+            )
+        return (8.0, 30.0), {}, "shared_start_projection_unresolved"
+
+    def verify_audio(_source, start_sec, end_sec, **_kwargs):
+        verification_calls.append((start_sec, end_sec))
+        return mock.Mock(
+            verified=True,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            diagnostics={},
+        )
+
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=mock.sentinel.prepared_audio),
+    )
+    monkeypatch.setattr(pipeline_module, "_projected_speech_bounds", projected_bounds)
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify_audio,
+    )
+    monkeypatch.setattr(pipeline_module, "_acoustic_range_is_safe", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        pipeline_module,
+        "_acoustic_observation_shift_is_safe",
+        lambda *_args, **_kwargs: True,
+    )
+    return verification_calls
+
+
 def _one_cue_selector_result(
     evidence_quote: str,
     *,
@@ -646,6 +754,194 @@ def test_topic_generation_streams_independent_acoustic_passes_immediately_but_re
     assert context.counters()["stored_clips"] == 3
     assert context.counters()["deferred_clips"] == 0
     assert context.counters()["persisted_clips"] == 3
+
+
+def test_gemini_without_shared_cue_keeps_boundary_streaming_lazy(
+    monkeypatch,
+) -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:gemini-lazy-boundaries",
+        "duration": 20.0,
+        "segments": [
+            {
+                "cue_id": "slow",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "Python functions package reusable instructions.",
+            },
+            {
+                "cue_id": "fast",
+                "start": 10.0,
+                "end": 20.0,
+                "text": "Python loops repeat those instructions.",
+            },
+        ],
+    }
+    clips = [
+        _quality_clip(
+            candidate_id="slow",
+            cue_id="slow",
+            quote=transcript["segments"][0]["text"],
+            selection_authority="gemini",
+        ),
+        _quality_clip(
+            candidate_id="fast",
+            cue_id="fast",
+            start=10.0,
+            end=20.0,
+            quote=transcript["segments"][1]["text"],
+            selection_authority="gemini",
+        ),
+    ]
+    assert pipeline_module._adjacent_gemini_shared_cue_pairs(transcript, clips) == []
+    engine_out = {"clips": clips, "transcript": transcript, "notes": ""}
+    monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=mock.sentinel.prepared_audio),
+    )
+    monkeypatch.setattr(pipeline_module, "_acoustic_range_is_safe", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        pipeline_module,
+        "_acoustic_observation_shift_is_safe",
+        lambda *_args, **_kwargs: True,
+    )
+    release_slow = threading.Event()
+    slow_finished = threading.Event()
+
+    def verify_audio(_source, start_sec, end_sec, **_kwargs):
+        if start_sec == 0.0:
+            released_by_callback = release_slow.wait(timeout=1.0)
+            slow_finished.set()
+            assert released_by_callback
+        return mock.Mock(
+            verified=True,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            diagnostics={},
+        )
+
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify_audio,
+    )
+    pipeline = _pipeline()
+
+    def persist(*, clip, **_kwargs):
+        candidate_id = str(clip["selection_candidate_id"]).split("::")[-1]
+        return f"reel-{candidate_id}", mock.sentinel.metadata
+
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+    emitted: list[str] = []
+    first_callback_saw_slow_finished: list[bool] = []
+
+    def emit(reel: str) -> None:
+        emitted.append(reel)
+        if len(emitted) == 1:
+            first_callback_saw_slow_finished.append(slow_finished.is_set())
+            release_slow.set()
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext("slow", require_acoustic_boundaries=True),
+        max_videos=1,
+        max_reels=2,
+        on_reel_created=emit,
+        retrieval_profile="deep",
+    )
+
+    assert reels == ["reel-slow", "reel-fast"]
+    assert emitted == ["reel-fast", "reel-slow"]
+    assert first_callback_saw_slow_finished == [False]
+
+
+def test_topic_generation_reconciles_shared_gemini_cue_before_persistence(
+    monkeypatch,
+) -> None:
+    engine_out = _shared_gemini_engine_out()
+    monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    verification_calls = _stub_shared_gemini_boundaries(monkeypatch)
+    pipeline = _pipeline()
+    stored: list[dict] = []
+
+    def persist(*, clip, **_kwargs):
+        stored.append(clip)
+        candidate_id = str(clip["selection_candidate_id"]).split("::")[-1]
+        return f"reel-{candidate_id}", mock.sentinel.metadata
+
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext("slow", require_acoustic_boundaries=True),
+        max_videos=1,
+        max_reels=2,
+        retrieval_profile="deep",
+    )
+
+    assert reels == ["reel-preferred-left", "reel-secondary-right"]
+    assert set(verification_calls) == {(0.0, 12.0), (8.0, 30.0)}
+    by_id = {
+        str(clip["selection_candidate_id"]).split("::")[-1]: clip
+        for clip in stored
+    }
+    assert by_id["preferred-left"]["end"] == 12.0
+    assert by_id["secondary-right"]["start"] == 12.0
+    assert by_id["preferred-left"]["end"] <= by_id["secondary-right"]["start"]
+    right_boundary = by_id["secondary-right"]["search_context"]
+    assert right_boundary["boundary_status"] == "context_aligned"
+    assert right_boundary["boundary_diagnostics"]["transcript"][
+        "adjacent_clip_handoff"
+    ][0]["donor_candidate_id"].endswith("::preferred-left")
+
+
+def test_shared_gemini_cue_persistence_cap_keeps_preferred_candidate(
+    monkeypatch,
+) -> None:
+    engine_out = _shared_gemini_engine_out(reverse_clips=True)
+    monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    verification_calls = _stub_shared_gemini_boundaries(monkeypatch)
+    reconcile = mock.Mock(wraps=pipeline_module._reconcile_adjacent_gemini_handoffs)
+    monkeypatch.setattr(
+        pipeline_module,
+        "_reconcile_adjacent_gemini_handoffs",
+        reconcile,
+    )
+    pipeline = _pipeline()
+    stored_ids: list[str] = []
+
+    def persist(*, clip, **_kwargs):
+        candidate_id = str(clip["selection_candidate_id"]).split("::")[-1]
+        stored_ids.append(candidate_id)
+        return f"reel-{candidate_id}", mock.sentinel.metadata
+
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        knowledge_level="beginner",
+        generation_context=GenerationContext("slow", require_acoustic_boundaries=True),
+        max_videos=1,
+        max_reels=2,
+        max_persisted_reels=1,
+        retrieval_profile="deep",
+    )
+
+    assert reels == ["reel-preferred-left"]
+    assert stored_ids == ["preferred-left"]
+    assert set(verification_calls) == {(0.0, 12.0), (8.0, 30.0)}
+    reconcile.assert_called_once()
 
 
 def test_gemini_authority_never_receives_backend_semantic_context_expansion(
@@ -2170,6 +2466,416 @@ def test_partial_cue_projection_uses_caption_tokens_without_native_words() -> No
         "required_speech_sec": 2.707,
         "excluded_neighbor_onset_sec": 1.429,
     }
+
+
+def test_explicit_edges_use_caption_tokens_when_native_words_do_not_align() -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:mismatched-native-edge-timing",
+        "duration": 12.0,
+        "segments": [{
+            "cue_id": "shared-unit",
+            "start": 0.0,
+            "end": 12.0,
+            "text": (
+                "Previous answer is five. So let's say x squared. Work every "
+                "algebra step. The answer is two x. Next example is one over x."
+            ),
+        }],
+    }
+    clip = _quality_clip(
+        cue_id="shared-unit",
+        start=0.0,
+        end=12.0,
+        edge_projection={
+            "start": {
+                "cue_id": "shared-unit",
+                "quote": "So let's say x squared",
+            },
+            "end": {
+                "cue_id": "shared-unit",
+                "quote": "The answer is two x",
+            },
+        },
+    )
+    caption = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert caption is not None
+    prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+        "ready",
+        source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a",
+            lexical_words=(
+                pipeline_module.clip_engine_silence.lexical_timing.LexicalWord(
+                    "unrelated", 0.5,
+                ),
+                pipeline_module.clip_engine_silence.lexical_timing.LexicalWord(
+                    "native", 1.0,
+                ),
+                pipeline_module.clip_engine_silence.lexical_timing.LexicalWord(
+                    "captions", 1.5,
+                ),
+            ),
+        ),
+    )
+
+    bounds, projection, error = pipeline_module._projected_speech_bounds(
+        transcript,
+        clip,
+        caption,
+        prepared,
+    )
+
+    assert error is None
+    assert 0.0 < bounds[0] < bounds[1] < 12.0
+    assert projection["caption_projection_verified"] is True
+    assert projection["start"]["mode"] == "caption_token_interpolation"
+    assert projection["end"]["mode"] == "caption_token_interpolation"
+    assert "lexical_boundary_verified" not in projection
+
+
+def test_adjacent_gemini_handoffs_clamp_both_unresolved_shared_cue_edges() -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:adjacent-gemini-handoffs",
+        "duration": 40.0,
+        "segments": [
+            {"cue_id": "linear", "start": 0.0, "end": 10.0, "text": "Linear work."},
+            {
+                "cue_id": "linear-x2",
+                "start": 8.0,
+                "end": 20.0,
+                "text": "The answer is five. X squared starts here.",
+            },
+            {
+                "cue_id": "x2-reciprocal",
+                "start": 18.0,
+                "end": 30.0,
+                "text": "The answer is two x. One over x starts here.",
+            },
+            {
+                "cue_id": "reciprocal",
+                "start": 28.0,
+                "end": 40.0,
+                "text": "Reciprocal work and answer.",
+            },
+        ],
+    }
+    linear = _quality_clip(
+        candidate_id="linear",
+        start=0.0,
+        end=20.0,
+        cue_ids=["linear", "linear-x2"],
+        selection_authority="gemini",
+        edge_projection={
+            "end": {"cue_id": "linear-x2", "quote": "The answer is five"},
+        },
+    )
+    x2 = _quality_clip(
+        candidate_id="x2",
+        start=8.0,
+        end=30.0,
+        cue_ids=["linear-x2", "x2-reciprocal"],
+        selection_authority="gemini",
+        edge_projection={
+            "start": {"cue_id": "linear-x2", "quote": "X squared starts here"},
+            "end": {"cue_id": "x2-reciprocal", "quote": "The answer is two x"},
+        },
+    )
+    reciprocal = _quality_clip(
+        candidate_id="reciprocal",
+        start=18.0,
+        end=40.0,
+        cue_ids=["x2-reciprocal", "reciprocal"],
+        selection_authority="gemini",
+        edge_projection={
+            "start": {
+                "cue_id": "x2-reciprocal",
+                "quote": "One over x starts here",
+            },
+        },
+    )
+
+    def aligned(start: float, end: float):
+        return pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "context_aligned",
+            start,
+            end,
+            {
+                "stage": "transcript",
+                "reason": "test",
+                "context_aligned": True,
+                "final_range": [start, end],
+            },
+        )
+
+    results = [
+        (
+            {},
+            aligned(0.0, 12.0),
+            {
+                "end": {
+                    "cue_id": "linear-x2",
+                    "mode": "projected",
+                },
+            },
+            (0.0, 12.0),
+        ),
+        (
+            {},
+            aligned(8.0, 30.0),
+            {"context_fallback": {"reason": "full_cue_fallback"}},
+            (8.0, 30.0),
+        ),
+        (
+            {},
+            aligned(24.0, 40.0),
+            {
+                "start": {
+                    "cue_id": "x2-reciprocal",
+                    "mode": "caption_token_interpolation",
+                },
+            },
+            (24.0, 40.0),
+        ),
+    ]
+
+    reconciled = pipeline_module._reconcile_adjacent_gemini_handoffs(
+        transcript,
+        [linear, x2, reciprocal],
+        results,
+    )
+
+    assert len(reconciled) == 3
+    repaired = reconciled[1][1]
+    assert repaired is not None
+    assert repaired.status == "context_aligned"
+    assert (repaired.start_sec, repaired.end_sec) == (12.0, 24.0)
+    assert reconciled[1][3] == (12.0, 24.0)
+    handoffs = repaired.diagnostics["adjacent_clip_handoff"]
+    assert [item["target_side"] for item in handoffs] == ["start", "end"]
+    assert [item["donor_candidate_id"] for item in handoffs] == [
+        "linear",
+        "reciprocal",
+    ]
+
+
+def test_adjacent_handoff_never_overrides_an_independently_resolved_edge() -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:resolved-gemini-edge",
+        "duration": 30.0,
+        "segments": [
+            {"cue_id": "left", "start": 0.0, "end": 10.0, "text": "Left work."},
+            {
+                "cue_id": "shared",
+                "start": 8.0,
+                "end": 20.0,
+                "text": "Left answer. Right setup.",
+            },
+            {"cue_id": "right", "start": 18.0, "end": 30.0, "text": "Right work."},
+        ],
+    }
+    left = _quality_clip(
+        candidate_id="left",
+        start=0.0,
+        end=20.0,
+        cue_ids=["left", "shared"],
+        selection_authority="gemini",
+        edge_projection={
+            "end": {"cue_id": "shared", "quote": "Left answer"},
+        },
+    )
+    right = _quality_clip(
+        candidate_id="right",
+        start=8.0,
+        end=30.0,
+        cue_ids=["shared", "right"],
+        selection_authority="gemini",
+        edge_projection={
+            "start": {"cue_id": "shared", "quote": "Right setup"},
+        },
+    )
+
+    def aligned(start: float, end: float):
+        return pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "context_aligned",
+            start,
+            end,
+            {"context_aligned": True, "final_range": [start, end]},
+        )
+
+    results = [
+        (
+            {},
+            aligned(0.0, 12.0),
+            {"end": {"cue_id": "shared", "mode": "projected"}},
+            (0.0, 12.0),
+        ),
+        (
+            {},
+            aligned(10.0, 30.0),
+            {
+                "start": {
+                    "cue_id": "shared",
+                    "mode": "projected",
+                },
+            },
+            (10.0, 30.0),
+        ),
+    ]
+
+    reconciled = pipeline_module._reconcile_adjacent_gemini_handoffs(
+        transcript,
+        [left, right],
+        results,
+    )
+
+    assert reconciled[1][1].start_sec == 10.0
+    assert "adjacent_clip_handoff" not in reconciled[1][1].diagnostics
+
+    fallback_results = [
+        (
+            {},
+            aligned(0.0, 12.0),
+            {
+                "end": {"cue_id": "shared", "mode": "projected"},
+                "context_fallback": {"reason": "full_cue_fallback"},
+            },
+            (0.0, 12.0),
+        ),
+        (
+            {},
+            aligned(10.0, 30.0),
+            {"context_fallback": {"reason": "full_cue_fallback"}},
+            (10.0, 30.0),
+        ),
+    ]
+    fallback_reconciled = pipeline_module._reconcile_adjacent_gemini_handoffs(
+        transcript,
+        [left, right],
+        fallback_results,
+    )
+
+    assert fallback_reconciled[1][1].start_sec == 10.0
+    assert "adjacent_clip_handoff" not in fallback_reconciled[1][1].diagnostics
+
+
+def test_multi_clip_adapter_preserves_all_non_overlapping_shared_cue_units() -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:shared-cue-unit-inventory",
+        "duration": 40.0,
+        "segments": [
+            {
+                "cue_id": "linear",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "Linear setup and algebra produce five.",
+            },
+            {
+                "cue_id": "linear-x2",
+                "start": 8.0,
+                "end": 20.0,
+                "text": "The answer is five. X squared starts here with the limit.",
+            },
+            {
+                "cue_id": "x2-reciprocal",
+                "start": 18.0,
+                "end": 30.0,
+                "text": "The answer is two x. One over x starts here with the limit.",
+            },
+            {
+                "cue_id": "reciprocal",
+                "start": 28.0,
+                "end": 40.0,
+                "text": "Reciprocal algebra produces negative one over x squared.",
+            },
+        ],
+    }
+    clips = [
+        _quality_clip(
+            candidate_id="reciprocal",
+            start=18.0,
+            end=40.0,
+            cue_ids=["x2-reciprocal", "reciprocal"],
+            selection_authority="gemini",
+            quote="Reciprocal algebra produces negative one over x squared",
+            edge_projection={
+                "start": {
+                    "cue_id": "x2-reciprocal",
+                    "quote": "One over x starts here",
+                },
+            },
+        ),
+        _quality_clip(
+            candidate_id="linear",
+            start=0.0,
+            end=20.0,
+            cue_ids=["linear", "linear-x2"],
+            selection_authority="gemini",
+            quote="Linear setup and algebra produce five",
+            edge_projection={
+                "end": {
+                    "cue_id": "linear-x2",
+                    "quote": "The answer is five",
+                },
+            },
+        ),
+        _quality_clip(
+            candidate_id="x2",
+            start=8.0,
+            end=30.0,
+            cue_ids=["linear-x2", "x2-reciprocal"],
+            selection_authority="gemini",
+            quote="X squared starts here with the limit",
+            edge_projection={
+                "start": {
+                    "cue_id": "linear-x2",
+                    "quote": "X squared starts here",
+                },
+                "end": {
+                    "cue_id": "x2-reciprocal",
+                    "quote": "The answer is two x",
+                },
+            },
+        ),
+    ]
+
+    verified = pipeline_module._verified_direct_adapter_clips(
+        source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        engine_out={"clips": clips, "transcript": transcript},
+        should_cancel=None,
+        exact_topic="limit definition",
+    )
+
+    assert {clip["selection_candidate_id"] for clip in verified} == {
+        "linear",
+        "x2",
+        "reciprocal",
+    }
+    by_id = {clip["selection_candidate_id"]: clip for clip in verified}
+    assert by_id["linear"]["end"] <= by_id["x2"]["start"]
+    assert by_id["x2"]["end"] <= by_id["reciprocal"]["start"]
+    for clip in verified:
+        context = clip["search_context"]
+        assert pipeline_module.clip_engine_silence.persisted_boundary_is_usable(
+            context,
+            t_start=clip["start"],
+            t_end=clip["end"],
+        ) is True
+    assert by_id["linear"]["search_context"]["selection_caption_cues"][-1][
+        "text"
+    ].endswith("The answer is five")
+    assert by_id["x2"]["search_context"]["selection_caption_cues"][0][
+        "text"
+    ].startswith("X squared starts here")
+    assert by_id["x2"]["search_context"]["selection_caption_cues"][-1][
+        "text"
+    ].endswith("The answer is two x")
 
 
 def test_projected_one_token_answer_end_advances_past_its_caption_onset() -> None:
