@@ -535,7 +535,7 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
         )
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
-            "quality_silence_v35",
+            "quality_silence_v36",
         )
 
 

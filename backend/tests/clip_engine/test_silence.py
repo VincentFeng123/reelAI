@@ -57,7 +57,7 @@ def _prepared() -> silence.AudioPreparationResult:
 
 def _context_aligned_search_context() -> dict:
     return {
-        "selection_contract_version": "quality_silence_v35",
+        "selection_contract_version": "quality_silence_v36",
         "boundary_status": "context_aligned",
         "speech_corridor_verified": True,
         "selection_caption_cues": [
@@ -143,7 +143,7 @@ def test_previous_context_aligned_contract_remains_viewable() -> None:
 
 def test_current_strict_boundary_is_bound_to_persisted_range() -> None:
     context = {
-        "selection_contract_version": "quality_silence_v35",
+        "selection_contract_version": "quality_silence_v36",
         "boundary_status": "verified",
         "boundary_diagnostics": {
             "acoustic_verified": True,

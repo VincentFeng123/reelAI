@@ -439,6 +439,17 @@ _TERMINAL_INCOMPLETE_SUBJECT_RE = re.compile(
     r"[.!?]?\s*$",
     re.IGNORECASE,
 )
+_TERMINAL_ATTRIBUTIVE_MODIFIER_RE = re.compile(
+    r"\bof\s+"
+    r"[a-z][a-z'’\-]{3,}(?:al|ary|ed|ent|ful|ic|ical|ing|ive|less|ory|ous)\s*$",
+    re.IGNORECASE,
+)
+_NEXT_ATTRIBUTIVE_SUBJECT_PREDICATE_RE = re.compile(
+    r"^\s*[a-z][\w'’\-]*(?:\s+[a-z][\w'’\-]*){0,2}\s+"
+    r"(?:am|are|can|could|did|do|does|had|has|have|is|may|might|must|"
+    r"shall|should|was|were|will|would|equals?|means?|represents?)\b",
+    re.IGNORECASE,
+)
 _TERMINAL_UNPUNCTUATED_SUBJECT_PRONOUN_RE = re.compile(
     r"\b(?P<pronoun>i|we|you|he|she|it|they|this|that)\s*$",
     re.IGNORECASE,
@@ -506,7 +517,8 @@ _TERMINAL_AMBIGUOUS_DEGREE_RE = re.compile(
     re.IGNORECASE,
 )
 _TERMINAL_EXPLICIT_INCOMPLETE_CLAUSE_RE = re.compile(
-    r"\b(?:although|because|if|since|unless|until|when|whereas|while)"
+    r"\b(?:although|because|even\s+if\s+(?:not|so)|if|since|unless|until|"
+    r"when|whereas|while)"
     r"\s*[.!?]?[\"')\]]*$",
     re.IGNORECASE,
 )
@@ -708,6 +720,13 @@ _HARD_TOPIC_RESET_RE = re.compile(
     r"(?:now\s+)?that\s+brings\s+us\s+to|"
     r"(?:now\s+)?moving\s+on\s+to|"
     r"(?:now\s+)?turn\s+(?:our\s+)?attention\s+to|"
+    r"(?P<conditional_handoff>"
+    r"(?:but|however)\s+(?:occasionally|sometimes)\s*[,]?\s+"
+    r"[^.!?]{1,120}?\b(?:cannot|can['’]?t|does\s+not|doesn['’]?t|"
+    r"will\s+not|won['’]?t)\b[^.!?]{0,100}[.!?]\s+"
+    r"(?:and\s+)?when\s+that\s+happens\s*[,]?\s+"
+    r"(?:we|you)\s+(?:can|could|should)\s+(?:instead\s+)?"
+    r"(?:apply|use|turn\s+to))|"
     r"(?:now\s+)?(?:let(?:['’]?s|\s+us)\s+(?:consider|do|go\s+through|"
     r"look\s+at|take|try|work\s+out|work\s+through)|consider|for|try)"
     r"(?=\s+(?:another|one\s+more|the\s+next|a\s+(?:different|new))\s+"
@@ -1090,6 +1109,16 @@ _OPENING_CONTEXTUAL_REFORMULATION_RE = re.compile(
     r"another\s+(?:(?:one|ones|thing|things)\b|"
     r"(?:example|examples|case|cases)\b(?!\s+of\b))"
     r")",
+    re.IGNORECASE,
+)
+_OPENING_RELATIVE_BRIDGE_RE = re.compile(
+    r"^\s*which\s+(?:also\s+)?(?:aligns?|corresponds?|fits?|"
+    r"illustrates?|matches?|means?|reflects?|shows?|supports?)\b"
+    r"[^?]{0,160}:\s*$",
+    re.IGNORECASE,
+)
+_OPENING_DEPENDENT_SENTENCE_RE = re.compile(
+    r"^\s*(?:although|because|if|since|unless|until|when|whereas|while)\b",
     re.IGNORECASE,
 )
 _OPENING_CONTEXTUAL_EXAMPLE_RE = re.compile(
@@ -2590,6 +2619,7 @@ def _cue_opens_mid_thought(text: str, *, ignore_caption_case: bool) -> bool:
     if (
         _OPENING_RELATIVE_WHERE_FRAGMENT_RE.match(str(text or ""))
         or _OPENING_SUBORDINATE_PRONOUN_REFERENCE_RE.match(str(text or ""))
+        or _OPENING_RELATIVE_BRIDGE_RE.match(str(text or ""))
     ):
         return True
     guarded = _guard_text(text, ignore_caption_case=ignore_caption_case)
@@ -3334,7 +3364,14 @@ def _cue_has_explicit_dangling_end(text: str, next_text: str) -> bool:
     from .discourse import first_lexical_character_index
 
     raw_text = str(text or "").strip()
-    next_lexical_index = first_lexical_character_index(next_text)
+    raw_next_text = str(next_text or "")
+    next_lexical_index = first_lexical_character_index(raw_next_text)
+    attributive_subject_continues = bool(
+        _TERMINAL_ATTRIBUTIVE_MODIFIER_RE.search(raw_text)
+        and next_lexical_index is not None
+        and raw_next_text[next_lexical_index].islower()
+        and _NEXT_ATTRIBUTIVE_SUBJECT_PREDICATE_RE.match(raw_next_text)
+    )
     ambiguous_degree_continues = bool(
         _TERMINAL_AMBIGUOUS_DEGREE_RE.search(raw_text)
         and next_lexical_index is not None
@@ -3365,10 +3402,12 @@ def _cue_has_explicit_dangling_end(text: str, next_text: str) -> bool:
         _TERMINAL_CALLBACK_RE.search(raw_text)
         or _TERMINAL_DANGLING_TRANSITION_RE.search(raw_text)
         or _TERMINAL_DANGLING_EXAMPLE_INTRO_RE.search(raw_text)
+        or _TERMINAL_EXPLICIT_INCOMPLETE_CLAUSE_RE.search(raw_text)
         or _TERMINAL_INCOMPLETE_SUBJECT_RE.search(raw_text)
         or _TERMINAL_BARE_SUBJECT_RE.search(raw_text)
         or nominal_subject_continues
         or pronoun_subject_continues
+        or attributive_subject_continues
         or _TERMINAL_DANGLING_ARTICLE_RE.search(raw_text)
         or _TERMINAL_DANGLING_LINK_RE.search(raw_text)
         or (
@@ -3446,6 +3485,7 @@ def _terminal_content_is_explicitly_incomplete(text: str) -> bool:
         or _has_unfinished_exemplification_tail(raw_text)
         or _TERMINAL_DANGLING_EXAMPLE_INTRO_RE.search(raw_text)
         or _TERMINAL_EXPLICIT_INCOMPLETE_CLAUSE_RE.search(raw_text)
+        or _TERMINAL_INCOMPLETE_SUBJECT_RE.search(raw_text)
         or _TERMINAL_COORDINATING_CONJUNCTION_RE.search(raw_text)
         or _TERMINAL_DANGLING_ARTICLE_RE.search(raw_text)
         or _TERMINAL_REQUIRED_COMPLEMENT_RE.search(raw_text)
@@ -3498,9 +3538,28 @@ def _trim_trailing_incomplete_suffix(
     )
     full_suffix = _cue_clip_text(segments, start_line, end_line)
     final_text = str(segments[end_line].get("text") or "")
+    previous_text = (
+        str(segments[end_line - 1].get("text") or "").strip()
+        if end_line > start_line
+        else ""
+    )
     following_lexical_index = first_lexical_character_index(following_text)
     ambiguous_degree = _TERMINAL_AMBIGUOUS_DEGREE_RE.search(full_suffix)
     bare_subject = _TERMINAL_BARE_SUBJECT_RE.search(full_suffix)
+    trailing_incomplete_sentence = bool(
+        previous_text
+        and classify_terminator(previous_text)
+        and _OPENING_DEPENDENT_SENTENCE_RE.match(final_text)
+        and not (
+            protected_quote
+            and _contains_quote(final_text, protected_quote)
+        )
+        and _cue_has_weak_end(
+            final_text,
+            following_text,
+            ignore_caption_case=True,
+        )
+    )
     possible_trigger = bool(
         _TERMINAL_DANGLING_TRANSITION_RE.search(full_suffix)
         or _TERMINAL_DANGLING_DEGREE_RE.search(full_suffix)
@@ -3518,6 +3577,7 @@ def _trim_trailing_incomplete_suffix(
             and _TRAILING_FORWARD_SETUP_RE.search(full_suffix)
         )
         or _FORWARD_TOPIC_TRANSITION_RE.match(final_text)
+        or trailing_incomplete_sentence
         or _unconditional_trailing_edge_noise_start(
             final_text,
             require_edge_prefix=True,
@@ -3584,6 +3644,24 @@ def _trim_trailing_incomplete_suffix(
             bare_subject
             and re.search(r"[.!?]", suffix[:bare_subject.start()])
         )
+        previous_line = line - 1
+        trailing_incomplete_sentence = bool(
+            line == end_line
+            and previous_line >= start_line
+            and classify_terminator(
+                str(segments[previous_line].get("text") or "").strip()
+            )
+            and _OPENING_DEPENDENT_SENTENCE_RE.match(suffix)
+            and not (
+                protected_quote
+                and _contains_quote(suffix, protected_quote)
+            )
+            and _cue_has_weak_end(
+                suffix,
+                following_text,
+                ignore_caption_case=True,
+            )
+        )
         if not (
             dangling_transition
             or dangling_degree
@@ -3593,9 +3671,9 @@ def _trim_trailing_incomplete_suffix(
             or forward_transition
             or unconditional_edge_noise
             or version_edge_noise
+            or trailing_incomplete_sentence
         ):
             continue
-        previous_line = line - 1
         if previous_line < start_line:
             return end_line if forward_setup else None
         previous_text = str(segments[previous_line].get("text") or "").strip()
@@ -3844,7 +3922,10 @@ def _close_cue_context(
             next_text,
         )
     ) or force_end_clause_completion:
-        if _terminal_content_is_explicitly_incomplete(final_end_text):
+        if (
+            force_end_clause_completion
+            or _terminal_content_is_explicitly_incomplete(final_end_text)
+        ):
             return start_line, end_line, "unresolved_weak_end"
         return start_line, end_line, "unresolved_boundary_end"
     return (
@@ -4936,6 +5017,7 @@ def _recover_start_forward_across_cues(
         ordinary_boundary = bool(
             classify_terminator(previous)
             or _cue_is_only_structural_filler(previous)
+            or _OPENING_RELATIVE_BRIDGE_RE.match(previous)
             or gap >= _SECTION_RESET_GAP_S
         )
         agenda_boundary = bool(
@@ -6108,6 +6190,28 @@ def _objective_bridges_sections(
     # A method change within one objective needs independent multi-token
     # evidence on both sides; one shared word cannot merge adjacent lessons.
     return len(left_overlap) >= 2 and len(right_overlap) >= 2
+
+
+def _conditional_handoff_bridges_objective(
+    reset: re.Match[str],
+    learning_objective: str,
+) -> bool:
+    """Keep a method fallback only when the objective names both alternatives."""
+    handoff = str(reset.groupdict().get("conditional_handoff") or "")
+    if not handoff or not _objective_explicitly_relates_sections(learning_objective):
+        return False
+    generic = {
+        "complete", "concept", "describe", "discuss", "example", "explain",
+        "idea", "learn", "lesson", "show", "teach", "understand", "work",
+    }
+    objective_tokens = _content_tokens(learning_objective) - generic
+    premise_overlap = objective_tokens & _content_tokens(handoff)
+    alternative_overlap = objective_tokens & _content_tokens(reset.group("subject"))
+    return bool(
+        premise_overlap
+        and alternative_overlap
+        and len(premise_overlap | alternative_overlap) >= 2
+    )
 
 
 @dataclass(frozen=True)
@@ -7543,6 +7647,9 @@ def _candidate_topic_transitions(
                     " ".join(left_parts),
                     " ".join(right_parts),
                     reset_subject=subject,
+                ) or _conditional_handoff_bridges_objective(
+                    reset,
+                    learning_objective,
                 )
                 can_bridge = bool(
                     objective_bridges
@@ -7632,6 +7739,9 @@ def _candidate_topic_transitions(
                     " ".join(left_parts),
                     " ".join(right_parts),
                     reset_subject=subject,
+                ) or _conditional_handoff_bridges_objective(
+                    reset,
+                    learning_objective,
                 )
                 can_bridge = bool(
                     objective_bridges
@@ -7742,11 +7852,17 @@ def _contains_bridged_topic_navigation(
         )
         if connector is not None:
             navigation_left = connector.start()
-        if _objective_bridges_sections(
-            learning_objective,
-            raw_text[:navigation_left],
-            raw_text[reset.start("subject"):],
-            reset_subject=reset.group("subject"),
+        if (
+            _objective_bridges_sections(
+                learning_objective,
+                raw_text[:navigation_left],
+                raw_text[reset.start("subject"):],
+                reset_subject=reset.group("subject"),
+            )
+            or _conditional_handoff_bridges_objective(
+                reset,
+                learning_objective,
+            )
         ):
             return True
     return False

@@ -89,6 +89,16 @@ def _run(topics: list[G._Topic], segments: list[dict] | None = None,
     )
 
 
+def _boundary_topic(start_line: int, end_line: int, **overrides) -> G._BoundaryTopic:
+    data = {
+        key: value
+        for key, value in _topic(start_line, end_line).model_dump().items()
+        if key in G._BoundaryTopic.model_fields
+    }
+    data.update(overrides)
+    return G._BoundaryTopic.model_validate(data)
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -2361,6 +2371,321 @@ def test_boundary_prompt_requires_the_requested_identification_task():
     )
     assert "identification, recognition, diagnosis" in user
     assert "history or definition alone is not a direct match" in user
+
+
+def test_production_two_sided_p_value_clip_trims_unfinished_next_sentence():
+    texts = [
+        "Because of this--and a few other reasons we’ll talk about later in the series--p-values are",
+        "often two-sided, meaning that we look at how far away a value is from the mean, regardless",
+        "of if it’s higher or lower . This allows us to reject the null hypothesis if our value",
+        "is significantly higher than the mean, or if the value is significantly lower than the",
+        "mean.",
+        "Because the distribution of sample means is symmetrical, if 9% of the samples of caloric",
+        "intake are higher than a mean of 2,400, about 18 percent of sample means for calories would",
+        "be as far away or further from the population mean than 2,400 is in either direction.",
+        "In other words, a two-sided p-value is a measure of how extreme your sample mean is, because",
+        "it tells you how often you’ll get a value that’s as or more extreme than the one you",
+        "got.",
+    ]
+    segments = [
+        {
+            "cue_id": f"bf3egy7TQ2Q:cue:{126 + index}",
+            "start": float(index * 5),
+            "end": float((index + 1) * 5),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+    proposal = _boundary_topic(
+        0,
+        5,
+        candidate_id="two-sided-p-values",
+        start_quote="p-values are",
+        end_quote="samples of caloric",
+        title="How two-sided p-values work",
+        learning_objective="Explain why p-values can be two-sided.",
+        facet="two-sided p-values",
+        topic_evidence_quote=(
+            "reject the null hypothesis if our value is significantly"
+        ),
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="AP Statistics hypothesis tests and p-values",
+    )
+
+    assert len(report.clips) == 1
+    clip = report.clips[0]
+    assert clip["cue_ids"][-1] == "bf3egy7TQ2Q:cue:130"
+    assert clip["_clip_text"].endswith("mean.")
+    assert "samples of caloric" not in clip["_clip_text"]
+
+
+def test_production_p_value_clip_drops_referential_which_opening():
+    texts = [
+        "more extreme.",
+        "Which matches the general form of a test statistic:",
+        "The p-value will tell us how rare or extreme our data is so that we can figure out whether",
+        "we think there’s an effect. Like whether children with more than 100 books in their",
+        "home have a higher than average IQ. Historically we’ve done this with tables, but most statistical",
+        "programs, even Excel, can calculate this.",
+    ]
+    segments = [
+        {
+            "cue_id": f"QZ7kgmhdIwA:cue:{54 + index}",
+            "start": float(index * 5),
+            "end": float((index + 1) * 5),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+    proposal = _boundary_topic(
+        1,
+        5,
+        candidate_id="p-value-intro",
+        start_quote="Which matches the general form",
+        end_quote="even Excel, can calculate this",
+        title="What a p-value tells you",
+        learning_objective="Explain the purpose of a p-value.",
+        facet="p-value purpose",
+        topic_evidence_quote="p-value will tell us how rare or extreme our data is",
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="AP Statistics hypothesis tests and p-values",
+    )
+
+    assert len(report.clips) == 1
+    clip = report.clips[0]
+    assert clip["cue_ids"][0] == "QZ7kgmhdIwA:cue:56"
+    assert clip["_clip_text"].startswith("The p-value will tell us")
+    assert "Which matches" not in clip["_clip_text"]
+
+
+def test_production_critical_value_clip_stops_before_t_test_handoff():
+    texts = [
+        "The first way is to calculate a “critical” value. A critical value is a value of our",
+        "test statistic that marks the limits of our “extreme” values. A test statistic that",
+        "is more extreme than these critical values (that is it’s towards the tails) causes",
+        "us to reject the null .",
+        "We calculate our critical value by finding out which test-statistic value corresponds",
+        "to the top 0.5, 1, or 5% most extreme values. For a z-test with alpha = 0.05, the critical",
+        "values are 1.96 and -1.96.",
+        "If your z-statistic is more extreme than the critical value, you call it “statistically",
+        "significant”. So, we found evidence...in this case...that the flu shot is working.",
+        "But sometimes, a z-test won’t apply. And when that happens, we can use the t-distribution",
+        "and corresponding t-statistic to conduct a hypothesis test.",
+    ]
+    segments = [
+        {
+            "cue_id": f"QZ7kgmhdIwA:cue:{83 + index}",
+            "start": float(index * 5),
+            "end": float((index + 1) * 5),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+    proposal = _boundary_topic(
+        0,
+        10,
+        candidate_id="critical-value-significance",
+        start_quote="A critical value is",
+        end_quote="t-statistic to conduct a hypothesis test",
+        title="Using critical values",
+        learning_objective=(
+            "Explain how critical values determine statistical significance."
+        ),
+        facet="critical values",
+        topic_evidence_quote=(
+            "test statistic that is more extreme than these critical values"
+        ),
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="AP Statistics hypothesis tests and p-values",
+    )
+
+    assert len(report.clips) == 1
+    clip = report.clips[0]
+    assert clip["cue_ids"][-1] == "QZ7kgmhdIwA:cue:91"
+    assert clip["_clip_text"].endswith("the flu shot is working.")
+    assert "t-distribution" not in clip["_clip_text"]
+
+
+def test_z_test_fallback_handoff_is_kept_when_it_is_the_whole_objective():
+    texts = [
+        "A z-test uses the normal distribution when its assumptions apply.",
+        "But sometimes, a z-test won’t apply. And when that happens, we can use the t-distribution",
+        "and corresponding t-statistic to conduct a hypothesis test.",
+    ]
+    segments = [
+        {
+            "cue_id": f"z-to-t:cue:{index}",
+            "start": float(index * 5),
+            "end": float((index + 1) * 5),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    transitions = G._candidate_topic_transitions(
+        segments,
+        0,
+        2,
+        evidence_quote="z-test won’t apply",
+        learning_objective=(
+            "Explain when a z-test does not apply and how to use the t-distribution."
+        ),
+    )
+
+    assert transitions == []
+
+
+def test_production_unpunctuated_p_value_clip_rejects_dangling_edges():
+    texts = [
+        "John is wrong John hopes the null",
+        "hypothesis will be rejected because it",
+        "would mean it's very likely even if not",
+        "100% certain that his right he",
+        "ultimately rolls the dice thousand times",
+        "and it lands on six in twenty percent of",
+        "the cases so higher than the previously",
+        "mentioned one in six odds is this enough",
+        "to negate the null hypothesis well no",
+        "because we also have to determine",
+        "whether the findings are statistically",
+        "significant to do this we calculate the",
+        "so called p-value which is a number",
+        "between zero and one that lots of",
+        "applications easily generate for us",
+        "based on the data we provide generally",
+        "speaking if the p-value is lower than",
+        "point zero five it's a good argument in",
+        "favor of rejecting the null hypothesis",
+        "and making John happy in our case we'll",
+        "assume the p-value is point zero four",
+        "which is low enough to reject our null",
+        "hypothesis and kind of like a saying",
+        "John's twenty percent success rate is",
+        "better than a standard one-in-six odds",
+    ]
+    segments = [
+        {
+            "cue_id": f"nb75_GFPD9A:cue:{18 + index}",
+            "start": float(index * 3),
+            "end": float((index + 1) * 3),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+    proposal = _boundary_topic(
+        3,
+        19,
+        candidate_id="p-value-definition-rule",
+        start_quote="100% certain that his right",
+        end_quote="in our case we'll",
+        title="How a p-value supports rejection",
+        learning_objective=(
+            "Explain how a p-value is used to reject the null hypothesis."
+        ),
+        facet="p-value decision rule",
+        topic_evidence_quote=(
+            "if the p-value is lower than point zero five"
+        ),
+    )
+
+    assert G._cue_opens_mid_thought_at(
+        segments,
+        3,
+        ignore_caption_case=True,
+    )
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="AP Statistics hypothesis tests and p-values",
+    )
+
+    assert report.clips == []
+    assert "proposal_0:unresolved_weak_end" in report.rejected_reasons
+
+
+def test_standalone_percentage_explanation_is_not_a_mid_thought_opening():
+    segments = [
+        {
+            "cue_id": "statistics:cue:1",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "Confidence intervals summarize uncertainty.",
+        },
+        {
+            "cue_id": "statistics:cue:2",
+            "start": 4.0,
+            "end": 8.0,
+            "text": "95% certain means the interval excludes the null value.",
+        },
+    ]
+
+    assert not G._cue_opens_mid_thought_at(
+        segments,
+        1,
+        ignore_caption_case=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "opening",
+    [
+        "Who shows the highest score",
+        "Which matches the data",
+    ],
+)
+def test_unpunctuated_wh_question_is_not_a_relative_bridge(opening):
+    assert not G._cue_opens_mid_thought(
+        opening,
+        ignore_caption_case=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("previous", "following"),
+    [
+        ("This method is practical", "students are likely to use it"),
+        ("The reaction is exothermic", "products are released next"),
+        ("We chose an alternative", "students are free to compare it"),
+        ("The lab uses this chemical", "reactions are measured tomorrow"),
+    ],
+)
+def test_complete_copular_adjective_is_not_a_dangling_modifier(
+    previous,
+    following,
+):
+    assert not G._cue_has_explicit_dangling_end(previous, following)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Check whether p is below 0.05. Reject the null if so.",
+        "If the condition holds, use method A; use method B if not.",
+    ],
+)
+def test_complete_local_if_proform_is_not_a_dangling_clause(text):
+    assert not G._terminal_content_is_explicitly_incomplete(text)
+    assert not G._cue_has_explicit_dangling_end(text, "")
 
 
 def _selection_task_tail(user: str) -> str:

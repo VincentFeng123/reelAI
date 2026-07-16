@@ -17,7 +17,7 @@ from .metadata import normalize_youtube_video_id
 logger = logging.getLogger(__name__)
 
 SEARCH_SCHEMA_VERSION = 2
-TRANSCRIPT_SCHEMA_VERSION = 4
+TRANSCRIPT_SCHEMA_VERSION = 5
 TRANSCRIPT_PROFILE = f"chunk{max(1, int(config.SUPADATA_CHUNK_SIZE))}-auto"
 SEARCH_POSITIVE_TTL_SEC = 6 * 60 * 60
 SEARCH_EMPTY_TTL_SEC = 15 * 60

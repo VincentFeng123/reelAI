@@ -127,6 +127,27 @@ def test_synchronous_auto_generated_transcript_is_accepted(monkeypatch) -> None:
     }]
 
 
+def test_transcript_decodes_double_escaped_caption_entities(monkeypatch) -> None:
+    _install_client(monkeypatch, lambda *args: _Response(200, {
+        "lang": "en",
+        "content": [{
+            "id": "escaped-cue",
+            "offset": 0,
+            "duration": 2_000,
+            "text": "In our case we&amp;#39;ll reject the null &amp;amp; continue.",
+        }],
+    }))
+
+    artifact = supadata_client.fetch_transcript_artifact(
+        VIDEO_URL,
+        cache_store=MemoryProviderCache(),
+    )
+
+    assert artifact.segments[0]["text"] == (
+        "In our case we'll reject the null & continue."
+    )
+
+
 def test_transcription_adapter_matches_practice_chunk_and_word_timing(monkeypatch) -> None:
     calls = []
 

@@ -1,6 +1,7 @@
 """Supadata timed-transcript client backed by validated transcript artifacts."""
 from __future__ import annotations
 
+import html
 import math
 import time
 from collections.abc import Callable
@@ -38,6 +39,20 @@ from ..provider_runtime import (
 
 DEFAULT_TRANSCRIPT_DEADLINE_SEC = 180.0
 TRANSCRIPT_POLL_INTERVAL_SEC = 1.0
+
+
+def _normalized_caption_text(value: object) -> str:
+    text = str(value or "")
+    # Some generated YouTube captions arrive double-escaped (for example,
+    # ``we&amp;#39;ll``). Decode at the provider boundary so quote grounding,
+    # dangling-clause guards, captions, and persisted snippets all see the same
+    # spoken text.
+    for _ in range(2):
+        decoded = html.unescape(text)
+        if decoded == text:
+            break
+        text = decoded
+    return " ".join(text.split()).strip()
 
 
 def _deadline_or_default(value: float | None) -> float:
@@ -234,7 +249,7 @@ def _normalize_content(
             duration_ms = float(raw.get("duration"))
         except (TypeError, ValueError):
             return []
-        text = " ".join(str(raw.get("text") or "").split()).strip()
+        text = _normalized_caption_text(raw.get("text"))
         if not text:
             continue
         cues.append(

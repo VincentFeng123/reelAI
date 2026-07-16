@@ -54,10 +54,10 @@ def _artifact() -> TranscriptArtifact:
 
 
 def test_transcript_cache_version_invalidates_coarser_cue_artifacts() -> None:
-    assert TRANSCRIPT_SCHEMA_VERSION == 4
+    assert TRANSCRIPT_SCHEMA_VERSION == 5
     assert TRANSCRIPT_PROFILE == f"chunk{clip_engine_config.SUPADATA_CHUNK_SIZE}-auto"
     assert _artifact().artifact_key.startswith(
-        f"native-transcript:v4:{TRANSCRIPT_PROFILE}:"
+        f"native-transcript:v5:{TRANSCRIPT_PROFILE}:"
     )
 
 
