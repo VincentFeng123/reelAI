@@ -58,6 +58,10 @@ import {
 const REEL_BATCH_SIZE = 3;
 const INITIAL_READY_BATCH_COUNT = 3;
 const INITIAL_READY_REEL_TARGET = REEL_BATCH_SIZE * INITIAL_READY_BATCH_COUNT;
+// Retry at most three consecutive resumable partials without verified growth.
+const MAX_ZERO_GROWTH_CONTINUATIONS = 3;
+// Leave one slot in the backend's six-request window for the feed's initial autofill.
+const MAX_GENERATION_ATTEMPTS_PER_FILL = 5;
 const PAGE_SIZE = INITIAL_READY_REEL_TARGET;
 
 function readyReservoirTarget(_mode: GenerationMode): number {
@@ -1509,7 +1513,12 @@ function FeedPageInner() {
 
   const noteFeedFailure = useCallback((failure: unknown) => {
     transportFailureStreakRef.current = 0;
-    setVisibleFeedError(failure instanceof Error ? failure.message : "Feed failed to load");
+    const message = failure instanceof Error
+      ? failure.message
+      : typeof failure === "string"
+        ? failure.trim()
+        : "";
+    setVisibleFeedError(message || "Feed failed to load");
   }, [setVisibleFeedError]);
 
   const markPagedFeedExhausted = useCallback(() => {
@@ -2498,12 +2507,14 @@ function FeedPageInner() {
         markRecoveryProgress(0);
         if (authoritativeExhausted) {
           clearRecoveredTransportError();
-        } else if (isTransportError(firstFailedRow?.error)) {
-          noteFeedTransportFailure(firstFailedRow?.error, { forceVisible: true });
-        } else if (firstFailedRow?.error) {
-          noteFeedFailure(firstFailedRow.error);
-        } else {
-          noteFeedFailure("No new clips arrived. Retry to continue searching.");
+        } else if (options?.surfaceError || reelsRef.current.length === 0) {
+          if (isTransportError(firstFailedRow?.error)) {
+            noteFeedTransportFailure(firstFailedRow?.error, { forceVisible: true });
+          } else if (firstFailedRow?.error) {
+            noteFeedFailure(firstFailedRow.error);
+          } else {
+            noteFeedFailure("No new clips arrived. Retry to continue searching.");
+          }
         }
         setRecoveryPhase("idle");
         return [];
@@ -2586,8 +2597,12 @@ function FeedPageInner() {
   ): Promise<number> => {
     const targetCount = Math.max(1, Math.min(REEL_BATCH_SIZE, Math.floor(requestedCount)));
     let addedTotal = 0;
-    let consecutiveEmptyPartialBatches = 0;
-    for (let attempt = 0; attempt < REEL_BATCH_SIZE + 1 && addedTotal < targetCount; attempt += 1) {
+    let consecutiveZeroGrowthContinuations = 0;
+    const maxAttempts = Math.min(
+      MAX_GENERATION_ATTEMPTS_PER_FILL,
+      targetCount + MAX_ZERO_GROWTH_CONTINUATIONS,
+    );
+    for (let attempt = 0; attempt < maxAttempts && addedTotal < targetCount; attempt += 1) {
       const openMaterialIds = getFeedMaterialIds().filter((id) => !isGenerationFinished(id));
       if (openMaterialIds.length === 0 || isGeneratingRef.current) {
         break;
@@ -2600,15 +2615,18 @@ function FeedPageInner() {
       const addedCount = Math.max(0, reelsRef.current.length - countBeforeRequest);
       if (addedCount > 0) {
         addedTotal += Math.min(targetCount - addedTotal, addedCount);
-        consecutiveEmptyPartialBatches = 0;
+        consecutiveZeroGrowthContinuations = 0;
         continue;
       }
       const hasOpenPartialCursor = openMaterialIds.some((id) => (
         lastTerminalStatusByMaterialRef.current.get(id) === "partial"
         && !isGenerationFinished(id)
       ));
-      if (hasOpenPartialCursor && consecutiveEmptyPartialBatches < 1) {
-        consecutiveEmptyPartialBatches += 1;
+      if (
+        hasOpenPartialCursor
+        && consecutiveZeroGrowthContinuations < MAX_ZERO_GROWTH_CONTINUATIONS
+      ) {
+        consecutiveZeroGrowthContinuations += 1;
         continue;
       }
       break;
@@ -3105,8 +3123,8 @@ function FeedPageInner() {
           persistedPagesExhausted = persisted.exhausted;
           nextPersistedPage += 1;
         }
-        let consecutiveEmptyPartialBatches = 0;
-        for (let attempt = 0; attempt < INITIAL_READY_REEL_TARGET; attempt += 1) {
+        let consecutiveZeroGrowthContinuations = 0;
+        for (let attempt = 0; attempt < MAX_GENERATION_ATTEMPTS_PER_FILL; attempt += 1) {
           const startupMaterialIds = getFeedMaterialIds();
           if (
             startupMaterialIds.length === 0
@@ -3133,15 +3151,18 @@ function FeedPageInner() {
             return;
           }
           if (reelsRef.current.length > countBeforeRequest) {
-            consecutiveEmptyPartialBatches = 0;
+            consecutiveZeroGrowthContinuations = 0;
             continue;
           }
           const hasOpenPartialCursor = getFeedMaterialIds().some((id) => (
             lastTerminalStatusByMaterialRef.current.get(id) === "partial"
             && !isGenerationFinished(id)
           ));
-          if (hasOpenPartialCursor && consecutiveEmptyPartialBatches < 1) {
-            consecutiveEmptyPartialBatches += 1;
+          if (
+            hasOpenPartialCursor
+            && consecutiveZeroGrowthContinuations < MAX_ZERO_GROWTH_CONTINUATIONS
+          ) {
+            consecutiveZeroGrowthContinuations += 1;
             continue;
           }
           return;

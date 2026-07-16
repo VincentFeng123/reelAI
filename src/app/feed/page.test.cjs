@@ -268,6 +268,8 @@ test("feed starts with three three-clip batches and resumes durable jobs", () =>
   assert.match(source, /const REEL_BATCH_SIZE = 3;/);
   assert.match(source, /const INITIAL_READY_BATCH_COUNT = 3;/);
   assert.match(source, /const INITIAL_READY_REEL_TARGET = REEL_BATCH_SIZE \* INITIAL_READY_BATCH_COUNT;/);
+  assert.match(source, /const MAX_ZERO_GROWTH_CONTINUATIONS = 3;/);
+  assert.match(source, /const MAX_GENERATION_ATTEMPTS_PER_FILL = 5;/);
   assert.match(source, /const PAGE_SIZE = INITIAL_READY_REEL_TARGET;/);
   assert.match(source, /return INITIAL_READY_REEL_TARGET;/);
   assert.match(source, /prefetch: readyReservoirTarget\(requestGenerationMode\)/);
@@ -623,6 +625,97 @@ test("failed empty generation reattaches through the authoritative feed", async 
   assert.equal(isGeneratingRef.current, true);
   assert.equal(generationProgress, null, "the recovered consumer owns loading state after reattachment");
   assert.equal(clearedTailAdvance, 0, "an attached durable job must retain pending tail advance");
+});
+
+test("background zero-growth partial keeps an existing reel playable without a fatal error", async () => {
+  const searchScope = { key: "material", seq: 1, controller: new AbortController() };
+  const isGeneratingRef = { current: false };
+  const reelsRef = {
+    current: [{ reel_id: "verified-a", material_id: "material-a" }],
+  };
+  const generationBatchTokensRef = { current: new Set() };
+  const generationConsumerByMaterialRef = { current: new Map() };
+  const surfacedErrors = [];
+  const callback = compileUseCallback("requestMore", {
+    getFeedMaterialIds: () => ["material-a"],
+    settingsScopeReady: true,
+    isGeneratingRef,
+    canRequestMore: true,
+    isIngestMaterial: false,
+    setCanRequestMore: () => {},
+    setFeedPagesExhausted: () => {},
+    isGenerationFinished: () => false,
+    activeSearchScopeRef: { current: searchScope },
+    getFeedTuningSettings: () => ({
+      minRelevance: 0.3,
+      creativeCommonsOnly: false,
+      preferredVideoDuration: "any",
+    }),
+    reelsRef,
+    REEL_BATCH_SIZE: 3,
+    INITIAL_READY_REEL_TARGET: 9,
+    generationMode: "fast",
+    generationBatchTokensRef,
+    syncGenerationLockState: () => {},
+    armActiveRecoveryRequest: () => {},
+    setVisibleFeedError: () => {},
+    progressClearTimerRef: { current: null },
+    setGenerationProgress: () => {},
+    generationJobByMaterialRef: { current: new Map() },
+    continuationTokenByMaterialRef: { current: new Map([["material-a", "previous-job"]]) },
+    claimGenerationConsumer: () => Symbol("consumer"),
+    GENERATION_STREAM_IDLE_TIMEOUT_MS: 35_000,
+    generateReelsStream: async () => ({
+      reels: [],
+      batch_id: "next-job",
+      batch_size: 0,
+      continuation_token: "next-job",
+      terminal_status: "partial",
+    }),
+    isSearchScopeActive: (scope) => scope === searchScope,
+    noteGenerationTerminal: () => {},
+    settleGenerationContinuation: () => {},
+    appendGeneratedReels: () => ({ reels: reelsRef.current, addedReels: [], addedCount: 0, updatedCount: 0 }),
+    dedupeByIdentity: (rows) => rows,
+    reconcileGeneratedReels: () => ({ reels: reelsRef.current, addedReels: [], addedCount: 0, updatedCount: 0 }),
+    isRequestInterruptedError: () => false,
+    releaseGenerationConsumer: () => {},
+    materialId: "material-a",
+    recoveryAttemptedIdsRef: { current: new Set() },
+    recoverMissingMaterial: async () => false,
+    mergeReelBatchesInServerOrder: (batches) => batches.flat(),
+    generationConsumerByMaterialRef,
+    loadPage: async () => ({ addedCount: 0, exhausted: false }),
+    markRecoveryProgress: () => {},
+    clearPendingTailAdvance: () => {},
+    isTransportError: () => false,
+    noteFeedTransportFailure: (error) => surfacedErrors.push(error),
+    noteFeedFailure: (error) => surfacedErrors.push(error),
+    setRecoveryPhase: () => {},
+    clearRecoveredTransportError: () => {},
+    finishActiveRecoveryRequest: () => {},
+    setTimeout: () => 1,
+    console: { warn: () => {} },
+  });
+
+  assert.deepEqual(await callback({ surfaceError: false, requestedCount: 3 }), []);
+  assert.deepEqual(surfacedErrors, []);
+
+  assert.deepEqual(await callback({ surfaceError: true, requestedCount: 3 }), []);
+  assert.deepEqual(surfacedErrors, ["No new clips arrived. Retry to continue searching."]);
+  assert.equal(reelsRef.current.length, 1);
+});
+
+test("feed failure copy preserves an explicit string message", () => {
+  const messages = [];
+  const callback = compileUseCallback("noteFeedFailure", {
+    transportFailureStreakRef: { current: 2 },
+    setVisibleFeedError: (message) => messages.push(message),
+  });
+
+  callback("No new clips arrived. Retry to continue searching.");
+
+  assert.deepEqual(messages, ["No new clips arrived. Retry to continue searching."]);
 });
 
 test("sequential terminal batches advance continuation and preserve a same-video sibling", async () => {
@@ -1049,6 +1142,8 @@ test("bootstrap consumes duplicate persisted pages before considering generation
     activeIndexRef: { current: 0 },
     readyReservoirTarget: () => 12,
     INITIAL_READY_REEL_TARGET: 9,
+    MAX_GENERATION_ATTEMPTS_PER_FILL: 5,
+    MAX_ZERO_GROWTH_CONTINUATIONS: 3,
     REEL_BATCH_SIZE: 3,
     getFeedMaterialIds: () => ["material"],
     isGenerationFinished: () => false,
@@ -1101,6 +1196,8 @@ test("bootstrap continues partial initial inventory in bounded batches until nin
     activeIndexRef: { current: 0 },
     readyReservoirTarget: () => 9,
     INITIAL_READY_REEL_TARGET: 9,
+    MAX_GENERATION_ATTEMPTS_PER_FILL: 5,
+    MAX_ZERO_GROWTH_CONTINUATIONS: 3,
     REEL_BATCH_SIZE: 3,
     getFeedMaterialIds: () => ["material"],
     isGenerationFinished: () => false,
@@ -1133,7 +1230,7 @@ test("bootstrap continues partial initial inventory in bounded batches until nin
   assert.match(bootstrapEffectText, /\|\| generatingMore/);
 });
 
-test("startup retries only two consecutive zero-growth partial continuations", async () => {
+test("startup bounds repeated zero-growth partial continuations without discarding its usable reel", async () => {
   const reelsRef = { current: [{ reel_id: "strict-cached" }] };
   const searchScope = { key: "material", seq: 1 };
   let generationRequests = 0;
@@ -1154,6 +1251,8 @@ test("startup retries only two consecutive zero-growth partial continuations", a
     activeIndexRef: { current: 0 },
     readyReservoirTarget: () => 9,
     INITIAL_READY_REEL_TARGET: 9,
+    MAX_GENERATION_ATTEMPTS_PER_FILL: 5,
+    MAX_ZERO_GROWTH_CONTINUATIONS: 3,
     REEL_BATCH_SIZE: 3,
     getFeedMaterialIds: () => ["material"],
     isGenerationFinished: () => false,
@@ -1171,7 +1270,109 @@ test("startup retries only two consecutive zero-growth partial continuations", a
 
   await callback(false);
 
-  assert.equal(generationRequests, 2);
+  assert.equal(generationRequests, 4);
+  assert.equal(reelsRef.current.length, 1);
+});
+
+test("startup crosses zero-growth partials and keeps searching until nine reels are ready", async () => {
+  const reelsRef = { current: [{ reel_id: "useful-initial" }] };
+  const searchScope = { key: "material", seq: 1 };
+  const statuses = new Map([["material", "partial"]]);
+  const additionsByRequest = [0, 0, 3, 3, 2];
+  const requestedCounts = [];
+  const callback = compileUseCallback("bootstrapFirstReels", {
+    materialId: "material",
+    isGeneratingRef: { current: false },
+    canRequestMore: true,
+    isIngestMaterial: false,
+    setBootstrappingFirstReels: () => {},
+    setCanRequestMore: () => {},
+    setFeedPagesExhausted: () => {},
+    activeSearchScopeRef: { current: searchScope },
+    page: 1,
+    hasMore: false,
+    total: 1,
+    PAGE_SIZE: 9,
+    reelsRef,
+    activeIndexRef: { current: 0 },
+    readyReservoirTarget: () => 9,
+    INITIAL_READY_REEL_TARGET: 9,
+    MAX_GENERATION_ATTEMPTS_PER_FILL: 5,
+    MAX_ZERO_GROWTH_CONTINUATIONS: 3,
+    REEL_BATCH_SIZE: 3,
+    getFeedMaterialIds: () => ["material"],
+    isGenerationFinished: () => false,
+    lastTerminalStatusByMaterialRef: { current: statuses },
+    generationMode: "fast",
+    loadPage: async () => {
+      throw new Error("there are no persisted pages");
+    },
+    isSearchScopeActive: (scope) => scope === searchScope,
+    requestMore: async (options) => {
+      requestedCounts.push(options.requestedCount);
+      const addedCount = additionsByRequest.shift() ?? 0;
+      const currentCount = reelsRef.current.length;
+      reelsRef.current = [
+        ...reelsRef.current,
+        ...Array.from({ length: addedCount }, (_, index) => ({
+          reel_id: `fresh-${currentCount + index}`,
+        })),
+      ];
+      return [];
+    },
+  });
+
+  await callback(false);
+
+  assert.deepEqual(requestedCounts, [3, 3, 3, 3, 2]);
+  assert.equal(reelsRef.current.length, 9);
+});
+
+test("startup stops immediately after an authoritative exhausted continuation", async () => {
+  const reelsRef = { current: [{ reel_id: "only-verified-reel" }] };
+  const searchScope = { key: "material", seq: 1 };
+  const statuses = new Map([["material", "partial"]]);
+  let generationRequests = 0;
+  let exhausted = false;
+  const callback = compileUseCallback("bootstrapFirstReels", {
+    materialId: "material",
+    isGeneratingRef: { current: false },
+    canRequestMore: true,
+    isIngestMaterial: false,
+    setBootstrappingFirstReels: () => {},
+    setCanRequestMore: () => {},
+    setFeedPagesExhausted: () => {},
+    activeSearchScopeRef: { current: searchScope },
+    page: 1,
+    hasMore: false,
+    total: 1,
+    PAGE_SIZE: 9,
+    reelsRef,
+    activeIndexRef: { current: 0 },
+    readyReservoirTarget: () => 9,
+    INITIAL_READY_REEL_TARGET: 9,
+    MAX_GENERATION_ATTEMPTS_PER_FILL: 5,
+    MAX_ZERO_GROWTH_CONTINUATIONS: 3,
+    REEL_BATCH_SIZE: 3,
+    getFeedMaterialIds: () => ["material"],
+    isGenerationFinished: () => exhausted,
+    lastTerminalStatusByMaterialRef: { current: statuses },
+    generationMode: "fast",
+    loadPage: async () => {
+      throw new Error("there are no persisted pages");
+    },
+    isSearchScopeActive: (scope) => scope === searchScope,
+    requestMore: async () => {
+      generationRequests += 1;
+      statuses.set("material", "exhausted");
+      exhausted = true;
+      return [];
+    },
+  });
+
+  await callback(false);
+
+  assert.equal(generationRequests, 1);
   assert.equal(reelsRef.current.length, 1);
 });
 
@@ -1267,6 +1468,8 @@ test("a one-reel partial continuation immediately fills the remaining two slots"
   const requestedCounts = [];
   const callback = compileUseCallback("requestReadyBatch", {
     REEL_BATCH_SIZE: 3,
+    MAX_ZERO_GROWTH_CONTINUATIONS: 3,
+    MAX_GENERATION_ATTEMPTS_PER_FILL: 5,
     getFeedMaterialIds: () => ["material-a"],
     isGenerationFinished: () => false,
     isGeneratingRef: { current: false },
@@ -1292,6 +1495,61 @@ test("a one-reel partial continuation immediately fills the remaining two slots"
   assert.equal(await callback(), 3);
   assert.deepEqual(requestedCounts, [3, 2]);
   assert.equal(reelsRef.current.length, 12);
+});
+
+test("a ready-batch refill crosses two zero-growth partials before adding the next batch", async () => {
+  const reelsRef = { current: Array.from({ length: 9 }, (_, index) => ({ reel_id: String(index) })) };
+  const statuses = new Map([["material-a", "partial"]]);
+  let generationRequests = 0;
+  const callback = compileUseCallback("requestReadyBatch", {
+    REEL_BATCH_SIZE: 3,
+    MAX_ZERO_GROWTH_CONTINUATIONS: 3,
+    MAX_GENERATION_ATTEMPTS_PER_FILL: 5,
+    getFeedMaterialIds: () => ["material-a"],
+    isGenerationFinished: () => false,
+    isGeneratingRef: { current: false },
+    reelsRef,
+    lastTerminalStatusByMaterialRef: { current: statuses },
+    requestMore: async () => {
+      generationRequests += 1;
+      if (generationRequests === 3) {
+        reelsRef.current = [
+          ...reelsRef.current,
+          { reel_id: "fresh-a" },
+          { reel_id: "fresh-b" },
+          { reel_id: "fresh-c" },
+        ];
+      }
+      return [];
+    },
+  });
+
+  assert.equal(await callback(), 3);
+  assert.equal(generationRequests, 3);
+  assert.equal(reelsRef.current.length, 12);
+});
+
+test("a ready-batch refill bounds repeated zero-growth partials", async () => {
+  const reelsRef = { current: Array.from({ length: 9 }, (_, index) => ({ reel_id: String(index) })) };
+  let generationRequests = 0;
+  const callback = compileUseCallback("requestReadyBatch", {
+    REEL_BATCH_SIZE: 3,
+    MAX_ZERO_GROWTH_CONTINUATIONS: 3,
+    MAX_GENERATION_ATTEMPTS_PER_FILL: 5,
+    getFeedMaterialIds: () => ["material-a"],
+    isGenerationFinished: () => false,
+    isGeneratingRef: { current: false },
+    reelsRef,
+    lastTerminalStatusByMaterialRef: { current: new Map([["material-a", "partial"]]) },
+    requestMore: async () => {
+      generationRequests += 1;
+      return [];
+    },
+  });
+
+  assert.equal(await callback(), 0);
+  assert.equal(generationRequests, 4);
+  assert.equal(reelsRef.current.length, 9);
 });
 
 test("ready-reservoir prefetch waits for batch two and keeps batch three buffered", () => {

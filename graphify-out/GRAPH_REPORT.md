@@ -1,12 +1,12 @@
 # Graph Report - .  (2026-07-16)
 
 ## Corpus Check
-- 392 files · ~1,168,179 words
+- 392 files · ~1,168,317 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 11363 nodes · 52887 edges · 338 communities detected
-- Extraction: 26% EXTRACTED · 74% INFERRED · 0% AMBIGUOUS · INFERRED: 39309 edges (avg confidence: 0.5)
+- 11365 nodes · 52889 edges · 339 communities detected
+- Extraction: 26% EXTRACTED · 74% INFERRED · 0% AMBIGUOUS · INFERRED: 39310 edges (avg confidence: 0.5)
 - Token cost: 0 input · 0 output
 
 ## Community Hubs (Navigation)
@@ -348,6 +348,7 @@
 - [[_COMMUNITY_Community 335|Community 335]]
 - [[_COMMUNITY_Community 336|Community 336]]
 - [[_COMMUNITY_Community 337|Community 337]]
+- [[_COMMUNITY_Community 338|Community 338]]
 
 ## God Nodes (most connected - your core abstractions)
 1. `Sentence` - 3142 edges
@@ -381,27 +382,27 @@ Nodes (2727): Run one localized Flash batch and merge only independently valid r
 
 ### Community 1 - "Community 1"
 Cohesion: 0.01
-Nodes (809): _arc_verify_enabled(), ArcCandidate, ArcCheckLLM, ArcVerifyLLM, _concepts(), detect_arcs(), _pair_practice_prompts(), Deterministic instructional-arc detection (Wave 2 P3a).  Scans the time-ordered (+801 more)
+Nodes (811): _arc_verify_enabled(), ArcCandidate, ArcCheckLLM, ArcVerifyLLM, _concepts(), detect_arcs(), _pair_practice_prompts(), Deterministic instructional-arc detection (Wave 2 P3a).  Scans the time-ordered (+803 more)
 
 ### Community 2 - "Community 2"
 Cohesion: 0.02
-Nodes (628): _BackfillPlan, Adaptive recall-check persistence, readiness, and session lifecycle., Promote one named level after sustained, broad mastery evidence.          Manual, Promote one named level after sustained, broad mastery evidence.          Manual, Validate and persist one private answer-bearing question for a reel., Choose a stable 2-5 reel cadence, then adapt it to current evidence., Record one distinct forward navigation without changing watch analytics., Record one distinct forward navigation without changing watch analytics. (+620 more)
+Nodes (630): _BackfillPlan, Adaptive recall-check persistence, readiness, and session lifecycle., Promote one named level after sustained, broad mastery evidence.          Manual, Promote one named level after sustained, broad mastery evidence.          Manual, Validate and persist one private answer-bearing question for a reel., Choose a stable 2-5 reel cadence, then adapt it to current evidence., Record one distinct forward navigation without changing watch analytics., Record one distinct forward navigation without changing watch analytics. (+622 more)
 
 ### Community 3 - "Community 3"
 Cohesion: 0.09
 Nodes (412): cue_text(), filter_by_query(), pick_best_clip(), Bridge: translates clip_engine output into IngestionPipeline._persist_ingest() i, Construct the canonical YouTube source reference used by persistence., Build IngestSegment from a clip dict; text is in-window transcript or clip title, Token-overlap relevance of a clip against a query.      Returns 1.0 when query i, When query is falsy, return clips unchanged.     Otherwise: annotate each clip w (+404 more)
 
 ### Community 4 - "Community 4"
+Cohesion: 0.01
+Nodes (251): _await_with_probe(), is_cancelled(), raise_if_cancelled(), Small async-to-sync bridge for actively cancellable provider requests.  The publ, Run an async request from synchronous pipeline code.      Normal generation work, run_cancellable(), sleep_with_probe(), wait_with_probe() (+243 more)
+
+### Community 5 - "Community 5"
 Cohesion: 0.32
 Nodes (285): AssessmentCancelledError, AssessmentService, EngineError, Base error for the clip engine., GenerationQueueFullError, JobLeaseLostError, Generate a verification code, store its hash, and return the plaintext code., Generate a verification code, store its hash, and return the plaintext code. (+277 more)
 
-### Community 5 - "Community 5"
-Cohesion: 0.02
-Nodes (296): Enum, _acquire_selector_slot(), _apply_enrichment(), _AtomicDeclarative, _authoritative_pro(), _boundary_prompts(), _boundary_repair_prompts(), _boundary_selector_content() (+288 more)
-
 ### Community 6 - "Community 6"
-Cohesion: 0.01
-Nodes (208): _await_with_probe(), is_cancelled(), raise_if_cancelled(), Small async-to-sync bridge for actively cancellable provider requests.  The publ, Run an async request from synchronous pipeline code.      Normal generation work, run_cancellable(), sleep_with_probe(), wait_with_probe() (+200 more)
+Cohesion: 0.02
+Nodes (295): Enum, _acquire_selector_slot(), _apply_enrichment(), _AtomicDeclarative, _authoritative_pro(), _boundary_prompts(), _boundary_repair_prompts(), _boundary_selector_content() (+287 more)
 
 ### Community 7 - "Community 7"
 Cohesion: 0.02
@@ -413,23 +414,23 @@ Nodes (191): _atomic_write(), _available_questions(), _cadence_session_id(), _ca
 
 ### Community 9 - "Community 9"
 Cohesion: 0.02
-Nodes (175): _energy_min_snap(), _ensure_audio(), _gap_after(), _gap_before(), _pick_end(), _pick_start(), Precise boundary refinement with targeted Whisper.  Supadata gives fast but coar, Absolute time of the lowest-RMS ``frame_ms`` frame within ``[a, b]`` — the quiet (+167 more)
+Nodes (159): _artifact_path(), _chunk_path(), load_artifact(), load_chunk(), On-disk caching for punctuation.  Two levels, both under ``work/<video_id>/``: -, save_artifact(), save_chunk(), transcript_fingerprint() (+151 more)
 
 ### Community 10 - "Community 10"
 Cohesion: 0.02
-Nodes (159): _artifact_path(), _chunk_path(), load_artifact(), load_chunk(), On-disk caching for punctuation.  Two levels, both under ``work/<video_id>/``: -, save_artifact(), save_chunk(), transcript_fingerprint() (+151 more)
+Nodes (68): Real-data end-to-end regression tests using ACTUAL transcripts captured from You, Pipeline behaviour on a real punctuated transcript., RealTranscript3B1BTests, BoundaryPaddingTests, make_transcript(), Invariant tests for reel cutting — verify the contract the user cares about:  1., Build ``n`` cues, each ending with terminal punctuation so every         cue bou, Production callers import REEL_PAD_START_SEC / REEL_PAD_END_SEC.         Lock in (+60 more)
 
 ### Community 11 - "Community 11"
 Cohesion: 0.02
-Nodes (70): extract_concepts(), _extract_concepts_via_llm(), Extract higher-quality concepts via Gemini (falling back to Groq)., _summary_for_terms(), classify_query(), _content_tokens(), _extract_anchors(), QueryIntent (+62 more)
+Nodes (153): _energy_min_snap(), _ensure_audio(), _gap_after(), _gap_before(), _pick_end(), _pick_start(), Precise boundary refinement with targeted Whisper.  Supadata gives fast but coar, Absolute time of the lowest-RMS ``frame_ms`` frame within ``[a, b]`` — the quiet (+145 more)
 
 ### Community 12 - "Community 12"
-Cohesion: 0.02
-Nodes (68): Real-data end-to-end regression tests using ACTUAL transcripts captured from You, Pipeline behaviour on a real punctuated transcript., RealTranscript3B1BTests, BoundaryPaddingTests, make_transcript(), Invariant tests for reel cutting — verify the contract the user cares about:  1., Build ``n`` cues, each ending with terminal punctuation so every         cue bou, Production callers import REEL_PAD_START_SEC / REEL_PAD_END_SEC.         Lock in (+60 more)
+Cohesion: 0.01
+Nodes (188): ProviderBudgetExceededError, _AssessmentDraft, _BoundaryPlan, _BoundaryRepairCandidate, _BoundaryRepairItem, _BoundaryRepairPlan, _BoundaryTopic, _CardEnrichmentItem (+180 more)
 
 ### Community 13 - "Community 13"
-Cohesion: 0.01
-Nodes (189): ProviderBudgetExceededError, _AssessmentDraft, _BoundaryPlan, _BoundaryRepairCandidate, _BoundaryRepairItem, _BoundaryRepairPlan, _BoundaryTopic, _CardEnrichmentItem (+181 more)
+Cohesion: 0.02
+Nodes (52): extract_concepts(), _extract_concepts_via_llm(), Extract higher-quality concepts via Gemini (falling back to Groq)., _summary_for_terms(), Exception, APIStatusError, BadRequestError, chat() (+44 more)
 
 ### Community 14 - "Community 14"
 Cohesion: 0.03
@@ -437,7 +438,7 @@ Nodes (152): _call_telemetry(), _cancel_requested(), _create_client(), _default_
 
 ### Community 15 - "Community 15"
 Cohesion: 0.02
-Nodes (163): _jsonable(), Run-artifact persistence (W25-G): every assembled run leaves an auditable trail., Best-effort JSON projection: dataclass → asdict, pydantic → model_dump,     dict, Persist one assembled run's plan/arcs/shipped/ledger under     ``<work_dir>/<vid, write_run_artifacts(), best_match(), find_human_clip(), gold_chapters() (+155 more)
+Nodes (153): _jsonable(), Run-artifact persistence (W25-G): every assembled run leaves an auditable trail., Best-effort JSON projection: dataclass → asdict, pydantic → model_dump,     dict, Persist one assembled run's plan/arcs/shipped/ledger under     ``<work_dir>/<vid, write_run_artifacts(), best_match(), find_human_clip(), gold_chapters() (+145 more)
 
 ### Community 16 - "Community 16"
 Cohesion: 0.02
@@ -448,12 +449,12 @@ Cohesion: 0.03
 Nodes (85): _assessment(), Strict shipping contract for the guarded Gemini educational selector., _run(), _segs(), _selection_task_tail(), test_adjacent_facets_inside_one_coarse_cue_remain_distinct(), test_ambiguous_projected_edge_quote_falls_back_without_rejection(), test_apostrophe_typography_is_grounded_and_source_spelling_is_preserved() (+77 more)
 
 ### Community 18 - "Community 18"
-Cohesion: 0.03
-Nodes (96): crop_clip(), crop_clip_local(), crop_highlights(), crop_highlights_local(), _cut_subclip(), _ratio(), Local clipping: ffmpeg subclip + OpenCV face-aware vertical crop.  Two stages pe, Submit one autocrop job and return the URL of the rendered short. (+88 more)
-
-### Community 19 - "Community 19"
 Cohesion: 0.06
 Nodes (97): answerAssessmentQuestion(), ApiError, apiUrl(), askStudyChat(), buildApiError(), buildGenerateReelsRequestBody(), cancelGenerationJob(), captureCommunitySessionContext() (+89 more)
+
+### Community 19 - "Community 19"
+Cohesion: 0.03
+Nodes (84): crop_clip(), crop_clip_local(), crop_highlights(), crop_highlights_local(), _cut_subclip(), _ratio(), Local clipping: ffmpeg subclip + OpenCV face-aware vertical crop.  Two stages pe, Submit one autocrop job and return the URL of the rendered short. (+76 more)
 
 ### Community 20 - "Community 20"
 Cohesion: 0.02
@@ -465,7 +466,7 @@ Nodes (2): MediumRegressionTests, _validated_query_plan()
 
 ### Community 22 - "Community 22"
 Cohesion: 0.06
-Nodes (68): _discovery(), _FixedSemanticEmbedding, _one_cue_selector_result(), _pipeline(), _pipeline_with_semantic(), _plan(), _quality_clip(), _SemanticVector (+60 more)
+Nodes (66): _discovery(), _one_cue_selector_result(), _pipeline(), _pipeline_with_semantic(), _plan(), _quality_clip(), test_acoustic_boundary_plan_fails_closed_for_missing_cue_ids(), test_acoustic_result_crossing_prior_speech_is_stored_but_deferred() (+58 more)
 
 ### Community 23 - "Community 23"
 Cohesion: 0.08
@@ -492,68 +493,68 @@ Cohesion: 0.06
 Nodes (22): _blend_engine_out(), _build_engine_out(), _clip_side_effect(), _difficulty_engine_out(), DifficultyPersistenceTests, EmbedUrlCeilTests, _fractional_engine_out(), IngestTopicProgressTests (+14 more)
 
 ### Community 29 - "Community 29"
+Cohesion: 0.07
+Nodes (41): _audio_bitrate(), _audio_entry(), AudioPreparationResult, _canonical_watch_url(), _decode_window(), _diagnostic_range(), _EdgeSearchResult, _end_search_windows() (+33 more)
+
+### Community 30 - "Community 30"
 Cohesion: 0.04
 Nodes (3): _FakeGeminiClient, test_failed_expansion_dispatch_is_recorded_once(), test_successful_expansion_dispatch_is_not_double_recorded()
 
-### Community 30 - "Community 30"
+### Community 31 - "Community 31"
 Cohesion: 0.07
 Nodes (29): InvalidReferenceError, A supplied material or concept does not exist or the pair is inconsistent., build_video_id(), _cli_main(), ensure_sentinel_concept(), ensure_sentinel_material(), load_existing_reel(), load_ingest_metadata_blob() (+21 more)
 
-### Community 31 - "Community 31"
+### Community 32 - "Community 32"
 Cohesion: 0.06
 Nodes (26): buildCommunitySetInformationParagraphs(), createDraftReelRow(), detectYouTubeDurationWithIframeApi(), draftRowsFromReels(), extractYouTubeVideoId(), formatCommunityPlatformSummary(), formatCompact(), formatLastEditedLabel() (+18 more)
 
-### Community 32 - "Community 32"
+### Community 33 - "Community 33"
 Cohesion: 0.12
 Nodes (34): _assessment(), _convert(), _plan(), _segs(), test_bad_line_indices_are_rejected_instead_of_clamped(), test_boundary_repair_without_explicit_clip_limit_does_not_compare_none(), test_chemistry_fast_path_closes_two_cues_of_missing_setup(), test_clip_limit_uses_overall_quality_before_stable_chronology() (+26 more)
 
-### Community 33 - "Community 33"
+### Community 34 - "Community 34"
 Cohesion: 0.07
 Nodes (16): ClipEngineGenerateReelsTests, _discover_result(), _five_minute_engine_out(), LevelAwareFeedTests, _many_clip_engine_out(), _multi_clip_engine_out(), _quality_v2_engine_out(), Tests for the clip-engine-routed ReelService.generate_reels (Task T4).  The lega (+8 more)
 
-### Community 34 - "Community 34"
+### Community 35 - "Community 35"
 Cohesion: 0.09
 Nodes (43): _by_id(), test_arc_ids_sequential(), test_bus_problem_slice_from_audit_yields_two_arcs(), test_closer_before_steps_does_not_close_the_arc(), test_closer_between_steps_does_not_truncate_the_arc(), test_closer_exactly_at_the_gap_bound_is_accepted(), test_closer_terminal_accepted_only_after_steps(), test_closer_without_steps_is_not_a_terminal() (+35 more)
 
-### Community 35 - "Community 35"
+### Community 36 - "Community 36"
 Cohesion: 0.05
 Nodes (1): Discourse-onset primitive — text-only, offline. Decides whether a sentence used
 
-### Community 36 - "Community 36"
+### Community 37 - "Community 37"
 Cohesion: 0.12
 Nodes (39): _collapse_fixture(), _det(), _passing_judge(), W25-F replace bar: a ship-flagged newcomer (hard core failed, phantom evidence), _rel(), _same_model(), _structure(), _superset_fixture() (+31 more)
 
-### Community 37 - "Community 37"
+### Community 38 - "Community 38"
 Cohesion: 0.12
 Nodes (37): _complete(), Focused adaptive recall-check service tests (SQLite, no network)., _seed_completed_accuracy(), _seed_pending_session(), _seed_promotion_outcome(), _seed_reel(), test_answer_rejects_an_unrepairable_partial_without_storing_an_attempt(), test_answer_repairs_legacy_partial_before_accepting_a_cached_question() (+29 more)
 
-### Community 38 - "Community 38"
+### Community 39 - "Community 39"
 Cohesion: 0.12
 Nodes (25): _mk_row(), _sent(), _sents(), _spec(), _structure(), test_antecedent_removal_removes_source_unit_sentences(), test_antecedent_removal_skips_when_no_references(), test_antecedent_removal_skips_when_removal_would_empty_clip() (+17 more)
 
-### Community 39 - "Community 39"
+### Community 40 - "Community 40"
 Cohesion: 0.12
 Nodes (32): _dd(), _hard_core_partial(), _mk_cand(), _node_units(), _over_inclusion(), _pass(), _script(), _snap() (+24 more)
 
-### Community 40 - "Community 40"
+### Community 41 - "Community 41"
 Cohesion: 0.11
 Nodes (3): Difficulty-stage and value ordering for versioned clipping selections., _selection_item(), SelectionContractOrderingTests
-
-### Community 41 - "Community 41"
-Cohesion: 0.09
-Nodes (32): align_edge_anchor(), _approximate_quote_span(), _character_score(), EdgeAnchor, fetch_json3_words(), _fetch_payload(), _is_original_asr_alias(), Json3CaptionTrack (+24 more)
 
 ### Community 42 - "Community 42"
 Cohesion: 0.06
 Nodes (4): _make_clip(), Pure unit tests for backend.app.clip_engine.bridge — no DB, no network., test_pick_best_clip_fallback_when_none_in_bounds(), test_pick_best_clip_prefers_in_bounds()
 
 ### Community 43 - "Community 43"
-Cohesion: 0.19
-Nodes (31): _by_id(), _cmap(), _rel(), _same_model(), _structure(), test_arc_verify_outage_note_travels_with_successful_plan(), test_assemble_plan_failure_degrades_to_priority_and_notes_it(), test_assemble_plan_path_ships_the_calculation_final_arc() (+23 more)
-
-### Community 44 - "Community 44"
 Cohesion: 0.07
 Nodes (5): _artifact(), test_transcript_cache_rejects_tombstoned_video(), test_transcript_cache_version_invalidates_coarser_cue_artifacts(), test_transcript_validation_accepts_auto_mode_artifact(), test_transcript_validation_rejects_nonfinite_and_nonmonotonic_cues()
+
+### Community 44 - "Community 44"
+Cohesion: 0.19
+Nodes (31): _by_id(), _cmap(), _rel(), _same_model(), _structure(), test_arc_verify_outage_note_travels_with_successful_plan(), test_assemble_plan_failure_degrades_to_priority_and_notes_it(), test_assemble_plan_path_ships_the_calculation_final_arc() (+23 more)
 
 ### Community 45 - "Community 45"
 Cohesion: 0.09
@@ -632,32 +633,32 @@ Cohesion: 0.16
 Nodes (17): _gate(), _healthy_rollback_metrics(), _rows(), test_all_promotion_thresholds_pass_on_qualifying_rows(), test_cluster_bootstrap_uses_pair_means_not_individual_clips(), test_each_monitoring_trigger_requires_pro_only_rollback(), test_each_threshold_can_block_promotion(), test_inclusive_thresholds_pass_at_their_boundaries() (+9 more)
 
 ### Community 64 - "Community 64"
+Cohesion: 0.19
+Nodes (21): _Assessment, _clean_list(), _clean_text(), _contains_tokens(), _cue_batches(), _cue_id(), _estimate_tokens(), _grounded_takeaways() (+13 more)
+
+### Community 65 - "Community 65"
 Cohesion: 0.1
 Nodes (7): BaseSettings, get_settings(), Settings, _clear_text_provider_env(), StructuredPayload, test_availability_ignores_credentials_for_disabled_providers(), test_gemini_builder_accepts_rotated_key_without_api_blackout()
 
-### Community 65 - "Community 65"
+### Community 66 - "Community 66"
 Cohesion: 0.14
 Nodes (11): ClipEngineFeedRefineFeedbackTests, _discover_result(), _quality_v2_engine_out(), Tests for feed ranking, feedback score shifts, refinement generation swap, and c, Patch discover + clip at the pipeline aliases; registers cleanup., ranked_feed returns clip-engine reels with a numeric score, descending., v2 ranks by selector quality even after feedback is recorded., _activate_generation updates the head; gen-1 and gen-2 feeds don't bleed. (+3 more)
 
-### Community 66 - "Community 66"
+### Community 67 - "Community 67"
 Cohesion: 0.28
 Nodes (20): _cue(), _plan(), _report(), test_binary_comparison_keeps_only_the_explicit_requested_relation(), test_conditional_complement_is_kept_despite_caption_punctuation(), test_context_expansion_trims_to_latest_topic_anchored_sentence(), test_embedded_subject_split_across_cues_keeps_its_predicate_and_condition(), test_embedded_subject_split_expands_through_its_predicate() (+12 more)
 
-### Community 67 - "Community 67"
+### Community 68 - "Community 68"
 Cohesion: 0.19
 Nodes (14): _judge(), E1a labeling exporter — pure manifest construction, stratum tagging, per-stratum, _rej(), _spec(), test_accepted_entry_fields(), test_build_manifest_and_write(), test_build_manifest_applies_limit_across_videos(), test_collect_video_missing_cache_is_none() (+6 more)
 
-### Community 68 - "Community 68"
+### Community 69 - "Community 69"
 Cohesion: 0.16
 Nodes (14): _cols(), _structure(), test_chapter_coverage_fraction_by_sentence_containment(), test_chapter_coverage_nan_without_topics_zero_without_clips(), test_chapter_coverage_uses_unit_node_id_when_present(), test_topic_span_coverage_nan_without_timing_zero_without_clips(), test_topic_span_coverage_sliver_reads_low_where_chapter_coverage_reads_full(), test_topic_span_coverage_unions_overlaps_and_clips_to_node() (+6 more)
 
-### Community 69 - "Community 69"
+### Community 70 - "Community 70"
 Cohesion: 0.17
 Nodes (18): _manifest(), _profile_result(), test_bad_hash_blocks_execution_before_output(), test_empty_or_missing_telemetry_never_prices_as_zero_complete_usage(), test_executable_runner_emits_375_rows_and_never_calls_hybrid(), test_hybrid_preserves_green_split_enrichment_fallback_telemetry(), test_hybrid_synthesis_failure_still_emits_all_fifth_rows(), test_hybrid_uses_same_repeat_flash_or_corrected_pro_without_extra_call() (+10 more)
-
-### Community 70 - "Community 70"
-Cohesion: 0.2
-Nodes (20): _Assessment, _clean_list(), _clean_text(), _contains_tokens(), _cue_batches(), _cue_id(), _estimate_tokens(), _grounded_takeaways() (+12 more)
 
 ### Community 71 - "Community 71"
 Cohesion: 0.1
@@ -677,11 +678,11 @@ Nodes (18): _generation_rows(), _items(), _record(), _scores(), test_blind_bundl
 
 ### Community 75 - "Community 75"
 Cohesion: 0.19
-Nodes (14): Per-clip difficulty: parsed, normalized, carried — NEVER gates a clip., _run(), _segments(), _segs(), test_difficulty_carried_on_clip(), test_difficulty_defaults_to_half_when_omitted(), test_difficulty_is_carried(), test_difficulty_is_required() (+6 more)
+Nodes (4): DirectAdapterMediaTailTests, _media_tail_engine_out(), _prepared_audio(), Regression coverage for quiet handoffs beyond the final caption timestamp.
 
 ### Community 76 - "Community 76"
 Cohesion: 0.19
-Nodes (4): DirectAdapterMediaTailTests, _media_tail_engine_out(), _prepared_audio(), Regression coverage for quiet handoffs beyond the final caption timestamp.
+Nodes (14): Per-clip difficulty: parsed, normalized, carried — NEVER gates a clip., _run(), _segments(), _segs(), test_difficulty_carried_on_clip(), test_difficulty_defaults_to_half_when_omitted(), test_difficulty_is_carried(), test_difficulty_is_required() (+6 more)
 
 ### Community 77 - "Community 77"
 Cohesion: 0.16
@@ -792,156 +793,156 @@ Cohesion: 0.21
 Nodes (3): ClipEngineIngestUrlTests, _fake_engine_out(), Tests for the clip-engine-routed ingest_url (Task 9).  Strategy: mock the two he
 
 ### Community 104 - "Community 104"
+Cohesion: 0.49
+Nodes (10): _expand(), _fixture(), _mk_cand(), role_units(), test_boolean_result_pull_disabled_for_practice_prompt_contract(), test_contract_free_span_keeps_result_pull(), test_kind_hint_result_pull_gated_by_bound_contract(), test_reasoning_pull_also_disabled_for_practice_prompt_contract() (+2 more)
+
+### Community 105 - "Community 105"
 Cohesion: 0.29
 Nodes (10): _pick(), _fit_budget must accept k==a when it's the only terminator within budget (spec #, _fit_budget must append window_close_forced when no terminator falls within budg, _sent(), test_fit_budget_no_terminator_in_budgeted_span(), test_fit_budget_terminator_only_at_window_start(), test_window_clamps_out_of_range(), test_window_moves_start_off_dangling_opener() (+2 more)
 
-### Community 105 - "Community 105"
+### Community 106 - "Community 106"
 Cohesion: 0.18
 Nodes (2): NormalizeTests, TargetTests
 
-### Community 106 - "Community 106"
+### Community 107 - "Community 107"
 Cohesion: 0.29
 Nodes (8): _post(), E1c labels endpoints — POST /api/labels merge-not-clobber + GET resume.  FastAPI, test_bad_video_ids_rejected(), test_post_corrupt_golden_file_is_409_and_untouched(), test_post_creates_golden_file_and_get_resumes(), test_post_empty_note_keeps_existing_note(), test_post_preserves_existing_gold_keys(), test_post_upserts_by_span_within_tolerance_and_appends_new()
 
-### Community 107 - "Community 107"
+### Community 108 - "Community 108"
 Cohesion: 0.22
 Nodes (4): ClipEngineTopicCutTests, _fake_engine_out_two_clips(), Tests for the clip-engine-routed ingest_topic_cut (Task 10).  Strategy: mirror t, Returns a transcript + 2 clips.     Clip 0 (30-90s): talks about the "chain rule
 
-### Community 108 - "Community 108"
+### Community 109 - "Community 109"
 Cohesion: 0.22
 Nodes (3): normalizeSignupEmailForComparison(), onSendVerificationEmail(), onVerifyAccount()
 
-### Community 109 - "Community 109"
+### Community 110 - "Community 110"
 Cohesion: 0.18
 Nodes (0):
 
-### Community 110 - "Community 110"
+### Community 111 - "Community 111"
 Cohesion: 0.2
 Nodes (2): RankedExclusionNormalizationTests, Regression test for Finding #1: client pagination exclusion across the video_id
 
-### Community 111 - "Community 111"
+### Community 112 - "Community 112"
 Cohesion: 0.22
 Nodes (2): FastAPI assessment contract, privacy, resume, and learner isolation., TestAssessmentApi
 
-### Community 112 - "Community 112"
+### Community 113 - "Community 113"
 Cohesion: 0.47
 Nodes (8): _clip(), test_coarse_mid_thought_start_recovers_same_objective_context(), test_direct_adapter_persists_expanded_context_cues(), test_explicit_projected_and_overlap_edges_remain_exact_handoffs(), test_sponsor_context_is_not_authorized(), test_unmarked_different_topic_prefix_is_not_authorized(), test_unmarked_different_topic_suffix_is_not_authorized(), _transcript()
 
-### Community 113 - "Community 113"
+### Community 114 - "Community 114"
 Cohesion: 0.2
 Nodes (0):
 
-### Community 114 - "Community 114"
+### Community 115 - "Community 115"
 Cohesion: 0.36
 Nodes (6): _structure(), test_select_keeps_teaching_drops_filler(), test_select_never_zero_on_llm_failure(), test_select_respects_max_clips(), test_target_topic_does_not_fallback_to_off_topic_clips(), test_target_topic_filters_selection_and_reaches_prompt()
 
-### Community 115 - "Community 115"
+### Community 116 - "Community 116"
 Cohesion: 0.36
 Nodes (7): _dump(), _make_fake_extract(), _make_fake_llm(), _run_describe(), _run_extract(), test_scene_dedup_identical_under_reversed_extraction_completion(), test_vision_events_identical_under_reversed_batch_completion()
 
-### Community 116 - "Community 116"
+### Community 117 - "Community 117"
 Cohesion: 0.36
 Nodes (7): Precise-boundary resilience + direction-safe Whisper picks. Offline (no audio, n, _sent(), test_pick_end_never_moves_earlier_than_window_floor(), test_pick_end_normal_path_unchanged(), test_pick_start_keep_first_at_video_start(), test_pick_start_never_moves_later_than_window_ceiling(), test_pick_start_normal_path_unchanged()
-
-### Community 117 - "Community 117"
-Cohesion: 0.46
-Nodes (6): Energy-minimum snap (Task 3). Synthesizes a tone+silence wav — no whisper, no ff, test_absolute_offset_respected(), test_snaps_to_silent_frame(), test_subframe_interval_returns_none(), _tone_then_silence(), _write_wav()
 
 ### Community 118 - "Community 118"
 Cohesion: 0.25
 Nodes (3): _whisper_window: refine model + VAD kwargs, and returns (sents, wav_path). Model, _Seg, _W
 
 ### Community 119 - "Community 119"
+Cohesion: 0.46
+Nodes (6): Energy-minimum snap (Task 3). Synthesizes a tone+silence wav — no whisper, no ff, test_absolute_offset_respected(), test_snaps_to_silent_frame(), test_subframe_interval_returns_none(), _tone_then_silence(), _write_wav()
+
+### Community 120 - "Community 120"
 Cohesion: 0.36
 Nodes (6): _FakeModel, _install_fake(), Refine-model Whisper singleton (Task 2). WhisperModel is stubbed — no real model, test_refine_reuses_full_singleton_when_models_match(), test_refine_singleton_builds_refine_model(), test_refine_singleton_uses_refine_workers()
 
-### Community 120 - "Community 120"
+### Community 121 - "Community 121"
 Cohesion: 0.43
 Nodes (7): Onset START guard — the symmetric twin of the weak-END guard. Offline (no audio/, _sent(), test_backward_extension_bounded_by_node_span(), test_good_onset_start_unchanged(), test_is_weak_start_matches_primitive(), test_only_weak_start_still_places_flagged(), test_weak_start_extends_back_to_onset()
 
-### Community 121 - "Community 121"
+### Community 122 - "Community 122"
 Cohesion: 0.29
 Nodes (1): CommunityAuthDbMigrationTests
 
-### Community 122 - "Community 122"
+### Community 123 - "Community 123"
 Cohesion: 0.36
 Nodes (4): _reload_segment_config(), test_legacy_pro_override_wins_then_explicit_pro_model_is_fallback(), test_segment_flash_failover_model_is_configurable_and_can_be_disabled(), test_segment_router_rejects_invalid_values_and_clamps_percent()
 
-### Community 123 - "Community 123"
+### Community 124 - "Community 124"
 Cohesion: 0.29
 Nodes (3): ClipEngineContractTests, _fake_engine_out(), HTTP-layer contract smoke test for POST /api/ingest/url (Task 13).  Asserts that
 
-### Community 124 - "Community 124"
+### Community 125 - "Community 125"
 Cohesion: 0.36
 Nodes (1): CommunityHistorySyncTests
 
-### Community 125 - "Community 125"
+### Community 126 - "Community 126"
 Cohesion: 0.32
 Nodes (3): _run_clean_process(), test_embedding_request_cannot_lazy_load_torch(), test_main_import_uses_no_torch_embedding_backend()
 
-### Community 126 - "Community 126"
+### Community 127 - "Community 127"
 Cohesion: 0.25
 Nodes (1): CommunityReelDurationSecurityTests
 
-### Community 127 - "Community 127"
+### Community 128 - "Community 128"
 Cohesion: 0.36
 Nodes (1): CommunitySettingsSyncTests
 
-### Community 128 - "Community 128"
+### Community 129 - "Community 129"
 Cohesion: 0.25
 Nodes (0):
 
-### Community 129 - "Community 129"
+### Community 130 - "Community 130"
 Cohesion: 0.46
 Nodes (5): historyScopeStorageKey(), normalizeHistoryAccountId(), readScopedHistorySnapshot(), seedGuestHistoryScopeFromActiveHistory(), writeScopedHistorySnapshot()
 
-### Community 130 - "Community 130"
-Cohesion: 0.62
-Nodes (6): _closure(), test_non_onset_required_overflowing_the_soft_budget_is_carded(), test_onset_beyond_the_hard_cap_is_carded_not_inlined(), test_onset_overflowing_into_the_soft_hard_window_is_inlined(), test_required_before_onset_is_inlined_even_past_span_budget(), _u()
-
 ### Community 131 - "Community 131"
+Cohesion: 0.48
+Nodes (6): Per-clip orientation cards (feed display). Offline — llm_json monkeypatched, zer, test_extractive_fallback_on_llm_error(), test_grounded_llm_cards_assigned_per_clip(), test_never_blank_and_word_capped(), test_ungrounded_llm_card_rejected(), _units()
+
+### Community 132 - "Community 132"
 Cohesion: 0.29
 Nodes (0):
 
-### Community 132 - "Community 132"
+### Community 133 - "Community 133"
 Cohesion: 0.33
 Nodes (4): IngestionTopicCutTests, _make_long_transcript_cues(), Integration tests for `POST /api/ingest/topic-cut` and the corresponding `Ingest, 20 cues × 30 seconds = 10 minutes of fake speech, two clearly distinct topics.
 
-### Community 133 - "Community 133"
+### Community 134 - "Community 134"
 Cohesion: 0.48
 Nodes (2): _build_request(), RateLimitClientIpResolutionTests
 
-### Community 134 - "Community 134"
+### Community 135 - "Community 135"
 Cohesion: 0.29
 Nodes (0):
 
-### Community 135 - "Community 135"
+### Community 136 - "Community 136"
 Cohesion: 0.48
 Nodes (5): _cancel_shortly(), test_active_async_request_is_cancelled_within_three_hundred_ms(), test_chat_http_request_receives_cancellation(), test_gemini_active_request_receives_cancellation(), test_supadata_active_socket_receives_cancellation_and_does_not_retry()
 
-### Community 136 - "Community 136"
+### Community 137 - "Community 137"
 Cohesion: 0.43
 Nodes (5): applySearchFeedSettingsToParams(), buildSearchFeedQuery(), parseQueryBoolean(), parseQueryNumber(), readSearchFeedQuerySettings()
 
-### Community 137 - "Community 137"
+### Community 138 - "Community 138"
 Cohesion: 0.33
 Nodes (0):
 
-### Community 138 - "Community 138"
+### Community 139 - "Community 139"
 Cohesion: 0.33
 Nodes (1): Precise-cutting config surface (Task 1). Pure constants — no audio/whisper.
 
-### Community 139 - "Community 139"
+### Community 140 - "Community 140"
 Cohesion: 0.47
 Nodes (4): _columns(), Assessment/reel-content schema parity for SQLite and PostgreSQL., test_existing_sqlite_reels_and_history_are_migrated_idempotently(), test_fresh_sqlite_schema_contains_assessment_tables_and_private_keys()
 
-### Community 140 - "Community 140"
-Cohesion: 0.33
-Nodes (1): FE1 (embed bleed fix) + FE2 (quality payload) — the serving embed path.  FE1 roo
-
 ### Community 141 - "Community 141"
 Cohesion: 0.33
-Nodes (0):
+Nodes (1): FE1 (embed bleed fix) + FE2 (quality payload) — the serving embed path.  FE1 roo
 
 ### Community 142 - "Community 142"
 Cohesion: 0.33
@@ -949,30 +950,30 @@ Nodes (0):
 
 ### Community 143 - "Community 143"
 Cohesion: 0.33
-Nodes (1): VID4 eval columns for the edge probe (advisory rates). Offline, pure functions.
+Nodes (0):
 
 ### Community 144 - "Community 144"
+Cohesion: 0.33
+Nodes (1): VID4 eval columns for the edge probe (advisory rates). Offline, pure functions.
+
+### Community 145 - "Community 145"
 Cohesion: 0.4
 Nodes (1): refine_clip_boundaries wiring (Task 8). Offline: audio + _refine_one stubbed.
 
-### Community 145 - "Community 145"
+### Community 146 - "Community 146"
 Cohesion: 0.8
 Nodes (4): _connection(), _run_until_cancelled(), test_deep_expansion_forwards_cancellation_to_shared_query_plan(), test_topic_expansion_cancels_active_http_and_skips_later_calls_and_cache()
 
-### Community 146 - "Community 146"
+### Community 147 - "Community 147"
 Cohesion: 0.5
 Nodes (4): _collect_referenced_names(), Completeness guard: every config.<CONSTANT> referenced in the vendored gemini-pa, Every config.NAME reference in the gemini-path modules must be on the shim., test_shim_exposes_all_referenced_constants()
-
-### Community 147 - "Community 147"
-Cohesion: 0.4
-Nodes (0):
 
 ### Community 148 - "Community 148"
 Cohesion: 0.4
 Nodes (0):
 
 ### Community 149 - "Community 149"
-Cohesion: 0.5
+Cohesion: 0.4
 Nodes (0):
 
 ### Community 150 - "Community 150"
@@ -984,32 +985,32 @@ Cohesion: 0.5
 Nodes (0):
 
 ### Community 152 - "Community 152"
-Cohesion: 0.67
-Nodes (2): _cue(), QueryFocusedSnippetTests
-
-### Community 153 - "Community 153"
-Cohesion: 0.67
-Nodes (2): _sent(), test_opening_onset_rate_counts_only_good_openers()
-
-### Community 154 - "Community 154"
 Cohesion: 0.5
 Nodes (0):
 
-### Community 155 - "Community 155"
+### Community 153 - "Community 153"
 Cohesion: 0.67
-Nodes (2): createInitialState(), LoadingFlappyMiniGame()
+Nodes (2): _cue(), QueryFocusedSnippetTests
+
+### Community 154 - "Community 154"
+Cohesion: 0.67
+Nodes (2): _sent(), test_opening_onset_rate_counts_only_good_openers()
+
+### Community 155 - "Community 155"
+Cohesion: 0.5
+Nodes (0):
 
 ### Community 156 - "Community 156"
 Cohesion: 0.67
-Nodes (0):
+Nodes (2): createInitialState(), LoadingFlappyMiniGame()
 
 ### Community 157 - "Community 157"
 Cohesion: 0.67
-Nodes (1): pysbd's Segmenter is not thread-safe: segment() stashes the input on self.origin
+Nodes (0):
 
 ### Community 158 - "Community 158"
 Cohesion: 0.67
-Nodes (0):
+Nodes (1): pysbd's Segmenter is not thread-safe: segment() stashes the input on self.origin
 
 ### Community 159 - "Community 159"
 Cohesion: 0.67
@@ -1032,7 +1033,7 @@ Cohesion: 0.67
 Nodes (0):
 
 ### Community 164 - "Community 164"
-Cohesion: 1.0
+Cohesion: 0.67
 Nodes (0):
 
 ### Community 165 - "Community 165"
@@ -1181,11 +1182,11 @@ Nodes (0):
 
 ### Community 201 - "Community 201"
 Cohesion: 1.0
-Nodes (1): Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum
+Nodes (0):
 
 ### Community 202 - "Community 202"
 Cohesion: 1.0
-Nodes (1): Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p
+Nodes (1): Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum
 
 ### Community 203 - "Community 203"
 Cohesion: 1.0
@@ -1193,594 +1194,596 @@ Nodes (1): Return a JSON string conforming to ``schema`` from a VIDEO+text promp
 
 ### Community 204 - "Community 204"
 Cohesion: 1.0
-Nodes (1): Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p
+Nodes (1): Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p
 
 ### Community 205 - "Community 205"
 Cohesion: 1.0
-Nodes (1): When discover() returns a truthy "warning" (e.g. out-of-credits) and no videos,
+Nodes (1): Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p
 
 ### Community 206 - "Community 206"
 Cohesion: 1.0
-Nodes (1): Invalidate cache entries whenever the active prompt or validators change.
+Nodes (1): When discover() returns a truthy "warning" (e.g. out-of-credits) and no videos,
 
 ### Community 207 - "Community 207"
 Cohesion: 1.0
-Nodes (1): Keep evaluation side effects and source-less releases out of the cache.
+Nodes (1): Invalidate cache entries whenever the active prompt or validators change.
 
 ### Community 208 - "Community 208"
 Cohesion: 1.0
-Nodes (1): Hash every input that can change the validated public clip list.
+Nodes (1): Keep evaluation side effects and source-less releases out of the cache.
 
 ### Community 209 - "Community 209"
 Cohesion: 1.0
-Nodes (1): Provider metadata for one logical Gemini structured-content call.
+Nodes (1): Hash every input that can change the validated public clip list.
 
 ### Community 210 - "Community 210"
 Cohesion: 1.0
-Nodes (1): A typed Gemini failure carrying telemetry collected before failure.
+Nodes (1): Provider metadata for one logical Gemini structured-content call.
 
 ### Community 211 - "Community 211"
 Cohesion: 1.0
-Nodes (1): Run ``call`` (returns response text or falsy) with backoff on transient errors.
+Nodes (1): A typed Gemini failure carrying telemetry collected before failure.
 
 ### Community 212 - "Community 212"
 Cohesion: 1.0
-Nodes (1): Extract a typed HTTP status without relying on provider error prose.
+Nodes (1): Run ``call`` (returns response text or falsy) with backoff on transient errors.
 
 ### Community 213 - "Community 213"
 Cohesion: 1.0
-Nodes (1): Return a bounded provider Retry-After delay without retaining error prose.
+Nodes (1): Extract a typed HTTP status without relying on provider error prose.
 
 ### Community 214 - "Community 214"
 Cohesion: 1.0
-Nodes (1): Wait for a retry while polling the generation cancellation callback.
+Nodes (1): Return a bounded provider Retry-After delay without retaining error prose.
 
 ### Community 215 - "Community 215"
 Cohesion: 1.0
-Nodes (1): Return the JSON-Schema subset accepted by Gemini 3 GenerateContent.      Gemini
+Nodes (1): Wait for a retry while polling the generation cancellation callback.
 
 ### Community 216 - "Community 216"
 Cohesion: 1.0
-Nodes (1): Run one Gemini 3 structured call with bounded transport behavior.      SDK retri
+Nodes (1): Return the JSON-Schema subset accepted by Gemini 3 GenerateContent.      Gemini
 
 ### Community 217 - "Community 217"
 Cohesion: 1.0
-Nodes (1): Return a JSON string conforming to `schema` (a Pydantic model class).      ``max
+Nodes (1): Run one Gemini 3 structured call with bounded transport behavior.      SDK retri
 
 ### Community 218 - "Community 218"
 Cohesion: 1.0
-Nodes (1): A Gemini image Part from raw JPEG bytes.
+Nodes (1): Return a JSON string conforming to `schema` (a Pydantic model class).      ``max
 
 ### Community 219 - "Community 219"
 Cohesion: 1.0
-Nodes (1): Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum
+Nodes (1): A Gemini image Part from raw JPEG bytes.
 
 ### Community 220 - "Community 220"
 Cohesion: 1.0
-Nodes (1): A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma
+Nodes (1): Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum
 
 ### Community 221 - "Community 221"
 Cohesion: 1.0
-Nodes (1): Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p
+Nodes (1): A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma
 
 ### Community 222 - "Community 222"
 Cohesion: 1.0
-Nodes (1): Invalidate cache entries whenever the active prompt or validators change.
+Nodes (1): Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p
 
 ### Community 223 - "Community 223"
 Cohesion: 1.0
-Nodes (1): Keep evaluation side effects and source-less releases out of the cache.
+Nodes (1): Invalidate cache entries whenever the active prompt or validators change.
 
 ### Community 224 - "Community 224"
 Cohesion: 1.0
-Nodes (1): Hash every input that can change the validated public clip list.
+Nodes (1): Keep evaluation side effects and source-less releases out of the cache.
 
 ### Community 225 - "Community 225"
 Cohesion: 1.0
-Nodes (1): Classify resolver failures without retaining sensitive command output.
+Nodes (1): Hash every input that can change the validated public clip list.
 
 ### Community 226 - "Community 226"
 Cohesion: 1.0
-Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
+Nodes (1): Classify resolver failures without retaining sensitive command output.
 
 ### Community 227 - "Community 227"
 Cohesion: 1.0
-Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
+Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
 
 ### Community 228 - "Community 228"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending backward.
+Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
 
 ### Community 229 - "Community 229"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending forward.
+Nodes (1): Return nearest-first, non-overlapping windows extending backward.
 
 ### Community 230 - "Community 230"
 Cohesion: 1.0
-Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
+Nodes (1): Return nearest-first, non-overlapping windows extending forward.
 
 ### Community 231 - "Community 231"
 Cohesion: 1.0
-Nodes (1): Exact cue 0-30 slice from the 129-cue production Supadata artifact.
+Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
 
 ### Community 232 - "Community 232"
 Cohesion: 1.0
-Nodes (1): Classify resolver failures without retaining sensitive command output.
+Nodes (1): Exact cue 0-30 slice from the 129-cue production Supadata artifact.
 
 ### Community 233 - "Community 233"
 Cohesion: 1.0
-Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
+Nodes (1): Classify resolver failures without retaining sensitive command output.
 
 ### Community 234 - "Community 234"
 Cohesion: 1.0
-Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
+Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
 
 ### Community 235 - "Community 235"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending backward.
+Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
 
 ### Community 236 - "Community 236"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending forward.
+Nodes (1): Return nearest-first, non-overlapping windows extending backward.
 
 ### Community 237 - "Community 237"
 Cohesion: 1.0
-Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
+Nodes (1): Return nearest-first, non-overlapping windows extending forward.
 
 ### Community 238 - "Community 238"
 Cohesion: 1.0
-Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
+Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
 
 ### Community 239 - "Community 239"
 Cohesion: 1.0
-Nodes (1): Classify resolver failures without retaining sensitive command output.
+Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
 
 ### Community 240 - "Community 240"
 Cohesion: 1.0
-Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
+Nodes (1): Classify resolver failures without retaining sensitive command output.
 
 ### Community 241 - "Community 241"
 Cohesion: 1.0
-Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
+Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
 
 ### Community 242 - "Community 242"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending backward.
+Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
 
 ### Community 243 - "Community 243"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending forward.
+Nodes (1): Return nearest-first, non-overlapping windows extending backward.
 
 ### Community 244 - "Community 244"
 Cohesion: 1.0
-Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
+Nodes (1): Return nearest-first, non-overlapping windows extending forward.
 
 ### Community 245 - "Community 245"
 Cohesion: 1.0
-Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
+Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
 
 ### Community 246 - "Community 246"
 Cohesion: 1.0
-Nodes (1): Classify resolver failures without retaining sensitive command output.
+Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
 
 ### Community 247 - "Community 247"
 Cohesion: 1.0
-Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
+Nodes (1): Classify resolver failures without retaining sensitive command output.
 
 ### Community 248 - "Community 248"
 Cohesion: 1.0
-Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
+Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
 
 ### Community 249 - "Community 249"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending backward.
+Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
 
 ### Community 250 - "Community 250"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending forward.
+Nodes (1): Return nearest-first, non-overlapping windows extending backward.
 
 ### Community 251 - "Community 251"
 Cohesion: 1.0
-Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
+Nodes (1): Return nearest-first, non-overlapping windows extending forward.
 
 ### Community 252 - "Community 252"
 Cohesion: 1.0
-Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
+Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
 
 ### Community 253 - "Community 253"
 Cohesion: 1.0
-Nodes (1): Classify resolver failures without retaining sensitive command output.
+Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
 
 ### Community 254 - "Community 254"
 Cohesion: 1.0
-Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
+Nodes (1): Classify resolver failures without retaining sensitive command output.
 
 ### Community 255 - "Community 255"
 Cohesion: 1.0
-Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
+Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
 
 ### Community 256 - "Community 256"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending backward.
+Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
 
 ### Community 257 - "Community 257"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending forward.
+Nodes (1): Return nearest-first, non-overlapping windows extending backward.
 
 ### Community 258 - "Community 258"
 Cohesion: 1.0
-Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
+Nodes (1): Return nearest-first, non-overlapping windows extending forward.
 
 ### Community 259 - "Community 259"
 Cohesion: 1.0
-Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
+Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
 
 ### Community 260 - "Community 260"
 Cohesion: 1.0
-Nodes (1): Classify resolver failures without retaining sensitive command output.
+Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
 
 ### Community 261 - "Community 261"
 Cohesion: 1.0
-Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
+Nodes (1): Classify resolver failures without retaining sensitive command output.
 
 ### Community 262 - "Community 262"
 Cohesion: 1.0
-Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
+Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
 
 ### Community 263 - "Community 263"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending backward.
+Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
 
 ### Community 264 - "Community 264"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending forward.
+Nodes (1): Return nearest-first, non-overlapping windows extending backward.
 
 ### Community 265 - "Community 265"
 Cohesion: 1.0
-Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
+Nodes (1): Return nearest-first, non-overlapping windows extending forward.
 
 ### Community 266 - "Community 266"
 Cohesion: 1.0
-Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
+Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
 
 ### Community 267 - "Community 267"
 Cohesion: 1.0
-Nodes (1): Classify resolver failures without retaining sensitive command output.
+Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
 
 ### Community 268 - "Community 268"
 Cohesion: 1.0
-Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
+Nodes (1): Classify resolver failures without retaining sensitive command output.
 
 ### Community 269 - "Community 269"
 Cohesion: 1.0
-Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
+Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
 
 ### Community 270 - "Community 270"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending backward.
+Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
 
 ### Community 271 - "Community 271"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending forward.
+Nodes (1): Return nearest-first, non-overlapping windows extending backward.
 
 ### Community 272 - "Community 272"
 Cohesion: 1.0
-Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
+Nodes (1): Return nearest-first, non-overlapping windows extending forward.
 
 ### Community 273 - "Community 273"
 Cohesion: 1.0
-Nodes (1): Classify resolver failures without retaining sensitive command output.
+Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
 
 ### Community 274 - "Community 274"
 Cohesion: 1.0
-Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
+Nodes (1): Classify resolver failures without retaining sensitive command output.
 
 ### Community 275 - "Community 275"
 Cohesion: 1.0
-Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
+Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
 
 ### Community 276 - "Community 276"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending backward.
+Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
 
 ### Community 277 - "Community 277"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending forward.
+Nodes (1): Return nearest-first, non-overlapping windows extending backward.
 
 ### Community 278 - "Community 278"
 Cohesion: 1.0
-Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
+Nodes (1): Return nearest-first, non-overlapping windows extending forward.
 
 ### Community 279 - "Community 279"
 Cohesion: 1.0
-Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
+Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
 
 ### Community 280 - "Community 280"
 Cohesion: 1.0
-Nodes (1): Classify resolver failures without retaining sensitive command output.
+Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
 
 ### Community 281 - "Community 281"
 Cohesion: 1.0
-Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
+Nodes (1): Classify resolver failures without retaining sensitive command output.
 
 ### Community 282 - "Community 282"
 Cohesion: 1.0
-Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
+Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
 
 ### Community 283 - "Community 283"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending backward.
+Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
 
 ### Community 284 - "Community 284"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending forward.
+Nodes (1): Return nearest-first, non-overlapping windows extending backward.
 
 ### Community 285 - "Community 285"
 Cohesion: 1.0
-Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
+Nodes (1): Return nearest-first, non-overlapping windows extending forward.
 
 ### Community 286 - "Community 286"
 Cohesion: 1.0
-Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
+Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
 
 ### Community 287 - "Community 287"
 Cohesion: 1.0
-Nodes (1): Classify resolver failures without retaining sensitive command output.
+Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
 
 ### Community 288 - "Community 288"
 Cohesion: 1.0
-Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
+Nodes (1): Classify resolver failures without retaining sensitive command output.
 
 ### Community 289 - "Community 289"
 Cohesion: 1.0
-Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
+Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
 
 ### Community 290 - "Community 290"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending backward.
+Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
 
 ### Community 291 - "Community 291"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending forward.
+Nodes (1): Return nearest-first, non-overlapping windows extending backward.
 
 ### Community 292 - "Community 292"
 Cohesion: 1.0
-Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
+Nodes (1): Return nearest-first, non-overlapping windows extending forward.
 
 ### Community 293 - "Community 293"
 Cohesion: 1.0
-Nodes (1): Align a uniquely quoted partial edge to explicit lexical onsets.      ``start``
+Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
 
 ### Community 294 - "Community 294"
 Cohesion: 1.0
-Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
+Nodes (1): Align a uniquely quoted partial edge to explicit lexical onsets.      ``start``
 
 ### Community 295 - "Community 295"
 Cohesion: 1.0
-Nodes (1): Classify resolver failures without retaining sensitive command output.
+Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
 
 ### Community 296 - "Community 296"
 Cohesion: 1.0
-Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
+Nodes (1): Classify resolver failures without retaining sensitive command output.
 
 ### Community 297 - "Community 297"
 Cohesion: 1.0
-Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
+Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
 
 ### Community 298 - "Community 298"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending backward.
+Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
 
 ### Community 299 - "Community 299"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending forward.
+Nodes (1): Return nearest-first, non-overlapping windows extending backward.
 
 ### Community 300 - "Community 300"
 Cohesion: 1.0
-Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
+Nodes (1): Return nearest-first, non-overlapping windows extending forward.
 
 ### Community 301 - "Community 301"
 Cohesion: 1.0
-Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
+Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
 
 ### Community 302 - "Community 302"
 Cohesion: 1.0
-Nodes (1): Classify resolver failures without retaining sensitive command output.
+Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
 
 ### Community 303 - "Community 303"
 Cohesion: 1.0
-Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
+Nodes (1): Classify resolver failures without retaining sensitive command output.
 
 ### Community 304 - "Community 304"
 Cohesion: 1.0
-Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
+Nodes (1): Kill yt-dlp and any Deno child without an unbounded pipe wait.
 
 ### Community 305 - "Community 305"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending backward.
+Nodes (1): Resolve bestaudio without downloading it, suitable for parallel prefetch.      C
 
 ### Community 306 - "Community 306"
 Cohesion: 1.0
-Nodes (1): Return nearest-first, non-overlapping windows extending forward.
+Nodes (1): Return nearest-first, non-overlapping windows extending backward.
 
 ### Community 307 - "Community 307"
 Cohesion: 1.0
-Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
+Nodes (1): Return nearest-first, non-overlapping windows extending forward.
 
 ### Community 308 - "Community 308"
 Cohesion: 1.0
-Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
+Nodes (1): Verify and adjust one clip to measured quiet edge intervals.      ``start_sec``
 
 ### Community 309 - "Community 309"
 Cohesion: 1.0
-Nodes (1): Return a bounded provider Retry-After delay without retaining error prose.
+Nodes (1): A source/caption edge is not proof of an in-cue semantic handoff.
 
 ### Community 310 - "Community 310"
 Cohesion: 1.0
-Nodes (1): Wait for a retry while polling the generation cancellation callback.
+Nodes (1): Return a bounded provider Retry-After delay without retaining error prose.
 
 ### Community 311 - "Community 311"
 Cohesion: 1.0
-Nodes (1): Return the JSON-Schema subset accepted by Gemini 3 GenerateContent.      Gemini
+Nodes (1): Wait for a retry while polling the generation cancellation callback.
 
 ### Community 312 - "Community 312"
 Cohesion: 1.0
-Nodes (1): Run one Gemini 3 structured call with bounded transport behavior.      SDK retri
+Nodes (1): Return the JSON-Schema subset accepted by Gemini 3 GenerateContent.      Gemini
 
 ### Community 313 - "Community 313"
 Cohesion: 1.0
-Nodes (1): Return a JSON string conforming to `schema` (a Pydantic model class).      ``max
+Nodes (1): Run one Gemini 3 structured call with bounded transport behavior.      SDK retri
 
 ### Community 314 - "Community 314"
 Cohesion: 1.0
-Nodes (1): A Gemini image Part from raw JPEG bytes.
+Nodes (1): Return a JSON string conforming to `schema` (a Pydantic model class).      ``max
 
 ### Community 315 - "Community 315"
 Cohesion: 1.0
-Nodes (1): Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum
+Nodes (1): A Gemini image Part from raw JPEG bytes.
 
 ### Community 316 - "Community 316"
 Cohesion: 1.0
-Nodes (1): A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma
+Nodes (1): Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum
 
 ### Community 317 - "Community 317"
 Cohesion: 1.0
-Nodes (1): Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p
+Nodes (1): A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma
 
 ### Community 318 - "Community 318"
 Cohesion: 1.0
-Nodes (1): Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p
+Nodes (1): Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p
 
 ### Community 319 - "Community 319"
 Cohesion: 1.0
-Nodes (1): Run one Gemini 3 structured call with bounded transport behavior.      SDK retri
+Nodes (1): Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p
 
 ### Community 320 - "Community 320"
 Cohesion: 1.0
-Nodes (1): Return a JSON string conforming to `schema` (a Pydantic model class).      ``max
+Nodes (1): Run one Gemini 3 structured call with bounded transport behavior.      SDK retri
 
 ### Community 321 - "Community 321"
 Cohesion: 1.0
-Nodes (1): A Gemini image Part from raw JPEG bytes.
+Nodes (1): Return a JSON string conforming to `schema` (a Pydantic model class).      ``max
 
 ### Community 322 - "Community 322"
 Cohesion: 1.0
-Nodes (1): Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum
+Nodes (1): A Gemini image Part from raw JPEG bytes.
 
 ### Community 323 - "Community 323"
 Cohesion: 1.0
-Nodes (1): A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma
+Nodes (1): Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum
 
 ### Community 324 - "Community 324"
 Cohesion: 1.0
-Nodes (1): Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p
+Nodes (1): A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma
 
 ### Community 325 - "Community 325"
 Cohesion: 1.0
-Nodes (1): Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p
+Nodes (1): Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p
 
 ### Community 326 - "Community 326"
 Cohesion: 1.0
-Nodes (1): Two relevance-surviving clips from one video's transcript. Each clip's     windo
+Nodes (1): Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p
 
 ### Community 327 - "Community 327"
 Cohesion: 1.0
-Nodes (1): One 300s whole-topic clip — the kind the practice (Gemini) engine cuts for     a
+Nodes (1): Two relevance-surviving clips from one video's transcript. Each clip's     windo
 
 ### Community 328 - "Community 328"
 Cohesion: 1.0
-Nodes (1): Context managers patching discover + run.clip at the pipeline aliases.
+Nodes (1): One 300s whole-topic clip — the kind the practice (Gemini) engine cuts for     a
 
 ### Community 329 - "Community 329"
 Cohesion: 1.0
-Nodes (1): Production regression: ``advanced ATP`` retrieved SAP S/4HANA for a         cell
+Nodes (1): Context managers patching discover + run.clip at the pipeline aliases.
 
 ### Community 330 - "Community 330"
 Cohesion: 1.0
-Nodes (1): Text/file materials may have no subject tag. Their sibling concepts         stil
+Nodes (1): Production regression: ``advanced ATP`` retrieved SAP S/4HANA for a         cell
 
 ### Community 331 - "Community 331"
 Cohesion: 1.0
-Nodes (1): Old completed inventories are replayed without regeneration, so the         serv
+Nodes (1): Text/file materials may have no subject tag. Their sibling concepts         stil
 
 ### Community 332 - "Community 332"
 Cohesion: 1.0
-Nodes (1): Serve-time level scoring: matched clips first, off-level kept at the     back, a
+Nodes (1): Old completed inventories are replayed without regeneration, so the         serv
 
 ### Community 333 - "Community 333"
 Cohesion: 1.0
-Nodes (1): Return the first letter/digit index, ignoring opening quotes/brackets.
+Nodes (1): Serve-time level scoring: matched clips first, off-level kept at the     back, a
 
 ### Community 334 - "Community 334"
 Cohesion: 1.0
-Nodes (1): A leading marker is fine when the sentence stands on its own as new framing/a qu
+Nodes (1): Return the first letter/digit index, ignoring opening quotes/brackets.
 
 ### Community 335 - "Community 335"
 Cohesion: 1.0
-Nodes (1): Reject only question references without context earlier in the same cue.      Ca
+Nodes (1): A leading marker is fine when the sentence stands on its own as new framing/a qu
 
 ### Community 336 - "Community 336"
 Cohesion: 1.0
-Nodes (1): Find opening references without a lexical antecedent in accumulated context.
+Nodes (1): Reject only question references without context earlier in the same cue.      Ca
 
 ### Community 337 - "Community 337"
+Cohesion: 1.0
+Nodes (1): Find opening references without a lexical antecedent in accumulated context.
+
+### Community 338 - "Community 338"
 Cohesion: 1.0
 Nodes (1): True when this sentence, as a clip's first line, drops the viewer mid-thought.
 
 ## Knowledge Gaps
-- **3311 isolated node(s):** `Submit one autocrop job and return the URL of the rendered short.`, `MuAPI result shapes vary by endpoint — try common keys.`, `Find the most viral-worthy highlights in a transcript.  Logic ported from ViralV`, `Default LLM backend: MuAPI gpt-5-mini.`, `gpt-5-4 sometimes wraps JSON in markdown fences — strip and parse.` (+3306 more)
+- **3312 isolated node(s):** `Submit one autocrop job and return the URL of the rendered short.`, `MuAPI result shapes vary by endpoint — try common keys.`, `Find the most viral-worthy highlights in a transcript.  Logic ported from ViralV`, `Default LLM backend: MuAPI gpt-5-mini.`, `gpt-5-4 sometimes wraps JSON in markdown fences — strip and parse.` (+3307 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **Thin community `Community 164`** (2 nodes): `ProcessingStepper.tsx`, `ProcessingStepper()`
+- **Thin community `Community 165`** (2 nodes): `ProcessingStepper.tsx`, `ProcessingStepper()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 165`** (2 nodes): `ResultsGrid.tsx`, `ResultsGrid()`
+- **Thin community `Community 166`** (2 nodes): `ResultsGrid.tsx`, `ResultsGrid()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 166`** (2 nodes): `DownloadAll()`, `DownloadAll.tsx`
+- **Thin community `Community 167`** (2 nodes): `DownloadAll()`, `DownloadAll.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 167`** (2 nodes): `VolumetricGlowBackground.tsx`, `VolumetricGlowBackground()`
+- **Thin community `Community 168`** (2 nodes): `VolumetricGlowBackground.tsx`, `VolumetricGlowBackground()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 168`** (2 nodes): `useJobStream.ts`, `useJobStream()`
+- **Thin community `Community 169`** (2 nodes): `useJobStream.ts`, `useJobStream()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 169`** (2 nodes): `test_topics_types.py`, `test_schemas_and_dataclasses_exist()`
+- **Thin community `Community 170`** (2 nodes): `test_topics_types.py`, `test_schemas_and_dataclasses_exist()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 170`** (2 nodes): `test_youtube_transport.py`, `test_youtube_impersonation_target_is_supported()`
+- **Thin community `Community 171`** (2 nodes): `test_youtube_transport.py`, `test_youtube_impersonation_target_is_supported()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 171`** (2 nodes): `test_provider_cache_db.py`, `test_sqlite_provider_cache_round_trip_and_tombstone_filter()`
+- **Thin community `Community 172`** (2 nodes): `test_provider_cache_db.py`, `test_sqlite_provider_cache_round_trip_and_tombstone_filter()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 172`** (2 nodes): `test_singleflight.py`, `test_singleflight_coalesces_identical_concurrent_work()`
+- **Thin community `Community 173`** (2 nodes): `test_singleflight.py`, `test_singleflight_coalesces_identical_concurrent_work()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 173`** (2 nodes): `RootLayout()`, `layout.tsx`
+- **Thin community `Community 174`** (2 nodes): `RootLayout()`, `layout.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 174`** (2 nodes): `Loading()`, `loading.tsx`
+- **Thin community `Community 175`** (2 nodes): `Loading()`, `loading.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 175`** (2 nodes): `FullscreenLoadingScreen()`, `FullscreenLoadingScreen.tsx`
+- **Thin community `Community 176`** (2 nodes): `FullscreenLoadingScreen()`, `FullscreenLoadingScreen.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 176`** (2 nodes): `ViewportModalPortal.tsx`, `ViewportModalPortal()`
+- **Thin community `Community 177`** (2 nodes): `ViewportModalPortal.tsx`, `ViewportModalPortal()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 177`** (2 nodes): `youtubeIframeApi.ts`, `loadYouTubeIframeApi()`
+- **Thin community `Community 178`** (2 nodes): `youtubeIframeApi.ts`, `loadYouTubeIframeApi()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 178`** (1 nodes): `next-env.d.ts`
+- **Thin community `Community 179`** (1 nodes): `next-env.d.ts`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 179`** (1 nodes): `tailwind.config.ts`
+- **Thin community `Community 180`** (1 nodes): `tailwind.config.ts`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 180`** (1 nodes): `postcss.config.js`
+- **Thin community `Community 181`** (1 nodes): `postcss.config.js`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 181`** (1 nodes): `next.config.ts`
+- **Thin community `Community 182`** (1 nodes): `next.config.ts`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 182`** (1 nodes): `tailwind.config.js`
+- **Thin community `Community 183`** (1 nodes): `tailwind.config.js`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 183`** (1 nodes): `vite.config.ts`
+- **Thin community `Community 184`** (1 nodes): `vite.config.ts`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 184`** (1 nodes): `postcss.config.js`
+- **Thin community `Community 185`** (1 nodes): `postcss.config.js`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 185`** (1 nodes): `main.tsx`
+- **Thin community `Community 186`** (1 nodes): `main.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 186`** (1 nodes): `types.ts`
+- **Thin community `Community 187`** (1 nodes): `types.ts`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 187`** (1 nodes): `SettingsDrawer.tsx`
+- **Thin community `Community 188`** (1 nodes): `SettingsDrawer.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 188`** (1 nodes): `InputCard.tsx`
-  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 189`** (1 nodes): `__init__.py`
+- **Thin community `Community 189`** (1 nodes): `InputCard.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 190`** (1 nodes): `__init__.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
@@ -1800,293 +1803,295 @@ Nodes (1): True when this sentence, as a clip's first line, drops the viewer mid
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 198`** (1 nodes): `__init__.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 199`** (1 nodes): `GenerationProgress.tsx`
+- **Thin community `Community 199`** (1 nodes): `__init__.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 200`** (1 nodes): `types.ts`
+- **Thin community `Community 200`** (1 nodes): `GenerationProgress.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 201`** (1 nodes): `Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum`
+- **Thin community `Community 201`** (1 nodes): `types.ts`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 202`** (1 nodes): `Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p`
+- **Thin community `Community 202`** (1 nodes): `Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 203`** (1 nodes): `Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 204`** (1 nodes): `Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p`
+- **Thin community `Community 204`** (1 nodes): `Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 205`** (1 nodes): `When discover() returns a truthy "warning" (e.g. out-of-credits) and no videos,`
+- **Thin community `Community 205`** (1 nodes): `Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 206`** (1 nodes): `Invalidate cache entries whenever the active prompt or validators change.`
+- **Thin community `Community 206`** (1 nodes): `When discover() returns a truthy "warning" (e.g. out-of-credits) and no videos,`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 207`** (1 nodes): `Keep evaluation side effects and source-less releases out of the cache.`
+- **Thin community `Community 207`** (1 nodes): `Invalidate cache entries whenever the active prompt or validators change.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 208`** (1 nodes): `Hash every input that can change the validated public clip list.`
+- **Thin community `Community 208`** (1 nodes): `Keep evaluation side effects and source-less releases out of the cache.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 209`** (1 nodes): `Provider metadata for one logical Gemini structured-content call.`
+- **Thin community `Community 209`** (1 nodes): `Hash every input that can change the validated public clip list.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 210`** (1 nodes): `A typed Gemini failure carrying telemetry collected before failure.`
+- **Thin community `Community 210`** (1 nodes): `Provider metadata for one logical Gemini structured-content call.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 211`** (1 nodes): `Run ``call`` (returns response text or falsy) with backoff on transient errors.`
+- **Thin community `Community 211`** (1 nodes): `A typed Gemini failure carrying telemetry collected before failure.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 212`** (1 nodes): `Extract a typed HTTP status without relying on provider error prose.`
+- **Thin community `Community 212`** (1 nodes): `Run ``call`` (returns response text or falsy) with backoff on transient errors.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 213`** (1 nodes): `Return a bounded provider Retry-After delay without retaining error prose.`
+- **Thin community `Community 213`** (1 nodes): `Extract a typed HTTP status without relying on provider error prose.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 214`** (1 nodes): `Wait for a retry while polling the generation cancellation callback.`
+- **Thin community `Community 214`** (1 nodes): `Return a bounded provider Retry-After delay without retaining error prose.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 215`** (1 nodes): `Return the JSON-Schema subset accepted by Gemini 3 GenerateContent.      Gemini`
+- **Thin community `Community 215`** (1 nodes): `Wait for a retry while polling the generation cancellation callback.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 216`** (1 nodes): `Run one Gemini 3 structured call with bounded transport behavior.      SDK retri`
+- **Thin community `Community 216`** (1 nodes): `Return the JSON-Schema subset accepted by Gemini 3 GenerateContent.      Gemini`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 217`** (1 nodes): `Return a JSON string conforming to `schema` (a Pydantic model class).      ``max`
+- **Thin community `Community 217`** (1 nodes): `Run one Gemini 3 structured call with bounded transport behavior.      SDK retri`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 218`** (1 nodes): `A Gemini image Part from raw JPEG bytes.`
+- **Thin community `Community 218`** (1 nodes): `Return a JSON string conforming to `schema` (a Pydantic model class).      ``max`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 219`** (1 nodes): `Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum`
+- **Thin community `Community 219`** (1 nodes): `A Gemini image Part from raw JPEG bytes.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 220`** (1 nodes): `A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma`
+- **Thin community `Community 220`** (1 nodes): `Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 221`** (1 nodes): `Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p`
+- **Thin community `Community 221`** (1 nodes): `A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 222`** (1 nodes): `Invalidate cache entries whenever the active prompt or validators change.`
+- **Thin community `Community 222`** (1 nodes): `Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 223`** (1 nodes): `Keep evaluation side effects and source-less releases out of the cache.`
+- **Thin community `Community 223`** (1 nodes): `Invalidate cache entries whenever the active prompt or validators change.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 224`** (1 nodes): `Hash every input that can change the validated public clip list.`
+- **Thin community `Community 224`** (1 nodes): `Keep evaluation side effects and source-less releases out of the cache.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 225`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
+- **Thin community `Community 225`** (1 nodes): `Hash every input that can change the validated public clip list.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 226`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
+- **Thin community `Community 226`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 227`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
+- **Thin community `Community 227`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 228`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
+- **Thin community `Community 228`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 229`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
+- **Thin community `Community 229`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 230`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
+- **Thin community `Community 230`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 231`** (1 nodes): `Exact cue 0-30 slice from the 129-cue production Supadata artifact.`
+- **Thin community `Community 231`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 232`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
+- **Thin community `Community 232`** (1 nodes): `Exact cue 0-30 slice from the 129-cue production Supadata artifact.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 233`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
+- **Thin community `Community 233`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 234`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
+- **Thin community `Community 234`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 235`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
+- **Thin community `Community 235`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 236`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
+- **Thin community `Community 236`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 237`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
+- **Thin community `Community 237`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 238`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
+- **Thin community `Community 238`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 239`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
+- **Thin community `Community 239`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 240`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
+- **Thin community `Community 240`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 241`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
+- **Thin community `Community 241`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 242`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
+- **Thin community `Community 242`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 243`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
+- **Thin community `Community 243`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 244`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
+- **Thin community `Community 244`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 245`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
+- **Thin community `Community 245`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 246`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
+- **Thin community `Community 246`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 247`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
+- **Thin community `Community 247`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 248`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
+- **Thin community `Community 248`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 249`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
+- **Thin community `Community 249`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 250`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
+- **Thin community `Community 250`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 251`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
+- **Thin community `Community 251`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 252`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
+- **Thin community `Community 252`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 253`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
+- **Thin community `Community 253`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 254`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
+- **Thin community `Community 254`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 255`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
+- **Thin community `Community 255`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 256`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
+- **Thin community `Community 256`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 257`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
+- **Thin community `Community 257`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 258`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
+- **Thin community `Community 258`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 259`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
+- **Thin community `Community 259`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 260`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
+- **Thin community `Community 260`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 261`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
+- **Thin community `Community 261`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 262`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
+- **Thin community `Community 262`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 263`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
+- **Thin community `Community 263`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 264`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
+- **Thin community `Community 264`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 265`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
+- **Thin community `Community 265`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 266`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
+- **Thin community `Community 266`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 267`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
+- **Thin community `Community 267`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 268`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
+- **Thin community `Community 268`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 269`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
+- **Thin community `Community 269`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 270`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
+- **Thin community `Community 270`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 271`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
+- **Thin community `Community 271`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 272`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
+- **Thin community `Community 272`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 273`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
+- **Thin community `Community 273`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 274`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
+- **Thin community `Community 274`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 275`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
+- **Thin community `Community 275`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 276`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
+- **Thin community `Community 276`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 277`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
+- **Thin community `Community 277`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 278`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
+- **Thin community `Community 278`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 279`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
+- **Thin community `Community 279`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 280`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
+- **Thin community `Community 280`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 281`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
+- **Thin community `Community 281`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 282`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
+- **Thin community `Community 282`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 283`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
+- **Thin community `Community 283`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 284`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
+- **Thin community `Community 284`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 285`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
+- **Thin community `Community 285`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 286`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
+- **Thin community `Community 286`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 287`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
+- **Thin community `Community 287`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 288`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
+- **Thin community `Community 288`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 289`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
+- **Thin community `Community 289`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 290`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
+- **Thin community `Community 290`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 291`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
+- **Thin community `Community 291`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 292`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
+- **Thin community `Community 292`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 293`** (1 nodes): `Align a uniquely quoted partial edge to explicit lexical onsets.      ``start```
+- **Thin community `Community 293`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 294`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
+- **Thin community `Community 294`** (1 nodes): `Align a uniquely quoted partial edge to explicit lexical onsets.      ``start```
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 295`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
+- **Thin community `Community 295`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 296`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
+- **Thin community `Community 296`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 297`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
+- **Thin community `Community 297`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 298`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
+- **Thin community `Community 298`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 299`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
+- **Thin community `Community 299`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 300`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
+- **Thin community `Community 300`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 301`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
+- **Thin community `Community 301`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 302`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
+- **Thin community `Community 302`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 303`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
+- **Thin community `Community 303`** (1 nodes): `Classify resolver failures without retaining sensitive command output.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 304`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
+- **Thin community `Community 304`** (1 nodes): `Kill yt-dlp and any Deno child without an unbounded pipe wait.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 305`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
+- **Thin community `Community 305`** (1 nodes): `Resolve bestaudio without downloading it, suitable for parallel prefetch.      C`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 306`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
+- **Thin community `Community 306`** (1 nodes): `Return nearest-first, non-overlapping windows extending backward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 307`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
+- **Thin community `Community 307`** (1 nodes): `Return nearest-first, non-overlapping windows extending forward.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 308`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
+- **Thin community `Community 308`** (1 nodes): `Verify and adjust one clip to measured quiet edge intervals.      ``start_sec```
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 309`** (1 nodes): `Return a bounded provider Retry-After delay without retaining error prose.`
+- **Thin community `Community 309`** (1 nodes): `A source/caption edge is not proof of an in-cue semantic handoff.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 310`** (1 nodes): `Wait for a retry while polling the generation cancellation callback.`
+- **Thin community `Community 310`** (1 nodes): `Return a bounded provider Retry-After delay without retaining error prose.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 311`** (1 nodes): `Return the JSON-Schema subset accepted by Gemini 3 GenerateContent.      Gemini`
+- **Thin community `Community 311`** (1 nodes): `Wait for a retry while polling the generation cancellation callback.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 312`** (1 nodes): `Run one Gemini 3 structured call with bounded transport behavior.      SDK retri`
+- **Thin community `Community 312`** (1 nodes): `Return the JSON-Schema subset accepted by Gemini 3 GenerateContent.      Gemini`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 313`** (1 nodes): `Return a JSON string conforming to `schema` (a Pydantic model class).      ``max`
+- **Thin community `Community 313`** (1 nodes): `Run one Gemini 3 structured call with bounded transport behavior.      SDK retri`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 314`** (1 nodes): `A Gemini image Part from raw JPEG bytes.`
+- **Thin community `Community 314`** (1 nodes): `Return a JSON string conforming to `schema` (a Pydantic model class).      ``max`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 315`** (1 nodes): `Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum`
+- **Thin community `Community 315`** (1 nodes): `A Gemini image Part from raw JPEG bytes.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 316`** (1 nodes): `A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma`
+- **Thin community `Community 316`** (1 nodes): `Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 317`** (1 nodes): `Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p`
+- **Thin community `Community 317`** (1 nodes): `A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 318`** (1 nodes): `Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p`
+- **Thin community `Community 318`** (1 nodes): `Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 319`** (1 nodes): `Run one Gemini 3 structured call with bounded transport behavior.      SDK retri`
+- **Thin community `Community 319`** (1 nodes): `Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 320`** (1 nodes): `Return a JSON string conforming to `schema` (a Pydantic model class).      ``max`
+- **Thin community `Community 320`** (1 nodes): `Run one Gemini 3 structured call with bounded transport behavior.      SDK retri`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 321`** (1 nodes): `A Gemini image Part from raw JPEG bytes.`
+- **Thin community `Community 321`** (1 nodes): `Return a JSON string conforming to `schema` (a Pydantic model class).      ``max`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 322`** (1 nodes): `Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum`
+- **Thin community `Community 322`** (1 nodes): `A Gemini image Part from raw JPEG bytes.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 323`** (1 nodes): `A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma`
+- **Thin community `Community 323`** (1 nodes): `Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 324`** (1 nodes): `Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p`
+- **Thin community `Community 324`** (1 nodes): `A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 325`** (1 nodes): `Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p`
+- **Thin community `Community 325`** (1 nodes): `Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 326`** (1 nodes): `Two relevance-surviving clips from one video's transcript. Each clip's     windo`
+- **Thin community `Community 326`** (1 nodes): `Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 327`** (1 nodes): `One 300s whole-topic clip — the kind the practice (Gemini) engine cuts for     a`
+- **Thin community `Community 327`** (1 nodes): `Two relevance-surviving clips from one video's transcript. Each clip's     windo`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 328`** (1 nodes): `Context managers patching discover + run.clip at the pipeline aliases.`
+- **Thin community `Community 328`** (1 nodes): `One 300s whole-topic clip — the kind the practice (Gemini) engine cuts for     a`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 329`** (1 nodes): `Production regression: ``advanced ATP`` retrieved SAP S/4HANA for a         cell`
+- **Thin community `Community 329`** (1 nodes): `Context managers patching discover + run.clip at the pipeline aliases.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 330`** (1 nodes): `Text/file materials may have no subject tag. Their sibling concepts         stil`
+- **Thin community `Community 330`** (1 nodes): `Production regression: ``advanced ATP`` retrieved SAP S/4HANA for a         cell`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 331`** (1 nodes): `Old completed inventories are replayed without regeneration, so the         serv`
+- **Thin community `Community 331`** (1 nodes): `Text/file materials may have no subject tag. Their sibling concepts         stil`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 332`** (1 nodes): `Serve-time level scoring: matched clips first, off-level kept at the     back, a`
+- **Thin community `Community 332`** (1 nodes): `Old completed inventories are replayed without regeneration, so the         serv`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 333`** (1 nodes): `Return the first letter/digit index, ignoring opening quotes/brackets.`
+- **Thin community `Community 333`** (1 nodes): `Serve-time level scoring: matched clips first, off-level kept at the     back, a`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 334`** (1 nodes): `A leading marker is fine when the sentence stands on its own as new framing/a qu`
+- **Thin community `Community 334`** (1 nodes): `Return the first letter/digit index, ignoring opening quotes/brackets.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 335`** (1 nodes): `Reject only question references without context earlier in the same cue.      Ca`
+- **Thin community `Community 335`** (1 nodes): `A leading marker is fine when the sentence stands on its own as new framing/a qu`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 336`** (1 nodes): `Find opening references without a lexical antecedent in accumulated context.`
+- **Thin community `Community 336`** (1 nodes): `Reject only question references without context earlier in the same cue.      Ca`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 337`** (1 nodes): `True when this sentence, as a clip's first line, drops the viewer mid-thought.`
+- **Thin community `Community 337`** (1 nodes): `Find opening references without a lexical antecedent in accumulated context.`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 338`** (1 nodes): `True when this sentence, as a clip's first line, drops the viewer mid-thought.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `Sentence` connect `Community 0` to `Community 96`, `Community 1`, `Community 2`, `Community 99`, `Community 100`, `Community 5`, `Community 70`, `Community 104`, `Community 9`, `Community 10`, `Community 13`, `Community 116`, `Community 118`, `Community 120`, `Community 27`, `Community 92`?**
+- **Why does `Sentence` connect `Community 0` to `Community 64`, `Community 1`, `Community 2`, `Community 99`, `Community 100`, `Community 96`, `Community 6`, `Community 9`, `Community 105`, `Community 11`, `Community 12`, `Community 117`, `Community 118`, `Community 121`, `Community 27`, `Community 92`?**
   _High betweenness centrality (0.368) - this node is a cross-community bridge._
 - **Why does `Clip segmentation — pick a 15-60s window that starts and ends on a natural bound` connect `Community 2` to `Community 0`, `Community 1`, `Community 3`?**
   _High betweenness centrality (0.086) - this node is a cross-community bridge._
-- **Why does `IngestTranscriptCue` connect `Community 2` to `Community 1`, `Community 3`, `Community 4`, `Community 152`, `Community 30`?**
+- **Why does `IngestTranscriptCue` connect `Community 2` to `Community 1`, `Community 3`, `Community 5`, `Community 153`, `Community 31`?**
   _High betweenness centrality (0.070) - this node is a cross-community bridge._
 - **Are the 3136 inferred relationships involving `Sentence` (e.g. with `Precise boundary refinement with targeted Whisper.  Supadata gives fast but coar` and `Absolute time of the lowest-RMS ``frame_ms`` frame within ``[a, b]`` — the quiet`) actually correct?**
   _`Sentence` has 3136 INFERRED edges - model-reasoned connections that need verification._

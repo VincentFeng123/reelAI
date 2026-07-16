@@ -721,6 +721,30 @@ def test_generation_usage_payload_aggregates_stage_tokens_cost_and_fallbacks() -
     assert payload["budget"]["gemini"]["cost_limit_usd"] == 0.45
 
 
+def test_generation_usage_preserves_video_grounding_transport_fact() -> None:
+    context = GenerationContext("slow", generation_id="job-grounding-audit")
+    context.record_gemini(
+        attempt=1,
+        model_used="gemini-3.1-pro-preview",
+        quality_degraded=False,
+        stage="selection",
+        usage={
+            "prompt_tokens": 100,
+            "candidate_tokens": 20,
+            "thought_tokens": 0,
+            "total_tokens": 120,
+            "video_grounded": False,
+        },
+    )
+
+    record = context.usage()[0]
+    assert record["metadata"]["video_grounded"] is False
+    assert (
+        context.usage_payload()["provider_calls"][0]["metadata"]["video_grounded"]
+        is False
+    )
+
+
 def test_generation_usage_counts_selector_retries_as_physical_attempts_once() -> None:
     context = GenerationContext("fast", generation_id="job-retried-selector")
     context.record_gemini(

@@ -922,6 +922,7 @@ class GenerationContext:
             record_metadata["stage"] = str(stage)
         for field_name in (
             "video_id",
+            "video_grounded",
             "latency_ms",
             "retries",
             "finish_reason",
