@@ -43,6 +43,7 @@ def test_clip_builds_embed_urls_and_forwards_topic(monkeypatch):
         seen["segment_media_resolution"] = settings.get(
             "_segment_media_resolution"
         )
+        seen["generation_context"] = settings.get("generation_context")
         return ([{"start": 1.0, "end": 4.0, "cut_end": 4.15, "title": "Bit",
                   "facet": "concept", "reason": "", "sequence_index": 1}], "1 clip")
 
@@ -65,6 +66,54 @@ def test_clip_builds_embed_urls_and_forwards_topic(monkeypatch):
     assert seen["segment_video_url"] == seen["transcript_url"]
     assert seen["video_grounding_required"] is False
     assert seen["segment_media_resolution"] == "low"
+    assert isinstance(seen["generation_context"], GenerationContext)
+    assert seen["generation_context"].budget.mode == "fast"
+
+
+def test_standalone_pro_boundary_fallback_dispatches_with_bounded_selector(monkeypatch):
+    contexts: list[GenerationContext] = []
+    provider_calls: list[dict] = []
+
+    def context_factory(*args, **kwargs):
+        context = GenerationContext(*args, **kwargs)
+        contexts.append(context)
+        return context
+
+    def fake_generate(_system, _user, _schema, **kwargs):
+        provider_calls.append(kwargs)
+        return SimpleNamespace(
+            text=(
+                '{"request_intent":{"exact_request":"calculus",'
+                '"constraints":[{"constraint_id":"subject","kind":"subject",'
+                '"source_phrase":"calculus","requirement":"Teach calculus"}]},'
+                '"topics":[]}'
+            ),
+            telemetry={
+                "model": kwargs["model"],
+                "prompt_tokens": 1_200,
+                "candidate_tokens": 30,
+                "thought_tokens": 20,
+                "total_tokens": 1_250,
+            },
+        )
+
+    monkeypatch.setattr(run, "GenerationContext", context_factory)
+    monkeypatch.setattr(gemini_client, "generate_json_v3", fake_generate)
+
+    output = run.pro_boundary_fallback(
+        {"segments": [{"start": 0.0, "end": 5.0, "text": "lesson"}]},
+        topic="calculus",
+        video_id="dQw4w9WgXcQ",
+    )
+
+    assert output["route"] == "aggregate_pro_fallback"
+    assert len(provider_calls) == 1
+    assert len(contexts) == 1
+    budget = contexts[0].budget.snapshot()["gemini"]
+    assert budget["selector_calls"] == 1
+    assert budget["pro_selector_calls"] == 1
+    assert budget["pro_fallback_calls"] == 0
+    assert budget["inflight_reserved_cost_usd"] == 0.0
 
 
 def test_production_url_records_one_text_only_pro_selector_call(monkeypatch):
@@ -165,6 +214,9 @@ def test_pro_boundary_fallback_preserves_canonical_video_cache_identity(monkeypa
     )
     assert seen["_segment_video_grounding_required"] is False
     assert seen["_segment_media_resolution"] == "low"
+    assert isinstance(seen["generation_context"], GenerationContext)
+    assert seen["generation_context"].budget.mode == "fast"
+    assert seen["budget_operation"] == "pro_authoritative"
 
 
 def test_direct_url_segment_cache_hit_skips_all_gemini_and_budget(monkeypatch):

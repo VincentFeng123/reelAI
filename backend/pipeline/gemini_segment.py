@@ -1600,6 +1600,11 @@ _SELECTION_OUTPUT_TOKENS = 24_576
 # while allowing Fast's two and Slow's three 30k-token source analyses to start
 # together within their existing hard job-cost ceilings.
 _BOUNDARY_OUTPUT_TOKENS = 6_000
+# Calls cheap enough under a byte-per-token upper bound may use the local
+# estimate. Anything larger gets the provider's free exact count first, so two
+# Fast or three Slow selectors cannot collectively under-reserve past the job
+# ceiling even for high-entropy text.
+_MAX_UNCOUNTED_SELECTOR_COST_USD = 0.20
 # At low media resolution Gemini uses roughly one 66-token video frame plus
 # 32 audio tokens per second. The rounded rate also covers timestamp metadata.
 _LOW_RESOLUTION_VIDEO_TOKENS_PER_SECOND = 100
@@ -11301,6 +11306,36 @@ class _ModelCallError(RuntimeError):
         self.telemetry = telemetry
 
 
+class GeminiTokenPreflightError(RuntimeError):
+    """A long request could not be priced safely before generation dispatch."""
+
+    def __init__(
+        self,
+        cause: Exception,
+        *,
+        model: str,
+        operation: str,
+        prompt_version: str,
+        thinking_level: str,
+        retryable: bool,
+        status_code: int | None,
+    ):
+        super().__init__("Gemini token preflight was unavailable")
+        self.telemetry = {
+            "error_type": type(self).__name__,
+            "provider_error_type": type(cause).__name__,
+            "model": model,
+            "operation": operation,
+            "prompt_version": prompt_version,
+            "thinking_level": thinking_level,
+            "retryable": bool(retryable),
+            "dispatched": False,
+            "token_preflight_failed": True,
+        }
+        if status_code is not None:
+            self.telemetry["provider_status_code"] = int(status_code)
+
+
 def _telemetry_dict(value: object) -> dict:
     if value is None:
         return {}
@@ -11533,7 +11568,12 @@ def _call_model(
     media_resolution=None,
     estimated_media_tokens: int = 0,
 ) -> tuple[BaseModel, dict]:
-    from ..gemini_client import count_request_tokens, generate_json_v3
+    from ..gemini_client import (
+        _gemini_status_code,
+        _transient_gemini_error,
+        count_request_tokens,
+        generate_json_v3,
+    )
 
     if isinstance(user, str):
         prompt_user_text = user
@@ -11565,7 +11605,15 @@ def _call_model(
                 1,
                 math.ceil((len(prompt_text) + schema_bytes) / 3),
             )
-            if request_bytes + 1_000 > 200_000:
+            estimate_buffer_tokens = 1_000
+            conservative_uncomputed_cost = _model_cost({
+                "model": model,
+                "prompt_tokens": (
+                    request_bytes + max(0, int(estimated_media_tokens))
+                ),
+                "candidate_tokens": max_output_tokens,
+            })
+            if conservative_uncomputed_cost > _MAX_UNCOUNTED_SELECTOR_COST_USD:
                 remaining_s = max(0.0, deadline_monotonic - time.monotonic())
                 if remaining_s >= 1.0 and not _cancel_requested(cancelled):
                     try:
@@ -11576,10 +11624,35 @@ def _call_model(
                             model=model,
                             timeout_s=min(10.0, remaining_s),
                         )
-                    except Exception:  # fail closed on preflight unavailability
-                        estimated_text_tokens = request_bytes
+                    except Exception as exc:
+                        # Raw UTF-8 bytes are not tokens. Treating them as such
+                        # can fabricate a >200k long-context price tier for an
+                        # ordinary English transcript. Fail before generation
+                        # with an explicit, retryable preflight error instead.
+                        raise GeminiTokenPreflightError(
+                            exc,
+                            model=model,
+                            operation=operation,
+                            prompt_version=prompt_version,
+                            thinking_level=thinking_level,
+                            retryable=_transient_gemini_error(exc),
+                            status_code=_gemini_status_code(exc),
+                        ) from exc
+                    # countTokens receives the same system instruction, user
+                    # content, and response schema as generateContent. Its exact
+                    # result must choose the pricing tier without an artificial
+                    # post-count buffer that could push 199.5k over 200k.
+                    estimate_buffer_tokens = 0
                 else:
-                    estimated_text_tokens = request_bytes
+                    raise GeminiTokenPreflightError(
+                        TimeoutError("token preflight deadline unavailable"),
+                        model=model,
+                        operation=operation,
+                        prompt_version=prompt_version,
+                        thinking_level=thinking_level,
+                        retryable=True,
+                        status_code=None,
+                    )
             reserved = budget_reserve(
                 operation=operation,
                 model=model,
@@ -11587,7 +11660,7 @@ def _call_model(
                 prompt_text=prompt_text,
                 estimated_input_tokens=(
                     estimated_text_tokens
-                    + 1_000
+                    + estimate_buffer_tokens
                     + max(0, int(estimated_media_tokens))
                 ),
                 deadline_monotonic=deadline_monotonic,
@@ -12365,9 +12438,14 @@ def _flash_disable_reason() -> str | None:
 
 
 def _authoritative_pro(transcript: dict, settings: dict, topic: str, deadline: float,
-                       cancelled: CancelledCb, *, fallback: bool = False) -> SegmentResult:
+                       cancelled: CancelledCb, *, fallback: bool = False,
+                       budget_operation: str | None = None) -> SegmentResult:
     profile = PRO_BOUNDARY_PROFILE if fallback else AUTHORITATIVE_PRO_PROFILE
-    operation = "pro_fallback" if fallback else "pro_authoritative"
+    operation = budget_operation or (
+        "pro_fallback" if fallback else "pro_authoritative"
+    )
+    if operation not in {"pro_authoritative", "pro_fallback"}:
+        raise ValueError(f"Unsupported Pro budget operation: {operation}")
     runtime_settings = dict(settings)
     runtime_settings["_segment_operation"] = operation
     result = run_segment_profile(
@@ -12385,6 +12463,7 @@ def pro_boundary_fallback_detailed(
     *,
     topic: str = "",
     video_id: str = "",
+    budget_operation: str = "pro_fallback",
 ) -> SegmentResult:
     """Run the one aggregate, boundary-only Pro fallback on an existing transcript."""
     sink = settings.get("_segment_telemetry")
@@ -12405,6 +12484,7 @@ def pro_boundary_fallback_detailed(
         deadline,
         cancelled,
         fallback=True,
+        budget_operation=budget_operation,
     )
     result.route = "aggregate_pro_fallback"
     result.fallback_reasons = reasons

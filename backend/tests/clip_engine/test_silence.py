@@ -2007,11 +2007,54 @@ def test_decode_http_403_refreshes_once_through_next_route_without_refetching_wo
         "https://media.example/healthy.m4a",
     ]
     assert len(resolved_commands) == 2
-    assert "youtube:player_client=web_embedded;player_skip=webpage" in resolved_commands[1]
+    assert "youtube:player_client=web_embedded" in resolved_commands[1]
     assert fetch.call_count == 1
 
 
-def test_prepare_reuses_cookie_proxy_and_pot_configuration(tmp_path: Path, monkeypatch) -> None:
+def test_failed_media_refresh_preserves_safe_resolver_attempt_diagnostics(
+    tmp_path: Path,
+) -> None:
+    source = silence.PreparedAudioSource(
+        url="https://media.example/expired.m4a",
+        format_id="140",
+    )
+    attempt_reasons = (
+        "direct:default:cookies:youtube_bot_challenge",
+        "direct:web_embedded:cookieless:attempt_timeout",
+    )
+
+    def fail_refresh(_deadline, _cancel_check):
+        raise silence._Unavailable(
+            "resolve",
+            "youtube_bot_challenge",
+            attempt_reasons=attempt_reasons,
+        )
+
+    source._decode_state.configure_refresh(fail_refresh)
+    with mock.patch.object(
+        silence,
+        "_run_command",
+        side_effect=silence._Unavailable("decode", "media_http_403"),
+    ):
+        with pytest.raises(silence._Unavailable) as exc_info:
+            silence._decode_window(
+                source,
+                window_start_sec=0.0,
+                window_duration_sec=0.2,
+                output_path=tmp_path / "refresh-failed.wav",
+                ffmpeg_bin="ffmpeg",
+                deadline=time.monotonic() + 10.0,
+                cancel_check=None,
+            )
+
+    assert exc_info.value.reason == "media_http_403"
+    assert exc_info.value.attempt_reasons == attempt_reasons
+
+
+def test_prepare_uses_cookieless_mweb_proxy_and_pot_configuration(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     cookie_file = tmp_path / "cookies.txt"
     cookie_file.write_text("# Netscape HTTP Cookie File\n")
     monkeypatch.setenv("YT_COOKIES_FILE", str(cookie_file))
@@ -2035,12 +2078,15 @@ def test_prepare_reuses_cookie_proxy_and_pot_configuration(tmp_path: Path, monke
 
     assert result.ready
     command = run.call_args.args[0]
-    assert command[command.index("--cookies") + 1] == str(cookie_file)
+    assert "--cookies" not in command
+    assert "--cookies-from-browser" not in command
     assert command[command.index("--proxy") + 1] == "http://one.example:8080"
     assert command[command.index("--extractor-args") + 1] == (
         "youtubepot-bgutilhttp:base_url=http://pot.internal:4416"
     )
-    assert command[command.index("--impersonate") + 1] == "chrome"
+    assert "youtube:player_client=mweb" in command
+    assert "--impersonate" not in command
+    assert "--ignore-config" in command
     assert command[command.index("--format") + 1] == (
         "worstaudio[acodec!=none][vcodec=none]"
     )
@@ -2254,12 +2300,16 @@ def test_prepare_retries_bot_challenge_with_embedded_player(monkeypatch) -> None
 
     assert result.ready
     assert "youtube:player_client=web_embedded" not in commands[0]
-    assert (
-        "youtube:player_client=web_embedded;player_skip=webpage" in commands[1]
-    )
+    assert "youtube:player_client=web_embedded" in commands[1]
 
 
-def test_prepare_uses_mweb_when_pot_provider_is_configured(monkeypatch) -> None:
+def test_prepare_prefers_cookieless_mweb_pot_over_configured_cookies(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cookie_file = tmp_path / "cookies.txt"
+    cookie_file.write_text("# Netscape HTTP Cookie File\n")
+    monkeypatch.setenv("YT_COOKIES_FILE", str(cookie_file))
     monkeypatch.setattr(
         silence,
         "get_settings",
@@ -2276,7 +2326,43 @@ def test_prepare_uses_mweb_when_pot_provider_is_configured(monkeypatch) -> None:
 
     def fake_run(command, **_kwargs):
         commands.append(list(command))
-        if len(commands) == 1:
+        return payload, b""
+
+    with mock.patch.object(silence, "_run_command", side_effect=fake_run):
+        result = silence.prepare_audio_source("dQw4w9WgXcQ")
+
+    assert result.ready
+    assert len(commands) == 1
+    assert "--cookies" not in commands[0]
+    assert "--cookies-from-browser" not in commands[0]
+    assert "youtube:player_client=mweb" in commands[0]
+    assert "youtubepot-bgutilhttp:base_url=http://pot.internal:4416" in commands[0]
+
+
+def test_prepare_falls_back_across_distinct_provider_auth_profiles(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cookie_file = tmp_path / "cookies.txt"
+    cookie_file.write_text("# Netscape HTTP Cookie File\n")
+    monkeypatch.setenv("YT_COOKIES_FILE", str(cookie_file))
+    monkeypatch.setattr(
+        silence,
+        "get_settings",
+        lambda: mock.Mock(
+            proxy_urls="",
+            ytdlp_pot_provider_url="http://pot.internal:4416",
+        ),
+    )
+    payload = (
+        b'{"url":"https://media.example/audio.m4a","format_id":"251",'
+        b'"acodec":"opus","vcodec":"none","tbr":49.0}'
+    )
+    commands: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(list(command))
+        if len(commands) < 3:
             raise silence._Unavailable("resolve", "youtube_bot_challenge")
         return payload, b""
 
@@ -2284,8 +2370,12 @@ def test_prepare_uses_mweb_when_pot_provider_is_configured(monkeypatch) -> None:
         result = silence.prepare_audio_source("dQw4w9WgXcQ")
 
     assert result.ready
-    assert "youtube:player_client=mweb;player_skip=webpage" in commands[1]
-    assert "youtubepot-bgutilhttp:base_url=http://pot.internal:4416" in commands[1]
+    assert "youtube:player_client=mweb" in commands[0]
+    assert "--cookies" not in commands[0]
+    assert "youtube:player_client=" not in " ".join(commands[1])
+    assert commands[1][commands[1].index("--cookies") + 1] == str(cookie_file)
+    assert "youtube:player_client=web_embedded" in commands[2]
+    assert "--cookies" not in commands[2]
 
 
 def test_prepare_caps_route_plan_and_gives_each_attempt_viable_time(monkeypatch) -> None:
@@ -2320,7 +2410,7 @@ def test_prepare_caps_route_plan_and_gives_each_attempt_viable_time(monkeypatch)
     assert "http://two.example:8080" in commands[1]
     assert "--proxy" not in commands[2]
     assert (
-        "youtube:player_client=web_embedded;player_skip=webpage" in commands[2]
+        "youtube:player_client=web_embedded" in commands[2]
     )
 
 
@@ -2351,6 +2441,8 @@ def test_prepare_reserves_time_for_fallback_after_attempt_timeout(monkeypatch) -
 
 
 def test_prepare_preserves_actionable_reasons_across_failed_attempts(monkeypatch) -> None:
+    monkeypatch.delenv("YT_COOKIES_FILE", raising=False)
+    monkeypatch.delenv("YT_COOKIES_FROM_BROWSER", raising=False)
     monkeypatch.setattr(
         silence,
         "get_settings",
@@ -2367,8 +2459,8 @@ def test_prepare_preserves_actionable_reasons_across_failed_attempts(monkeypatch
     assert result.status == "unavailable"
     assert result.diagnostics["reason"] == "youtube_bot_challenge"
     assert result.diagnostics["attempt_reasons"] == [
-        "direct:default:youtube_bot_challenge",
-        "direct:web_embedded:process_failed",
+        "direct:default:cookieless:youtube_bot_challenge",
+        "direct:web_embedded:cookieless:process_failed",
     ]
 
 
@@ -2379,8 +2471,8 @@ def test_preparation_attempt_reasons_reach_boundary_diagnostics() -> None:
             "stage": "resolve",
             "reason": "youtube_bot_challenge",
             "attempt_reasons": [
-                "proxy:default:proxy_failed",
-                "direct:web_embedded:youtube_bot_challenge",
+                "proxy:default:cookies:proxy_failed",
+                "direct:web_embedded:cookieless:youtube_bot_challenge",
             ],
             "elapsed_ms": 123,
         },
@@ -2395,7 +2487,34 @@ def test_preparation_attempt_reasons_reach_boundary_diagnostics() -> None:
     assert result.diagnostics["prepare_elapsed_ms"] == 123
 
 
+def test_inline_resolution_attempt_reasons_reach_boundary_diagnostics(
+    monkeypatch,
+) -> None:
+    failure = silence._Unavailable(
+        "resolve",
+        "youtube_bot_challenge",
+        attempt_reasons=(
+            "direct:default:cookies:youtube_bot_challenge",
+            "direct:mweb:cookieless:youtube_bot_challenge",
+        ),
+    )
+    monkeypatch.setattr(
+        silence,
+        "_prepare_audio_source",
+        mock.Mock(side_effect=failure),
+    )
+
+    result = silence.verify_acoustic_boundaries(
+        "dQw4w9WgXcQ", 10.0, 20.0
+    )
+
+    assert result.status == "unavailable"
+    assert result.diagnostics["attempt_reasons"] == list(failure.attempt_reasons)
+
+
 def test_global_prepare_timeout_keeps_the_terminal_attempt_reason(monkeypatch) -> None:
+    monkeypatch.delenv("YT_COOKIES_FILE", raising=False)
+    monkeypatch.delenv("YT_COOKIES_FROM_BROWSER", raising=False)
     monkeypatch.setattr(
         silence,
         "get_settings",
@@ -2412,7 +2531,7 @@ def test_global_prepare_timeout_keeps_the_terminal_attempt_reason(monkeypatch) -
     assert result.status == "unavailable"
     assert result.diagnostics["reason"] == "deadline_exceeded"
     assert result.diagnostics["attempt_reasons"] == [
-        "direct:default:deadline_exceeded"
+        "direct:default:cookieless:deadline_exceeded"
     ]
 
 

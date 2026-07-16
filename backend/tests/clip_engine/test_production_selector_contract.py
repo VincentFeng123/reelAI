@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from backend import gemini_client
+from backend.app.clip_engine.errors import ProviderBudgetExceededError
 from backend.app.clip_engine.provider_runtime import GenerationContext
 from backend.pipeline import gemini_segment
 
@@ -175,6 +176,11 @@ def test_video_grounded_boundary_selector_sends_one_youtube_part_before_text(
         )
 
     monkeypatch.setattr(gemini_client, "generate_json_v3", fake_generate)
+    monkeypatch.setattr(
+        gemini_client,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 1_000,
+    )
 
     def reserve(**kwargs):
         reservations.append(kwargs)
@@ -233,8 +239,13 @@ def test_video_grounded_boundary_selector_sends_one_youtube_part_before_text(
         separators=(",", ":"),
     ).encode("utf-8"))
     text_estimate = math.ceil((len(prompt_text) + schema_bytes) / 3) + 1_000
+    expected_text_tokens = (
+        1_000
+        if profile == gemini_segment.PRO_BOUNDARY_PROFILE
+        else text_estimate
+    )
     assert reservation["estimated_input_tokens"] == (
-        text_estimate
+        expected_text_tokens
         + 600 * gemini_segment._LOW_RESOLUTION_VIDEO_TOKENS_PER_SECOND
     )
 
@@ -289,6 +300,11 @@ def test_long_video_pro_reservation_fails_before_provider_dispatch(
         gemini_client,
         "generate_json_v3",
         lambda *_args, **_kwargs: calls.append(True),
+    )
+    monkeypatch.setattr(
+        gemini_client,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 1_000,
     )
 
     result = gemini_segment.run_segment_profile(
@@ -350,6 +366,11 @@ def test_long_preferred_video_url_dispatches_one_pro_transcript_only_call(
         )
 
     monkeypatch.setattr(gemini_client, "generate_json_v3", fake_generate)
+    monkeypatch.setattr(
+        gemini_client,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 40_000,
+    )
     segments = [
         {
             "cue_id": f"supadata-cue-{index}",
@@ -449,8 +470,10 @@ def test_no_space_unicode_transcript_cannot_cross_long_context_price_tier(
     assert calls == []
     assert result.clips == []
     assert result.classification_reasons == [
-        "request_failure:ProviderBudgetExceededError"
+        "request_failure:GeminiTokenPreflightError"
     ]
+    assert result.calls[0]["retryable"] is False
+    assert result.calls[0]["token_preflight_failed"] is True
     budget = context.budget.snapshot()["gemini"]
     assert budget["selector_calls"] == 0
     assert budget["cost_exposure_usd"] == 0.0
@@ -507,7 +530,103 @@ def test_exact_token_preflight_admits_affordable_long_unicode_text(
     assert len(token_counts) == len(calls) == 1
     assert token_counts[0]["model"] == "gemini-3.1-pro-preview"
     assert token_counts[0]["schema"] is gemini_segment._BoundaryPlan
-    assert reservations[0]["estimated_input_tokens"] == 61_000
+    assert reservations[0]["estimated_input_tokens"] == 60_000
+
+
+def test_exact_token_preflight_does_not_push_affordable_prompt_into_long_context_tier(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("slow", generation_id="selector-exact-tier")
+    reservations: list[dict] = []
+    calls: list[dict] = []
+
+    monkeypatch.setattr(
+        gemini_client,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 199_500,
+    )
+
+    def generate(_system, _user, _schema, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            text='{"topics": []}',
+            telemetry={
+                "model": kwargs["model"],
+                "prompt_tokens": 199_500,
+                "candidate_tokens": 10,
+                "thought_tokens": 10,
+                "total_tokens": 199_520,
+            },
+        )
+
+    monkeypatch.setattr(gemini_client, "generate_json_v3", generate)
+
+    parsed, _call = gemini_segment._call_model(
+        "system",
+        "x" * 200_000,
+        gemini_segment._BoundaryPlan,
+        model="gemini-3.1-pro-preview",
+        thinking_level="medium",
+        max_output_tokens=100,
+        timeout_s=30.0,
+        deadline_monotonic=time.monotonic() + 10.0,
+        operation="pro_authoritative",
+        prompt_version=gemini_segment.PRO_BOUNDARY_PROFILE,
+        cancelled=None,
+        budget_reserve=lambda **payload: (
+            reservations.append(payload)
+            or context.reserve_gemini_call(**payload)
+        ),
+        budget_reconcile=context.reconcile_gemini_call,
+        max_retries=0,
+    )
+
+    assert parsed.topics == []
+    assert len(calls) == len(reservations) == 1
+    assert reservations[0]["estimated_input_tokens"] == 199_500
+    assert context.budget.snapshot()["gemini"]["committed_cost_usd"] == pytest.approx(
+        (199_500 * 2.0 + 20 * 12.0) / 1_000_000.0
+    )
+
+
+def test_exact_preflight_prevents_high_entropy_text_from_exceeding_fast_ceiling(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("fast", generation_id="selector-high-entropy")
+    generated: list[object] = []
+    monkeypatch.setattr(
+        gemini_client,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 198_000,
+    )
+    monkeypatch.setattr(
+        gemini_client,
+        "generate_json_v3",
+        lambda *_args, **_kwargs: generated.append(True),
+    )
+
+    with pytest.raises(ProviderBudgetExceededError):
+        gemini_segment._call_model(
+            "system",
+            "x" * 70_000,
+            gemini_segment._BoundaryPlan,
+            model="gemini-3.1-pro-preview",
+            thinking_level="medium",
+            max_output_tokens=6_000,
+            timeout_s=30.0,
+            deadline_monotonic=time.monotonic() + 10.0,
+            operation="pro_authoritative",
+            prompt_version=gemini_segment.PRO_BOUNDARY_PROFILE,
+            cancelled=None,
+            budget_reserve=context.reserve_gemini_call,
+            budget_reconcile=context.reconcile_gemini_call,
+            max_retries=0,
+        )
+
+    assert generated == []
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["selector_calls"] == 0
+    assert budget["cost_exposure_usd"] == 0.0
 
 
 def test_preferred_video_url_failure_never_dispatches_a_media_retry(

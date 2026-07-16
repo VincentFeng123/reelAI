@@ -389,8 +389,9 @@ class GenerationBudget:
                     "lifetime_reserved_worst_case_cost_usd": round(
                         self._gemini_reserved_cost_usd, 8
                     ),
-                    # Compatibility alias. This is cumulative reservation
-                    # history, not a charge or the current admission exposure.
+                    # Compatibility alias for cumulative historical maxima.
+                    # It is a reservation diagnostic, never billed spend; use
+                    # cost_exposure_usd for the current admission exposure.
                     "reserved_cost_usd": round(self._gemini_reserved_cost_usd, 8),
                     "settled_cost_exposure_usd": round(
                         self._gemini_committed_cost_usd, 8
@@ -945,6 +946,7 @@ class GenerationContext:
             "provider_error_type",
             "provider_status_code",
             "retryable",
+            "token_preflight_failed",
             "error_history",
             "failover_from_model",
             "failover_model",
@@ -1078,6 +1080,7 @@ class GenerationContext:
         cache_hits = sum(
             1 for row in records if bool((row.get("metadata") or {}).get("cache_hit"))
         )
+        budget_snapshot = self.budget.snapshot()["gemini"]
         summary = {
             "gemini_calls": len(gemini_calls),
             "gemini_attempts": sum(
@@ -1108,7 +1111,17 @@ class GenerationContext:
                 for row in gemini_calls
             ),
             "estimated_cost_usd": round(estimated_cost, 8),
-            "reserved_worst_case_cost_usd": self.budget.snapshot()["gemini"][
+            "current_cost_exposure_usd": budget_snapshot[
+                "cost_exposure_usd"
+            ],
+            "cost_limit_usd": budget_snapshot["cost_limit_usd"],
+            # Compatibility alias for lifetime reservation history. It can
+            # exceed the job ceiling after sequential calls and is not spend;
+            # current_cost_exposure_usd is the active bounded value.
+            "reserved_worst_case_cost_usd": budget_snapshot[
+                "lifetime_reserved_worst_case_cost_usd"
+            ],
+            "lifetime_reserved_worst_case_cost_usd": budget_snapshot[
                 "lifetime_reserved_worst_case_cost_usd"
             ],
             "billing_unknown_calls": sum(

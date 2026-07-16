@@ -78,6 +78,7 @@ class _SourceDecodeState:
         self.refreshing = False
         self.refresh_used = False
         self.terminal_reason = ""
+        self.terminal_attempt_reasons: tuple[str, ...] = ()
 
     def configure_initial(self, source: PreparedAudioSource) -> None:
         with self.condition:
@@ -91,9 +92,9 @@ class _SourceDecodeState:
         with self.condition:
             self.refresh_callback = callback
 
-    def failure(self) -> str:
+    def failure(self) -> tuple[str, tuple[str, ...]]:
         with self.condition:
-            return self.terminal_reason
+            return self.terminal_reason, self.terminal_attempt_reasons
 
     def trip(self, reason: str) -> None:
         with self.condition:
@@ -104,7 +105,11 @@ class _SourceDecodeState:
     def snapshot(self) -> tuple[PreparedAudioSource, int]:
         with self.condition:
             if self.terminal_reason:
-                raise _Unavailable("decode", self.terminal_reason)
+                raise _Unavailable(
+                    "decode",
+                    self.terminal_reason,
+                    attempt_reasons=self.terminal_attempt_reasons,
+                )
             if self.active_source is None:
                 raise _Unavailable("decode", "media_route_unavailable")
             return self.active_source, self.generation
@@ -121,7 +126,11 @@ class _SourceDecodeState:
         while True:
             with self.condition:
                 if self.terminal_reason:
-                    raise _Unavailable("decode", self.terminal_reason)
+                    raise _Unavailable(
+                        "decode",
+                        self.terminal_reason,
+                        attempt_reasons=self.terminal_attempt_reasons,
+                    )
                 if self.generation != failed_generation:
                     return
                 if not self.refreshing:
@@ -140,12 +149,17 @@ class _SourceDecodeState:
 
         try:
             refreshed = callback(deadline, cancel_check)
-        except _Unavailable:
+        except _Unavailable as exc:
             with self.condition:
                 self.refreshing = False
                 self.terminal_reason = reason
+                self.terminal_attempt_reasons = tuple(exc.attempt_reasons)
                 self.condition.notify_all()
-            raise _Unavailable("decode", reason) from None
+            raise _Unavailable(
+                "decode",
+                reason,
+                attempt_reasons=exc.attempt_reasons,
+            ) from None
         except Exception:
             with self.condition:
                 self.refreshing = False
@@ -626,17 +640,27 @@ def _proxy_url() -> str:
     return next(iter(_proxy_urls()), "")
 
 
+def _yt_dlp_cookie_args() -> list[str]:
+    cookie_file = str(os.environ.get("YT_COOKIES_FILE") or "").strip()
+    if cookie_file and os.path.isfile(cookie_file):
+        return ["--cookies", cookie_file]
+    browser = str(os.environ.get("YT_COOKIES_FROM_BROWSER") or "").strip()
+    return ["--cookies-from-browser", browser] if browser else []
+
+
 def _yt_dlp_command(
     watch_url: str,
     *,
     proxy_url: str | None = None,
     player_client: str = "default",
+    use_cookies: bool = True,
 ) -> list[str]:
     settings = get_settings()
     command = [
         sys.executable,
         "-m",
         "yt_dlp",
+        "--ignore-config",
         "--dump-single-json",
         "--skip-download",
         "--no-playlist",
@@ -649,18 +673,11 @@ def _yt_dlp_command(
         "--fragment-retries",
         "1",
         "--no-remote-components",
-        "--impersonate",
-        "chrome",
         "--format",
         "worstaudio[acodec!=none][vcodec=none]",
     ]
-    cookie_file = str(os.environ.get("YT_COOKIES_FILE") or "").strip()
-    if cookie_file and os.path.isfile(cookie_file):
-        command.extend(["--cookies", cookie_file])
-    else:
-        browser = str(os.environ.get("YT_COOKIES_FROM_BROWSER") or "").strip()
-        if browser:
-            command.extend(["--cookies-from-browser", browser])
+    if use_cookies:
+        command.extend(_yt_dlp_cookie_args())
     proxy = _proxy_url() if proxy_url is None else proxy_url
     if proxy:
         command.extend(["--proxy", proxy])
@@ -673,7 +690,7 @@ def _yt_dlp_command(
         command.extend(
             [
                 "--extractor-args",
-                f"youtube:player_client={player_client};player_skip=webpage",
+                f"youtube:player_client={player_client}",
             ]
         )
     command.append(watch_url)
@@ -728,7 +745,7 @@ def _prepare_audio_source(
     deadline: float,
     cancel_check: CancelCheck | None,
     language: str = "en",
-    excluded_attempts: frozenset[tuple[str, str]] = frozenset(),
+    excluded_attempts: frozenset[tuple[str, str, bool]] = frozenset(),
     configure_refresh: bool = True,
     fetch_lexical: bool = True,
 ) -> PreparedAudioSource:
@@ -745,25 +762,33 @@ def _prepare_audio_source(
         default_routes = [configured_routes[0], ""]
     else:
         default_routes = configured_routes[:2]
-    attempts: list[tuple[str, str]] = [
-        (route, "default") for route in default_routes
+    primary_client = "mweb" if provider_configured else "default"
+    cookies_available = bool(_yt_dlp_cookie_args())
+    primary_uses_cookies = bool(not provider_configured and cookies_available)
+    attempts: list[tuple[str, str, bool]] = [
+        (route, primary_client, primary_uses_cookies)
+        for route in default_routes
     ]
     fallback_profiles = (
-        ("mweb", "web_embedded")
+        (("default", cookies_available), ("web_embedded", False))
         if provider_configured
-        else ("web_embedded",)
+        else (("web_embedded", False),)
     )
-    for profile in fallback_profiles:
+    for profile, use_cookies in fallback_profiles:
         if len(attempts) >= 3:
             break
-        attempts.append(("", profile))
+        # Public educational videos use the recommended cookieless mweb+POT
+        # route first. Keep one bounded cookie-backed default fallback for
+        # account-gated media, plus a cookieless embedded-client fallback when
+        # the three-attempt cap leaves room.
+        attempts.append(("", profile, use_cookies))
     attempts = [
         attempt for attempt in attempts[:3] if attempt not in excluded_attempts
     ]
     if not attempts:
         raise _Unavailable("resolve", "media_route_exhausted")
     attempt_reasons: list[str] = []
-    for attempt_index, (proxy, player_client) in enumerate(attempts):
+    for attempt_index, (proxy, player_client, use_cookies) in enumerate(attempts):
         try:
             remaining = _remaining(deadline, "resolve")
             attempts_left = len(attempts) - attempt_index
@@ -773,6 +798,7 @@ def _prepare_audio_source(
                     watch_url,
                     proxy_url=proxy,
                     player_client=player_client,
+                    use_cookies=use_cookies,
                 ),
                 deadline=attempt_deadline,
                 cancel_check=cancel_check,
@@ -875,7 +901,8 @@ def _prepare_audio_source(
                 else:
                     reason = "attempt_timeout"
             route = "proxy" if proxy else "direct"
-            attempt_reasons.append(f"{route}:{player_client}:{reason}")
+            auth = "cookies" if use_cookies else "cookieless"
+            attempt_reasons.append(f"{route}:{player_client}:{auth}:{reason}")
             if reason == "deadline_exceeded":
                 break
 
@@ -978,9 +1005,13 @@ def _decode_window(
 ) -> None:
     source_acquired = False
     while not source_acquired:
-        terminal_reason = source._decode_state.failure()
+        terminal_reason, terminal_attempt_reasons = source._decode_state.failure()
         if terminal_reason:
-            raise _Unavailable("decode", terminal_reason)
+            raise _Unavailable(
+                "decode",
+                terminal_reason,
+                attempt_reasons=terminal_attempt_reasons,
+            )
         if _is_cancelled(cancel_check):
             raise _Unavailable("decode", "cancelled")
         remaining = _remaining(deadline, "decode")
@@ -997,9 +1028,15 @@ def _decode_window(
             failure: _Unavailable | None = None
             try:
                 while not global_acquired:
-                    terminal_reason = source._decode_state.failure()
+                    terminal_reason, terminal_attempt_reasons = (
+                        source._decode_state.failure()
+                    )
                     if terminal_reason:
-                        raise _Unavailable("decode", terminal_reason)
+                        raise _Unavailable(
+                            "decode",
+                            terminal_reason,
+                            attempt_reasons=terminal_attempt_reasons,
+                        )
                     if _is_cancelled(cancel_check):
                         raise _Unavailable("decode", "cancelled")
                     remaining = _remaining(deadline, "decode")
@@ -1769,6 +1806,11 @@ def verify_acoustic_boundaries(
             stage=exc.stage,
             reason=exc.reason,
             started=started,
+            extra=(
+                {"attempt_reasons": list(exc.attempt_reasons)}
+                if exc.attempt_reasons
+                else None
+            ),
         )
     except Exception:
         return _unavailable(

@@ -334,6 +334,43 @@ def test_pro_reservation_applies_long_context_tier_before_dispatch() -> None:
     assert context.budget.snapshot()["gemini"]["pro_selector_calls"] == 1
 
 
+def test_current_cost_diagnostics_do_not_report_lifetime_reservations_as_spend() -> None:
+    context = GenerationContext("slow", generation_id="job-reservation-history")
+
+    for _ in range(3):
+        reservation = context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=95_000,
+            max_output_tokens=6_000,
+        )
+        context.record_gemini(
+            attempt=1,
+            model_used="gemini-3.1-pro-preview",
+            quality_degraded=False,
+            stage="selection",
+            usage={
+                **reservation,
+                "prompt_tokens": 10_000,
+                "candidate_tokens": 500,
+                "thought_tokens": 500,
+                "total_tokens": 11_000,
+                "dispatched": True,
+            },
+        )
+
+    budget = context.budget.snapshot()["gemini"]
+    summary = context.usage_payload()["summary"]
+    assert budget["lifetime_reserved_worst_case_cost_usd"] == pytest.approx(0.786)
+    assert budget["reserved_cost_usd"] == pytest.approx(0.786)
+    assert budget["cost_exposure_usd"] == pytest.approx(0.096)
+    assert summary["reserved_worst_case_cost_usd"] == pytest.approx(0.786)
+    assert summary["lifetime_reserved_worst_case_cost_usd"] == pytest.approx(0.786)
+    assert summary["estimated_cost_usd"] == pytest.approx(0.096)
+    assert summary["current_cost_exposure_usd"] == pytest.approx(0.096)
+    assert summary["cost_limit_usd"] == pytest.approx(0.70)
+
+
 @pytest.mark.parametrize(
     ("mode", "selector_count"),
     [("fast", 2), ("slow", 3)],

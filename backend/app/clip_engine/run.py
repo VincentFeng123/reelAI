@@ -21,6 +21,7 @@ from .errors import (
     UnsupportedURLError,
 )
 from .metadata import extract_video_id
+from .provider_runtime import GenerationContext
 
 
 def is_valid_timestamped_supadata_transcript(transcript: dict) -> bool:
@@ -174,6 +175,14 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
     if not video_id:
         raise UnsupportedURLError(f"Not a recognized YouTube URL: {url}")
     settings = dict(settings or {})
+    if not (settings.get("generation_context") or settings.get("provider_context")):
+        # Every production-facing clip invocation needs the same pre-dispatch
+        # token and cost guard. Callers with a multi-source job pass a shared
+        # context; isolated/legacy callers receive a bounded local one.
+        settings["generation_context"] = GenerationContext(
+            "fast",
+            generation_id=f"clip:{video_id}",
+        )
     settings.setdefault("segment_fine_snap", config.SEGMENT_FINE_SNAP)
     # Candidates are independently gated; one weak proposal must not poison others.
     settings.setdefault("segment_accept_partial_flash", True)
@@ -319,6 +328,14 @@ def pro_boundary_fallback(
     """Run aggregate Pro selection without retrieving or re-timestamping transcript data."""
     raise_if_cancelled(should_cancel)
     runtime_settings = dict(settings or {})
+    if not (
+        runtime_settings.get("generation_context")
+        or runtime_settings.get("provider_context")
+    ):
+        runtime_settings["generation_context"] = GenerationContext(
+            "fast",
+            generation_id=f"boundary:{video_id}",
+        )
     runtime_settings["should_cancel"] = should_cancel
     runtime_settings["_segment_routing_mode"] = "pro_only"
     runtime_settings["_segment_video_url"] = (
@@ -336,6 +353,10 @@ def pro_boundary_fallback(
         runtime_settings,
         topic=topic,
         video_id=video_id,
+        # This adapter is an explicit standalone selector, not the disabled
+        # automatic hybrid fallback. It uses the ordinary bounded selector slot
+        # while retaining the boundary-only prompt.
+        budget_operation="pro_authoritative",
     )
     clips = list(result.clips)
     for clip in clips:
