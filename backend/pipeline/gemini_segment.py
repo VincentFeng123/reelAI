@@ -1655,7 +1655,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v1"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v2"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v3"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -2204,6 +2204,12 @@ def _topic_rule(topic: str) -> str:
         "requested result. A history, definition, formula recital, prerequisite, alternate "
         "example, or general concept explanation alone does not fulfill that request. Include "
         "necessary setup inside the qualifying span, but do not return it as a separate clip. "
+        "Treat a named mathematical function, equation, expression, chemical formula, code "
+        "identifier, or other structured object as atomic. Any added, removed, or changed "
+        "term, coefficient, exponent, sign, constant, variable, or condition makes it a "
+        "different object. Do not accept a different object merely because it produces the "
+        "same requested outcome. For a request about f(x)=x squared, examples using x squared "
+        "minus three, x squared plus x, two x squared, or x cubed do not qualify. "
         "Shared vocabulary, a loose analogy, or general systems thinking is not request "
         "fulfillment."
         " Exclude fictional, supernatural, pseudoscientific, or invented mechanisms unless "
@@ -2322,6 +2328,9 @@ def _compact_output_guide() -> str:
   request_intent constraint_id. Each q must be an exact consecutive 5-16-word quote inside
   the candidate proving that fulfillment. If any required constraint cannot be evidenced,
   do not return the topic. ie proves complete request fit; cq independently proves teaching.
+  For a named expression or formula, q must include its complete spoken expression, including
+  trailing terms; a prefix such as "x squared" cannot evidence "x squared minus three" as an
+  exact x-squared object.
   When a format constraint spans multiple transformations, q anchors that ordered sequence;
   verify every requested transformation across the entire sq-through-eq span. One q never
   replaces the whole-span completeness check.
@@ -2356,6 +2365,8 @@ The earlier five x minus four example is a different objective: do not include i
 return it as a separate clip. Begin at the x-squared setup in line 41 and end at its final
 two-x result in line 45. Lines 42-44 are required reasoning, so never replace them with a
 formula-only clip, a summary, another function, or a general derivative explanation.
+An x-squared-minus-three example is also a different function and does not qualify, even
+though its derivative also simplifies to two x.
 Example output boundaries: s=41, e=45, sq="Let f of x equal x squared",
 eq="the derivative of x squared is two x". The topic's ie must evidence the named function,
 limit-definition task, algebra-step requirement, and final two-x outcome.
@@ -2456,6 +2467,9 @@ def _boundary_prompts(
         "Together the source phrases must cover every content-bearing request term. Preserve "
         "named subjects, requested operations or tasks, relationships, scope qualifiers, "
         "formats, and outcomes. Do not substitute retrieval expansions or a broader topic. "
+        "When a request contains a function, equation, expression, formula, identifier, or "
+        "other structured object, keep the complete object in one atomic constraint; never "
+        "reduce it to one shared term. "
         "Treat course, exam, grade, learner-level, and curriculum labels as scope constraints, "
         "not spoken subject constraints; the exact request and supplied transcript establish "
         "those qualifiers. Words such as 'every', 'each', 'all', 'step-by-step', 'including "

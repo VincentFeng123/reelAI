@@ -1380,6 +1380,13 @@ def test_specific_request_prompt_excludes_partial_supporting_units_and_prior_exa
     assert "the earlier five x minus four example" in normalized.casefold()
     assert "begin at the x-squared setup" in normalized.casefold()
     assert "end at its final two-x result" in normalized.casefold()
+    assert "x-squared-minus-three example is also a different function" in (
+        normalized.casefold()
+    )
+    assert "different object merely because it produces the same requested outcome" in (
+        normalized.casefold()
+    )
+    assert "q must include its complete spoken expression" in normalized.casefold()
     assert "one q never" in normalized.casefold()
     assert "whole-span completeness check" in normalized.casefold()
 
@@ -5004,6 +5011,7 @@ def test_selector_prompt_is_exhaustive_and_requires_full_constrained_request() -
     assert "each returned unit must contain grounded evidence" in user
     assert "every required non-scope constraint" in user
     assert "do not return it as a separate clip" in user
+    assert "keep the complete object in one atomic constraint" in user
     assert "every distinct educational unit" in user
     assert "whole transcript" in (_system + user).lower()
     assert (
