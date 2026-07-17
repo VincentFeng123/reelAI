@@ -2061,6 +2061,863 @@ def test_trusted_live_acceleration_candidate_advances_to_its_mass_setup() -> Non
     )
 
 
+def test_trusted_live_second_law_intro_starts_at_the_named_law_handoff() -> None:
+    segments = [
+        {
+            "cue_id": "pL2YfC-22Uc:cue:3",
+            "start": 98.84,
+            "end": 149.84,
+            "text": (
+                "force. Newton's first law of motion is also known as the law of "
+                "inertia. If we apply a force to the smaller object, it's"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:4",
+            "start": 147.36,
+            "end": 181.04,
+            "text": (
+                "going to be relatively easy to move. The larger object has more "
+                "inertia. It's going to resist any changes in motion that you try "
+                "to apply to it."
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:5",
+            "start": 179.599,
+            "end": 186.08,
+            "text": (
+                "Now the next law that you need to be familiar with is Newton's second"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:6",
+            "start": 188.519,
+            "end": 246.56,
+            "text": (
+                "law. Newton's second law is basically this equation. Force is equal "
+                "to mass time acceleration. And this of course is the net force. So "
+                "let's say if you have a mass of 5 kg and the acceleration on it is "
+                "2 m/s squared. The force is 10 newtons and this is the net force. "
+                "A newton is equivalent to 1 kilogram times a meter over second squ. "
+                "It turns out that the newton is not the only unit for force."
+            ),
+        },
+    ]
+    claim = "Force is equal to mass time acceleration"
+    plan = _compact_custom_plan(
+        request="Newton's second law F=ma",
+        start_quote="going to be relatively easy to",
+        end_quote=(
+            "A newton is equivalent to 1 kilogram times a meter over second squ."
+        ),
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "newtons-second-law-intro",
+            "start_line": 1,
+            "end_line": 3,
+            "title": "Newton's Second Law & Units",
+            "learning_objective": (
+                "Define Newton's second law, net force, and the units of force."
+            ),
+            "facet": "Definition and Units",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:5"
+    assert clip["start_quote"] == "Now the next law that you"
+    assert clip["_clip_text"].startswith("Now the next law that you need")
+    assert "going to be relatively easy" not in clip["_clip_text"]
+
+
+def test_trusted_live_acceleration_candidate_completes_both_people() -> None:
+    raw_cues = [
+        (
+            14,
+            513.279,
+            527.839,
+            "Newton's third law of motion states that for every action force there "
+            "is an equal but opposite reaction force. So let's say if you have two people",
+        ),
+        (
+            15,
+            530.36,
+            573.04,
+            "skating I'm just going to draw stick figures and one person has more "
+            "mass than the other person. So if the smaller person applies a force "
+            "of 100 newtons on the larger person, what force will the larger person "
+            "apply on the smaller person? According to Newton's third law, the forces "
+            "are always the",
+        ),
+        (
+            16,
+            570.92,
+            614.72,
+            "same. Now, let's say if the mass of the smaller person is 50 kg and the "
+            "mass of the larger person is 100 kg, who experiences the greater "
+            "acceleration? and who's going to move further. Let's say if they're on ice.",
+        ),
+        (
+            17,
+            612.279,
+            657.519,
+            "However, the acceleration is not the same. If you use the equation F is "
+            "equal to mA, the force acting on a smaller person is 100 and he has a "
+            "mass of 50 kg. So solving for the acceleration, you can see that he's "
+            "going to experience an acceleration of 2 m/s squared. Now the person on "
+            "the right, he's going to experience a small acceleration because he has "
+            "a larger mass. So using equation F is equal to",
+        ),
+        (
+            18,
+            654.2,
+            693.68,
+            "mA he experiences a force of 100 but since he has a mass of 100 the "
+            "acceleration is going to be one. So because he experiences a small "
+            "acceleration he's not going to move very far. the smaller person, he's "
+            "going to move a lot further than the larger person because he's smaller "
+            "and he experiences a greater acceleration. And the larger person,",
+        ),
+        (
+            19,
+            689.839,
+            738.959,
+            "he's not going to move back very much since he experiences a smaller "
+            "acceleration. Another example of Newton's second law uses gravity.",
+        ),
+    ]
+    segments = [
+        {
+            "cue_id": f"pL2YfC-22Uc:cue:{cue}",
+            "start": start,
+            "end": end,
+            "text": text,
+        }
+        for cue, start, end, text in raw_cues
+    ]
+    claim = (
+        "solving for the acceleration, you can see that he's going to experience "
+        "an acceleration"
+    )
+    plan = _compact_custom_plan(
+        request="Newton's second law F=ma",
+        start_quote="skating I'm just going to draw",
+        end_quote="he's going to experience an acceleration of 2 m/s squared.",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "solving-acceleration-fma",
+            "start_line": 1,
+            "end_line": 3,
+            "title": "Calculating Acceleration from Force",
+            "learning_objective": (
+                "Use Newton's second law to solve for acceleration given mass and force."
+            ),
+            "facet": "Solving for acceleration",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:16"
+    assert clip["start_quote"] == "Now, let's say if the mass"
+    assert clip["end_cue_id"] == "pL2YfC-22Uc:cue:19"
+    assert clip["end_quote"] == "since he experiences a smaller acceleration."
+    assert "acceleration is going to be one" in clip["_clip_text"]
+    assert "Another example" not in clip["_clip_text"]
+
+
+def test_trusted_live_multi_block_candidate_keeps_question_and_answer() -> None:
+    raw_cues = [
+        (
+            121,
+            4405.88,
+            4447.719,
+            "Finish the previous tension problem and then plug this into the second "
+            "equation so that you can get either t1 or t2 by itself. And",
+        ),
+        (
+            122,
+            4446.159,
+            4503.679,
+            "then you could solve it. Here's a question for you. Let's say if you have "
+            "two blocks next to each other. Block A has a mass of 20 kg and block B "
+            "has a mass of 10 kg. Let's say if we exert a force on block A of 90 "
+            "newtons. So here's the question. What is the force that A exerts on B? "
+            "And what is the force that B exerts on A? This problem is similar to "
+            "what we just did. We have a bunch of",
+        ),
+        (
+            123,
+            4500.92,
+            4541.28,
+            "blocks connected by ropes along a horizontal surface. Let's find the net "
+            "acceleration. The net force is 90. That's the total force that we're "
+            "applying. The total mass is 30 kg. So the acceleration is 3 m/s squared.",
+        ),
+        (
+            124,
+            4544.04,
+            4599.92,
+            "Now let's find the net force on each block. The net force acted on block A "
+            "is 20 * 3 which is 60 newtons. The net force acted on block B is m * A "
+            "10 * 3 which is 30 newtons. So now let's focus on block A. There is a "
+            "force of 30 newtons that is",
+        ),
+        (
+            125,
+            4596.12,
+            4644.159,
+            "opposing A. The only force that propels B to the right is the force that A "
+            "exerts on B which is 30 newtons. B slows down A by 30 newtons. So B",
+        ),
+        (
+            126,
+            4640.04,
+            4681.159,
+            "exerts 30 newtons on A and A exerts 30 newtons on B. These forces are "
+            "equal and opposite. They have the same magnitude but the direction is opposite",
+        ),
+        (
+            127,
+            4678.8,
+            4720.0,
+            "to each other. And so if two forces act at an angle, here's another example.",
+        ),
+    ]
+    segments = [
+        {
+            "cue_id": f"pL2YfC-22Uc:cue:{cue}",
+            "start": start,
+            "end": end,
+            "text": text,
+        }
+        for cue, start, end, text in raw_cues
+    ]
+    claim = "The net force is 90. That's the total force that we're applying"
+    plan = _compact_custom_plan(
+        request="Newton's second law F=ma",
+        start_quote="blocks connected by ropes along a",
+        end_quote=(
+            "The net force acted on block B is m * A 10 * 3 which is 30 newtons."
+        ),
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "solving-net-force-fma",
+            "start_line": 2,
+            "end_line": 3,
+            "title": "Finding Net Force on Multiple Blocks",
+            "learning_objective": (
+                "Calculate net acceleration and individual net forces for a "
+                "multi-block system using F=ma."
+            ),
+            "facet": "Solving for net force",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:122"
+    assert clip["start_quote"] == "Here's a question for you"
+    assert clip["end_cue_id"] == "pL2YfC-22Uc:cue:127"
+    assert clip["end_quote"] == "to each other."
+    assert "Block A has a mass of 20 kg" in clip["_clip_text"]
+    assert "A exerts 30 newtons on B" in clip["_clip_text"]
+    assert "another example" not in clip["_clip_text"]
+
+
+def test_trusted_live_force_fragment_starts_at_same_cue_sentence() -> None:
+    segments = [
+        {
+            "cue_id": "3EbUa5ZDybg:cue:129",
+            "start": 296.91,
+            "end": 298.59,
+            "text": "familiar with a few of the vectors we",
+        },
+        {
+            "cue_id": "3EbUa5ZDybg:cue:130",
+            "start": 298.59,
+            "end": 301.2,
+            "text": "will commonly use in physics. An object",
+        },
+        {
+            "cue_id": "3EbUa5ZDybg:cue:131",
+            "start": 301.2,
+            "end": 310.0,
+            "text": (
+                "at rest on a flat surface experiences gravity and a normal force. "
+                "If an applied force acts forward, friction acts backward."
+            ),
+        },
+        {
+            "cue_id": "3EbUa5ZDybg:cue:132",
+            "start": 310.0,
+            "end": 324.0,
+            "text": (
+                "When the applied force exceeds the maximum friction, the object will "
+                "accelerate in the direction of the applied force."
+            ),
+        },
+        {
+            "cue_id": "3EbUa5ZDybg:cue:146",
+            "start": 324.0,
+            "end": 338.789,
+            "text": (
+                "The friction vector will oppose its forward motion."
+            ),
+        },
+    ]
+    claim = (
+        "applied force exceeds the maximum friction, the object will accelerate"
+    )
+    plan = _compact_custom_plan(
+        request="forces causing acceleration",
+        start_quote="will commonly use in physics. An",
+        end_quote="oppose its forward motion.",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "acceleration-unbalanced-forces",
+            "start_line": 1,
+            "end_line": 4,
+            "title": "Applied Forces and Acceleration",
+            "learning_objective": (
+                "Explain how an applied force that exceeds opposing friction causes "
+                "acceleration."
+            ),
+            "facet": "forces causing acceleration",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "3EbUa5ZDybg:cue:130"
+    assert clip["start_quote"] == "An object"
+    assert clip["_clip_text"].startswith("An object at rest")
+    assert "will commonly use in physics" not in clip["_clip_text"]
+
+
+@pytest.mark.parametrize("large_gap", [False, True])
+def test_named_teaching_handoff_requires_anchor_and_contiguity(
+    large_gap: bool,
+) -> None:
+    handoff_start = 10.0 if large_gap else 2.0
+    named_subject = "Newton's second law" if large_gap else "thermodynamics"
+    segments = [
+        {
+            "cue_id": "named-guard:cue:0",
+            "start": 0.0,
+            "end": 2.0,
+            "text": "The previous idea is complete.",
+        },
+        {
+            "cue_id": "named-guard:cue:1",
+            "start": handoff_start,
+            "end": handoff_start + 2.0,
+            "text": (
+                f"Now the next law that we will study is {named_subject}."
+            ),
+        },
+        {
+            "cue_id": "named-guard:cue:2",
+            "start": handoff_start + 2.0,
+            "end": handoff_start + 5.0,
+            "text": "Force is equal to mass time acceleration.",
+        },
+    ]
+    claim = "Force is equal to mass time acceleration"
+    claim_location = gemini_segment._unique_evidence_location(
+        segments,
+        claim,
+        0,
+        2,
+    )
+    assert claim_location is not None
+
+    assert gemini_segment._trusted_named_teaching_handoff_start(
+        segments,
+        search_start_line=0,
+        claim_location=claim_location,
+        anchor_text="Newton's second law force mass acceleration",
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "handoff",
+    [
+        (
+            "The next law after Newton's second law is Newton's third law."
+        ),
+        (
+            "We already covered the next law yesterday. Newton's second law "
+            "relates force, mass, and acceleration."
+        ),
+        (
+            "The next law is Newton's third law, but this formula is Newton's "
+            "second law."
+        ),
+    ],
+    ids=[
+        "wrong-introduced-unit",
+        "mid-sentence-handoff",
+        "multiple-named-units",
+    ],
+)
+def test_named_teaching_handoff_does_not_use_incidental_anchor_words(
+    handoff: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "named-subject-guard:cue:0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": handoff,
+        },
+        {
+            "cue_id": "named-subject-guard:cue:1",
+            "start": 4.0,
+            "end": 8.0,
+            "text": "Force is equal to mass times acceleration.",
+        },
+    ]
+    claim = "Force is equal to mass times acceleration"
+    claim_location = gemini_segment._unique_evidence_location(
+        segments,
+        claim,
+        0,
+        1,
+    )
+    assert claim_location is not None
+
+    assert gemini_segment._trusted_named_teaching_handoff_start(
+        segments,
+        search_start_line=0,
+        claim_location=claim_location,
+        anchor_text="Newton's second law force mass acceleration",
+    ) is None
+
+
+@pytest.mark.parametrize("large_gap", [False, True])
+def test_prior_worked_question_is_not_imported_without_a_split_cue(
+    large_gap: bool,
+) -> None:
+    selected_start = 10.0 if large_gap else 4.0
+    segments = [
+        {
+            "cue_id": "worked-guard:cue:0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": (
+                "Here's a question for you. Let's say if a cart has a mass of two "
+                "kilograms, what is its acceleration? The setup is complete."
+            ),
+        },
+        {
+            "cue_id": "worked-guard:cue:1",
+            "start": selected_start,
+            "end": selected_start + 4.0,
+            "text": "The net force on a different block is ten newtons.",
+        },
+    ]
+
+    assert gemini_segment._trusted_prior_worked_question_start(
+        segments,
+        selected_line=1,
+        scope_text="Calculate net force on a block",
+    ) is None
+
+
+def test_prior_worked_question_does_not_cross_a_completed_problem() -> None:
+    segments = [
+        {
+            "cue_id": "worked-question-guard:cue:0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "Here's a question for you. Let's say if cart A has a mass of "
+                "two kilograms and a force of four newtons, what is its "
+                "acceleration? Here's the question. What is the force on block "
+                "B? We have a bunch of"
+            ),
+        },
+        {
+            "cue_id": "worked-question-guard:cue:1",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "blocks connected by ropes along a horizontal surface.",
+        },
+    ]
+
+    assert gemini_segment._trusted_prior_worked_question_start(
+        segments,
+        selected_line=1,
+        scope_text=(
+            "Calculate net acceleration and force for connected blocks"
+        ),
+    ) is None
+
+
+def test_prior_worked_question_recognizes_an_asr_punctuated_answer() -> None:
+    segments = [
+        {
+            "cue_id": "worked-asr-question-guard:cue:0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "Here's a question for you. Let's say if cart A has a mass of "
+                "two kilograms and a force of four newtons, what is its "
+                "acceleration. The answer is two. Here's the question. What is "
+                "the force on block B? We have a bunch of"
+            ),
+        },
+        {
+            "cue_id": "worked-asr-question-guard:cue:1",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "blocks connected by ropes along a horizontal surface.",
+        },
+    ]
+
+    assert gemini_segment._trusted_prior_worked_question_start(
+        segments,
+        selected_line=1,
+        scope_text=(
+            "Calculate net acceleration and force for connected blocks"
+        ),
+    ) is None
+
+
+def test_worked_end_does_not_cross_lexically_related_unrelated_content() -> None:
+    answer = "The acceleration is two meters per second squared."
+    first = f"{answer} Now compare the same cart's force and mass."
+    segments = [
+        {
+            "cue_id": "worked-scope-guard:cue:0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": first,
+        },
+        {
+            "cue_id": "worked-scope-guard:cue:1",
+            "start": 8.0,
+            "end": 12.0,
+            "text": (
+                "Mass media influences culture. The force of public opinion "
+                "changes behavior."
+            ),
+        },
+        {
+            "cue_id": "worked-scope-guard:cue:2",
+            "start": 12.0,
+            "end": 16.0,
+            "text": "Another example uses a pulley.",
+        },
+    ]
+
+    assert gemini_segment._trusted_projected_worked_arc_end(
+        segments,
+        end_line=0,
+        end_span=(0, len(answer)),
+        scope_text=(
+            "Worked example calculating acceleration from force and mass"
+        ),
+    ) is None
+
+
+def test_worked_end_does_not_cross_a_complete_shared_vocabulary_cue() -> None:
+    answer = "The acceleration is two meters per second squared."
+    first = f"{answer} Now compare the same cart's force and mass."
+    segments = [
+        {
+            "cue_id": "worked-shared-words-guard:cue:0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": first,
+        },
+        {
+            "cue_id": "worked-shared-words-guard:cue:1",
+            "start": 8.0,
+            "end": 12.0,
+            "text": (
+                "Mass and force are also terms used metaphorically in public "
+                "policy."
+            ),
+        },
+        {
+            "cue_id": "worked-shared-words-guard:cue:2",
+            "start": 12.0,
+            "end": 16.0,
+            "text": "Another example uses a pulley.",
+        },
+    ]
+
+    assert gemini_segment._trusted_projected_worked_arc_end(
+        segments,
+        end_line=0,
+        end_span=(0, len(answer)),
+        scope_text=(
+            "Worked example calculating acceleration from force and mass"
+        ),
+    ) is None
+
+
+def test_worked_end_keeps_a_grounded_independent_result_cue() -> None:
+    answer = "The first cart accelerates at 2 meters per second squared."
+    first = (
+        f"{answer} Now solve for the other cart using mass and force."
+    )
+    segments = [
+        {
+            "cue_id": "worked-result:cue:0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": first,
+        },
+        {
+            "cue_id": "worked-result:cue:1",
+            "start": 8.0,
+            "end": 12.0,
+            "text": (
+                "The other cart accelerates at 1 meter per second squared, "
+                "completing the comparison."
+            ),
+        },
+        {
+            "cue_id": "worked-result:cue:2",
+            "start": 12.0,
+            "end": 16.0,
+            "text": "Another example uses a pulley.",
+        },
+    ]
+
+    completion = gemini_segment._trusted_projected_worked_arc_end(
+        segments,
+        end_line=0,
+        end_span=(0, len(answer)),
+        scope_text=(
+            "Worked comparison: calculate the acceleration of each cart "
+            "from force and mass"
+        ),
+    )
+
+    assert completion is not None
+    assert completion[0] == 1
+    assert completion[2].endswith("completing the comparison.")
+
+
+def test_worked_end_validates_every_remaining_same_cue_sentence() -> None:
+    answer = "The acceleration is two meters per second squared."
+    first = (
+        f"{answer} Now calculate the remaining mass and force. "
+        "Renaissance art uses perspective and color."
+    )
+    segments = [
+        {
+            "cue_id": "worked-same-cue-guard:cue:0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": first,
+        },
+        {
+            "cue_id": "worked-same-cue-guard:cue:1",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "Another example uses a pulley.",
+        },
+    ]
+
+    assert gemini_segment._trusted_projected_worked_arc_end(
+        segments,
+        end_line=0,
+        end_span=(0, len(answer)),
+        scope_text=(
+            "Worked example calculating acceleration from force and mass"
+        ),
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        " Another example uses a different cart.",
+        " Now the other cart has more mass, but its result is not given.",
+    ],
+    ids=["fresh-example", "unclosed-continuation"],
+)
+def test_unproven_worked_end_completion_keeps_gemini_cut(
+    suffix: str,
+) -> None:
+    answer = "acceleration is two meters per second squared."
+    text = f"A cart has a net force and mass, so its {answer}{suffix}"
+    plan = _compact_custom_plan(
+        request="solve for acceleration",
+        start_quote="A cart has a net force",
+        end_quote=answer,
+        claim_quote=answer,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "title": "Calculating Acceleration",
+            "learning_objective": "Calculate acceleration from net force and mass",
+            "facet": "solving for acceleration",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{
+            "cue_id": "worked-end-guard:cue:0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": text,
+        }],
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["end_quote"] == answer
+    assert "completed_projected_worked_arc" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+@pytest.mark.parametrize(
+    "prior_subject",
+    ["When a force acts, the object", "The object"],
+    ids=["topical-clause", "short-generic-subject"],
+)
+def test_clipped_claim_opening_recovers_the_immediate_prior_subject(
+    prior_subject: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "claim-subject:cue:0",
+            "start": 0.0,
+            "end": 3.0,
+            "text": prior_subject,
+        },
+        {
+            "cue_id": "claim-subject:cue:1",
+            "start": 3.0,
+            "end": 8.0,
+            "text": (
+                "accelerates because net force acts. Force is measured in "
+                "newtons."
+            ),
+        },
+    ]
+    claim = "accelerates because net force acts"
+    plan = _compact_custom_plan(
+        request="how net force causes acceleration",
+        start_quote=claim,
+        end_quote="Force is measured in newtons.",
+        claim_quote=claim,
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "claim-subject:cue:0"
+    assert clip["_clip_text"].startswith(prior_subject)
+
+
+def test_clipped_claim_opening_does_not_graft_an_unrelated_subject() -> None:
+    segments = [
+        {
+            "cue_id": "claim-subject-guard:cue:0",
+            "start": 0.0,
+            "end": 3.0,
+            "text": "The lecture about Renaissance art",
+        },
+        {
+            "cue_id": "claim-subject-guard:cue:1",
+            "start": 3.0,
+            "end": 8.0,
+            "text": (
+                "accelerates because net force acts. Force is measured in "
+                "newtons."
+            ),
+        },
+    ]
+    claim = "accelerates because net force acts"
+    plan = _compact_custom_plan(
+        request="how net force causes acceleration",
+        start_quote=claim,
+        end_quote="Force is measured in newtons.",
+        claim_quote=claim,
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "claim-subject-guard:cue:1"
+    assert "Renaissance art" not in clip["_clip_text"]
+
+
 @pytest.mark.parametrize(
     (
         "model_start_line",
@@ -2500,8 +3357,25 @@ def _fresh_v34_xz_segments() -> list[dict]:
             "It is",
             "proportional to the force applied",
         ),
+        (
+            37,
+            49,
+            "experiences will be directly",
+            "in response to the net force",
+            "net force is the sum of all the forces acting",
+            "Calculating Net Force",
+            "Define net force as the vector sum of all forces acting on an object",
+            "net force",
+            39,
+            "It is",
+            "experiences will be directly",
+        ),
     ],
-    ids=["fma-proportionality", "net-force-vector-addition"],
+    ids=[
+        "fma-proportionality",
+        "net-force-vector-addition",
+        "fresh-v35-split-relational-tail",
+    ],
 )
 def test_fresh_v34_relational_fragments_recover_the_claim_sentence(
     start_cue: int,
@@ -2553,6 +3427,89 @@ def test_fresh_v34_relational_fragments_recover_the_claim_sentence(
     assert clip["_clip_text"].startswith(expected_quote)
     assert excluded_prefix not in clip["_clip_text"]
     assert "trimmed_clipped_start_to_claim_sentence" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("selected_end", "claim_start", "claim", "claim_cue_start"),
+    [
+        (
+            "proportional to force. A separate reminder follows. It is",
+            "important to note that net force is the sum of all forces acting.",
+            "net force is the sum of all forces acting",
+            4.0,
+        ),
+        (
+            "proportional to force. It is",
+            "important to note that net force is the sum of all forces acting.",
+            "net force is the sum of all forces acting",
+            12.0,
+        ),
+        (
+            "proportional to force. It is",
+            "important to note that this relationship only holds when mass is constant.",
+            "this relationship only holds when mass is constant",
+            4.0,
+        ),
+    ],
+    ids=["intervening-sentence", "caption-reset", "unresolved-reference"],
+)
+def test_relational_tail_does_not_skip_required_claim_context(
+    selected_end: str,
+    claim_start: str,
+    claim: str,
+    claim_cue_start: float,
+) -> None:
+    segments = [
+        {
+            "cue_id": "relational-guard:cue:0",
+            "start": 0.0,
+            "end": 2.0,
+            "text": "The law says the acceleration an object",
+        },
+        {
+            "cue_id": "relational-guard:cue:1",
+            "start": 2.0,
+            "end": 4.0,
+            "text": f"experiences will be directly {selected_end}",
+        },
+        {
+            "cue_id": "relational-guard:cue:2",
+            "start": claim_cue_start,
+            "end": claim_cue_start + 4.0,
+            "text": claim_start,
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="Newton's second law relationship",
+        start_quote="experiences will be directly",
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 2,
+            "title": "Newton's second law relationship",
+            "learning_objective": "Explain the force and acceleration relationship",
+            "facet": "force and acceleration relationship",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert not clip["_clip_text"].startswith("It is")
+    assert "trimmed_clipped_start_to_claim_sentence" not in (
         clip["_boundary_fallback_reasons"]
     )
 

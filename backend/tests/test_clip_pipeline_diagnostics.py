@@ -2674,6 +2674,59 @@ def test_direct_adapter_uses_groq_words_after_ambiguous_edge_silence_fails(
     assert attempt["word_counts"] == [len(_groq_edge_words())]
 
 
+def test_direct_adapter_uses_bounded_groq_after_acoustic_deadline_expires(
+    monkeypatch,
+) -> None:
+    engine_out = _ambiguous_gemini_edge_engine_out()
+    prepared = _ready_audio()
+    clock = [100.0]
+
+    def verify_after_deadline(_source, start_sec, end_sec, **_kwargs):
+        clock[0] = 101.1
+        return pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "unavailable",
+            start_sec,
+            end_sec,
+            {"stage": "boundary", "reason": "silence_not_found"},
+        )
+
+    verify_audio = mock.Mock(side_effect=verify_after_deadline)
+    groq_words = mock.Mock(return_value=_groq_edge_words())
+    monkeypatch.setattr(pipeline_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "DEEP_PHASE_TIMEOUT_SEC",
+        1.0,
+    )
+    monkeypatch.setattr(pipeline_module, "GROQ_BOUNDARY_TIMEOUT_SEC", 0.25)
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify_audio,
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_groq_boundary_asr,
+        "transcribe_boundary_words",
+        groq_words,
+    )
+
+    verified = pipeline_module._verified_direct_adapter_clips(
+        source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        engine_out=engine_out,
+        should_cancel=None,
+        prepared_audio=prepared,
+        require_acoustic_boundaries=True,
+        exact_topic="x squared limit",
+    )
+
+    assert len(verified) == 1
+    assert verified[0]["start"] == 5.0
+    verify_audio.assert_called_once()
+    assert 0.0 < verify_audio.call_args.kwargs["timeout_sec"] <= 0.75
+    groq_words.assert_called_once()
+    assert 0.0 < groq_words.call_args.kwargs["timeout_sec"] <= 0.25
+
+
 def test_direct_adapter_aligns_supadata_symbolic_math_quote_to_spoken_groq_words(
     monkeypatch,
 ) -> None:
@@ -3347,16 +3400,19 @@ def test_groq_words_for_clip_uses_only_explicit_projected_edges(
     assert call["target_sec"] == projected_target
 
 
-def test_topic_generation_clamps_boundary_deadline_and_skips_late_groq(
+def test_topic_generation_runs_bounded_groq_when_acoustic_worker_misses_deadline(
     monkeypatch,
 ) -> None:
     engine_out = _ambiguous_gemini_edge_engine_out()
     prepared = _ready_audio()
     acoustic_timeouts: list[float] = []
+    release_acoustic = threading.Event()
+    acoustic_returned = threading.Event()
 
     def slow_acoustic(_source, start_sec, end_sec, **kwargs):
         acoustic_timeouts.append(float(kwargs["timeout_sec"]))
-        time.sleep(0.6)
+        release_acoustic.wait(timeout=2.0)
+        acoustic_returned.set()
         return pipeline_module.clip_engine_silence.SilenceVerificationResult(
             "unavailable",
             start_sec,
@@ -3364,8 +3420,9 @@ def test_topic_generation_clamps_boundary_deadline_and_skips_late_groq(
             {"stage": "boundary", "reason": "silence_not_found"},
         )
 
-    groq_words = mock.Mock(return_value=())
+    groq_words = mock.Mock(return_value=_groq_edge_words())
     monkeypatch.setattr(pipeline_module, "INGEST_TOPIC_VIDEO_TIMEOUT_SEC", 0.5)
+    monkeypatch.setattr(pipeline_module, "GROQ_BOUNDARY_TIMEOUT_SEC", 0.1)
     monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
     monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
     monkeypatch.setattr(
@@ -3384,28 +3441,39 @@ def test_topic_generation_clamps_boundary_deadline_and_skips_late_groq(
         groq_words,
     )
     pipeline = _pipeline()
+    persist_clip = mock.Mock(
+        return_value=("stored-reel", mock.sentinel.metadata)
+    )
     monkeypatch.setattr(
         pipeline,
         "_persist_engine_clip",
-        mock.Mock(return_value=("stored-reel", mock.sentinel.metadata)),
+        persist_clip,
     )
 
-    pipeline.ingest_topic(
-        topic="Intro to Python",
-        material_id="material",
-        concept_id="concept",
-        generation_context=GenerationContext(
-            "slow",
-            require_acoustic_boundaries=True,
-        ),
-        max_videos=1,
-        max_reels=1,
-        retrieval_profile="deep",
-    )
+    try:
+        reels, _ = pipeline.ingest_topic(
+            topic="Intro to Python",
+            material_id="material",
+            concept_id="concept",
+            generation_context=GenerationContext(
+                "slow",
+                require_acoustic_boundaries=True,
+            ),
+            max_videos=1,
+            max_reels=1,
+            retrieval_profile="deep",
+        )
 
-    assert len(acoustic_timeouts) == 1
-    assert 0.0 < acoustic_timeouts[0] <= 0.5
-    groq_words.assert_not_called()
+        assert reels == ["stored-reel"]
+        assert len(acoustic_timeouts) == 1
+        assert 0.0 < acoustic_timeouts[0] < 0.5
+        groq_words.assert_called_once()
+        assert 0.0 < groq_words.call_args.kwargs["timeout_sec"] <= 0.1
+        assert persist_clip.call_args.kwargs["clip"]["start"] == 5.0
+    finally:
+        release_acoustic.set()
+        assert acoustic_returned.wait(timeout=1.0)
+        time.sleep(0.02)
 
 
 def test_topic_generation_dedupes_groq_refinement_for_one_shared_cue_video(

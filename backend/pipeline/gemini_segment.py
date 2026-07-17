@@ -10185,21 +10185,29 @@ def _trusted_weak_prior_start_span(
     """Recover the exact prior-sentence onset of a split caption phrase."""
     source = str(prior_text or "")
     selected = str(selected_text or "").strip()
-    if (
-        not source.strip()
-        or not selected
-        or source.rstrip().endswith("?")
-        or not _cue_has_weak_end(
-            source,
-            selected,
-            ignore_caption_case=True,
-        )
-    ):
+    if not source.strip() or not selected or source.rstrip().endswith("?"):
         return None
     sentence_spans = _sentence_character_spans(source)
     setup_left = sentence_spans[-1][0] if sentence_spans else 0
     setup = source[setup_left:].strip()
     joined = f"{setup} {selected}"
+    lexical_predicate_split = bool(
+        not re.search(r"[.!?][\"')\]]*\s*$", source)
+        and (
+            len(_toks(setup)) >= 3
+            or _TRUSTED_SPLIT_GENERIC_SUBJECT_RE.fullmatch(setup)
+        )
+        and _TRUSTED_SPLIT_LEXICAL_PREDICATE_RE.match(selected)
+    )
+    if not (
+        _cue_has_weak_end(
+            source,
+            selected,
+            ignore_caption_case=True,
+        )
+        or lexical_predicate_split
+    ):
+        return None
     if not (
         _opening_clause_is_standalone(joined)
         or _local_example_setup_is_complete(joined)
@@ -10482,6 +10490,576 @@ _TRUSTED_CLAIM_SENTENCE_ARC_SCOPE_RE = re.compile(
     r"\b(?:causal|chain|cycle|mechanism|pathway|process|sequence|stages?|steps?)\b",
     re.IGNORECASE,
 )
+_TRUSTED_RELATIONAL_CLAUSE_RE = re.compile(
+    r"\b(?:(?:directly|inversely)\s+)?"
+    r"(?:equal|equivalent|proportional|related|similar|connected|dependent)\s+"
+    r"(?:to|on)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_NAMED_TEACHING_HANDOFF_RE = re.compile(
+    r"(?<!\w)(?P<handoff>(?:now\s+)?the\s+next\s+"
+    r"(?:concept|equation|idea|law|method|principle|relationship|rule|topic)\b)",
+    re.IGNORECASE,
+)
+_TRUSTED_NAMED_UNIT_LINK_RE = re.compile(
+    r"\b(?:is|are)\s+(?:(?:called|known)\s+(?:as\s+)?)?",
+    re.IGNORECASE,
+)
+_TRUSTED_NAMED_UNIT_GENERIC_TOKENS = frozenset({
+    "concept",
+    "equation",
+    "idea",
+    "law",
+    "method",
+    "motion",
+    "principle",
+    "relationship",
+    "rule",
+    "topic",
+})
+_TRUSTED_WORKED_QUESTION_FRAME_RE = re.compile(
+    r"(?<!\w)(?P<frame>here(?:['’]s|\s+is)\s+(?:a|the)\s+question"
+    r"(?:\s+for\s+you)?)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_WORKED_CONTINUATION_RE = re.compile(
+    r"^[\s.!?,;:—-]*(?:(?:and|but|so)\s*[,;:]?\s+)?"
+    r"(?:now\b|our\s+next\s+step\b)",
+    re.IGNORECASE,
+)
+_TRUSTED_WORKED_RESULT_SIGNAL_RE = re.compile(
+    r"\b(?:(?:the\s+)?(?:answer|result|solution)\s+(?:is|equals?)|"
+    r"complet(?:e|ed|es|ing)\s+(?:the\s+)?(?:calculation|comparison|"
+    r"derivation|example|exercise|problem|proof)|"
+    r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"-?\d+(?:\.\d+)?)\s+(?:kilograms?|meters?|newtons?|seconds?))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_SPLIT_LEXICAL_PREDICATE_RE = re.compile(
+    r"^\s*(?:accelerates?|acts?|becomes?|causes?|changes?|depends?|equals?|"
+    r"experiences?|gives?|increases?|means?|moves?|occurs?|produces?|"
+    r"requires?|results?|shows?|starts?|stops?)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_SPLIT_GENERIC_SUBJECT_RE = re.compile(
+    r"\s*(?:a|an|the|this|that)\s+"
+    r"(?:block|body|cart|object|particle|person|system)\s*",
+    re.IGNORECASE,
+)
+_TRUSTED_FRESH_EXAMPLE_RE = re.compile(
+    r"(?<!\w)(?:another|one\s+more|the\s+next|a\s+(?:different|new))\s+"
+    r"(?:(?:brief|concrete|quick|short|simple|worked)\s+)*"
+    r"(?:calculation|case|derivation|example|exercise|problem|proof)\b",
+    re.IGNORECASE,
+)
+
+
+def _trusted_named_teaching_handoff_start(
+    segments: list[dict],
+    *,
+    search_start_line: int,
+    claim_location: tuple[int, int, int, int],
+    anchor_text: str,
+) -> tuple[int, tuple[int, int]] | None:
+    """Find an explicit named-unit introduction before the grounded claim."""
+    claim_line, claim_left, claim_end_line, _claim_right = claim_location
+    if not (
+        0 <= search_start_line <= claim_line <= claim_end_line < len(segments)
+    ):
+        return None
+    parts: list[str] = []
+    line_offsets: dict[int, tuple[int, int]] = {}
+    cursor = 0
+    for line in range(search_start_line, claim_end_line + 1):
+        if line > search_start_line:
+            try:
+                gap = (
+                    float(segments[line].get("start", 0.0))
+                    - float(segments[line - 1].get("end", 0.0))
+                )
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+                return None
+            parts.append(" ")
+            cursor += 1
+        source = str(segments[line].get("text") or "")
+        line_offsets[line] = (cursor, cursor + len(source))
+        parts.append(source)
+        cursor += len(source)
+    joined = "".join(parts)
+    claim_start = line_offsets[claim_line][0] + claim_left
+    anchor_tokens = _content_tokens(anchor_text)
+    sentence_spans = _sentence_character_spans(joined)
+    candidates: list[tuple[int, tuple[int, int], int]] = []
+    for handoff in _TRUSTED_NAMED_TEACHING_HANDOFF_RE.finditer(
+        joined,
+        0,
+        claim_start,
+    ):
+        onset = handoff.start("handoff")
+        sentence_span = next(
+            (
+                span
+                for span in sentence_spans
+                if span[0] <= onset < span[1]
+            ),
+            None,
+        )
+        if sentence_span is None:
+            continue
+        if _WORD_RE.search(joined[sentence_span[0]:onset]) is not None:
+            continue
+        sentence = joined[sentence_span[0]:sentence_span[1]]
+        subject_links = list(_TRUSTED_NAMED_UNIT_LINK_RE.finditer(
+            sentence,
+            handoff.end("handoff") - sentence_span[0],
+        ))
+        if len(subject_links) != 1:
+            continue
+        named_subject = sentence[subject_links[0].end():]
+        named_tokens = (
+            _content_tokens(named_subject)
+            - _TRUSTED_NAMED_UNIT_GENERIC_TOKENS
+        )
+        if len(named_tokens & anchor_tokens) < 2:
+            continue
+        onset_line = next(
+            (
+                line
+                for line, (left, right) in line_offsets.items()
+                if left <= onset < right
+            ),
+            None,
+        )
+        if onset_line is None:
+            continue
+        source = str(segments[onset_line].get("text") or "")
+        source_left = onset - line_offsets[onset_line][0]
+        quote = _exact_boundary_quote(source[source_left:], want="start")
+        span = _quote_character_span(source, quote) if quote else None
+        if span is not None and span[0] == source_left:
+            candidates.append((onset_line, span, onset))
+    if not candidates:
+        return None
+    line, span, _onset = max(candidates, key=lambda item: item[2])
+    return line, span
+
+
+def _trusted_prior_worked_question_start(
+    segments: list[dict],
+    *,
+    selected_line: int,
+    scope_text: str,
+) -> tuple[int, tuple[int, int]] | None:
+    """Recover one adjacent cue containing a framed worked-problem setup."""
+    if (
+        selected_line <= 0
+        or (
+            _ATOMIC_WORKED_SCOPE_RE.search(scope_text) is None
+            and _TRUSTED_WORKED_TASK_SCOPE_RE.search(scope_text) is None
+        )
+        or not _cue_opens_mid_thought_at(
+            segments,
+            selected_line,
+            ignore_caption_case=True,
+        )
+    ):
+        return None
+    prior_line = selected_line - 1
+    try:
+        gap = (
+            float(segments[selected_line].get("start", 0.0))
+            - float(segments[prior_line].get("end", 0.0))
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+        return None
+    prior = str(segments[prior_line].get("text") or "")
+    selected = str(segments[selected_line].get("text") or "")
+    if not _cue_has_weak_end(prior, selected, ignore_caption_case=True):
+        return None
+    scope_tokens = _content_tokens(scope_text)
+    frames = list(_TRUSTED_WORKED_QUESTION_FRAME_RE.finditer(prior))
+    for index in range(len(frames) - 1, -1, -1):
+        frame = frames[index]
+        setup_right = (
+            frames[index + 1].start("frame")
+            if index + 1 < len(frames)
+            else len(prior)
+        )
+        setup = prior[frame.start("frame"):setup_right]
+        retained_question = prior[frame.start("frame"):]
+        completed_problem = bool(
+            "?" in setup
+            or (
+                _WORKED_UNIT_QUESTION_TOKEN_RE.search(setup)
+                and _SPLIT_CAPTION_COMPLETION_SIGNAL_RE.search(setup)
+            )
+        )
+        if setup_right < len(prior) and completed_problem:
+            # Do not cross a completed earlier problem merely because a later
+            # restated question supplies another question mark.
+            continue
+        conditional = next(
+            (
+                handoff
+                for handoff in _TRUSTED_CLAIM_SETUP_HANDOFF_RE.finditer(
+                    setup,
+                    frame.end("frame") - frame.start("frame"),
+                )
+                if handoff.group("conditional") is not None
+            ),
+            None,
+        )
+        if (
+            conditional is None
+            or "?" not in retained_question
+            or _WORKED_UNIT_QUESTION_TOKEN_RE.search(retained_question) is None
+            or len(_content_tokens(setup) & scope_tokens) < 2
+        ):
+            continue
+        return prior_line, frame.span("frame")
+    return None
+
+
+def _trusted_same_cue_sentence_start(
+    segments: list[dict],
+    *,
+    selected_line: int,
+    selected_left: int,
+    claim_location: tuple[int, int, int, int],
+    scope_text: str,
+) -> tuple[int, tuple[int, int]] | None:
+    """Drop a dangling rolling-caption prefix before a grounded sentence."""
+    claim_line, claim_left, claim_end_line, _claim_right = claim_location
+    if (
+        not (0 <= selected_line <= claim_line <= claim_end_line < len(segments))
+        or _ATOMIC_WORKED_SCOPE_RE.search(scope_text) is not None
+        or _TRUSTED_WORKED_TASK_SCOPE_RE.search(scope_text) is not None
+        or _ATOMIC_CAUSAL_SCOPE_RE.search(scope_text) is not None
+        or _TRUSTED_CLAIM_SENTENCE_ARC_SCOPE_RE.search(scope_text) is not None
+        or _EXPLICIT_COMPARISON_OBJECTIVE_RE.search(scope_text) is not None
+        or not _cue_opens_mid_thought_at(
+            segments,
+            selected_line,
+            ignore_caption_case=True,
+        )
+    ):
+        return None
+    source = str(segments[selected_line].get("text") or "")
+    if re.match(
+        r"^\s*(?:the\s+)?answer\s+(?:is|equals?)\b",
+        source[selected_left:],
+        re.IGNORECASE,
+    ):
+        return None
+    for sentence_left, _sentence_right in _sentence_character_spans(source):
+        first_word = _WORD_RE.search(source, sentence_left)
+        if first_word is None or first_word.start() <= selected_left:
+            continue
+        if selected_line == claim_line and first_word.start() > claim_left:
+            continue
+        prefix = source[selected_left:first_word.start()]
+        if re.search(r"[.!?]", prefix) is None:
+            continue
+        joined_parts = [source[first_word.start():]]
+        contiguous = True
+        for line in range(selected_line + 1, claim_end_line + 1):
+            try:
+                gap = (
+                    float(segments[line].get("start", 0.0))
+                    - float(segments[line - 1].get("end", 0.0))
+                )
+            except (TypeError, ValueError, OverflowError):
+                contiguous = False
+                break
+            if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+                contiguous = False
+                break
+            joined_parts.append(str(segments[line].get("text") or ""))
+        if not contiguous:
+            continue
+        retained = " ".join(joined_parts)
+        retained_sentences = _sentence_character_spans(retained)
+        opening = (
+            retained[:retained_sentences[0][1]]
+            if retained_sentences
+            else retained
+        )
+        if (
+            not _opening_clause_is_standalone(opening)
+            or _opening_has_unresolved_setup_reference(opening)
+            or not (
+                _content_tokens(opening) & _content_tokens(scope_text)
+            )
+        ):
+            continue
+        quote = _exact_boundary_quote(source[first_word.start():], want="start")
+        span = _quote_character_span(source, quote) if quote else None
+        if span is not None and span[0] == first_word.start():
+            return selected_line, span
+    return None
+
+
+def _trusted_projected_worked_arc_end(
+    segments: list[dict],
+    *,
+    end_line: int,
+    end_span: tuple[int, int] | None,
+    scope_text: str,
+) -> tuple[int, tuple[int, int], str] | None:
+    """Finish an explicit same-problem continuation before a fresh unit."""
+    if (
+        end_span is None
+        or not (0 <= end_line < len(segments))
+        or (
+            _ATOMIC_WORKED_SCOPE_RE.search(scope_text) is None
+            and _TRUSTED_WORKED_TASK_SCOPE_RE.search(scope_text) is None
+        )
+    ):
+        return None
+    end_text = str(segments[end_line].get("text") or "")
+    suffix = end_text[end_span[1]:]
+    if (
+        _WORD_RE.search(suffix) is None
+        or _TRUSTED_WORKED_CONTINUATION_RE.match(suffix) is None
+    ):
+        return None
+    sentence_spans = _sentence_character_spans(suffix)
+    continuation_right = (
+        sentence_spans[min(1, len(sentence_spans) - 1)][1]
+        if sentence_spans
+        else len(suffix)
+    )
+    if (
+        len(
+            _content_tokens(suffix[:continuation_right])
+            & _content_tokens(scope_text)
+        )
+        < 2
+    ):
+        return None
+
+    scope_tokens = _content_tokens(scope_text)
+    following_text = (
+        str(segments[end_line + 1].get("text") or "")
+        if end_line + 1 < len(segments)
+        else ""
+    )
+    following_spans = _sentence_character_spans(following_text)
+    following_opening = (
+        following_text[:following_spans[0][1]]
+        if following_spans
+        else following_text
+    )
+    terminal_split_continues = bool(
+        following_text
+        and _cue_has_weak_end(
+            end_text,
+            following_text,
+            ignore_caption_case=True,
+        )
+    )
+    for index, (left, right) in enumerate(sentence_spans):
+        piece = suffix[left:right]
+        if (
+            _WORD_RE.search(piece)
+            and not (_content_tokens(piece) & scope_tokens)
+            and not (
+                index == len(sentence_spans) - 1
+                and terminal_split_continues
+                and len(
+                    _content_tokens(f"{piece} {following_opening}")
+                    & scope_tokens
+                ) >= 2
+            )
+        ):
+            return None
+
+    def same_arc_piece(line: int, piece: str) -> bool:
+        if _WORD_RE.search(piece) is None:
+            return True
+        if line <= end_line:
+            return False
+        previous = str(segments[line - 1].get("text") or "")
+        current = str(segments[line].get("text") or "")
+        scope_overlap = _content_tokens(piece) & scope_tokens
+        independent_worked_result = bool(
+            len(scope_overlap) >= 2
+            and _TRUSTED_WORKED_RESULT_SIGNAL_RE.search(piece)
+        )
+        split_named_subject = bool(
+            re.search(
+                r"\b(?:[Aa]nd|[Bb]ut|[Ss]o)\s+(?:block\s+)?[A-Z]\s*$",
+                previous,
+            )
+            and re.match(r"^\s*[a-z][\w'’\-]*\b", piece)
+        )
+        return bool(
+            (
+                scope_overlap
+                and (
+                    _cue_has_weak_end(
+                        previous,
+                        current,
+                        ignore_caption_case=True,
+                    )
+                    or split_named_subject
+                )
+            )
+            or (
+                len(_sentence_character_spans(piece)) == 1
+                and re.search(
+                    r"\b(?:connected|dependent|equal|equivalent|opposite|"
+                    r"proportional|related|similar)\s*$",
+                    previous,
+                    re.IGNORECASE,
+                )
+                is not None
+                and re.match(
+                    r"^\s*(?:from|to|with)\b",
+                    piece,
+                    re.IGNORECASE,
+                )
+                is not None
+            )
+            or independent_worked_result
+        )
+
+    def completed_boundary(
+        line: int,
+        retained: str,
+    ) -> tuple[int, tuple[int, int], str] | None:
+        complete = _last_safe_complete_prefix(retained)
+        if not complete:
+            return None
+        words = list(_WORD_RE.finditer(complete))
+        if not words:
+            return None
+        quote_left = words[max(0, len(words) - 6)].start()
+        quote = complete[quote_left:]
+        return line, (quote_left, len(complete)), quote
+
+    for line in range(end_line, len(segments)):
+        if line > end_line:
+            try:
+                gap = (
+                    float(segments[line].get("start", 0.0))
+                    - float(segments[line - 1].get("end", 0.0))
+                )
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+                return None
+        source = str(segments[line].get("text") or "")
+        search_left = end_span[1] if line == end_line else 0
+        sentence_spans = _sentence_character_spans(source)
+        hard_markers = list(_HARD_TOPIC_RESET_RE.finditer(source, search_left))
+        if line == end_line:
+            continuation = source[search_left:]
+            continuation_spans = _sentence_character_spans(continuation)
+            if (
+                _TRUSTED_WORKED_CONTINUATION_RE.match(continuation)
+                and continuation_spans
+            ):
+                continuation_right = search_left + continuation_spans[0][1]
+                hard_markers = [
+                    marker
+                    for marker in hard_markers
+                    if marker.start() >= continuation_right
+                ]
+        fresh_markers = [
+            marker
+            for marker in _TRUSTED_FRESH_EXAMPLE_RE.finditer(
+                source,
+                search_left,
+            )
+            if not any(
+                span[0] <= marker.start() < span[1]
+                and _WORD_RE.search(source[span[0]:marker.start()]) is not None
+                for span in sentence_spans
+            )
+        ]
+        marker_matches = [*hard_markers, *fresh_markers]
+        if not marker_matches:
+            if line > end_line and not same_arc_piece(line, source):
+                return None
+            continue
+        marker = min(marker_matches, key=lambda match: match.start())
+        marker_sentence = next(
+            (
+                span
+                for span in sentence_spans
+                if span[0] <= marker.start() < span[1]
+            ),
+            None,
+        )
+        marker_left = marker_sentence[0] if marker_sentence is not None else marker.start()
+        if marker_left <= search_left:
+            if line <= end_line:
+                return None
+            previous_line = line - 1
+            previous = str(segments[previous_line].get("text") or "")
+            return completed_boundary(previous_line, previous)
+        retained = source[:marker_left]
+        if line > end_line and not same_arc_piece(line, retained):
+            return None
+        return completed_boundary(line, retained)
+    return None
+
+
+def _trusted_relational_sentence_before_claim(
+    segments: list[dict],
+    *,
+    selected_line: int,
+    selected_left: int,
+    claim_location: tuple[int, int, int, int],
+) -> bool:
+    """Confirm that a clipped opening finishes a relational prior sentence."""
+    claim_line, claim_left, claim_end_line, claim_right = claim_location
+    if not (
+        0 <= selected_line <= claim_line <= claim_end_line < len(segments)
+    ):
+        return False
+    for line in range(selected_line, claim_end_line):
+        try:
+            gap = (
+                float(segments[line + 1].get("start", 0.0))
+                - float(segments[line].get("end", 0.0))
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+            return False
+    parts: list[str] = []
+    for line in range(selected_line, claim_line + 1):
+        source = str(segments[line].get("text") or "")
+        left = selected_left if line == selected_line else 0
+        right = claim_left if line == claim_line else len(source)
+        if right > left:
+            parts.append(source[left:right])
+    prefix = " ".join(parts)
+    sentence_spans = _sentence_character_spans(prefix)
+    first_sentence = (
+        prefix[:sentence_spans[0][1]] if sentence_spans else prefix
+    )
+    if _TRUSTED_RELATIONAL_CLAUSE_RE.search(first_sentence) is None:
+        return False
+    remainder = prefix[len(first_sentence):].lstrip()
+    note_frame = _TRUSTED_CLAIM_SENTENCE_ONSET_RE.match(remainder)
+    if note_frame is None or note_frame.group("note") is None:
+        return False
+    claim_parts: list[str] = []
+    for line in range(claim_line, claim_end_line + 1):
+        source = str(segments[line].get("text") or "")
+        left = claim_left if line == claim_line else 0
+        right = claim_right if line == claim_end_line else len(source)
+        if right > left:
+            claim_parts.append(source[left:right])
+    note_body = " ".join((remainder[note_frame.end():], *claim_parts))
+    return not _opening_has_unresolved_setup_reference(note_body)
 
 
 def _trusted_claim_sentence_start(
@@ -10794,6 +11372,7 @@ def _trusted_compact_plan_to_report(
         model_start_quote = str(proposal.start_quote or "").strip()
         effective_start_quote = model_start_quote
         model_end_quote = str(proposal.end_quote or "").strip()
+        effective_end_quote = model_end_quote
         start_anchor = boundary_anchor(model_start_quote, a, b)
         end_anchor = boundary_anchor(model_end_quote, a, b)
         start_span: tuple[int, int] | None = None
@@ -11008,6 +11587,7 @@ def _trusted_compact_plan_to_report(
                 < 2
             )
             claim_setup_start: tuple[int, tuple[int, int]] | None = None
+            named_handoff_start: tuple[int, tuple[int, int]] | None = None
             current_start_text = str(segments[a].get("text") or "")
             current_start_left = start_span[0] if start_span is not None else 0
             current_start_is_clipped = bool(
@@ -11049,6 +11629,22 @@ def _trusted_compact_plan_to_report(
                 and _TRUSTED_PROJECTED_SETUP_RE.match(current_opening)
                 and _local_example_setup_is_complete(current_opening)
             )
+            if (
+                current_start_is_clipped
+                or model_start_misses_claim_anchor
+                or model_start_misses_claim_quote
+            ):
+                named_handoff_start = _trusted_named_teaching_handoff_start(
+                    segments,
+                    search_start_line=min(
+                        a,
+                        start_anchor.first_line
+                        if start_anchor is not None
+                        else a,
+                    ),
+                    claim_location=claim_location,
+                    anchor_text=claim_anchor_text,
+                )
             if (
                 not preserve_complete_local_setup
                 and (
@@ -11111,7 +11707,19 @@ def _trusted_compact_plan_to_report(
                 section_start <= claim_location[0]
                 and claim_location[2] <= b
             ):
-                if claim_setup_start is not None:
+                if named_handoff_start is not None:
+                    a, start_span = named_handoff_start
+                    effective_start_quote = _literal_source_quote(
+                        str(segments[a].get("text") or ""),
+                        "",
+                        start_span,
+                    )
+                    structural_start_trimmed = True
+                    trusted_structural_onset_applied = True
+                    diagnostics.append(
+                        "trimmed_clipped_start_to_named_handoff"
+                    )
+                elif claim_setup_start is not None:
                     a, start_span = claim_setup_start
                     effective_start_quote = _literal_source_quote(
                         str(segments[a].get("text") or ""),
@@ -11244,21 +11852,32 @@ def _trusted_compact_plan_to_report(
                 diagnostics.append(
                     "trimmed_clipped_start_to_claim_setup"
                 )
-        claim_sentence_selected = final_start_text[final_start_left:]
-        claim_sentence_frame = (
-            "ordinal"
-            if _TRUSTED_SUBJECTLESS_PREDICATE_OPENING_RE.match(
-                claim_sentence_selected
-            )
-            else (
-                "note"
-                if _OPENING_BARE_RELATIONAL_PREDICATE_RE.match(
-                    claim_sentence_selected
+        final_start_text = str(segments[a].get("text") or "")
+        final_start_left = start_span[0] if start_span is not None else 0
+        if not trusted_structural_onset_applied:
+            final_start_is_clipped = bool(
+                (
+                    start_span is not None
+                    and start_span[0] > 0
+                    and not _projected_start_is_standalone(
+                        final_start_text,
+                        start_span,
+                    )
                 )
-                else ""
+                or (
+                    final_start_left == 0
+                    and _cue_opens_mid_thought_at(
+                        segments,
+                        a,
+                        ignore_caption_case=True,
+                    )
+                )
+                or (
+                    start_span is None
+                    and not _opening_clause_is_standalone(final_start_text)
+                )
             )
-        )
-        claim_sentence_scope = " ".join(
+        final_scope_text = " ".join(
             str(value or "")
             for value in (
                 proposal.title,
@@ -11267,6 +11886,147 @@ def _trusted_compact_plan_to_report(
                 model_claim_quote,
             )
         )
+        prior_worked_setup = (
+            _trusted_prior_worked_question_start(
+                segments,
+                selected_line=a,
+                scope_text=final_scope_text,
+            )
+            if final_start_is_clipped
+            and not trusted_structural_onset_applied
+            else None
+        )
+        if prior_worked_setup is not None:
+            a, start_span = prior_worked_setup
+            effective_start_quote = _literal_source_quote(
+                str(segments[a].get("text") or ""),
+                "",
+                start_span,
+            )
+            structural_start_trimmed = True
+            trusted_structural_onset_applied = True
+            final_start_is_clipped = False
+            diagnostics.append("expanded_prior_worked_question_setup")
+            final_start_text = str(segments[a].get("text") or "")
+            final_start_left = start_span[0]
+        split_claim_subject_start: tuple[int, tuple[int, int]] | None = None
+        if (
+            not trusted_structural_onset_applied
+            and claim_location is not None
+            and a > 0
+            and claim_location[0] == a == claim_location[2]
+            and claim_location[1] == final_start_left
+        ):
+            opening_spans = _sentence_character_spans(
+                final_start_text[final_start_left:]
+            )
+            opening_right = (
+                final_start_left + opening_spans[0][1]
+                if opening_spans
+                else len(final_start_text)
+            )
+            try:
+                prior_gap = (
+                    float(segments[a].get("start", 0.0))
+                    - float(segments[a - 1].get("end", 0.0))
+                )
+            except (TypeError, ValueError, OverflowError):
+                prior_gap = math.inf
+            if (
+                claim_location[3] <= opening_right
+                and math.isfinite(prior_gap)
+                and prior_gap < _SECTION_RESET_GAP_S
+            ):
+                prior_text = str(segments[a - 1].get("text") or "")
+                prior_span = _trusted_weak_prior_start_span(
+                    prior_text,
+                    final_start_text[final_start_left:],
+                )
+                prior_scope_overlap = (
+                    _content_tokens(
+                        prior_text[prior_span[0]:]
+                        if prior_span is not None
+                        else ""
+                    )
+                    & _content_tokens(final_scope_text)
+                )
+                generic_subject = bool(
+                    prior_span is not None
+                    and _TRUSTED_SPLIT_GENERIC_SUBJECT_RE.fullmatch(
+                        prior_text[prior_span[0]:]
+                    )
+                )
+                if prior_span is not None and (
+                    len(prior_scope_overlap) >= 2 or generic_subject
+                ):
+                    split_claim_subject_start = a - 1, prior_span
+        if split_claim_subject_start is not None:
+            a, start_span = split_claim_subject_start
+            effective_start_quote = _literal_source_quote(
+                str(segments[a].get("text") or ""),
+                "",
+                start_span,
+            )
+            structural_start_trimmed = True
+            trusted_structural_onset_applied = True
+            final_start_is_clipped = False
+            diagnostics.append("expanded_split_claim_subject_context")
+            final_start_text = str(segments[a].get("text") or "")
+            final_start_left = start_span[0]
+        same_cue_sentence_start = (
+            _trusted_same_cue_sentence_start(
+                segments,
+                selected_line=a,
+                selected_left=final_start_left,
+                claim_location=claim_location,
+                scope_text=final_scope_text,
+            )
+            if final_start_is_clipped
+            and not trusted_structural_onset_applied
+            and claim_location is not None
+            else None
+        )
+        if same_cue_sentence_start is not None:
+            a, start_span = same_cue_sentence_start
+            effective_start_quote = _literal_source_quote(
+                str(segments[a].get("text") or ""),
+                "",
+                start_span,
+            )
+            structural_start_trimmed = True
+            trusted_structural_onset_applied = True
+            final_start_is_clipped = False
+            diagnostics.append("trimmed_dangling_same_cue_prefix")
+            final_start_text = str(segments[a].get("text") or "")
+            final_start_left = start_span[0]
+        claim_sentence_selected = final_start_text[final_start_left:]
+        relational_sentence_before_claim = bool(
+            final_start_is_clipped
+            and claim_location is not None
+            and _trusted_relational_sentence_before_claim(
+                segments,
+                selected_line=a,
+                selected_left=final_start_left,
+                claim_location=claim_location,
+            )
+        )
+        claim_sentence_frame = (
+            "ordinal"
+            if _TRUSTED_SUBJECTLESS_PREDICATE_OPENING_RE.match(
+                claim_sentence_selected
+            )
+            else (
+                "note"
+                if (
+                    _OPENING_BARE_RELATIONAL_PREDICATE_RE.match(
+                        claim_sentence_selected
+                    )
+                    or relational_sentence_before_claim
+                )
+                else ""
+            )
+        )
+        claim_sentence_scope = final_scope_text
         if (
             final_start_is_clipped
             and not trusted_structural_onset_applied
@@ -11338,6 +12098,16 @@ def _trusted_compact_plan_to_report(
             )
             diagnostics.extend(start_context_diagnostics)
 
+        worked_arc_end = _trusted_projected_worked_arc_end(
+            segments,
+            end_line=b,
+            end_span=end_span,
+            scope_text=final_scope_text,
+        )
+        if worked_arc_end is not None:
+            b, end_span, effective_end_quote = worked_arc_end
+            diagnostics.append("completed_projected_worked_arc")
+
         start_text = str(segments[a].get("text") or "")
         end_text = str(segments[b].get("text") or "")
         start_quote = (
@@ -11346,7 +12116,7 @@ def _trusted_compact_plan_to_report(
             else _exact_boundary_quote(start_text, want="start")
         )
         end_quote = (
-            _literal_source_quote(end_text, model_end_quote, end_span)
+            _literal_source_quote(end_text, effective_end_quote, end_span)
             if end_span is not None
             else _exact_boundary_quote(end_text, want="end")
         )

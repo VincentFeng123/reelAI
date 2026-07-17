@@ -3382,11 +3382,11 @@ def _verified_direct_adapter_clips(
         ) = boundary_plan
         remaining_verification_sec = direct_verification_deadline - time.monotonic()
         groq_request_count = _groq_boundary_request_count(raw_clip)
-        groq_reserve_sec = min(
-            max(0.0, remaining_verification_sec) / 2.0,
-            groq_request_count * GROQ_BOUNDARY_TIMEOUT_SEC,
+        groq_budget_sec = groq_request_count * GROQ_BOUNDARY_TIMEOUT_SEC
+        acoustic_timeout_sec = max(
+            0.0,
+            remaining_verification_sec - groq_budget_sec,
         )
-        acoustic_timeout_sec = remaining_verification_sec - groq_reserve_sec
         if bool(getattr(prepared, "ready", False)) and acoustic_timeout_sec > 0.0:
             acoustic = clip_engine_silence.verify_acoustic_boundaries(
                 source_url,
@@ -3451,8 +3451,7 @@ def _verified_direct_adapter_clips(
                     "reason": "acoustic_refinement_unsafe",
                 },
             )
-        remaining_for_groq = direct_verification_deadline - time.monotonic()
-        if remaining_for_groq > 0.0:
+        if groq_budget_sec > 0.0:
             (
                 acoustic,
                 speech_bounds,
@@ -3470,10 +3469,7 @@ def _verified_direct_adapter_clips(
                 source_end_sec=media_end,
                 sibling_clips=candidates,
                 cache=groq_boundary_cache,
-                timeout_sec=min(
-                    max(1, groq_request_count) * GROQ_BOUNDARY_TIMEOUT_SEC,
-                    remaining_for_groq,
-                ),
+                timeout_sec=groq_budget_sec,
                 cancel_check=should_cancel,
             )
         acoustic = _transcript_aligned_result(
@@ -5065,10 +5061,8 @@ class IngestionPipeline:
                     caption,
                     prepared_audio,
                 )
-                required_start, required_end = speech_bounds
                 if projection_error:
                     speech_bounds = complete_cue_bounds
-                    required_start, required_end = speech_bounds
                     projection = (
                         {
                             "context_fallback": {
@@ -5176,12 +5170,7 @@ class IngestionPipeline:
                     start_two_sided,
                     end_two_sided,
                 ) = boundary_plan
-                if not require_acoustic_boundaries or not allow_audio:
-                    fallback_reason = (
-                        "audio_refinement_deadline_exceeded"
-                        if require_acoustic_boundaries
-                        else "complete_discourse_boundary"
-                    )
+                if not require_acoustic_boundaries:
                     transcript_boundary = _transcript_aligned_result(
                         clip_engine_silence.SilenceVerificationResult(
                             "unavailable",
@@ -5189,7 +5178,7 @@ class IngestionPipeline:
                             end_target,
                             {
                                 "stage": "transcript",
-                                "reason": fallback_reason,
+                                "reason": "complete_discourse_boundary",
                             },
                         ),
                         speech_bounds=speech_bounds,
@@ -5202,44 +5191,37 @@ class IngestionPipeline:
                     verification_deadline - time.monotonic()
                 )
                 groq_request_count = _groq_boundary_request_count(raw_clip)
-                groq_reserve_sec = min(
-                    remaining_verification_sec / 2.0,
-                    groq_request_count * GROQ_BOUNDARY_TIMEOUT_SEC,
+                groq_budget_sec = groq_request_count * GROQ_BOUNDARY_TIMEOUT_SEC
+                acoustic_timeout_sec = max(
+                    0.0,
+                    remaining_verification_sec - groq_budget_sec,
                 )
-                acoustic_timeout_sec = (
-                    remaining_verification_sec - groq_reserve_sec
-                )
-                if acoustic_timeout_sec <= 0:
-                    transcript_boundary = _transcript_aligned_result(
-                        clip_engine_silence.SilenceVerificationResult(
-                            "unavailable",
-                            required_start,
-                            required_end,
-                            {
-                                "stage": "transcript",
-                                "reason": "audio_refinement_deadline_exceeded",
-                            },
-                        ),
-                        speech_bounds=speech_bounds,
-                        search_limits=(search_start_limit, search_end_limit),
-                        projection_diagnostics=projection,
+                if allow_audio and acoustic_timeout_sec > 0.0:
+                    acoustic = clip_engine_silence.verify_acoustic_boundaries(
+                        str(v.get("url") or v.get("id") or ""),
+                        start_target,
+                        end_target,
+                        search_start_limit_sec=search_start_limit,
+                        search_end_limit_sec=search_end_limit,
+                        require_speech_handoff=False,
+                        require_start_speech_handoff=start_handoff,
+                        require_end_speech_handoff=end_handoff,
+                        require_start_two_sided=start_two_sided,
+                        require_end_two_sided=end_two_sided,
+                        prepared=prepared_audio,
+                        timeout_sec=acoustic_timeout_sec,
+                        cancel_check=should_cancel,
                     )
-                    return caption, transcript_boundary, projection, speech_bounds
-                acoustic = clip_engine_silence.verify_acoustic_boundaries(
-                    str(v.get("url") or v.get("id") or ""),
-                    start_target,
-                    end_target,
-                    search_start_limit_sec=search_start_limit,
-                    search_end_limit_sec=search_end_limit,
-                    require_speech_handoff=False,
-                    require_start_speech_handoff=start_handoff,
-                    require_end_speech_handoff=end_handoff,
-                    require_start_two_sided=start_two_sided,
-                    require_end_two_sided=end_two_sided,
-                    prepared=prepared_audio,
-                    timeout_sec=acoustic_timeout_sec,
-                    cancel_check=should_cancel,
-                )
+                else:
+                    acoustic = clip_engine_silence.SilenceVerificationResult(
+                        "unavailable",
+                        start_target,
+                        end_target,
+                        {
+                            "stage": "transcript",
+                            "reason": "audio_refinement_deadline_exceeded",
+                        },
+                    )
                 if (
                     acoustic.verified
                     and not (
@@ -5274,38 +5256,27 @@ class IngestionPipeline:
                             "reason": "acoustic_refinement_unsafe",
                         },
                     )
-                remaining_for_groq = verification_deadline - time.monotonic()
-                if remaining_for_groq <= 0.0:
-                    acoustic = _transcript_aligned_result(
+                if groq_budget_sec > 0.0:
+                    (
                         acoustic,
+                        speech_bounds,
+                        projection,
+                        (search_start_limit, search_end_limit),
+                    ) = _groq_refine_without_silence(
+                        acoustic,
+                        transcript=engine_out["transcript"],
+                        raw_clip=raw_clip,
+                        caption_diagnostics=caption,
+                        prepared=prepared_audio,
                         speech_bounds=speech_bounds,
-                        search_limits=(search_start_limit, search_end_limit),
                         projection_diagnostics=projection,
+                        search_limits=(search_start_limit, search_end_limit),
+                        source_end_sec=media_end,
+                        sibling_clips=candidate_clips,
+                        cache=groq_boundary_cache,
+                        timeout_sec=groq_budget_sec,
+                        cancel_check=should_cancel,
                     )
-                    return caption, acoustic, projection, speech_bounds
-                (
-                    acoustic,
-                    speech_bounds,
-                    projection,
-                    (search_start_limit, search_end_limit),
-                ) = _groq_refine_without_silence(
-                    acoustic,
-                    transcript=engine_out["transcript"],
-                    raw_clip=raw_clip,
-                    caption_diagnostics=caption,
-                    prepared=prepared_audio,
-                    speech_bounds=speech_bounds,
-                    projection_diagnostics=projection,
-                    search_limits=(search_start_limit, search_end_limit),
-                    source_end_sec=media_end,
-                    sibling_clips=candidate_clips,
-                    cache=groq_boundary_cache,
-                    timeout_sec=min(
-                        max(1, groq_request_count) * GROQ_BOUNDARY_TIMEOUT_SEC,
-                        remaining_for_groq,
-                    ),
-                    cancel_check=should_cancel,
-                )
                 acoustic = _transcript_aligned_result(
                     acoustic,
                     speech_bounds=speech_bounds,
