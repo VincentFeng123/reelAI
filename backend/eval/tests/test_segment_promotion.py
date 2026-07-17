@@ -213,12 +213,12 @@ def test_profile_selection_is_single_first_and_uses_eligible_pro_baseline():
         }}
     failed = {"status": "fail", "promote": False}
     selection = P.select_evaluation_profiles(
-        comparison, passed("flash_single_v1"), passed("flash_split_v1"))
+        comparison, passed("flash_single_v1"), passed("flash_split_v2"))
     assert selection["selected_pro_profile"] == "corrected_pro_v1"
     assert selection["selected_flash_profile"] == "flash_single_v1"
     assert selection["eligible"] is True
-    selection = P.select_evaluation_profiles(comparison, failed, passed("flash_split_v1"))
-    assert selection["selected_flash_profile"] == "flash_split_v1"
+    selection = P.select_evaluation_profiles(comparison, failed, passed("flash_split_v2"))
+    assert selection["selected_flash_profile"] == "flash_split_v2"
     assert P.select_evaluation_profiles(comparison, failed, failed)["eligible"] is False
 
 

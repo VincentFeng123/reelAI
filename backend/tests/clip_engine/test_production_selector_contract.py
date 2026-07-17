@@ -2033,7 +2033,18 @@ def test_trusted_live_acceleration_candidate_advances_to_its_mass_setup() -> Non
     )
 
 
-def test_trusted_live_units_candidate_advances_to_acceleration_handoff() -> None:
+@pytest.mark.parametrize(
+    ("model_start_line", "model_start_quote"),
+    [
+        (1, "units for speed so if you're"),
+        (0, "meters per second these are all examples"),
+    ],
+    ids=["clipped-speed-tail", "complete-speed-background"],
+)
+def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
+    model_start_line: int,
+    model_start_quote: str,
+) -> None:
     raw_cues = [
         (
             0,
@@ -2094,14 +2105,14 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff() -> None
     claim = "meters per second squared are common units for acceleration"
     plan = _compact_custom_plan(
         request="Newton's second law",
-        start_quote="units for speed so if you're",
+        start_quote=model_start_quote,
         end_quote="speed doesn't change you are accelerating",
         claim_quote=claim,
     )
     plan = plan.model_copy(update={
         "topics": [plan.topics[0].model_copy(update={
             "candidate_id": "acceleration-definition-units",
-            "start_line": 1,
+            "start_line": model_start_line,
             "end_line": 3,
             "title": "Acceleration and Its Units",
             "learning_objective": (
@@ -2984,6 +2995,16 @@ def test_newtons_second_law_prompt_requires_subject_anchoring_and_context() -> N
         "a complete standalone definition of acceleration as the rate of change of "
         "velocity can be foundational support"
     ) in normalized
+    assert "background-detour boundary example" in normalized
+    assert (
+        "sq, cq, title, obj, and facet must all describe the same atomic educational unit"
+        in normalized
+    )
+    assert 'use s=62, sq="you\'re now ready to understand acceleration"' in normalized
+    assert (
+        "do not fold the whole completed prerequisite into the later target unit"
+        in normalized
+    )
     assert "the semantic opening may not rely on an unresolved referent" in normalized
     assert (
         'do not start at line 51 with "this law tells us"'
@@ -3002,7 +3023,7 @@ def test_newtons_second_law_prompt_requires_subject_anchoring_and_context() -> N
     ) in normalized
     assert "include the contiguous spoken unit" in normalized
     assert "end eq after the unit" in normalized
-    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v8"
+    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v9"
 
 
 def test_boundary_prompt_stays_transcript_only_when_video_is_requested() -> None:
@@ -3774,7 +3795,7 @@ def test_flash_selector_fails_over_immediately_after_one_503(monkeypatch) -> Non
                 gemini_client.GeminiCallTelemetry(
                     model=model,
                     operation="flash_boundary_selector",
-                    prompt_version="flash_split_v1",
+                    prompt_version="flash_split_v2",
                     thinking_level="low",
                     latency_ms=5.0,
                     retries=0,
@@ -3822,7 +3843,7 @@ def test_flash_selector_fails_over_immediately_after_one_503(monkeypatch) -> Non
         timeout_s=10.0,
         deadline_monotonic=time.monotonic() + 10.0,
         operation="flash_boundary_selector",
-        prompt_version="flash_split_v1",
+        prompt_version="flash_split_v2",
         cancelled=None,
         max_retries=0,
         failover_model="gemini-3.1-flash-lite",

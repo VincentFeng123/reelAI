@@ -2782,6 +2782,137 @@ def test_direct_adapter_aligns_supadata_symbolic_math_quote_to_spoken_groq_words
     transcribe.assert_called_once()
 
 
+def test_live_acceleration_groq_places_repaired_gemini_start_on_exact_word(
+    monkeypatch,
+) -> None:
+    start_quote = "you're now ready to understand acceleration"
+    cue_two = (
+        "so while your speed may have been 72 miles per hour your velocity was "
+        "72 miles per hour east or 72 miles per hour towards the beach there "
+        "just has to be some direction attached to the speed to make it a "
+        "velocity with that knowledge in hand you're now ready to understand "
+        "acceleration which is simply the rate at which velocity changes it's "
+        "represented as distance per time per time or distance per time squared "
+        "for example meters per second squared are common units for acceleration"
+    )
+    cue_three = (
+        "anytime you change your velocity you are accelerating that can be "
+        "speeding up or slowing down which is also known as negative "
+        "acceleration but Direction is also a component of velocity so when you "
+        "change your direction even if your speed doesn't change you are accelerating"
+    )
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:Jyiw6KkedDY-live-acceleration",
+        "duration": 128.97,
+        "segments": [
+            {
+                "cue_id": "Jyiw6KkedDY:cue:2",
+                "start": 60.48,
+                "end": 95.729,
+                "text": cue_two,
+            },
+            {
+                "cue_id": "Jyiw6KkedDY:cue:3",
+                "start": 92.75,
+                "end": 128.97,
+                "text": cue_three,
+            },
+        ],
+    }
+    repaired_gemini_clip = _quality_clip(
+        candidate_id="acceleration-definition-units",
+        cue_id="Jyiw6KkedDY:cue:2",
+        cue_ids=["Jyiw6KkedDY:cue:2", "Jyiw6KkedDY:cue:3"],
+        start=60.48,
+        end=128.97,
+        quote="meters per second squared are common units for acceleration",
+        selection_authority="gemini",
+        start_quote=start_quote,
+        end_quote="speed doesn't change you are accelerating",
+        edge_projection={
+            "start": {
+                "required": True,
+                "cue_id": "Jyiw6KkedDY:cue:2",
+                "quote": start_quote,
+            }
+        },
+        title="Acceleration and Its Units",
+        learning_objective=(
+            "Define acceleration and identify its standard units of measurement"
+        ),
+        facet="acceleration and units",
+    )
+    prepared = _ready_audio(duration_sec=128.97)
+    exact_start = 76.12
+    word = pipeline_module.clip_engine_silence.lexical_timing.LexicalWord
+    groq_words = tuple(
+        word(text, onset)
+        for text, onset in (
+            ("hand", 75.86),
+            ("you're", exact_start),
+            ("now", 76.30),
+            ("ready", 76.52),
+            ("to", 76.68),
+            ("understand", 76.90),
+            ("acceleration", 77.28),
+            ("which", 77.52),
+        )
+    )
+    verify_audio = mock.Mock(
+        return_value=pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "unavailable",
+            60.48,
+            128.97,
+            {"stage": "start", "reason": "start_silence_not_found"},
+        )
+    )
+    transcribe = mock.Mock(return_value=groq_words)
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify_audio,
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_groq_boundary_asr,
+        "transcribe_boundary_words",
+        transcribe,
+    )
+
+    verified = pipeline_module._verified_direct_adapter_clips(
+        source_url="https://www.youtube.com/watch?v=Jyiw6KkedDY",
+        engine_out={
+            "clips": [repaired_gemini_clip],
+            "transcript": transcript,
+            "notes": "",
+        },
+        should_cancel=None,
+        prepared_audio=prepared,
+        require_acoustic_boundaries=True,
+        exact_topic="Newton's second law",
+    )
+
+    assert len(verified) == 1
+    assert verified[0]["selection_candidate_id"] == "acceleration-definition-units"
+    assert verified[0]["start"] == exact_start
+    assert verified[0]["search_context"]["surface_eligible"] is True
+    verify_audio.assert_called_once()
+    transcribe.assert_called_once()
+    request = transcribe.call_args.kwargs
+    assert request["window_start_sec"] <= exact_start <= request["window_end_sec"]
+    assert request["window_end_sec"] - request["window_start_sec"] == pytest.approx(
+        pipeline_module.GROQ_BOUNDARY_WINDOW_SEC
+    )
+    projection = verified[0]["search_context"]["boundary_diagnostics"][
+        "lexical_projection"
+    ]
+    assert projection["start"]["quote"] == start_quote
+    assert projection["start"]["required_speech_sec"] == exact_start
+    assert projection["start"]["timing_source"] == "groq_boundary_asr"
+    assert projection["groq_boundary_asr"]["applied"] is True
+
+
 @pytest.mark.parametrize(
     "first_words",
     [

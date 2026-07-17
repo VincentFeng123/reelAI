@@ -1668,8 +1668,8 @@ _NonBlank = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1
 PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
-FLASH_SPLIT_PROFILE = "flash_split_v1"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v8"
+FLASH_SPLIT_PROFILE = "flash_split_v2"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v9"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -1954,7 +1954,9 @@ class _CompactBoundaryTopic(_StrictModel):
         description=(
             "Five to sixteen exact consecutive transcript words containing the "
             "unit's substantive educational claim, explanation, or answer. It cannot "
-            "be an agenda, outline, topic mention, promise, or unanswered question."
+            "be an agenda, outline, topic mention, promise, unanswered question, or "
+            "a claim from an earlier background unit. It must teach the same atomic "
+            "unit named by title, obj, and facet."
         ),
     )
     title: _CompactTitle
@@ -2373,7 +2375,9 @@ def _compact_output_guide() -> str:
   later transition, recap, outro, joke, or next topic.
 - cq = claim_quote: 5-16 exact consecutive transcript words between the chosen semantic edges
   containing the core educational claim, explanation, result, or answer. cq proves where the
-  teaching is; it does not define the start or end and cannot be mere agenda or topic mention.
+  teaching is; it does not define the start or end and cannot be mere agenda, topic mention, or
+  a claim from an earlier prerequisite/background lesson. sq, cq, title, obj, and facet must all
+  describe the same atomic educational unit.
 - title = a clear viewer-facing title of at most 12 words.
 - obj = learning_objective: one precise sentence, at most 24 words, stating what the viewer
   will understand or be able to do after this clip. Give exactly one objective.
@@ -2463,6 +2467,19 @@ Named-referent context example:
 Do not start at line 51 with "This law tells us". The original request and video title are not
 spoken context. Include line 50 and begin sq at "Newton's second law" so the referent is audible
 inside the clip.
+
+Background-detour boundary example:
+[60] 10:00 Speed measures how fast position changes, with units such as meters per second.
+[61] 10:08 Velocity is speed with a direction attached to it.
+[62] 10:16 With that knowledge in hand, you're now ready to understand acceleration, which is
+the rate at which velocity changes and is measured in meters per second squared.
+For an acceleration candidate whose obj is "Define acceleration and identify its units", lines
+60-61 are earlier completed background units, not permission to make the acceleration clip begin
+with a speed lesson. Use s=62, sq="you're now ready to understand acceleration", and a cq about
+the acceleration definition or its units. WRONG: title/obj/facet describe acceleration while sq
+or cq begins in the earlier speed or velocity lesson. If an earlier prerequisite is independently
+relevant, return it as its own supporting candidate; do not fold the whole completed prerequisite
+into the later target unit merely because it comes first.
 
 Named worked-example boundary example:
 [40] 06:00 This is simply equal to five. So that's the derivative of five x minus four. It's five. Now let's try another example. So let's say if f of x is equal to x squared, what is the first derivative?
@@ -2650,6 +2667,11 @@ def _boundary_prompts(
         "the requested setup inside it. Never begin sq at the previous conclusion or "
         "navigation. A clause such as 'So let's say if f' that states the requested object is "
         "setup, not context-only handoff; preserve its first 'So'. "
+        "Keep sq, cq, title, obj, and facet on the same atomic educational unit. An earlier "
+        "complete prerequisite or background explanation is a separate unit, not required "
+        "context merely because it helps introduce the later target. Return that background "
+        "separately when it qualifies, and begin the target candidate at its shortest complete "
+        "spoken setup. "
         "Never start a candidate with context-only handoff language such as 'on the other "
         "hand', 'now/then the next step', or 'so step five'; include the "
         "missing setup or begin at the first independently understandable teaching sentence. "
