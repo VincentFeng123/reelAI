@@ -46,6 +46,27 @@ def test_assessment_model_stays_flash_when_shared_or_assessment_models_are_pro(
     importlib.reload(cfg)
 
 
+def test_lesson_order_model_never_consumes_pro_selector_budget(monkeypatch):
+    with monkeypatch.context() as patch:
+        patch.delenv("LESSON_ORDER_MODEL", raising=False)
+        cfg = importlib.reload(importlib.import_module("backend.app.clip_engine.config"))
+        assert cfg.LESSON_ORDER_MODEL == "gemini-2.5-flash-lite"
+
+        patch.setenv("LESSON_ORDER_MODEL", "gemini-3.1-pro-preview")
+        cfg = importlib.reload(cfg)
+        assert cfg.LESSON_ORDER_MODEL == "gemini-2.5-flash-lite"
+
+        patch.setenv("LESSON_ORDER_MODEL", "gemini-3.1-flash-lite")
+        cfg = importlib.reload(cfg)
+        assert cfg.LESSON_ORDER_MODEL == "gemini-2.5-flash-lite"
+
+        patch.setenv("LESSON_ORDER_MODEL", "gemini-2.5-flash")
+        cfg = importlib.reload(cfg)
+        assert cfg.LESSON_ORDER_MODEL == "gemini-2.5-flash"
+
+    importlib.reload(cfg)
+
+
 def test_curation_gate_defaults(monkeypatch):
     monkeypatch.delenv("SEGMENT_MAX_CLIP_S", raising=False)
     monkeypatch.delenv("SEGMENT_INFORMATIVENESS_MIN", raising=False)

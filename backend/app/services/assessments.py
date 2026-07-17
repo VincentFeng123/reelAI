@@ -26,7 +26,8 @@ from ..clip_engine.errors import CancellationError, ProviderError
 
 
 COMPLETION_FRACTION = 0.80
-REEL_BATCH_SIZE = 3
+# Compatibility for reels with no version-2 organizer metadata at all.
+LEGACY_CADENCE_TARGET = 3
 SESSION_QUESTION_TARGET = 3
 CONCEPT_ADJUSTMENT_BOUND = 0.25
 BACKFILL_CACHE_PREFIX = "assessment_question_backfill:"
@@ -55,6 +56,33 @@ class _BackfillPlan(BaseModel):
 def _check_cancelled(should_cancel: Callable[[], bool] | None) -> None:
     if should_cancel is not None and should_cancel():
         raise AssessmentCancelledError("Assessment generation cancelled.")
+
+
+def assessment_checkpoint_reel_ids(
+    ordered_reel_ids: list[str],
+    proposed_checkpoint_reel_ids: object = None,
+    *,
+    degraded: bool = False,
+) -> list[str] | None:
+    """Validate the organizer's exact checkpoint list without inventing cadence."""
+    if (
+        degraded
+        or not ordered_reel_ids
+        or not all(isinstance(reel_id, str) and reel_id for reel_id in ordered_reel_ids)
+        or len(set(ordered_reel_ids)) != len(ordered_reel_ids)
+        or not isinstance(proposed_checkpoint_reel_ids, list)
+    ):
+        return None
+    positions = {reel_id: index for index, reel_id in enumerate(ordered_reel_ids)}
+    proposed = proposed_checkpoint_reel_ids
+    if (
+        not all(isinstance(reel_id, str) and reel_id in positions for reel_id in proposed)
+        or len(set(proposed)) != len(proposed)
+        or [positions[reel_id] for reel_id in proposed]
+        != sorted(positions[reel_id] for reel_id in proposed)
+    ):
+        return None
+    return list(proposed)
 
 
 @contextmanager
@@ -340,17 +368,120 @@ class AssessmentService:
         return total
 
     @staticmethod
+    def _organizer_checkpoint_assignments(
+        conn: Any,
+        *,
+        learner_id: str,
+        material_id: str,
+        reel_ids: set[str],
+    ) -> dict[str, tuple[bool, bool]]:
+        """Resolve reels against the newest learner-owned released lesson plans.
+
+        Each value is ``(organizer_controls_cadence, is_checkpoint)``. A valid
+        version-2 plan controls only reels named in its order. Corrupt or
+        incomplete version-2 metadata controls the unresolved current window
+        conservatively, so it cannot accidentally fall back to a numeric quiz.
+        """
+        if not reel_ids:
+            return {}
+        rows = fetch_all(
+            conn,
+            """
+            SELECT g.lesson_order_json
+            FROM reel_generation_jobs j
+            JOIN reel_generations g ON g.id = j.result_generation_id
+            WHERE j.learner_id = ?
+              AND j.material_id = ?
+              AND j.status IN ('completed', 'partial')
+              AND j.result_generation_id IS NOT NULL
+            ORDER BY COALESCE(j.completed_at, j.updated_at, j.created_at) DESC,
+                     j.created_at DESC,
+                     j.id DESC
+            LIMIT 100
+            """,
+            (learner_id, material_id),
+        )
+        unresolved = set(reel_ids)
+        assignments: dict[str, tuple[bool, bool]] = {}
+        for row in rows:
+            raw = row.get("lesson_order_json")
+            if raw is None:
+                continue
+            try:
+                payload = json.loads(str(raw))
+            except (TypeError, json.JSONDecodeError):
+                for reel_id in unresolved:
+                    assignments[reel_id] = (True, False)
+                break
+            if not isinstance(payload, dict):
+                for reel_id in unresolved:
+                    assignments[reel_id] = (True, False)
+                break
+            if payload.get("version") != 2:
+                continue
+            ordered = payload.get("ordered_reel_ids")
+            if (
+                not isinstance(ordered, list)
+                or not ordered
+                or not all(isinstance(reel_id, str) and reel_id for reel_id in ordered)
+                or len(set(ordered)) != len(ordered)
+            ):
+                for reel_id in unresolved:
+                    assignments[reel_id] = (True, False)
+                break
+            matching = unresolved.intersection(ordered)
+            if not matching:
+                continue
+            checkpoint_set = set(
+                assessment_checkpoint_reel_ids(
+                    ordered,
+                    payload.get("assessment_checkpoint_reel_ids"),
+                    degraded=payload.get("degraded") is not False,
+                )
+                or []
+            )
+            for reel_id in matching:
+                assignments[reel_id] = (True, reel_id in checkpoint_set)
+            unresolved.difference_update(matching)
+            if not unresolved:
+                break
+        return assignments
+
+    @classmethod
     def _cadence_target(
+        cls,
+        conn: Any,
         *,
         learner_id: str,
         material_id: str,
         window_cutoff: str,
         recent_accuracy: float | None,
         scroll_rows: list[dict[str, Any]],
-    ) -> int:
-        """Match recall readiness to the feed's fixed three-reel batch boundary."""
-        del learner_id, material_id, window_cutoff, recent_accuracy, scroll_rows
-        return REEL_BATCH_SIZE
+    ) -> tuple[int, str | None, bool]:
+        """Return reached position, checkpoint ID, and organizer cadence control."""
+        del window_cutoff, recent_accuracy
+        reel_ids = {
+            str(row.get("reel_id") or "")
+            for row in scroll_rows
+            if str(row.get("reel_id") or "")
+        }
+        assignments = cls._organizer_checkpoint_assignments(
+            conn,
+            learner_id=learner_id,
+            material_id=material_id,
+            reel_ids=reel_ids,
+        )
+        organizer_controls_window = any(
+            assignments.get(str(row.get("reel_id") or ""), (False, False))[0]
+            for row in scroll_rows
+        )
+        if organizer_controls_window:
+            for position, row in enumerate(scroll_rows, start=1):
+                reel_id = str(row.get("reel_id") or "")
+                if assignments.get(reel_id, (False, False))[1]:
+                    return position, reel_id, True
+            return 0, None, True
+        return LEGACY_CADENCE_TARGET, None, False
 
     @staticmethod
     def _cadence_session_id(
@@ -403,6 +534,38 @@ class AssessmentService:
             FROM assessment_sessions
             WHERE learner_id = ? AND material_id = ? AND status = ? AND {column} IS NOT NULL
             ORDER BY {column} DESC
+            LIMIT 1
+            """,
+            (learner_id, material_id, status),
+        )
+        return str((row or {}).get("cutoff") or "")
+
+    @staticmethod
+    def _latest_cadence_cutoff(
+        conn: Any,
+        learner_id: str,
+        material_id: str,
+        status: str,
+    ) -> str:
+        """Consume through the organizer checkpoint, not later session completion."""
+        column = "completed_at" if status == "completed" else "snoozed_at"
+        row = fetch_one(
+            conn,
+            f"""
+            SELECT CASE
+                     WHEN TRIM(COALESCE(s.organizer_checkpoint_reel_id, '')) != ''
+                     THEN COALESCE(p.scrolled_at, s.{column}, s.created_at)
+                     ELSE s.{column}
+                   END AS cutoff
+            FROM assessment_sessions s
+            LEFT JOIN learner_reel_progress p
+              ON p.learner_id = s.learner_id
+             AND p.reel_id = s.organizer_checkpoint_reel_id
+            WHERE s.learner_id = ?
+              AND s.material_id = ?
+              AND s.status = ?
+              AND s.{column} IS NOT NULL
+            ORDER BY cutoff DESC
             LIMIT 1
             """,
             (learner_id, material_id, status),
@@ -542,12 +705,18 @@ class AssessmentService:
             conn, learner_id, material_id
         )
         completed_cutoff = self._latest_cutoff(conn, learner_id, material_id, "completed")
-        snoozed_cutoff = self._latest_cutoff(conn, learner_id, material_id, "snoozed")
-        cadence_cutoff = max(completed_cutoff, snoozed_cutoff)
+        completed_cadence_cutoff = self._latest_cadence_cutoff(
+            conn, learner_id, material_id, "completed"
+        )
+        snoozed_cadence_cutoff = self._latest_cadence_cutoff(
+            conn, learner_id, material_id, "snoozed"
+        )
+        cadence_cutoff = max(completed_cadence_cutoff, snoozed_cadence_cutoff)
         completed_rows = self._completed_rows(conn, learner_id, material_id, completed_cutoff)
         total_units = self._information_units(completed_rows)
         scroll_rows = self._scrolled_rows(conn, learner_id, material_id, cadence_cutoff)
-        cadence_target = self._cadence_target(
+        cadence_target, organizer_checkpoint_reel_id, organizer_plan_active = self._cadence_target(
+            conn,
             learner_id=learner_id,
             material_id=material_id,
             window_cutoff=cadence_cutoff,
@@ -556,13 +725,29 @@ class AssessmentService:
         )
 
         available = self._available_questions(conn, learner_id, material_id, cadence_cutoff)
+        if organizer_checkpoint_reel_id:
+            available = [
+                row
+                for row in available
+                if str(row.get("reel_id") or "")
+                == organizer_checkpoint_reel_id
+            ]
+        session_question_target = (
+            self._pending_session_target(pending)
+            if pending
+            else 1
+            if organizer_checkpoint_reel_id
+            else SESSION_QUESTION_TARGET
+        )
         question_reels = {
             str(row.get("reel_id") or "")
             for row in available
             if str(row.get("reel_id") or "")
         }
-        question_pool_complete = len(question_reels) >= SESSION_QUESTION_TARGET
-        numeric_due = len(scroll_rows) >= cadence_target
+        question_pool_complete = len(question_reels) >= session_question_target
+        numeric_due = bool(organizer_checkpoint_reel_id) or (
+            not organizer_plan_active and len(scroll_rows) >= cadence_target
+        )
         # Readiness is the durable due state. Question availability is handled
         # separately so a transient provider failure cannot erase that state.
         ready = bool(pending) or numeric_due
@@ -572,6 +757,9 @@ class AssessmentService:
             "information_units": total_units,
             "readiness_threshold": float(cadence_target),
             "cadence_target": cadence_target,
+            "session_question_target": session_question_target,
+            "organizer_checkpoint_reel_id": organizer_checkpoint_reel_id,
+            "organizer_plan_active": organizer_plan_active,
             "scroll_count": len(scroll_rows),
             "completed_cutoff": completed_cutoff,
             "cadence_cutoff": cadence_cutoff,
@@ -1063,7 +1251,17 @@ class AssessmentService:
             for row in state["available_questions"]
             if str(row.get("reel_id") or "")
         }
-        return min(SESSION_QUESTION_TARGET, len(distinct_reels))
+        return min(
+            max(1, int(state.get("session_question_target") or SESSION_QUESTION_TARGET)),
+            len(distinct_reels),
+        )
+
+    @staticmethod
+    def _pending_session_target(pending: dict[str, Any]) -> int:
+        """Each organizer checkpoint is one immediate reel-grounded question."""
+        if str(pending.get("organizer_checkpoint_reel_id") or ""):
+            return 1
+        return SESSION_QUESTION_TARGET
 
     @staticmethod
     def _select_questions(
@@ -1137,7 +1335,8 @@ class AssessmentService:
             return None
         session_id = str(pending["id"])
         existing = self._pending_question_rows(conn, session_id)
-        if len(existing) >= SESSION_QUESTION_TARGET:
+        question_target = self._pending_session_target(pending)
+        if len(existing) >= question_target:
             if int(pending.get("question_count") or 0) != len(existing):
                 execute_modify(
                     conn,
@@ -1148,7 +1347,7 @@ class AssessmentService:
                 conn, "SELECT * FROM assessment_sessions WHERE id = ?", (session_id,)
             )
 
-        needed = SESSION_QUESTION_TARGET - len(existing)
+        needed = question_target - len(existing)
         additions = self._select_questions(
             state["available_questions"],
             needed,
@@ -1179,7 +1378,7 @@ class AssessmentService:
                 SET question_count = ?, updated_at = ?
                 WHERE id = ? AND status = 'pending'
                 """,
-                (SESSION_QUESTION_TARGET, now_iso(), session_id),
+                (question_target, now_iso(), session_id),
             )
         return fetch_one(
             conn, "SELECT * FROM assessment_sessions WHERE id = ?", (session_id,)
@@ -1189,9 +1388,10 @@ class AssessmentService:
         self, conn: Any, pending: dict[str, Any] | None
     ) -> dict[str, Any] | None:
         session = self._serialize_session(conn, pending)
+        question_target = self._pending_session_target(pending or {})
         if (
             session
-            and len(session["questions"]) >= SESSION_QUESTION_TARGET
+            and len(session["questions"]) >= question_target
             and int(session["question_count"]) == len(session["questions"])
         ):
             return session
@@ -1220,9 +1420,12 @@ class AssessmentService:
         state = self._readiness_state(conn, learner_id, material_id)
         if state["pending"]:
             if not self._exposable_pending_session(conn, state["pending"]):
+                checkpoint_reel_id = str(
+                    state["pending"].get("organizer_checkpoint_reel_id") or ""
+                )
                 self.prepare_reel_questions(
                     conn,
-                    reel_ids=[
+                    reel_ids=[checkpoint_reel_id] if checkpoint_reel_id else [
                         str(row.get("reel_id") or "")
                         for row in state["scroll_rows"]
                     ],
@@ -1253,9 +1456,12 @@ class AssessmentService:
             state["numeric_due"]
             and not bool(state["question_pool_complete"])
         ):
+            checkpoint_reel_id = str(
+                state.get("organizer_checkpoint_reel_id") or ""
+            )
             self.prepare_reel_questions(
                 conn,
-                reel_ids=[
+                reel_ids=[checkpoint_reel_id] if checkpoint_reel_id else [
                     str(row.get("reel_id") or "")
                     for row in state["scroll_rows"]
                 ],
@@ -1273,7 +1479,11 @@ class AssessmentService:
             }
         count = self._desired_question_count(conn, state)
         selected = self._select_questions(state["available_questions"], count)
-        if len(selected) != SESSION_QUESTION_TARGET:
+        question_target = max(
+            1,
+            int(state.get("session_question_target") or SESSION_QUESTION_TARGET),
+        )
+        if len(selected) != question_target:
             return {
                 "status": "not_ready",
                 "assessment_ready": bool(state["numeric_due"]),
@@ -1296,9 +1506,10 @@ class AssessmentService:
                 INSERT INTO assessment_sessions (
                     id, learner_id, material_id, status, current_index,
                     question_count, correct_count, information_units,
-                    readiness_threshold, created_at, updated_at,
+                    readiness_threshold, organizer_checkpoint_reel_id,
+                    created_at, updated_at,
                     completed_at, snoozed_at
-                ) VALUES (?, ?, ?, 'pending', 0, ?, 0, ?, ?, ?, ?, NULL, NULL)
+                ) VALUES (?, ?, ?, 'pending', 0, ?, 0, ?, ?, ?, ?, ?, NULL, NULL)
                 ON CONFLICT DO NOTHING
                 """,
                 (
@@ -1308,6 +1519,7 @@ class AssessmentService:
                     len(selected),
                     float(state["information_units"]),
                     float(state["readiness_threshold"]),
+                    state.get("organizer_checkpoint_reel_id"),
                     timestamp,
                     timestamp,
                 ),
@@ -1672,6 +1884,8 @@ class AssessmentService:
             )
             repaired = self._repair_pending_session(conn, state=state)
             if not self._exposable_pending_session(conn, repaired):
+                if str(session.get("organizer_checkpoint_reel_id") or ""):
+                    raise ValueError("assessment session is incomplete")
                 raise ValueError(
                     "assessment session must contain at least three questions"
                 )

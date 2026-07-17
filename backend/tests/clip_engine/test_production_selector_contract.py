@@ -157,8 +157,17 @@ def test_selector_contract_allows_short_exact_edges_without_padding() -> None:
 
     schema = gemini_segment._CompactBoundaryTopic.model_json_schema()
     assert "first spoken word" in schema["properties"]["sq"]["description"]
+    assert "independently understandable spoken sentence" in (
+        schema["properties"]["sq"]["description"]
+    )
+    assert "never the semantic span or clip duration" in (
+        schema["properties"]["sq"]["description"]
+    )
     assert "whole same-objective teaching arc" in schema["properties"]["eq"]["description"]
     assert "intermediate result is not an endpoint" in schema["properties"]["eq"]["description"]
+    assert "complete concluding sentence or independent clause" in (
+        schema["properties"]["eq"]["description"]
+    )
 
 
 def test_selector_contract_prioritizes_wholeness_over_clip_length() -> None:
@@ -168,11 +177,14 @@ def test_selector_contract_prioritizes_wholeness_over_clip_length() -> None:
         "the result and its explanation",
     )
     prompt = f"{system}\n{user}".casefold()
+    normalized = " ".join(prompt.split())
 
     assert "context and wholeness have absolute priority over concision" in prompt
     assert "if completeness and brevity conflict, choose the longer complete span" in prompt
     assert "a locally grammatical sentence or intermediate result is not an endpoint" in prompt
     assert "there is no numeric duration cap" in prompt
+    assert '"shortest" describes only the quote used to locate that word' in normalized
+    assert "never asks for a shorter semantic span or clip" in normalized
     assert "shortest concise span" not in prompt
 
 
@@ -2050,16 +2062,45 @@ def test_trusted_live_acceleration_candidate_advances_to_its_mass_setup() -> Non
 
 
 @pytest.mark.parametrize(
-    ("model_start_line", "model_start_quote"),
+    ("model_start_line", "model_start_quote", "model_end_line", "model_end_quote"),
     [
-        (1, "units for speed so if you're"),
-        (0, "meters per second these are all examples"),
+        (
+            1,
+            "units for speed so if you're",
+            3,
+            "speed doesn't change you are accelerating",
+        ),
+        (
+            0,
+            "meters per second these are all examples",
+            3,
+            "speed doesn't change you are accelerating",
+        ),
+        (
+            1,
+            "units for speed so if you're",
+            2,
+            "common units for acceleration",
+        ),
+        (
+            1,
+            "units of speed so if you're",
+            2,
+            "common units for acceleration",
+        ),
     ],
-    ids=["clipped-speed-tail", "complete-speed-background"],
+    ids=[
+        "clipped-speed-tail",
+        "complete-speed-background",
+        "live-acceleration-definition",
+        "ungrounded-live-acceleration-start",
+    ],
 )
 def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
     model_start_line: int,
     model_start_quote: str,
+    model_end_line: int,
+    model_end_quote: str,
 ) -> None:
     raw_cues = [
         (
@@ -2122,21 +2163,67 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
     plan = _compact_custom_plan(
         request="Newton's second law",
         start_quote=model_start_quote,
-        end_quote="speed doesn't change you are accelerating",
+        end_quote=model_end_quote,
         claim_quote=claim,
     )
     plan = plan.model_copy(update={
         "topics": [plan.topics[0].model_copy(update={
             "candidate_id": "acceleration-definition-units",
             "start_line": model_start_line,
-            "end_line": 3,
-            "title": "Acceleration and Its Units",
+            "end_line": model_end_line,
+            "title": "Defining Acceleration and Its Units",
             "learning_objective": (
-                "Define acceleration and identify its standard units of measurement"
+                "Define acceleration as the rate of velocity change and identify its units."
             ),
-            "facet": "acceleration and units",
+            "facet": "acceleration definition",
+            "directly_teaches_topic": False,
         })],
     })
+    if model_end_line == 2:
+        exact_request = (
+            "Explain Newton's second law F=ma from intuition through worked examples, "
+            "including net force, mass, acceleration, units, and solving for each variable"
+        )
+        constraints = [
+            ("law", "subject", "Newton's second law F=ma"),
+            ("intuition", "format", "from intuition"),
+            ("worked_examples", "format", "through worked examples"),
+            ("net_force", "subject", "net force"),
+            ("mass", "subject", "mass"),
+            ("acceleration", "subject", "acceleration"),
+            ("units", "outcome", "units"),
+            ("variables", "task", "solving for each variable"),
+        ]
+        plan = plan.model_copy(update={
+            "request_intent": gemini_segment._RequestIntent.model_validate({
+                "exact_request": exact_request,
+                "constraints": [
+                    {
+                        "constraint_id": constraint_id,
+                        "kind": kind,
+                        "source_phrase": source_phrase,
+                        "requirement": source_phrase,
+                    }
+                    for constraint_id, kind, source_phrase in constraints
+                ],
+            }),
+            "topics": [plan.topics[0].model_copy(update={
+                "intent_evidence": [
+                    gemini_segment._CompactIntentEvidence.model_validate({
+                        "id": "acceleration",
+                        "q": (
+                            "acceleration which is simply the rate at which velocity changes"
+                        ),
+                    }),
+                    gemini_segment._CompactIntentEvidence.model_validate({
+                        "id": "units",
+                        "q": (
+                            "meters per second squared are common units for acceleration"
+                        ),
+                    }),
+                ],
+            })],
+        })
 
     report = gemini_segment._plan_to_report(
         plan,
@@ -2157,6 +2244,143 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
     assert "with that knowledge" not in clip["_clip_text"]
     assert "units for speed" not in clip["_clip_text"]
     assert "trimmed_clipped_start_to_claim_setup" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_recovered_misaligned_start_uses_later_claim_handoff() -> None:
+    segments = [
+        {
+            "cue_id": "Jyiw6KkedDY:cue:0",
+            "start": 0.269,
+            "end": 33.84,
+            "text": (
+                "Speed is distance over time. Meters per second are examples of speed."
+            ),
+        },
+        {
+            "cue_id": "Jyiw6KkedDY:cue:1",
+            "start": 31.08,
+            "end": 63.27,
+            "text": (
+                "units for speed so if you're driving in your car at 72 miles per hour "
+                "then that's your speed and your average speed can differ velocity is "
+                "speed with a direction attached to it"
+            ),
+        },
+        {
+            "cue_id": "Jyiw6KkedDY:cue:2",
+            "start": 60.48,
+            "end": 95.729,
+            "text": (
+                "with that knowledge in hand you're now ready to understand acceleration "
+                "which is simply the rate at which velocity changes it's represented as "
+                "distance per time squared and meters per second squared are common units "
+                "for acceleration"
+            ),
+        },
+    ]
+    claim = "acceleration which is simply the rate at which velocity changes"
+    exact_request = (
+        "Explain Newton's second law F=ma from intuition through worked examples, "
+        "including net force, mass, acceleration, units, and solving for each variable"
+    )
+    plan = _compact_custom_plan(
+        request="acceleration",
+        start_quote="units for speed so if you're",
+        end_quote="common units for acceleration",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "request_intent": plan.request_intent.model_copy(update={
+            "exact_request": exact_request,
+        }),
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "acceleration-definition-units",
+            "start_line": 0,
+            "end_line": 2,
+            "title": "Defining Acceleration and Its Units",
+            "learning_objective": (
+                "Define acceleration as the rate of velocity change and identify its units."
+            ),
+            "facet": "acceleration definition",
+            "directly_teaches_topic": False,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "Jyiw6KkedDY:cue:2"
+    assert clip["start_quote"] == "you're now ready to understand acceleration"
+    assert clip["edge_projection"]["start"] == {
+        "required": True,
+        "cue_id": "Jyiw6KkedDY:cue:2",
+        "quote": "you're now ready to understand acceleration",
+    }
+    assert "range_recovered_from_edges" in clip["_boundary_fallback_reasons"]
+    assert "trimmed_clipped_start_to_claim_setup" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+@pytest.mark.parametrize(
+    "later_setup",
+    [
+        "Now what acceleration results when the net force acts on the mass?",
+        (
+            "Now let's say if a net force acts on a mass, what acceleration "
+            "results?"
+        ),
+    ],
+    ids=["later-question", "later-conditional"],
+)
+def test_trusted_lexically_different_same_objective_setup_is_preserved(
+    later_setup: str,
+) -> None:
+    opening = "Picture a loaded wagon that barely changes its motion when shoved"
+    claim = (
+        "Newton's second law says acceleration equals net force divided by mass"
+    )
+    text = f"{opening}. {later_setup} {claim}."
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote=opening,
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "title": "Applying Newton's Second Law",
+            "learning_objective": (
+                "Calculate acceleration from net force and mass."
+            ),
+            "facet": "force-mass-acceleration calculation",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 18.0, "text": text}],
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_quote"] == opening
+    assert clip["_clip_text"].startswith(opening)
+    assert "trimmed_clipped_start_to_claim_setup" not in (
         clip["_boundary_fallback_reasons"]
     )
 
@@ -2873,6 +3097,14 @@ def test_compact_prompt_defines_every_key_and_demonstrates_exact_edges() -> None
     assert "caption-line index, not seconds" in normalized
     assert "Its FIRST spoken word" in normalized
     assert "Its LAST spoken word" in normalized
+    assert "complete independently understandable spoken sentence or independent clause" in (
+        normalized
+    )
+    assert "never a trailing clause, complement, list item, or clipped completion" in (
+        normalized
+    )
+    assert "never a leading clause, sentence prefix, or unfilled predicate" in normalized
+    assert "never asks for a shorter semantic span or clip" in normalized
     assert (
         "cq proves where the teaching is; it does not define the start or end"
         in normalized
@@ -3013,10 +3245,12 @@ def test_newtons_second_law_prompt_requires_subject_anchoring_and_context() -> N
     ) in normalized
     assert "background-detour boundary example" in normalized
     assert (
-        "sq, cq, title, obj, and facet must all describe the same atomic educational unit"
+        "sq, eq, cq, every ie q, title, obj, and facet on the same atomic educational unit"
         in normalized
     )
     assert 'use s=62, sq="you\'re now ready to understand acceleration"' in normalized
+    assert 'also wrong: an acceleration candidate uses ie q="units for speed"' in normalized
+    assert "this rule still applies for a beginner viewer" in normalized
     assert (
         "do not fold the whole completed prerequisite into the later target unit"
         in normalized
@@ -3145,6 +3379,7 @@ def test_boundary_selector_never_attaches_video_even_when_requested(
     assert "current level is beginner" in contents
     assert "difficulty band 0.00-0.40" in contents
     assert "assume no topic-specific background" in contents
+    assert "never prepend a separately complete prerequisite/background lesson" in contents
     assert "youtube.com" not in contents
     assert call["media_resolution"] is None
     assert call.get("estimated_media_tokens", 0) == 0

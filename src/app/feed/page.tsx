@@ -182,6 +182,17 @@ type FeedSearchScope = {
   controller: AbortController;
 };
 
+type AssessmentGateDecision = "continue" | "assessment" | "cancelled";
+
+type AssessmentGateRequest = {
+  key: string;
+  seq: number;
+  reelId: string;
+  promise: Promise<AssessmentGateDecision>;
+  advanceRequested: boolean;
+  advanceHandlerAttached: boolean;
+};
+
 type ActiveRecoveryRequest = {
   key: string;
   seq: number;
@@ -1145,7 +1156,7 @@ function FeedPageInner() {
   const chatAbortControllerRef = useRef<AbortController | null>(null);
   const assessmentProgressMaxRef = useRef<Map<string, number>>(new Map());
   const reportedForwardScrollKeysRef = useRef<Set<string>>(new Set());
-  const assessmentStartRequestRef = useRef<{ key: string; seq: number; reelId: string } | null>(null);
+  const assessmentStartRequestRef = useRef<AssessmentGateRequest | null>(null);
   const activeSearchScopeRef = useRef<FeedSearchScope>({
     key: "",
     seq: 0,
@@ -3239,86 +3250,96 @@ function FeedPageInner() {
     requestReadyBatch,
   ]);
 
-  const reportForwardScrollForReel = useCallback((outgoingReel: Reel | undefined) => {
-    if (
-      assessmentStartRequestRef.current
-      || assessmentBootstrapPending
-      || assessmentGatePending
-      || assessmentSession
-    ) {
-      return;
-    }
+  const reportForwardScrollForReel = useCallback((outgoingReel: Reel | undefined): AssessmentGateRequest | null => {
     const reelId = String(outgoingReel?.reel_id || "").trim();
     const reelMaterialId = String(outgoingReel?.material_id || materialId || "").trim();
     if (!reelId || !reelMaterialId || reelId.startsWith("community:")) {
-      return;
+      return null;
     }
 
     const searchScope = activeSearchScopeRef.current;
     const reportKey = `${searchScope.key}:${searchScope.seq}:${reelId}`;
+    const activeRequest = assessmentStartRequestRef.current;
+    if (activeRequest) {
+      return activeRequest.key === searchScope.key
+        && activeRequest.seq === searchScope.seq
+        && activeRequest.reelId === reelId
+        ? activeRequest
+        : null;
+    }
+    if (assessmentBootstrapPending || assessmentGatePending || assessmentSession) {
+      return null;
+    }
     if (reportedForwardScrollKeysRef.current.has(reportKey)) {
-      return;
+      return null;
     }
     reportedForwardScrollKeysRef.current.add(reportKey);
 
-    void (async () => {
+    const assessmentRequest: AssessmentGateRequest = {
+      key: searchScope.key,
+      seq: searchScope.seq,
+      reelId,
+      promise: Promise.resolve("cancelled"),
+      advanceRequested: false,
+      advanceHandlerAttached: false,
+    };
+    assessmentStartRequestRef.current = assessmentRequest;
+    setAssessmentGatePending(true);
+    setAssessmentError(null);
+
+    assessmentRequest.promise = (async (): Promise<AssessmentGateDecision> => {
+      let decision: AssessmentGateDecision = "cancelled";
       try {
         const scroll = await reportReelScroll({
           reelId,
           signal: searchScope.controller.signal,
         });
-        if (!isSearchScopeActive(searchScope) || !scroll.assessment_ready || assessmentStartRequestRef.current) {
-          return;
+        if (!isSearchScopeActive(searchScope)) {
+          return decision;
+        }
+        if (!scroll.assessment_ready) {
+          decision = "continue";
+          return decision;
         }
 
-        const assessmentRequest = { key: searchScope.key, seq: searchScope.seq, reelId };
-        assessmentStartRequestRef.current = assessmentRequest;
-        setAssessmentGatePending(true);
+        const response = await startNextAssessment({
+          materialId: String(scroll.material_id || reelMaterialId).trim(),
+          signal: searchScope.controller.signal,
+        });
+        if (!isSearchScopeActive(searchScope)) {
+          return decision;
+        }
+        if (!response.session || response.session.questions.length === 0) {
+          reportedForwardScrollKeysRef.current.delete(reportKey);
+          decision = "continue";
+          return decision;
+        }
+
+        const nextSession = withAssessmentAccuracy(response.session, response);
+        decision = "assessment";
+        setAssessmentSession(nextSession);
+        setAssessmentQuestionIndex(clamp(nextSession.current_index, 0, nextSession.questions.length - 1));
+        setAssessmentAnswerReveal(null);
+        setAssessmentResultsVisible(nextSession.answered_count >= nextSession.question_count);
+        setAssessmentAdvanceAfterClose(assessmentRequest.advanceRequested);
         setAssessmentError(null);
-        let openedAssessment = false;
-        try {
-          const response = await startNextAssessment({
-            materialId: String(scroll.material_id || reelMaterialId).trim(),
-            signal: searchScope.controller.signal,
-          });
-          if (!isSearchScopeActive(searchScope)) {
-            return;
-          }
-          if (!response.session || response.session.questions.length === 0) {
-            return;
-          }
-
-          const nextSession = withAssessmentAccuracy(response.session, response);
-          openedAssessment = true;
-          setAssessmentSession(nextSession);
-          setAssessmentQuestionIndex(clamp(nextSession.current_index, 0, nextSession.questions.length - 1));
-          setAssessmentAnswerReveal(null);
-          setAssessmentResultsVisible(nextSession.answered_count >= nextSession.question_count);
-          setAssessmentAdvanceAfterClose(false);
-          setAssessmentGatePending(false);
-          setAssessmentError(null);
-        } catch (error) {
-          if (isSearchScopeActive(searchScope) && !isRequestInterruptedError(error)) {
-            console.warn("Could not start recall check:", error);
-          }
-        } finally {
-          if (!openedAssessment) {
-            reportedForwardScrollKeysRef.current.delete(reportKey);
-            if (assessmentStartRequestRef.current === assessmentRequest) {
-              assessmentStartRequestRef.current = null;
-              if (isSearchScopeActive(searchScope)) {
-                setAssessmentGatePending(false);
-              }
-            }
-          }
-        }
       } catch (error) {
         reportedForwardScrollKeysRef.current.delete(reportKey);
         if (isSearchScopeActive(searchScope) && !isRequestInterruptedError(error)) {
-          console.warn(`Could not record forward scroll for ${reelId}:`, error);
+          console.warn(`Could not finish recall gate for ${reelId}:`, error);
+          decision = "continue";
+        }
+      } finally {
+        if (isSearchScopeActive(searchScope)) {
+          setAssessmentGatePending(false);
+        }
+        if (decision !== "assessment" && assessmentStartRequestRef.current === assessmentRequest) {
+          assessmentStartRequestRef.current = null;
         }
       }
+      return decision;
     })();
+    return assessmentRequest;
   }, [
     assessmentBootstrapPending,
     assessmentGatePending,
@@ -3690,14 +3711,15 @@ function FeedPageInner() {
   const jumpOneReel = useCallback(
     (direction: 1 | -1) => {
       if (
-        assessmentStartRequestRef.current
-        || assessmentBootstrapPending
-        || assessmentGatePending
+        assessmentBootstrapPending
         || assessmentSession
       ) {
         return;
       }
       if (direction < 0) {
+        if (assessmentStartRequestRef.current || assessmentGatePending) {
+          return;
+        }
         commitOneReelMove(direction);
         return;
       }
@@ -3716,14 +3738,35 @@ function FeedPageInner() {
         return;
       }
 
-      commitOneReelMove(1);
-      reportForwardScrollForReel(outgoingReel);
+      const gateRequest = reportForwardScrollForReel(outgoingReel);
+      if (!gateRequest) {
+        if (!assessmentGatePending && !assessmentStartRequestRef.current) {
+          commitOneReelMove(1);
+        }
+        return;
+      }
+      gateRequest.advanceRequested = true;
+      if (gateRequest.advanceHandlerAttached) {
+        return;
+      }
+      gateRequest.advanceHandlerAttached = true;
+      void gateRequest.promise.then((decision) => {
+        if (
+          decision !== "continue"
+          || !isSearchScopeActive(gateRequest)
+          || reelsRef.current[activeIndexRef.current]?.reel_id !== gateRequest.reelId
+        ) {
+          return;
+        }
+        commitOneReelMove(1);
+      });
     },
     [
       assessmentBootstrapPending,
       assessmentGatePending,
       assessmentSession,
       commitOneReelMove,
+      isSearchScopeActive,
       maybeLoadMore,
       reportForwardScrollForReel,
     ],

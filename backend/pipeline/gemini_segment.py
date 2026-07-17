@@ -1918,7 +1918,9 @@ class _CompactIntentEvidence(_StrictModel):
         description=(
             "Five to sixteen exact consecutive transcript words that prove a primary "
             "unit fulfills the named constraint or ground a supporting unit's substantive "
-            "educational connection to that constraint."
+            "educational connection to that constraint. The quote must belong to the same "
+            "atomic teaching objective as sq, eq, cq, title, obj, and facet; never cite an "
+            "earlier completed prerequisite or a later adjacent lesson."
         ),
     )
 
@@ -1935,9 +1937,13 @@ class _CompactBoundaryTopic(_StrictModel):
         alias="sq",
         description=(
             "Shortest unique exact transcript quote whose first spoken word is the "
-            "first word required by this complete one-topic unit. It must occur uniquely "
-            "inside the s:e range and may continue across adjacent caption lines; ignore "
-            "acoustic silence and never include earlier speech for a pause."
+            "first word required by this complete one-topic unit and begins a complete, "
+            "independently understandable spoken sentence or independent clause. Never "
+            "begin at a prior sentence's trailing clause, complement, list item, or clipped "
+            "completion. 'Shortest' controls only this matching quote's word count, never "
+            "the semantic span or clip duration. It must occur uniquely inside the s:e "
+            "range and may continue across adjacent caption lines; ignore acoustic silence "
+            "and never include earlier speech for a pause."
         ),
     )
     end_quote: _CompactBoundaryQuote = Field(
@@ -1946,9 +1952,13 @@ class _CompactBoundaryTopic(_StrictModel):
             "Shortest unique exact transcript quote whose final spoken word is the "
             "final required word after this unit's whole same-objective teaching arc. A "
             "locally complete sentence or intermediate result is not an endpoint when the "
-            "same objective continues with reasoning, qualification, or explanation. It must occur uniquely "
-            "inside the s:e range and may begin across adjacent caption lines; ignore "
-            "acoustic silence and never include later speech for a pause."
+            "same objective continues with reasoning, qualification, or explanation. Its "
+            "last word must finish a complete concluding sentence or independent clause, "
+            "never stop at a leading clause, sentence prefix, or unfilled predicate. "
+            "'Shortest' controls only this matching quote's word count, never the semantic "
+            "span or clip duration. It must occur uniquely inside the s:e range and may "
+            "begin across adjacent caption lines; ignore acoustic silence and never include "
+            "later speech for a pause."
         ),
     )
     claim_quote: _CompactEvidenceQuote = Field(
@@ -2086,8 +2096,10 @@ _POLICY_AND_EXAMPLES = """Policy:
   whole request or is genuinely related to its subject, method, mechanism, relationship,
   prerequisite, application, or worked-example family. Every unit must make sense to a cold
   viewer hearing the clip without seeing the original video.
-- Include every necessary setup or prerequisite through the explanation's natural
-  conclusion. For a worked example, include the question or setup, reasoning, and answer.
+- Include every indispensable unresolved premise and same-objective setup through the
+  explanation's natural conclusion. Never prepend a separately complete prerequisite or
+  background lesson merely because it appears earlier; return that as its own candidate when
+  it qualifies. For a worked example, include the question or setup, reasoning, and answer.
 - For a worked numerical example that solves for a dimensioned physical quantity, a bare
   number is not a complete answer. Continue through the contiguous spoken unit statement
   (for example, "two meters per second squared") and place eq after that unit. A later
@@ -2283,8 +2295,9 @@ def _learner_rule(level: str) -> str:
     level_contracts = {
         "beginner": (
             "0.00-0.40",
-            "assume no topic-specific background; include or plainly explain every symbol, "
-            "term, and prerequisite needed for the objective",
+            "assume no topic-specific background; the selected same-objective span must "
+            "plainly establish every symbol, term, unresolved premise, and local setup it "
+            "needs, but never prepend a separately complete prerequisite/background lesson",
         ),
         "intermediate": (
             "0.30-0.70",
@@ -2370,13 +2383,20 @@ def _compact_output_guide() -> str:
 - e = end_line: the zero-based, inclusive index of the last transcript line enclosing the
   desired end. The enclosing caption range is every line from s through e.
 - sq = start_quote: 1-16 exact consecutive transcript words inside s:e. Its FIRST spoken word
-  is the exact first word the viewer should hear. sq may cross adjacent lines. Do not include
-  earlier greeting, filler, transition, or context solely to make the quote longer or unique.
+  is the exact first word the viewer should hear and must begin a complete independently
+  understandable spoken sentence or independent clause—never a trailing clause, complement,
+  list item, or clipped completion from the preceding sentence. sq may cross adjacent lines.
+  Do not include earlier greeting, filler, transition, or context solely to make the quote
+  longer or unique. "Shortest" describes only the quote used to locate that word; it never
+  asks for a shorter semantic span or clip.
 - eq = end_quote: 1-16 exact consecutive transcript words inside s:e. Its LAST spoken word is
   the exact final required word after the whole same-objective teaching arc. A grammatical
   sentence or intermediate answer is not an endpoint when its reasoning, qualification, or
-  explanation continues. eq may cross adjacent lines. Do not include a
-  later transition, recap, outro, joke, or next topic.
+  explanation continues. That last word must finish a complete concluding sentence or
+  independent clause—never a leading clause, sentence prefix, or unfilled predicate. eq may
+  cross adjacent lines. Do not include a later transition, recap, outro, joke, or next topic.
+  "Shortest" describes only the quote used to locate that word; it never asks for a shorter
+  semantic span or clip.
 - cq = claim_quote: 5-16 exact consecutive transcript words between the chosen semantic edges
   containing the core educational claim, explanation, result, or answer. cq proves where the
   teaching is; it does not define the start or end and cannot be mere agenda, topic mention, or
@@ -2415,7 +2435,9 @@ def _compact_output_guide() -> str:
   its id, not merely contain one of its words, symbols, variables, dimensions, or units. Apply
   a same-referent test before adding every item: read the constraint's source_phrase and q
   literally; if q teaches a different law, equation, relationship, object, or use of a shared
-  variable, it cannot ground that constraint. Generic
+  variable, it cannot ground that constraint. Every ie q must teach the same atomic objective
+  as sq, eq, cq, title, obj, and facet; never use evidence from an earlier completed
+  prerequisite or later adjacent lesson. Generic
   task, format, or outcome evidence alone is insufficient. Never use supporting ie to falsely
   claim a mismatched object or outcome. Do not output a role; the
   backend mechanically derives primary
@@ -2481,9 +2503,11 @@ For an acceleration candidate whose obj is "Define acceleration and identify its
 60-61 are earlier completed background units, not permission to make the acceleration clip begin
 with a speed lesson. Use s=62, sq="you're now ready to understand acceleration", and a cq about
 the acceleration definition or its units. WRONG: title/obj/facet describe acceleration while sq
-or cq begins in the earlier speed or velocity lesson. If an earlier prerequisite is independently
-relevant, return it as its own supporting candidate; do not fold the whole completed prerequisite
-into the later target unit merely because it comes first.
+or cq begins in the earlier speed or velocity lesson. Also WRONG: an acceleration candidate uses
+ie q="units for speed"; ie cannot pull a completed prerequisite into a different objective. This
+rule still applies for a beginner viewer. If an earlier prerequisite is independently relevant,
+return it as its own supporting candidate; do not fold the whole completed prerequisite into the
+later target unit merely because it comes first.
 
 Named worked-example boundary example:
 [40] 06:00 This is simply equal to five. So that's the derivative of five x minus four. It's five. Now let's try another example. So let's say if f of x is equal to x squared, what is the first derivative?
@@ -2676,18 +2700,21 @@ def _boundary_prompts(
         "the requested setup inside it. Never begin sq at the previous conclusion or "
         "navigation. A clause such as 'So let's say if f' that states the requested object is "
         "setup, not context-only handoff; preserve its first 'So'. "
-        "Keep sq, cq, title, obj, and facet on the same atomic educational unit. An earlier "
+        "Keep sq, eq, cq, every ie q, title, obj, and facet on the same atomic educational "
+        "unit. An earlier "
         "complete prerequisite or background explanation is a separate unit, not required "
         "context merely because it helps introduce the later target. Return that background "
-        "separately when it qualifies, and begin the target candidate at its shortest complete "
-        "spoken setup. "
+        "separately when it qualifies, and begin the target candidate at the complete spoken "
+        "setup required by that target's own objective. "
         "Never start a candidate with context-only handoff language such as 'on the other "
         "hand', 'now/then the next step', or 'so step five'; include the "
         "missing setup or begin at the first independently understandable teaching sentence. "
         f"Apply a cold-start and cold-stop test using {cold_start_basis}: never begin at a "
-        "dependent tail, tag question, unresolved 'other one' reformulation, or the "
+        "dependent tail, trailing clause, complement, list item, clipped sentence completion, "
+        "tag question, unresolved 'other one' reformulation, or the "
         "consequence of an analogy whose actors and mapping were omitted. Never end inside "
-        "a list, next-topic phrase, recap, contextual bridge, or outro. Use a one-word quote "
+        "a leading clause, sentence prefix, unfilled predicate, list, next-topic phrase, recap, "
+        "contextual bridge, or outro. Use a one-word quote "
         "when that is the exact clean edge; never pad an edge quote with nearby speech. "
         "An opening demonstrative or pronoun such as 'this law', 'this equation', 'that "
         "change', 'the second law', 'it', 'they', or 'these' must have its specific referent "
@@ -10390,8 +10417,9 @@ def _trusted_claim_setup_start(
     selected_left: int,
     claim_location: tuple[int, int, int, int],
     anchor_text: str,
+    teaching_handoff_only: bool = False,
 ) -> tuple[int, tuple[int, int]] | None:
-    """Advance a clipped Gemini edge to a later complete setup for its claim."""
+    """Advance a Gemini edge to a later explicit, complete setup for its claim."""
     claim_line, claim_left, _claim_end_line, _claim_right = claim_location
     anchor_tokens = _content_tokens(anchor_text)
     candidates: list[tuple[int, tuple[int, int]]] = []
@@ -10399,6 +10427,11 @@ def _trusted_claim_setup_start(
         source = str(segments[line].get("text") or "")
         upper = claim_left if line == claim_line else len(source)
         for handoff in _TRUSTED_CLAIM_SETUP_HANDOFF_RE.finditer(source, 0, upper):
+            if (
+                teaching_handoff_only
+                and handoff.group("teaching_setup") is None
+            ):
+                continue
             setup_left = (
                 handoff.start("teaching_setup")
                 if handoff.group("teaching_setup") is not None
@@ -10727,6 +10760,22 @@ def _trusted_compact_plan_to_report(
                 evidence_location=claim_location,
                 transitions=transitions,
             )
+            claim_anchor_text = " ".join(
+                str(value or "")
+                for value in (
+                    proposal.title,
+                    proposal.learning_objective,
+                    proposal.facet,
+                    model_claim_quote,
+                )
+            )
+            model_start_misses_claim_anchor = (
+                len(
+                    _content_tokens(model_start_quote)
+                    & _content_tokens(claim_anchor_text)
+                )
+                < 2
+            )
             claim_setup_start: tuple[int, tuple[int, int]] | None = None
             current_start_text = str(segments[a].get("text") or "")
             current_start_left = start_span[0] if start_span is not None else 0
@@ -10752,21 +10801,14 @@ def _trusted_compact_plan_to_report(
                     and not _opening_clause_is_standalone(current_start_text)
                 )
             )
-            if current_start_is_clipped:
+            if current_start_is_clipped or model_start_misses_claim_anchor:
                 claim_setup_start = _trusted_claim_setup_start(
                     segments,
                     selected_line=a,
                     selected_left=current_start_left,
                     claim_location=claim_location,
-                    anchor_text=" ".join(
-                        str(value or "")
-                        for value in (
-                            proposal.title,
-                            proposal.learning_objective,
-                            proposal.facet,
-                            model_claim_quote,
-                        )
-                    ),
+                    anchor_text=claim_anchor_text,
+                    teaching_handoff_only=not current_start_is_clipped,
                 )
                 if (
                     claim_setup_start is not None

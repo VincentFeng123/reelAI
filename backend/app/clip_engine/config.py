@@ -36,6 +36,20 @@ ASSESSMENT_MODEL = (
 )
 # Query-expansion uses the cheaper lite tier; segmentation keeps its own model.
 EXPAND_MODEL = os.environ.get("EXPAND_MODEL", "gemini-2.5-flash-lite")
+# Batch ordering is a small text-only task. Keep it on the cheap Lite tier.
+_lesson_order_model = (
+    os.environ.get("LESSON_ORDER_MODEL", "gemini-2.5-flash-lite").strip()
+    or "gemini-2.5-flash-lite"
+)
+_lesson_order_model_name = _lesson_order_model.rsplit("/", 1)[-1].casefold()
+# This path uses the bounded Gemini 2.5 thinking-budget contract. Pro/Gemini 3
+# capacity remains reserved for the authoritative transcript selector paths.
+LESSON_ORDER_MODEL = (
+    _lesson_order_model
+    if _lesson_order_model_name.startswith("gemini-2.5-")
+    and "pro" not in _lesson_order_model_name
+    else "gemini-2.5-flash-lite"
+)
 
 CLIP_ENGINE = os.environ.get("CLIP_ENGINE", "gemini")
 OUTPUT_MODE = os.environ.get("OUTPUT_MODE", "embed")

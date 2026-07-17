@@ -19,6 +19,7 @@ def test_fresh_sqlite_schema_contains_assessment_tables_and_private_keys() -> No
     conn = sqlite3.connect(":memory:")
     try:
         conn.executescript(db_module.SCHEMA)
+        db_module._migrate_durable_generation_foundation_sqlite(conn)
         assert {"ai_summary", "match_reason", "informativeness"} <= _columns(conn, "reels")
         assert {
             "learner_reel_progress",
@@ -35,6 +36,14 @@ def test_fresh_sqlite_schema_contains_assessment_tables_and_private_keys() -> No
             conn, "reel_assessment_questions"
         )
         assert "scrolled_at" in _columns(conn, "learner_reel_progress")
+        assert "lesson_order_json" in _columns(conn, "reel_generations")
+        assert "organizer_checkpoint_reel_id" in _columns(
+            conn, "assessment_sessions"
+        )
+        assert "idx_reel_generation_jobs_assessment_plans" in {
+            str(row[1])
+            for row in conn.execute("PRAGMA index_list(reel_generation_jobs)")
+        }
     finally:
         conn.close()
 
@@ -113,3 +122,24 @@ def test_postgres_schema_contains_matching_assessment_contract() -> None:
     assert "WHERE status = 'pending'" in sql
     assert "correct_index INTEGER NOT NULL" in sql
     assert "scrolled_at TEXT" in sql
+    assert "lesson_order_json TEXT" in sql
+    assert "organizer_checkpoint_reel_id TEXT" in sql
+
+
+def test_legacy_sqlite_lesson_and_checkpoint_columns_migrate_idempotently() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE reel_generations (id TEXT PRIMARY KEY)")
+        conn.execute("CREATE TABLE assessment_sessions (id TEXT PRIMARY KEY)")
+
+        db_module._migrate_lesson_order_sqlite(conn)
+        db_module._migrate_assessment_checkpoint_sqlite(conn)
+        db_module._migrate_lesson_order_sqlite(conn)
+        db_module._migrate_assessment_checkpoint_sqlite(conn)
+
+        assert "lesson_order_json" in _columns(conn, "reel_generations")
+        assert "organizer_checkpoint_reel_id" in _columns(
+            conn, "assessment_sessions"
+        )
+    finally:
+        conn.close()

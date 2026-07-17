@@ -3943,12 +3943,12 @@ def test_groq_word_spans_add_safe_cushions_without_reaching_neighbor() -> None:
     )
 
     assert error is None
-    assert bounds == pytest.approx((0.94, 2.46))
+    assert bounds == pytest.approx((0.9, 2.52))
     assert projection["end"]["quote_last_end_sec"] == 2.4
     assert search_limits == pytest.approx((0.5, 2.6))
     assert aligned.status == "context_aligned"
-    assert aligned.start_sec == pytest.approx(0.94)
-    assert aligned.end_sec == pytest.approx(2.46)
+    assert aligned.start_sec == pytest.approx(0.9)
+    assert aligned.end_sec == pytest.approx(2.52)
     assert aligned.end_sec < projection["end"]["excluded_neighbor_onset_sec"]
 
 

@@ -109,10 +109,15 @@ from .models import (
     ReelScrollResponse,
 )
 from .services import llm_router
-from .services.assessments import AssessmentCancelledError, AssessmentService
+from .services.assessments import (
+    AssessmentCancelledError,
+    AssessmentService,
+    assessment_checkpoint_reel_ids,
+)
 from .services.email import send_welcome_email
 from .services.embeddings import EmbeddingService
 from .services.material_intelligence import MaterialIntelligenceService
+from .services.lesson_ordering import LESSON_ORDER_PROMPT_VERSION, order_lesson_batch
 from .services.parsers import ParseError, extract_text_from_file
 from .services.reels import GenerationCancelledError, ReelService
 from .services.search_query_plan import build_search_query_plan
@@ -2699,6 +2704,117 @@ def _fetch_generation_row(conn, generation_id: str | None) -> dict[str, Any] | N
     return fetch_one(conn, "SELECT * FROM reel_generations WHERE id = ?", (generation_id,))
 
 
+def _stored_generation_lesson_order_metadata(
+    conn,
+    generation_id: str | None,
+) -> dict[str, Any] | None:
+    """Return persisted metadata, None for legacy, or {} for corruption."""
+    row = _fetch_generation_row(conn, generation_id)
+    raw = (row or {}).get("lesson_order_json")
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(str(raw))
+    except (TypeError, json.JSONDecodeError):
+        logger.warning("Rejecting malformed lesson order generation_id=%s", generation_id)
+        return {}
+    if not isinstance(payload, dict):
+        logger.warning("Rejecting malformed lesson order generation_id=%s", generation_id)
+        return {}
+    return payload
+
+
+def _stored_generation_lesson_order_ids(
+    conn,
+    generation_id: str | None,
+) -> list[str] | None:
+    """Return a release order, None for legacy, or [] for invalid metadata."""
+    payload = _stored_generation_lesson_order_metadata(conn, generation_id)
+    if payload is None:
+        return None
+    values = payload.get("ordered_reel_ids")
+    if not isinstance(values, list):
+        return []
+    ordered_ids = [value if isinstance(value, str) else "" for value in values]
+    if (
+        not ordered_ids
+        or any(not reel_id for reel_id in ordered_ids)
+        or len(set(ordered_ids)) != len(ordered_ids)
+    ):
+        logger.warning("Rejecting invalid lesson order generation_id=%s", generation_id)
+        return []
+    return ordered_ids
+
+
+def _apply_generation_lesson_order(
+    conn,
+    *,
+    generation_id: str | None,
+    reels: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Apply persisted order only when it exactly matches valid inventory."""
+    ordered_ids = _stored_generation_lesson_order_ids(conn, generation_id)
+    if ordered_ids is None:
+        return reels
+    reel_ids = [
+        value if isinstance(value, str) else ""
+        for reel in reels
+        for value in [reel.get("reel_id")]
+    ]
+    if (
+        any(not reel_id for reel_id in reel_ids)
+        or len(set(reel_ids)) != len(reel_ids)
+        or len(ordered_ids) != len(reel_ids)
+        or set(ordered_ids) != set(reel_ids)
+    ):
+        logger.warning(
+            "Ignoring stale lesson order generation_id=%s stored=%d valid=%d",
+            generation_id,
+            len(ordered_ids),
+            len(reel_ids),
+        )
+        return reels
+    by_id = dict(zip(reel_ids, reels, strict=True))
+    return [by_id[reel_id] for reel_id in ordered_ids]
+
+
+def _persist_generation_lesson_order(
+    conn,
+    *,
+    generation_id: str,
+    metadata: dict[str, Any],
+) -> None:
+    updated = execute_modify(
+        conn,
+        "UPDATE reel_generations SET lesson_order_json = ? WHERE id = ?",
+        (dumps_json(metadata), generation_id),
+    )
+    if not updated:
+        raise RuntimeError(
+            f"generation row not found while storing lesson order: {generation_id}"
+        )
+
+
+def _lesson_order_topic(conn, *, material_id: str, reels: list[dict[str, Any]]) -> str:
+    material = fetch_one(
+        conn,
+        "SELECT raw_text, subject_tag, source_type FROM materials WHERE id = ?",
+        (material_id,),
+    ) or {}
+    if str(material.get("source_type") or "").strip().casefold() == "topic":
+        topic = " ".join(str(material.get("raw_text") or "").split())
+        if topic:
+            return topic[:500]
+    titles = list(
+        dict.fromkeys(
+            title
+            for reel in reels
+            if (title := str(reel.get("concept_title") or "").strip())
+        )
+    )
+    return " / ".join(titles[:6]) or str(material.get("subject_tag") or material_id)
+
+
 def _fetch_generation_head_row(conn, *, material_id: str, request_key: str) -> dict[str, Any] | None:
     return fetch_one(
         conn,
@@ -2839,7 +2955,21 @@ def _reel_source_video_id(reel: dict[str, Any]) -> str:
     return video_identity
 
 
-def _public_generation_reel(reel: dict[str, Any]) -> dict[str, Any]:
+_LESSON_ORDER_SELECTION_FIELDS = frozenset({
+    "_selection_candidate_id",
+    "_selection_chain_id",
+    "_selection_chain_position",
+    "_selection_prerequisite_ids",
+    "_selection_topic_relevance",
+    "_selection_informativeness",
+})
+
+
+def _public_generation_reel(
+    reel: dict[str, Any],
+    *,
+    preserve_lesson_order_metadata: bool = False,
+) -> dict[str, Any]:
     public_reel = dict(reel)
     selection_contract_version = str(
         public_reel.get("selection_contract_version")
@@ -2869,6 +2999,10 @@ def _public_generation_reel(reel: dict[str, Any]) -> dict[str, Any]:
         key: value
         for key, value in public_reel.items()
         if not key.startswith("_selection_")
+        or (
+            preserve_lesson_order_metadata
+            and key in _LESSON_ORDER_SELECTION_FIELDS
+        )
     }
 
 
@@ -3620,6 +3754,11 @@ def _ranked_request_reels(
             reel for reel in ranked
             if str(reel.get("reel_id") or "") not in excluded_reel_id_set
         ]
+    ranked = _apply_generation_lesson_order(
+        conn,
+        generation_id=generation_id,
+        reels=ranked,
+    )
 
     if page <= 1:
         shaped = _shape_request_page_reels(
@@ -3821,6 +3960,8 @@ def _generation_job_reels(
     job_row: dict[str, Any],
     *,
     requested_override: int | None = None,
+    apply_release_order: bool = True,
+    preserve_lesson_order_metadata: bool = False,
 ) -> list[dict[str, Any]]:
     generation_id = str(job_row.get("result_generation_id") or "").strip()
     if not generation_id:
@@ -3839,6 +3980,8 @@ def _generation_job_reels(
             ),
         ),
     )
+    stored_order_ids = _stored_generation_lesson_order_ids(conn, generation_id)
+    ranking_limit = max(requested, len(stored_order_ids or []))
     ranked = _ranked_request_reels(
         conn,
         material_id=str(job_row.get("material_id") or ""),
@@ -3853,7 +3996,7 @@ def _generation_job_reels(
         target_clip_duration_max_sec=None,
         exclude_video_ids=list(params.get("exclude_video_ids") or []),
         page=1,
-        limit=requested,
+        limit=ranking_limit,
         learner_id=str(job_row.get("learner_id") or LEGACY_LEARNER_ID),
         exclude_reel_ids=_continuation_delivered_reel_ids(
             conn,
@@ -3861,8 +4004,27 @@ def _generation_job_reels(
         ),
         include_source_chain=True,
     )
-    public_reels = [_public_generation_reel(reel) for reel in ranked]
-    return _current_selection_contract_reels(public_reels)[:requested]
+    internal_reels = [
+        _public_generation_reel(
+            reel,
+            preserve_lesson_order_metadata=True,
+        )
+        for reel in ranked
+    ]
+    valid_reels = _current_selection_contract_reels(internal_reels)
+    ordered_reels = (
+        _apply_generation_lesson_order(
+            conn,
+            generation_id=generation_id,
+            reels=valid_reels,
+        )
+        if apply_release_order
+        else valid_reels
+    )
+    selected = ordered_reels[:requested]
+    if preserve_lesson_order_metadata:
+        return selected
+    return [_public_generation_reel(reel) for reel in selected]
 
 
 def _reused_generation_reels(
@@ -4219,6 +4381,9 @@ def _run_leased_generation_job(
             source_generation_id = (
                 str(job_row.get("source_generation_id") or "").strip() or None
             )
+            generation_has_lesson_order = (
+                _stored_generation_lesson_order_ids(conn, generation_id) is not None
+            )
             source_generation_ids = _response_generation_ids(
                 conn,
                 source_generation_id,
@@ -4312,7 +4477,11 @@ def _run_leased_generation_job(
             current_count = source_reel_count + _count_generation_reels(
                 conn, generation_id
             )
-            if current_count < requested_count and remaining_source_budget > 0:
+            if (
+                not generation_has_lesson_order
+                and current_count < requested_count
+                and remaining_source_budget > 0
+            ):
                 context.budget.reserve_pass()
                 if should_cancel():
                     raise GenerationCancelledError("Generation cancelled.")
@@ -4359,24 +4528,152 @@ def _run_leased_generation_job(
             rankable_fallback = (
                 []
                 if cumulative_count or has_verified_reservoir
-                else _generation_job_reels(conn, refreshed_job)
+                else _generation_job_reels(
+                    conn,
+                    refreshed_job,
+                    apply_release_order=False,
+                    preserve_lesson_order_metadata=True,
+                )
             )
             stage_counters = context.counters()
             stage_counters["analyzed_sources"] = len(completed_source_ids)
             provider_cursor_open = int(
                 stage_counters.get("provider_cursor_open") or 0
             ) > 0
+            ordering_degraded = False
+            recall_preparation: dict[str, int] | None = None
             if cumulative_count or has_verified_reservoir or rankable_fallback:
+                final_reels = rankable_fallback or _generation_job_reels(
+                    conn,
+                    refreshed_job,
+                    preserve_lesson_order_metadata=True,
+                )
+                stored_order_ids = _stored_generation_lesson_order_ids(
+                    conn,
+                    generation_id,
+                )
+                if stored_order_ids is None:
+                    ordering = order_lesson_batch(
+                        final_reels,
+                        topic=_lesson_order_topic(
+                            conn,
+                            material_id=material_id,
+                            reels=final_reels,
+                        ),
+                        learner_level=str(params.get("knowledge_level") or "beginner"),
+                        should_cancel=should_cancel,
+                        generation_context=context,
+                    )
+                    final_reels = ordering.reels
+                    ordering_degraded = ordering.degraded
+                    checkpoint_ids = assessment_checkpoint_reel_ids(
+                        ordering.ordered_reel_ids,
+                        ordering.assessment_checkpoint_reel_ids,
+                        degraded=ordering.degraded,
+                    )
+                    _persist_generation_lesson_order(
+                        conn,
+                        generation_id=generation_id,
+                        metadata={
+                            "version": 2,
+                            "prompt_version": LESSON_ORDER_PROMPT_VERSION,
+                            "ordered_reel_ids": ordering.ordered_reel_ids,
+                            "assessment_checkpoint_reel_ids": checkpoint_ids,
+                            "model_used": ordering.model_used,
+                            "created_at": now_iso(),
+                            "degraded": ordering.degraded,
+                            "fallback_reason": ordering.fallback_reason,
+                            "provider_called": ordering.provider_called,
+                        },
+                    )
+                else:
+                    stored_metadata = (
+                        _stored_generation_lesson_order_metadata(conn, generation_id)
+                        or {}
+                    )
+                    ordering_degraded = (
+                        bool(stored_metadata.get("degraded")) or not stored_order_ids
+                    )
+                    final_reels = _apply_generation_lesson_order(
+                        conn,
+                        generation_id=generation_id,
+                        reels=final_reels,
+                    )
+                final_reels = [_public_generation_reel(reel) for reel in final_reels]
+
+                lesson_order_metadata = (
+                    _stored_generation_lesson_order_metadata(conn, generation_id) or {}
+                )
+                ordered_reel_ids = lesson_order_metadata.get("ordered_reel_ids")
+                organizer_checkpoint_ids = (
+                    assessment_checkpoint_reel_ids(
+                        ordered_reel_ids,
+                        lesson_order_metadata.get("assessment_checkpoint_reel_ids"),
+                        degraded=lesson_order_metadata.get("degraded") is not False,
+                    )
+                    if lesson_order_metadata.get("version") == 2
+                    and isinstance(ordered_reel_ids, list)
+                    else None
+                )
+                final_reel_id_set = {
+                    str(reel.get("reel_id") or "") for reel in final_reels
+                }
+                checkpoint_reel_ids = [
+                    reel_id
+                    for reel_id in organizer_checkpoint_ids or []
+                    if reel_id in final_reel_id_set
+                ]
+                if checkpoint_reel_ids:
+                    try:
+                        recall_preparation = assessment_service.prepare_reel_questions(
+                            conn,
+                            reel_ids=checkpoint_reel_ids,
+                            should_cancel=should_cancel,
+                            use_model=False,
+                        )
+                    except AssessmentCancelledError as exc:
+                        raise GenerationCancelledError(str(exc)) from exc
+                    except Exception:
+                        logger.exception(
+                            "organizer checkpoint preparation failed before release "
+                            "job_id=%s",
+                            job_id,
+                        )
+                        recall_preparation = None
+                    recall_preparation_complete = bool(
+                        recall_preparation
+                        and recall_preparation["requested"] == len(checkpoint_reel_ids)
+                        and recall_preparation["prepared"] == len(checkpoint_reel_ids)
+                    )
+                    if not recall_preparation_complete:
+                        degraded_metadata = dict(lesson_order_metadata)
+                        degraded_metadata.update(
+                            {
+                                "assessment_checkpoint_reel_ids": None,
+                                "degraded": True,
+                                "fallback_reason": "recall_preparation_unavailable",
+                                "recall_available": False,
+                            }
+                        )
+                        _persist_generation_lesson_order(
+                            conn,
+                            generation_id=generation_id,
+                            metadata=degraded_metadata,
+                        )
+                        ordering_degraded = True
+                        logger.warning(
+                            "recall unavailable; releasing clips without automatic "
+                            "checkpoints job_id=%s requested=%d prepared=%d",
+                            job_id,
+                            len(checkpoint_reel_ids),
+                            int((recall_preparation or {}).get("prepared") or 0),
+                        )
                 _activate_generation(
                     conn,
                     material_id=material_id,
                     request_key=str(job_row.get("request_key") or ""),
                     generation_id=generation_id,
                     retrieval_profile="unified",
-                )
-                final_reels = rankable_fallback or _generation_job_reels(
-                    conn,
-                    refreshed_job,
                 )
             elif provider_cursor_open:
                 _complete_generation(
@@ -4408,7 +4705,9 @@ def _run_leased_generation_job(
                 and bool((row.get("metadata") or {}).get("provider_call"))
             ]
             model_used = str((model_records[-1] if model_records else {}).get("model_used") or "") or None
-            quality_degraded = any(bool(row.get("quality_degraded")) for row in model_records)
+            quality_degraded = ordering_degraded or any(
+                bool(row.get("quality_degraded")) for row in model_records
+            )
             append_generation_event(
                 conn,
                 job_id=job_id,
@@ -4448,35 +4747,14 @@ def _run_leased_generation_job(
                     else None
                 ),
             )
-            if final_reels:
-                try:
-                    recall_preparation = assessment_service.prepare_reel_questions(
-                        conn,
-                        reel_ids=[
-                            str(reel.get("reel_id") or "") for reel in final_reels
-                        ],
-                        use_model=False,
-                    )
-                    log_recall_preparation = (
-                        logger.info
-                        if recall_preparation["prepared"]
-                        == recall_preparation["requested"]
-                        else logger.warning
-                    )
-                    log_recall_preparation(
-                        "recall preparation job_id=%s requested=%d prepared=%d fallback=%d",
-                        job_id,
-                        recall_preparation["requested"],
-                        recall_preparation["prepared"],
-                        recall_preparation["fallback"],
-                    )
-                except Exception:
-                    # Clips are already terminal and visible. Recall preparation is
-                    # best-effort here; the request-time transcript path remains a fallback.
-                    logger.exception(
-                        "recall preparation failed after clip release job_id=%s",
-                        job_id,
-                    )
+            if recall_preparation is not None:
+                logger.info(
+                    "recall preparation job_id=%s requested=%d prepared=%d fallback=%d",
+                    job_id,
+                    recall_preparation["requested"],
+                    recall_preparation["prepared"],
+                    recall_preparation["fallback"],
+                )
     except GenerationCancelledError:
         with get_conn(transactional=True) as conn:
             if generation_cancellation_requested(conn, job_id):

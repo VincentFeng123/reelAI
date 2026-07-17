@@ -144,6 +144,7 @@ CREATE TABLE IF NOT EXISTS reel_generations (
     completed_at TEXT,
     activated_at TEXT,
     error_text TEXT,
+    lesson_order_json TEXT,
     FOREIGN KEY(material_id) REFERENCES materials(id),
     FOREIGN KEY(concept_id) REFERENCES concepts(id)
 );
@@ -327,6 +328,7 @@ CREATE TABLE IF NOT EXISTS assessment_sessions (
     correct_count INTEGER NOT NULL DEFAULT 0,
     information_units REAL NOT NULL DEFAULT 0.0,
     readiness_threshold REAL NOT NULL DEFAULT 3.5,
+    organizer_checkpoint_reel_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     completed_at TEXT,
@@ -1133,6 +1135,42 @@ def _sqlite_add_missing_columns(
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
 
+def _migrate_lesson_order_sqlite(conn: sqlite3.Connection) -> None:
+    """Idempotently add durable lesson ordering to legacy SQLite generations."""
+    _sqlite_add_missing_columns(
+        conn,
+        "reel_generations",
+        (("lesson_order_json", "TEXT"),),
+    )
+
+
+def _migrate_lesson_order_postgres(conn: Any) -> None:
+    """Idempotently add durable lesson ordering to legacy PostgreSQL generations."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE reel_generations "
+            "ADD COLUMN IF NOT EXISTS lesson_order_json TEXT"
+        )
+
+
+def _migrate_assessment_checkpoint_sqlite(conn: sqlite3.Connection) -> None:
+    """Mark intentionally variable-size organizer checkpoint sessions."""
+    _sqlite_add_missing_columns(
+        conn,
+        "assessment_sessions",
+        (("organizer_checkpoint_reel_id", "TEXT"),),
+    )
+
+
+def _migrate_assessment_checkpoint_postgres(conn: Any) -> None:
+    """Mark intentionally variable-size organizer checkpoint sessions."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE assessment_sessions "
+            "ADD COLUMN IF NOT EXISTS organizer_checkpoint_reel_id TEXT"
+        )
+
+
 def _migrate_durable_generation_foundation_sqlite(conn: sqlite3.Connection) -> None:
     """Idempotently upgrade legacy SQLite tables for durable generation work."""
     _sqlite_add_missing_columns(conn, "reel_generation_jobs", _DURABLE_JOB_SQLITE_COLUMNS)
@@ -1209,6 +1247,15 @@ def _migrate_durable_generation_foundation_sqlite(conn: sqlite3.Connection) -> N
         ON reel_generation_jobs(status, lease_expires_at, created_at)
         """
     )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_reel_generation_jobs_assessment_plans
+        ON reel_generation_jobs(
+            learner_id, material_id, status,
+            completed_at DESC, updated_at DESC, created_at DESC
+        )
+        """
+    )
 
 
 def _migrate_durable_generation_foundation_postgres(conn: Any) -> None:
@@ -1276,6 +1323,15 @@ def _migrate_durable_generation_foundation_postgres(conn: Any) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_reel_generation_jobs_lease
             ON reel_generation_jobs(status, lease_expires_at, created_at)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_reel_generation_jobs_assessment_plans
+            ON reel_generation_jobs(
+                learner_id, material_id, status,
+                completed_at DESC, updated_at DESC, created_at DESC
+            )
             """
         )
 
@@ -1423,6 +1479,8 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE reels ADD COLUMN IF NOT EXISTS match_reason TEXT NOT NULL DEFAULT ''")
                 cur.execute("ALTER TABLE reels ADD COLUMN IF NOT EXISTS informativeness REAL")
             _migrate_durable_generation_foundation_postgres(conn)
+            _migrate_lesson_order_postgres(conn)
+            _migrate_assessment_checkpoint_postgres(conn)
             _migrate_reels_unique_clip_index_postgres(conn)
             _migrate_reel_feedback_uniqueness_postgres(conn)
             _migrate_assessment_scroll_postgres(conn)
@@ -1621,6 +1679,8 @@ def init_db() -> None:
             except sqlite3.OperationalError:
                 pass
         _migrate_durable_generation_foundation_sqlite(conn)
+        _migrate_lesson_order_sqlite(conn)
+        _migrate_assessment_checkpoint_sqlite(conn)
         _migrate_reels_unique_clip_index_sqlite(conn)
         _migrate_knowledge_level_sqlite(conn)
         _migrate_reel_learning_content_sqlite(conn)

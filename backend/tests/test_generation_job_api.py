@@ -132,6 +132,185 @@ def _conn() -> sqlite3.Connection:
     return conn
 
 
+def test_persisted_lesson_order_reorders_only_an_exact_valid_reel_set() -> None:
+    conn = _conn()
+    try:
+        generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key="lesson-order-exact-set",
+            generation_mode="fast",
+            retrieval_profile="unified",
+        )
+        reels = [{"reel_id": "a"}, {"reel_id": "b"}]
+        main._persist_generation_lesson_order(
+            conn,
+            generation_id=generation_id,
+            metadata={"version": 2, "ordered_reel_ids": ["b", "a"]},
+        )
+        assert main._apply_generation_lesson_order(
+            conn, generation_id=generation_id, reels=reels
+        ) == [reels[1], reels[0]]
+
+        main._persist_generation_lesson_order(
+            conn,
+            generation_id=generation_id,
+            metadata={"version": 2, "ordered_reel_ids": ["a"]},
+        )
+        assert main._apply_generation_lesson_order(
+            conn, generation_id=generation_id, reels=reels
+        ) == reels
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_ids", "preparation_complete"),
+    [
+        (["release-reel-1"], True),
+        ([], True),
+        (["release-reel-1"], False),
+    ],
+)
+def test_generation_prepares_only_organizer_checkpoints_before_release(
+    monkeypatch,
+    checkpoint_ids,
+    preparation_complete,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    suffix = (
+        "empty"
+        if not checkpoint_ids
+        else "selected"
+        if preparation_complete
+        else "incomplete"
+    )
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key=f"lesson-order-release-{suffix}",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={
+            "generation_mode": "fast",
+            "num_reels": 3,
+            "knowledge_level": "beginner",
+        },
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner=f"lesson-order-worker-{suffix}",
+        now=now,
+    )
+    assert leased
+    generated: list[dict] = []
+
+    def generate_stage(worker_conn, **kwargs) -> None:
+        for index in range(3):
+            generated.append(
+                _insert_generation_reel(
+                    worker_conn,
+                    generation_id=str(kwargs["generation_id"]),
+                    reel_id=f"release-reel-{index}",
+                    video_id=f"release-video-{index}",
+                    created_at=(now + timedelta(seconds=index)).isoformat(),
+                )
+            )
+
+    def order_batch(reels, **kwargs):
+        assert kwargs["topic"] == "Cell biology"
+        ordered = list(reversed(reels))
+        return mock.Mock(
+            reels=ordered,
+            ordered_reel_ids=[reel["reel_id"] for reel in ordered],
+            assessment_checkpoint_reel_ids=checkpoint_ids,
+            model_used="gemini-test",
+            degraded=False,
+            fallback_reason=None,
+            provider_called=True,
+        )
+
+    original_prepare = main.assessment_service.prepare_reel_questions
+    preparation_calls: list[dict] = []
+
+    def prepare_before_release(worker_conn, **kwargs):
+        preparation_calls.append(kwargs)
+        assert kwargs["reel_ids"] == ["release-reel-1"]
+        assert kwargs["use_model"] is False
+        assert generation_jobs.replay_events(conn, job_id=job["id"]) == []
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_heads"
+        ).fetchone()[0] == 0
+        if not preparation_complete:
+            return {"requested": 1, "prepared": 0, "fallback": 0}
+        return original_prepare(worker_conn, **kwargs)
+
+    original_append = main.append_generation_event
+
+    def append_after_preparation(worker_conn, **kwargs):
+        if checkpoint_ids and preparation_complete:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM reel_assessment_questions"
+            ).fetchone()[0] == 1
+        return original_append(worker_conn, **kwargs)
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: list(generated),
+    )
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
+    monkeypatch.setattr(
+        main.assessment_service,
+        "prepare_reel_questions",
+        prepare_before_release,
+    )
+    monkeypatch.setattr(main, "append_generation_event", append_after_preparation)
+
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        completed = generation_jobs.get_job(conn, job["id"])
+        assert completed is not None
+        assert completed["status"] == "completed"
+        assert len(preparation_calls) == (1 if checkpoint_ids else 0)
+        generation_row = main._fetch_generation_row(
+            conn, str(completed["result_generation_id"])
+        )
+        metadata = json.loads(str(generation_row["lesson_order_json"]))
+        assert metadata["ordered_reel_ids"] == [
+            "release-reel-2",
+            "release-reel-1",
+            "release-reel-0",
+        ]
+        assert metadata["assessment_checkpoint_reel_ids"] == (
+            checkpoint_ids if preparation_complete else None
+        )
+        assert metadata["degraded"] is (not preparation_complete)
+        if not preparation_complete:
+            assert metadata["fallback_reason"] == "recall_preparation_unavailable"
+            assert completed["quality_degraded"] == 1
+        final = next(
+            event
+            for event in generation_jobs.replay_events(conn, job_id=job["id"])
+            if event["type"] == "final"
+        )
+        assert [reel["reel_id"] for reel in final["payload"]["reels"]] == [
+            "release-reel-2",
+            "release-reel-1",
+            "release-reel-0",
+        ]
+    finally:
+        conn.close()
+
+
 def _patch_request_context(monkeypatch, conn: sqlite3.Connection) -> None:
     @contextmanager
     def connection(**_kwargs):

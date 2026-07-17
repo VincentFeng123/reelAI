@@ -1789,7 +1789,7 @@ test("a tail gesture is retained until the next reel arrives", () => {
   assert.match(source, /Your next swipe will continue automatically\./);
 });
 
-test("every terminal tail path reports the third reel before recall", () => {
+test("every forward transition waits for backend assessment readiness", () => {
   const reportStart = source.indexOf("const reportForwardScrollForReel = useCallback(");
   const reportEnd = source.indexOf("const shouldBlockDownwardAtEnd", reportStart);
   assert.ok(reportStart >= 0 && reportEnd > reportStart);
@@ -1797,6 +1797,8 @@ test("every terminal tail path reports the third reel before recall", () => {
   assert.match(helperText, /reportedForwardScrollKeysRef\.current\.has\(reportKey\)/);
   assert.match(helperText, /reportReelScroll\(/);
   assert.match(helperText, /startNextAssessment\(/);
+  assert.match(helperText, /if \(!scroll\.assessment_ready\)/);
+  assert.doesNotMatch(helperText, /cadence_target|scroll_count\s*%/);
 
   const tailBlockStart = source.indexOf("const shouldBlockDownwardAtEnd");
   const tailBlockEnd = source.indexOf("const maybeResumeProgress", tailBlockStart);
@@ -1807,9 +1809,18 @@ test("every terminal tail path reports the third reel before recall", () => {
 
   const jumpStart = source.indexOf("const jumpOneReel = useCallback(");
   const jumpEnd = source.indexOf("const requestAutoplayAdvance", jumpStart);
+  const jumpText = source.slice(jumpStart, jumpEnd);
   assert.match(
-    source.slice(jumpStart, jumpEnd),
+    jumpText,
     /if \(nextIndex <= currentIndex\) \{\s+reportForwardScrollForReel\(outgoingReel\);\s+maybeLoadMore\(\)/,
+  );
+  assert.match(
+    jumpText,
+    /const gateRequest = reportForwardScrollForReel\(outgoingReel\)[\s\S]*?gateRequest\.advanceRequested = true[\s\S]*?gateRequest\.promise\.then[\s\S]*?commitOneReelMove\(1\)/,
+  );
+  assert.doesNotMatch(
+    jumpText,
+    /commitOneReelMove\(1\);\s+reportForwardScrollForReel\(outgoingReel\)/,
   );
 
   const playbackStart = source.indexOf("const handleActivePlaybackProgress");
@@ -1818,6 +1829,208 @@ test("every terminal tail path reports the third reel before recall", () => {
     source.slice(playbackStart, playbackEnd),
     /naturalEnd[\s\S]*?activeIndexRef\.current >= reelsRef\.current\.length - 1[\s\S]*?reportForwardScrollForReel\(activeReel\)/,
   );
+});
+
+test("a checkpoint scroll gate serializes rapid swipes before opening recall", async () => {
+  const reels = Array.from({ length: 5 }, (_, index) => ({
+    reel_id: `reel-${index + 1}`,
+    material_id: "material-a",
+  }));
+  const activeIndexRef = { current: 2 };
+  const reelsRef = { current: reels };
+  const assessmentStartRequestRef = { current: null };
+  const reportedForwardScrollKeysRef = { current: new Set() };
+  const searchScope = {
+    key: "material-a",
+    seq: 1,
+    controller: new AbortController(),
+  };
+  const gateStates = [];
+  const openedSessions = [];
+  const advanceAfterClose = [];
+  let scrollCalls = 0;
+  let assessmentCalls = 0;
+  let commits = 0;
+  let resolveScroll;
+  let resolveAssessment;
+
+  const isSearchScopeActive = (scope) => (
+    scope.key === searchScope.key && scope.seq === searchScope.seq
+  );
+  const reportForwardScrollForReel = compileUseCallback("reportForwardScrollForReel", {
+    assessmentStartRequestRef,
+    assessmentBootstrapPending: false,
+    assessmentGatePending: false,
+    assessmentSession: null,
+    materialId: "material-a",
+    activeSearchScopeRef: { current: searchScope },
+    reportedForwardScrollKeysRef,
+    reportReelScroll: async () => {
+      scrollCalls += 1;
+      return new Promise((resolve) => {
+        resolveScroll = resolve;
+      });
+    },
+    isSearchScopeActive,
+    setAssessmentGatePending: (value) => gateStates.push(value),
+    setAssessmentError: () => {},
+    startNextAssessment: async () => {
+      assessmentCalls += 1;
+      return new Promise((resolve) => {
+        resolveAssessment = resolve;
+      });
+    },
+    withAssessmentAccuracy: (session) => session,
+    setAssessmentSession: (session) => openedSessions.push(session),
+    setAssessmentQuestionIndex: () => {},
+    clamp: (value, min, max) => Math.max(min, Math.min(max, value)),
+    setAssessmentAnswerReveal: () => {},
+    setAssessmentResultsVisible: () => {},
+    setAssessmentAdvanceAfterClose: (value) => advanceAfterClose.push(value),
+    isRequestInterruptedError: () => false,
+    console: { warn: () => {} },
+  });
+  const commitOneReelMove = (direction) => {
+    commits += 1;
+    activeIndexRef.current += direction;
+  };
+  const jumpOneReel = compileUseCallback("jumpOneReel", {
+    assessmentBootstrapPending: false,
+    assessmentSession: null,
+    assessmentStartRequestRef,
+    assessmentGatePending: false,
+    commitOneReelMove,
+    reelsRef,
+    activeIndexRef,
+    maybeLoadMore: () => {},
+    reportForwardScrollForReel,
+    isSearchScopeActive,
+  });
+
+  jumpOneReel(1);
+  const gatePromise = assessmentStartRequestRef.current.promise;
+  jumpOneReel(1);
+  jumpOneReel(1);
+
+  assert.equal(activeIndexRef.current, 2, "the next reel must stay hidden while the outgoing reel is reported");
+  assert.equal(scrollCalls, 1, "rapid navigation must share one checkpoint request");
+  assert.equal(commits, 0);
+  assert.deepEqual(gateStates, [true]);
+
+  resolveScroll({ assessment_ready: true, material_id: "material-a" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(assessmentCalls, 1);
+  assert.equal(activeIndexRef.current, 2, "navigation remains gated through assessment-next");
+
+  resolveAssessment({
+    session: {
+      id: "session-1",
+      questions: [{ id: "question-1" }],
+      current_index: 0,
+      answered_count: 0,
+      question_count: 1,
+    },
+  });
+  await gatePromise;
+
+  assert.equal(activeIndexRef.current, 2, "the outgoing reel remains active behind recall");
+  assert.equal(openedSessions.length, 1);
+  assert.deepEqual(advanceAfterClose, [true], "closing recall should consume exactly the queued move");
+  assert.deepEqual(gateStates, [true, false]);
+
+  const closeAssessmentAndContinue = compileUseCallback("closeAssessmentAndContinue", {
+    assessmentAdvanceAfterClose: true,
+    assessmentStartRequestRef,
+    setAssessmentSession: () => {},
+    setAssessmentQuestionIndex: () => {},
+    setAssessmentAnswerReveal: () => {},
+    setAssessmentAnswering: () => {},
+    setAssessmentResultsVisible: () => {},
+    setAssessmentPreparingFeed: () => {},
+    setAssessmentSnoozing: () => {},
+    setAssessmentError: () => {},
+    setAssessmentGatePending: () => {},
+    setAssessmentAdvanceAfterClose: () => {},
+    commitOneReelMove,
+  });
+  closeAssessmentAndContinue();
+  assert.equal(activeIndexRef.current, 3);
+  assert.equal(commits, 1);
+  assert.equal(assessmentStartRequestRef.current, null);
+});
+
+test("a failed checkpoint request fails open and releases the next reel for retry", async () => {
+  const reels = Array.from({ length: 3 }, (_, index) => ({
+    reel_id: `reel-${index + 1}`,
+    material_id: "material-a",
+  }));
+  const activeIndexRef = { current: 0 };
+  const reelsRef = { current: reels };
+  const assessmentStartRequestRef = { current: null };
+  const reportedForwardScrollKeysRef = { current: new Set() };
+  const searchScope = {
+    key: "material-a",
+    seq: 1,
+    controller: new AbortController(),
+  };
+  let scrollCalls = 0;
+  const isSearchScopeActive = (scope) => (
+    scope.key === searchScope.key && scope.seq === searchScope.seq
+  );
+  const reportForwardScrollForReel = compileUseCallback("reportForwardScrollForReel", {
+    assessmentStartRequestRef,
+    assessmentBootstrapPending: false,
+    assessmentGatePending: false,
+    assessmentSession: null,
+    materialId: "material-a",
+    activeSearchScopeRef: { current: searchScope },
+    reportedForwardScrollKeysRef,
+    reportReelScroll: async () => {
+      scrollCalls += 1;
+      if (scrollCalls === 1) {
+        throw new Error("scroll timed out");
+      }
+      return { assessment_ready: false, material_id: "material-a" };
+    },
+    isSearchScopeActive,
+    setAssessmentGatePending: () => {},
+    setAssessmentError: () => {},
+    startNextAssessment: async () => ({ session: null }),
+    withAssessmentAccuracy: (session) => session,
+    setAssessmentSession: () => {},
+    setAssessmentQuestionIndex: () => {},
+    clamp: (value, min, max) => Math.max(min, Math.min(max, value)),
+    setAssessmentAnswerReveal: () => {},
+    setAssessmentResultsVisible: () => {},
+    setAssessmentAdvanceAfterClose: () => {},
+    isRequestInterruptedError: () => false,
+    console: { warn: () => {} },
+  });
+  const jumpOneReel = compileUseCallback("jumpOneReel", {
+    assessmentBootstrapPending: false,
+    assessmentSession: null,
+    assessmentStartRequestRef,
+    assessmentGatePending: false,
+    commitOneReelMove: (direction) => {
+      activeIndexRef.current += direction;
+    },
+    reelsRef,
+    activeIndexRef,
+    maybeLoadMore: () => {},
+    reportForwardScrollForReel,
+    isSearchScopeActive,
+  });
+
+  jumpOneReel(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(activeIndexRef.current, 1, "a failed optional recall gate must fail open");
+  assert.equal(assessmentStartRequestRef.current, null);
+  assert.equal(reportedForwardScrollKeysRef.current.size, 0);
+
+  jumpOneReel(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(activeIndexRef.current, 2);
+  assert.equal(scrollCalls, 2, "the released gate must permit the next reel to report normally");
 });
 
 test("a failed or empty recall start can retry the same terminal reel", async () => {
@@ -1874,19 +2087,22 @@ test("a failed or empty recall start can retry the same terminal reel", async ()
     console: { warn: () => {} },
   });
 
-  callback({ reel_id: "reel-3", material_id: "material-a" });
-  await new Promise((resolve) => setImmediate(resolve));
+  const failedRequest = callback({ reel_id: "reel-3", material_id: "material-a" });
+  assert.ok(failedRequest);
+  await failedRequest.promise;
   assert.equal(reportedForwardScrollKeysRef.current.size, 0);
   assert.equal(assessmentStartRequestRef.current, null);
 
-  callback({ reel_id: "reel-3", material_id: "material-a" });
-  await new Promise((resolve) => setImmediate(resolve));
+  const emptyRequest = callback({ reel_id: "reel-3", material_id: "material-a" });
+  assert.ok(emptyRequest);
+  await emptyRequest.promise;
   assert.equal(scrollCalls, 2, "the backend-idempotent scroll report may be safely retried");
   assert.equal(assessmentCalls, 2);
   assert.equal(reportedForwardScrollKeysRef.current.size, 0);
 
-  callback({ reel_id: "reel-3", material_id: "material-a" });
-  await new Promise((resolve) => setImmediate(resolve));
+  const openedRequest = callback({ reel_id: "reel-3", material_id: "material-a" });
+  assert.ok(openedRequest);
+  await openedRequest.promise;
   assert.equal(scrollCalls, 3);
   assert.equal(assessmentCalls, 3);
   assert.equal(openedSessions.length, 1);

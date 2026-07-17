@@ -1481,6 +1481,7 @@ export async function reportReelProgress(params: {
 export async function reportReelScroll(params: {
   reelId: string;
   signal?: AbortSignal;
+  timeoutMs?: number;
 }): Promise<ReelScrollResponse> {
   const res = await safeFetch(apiUrl(`/reels/${encodeURIComponent(params.reelId)}/scroll`), {
     method: "POST",
@@ -1488,6 +1489,8 @@ export async function reportReelScroll(params: {
       ...communityRequestHeaders(),
     },
     signal: params.signal,
+    timeoutMs: params.timeoutMs ?? 6_000,
+    keepSignalAliveThroughBody: true,
   });
   return parseJsonResponse<ReelScrollResponse>(res);
 }
@@ -1510,6 +1513,7 @@ export async function fetchPendingAssessment(params: {
 export async function startNextAssessment(params: {
   materialId: string;
   signal?: AbortSignal;
+  timeoutMs?: number;
 }): Promise<AssessmentStatusResponse> {
   const res = await safeFetch(apiUrl("/assessments/next"), {
     method: "POST",
@@ -1519,6 +1523,8 @@ export async function startNextAssessment(params: {
     },
     body: JSON.stringify({ material_id: params.materialId }),
     signal: params.signal,
+    timeoutMs: params.timeoutMs ?? 8_000,
+    keepSignalAliveThroughBody: true,
   });
   return parseJsonResponse<AssessmentStatusResponse>(res);
 }

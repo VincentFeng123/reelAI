@@ -161,6 +161,56 @@ def _seed_pending_session(
         )
 
 
+def _seed_organizer_plan(
+    conn,
+    *,
+    reel_ids: list[str],
+    checkpoint_ids: object,
+    generation_id: str = "organizer-result",
+    job_id: str = "organizer-job",
+    degraded: bool = False,
+    completed_at: str = "2026-07-09T13:00:00+00:00",
+    ordered_ids: object = None,
+    version: int = 2,
+) -> None:
+    payload = {
+        "version": version,
+        "ordered_reel_ids": reel_ids if ordered_ids is None else ordered_ids,
+        "assessment_checkpoint_reel_ids": checkpoint_ids,
+        "degraded": degraded,
+    }
+    conn.execute(
+        "INSERT INTO reel_generations "
+        "(id, material_id, request_key, status, reel_count, created_at, completed_at, "
+        "lesson_order_json) VALUES (?, ?, ?, 'completed', ?, ?, ?, ?)",
+        (
+            generation_id,
+            MATERIAL,
+            f"request-{job_id}",
+            len(reel_ids),
+            completed_at,
+            completed_at,
+            json.dumps(payload),
+        ),
+    )
+    conn.execute(
+        "INSERT INTO reel_generation_jobs "
+        "(id, material_id, request_key, learner_id, result_generation_id, status, "
+        "phase, progress, created_at, updated_at, completed_at) "
+        "VALUES (?, ?, ?, ?, ?, 'completed', 'completed', 1.0, ?, ?, ?)",
+        (
+            job_id,
+            MATERIAL,
+            f"request-{job_id}",
+            LEARNER,
+            generation_id,
+            completed_at,
+            completed_at,
+            completed_at,
+        ),
+    )
+
+
 def test_progress_is_idempotent_and_rejects_non_study_reels(conn) -> None:
     _seed_reel(conn, reel_id="r1", concept_id="c1", video_id="v1")
     service = AssessmentService()
@@ -271,7 +321,7 @@ def test_scroll_is_idempotent_and_preserves_partial_watch_analytics(conn) -> Non
     assert row["completed_at"] is None
 
 
-def test_scroll_cadence_matches_each_three_reel_feed_batch(conn) -> None:
+def test_scroll_cadence_falls_back_to_three_without_an_organizer_plan(conn) -> None:
     service = AssessmentService()
     changed = [{"concept_id": "a"}, {"concept_id": "b"}]
     same = [{"concept_id": "a"}, {"concept_id": "a"}]
@@ -281,17 +331,230 @@ def test_scroll_cadence_matches_each_three_reel_feed_batch(conn) -> None:
         "window_cutoff": "",
     }
     assert service._cadence_target(
-        **common, recent_accuracy=None, scroll_rows=changed
-    ) == 3
+        conn, **common, recent_accuracy=None, scroll_rows=changed
+    ) == (3, None, False)
     assert service._cadence_target(
-        **common, recent_accuracy=0.4, scroll_rows=changed
-    ) == 3
+        conn, **common, recent_accuracy=0.4, scroll_rows=changed
+    ) == (3, None, False)
     assert service._cadence_target(
-        **common, recent_accuracy=1.0, scroll_rows=changed
-    ) == 3
+        conn, **common, recent_accuracy=1.0, scroll_rows=changed
+    ) == (3, None, False)
     assert service._cadence_target(
-        **common, recent_accuracy=None, scroll_rows=same
-    ) == 3
+        conn, **common, recent_accuracy=None, scroll_rows=same
+    ) == (3, None, False)
+
+
+def test_checkpoint_normalizer_preserves_only_the_organizer_plan() -> None:
+    reel_ids = [f"grouped-{index}" for index in range(7)]
+
+    assert assessments_module.assessment_checkpoint_reel_ids(
+        reel_ids, [reel_ids[4]]
+    ) == [reel_ids[4]]
+    assert assessments_module.assessment_checkpoint_reel_ids(reel_ids, []) == []
+    assert assessments_module.assessment_checkpoint_reel_ids(
+        reel_ids, [reel_ids[0]], degraded=True
+    ) is None
+    assert assessments_module.assessment_checkpoint_reel_ids(
+        reel_ids, ["unknown"]
+    ) is None
+
+
+def test_organizer_checkpoint_after_two_reels_creates_one_question_session(conn) -> None:
+    service = AssessmentService()
+    reel_ids = ["checkpoint-two-0", "checkpoint-two-1"]
+    for index, reel_id in enumerate(reel_ids):
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=f"checkpoint-two-c{index}",
+            video_id=f"checkpoint-two-v{index}",
+        )
+    _seed_organizer_plan(conn, reel_ids=reel_ids, checkpoint_ids=[reel_ids[1]])
+
+    first = service.record_scroll(conn, learner_id=LEARNER, reel_id=reel_ids[0])
+    second = service.record_scroll(conn, learner_id=LEARNER, reel_id=reel_ids[1])
+    created = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
+
+    assert first["assessment_ready"] is False
+    assert first["cadence_target"] == 0
+    assert second["assessment_ready"] is True
+    assert second["cadence_target"] == 2
+    assert created["status"] == "ready"
+    assert created["session"]["question_count"] == 1
+    assert [question["reel_id"] for question in created["session"]["questions"]] == [
+        reel_ids[1]
+    ]
+    stored = conn.execute(
+        "SELECT organizer_checkpoint_reel_id FROM assessment_sessions WHERE id = ?",
+        (created["session"]["id"],),
+    ).fetchone()
+    assert stored["organizer_checkpoint_reel_id"] == reel_ids[1]
+
+
+def test_later_checkpoint_survives_scrolls_before_first_quiz_completion(conn) -> None:
+    service = AssessmentService()
+    reel_ids = [f"checkpoint-race-{index}" for index in range(4)]
+    for index, reel_id in enumerate(reel_ids):
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=f"checkpoint-race-c{index}",
+            video_id=f"checkpoint-race-v{index}",
+        )
+    _seed_organizer_plan(
+        conn,
+        reel_ids=reel_ids,
+        checkpoint_ids=[reel_ids[1], reel_ids[3]],
+    )
+    for reel_id in reel_ids:
+        service.record_scroll(conn, learner_id=LEARNER, reel_id=reel_id)
+
+    first = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
+    assert first["status"] == "ready"
+    assert first["session"]["question_count"] == 1
+    assert first["session"]["questions"][0]["reel_id"] == reel_ids[1]
+    for question in first["session"]["questions"]:
+        correct_index = conn.execute(
+            "SELECT correct_index FROM reel_assessment_questions WHERE id = ?",
+            (question["id"],),
+        ).fetchone()[0]
+        service.answer(
+            conn,
+            learner_id=LEARNER,
+            session_id=first["session"]["id"],
+            question_id=question["id"],
+            choice_index=int(correct_index),
+        )
+
+    second = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
+
+    assert second["status"] == "ready"
+    assert second["session"]["id"] != first["session"]["id"]
+    assert second["session"]["question_count"] == 1
+    assert second["session"]["questions"][0]["reel_id"] == reel_ids[3]
+    stored = conn.execute(
+        "SELECT organizer_checkpoint_reel_id FROM assessment_sessions WHERE id = ?",
+        (second["session"]["id"],),
+    ).fetchone()
+    assert stored["organizer_checkpoint_reel_id"] == reel_ids[3]
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_ids", "degraded"),
+    [([], False), (None, False), (["suppressed-0"], True), (["unknown"], False)],
+)
+def test_v2_without_a_valid_checkpoint_never_invents_numeric_cadence(
+    conn,
+    checkpoint_ids,
+    degraded,
+) -> None:
+    service = AssessmentService()
+    reel_ids = [f"suppressed-{index}" for index in range(3)]
+    for index, reel_id in enumerate(reel_ids):
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=f"suppressed-c{index}",
+            video_id=f"suppressed-v{index}",
+        )
+    _seed_organizer_plan(
+        conn,
+        reel_ids=reel_ids,
+        checkpoint_ids=checkpoint_ids,
+        degraded=degraded,
+    )
+
+    results = [
+        service.record_scroll(conn, learner_id=LEARNER, reel_id=reel_id)
+        for reel_id in reel_ids
+    ]
+
+    assert [result["assessment_ready"] for result in results] == [False] * 3
+    assert all(result["cadence_target"] == 0 for result in results)
+    assert service.next_session(
+        conn, learner_id=LEARNER, material_id=MATERIAL
+    )["status"] == "not_ready"
+
+
+@pytest.mark.parametrize("invalid_order", [None, [], ["suppressed-0", "suppressed-0"]])
+def test_invalid_v2_order_suppresses_legacy_cadence_for_current_window(
+    conn,
+    invalid_order,
+) -> None:
+    service = AssessmentService()
+    reel_ids = [f"invalid-v2-{index}" for index in range(3)]
+    for index, reel_id in enumerate(reel_ids):
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=f"invalid-v2-c{index}",
+            video_id=f"invalid-v2-v{index}",
+        )
+    _seed_organizer_plan(
+        conn,
+        reel_ids=reel_ids,
+        checkpoint_ids=[],
+        ordered_ids=invalid_order,
+    )
+    if invalid_order is None:
+        conn.execute(
+            "UPDATE reel_generations SET lesson_order_json = ? WHERE id = 'organizer-result'",
+            (json.dumps({"version": 2, "assessment_checkpoint_reel_ids": []}),),
+        )
+
+    results = [
+        service.record_scroll(conn, learner_id=LEARNER, reel_id=reel_id)
+        for reel_id in reel_ids
+    ]
+
+    assert [result["assessment_ready"] for result in results] == [False] * 3
+    assert all(result["cadence_target"] == 0 for result in results)
+
+
+def test_malformed_lesson_metadata_never_falls_through_to_legacy_cadence(conn) -> None:
+    service = AssessmentService()
+    reel_ids = [f"malformed-v2-{index}" for index in range(3)]
+    for index, reel_id in enumerate(reel_ids):
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=f"malformed-v2-c{index}",
+            video_id=f"malformed-v2-v{index}",
+        )
+    _seed_organizer_plan(conn, reel_ids=reel_ids, checkpoint_ids=[])
+    conn.execute(
+        "UPDATE reel_generations SET lesson_order_json = '{' "
+        "WHERE id = 'organizer-result'"
+    )
+
+    results = [
+        service.record_scroll(conn, learner_id=LEARNER, reel_id=reel_id)
+        for reel_id in reel_ids
+    ]
+
+    assert [result["assessment_ready"] for result in results] == [False] * 3
+    assert all(result["cadence_target"] == 0 for result in results)
+
+
+def test_mixed_legacy_and_v2_window_defers_to_organizer_control(conn) -> None:
+    service = AssessmentService()
+    reel_ids = ["mixed-legacy", "mixed-v2-0", "mixed-v2-1"]
+    for index, reel_id in enumerate(reel_ids):
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=f"mixed-c{index}",
+            video_id=f"mixed-v{index}",
+        )
+    _seed_organizer_plan(conn, reel_ids=reel_ids[1:], checkpoint_ids=[])
+
+    results = [
+        service.record_scroll(conn, learner_id=LEARNER, reel_id=reel_id)
+        for reel_id in reel_ids
+    ]
+
+    assert [result["assessment_ready"] for result in results] == [False] * 3
+    assert results[-1]["cadence_target"] == 0
 
 
 def test_distinct_scrolls_become_ready_at_backend_owned_target(conn) -> None:

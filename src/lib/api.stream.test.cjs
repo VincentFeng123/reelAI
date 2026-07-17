@@ -27,6 +27,7 @@ const {
   queueCommunitySettingsSync,
   readCommunityAuthSession,
   reportReelScroll,
+  startNextAssessment,
 } = require("./api.ts");
 const TEST_OPTIONS = { timeout: 1_000 };
 
@@ -120,6 +121,51 @@ test("scroll reporting uses the bodyless forward-scroll contract", TEST_OPTIONS,
     assert.equal(response.material_id, "material-scroll-test");
   } finally {
     global.fetch = originalFetch;
+    if (originalWindow === undefined) {
+      delete global.window;
+    } else {
+      global.window = originalWindow;
+    }
+  }
+});
+
+test("scroll and assessment-next time out even after response headers", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  const originalWindow = global.window;
+  const originalSetTimeout = global.setTimeout;
+  const observedTimeouts = [];
+  installCommunitySessionTestWindow();
+
+  global.setTimeout = (callback, delay, ...args) => {
+    observedTimeouts.push(delay);
+    return originalSetTimeout(callback, 0, ...args);
+  };
+  global.fetch = async (_url, init = {}) => new Response(new ReadableStream({
+    start(controller) {
+      init.signal.addEventListener("abort", () => {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        controller.error(error);
+      }, { once: true });
+    },
+  }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+
+  try {
+    await assert.rejects(
+      reportReelScroll({ reelId: "reel-timeout" }),
+      /timed out before the backend response completed/i,
+    );
+    await assert.rejects(
+      startNextAssessment({ materialId: "material-timeout" }),
+      /timed out before the backend response completed/i,
+    );
+    assert.deepEqual(observedTimeouts, [6_000, 8_000]);
+  } finally {
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
     if (originalWindow === undefined) {
       delete global.window;
     } else {
