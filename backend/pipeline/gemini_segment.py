@@ -992,8 +992,11 @@ _OPENING_CONTEXTUAL_MODIFIER_SUBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 _OPENING_BARE_RELATIONAL_PREDICATE_RE = re.compile(
-    r"^\s*(?:is|are|was|were)\s+(?:equal|equivalent|proportional|related|"
-    r"similar|connected|dependent)\b",
+    r"^\s*(?:(?:is|are|was|were)\s+"
+    r"(?:equal|equivalent|proportional|related|similar|connected|dependent)\b|"
+    r"(?:(?:directly|inversely)\s+)?"
+    r"(?:equal|equivalent|proportional|related|similar|connected|dependent)\s+"
+    r"(?:to|on)\b)",
     re.IGNORECASE,
 )
 _OPENING_SUBJECTLESS_ADJECTIVE_COMPLEMENT_RE = re.compile(
@@ -10460,6 +10463,130 @@ _TRUSTED_CLAIM_SETUP_HANDOFF_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+_TRUSTED_CLAIM_SENTENCE_ONSET_RE = re.compile(
+    r"(?<!\w)(?:(?P<ordinal>"
+    r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth"
+    r")\s+(?:it|this|that))\s+"
+    r"(?:means?|shows?|implies?|indicates?|suggests?)\b|"
+    r"(?P<note>it\s+is)\s+"
+    r"(?:important|critical|crucial|essential)\s+to\s+"
+    r"(?:note|notice|remember|observe|emphasize)\b)",
+    re.IGNORECASE,
+)
+_TRUSTED_WORKED_TASK_SCOPE_RE = re.compile(
+    r"\b(?:applications?|examples?|find(?:ing)?|determin(?:e|ing)|"
+    r"evaluat(?:e|ing)|numerical\s+application)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_CLAIM_SENTENCE_ARC_SCOPE_RE = re.compile(
+    r"\b(?:causal|chain|cycle|mechanism|pathway|process|sequence|stages?|steps?)\b",
+    re.IGNORECASE,
+)
+
+
+def _trusted_claim_sentence_start(
+    segments: list[dict],
+    *,
+    selected_line: int,
+    claim_location: tuple[int, int, int, int],
+    allowed_frame: str,
+) -> tuple[int, tuple[int, int]] | None:
+    """Recover a nearby explicit sentence frame that contains the claim."""
+    claim_line, claim_left, claim_end_line, claim_right = claim_location
+    search_start = max(0, selected_line - 1)
+    if claim_line < search_start or claim_end_line >= len(segments):
+        return None
+
+    parts: list[str] = []
+    line_offsets: dict[int, tuple[int, int]] = {}
+    cursor = 0
+    for line in range(search_start, claim_end_line + 1):
+        if parts:
+            parts.append(" ")
+            cursor += 1
+        source = str(segments[line].get("text") or "")
+        line_offsets[line] = (cursor, cursor + len(source))
+        parts.append(source)
+        cursor += len(source)
+    joined = "".join(parts)
+    claim_start = line_offsets[claim_line][0] + claim_left
+    claim_end = line_offsets[claim_end_line][0] + claim_right
+
+    sentence_spans = _sentence_character_spans(joined)
+    candidates: list[tuple[int, tuple[int, int], int]] = []
+    for frame in _TRUSTED_CLAIM_SENTENCE_ONSET_RE.finditer(
+        joined,
+        0,
+        claim_start,
+    ):
+        group = "ordinal" if frame.group("ordinal") is not None else "note"
+        if group != allowed_frame:
+            continue
+        onset_left, onset_right = frame.span(group)
+        sentence_span = next(
+            (
+                span
+                for span in sentence_spans
+                if span[0] <= onset_left < span[1]
+            ),
+            None,
+        )
+        verified_sentence_boundary = bool(sentence_span and sentence_span[0] > 0)
+        if (
+            sentence_span is not None
+            and sentence_span[0] == 0
+            and search_start > 0
+        ):
+            from .sentences import classify_terminator
+
+            verified_sentence_boundary = bool(classify_terminator(str(
+                segments[search_start - 1].get("text") or ""
+            )))
+        elif search_start == 0:
+            verified_sentence_boundary = True
+        if (
+            sentence_span is None
+            or not verified_sentence_boundary
+            or _WORD_RE.search(joined[sentence_span[0]:onset_left]) is not None
+            or not (onset_right <= claim_start < claim_end <= sentence_span[1])
+        ):
+            continue
+
+        onset_line = next(
+            (
+                line
+                for line, (left, right) in line_offsets.items()
+                if left <= onset_left < onset_right <= right
+            ),
+            None,
+        )
+        if onset_line is None:
+            continue
+        contiguous = True
+        for line in range(onset_line, claim_end_line):
+            try:
+                gap = (
+                    float(segments[line + 1].get("start", 0.0))
+                    - float(segments[line].get("end", 0.0))
+                )
+            except (TypeError, ValueError, OverflowError):
+                contiguous = False
+                break
+            if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+                contiguous = False
+                break
+        if not contiguous:
+            continue
+        line_left = line_offsets[onset_line][0]
+        candidates.append((
+            onset_line,
+            (onset_left - line_left, onset_right - line_left),
+            onset_left,
+        ))
+    if not candidates:
+        return None
+    line, span, _position = max(candidates, key=lambda item: item[2])
+    return line, span
 
 
 def _trusted_claim_setup_start(
@@ -10471,6 +10598,7 @@ def _trusted_claim_setup_start(
     anchor_text: str,
     teaching_handoff_only: bool = False,
     teaching_subject_anchor_text: str = "",
+    allow_validated_single_subject_anchor: bool = False,
 ) -> tuple[int, tuple[int, int]] | None:
     """Advance a Gemini edge to a later explicit, complete setup for its claim."""
     claim_line, claim_left, _claim_end_line, _claim_right = claim_location
@@ -10480,6 +10608,7 @@ def _trusted_claim_setup_start(
         source = str(segments[line].get("text") or "")
         upper = claim_left if line == claim_line else len(source)
         for handoff in _TRUSTED_CLAIM_SETUP_HANDOFF_RE.finditer(source, 0, upper):
+            teaching_subject_matches_claim = False
             if (
                 teaching_handoff_only
                 and handoff.group("teaching_setup") is None
@@ -10509,8 +10638,12 @@ def _trusted_claim_setup_start(
                     _content_tokens(teaching_subject_anchor_text)
                     - generic_subject_tokens
                 )
-                if not subject_tokens.intersection(claim_tokens):
+                if (
+                    not subject_tokens
+                    or not subject_tokens.issubset(claim_tokens)
+                ):
                     continue
+                teaching_subject_matches_claim = True
             setup_left = (
                 handoff.start("teaching_setup")
                 if handoff.group("teaching_setup") is not None
@@ -10524,7 +10657,18 @@ def _trusted_claim_setup_start(
                 sentence_spans[0][1] if sentence_spans else len(retained)
             )
             opening = retained[:opening_right]
-            if len(_content_tokens(opening) & anchor_tokens) < 2:
+            required_anchor_overlap = (
+                1
+                if (
+                    allow_validated_single_subject_anchor
+                    and teaching_subject_matches_claim
+                )
+                else 2
+            )
+            if (
+                len(_content_tokens(opening) & anchor_tokens)
+                < required_anchor_overlap
+            ):
                 continue
             standalone_opening = (
                 _exact_boundary_quote(retained, want="start")
@@ -11065,6 +11209,112 @@ def _trusted_compact_plan_to_report(
                     and not _opening_clause_is_standalone(final_start_text)
                 )
             )
+        if (
+            final_start_is_clipped
+            and not trusted_structural_onset_applied
+            and claim_location is not None
+            and a <= claim_location[0] <= claim_location[2] <= b
+        ):
+            final_claim_setup = _trusted_claim_setup_start(
+                segments,
+                selected_line=a,
+                selected_left=final_start_left,
+                claim_location=claim_location,
+                anchor_text=model_claim_quote,
+                teaching_handoff_only=True,
+                teaching_subject_anchor_text=model_claim_quote,
+                allow_validated_single_subject_anchor=True,
+            )
+            if (
+                final_claim_setup is not None
+                and (
+                    final_claim_setup[0],
+                    final_claim_setup[1][0],
+                ) > (a, final_start_left)
+            ):
+                a, start_span = final_claim_setup
+                effective_start_quote = _literal_source_quote(
+                    str(segments[a].get("text") or ""),
+                    "",
+                    start_span,
+                )
+                structural_start_trimmed = True
+                trusted_structural_onset_applied = True
+                final_start_is_clipped = False
+                diagnostics.append(
+                    "trimmed_clipped_start_to_claim_setup"
+                )
+        claim_sentence_selected = final_start_text[final_start_left:]
+        claim_sentence_frame = (
+            "ordinal"
+            if _TRUSTED_SUBJECTLESS_PREDICATE_OPENING_RE.match(
+                claim_sentence_selected
+            )
+            else (
+                "note"
+                if _OPENING_BARE_RELATIONAL_PREDICATE_RE.match(
+                    claim_sentence_selected
+                )
+                else ""
+            )
+        )
+        claim_sentence_scope = " ".join(
+            str(value or "")
+            for value in (
+                proposal.title,
+                proposal.learning_objective,
+                proposal.facet,
+                model_claim_quote,
+            )
+        )
+        if (
+            final_start_is_clipped
+            and not trusted_structural_onset_applied
+            and claim_location is not None
+            and a <= claim_location[0] <= claim_location[2] <= b
+            and bool(claim_sentence_frame)
+            and _TRUSTED_SPLIT_COPULA_COMPLEMENT_OPENING_RE.match(
+                claim_sentence_selected
+            ) is None
+            and not (
+                start_span is not None
+                and final_start_left > 0
+                and _WORD_RE.search(final_start_text[:final_start_left])
+                is not None
+            )
+            and _ATOMIC_WORKED_SCOPE_RE.search(claim_sentence_scope) is None
+            and _TRUSTED_WORKED_TASK_SCOPE_RE.search(claim_sentence_scope)
+            is None
+            and _ATOMIC_CAUSAL_SCOPE_RE.search(claim_sentence_scope) is None
+            and _TRUSTED_CLAIM_SENTENCE_ARC_SCOPE_RE.search(
+                claim_sentence_scope
+            ) is None
+        ):
+            claim_sentence_start = _trusted_claim_sentence_start(
+                segments,
+                selected_line=a,
+                claim_location=claim_location,
+                allowed_frame=claim_sentence_frame,
+            )
+            if (
+                claim_sentence_start is not None
+                and (
+                    claim_sentence_start[0],
+                    claim_sentence_start[1][0],
+                ) != (a, final_start_left)
+            ):
+                a, start_span = claim_sentence_start
+                effective_start_quote = _literal_source_quote(
+                    str(segments[a].get("text") or ""),
+                    "",
+                    start_span,
+                )
+                structural_start_trimmed = True
+                trusted_structural_onset_applied = True
+                final_start_is_clipped = False
+                diagnostics.append(
+                    "trimmed_clipped_start_to_claim_sentence"
+                )
         should_repair_start_context = bool(
             not structural_start_trimmed
             or (

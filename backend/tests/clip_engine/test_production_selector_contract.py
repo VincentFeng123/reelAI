@@ -2068,6 +2068,8 @@ def test_trusted_live_acceleration_candidate_advances_to_its_mass_setup() -> Non
         "model_end_line",
         "model_end_quote",
         "combined_acceleration_tail",
+        "exact_fresh_v34_shape",
+        "punctuated_claim_handoff",
     ),
     [
         (
@@ -2076,12 +2078,16 @@ def test_trusted_live_acceleration_candidate_advances_to_its_mass_setup() -> Non
             3,
             "speed doesn't change you are accelerating",
             True,
+            False,
+            False,
         ),
         (
             0,
             "meters per second these are all examples",
             3,
             "speed doesn't change you are accelerating",
+            False,
+            False,
             False,
         ),
         (
@@ -2090,6 +2096,8 @@ def test_trusted_live_acceleration_candidate_advances_to_its_mass_setup() -> Non
             2,
             "common units for acceleration",
             False,
+            False,
+            False,
         ),
         (
             1,
@@ -2097,6 +2105,26 @@ def test_trusted_live_acceleration_candidate_advances_to_its_mass_setup() -> Non
             2,
             "common units for acceleration",
             False,
+            False,
+            False,
+        ),
+        (
+            1,
+            "units for speed so if you're",
+            3,
+            "even if your speed doesn't change you are accelerating",
+            False,
+            True,
+            False,
+        ),
+        (
+            1,
+            "units for speed so if you're",
+            3,
+            "even if your speed doesn't change you are accelerating",
+            False,
+            True,
+            True,
         ),
     ],
     ids=[
@@ -2104,6 +2132,8 @@ def test_trusted_live_acceleration_candidate_advances_to_its_mass_setup() -> Non
         "complete-speed-background",
         "live-acceleration-definition",
         "ungrounded-live-acceleration-start",
+        "exact-fresh-v34-selector-output",
+        "punctuated-claim-handoff",
     ],
 )
 def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
@@ -2112,6 +2142,8 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
     model_end_line: int,
     model_end_quote: str,
     combined_acceleration_tail: bool,
+    exact_fresh_v34_shape: bool,
+    punctuated_claim_handoff: bool,
 ) -> None:
     raw_cues = [
         (
@@ -2161,6 +2193,43 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
             "change your direction even if your speed doesn't change you are accelerating",
         ),
     ]
+    if exact_fresh_v34_shape:
+        if punctuated_claim_handoff:
+            cue, start, end, text = raw_cues[2]
+            raw_cues[2] = (
+                cue,
+                start,
+                end,
+                text.replace(
+                    "understand acceleration which is simply",
+                    "understand acceleration. Acceleration which is simply",
+                ),
+            )
+        raw_cues[3] = (
+            3,
+            92.75,
+            128.97,
+            "anytime you change your velocity you are accelerating that can be "
+            "speeding up or slowing down which is also known as negative "
+            "acceleration but Direction is also a component of velocity so when "
+            "you change your direction even if your speed doesn't change you are "
+            "accelerating does that blow your mind all right let's recap speed is "
+            "the rate at which something moves distance over time velocity is speed "
+            "with a direction so distance over time with a specific direction and "
+            "acceleration the king of",
+        )
+        raw_cues.append((
+            4,
+            126.03,
+            167.009,
+            "them all is distance over x squared or the rate at which velocity "
+            "changes so whether you're speeding up slow down or changing directions "
+            "you're changing your velocity and thus accelerating science is so cool "
+            "I hope you enjoyed this video feel free to throw any comments below "
+            "whether it be questions criticisms or just idle chitchat I'd love to "
+            "hear it don't forget to watch and share my other videos and I'll catch "
+            "you next time [Music]",
+        ))
     segments = [
         {
             "cue_id": f"Jyiw6KkedDY:cue:{cue}",
@@ -2171,9 +2240,13 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
         for cue, start, end, text in raw_cues
     ]
     claim = (
-        "meters per second squared are common units for acceleration"
-        if combined_acceleration_tail
-        else "meters per second squared are common units"
+        "acceleration which is simply the rate at which velocity changes"
+        if exact_fresh_v34_shape
+        else (
+            "meters per second squared are common units for acceleration"
+            if combined_acceleration_tail
+            else "meters per second squared are common units"
+        )
     )
     plan = _compact_custom_plan(
         request="Newton's second law",
@@ -2185,30 +2258,34 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
         "topics": [plan.topics[0].model_copy(update={
             "candidate_id": (
                 "acceleration-and-units"
-                if combined_acceleration_tail
+                if combined_acceleration_tail and not exact_fresh_v34_shape
                 else "acceleration-definition-units"
             ),
             "start_line": model_start_line,
             "end_line": model_end_line,
             "title": (
                 "Acceleration and its Units"
-                if combined_acceleration_tail
+                if combined_acceleration_tail and not exact_fresh_v34_shape
                 else "Defining Acceleration and Its Units"
             ),
             "learning_objective": (
                 "Define acceleration, state its units, and identify causes of acceleration"
-                if combined_acceleration_tail
-                else "Define acceleration as the rate of velocity change and identify its units"
+                if combined_acceleration_tail and not exact_fresh_v34_shape
+                else (
+                    "Define acceleration as the rate of change of velocity and identify its common units"
+                    if exact_fresh_v34_shape
+                    else "Define acceleration as the rate of velocity change and identify its units"
+                )
             ),
             "facet": (
                 "speed and acceleration definition and units"
-                if combined_acceleration_tail
+                if combined_acceleration_tail and not exact_fresh_v34_shape
                 else "acceleration definition and units"
             ),
             "directly_teaches_topic": False,
         })],
     })
-    if model_end_line == 2 or combined_acceleration_tail:
+    if model_end_line == 2 or combined_acceleration_tail or exact_fresh_v34_shape:
         exact_request = (
             "Explain Newton's second law F=ma from intuition through worked examples, "
             "including net force, mass, acceleration, units, and solving for each variable"
@@ -2241,14 +2318,20 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
                     gemini_segment._CompactIntentEvidence.model_validate({
                         "id": "acceleration",
                         "q": (
-                            "the rate at which velocity changes"
+                            claim
+                            if exact_fresh_v34_shape
+                            else "the rate at which velocity changes"
                             if combined_acceleration_tail
                             else "you're now ready to understand acceleration"
                         ),
                     }),
                     gemini_segment._CompactIntentEvidence.model_validate({
                         "id": "units",
-                        "q": claim,
+                        "q": (
+                            "meters per second squared are common units for acceleration"
+                            if exact_fresh_v34_shape
+                            else claim
+                        ),
                     }),
                 ],
             })],
@@ -2273,6 +2356,429 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
     assert "with that knowledge" not in clip["_clip_text"]
     assert "units for speed" not in clip["_clip_text"]
     assert "trimmed_clipped_start_to_claim_setup" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_claim_handoff_requires_the_whole_subject_to_match() -> None:
+    segments = [
+        {
+            "cue_id": "partial-subject:cue:0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": "The previous section covers background and units for speed",
+        },
+        {
+            "cue_id": "partial-subject:cue:1",
+            "start": 8.0,
+            "end": 18.0,
+            "text": (
+                "with that knowledge in hand you're now ready to understand mass "
+                "media. Force equals mass times acceleration."
+            ),
+        },
+    ]
+    claim = "Force equals mass times acceleration"
+    plan = _compact_custom_plan(
+        request="Newton force relationship",
+        start_quote="and units for speed",
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 0,
+            "end_line": 1,
+            "title": "Newton force relationship",
+            "learning_objective": "Explain the Newton force relationship",
+            "facet": "Newton force relationship",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "partial-subject:cue:0"
+    assert not clip["_clip_text"].startswith(
+        "you're now ready to understand mass media"
+    )
+
+
+def _fresh_v34_xz_segments() -> list[dict]:
+    texts = {
+        21: "and acceleration. There are a number of",
+        22: "things we can say about this equation,",
+        23: "which is tiny but powerful. First it",
+        24: "means that heavier objects will require",
+        25: "the application of greater force in",
+        26: "order to achieve the same acceleration",
+        27: "as lighter objects, with acceleration being",
+        28: "equal to force divided by mass. If we",
+        29: "want these objects of varying masses",
+        30: "each to accelerate at one meter per",
+        31: "second squared,",
+        32: "these are the magnitudes of the forces",
+        33: "that must be applied in order for the",
+        34: "math to work out. This also means that",
+        35: "the second law can be rephrased to state",
+        36: "that the acceleration an object",
+        37: "experiences will be directly",
+        38: "proportional to the force applied and",
+        39: "inversely proportional to its mass. It is",
+        40: "important to note that the net force is",
+        41: "the sum of all the forces acting on an",
+        42: "object. If multiple forces are acting on",
+        43: "an object, which is often the case, we",
+        44: "will need to represent them all in a",
+        45: "free body diagram and then add up all",
+        46: "the vectors to find the net force, which",
+        47: "will tell us",
+        48: "the direction of the acceleration that",
+        49: "will occur in response to the net force.",
+        50: "This kind of vector addition allows us",
+        51: "to make predictions about the motion of",
+        52: "an object even when it is being pushed",
+        53: "or pulled in a variety of ways. Since",
+    }
+    return [
+        {
+            "cue_id": f"xzA6IBWUEDE:cue:{cue}",
+            "start": float(cue),
+            "end": float(cue) + 1.0,
+            "text": text,
+        }
+        for cue, text in texts.items()
+    ]
+
+
+@pytest.mark.parametrize(
+    (
+        "start_cue",
+        "end_cue",
+        "start_quote",
+        "end_quote",
+        "claim",
+        "title",
+        "objective",
+        "facet",
+        "expected_cue",
+        "expected_quote",
+        "excluded_prefix",
+    ),
+    [
+        (
+            24,
+            28,
+            "means that heavier objects will require",
+            "equal to force divided by mass",
+            "acceleration being equal to force divided by mass",
+            "F=ma proportionality intuition",
+            "Explain how mass changes the force needed for equal acceleration",
+            "force, mass, and acceleration proportionality",
+            23,
+            "First it",
+            "which is tiny but powerful",
+        ),
+        (
+            38,
+            53,
+            "proportional to the force applied and",
+            "or pulled in a variety of ways",
+            "net force is the sum of all the forces",
+            "Net force and vector addition",
+            "Explain how forces add to produce net force and acceleration",
+            "net force vector addition",
+            39,
+            "It is",
+            "proportional to the force applied",
+        ),
+    ],
+    ids=["fma-proportionality", "net-force-vector-addition"],
+)
+def test_fresh_v34_relational_fragments_recover_the_claim_sentence(
+    start_cue: int,
+    end_cue: int,
+    start_quote: str,
+    end_quote: str,
+    claim: str,
+    title: str,
+    objective: str,
+    facet: str,
+    expected_cue: int,
+    expected_quote: str,
+    excluded_prefix: str,
+) -> None:
+    segments = _fresh_v34_xz_segments()
+    cue_to_line = {
+        int(segment["cue_id"].rsplit(":", 1)[1]): line
+        for line, segment in enumerate(segments)
+    }
+    plan = _compact_custom_plan(
+        request="Newton's second law F=ma",
+        start_quote=start_quote,
+        end_quote=end_quote,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": cue_to_line[start_cue],
+            "end_line": cue_to_line[end_cue],
+            "title": title,
+            "learning_objective": objective,
+            "facet": facet,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == f"xzA6IBWUEDE:cue:{expected_cue}"
+    assert clip["start_quote"] == expected_quote
+    assert clip["_clip_text"].startswith(expected_quote)
+    assert excluded_prefix not in clip["_clip_text"]
+    assert "trimmed_clipped_start_to_claim_sentence" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_named_subject_relational_sentence_remains_a_complete_start() -> None:
+    text = "Acceleration is proportional to force when mass stays constant."
+    segments = [{
+        "cue_id": "named-subject:cue:0",
+        "start": 0.0,
+        "end": 6.0,
+        "text": text,
+    }]
+    plan = _compact_custom_plan(
+        request="acceleration proportionality",
+        start_quote="Acceleration is proportional to force",
+        end_quote="mass stays constant",
+        claim_quote="Acceleration is proportional to force",
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "named-subject:cue:0"
+    assert clip["_clip_text"].startswith(
+        "Acceleration is proportional to force"
+    )
+    assert "trimmed_clipped_start_to_claim_sentence" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+@pytest.mark.parametrize("cross_cue_start", [False, True])
+def test_worked_example_keeps_givens_before_a_later_claim_frame(
+    cross_cue_start: bool,
+) -> None:
+    action = "and divide" if cross_cue_start else "Divide"
+    segments = [
+        {
+            "cue_id": "worked-example:cue:0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "A cart has a ten newton net force and a two kilogram mass."
+            ),
+        },
+        {
+            "cue_id": "worked-example:cue:1",
+            "start": 8.0,
+            "end": 17.0,
+            "text": (
+                f"{action} force by mass to "
+                "obtain five meters per second squared. "
+                "It is important to note that acceleration is five meters per "
+                "second squared."
+            ),
+        },
+    ]
+    claim = "acceleration is five meters per second squared"
+    plan = _compact_custom_plan(
+        request="finding acceleration from force and mass",
+        start_quote=(
+            "and divide force by mass"
+            if cross_cue_start
+            else "and a two kilogram mass"
+        ),
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1 if cross_cue_start else 0,
+            "end_line": 1,
+            "title": "Finding acceleration",
+            "learning_objective": (
+                "Determine acceleration from force and mass"
+            ),
+            "facet": "numerical application",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "worked-example:cue:0"
+    assert clip["_clip_text"].startswith("A cart has a ten newton net force")
+    assert "trimmed_clipped_start_to_claim_sentence" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_application_scope_keeps_givens_split_across_cues() -> None:
+    segments = [
+        {
+            "cue_id": "split-application:cue:0",
+            "start": 0.0,
+            "end": 6.0,
+            "text": "A cart has a ten newton net force",
+        },
+        {
+            "cue_id": "split-application:cue:1",
+            "start": 6.0,
+            "end": 12.0,
+            "text": (
+                "and a two kilogram mass. Divide force by mass to get five."
+            ),
+        },
+        {
+            "cue_id": "split-application:cue:2",
+            "start": 12.0,
+            "end": 18.0,
+            "text": (
+                "It is important to note that acceleration is five meters per "
+                "second squared."
+            ),
+        },
+    ]
+    claim = "acceleration is five meters per second squared"
+    plan = _compact_custom_plan(
+        request="acceleration from force and mass",
+        start_quote="and a two kilogram mass",
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 2,
+            "title": "Acceleration application",
+            "learning_objective": "Use force and mass to obtain acceleration",
+            "facet": "force and mass example",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "split-application:cue:0"
+    assert clip["_clip_text"].startswith("A cart has a ten newton net force")
+    assert "Divide force by mass to get five" in clip["_clip_text"]
+    assert "trimmed_clipped_start_to_claim_sentence" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_coherent_pathway_keeps_premises_before_a_final_claim() -> None:
+    segments = [
+        {
+            "cue_id": "pathway:cue:0",
+            "start": 0.0,
+            "end": 6.0,
+            "text": "Photosynthesis captures sunlight and uses water",
+        },
+        {
+            "cue_id": "pathway:cue:1",
+            "start": 6.0,
+            "end": 13.0,
+            "text": (
+                "and carbon dioxide to make ATP, which drives carbon fixation."
+            ),
+        },
+        {
+            "cue_id": "pathway:cue:2",
+            "start": 13.0,
+            "end": 19.0,
+            "text": (
+                "Finally this shows that sunlight becomes stored chemical energy."
+            ),
+        },
+    ]
+    claim = "sunlight becomes stored chemical energy"
+    plan = _compact_custom_plan(
+        request="photosynthesis energy pathway",
+        start_quote="and carbon dioxide to make ATP",
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 2,
+            "title": "Photosynthesis energy pathway",
+            "learning_objective": (
+                "Trace how sunlight becomes stored chemical energy"
+            ),
+            "facet": "photosynthesis mechanism",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "pathway:cue:0"
+    assert clip["_clip_text"].startswith("Photosynthesis captures sunlight")
+    assert "which drives carbon fixation" in clip["_clip_text"]
+    assert "trimmed_clipped_start_to_claim_sentence" not in (
         clip["_boundary_fallback_reasons"]
     )
 
