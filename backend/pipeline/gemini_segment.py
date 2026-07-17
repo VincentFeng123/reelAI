@@ -1655,7 +1655,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v1"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v5"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v6"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -2119,6 +2119,14 @@ _POLICY_AND_EXAMPLES = """Policy:
 - A supporting unit must contain substantive explanation or a complete worked example. A bare
   formula, definition, topic name, result, generic background statement, or shared vocabulary
   is not enough. Shared broad-field relevance is not a topical connection.
+- Every supporting unit must stay anchored to the request by either (a) teaching a named
+  subject, object, or relationship from the request, or (b) applying an explicitly named
+  technical method or mechanism within the same subject family. A generic task or format such
+  as explain, calculate, solve for a variable, show steps, give an example, or state units is
+  never an anchor by itself. Sharing only the head word of a more specific phrase is also not
+  enough: "force" does not ground "net force", and "units" does not ground the units of a
+  named law. A different governing law, equation, theory, system, or domain is not supporting
+  material merely because it uses the same algebra, units, or vocabulary.
 - Return a candidate only when informativeness, topic_relevance, and educational_importance
   are each at least 0.75 and the spoken unit satisfies every substantive, grounding,
   context, and filler rule.
@@ -2361,8 +2369,11 @@ def _compact_output_guide() -> str:
   5-16-word quote inside the candidate. For a PRIMARY unit, ie covers every required non-scope
   id and each q proves fulfillment of that constraint. For a SUPPORTING unit, ie contains at
   least one id and each q grounds the unit's substantive educational connection to that
-  constraint; it need not claim full fulfillment. Never use supporting ie to falsely claim a
-  mismatched object or outcome. Do not output a role; the backend mechanically derives primary
+  constraint; it need not claim full fulfillment. At least one supporting ie item must ground
+  a named subject, object, or relationship, or an explicitly named technical method used in the
+  same subject family. Generic task, format, or outcome evidence alone is insufficient. Never
+  use supporting ie to falsely claim a mismatched object or outcome. Do not output a role; the
+  backend mechanically derives primary
   only from direct=true plus full grounded coverage, otherwise supporting, and never rejects a
   unit based on that role.
   For a named expression or formula, q may claim its object id only when it includes the full
@@ -2371,6 +2382,15 @@ def _compact_output_guide() -> str:
   When a fulfilled format constraint spans multiple transformations, q anchors that sequence;
   verify every requested transformation across the entire sq-through-eq span. One q never
   replaces the whole-span completeness check.
+
+Subject-anchor counterexample:
+For the exact request "Explain Newton's second law F=ma from intuition to worked examples,
+including net force, mass, acceleration, units, and solving for each variable", omit a
+Coulomb's-law unit that merely mentions force or newtons, computes net electric force, or
+rearranges Coulomb's equation. Those overlaps do not teach Newton's second law, F=ma, its named
+quantities, or a technical method unique to that request. Such a unit qualifies only when one
+complete span explicitly connects the electric force back to F=ma, for example by using that
+force to calculate mass or acceleration. Generic algebraic isolation is not that connection.
 
 Worked format example — understand the boundary logic, but never copy its content or scores:
 All examples below assume no learner-level restriction. They demonstrate only schema and

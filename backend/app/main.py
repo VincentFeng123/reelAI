@@ -3961,15 +3961,8 @@ def _sanitize_generation_replay_events(
     job_row: dict[str, Any] | None,
     events: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    candidate_reel_ids = [
-        str(((event.get("payload") or {}).get("reel") or {}).get("reel_id") or "")
-        for event in events
-        if str(event.get("type") or "") == "candidate"
-    ]
-    usable_candidate_ids = _usable_boundary_reel_ids(conn, candidate_reel_ids)
     sanitized: list[dict[str, Any]] = []
     authoritative_reels: list[dict[str, Any]] | None = None
-    authoritative_reel_ids: set[str] | None = None
     terminal_inventory = bool(
         job_row
         and str(job_row.get("status") or "") in GENERATION_TERMINAL_STATUSES
@@ -3977,24 +3970,13 @@ def _sanitize_generation_replay_events(
     )
     if terminal_inventory and job_row is not None:
         authoritative_reels = _generation_job_reels(conn, job_row)
-        authoritative_reel_ids = {
-            str(reel.get("reel_id") or "").strip()
-            for reel in authoritative_reels
-            if str(reel.get("reel_id") or "").strip()
-        }
     for raw_event in events:
         event = dict(raw_event)
         event_type = str(event.get("type") or "")
         payload = dict(event.get("payload") or {})
         if event_type == "candidate":
-            reel = payload.get("reel")
-            reel_id = str((reel or {}).get("reel_id") or "") if isinstance(reel, dict) else ""
-            if reel_id not in usable_candidate_ids or (
-                authoritative_reel_ids is not None
-                and reel_id not in authoritative_reel_ids
-            ):
-                continue
-        elif event_type == "final" and job_row is not None:
+            continue
+        if event_type == "final" and job_row is not None:
             if authoritative_reels is None:
                 authoritative_reels = _generation_job_reels(conn, job_row)
             payload["reels"] = authoritative_reels
@@ -4275,28 +4257,13 @@ def _run_leased_generation_job(
                 # receives the fresh provider budget after cached inventory is
                 # drained, so playback never waits on Gemini after clip three.
                 remaining_source_budget = 0
-            emitted: set[tuple[str, str]] = set()
-            # Candidate events are provisional and reconciled against the
-            # authoritative capped final. Accepted overflow stays persisted for
-            # later difficulty progression without exceeding the live ceiling.
+            # Candidates remain private until retrieval is complete. The final
+            # ranked batch is released below, so discovery timing cannot lock a
+            # weaker supporting clip ahead of a stronger primary clip.
 
-            def on_candidate(reel: dict[str, Any]) -> None:
+            def on_candidate(_reel: dict[str, Any]) -> None:
                 if should_cancel():
                     raise GenerationCancelledError("Generation cancelled.")
-                identity = _reel_identity_key(reel)
-                if identity in emitted:
-                    return
-                if len(emitted) >= requested_count:
-                    return
-                emitted.add(identity)
-                public_reel = _public_generation_reel(reel)
-                append_generation_event(
-                    conn,
-                    job_id=job_id,
-                    event_type="candidate",
-                    payload={"reel": public_reel, "provisional": True},
-                    lease_owner=lease_owner,
-                )
 
             base_exclusions = list(params.get("exclude_video_ids") or [])
 
@@ -6677,17 +6644,13 @@ def feed(
         cross_request_source = False
         cross_request_source_covers_mode = False
         generation_id = (
-            str((latest_compatible_job or completed_job or {}).get("result_generation_id") or "").strip()
-            or str((latest_compatible_job or active_job or {}).get("source_generation_id") or "").strip()
-            or None
-        )
-        if generation_id is None:
+            str((active_job or {}).get("source_generation_id") or "").strip()
+            if active_job
+            else str((completed_job or {}).get("result_generation_id") or "").strip()
+        ) or None
+        if generation_id is None and not active_job:
             head = _fetch_active_generation_row(conn, material_id=material_id, request_key=request_key)
             generation_id = str((head or {}).get("id") or "") or None
-        if generation_id is None and active_job:
-            generation_id = (
-                str(active_job.get("source_generation_id") or "").strip() or None
-            )
         if generation_id is None and not completed_job and not active_job:
             generation_id = _verified_cross_request_source_generation(
                 conn,

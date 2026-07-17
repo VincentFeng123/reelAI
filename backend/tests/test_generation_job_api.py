@@ -2221,9 +2221,6 @@ def test_slow_generation_uses_one_deep_retrieval_with_three_source_cap(monkeypat
         assert ("ranking", 0.85) in progress_updates
         events = generation_jobs.replay_events(conn, job_id=job["id"])
         assert [event["type"] for event in events] == [
-            "candidate",
-            "candidate",
-            "candidate",
             "final",
             "terminal",
         ]
@@ -2231,7 +2228,7 @@ def test_slow_generation_uses_one_deep_retrieval_with_three_source_cap(monkeypat
             event["payload"]["reel"]["reel_id"]
             for event in events
             if event["type"] == "candidate"
-        ] == ["deep-reel-1", "deep-reel-2", "deep-reel-3"]
+        ] == []
         final_reel_ids = [
             reel["reel_id"]
             for event in events
@@ -2343,7 +2340,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
         assert gemini_budget["pro_calls"] == 0
         assert gemini_budget["pro_call_limit"] == 0
         events = generation_jobs.replay_events(conn, job_id=job["id"])
-        assert [event["type"] for event in events].count("candidate") == expected_reel_cap
+        assert [event["type"] for event in events].count("candidate") == 0
         assert [event["type"] for event in events][-2:] == ["final", "terminal"]
         final_event = next(event for event in events if event["type"] == "final")
         terminal_event = next(event for event in events if event["type"] == "terminal")
@@ -2410,7 +2407,7 @@ def test_generation_worker_caps_stream_but_keeps_every_persisted_candidate(
             for event in events
             if event["type"] == "candidate"
         ]
-        assert candidates == [f"streamed-reel-{index}" for index in range(8)]
+        assert candidates == []
         completed_job = generation_jobs.get_job(conn, job["id"])
         assert completed_job is not None
         assert conn.execute(
@@ -2979,8 +2976,8 @@ def test_generation_stream_replays_monotonic_persisted_events(monkeypatch) -> No
 
     try:
         events = asyncio.run(collect())
-        assert [event["type"] for event in events] == ["candidate", "final", "terminal"]
-        assert [event["seq"] for event in events] == [1, 3, 4]
+        assert [event["type"] for event in events] == ["final", "terminal"]
+        assert [event["seq"] for event in events] == [3, 4]
         assert all(event["job_id"] == job["id"] and event["timestamp"] for event in events)
     finally:
         conn.close()
@@ -3204,7 +3201,7 @@ def test_completed_job_status_and_replay_drop_currently_invalid_candidate(monkey
         event["payload"]["reel"]["reel_id"]
         for event in replay
         if event["type"] == "candidate"
-    ] == ["current-valid"]
+    ] == []
     final = next(event for event in replay if event["type"] == "final")
     assert [reel["reel_id"] for reel in final["payload"]["reels"]] == [
         "current-valid"
@@ -3413,7 +3410,7 @@ def test_boundary_only_failure_surfaces_strict_transcript_fallback_in_feed_and_r
         event["payload"]["reel"]["reel_id"]
         for event in replay
         if event["type"] == "candidate"
-    ] == [persisted.reel_id]
+    ] == []
     final = next(event for event in replay if event["type"] == "final")
     assert final["payload"]["authoritative"] is True
     assert [item["reel_id"] for item in final["payload"]["reels"]] == [

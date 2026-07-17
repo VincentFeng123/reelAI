@@ -1643,6 +1643,48 @@ def test_specific_request_prompt_returns_primary_and_complete_supporting_units()
     assert "whole-span completeness check" in normalized.casefold()
 
 
+def test_newtons_second_law_prompt_excludes_unanchored_coulomb_support() -> None:
+    exact_request = (
+        "Explain Newton's second law F=ma from intuition to worked examples, "
+        "including net force, mass, acceleration, units, and solving for each variable"
+    )
+    system, user = gemini_segment._boundary_prompts(
+        "\n".join([
+            "[0] 00:00 Newton's second law says net force equals mass times acceleration.",
+            "[1] 00:10 Coulomb's law computes electric force in newtons.",
+            "[2] 00:20 Rearrange Coulomb's equation to solve for either charge.",
+        ]),
+        3,
+        exact_request,
+    )
+    normalized = " ".join(f"{system}\n{user}".split()).casefold()
+
+    assert exact_request.casefold() in normalized
+    assert (
+        "every supporting unit must stay anchored to the request by either (a) "
+        "teaching a named subject, object, or relationship from the request, or "
+        "(b) applying an explicitly named technical method or mechanism within "
+        "the same subject family"
+    ) in normalized
+    assert (
+        "generic task or format such as explain, calculate, solve for a variable, "
+        "show steps, give an example, or state units is never an anchor by itself"
+    ) in normalized
+    assert (
+        'sharing only the head word of a more specific phrase is also not enough: '
+        '"force" does not ground "net force"'
+    ) in normalized
+    assert (
+        "omit a coulomb's-law unit that merely mentions force or newtons, computes "
+        "net electric force, or rearranges coulomb's equation"
+    ) in normalized
+    assert (
+        "such a unit qualifies only when one complete span explicitly connects the "
+        "electric force back to f=ma"
+    ) in normalized
+    assert "generic algebraic isolation is not that connection" in normalized
+
+
 def test_boundary_prompt_stays_transcript_only_when_video_is_requested() -> None:
     system, user = gemini_segment._boundary_prompts(
         "[0] 00:00 This curve approaches zero as x increases.",
