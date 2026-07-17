@@ -1949,7 +1949,7 @@ def test_trusted_live_weight_candidate_advances_to_its_complete_setup() -> None:
     )
 
 
-def test_trusted_live_acceleration_candidate_advances_to_its_mass_setup() -> None:
+def test_trusted_live_acceleration_candidate_recovers_its_people_setup() -> None:
     raw_cues = [
         (
             14,
@@ -2052,11 +2052,13 @@ def test_trusted_live_acceleration_candidate_advances_to_its_mass_setup() -> Non
     assert report.accepted_count == report.proposed_count == 1
     assert report.rejected_reasons == []
     [clip] = report.clips
-    assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:16"
-    assert clip["start_quote"] == "Now, let's say if the mass"
-    assert clip["_clip_text"].startswith("Now, let's say if the mass")
-    assert "skating I'm just going to draw" not in clip["_clip_text"]
-    assert "trimmed_clipped_start_to_claim_setup" in (
+    assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:14"
+    assert clip["start_quote"] == "So let's say if you have"
+    assert clip["_clip_text"].startswith(
+        "So let's say if you have two people skating I'm just going to draw"
+    )
+    assert "Now, let's say if the mass" in clip["_clip_text"]
+    assert "expanded_split_model_start_context" in (
         clip["_boundary_fallback_reasons"]
     )
 
@@ -2242,12 +2244,177 @@ def test_trusted_live_acceleration_candidate_completes_both_people() -> None:
     assert report.accepted_count == report.proposed_count == 1
     assert report.rejected_reasons == []
     [clip] = report.clips
-    assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:16"
-    assert clip["start_quote"] == "Now, let's say if the mass"
+    assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:14"
+    assert clip["start_quote"] == "So let's say if you have"
+    assert clip["_clip_text"].startswith(
+        "So let's say if you have two people skating I'm just going to draw"
+    )
     assert clip["end_cue_id"] == "pL2YfC-22Uc:cue:19"
     assert clip["end_quote"] == "since he experiences a smaller acceleration."
     assert "acceleration is going to be one" in clip["_clip_text"]
     assert "Another example" not in clip["_clip_text"]
+
+
+def test_trusted_live_acceleration_definition_drops_completed_prerequisites() -> None:
+    segments = [
+        {
+            "cue_id": "4dCrkp8qgLU:cue:1",
+            "start": 12.3,
+            "end": 45.6,
+            "text": (
+                "In physics, we will often be asking questions like where is an "
+                "object, which way is it moving, and how fast? To discuss the answers "
+                "to these questions we will frequently utilize the concepts of "
+                "position, velocity, and acceleration. So before we go any further "
+                "let's define these terms. Position is simple, it's just where an "
+                "object is in space. Usually this is discussed with some kind of "
+                "reference point or axes in mind, and we might express the position "
+                "of an object as being some distance from"
+            ),
+        },
+        {
+            "cue_id": "4dCrkp8qgLU:cue:2",
+            "start": 45.6,
+            "end": 79.5,
+            "text": (
+                "this reference point in meters. Velocity is the change in position "
+                "over time, so if this object travels five meters in five seconds it "
+                "is traveling at a velocity of one meter per second. And acceleration "
+                "is the change in velocity over time, so if this object starts at a "
+                "standstill and over five seconds gradually speeds up to 5 meters per "
+                "second, then it is accelerating at one meter per second per second, "
+                "or 1 meter per second squared. So that's how we define position, "
+                "velocity, and acceleration."
+            ),
+        },
+    ]
+    plan = gemini_segment._CompactBoundaryPlan.model_validate({
+        "request_intent": {
+            "exact_request": "acceleration definition and units",
+            "constraints": [
+                {
+                    "constraint_id": "c_accel",
+                    "kind": "subject",
+                    "source_phrase": "acceleration",
+                    "requirement": "Define acceleration",
+                },
+                {
+                    "constraint_id": "c_units",
+                    "kind": "outcome",
+                    "source_phrase": "units",
+                    "requirement": "Give acceleration units",
+                },
+            ],
+        },
+        "topics": [{
+            "candidate_id": "acceleration-definition-units",
+            "start_line": 0,
+            "end_line": 1,
+            "start_quote": "In physics, we will often be",
+            "end_quote": "or 1 meter per second squared.",
+            "claim_quote": "acceleration is the change in velocity over time",
+            "title": (
+                "Define acceleration and calculate its value with units in a simple scenario"
+            ),
+            "learning_objective": (
+                "Define acceleration and calculate its value with units in a simple scenario"
+            ),
+            "facet": "acceleration definition and units",
+            "informativeness": 0.9,
+            "topic_relevance": 0.9,
+            "educational_importance": 0.9,
+            "difficulty": 0.3,
+            "directly_teaches_topic": True,
+            "substantive": True,
+            "factually_grounded": True,
+            "self_contained": True,
+            "is_standalone": True,
+            "intent_evidence": [
+                {
+                    "id": "c_accel",
+                    "q": "acceleration is the change in velocity",
+                },
+                {
+                    "id": "c_units",
+                    "q": "or 1 meter per second squared",
+                },
+            ],
+        }],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "4dCrkp8qgLU:cue:2"
+    assert clip["start_quote"] == "And acceleration is the change in"
+    assert clip["_clip_text"].startswith(
+        "And acceleration is the change in velocity over time"
+    )
+    assert "Velocity is the change in position" not in clip["_clip_text"]
+    assert clip["end_quote"] == "or 1 meter per second squared."
+
+
+def test_trusted_definition_keeps_a_single_required_prerequisite() -> None:
+    prerequisite = (
+        "Velocity is displacement over time and includes both speed and direction."
+    )
+    claim = "Acceleration is the change in velocity over time"
+    segments = [
+        {
+            "cue_id": "definition-prerequisite:cue:0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": prerequisite,
+        },
+        {
+            "cue_id": "definition-prerequisite:cue:1",
+            "start": 8.0,
+            "end": 18.0,
+            "text": (
+                f"{claim}, so changing either speed or direction causes acceleration."
+            ),
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="acceleration",
+        start_quote="Velocity is displacement over time",
+        end_quote="changing either speed or direction causes acceleration",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 0,
+            "end_line": 1,
+            "title": "Define acceleration from its velocity prerequisite",
+            "learning_objective": (
+                "Use the velocity prerequisite to define acceleration"
+            ),
+            "facet": "acceleration definition",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "definition-prerequisite:cue:0"
+    assert clip["start_quote"] == "Velocity is displacement over time"
+    assert clip["_clip_text"].startswith(prerequisite)
 
 
 def test_trusted_live_multi_block_candidate_keeps_question_and_answer() -> None:
@@ -5387,7 +5554,12 @@ def test_boundary_selector_never_attaches_video_even_when_requested(
         separators=(",", ":"),
     ).encode("utf-8"))
     text_estimate = math.ceil((len(prompt_text) + schema_bytes) / 3) + 1_000
-    assert reservation["estimated_input_tokens"] == text_estimate
+    expected_input_tokens = (
+        text_estimate
+        if profile == gemini_segment.FLASH_SPLIT_PROFILE
+        else 1_000
+    )
+    assert reservation["estimated_input_tokens"] == expected_input_tokens
 
 
 def test_required_video_grounding_flag_cannot_block_transcript_only_dispatch(
@@ -5827,6 +5999,11 @@ def test_preferred_video_url_failure_never_dispatches_a_media_retry(
         )
 
     monkeypatch.setattr(gemini_client, "generate_json_v3", fail_generate)
+    monkeypatch.setattr(
+        gemini_client,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 1_000,
+    )
 
     result = gemini_segment.run_segment_profile(
         {

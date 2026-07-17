@@ -1693,10 +1693,13 @@ _FLASH_REPAIR_TIMEOUT_S = 20.0
 _FLASH_ENRICH_TIMEOUT_S = 25.0
 _PRO_TIMEOUT_S = 90.0
 _SELECTION_OUTPUT_TOKENS = 24_576
-# Six thousand compact-schema tokens still cover the exhaustive candidate cap
-# while allowing Fast's two and Slow's three 30k-token source analyses to start
-# together within their existing hard job-cost ceilings.
+# Six thousand compact-schema tokens cover the exhaustive candidate payload.
 _BOUNDARY_OUTPUT_TOKENS = 6_000
+# Gemini Pro counts hidden thought tokens against max_output_tokens. Reserve a
+# separate thought allowance so medium reasoning cannot consume the candidate
+# payload budget; two Fast or three Slow 30k-token text-only selectors still fit
+# their existing hard job-cost ceilings.
+_PRO_BOUNDARY_OUTPUT_TOKENS = 12_288
 # Calls cheap enough under a byte-per-token upper bound may use the local
 # estimate. Anything larger gets the provider's free exact count first, so two
 # Fast or three Slow selectors cannot collectively under-reserve past the job
@@ -10082,6 +10085,16 @@ _TRUSTED_SCENARIO_HANDOFF_RE = re.compile(
     r"(?<!\w)(?:(?:and|but|so)\s+)?(?:now\s+)?(?P<setup>what\s+if\b)",
     re.IGNORECASE,
 )
+_TRUSTED_EXPLICIT_DEFINITION_RE = re.compile(
+    r"^\s*(?:(?:and|but|so)\s*[,;:]?\s+)?"
+    r"(?P<subject>[a-z][\w'’-]*(?:\s+[a-z][\w'’-]*){0,2})\s+"
+    r"(?:is|are|means?|refers?\s+to)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_DEFINITION_SCOPE_RE = re.compile(
+    r"\b(?:define|defining|definition)\b",
+    re.IGNORECASE,
+)
 _TRUSTED_SPEAKER_FRAMING_SETUP_RE = re.compile(
     r"^\s*(?:professor|doctor|dr\.?)\s+[^,;:!?]{1,60}"
     r"[,;:—-]\s*(?P<setup>(?:i|we)\s+(?:want|would\s+like)\s+to\s+"
@@ -10722,6 +10735,154 @@ def _trusted_prior_worked_question_start(
             continue
         return prior_line, frame.span("frame")
     return None
+
+
+def _trusted_split_model_start_context(
+    segments: list[dict],
+    *,
+    selected_line: int,
+    selected_span: tuple[int, int] | None,
+) -> tuple[int, tuple[int, int]] | None:
+    """Recover a fresh scenario whose opening sentence is split across cues."""
+    if selected_line <= 0 or selected_span is None:
+        return None
+    selected = str(segments[selected_line].get("text") or "")
+    first_word = _WORD_RE.search(selected)
+    if first_word is None or selected_span[0] != first_word.start():
+        return None
+    prior_line = selected_line - 1
+    try:
+        gap = (
+            float(segments[selected_line].get("start", 0.0))
+            - float(segments[prior_line].get("end", 0.0))
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+        return None
+    prior = str(segments[prior_line].get("text") or "")
+    if _TRUSTED_WORKED_QUESTION_FRAME_RE.search(prior) is not None:
+        return None
+    conditional = next(
+        (
+            handoff
+            for handoff in reversed(list(
+                _TRUSTED_CLAIM_SETUP_HANDOFF_RE.finditer(prior)
+            ))
+            if handoff.group("conditional") is not None
+        ),
+        None,
+    )
+    if (
+        conditional is not None
+        and re.search(r"[.!?]", prior[conditional.start():]) is not None
+    ):
+        return None
+    scenario_quote = (
+        _exact_boundary_quote(prior[conditional.start():], want="start")
+        if conditional is not None
+        else ""
+    )
+    scenario_span = (
+        _quote_character_span(prior, scenario_quote)
+        if scenario_quote
+        else None
+    )
+    selected_suffix = selected[selected_span[0]:]
+    if (
+        scenario_span is None
+        or not _cue_has_weak_end(
+            prior,
+            selected_suffix,
+            ignore_caption_case=True,
+        )
+    ):
+        return None
+    joined = f"{prior[scenario_span[0]:]} {selected_suffix}"
+    sentence_spans = _sentence_character_spans(joined)
+    opening = joined[:sentence_spans[0][1]] if sentence_spans else joined
+    if not _local_example_setup_is_complete(opening):
+        return None
+    return prior_line, scenario_span
+
+
+def _trusted_explicit_definition_start(
+    segments: list[dict],
+    *,
+    selected_line: int,
+    selected_left: int,
+    claim_location: tuple[int, int, int, int],
+    claim_quote: str,
+    scope_text: str,
+) -> tuple[int, tuple[int, int]] | None:
+    """Skip completed sibling definitions when the target definition is explicit."""
+    claim_line, claim_left, claim_end_line, claim_right = claim_location
+    if (
+        claim_line != claim_end_line
+        or claim_line < selected_line
+        or _TRUSTED_DEFINITION_SCOPE_RE.search(scope_text) is None
+    ):
+        return None
+    source = str(segments[claim_line].get("text") or "")
+    sentence_span = next(
+        (
+            span
+            for span in _sentence_character_spans(source)
+            if span[0] <= claim_left < claim_right <= span[1]
+        ),
+        None,
+    )
+    if sentence_span is None:
+        return None
+    first_word = _WORD_RE.search(source, sentence_span[0], sentence_span[1])
+    if first_word is None:
+        return None
+    sentence = source[first_word.start():sentence_span[1]]
+    sentence_definition = _TRUSTED_EXPLICIT_DEFINITION_RE.match(sentence)
+    claim_definition = _TRUSTED_EXPLICIT_DEFINITION_RE.match(claim_quote)
+    if sentence_definition is None or claim_definition is None:
+        return None
+    definition_clause = sentence.split(",", 1)[0]
+    sentence_subject = _content_tokens(sentence_definition.group("subject"))
+    claim_subject = _content_tokens(claim_definition.group("subject"))
+    if (
+        not sentence_subject
+        or sentence_subject != claim_subject
+        or not sentence_subject.issubset(_content_tokens(scope_text))
+        or _opening_has_unresolved_setup_reference(definition_clause)
+    ):
+        return None
+
+    prefix_parts: list[str] = []
+    for line in range(selected_line, claim_line + 1):
+        text = str(segments[line].get("text") or "")
+        left = selected_left if line == selected_line else 0
+        right = first_word.start() if line == claim_line else len(text)
+        if right > left:
+            prefix_parts.append(text[left:right])
+    prefix = " ".join(prefix_parts)
+    if len(_toks(prefix)) < 6 or re.search(r"[.!?]", prefix) is None:
+        return None
+    sibling_subjects: set[frozenset[str]] = set()
+    for left, right in _sentence_character_spans(prefix):
+        prior_word = _WORD_RE.search(prefix, left, right)
+        if prior_word is None:
+            continue
+        prior_definition = _TRUSTED_EXPLICIT_DEFINITION_RE.match(
+            prefix[prior_word.start():right]
+        )
+        if prior_definition is None:
+            continue
+        prior_subject = frozenset(_content_tokens(
+            prior_definition.group("subject")
+        ))
+        if prior_subject and prior_subject != frozenset(claim_subject):
+            sibling_subjects.add(prior_subject)
+    if len(sibling_subjects) < 2:
+        return None
+    quote = _exact_boundary_quote(source[first_word.start():], want="start")
+    span = _quote_character_span(source, quote) if quote else None
+    return (claim_line, span) if span is not None else None
 
 
 def _trusted_same_cue_sentence_start(
@@ -11588,6 +11749,8 @@ def _trusted_compact_plan_to_report(
             )
             claim_setup_start: tuple[int, tuple[int, int]] | None = None
             named_handoff_start: tuple[int, tuple[int, int]] | None = None
+            split_model_start: tuple[int, tuple[int, int]] | None = None
+            explicit_definition_start: tuple[int, tuple[int, int]] | None = None
             current_start_text = str(segments[a].get("text") or "")
             current_start_left = start_span[0] if start_span is not None else 0
             current_start_is_clipped = bool(
@@ -11631,6 +11794,16 @@ def _trusted_compact_plan_to_report(
             )
             if (
                 current_start_is_clipped
+                and start_anchor is not None
+                and start_anchor.first_line == a
+            ):
+                split_model_start = _trusted_split_model_start_context(
+                    segments,
+                    selected_line=a,
+                    selected_span=start_anchor.first_span,
+                )
+            if (
+                current_start_is_clipped
                 or model_start_misses_claim_anchor
                 or model_start_misses_claim_quote
             ):
@@ -11669,6 +11842,26 @@ def _trusted_compact_plan_to_report(
                     and claim_setup_start[0] < section_start
                 ):
                     claim_setup_start = None
+            if (
+                not preserve_complete_local_setup
+                and (
+                    model_start_misses_claim_anchor
+                    or model_start_misses_claim_quote
+                )
+            ):
+                explicit_definition_start = _trusted_explicit_definition_start(
+                    segments,
+                    selected_line=a,
+                    selected_left=current_start_left,
+                    claim_location=claim_location,
+                    claim_quote=model_claim_quote,
+                    scope_text=claim_anchor_text,
+                )
+                if (
+                    explicit_definition_start is not None
+                    and explicit_definition_start[0] < section_start
+                ):
+                    explicit_definition_start = None
             scenario_start: tuple[int, tuple[int, int]] | None = None
             if (
                 start_anchor is not None
@@ -11719,6 +11912,18 @@ def _trusted_compact_plan_to_report(
                     diagnostics.append(
                         "trimmed_clipped_start_to_named_handoff"
                     )
+                elif split_model_start is not None:
+                    a, start_span = split_model_start
+                    effective_start_quote = _literal_source_quote(
+                        str(segments[a].get("text") or ""),
+                        "",
+                        start_span,
+                    )
+                    structural_start_trimmed = True
+                    trusted_structural_onset_applied = True
+                    diagnostics.append(
+                        "expanded_split_model_start_context"
+                    )
                 elif claim_setup_start is not None:
                     a, start_span = claim_setup_start
                     effective_start_quote = _literal_source_quote(
@@ -11730,6 +11935,18 @@ def _trusted_compact_plan_to_report(
                     trusted_structural_onset_applied = True
                     diagnostics.append(
                         "trimmed_clipped_start_to_claim_setup"
+                    )
+                elif explicit_definition_start is not None:
+                    a, start_span = explicit_definition_start
+                    effective_start_quote = _literal_source_quote(
+                        str(segments[a].get("text") or ""),
+                        "",
+                        start_span,
+                    )
+                    structural_start_trimmed = True
+                    trusted_structural_onset_applied = True
+                    diagnostics.append(
+                        "trimmed_completed_definitions_before_claim"
                     )
                 elif scenario_start is not None:
                     a, start_span = scenario_start
@@ -15272,7 +15489,11 @@ def _run_selection_profile(
         # Medium was both faster and more complete than high across the clean
         # cross-domain boundary corpus, while materially reducing billed thought
         # tokens. It remains configurable for explicit evaluation callers.
-        level, cap, timeout = "medium", _BOUNDARY_OUTPUT_TOKENS, _PRO_TIMEOUT_S
+        level, cap, timeout = (
+            "medium",
+            _PRO_BOUNDARY_OUTPUT_TOKENS,
+            _PRO_TIMEOUT_S,
+        )
         operation = "pro_fallback"
     else:
         raise ValueError(f"unknown segmentation profile: {profile}")
