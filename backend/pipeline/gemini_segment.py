@@ -1655,7 +1655,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v1"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v6"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v7"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -2119,14 +2119,19 @@ _POLICY_AND_EXAMPLES = """Policy:
 - A supporting unit must contain substantive explanation or a complete worked example. A bare
   formula, definition, topic name, result, generic background statement, or shared vocabulary
   is not enough. Shared broad-field relevance is not a topical connection.
-- Every supporting unit must stay anchored to the request by either (a) teaching a named
-  subject, object, or relationship from the request, or (b) applying an explicitly named
-  technical method or mechanism within the same subject family. A generic task or format such
-  as explain, calculate, solve for a variable, show steps, give an example, or state units is
-  never an anchor by itself. Sharing only the head word of a more specific phrase is also not
-  enough: "force" does not ground "net force", and "units" does not ground the units of a
+- Every supporting unit must stay anchored to the request by either (a) teaching the same
+  named subject, object, or relationship from the request, or (b) applying an explicitly named
+  technical method or mechanism within the same subject family. Evidence must refer to the
+  same thing and relationship as the request; repeating one variable, symbol, or noun is not
+  enough. When a request is centered on a named law, equation, theory, or system, a component
+  unit qualifies only when it independently teaches that requested component's meaning or
+  explicitly connects it to the governing topic. Using the component only as an operand inside
+  a different law or equation does not teach the requested component. A generic task or format
+  such as explain, calculate, solve for a variable, show steps, give an example, or state units
+  is never an anchor by itself. Sharing only the head word of a more specific phrase is also
+  not enough: "force" does not ground "net force", and "units" does not ground the units of a
   named law. A different governing law, equation, theory, system, or domain is not supporting
-  material merely because it uses the same algebra, units, or vocabulary.
+  material merely because it uses the same algebra, variables, units, or vocabulary.
 - Return a candidate only when informativeness, topic_relevance, and educational_importance
   are each at least 0.75 and the spoken unit satisfies every substantive, grounding,
   context, and filler rule.
@@ -2143,6 +2148,12 @@ _POLICY_AND_EXAMPLES = """Policy:
   topic_evidence_quote must be the
   shortest useful 5-16 consecutive words wholly between those chosen edges, copied with the
   same exactness.
+- The semantic opening may not rely on an unresolved referent. An opening such as "this law",
+  "this equation", "that change", "the second law", "it", "they", or "these" is invalid when
+  the specific referent is not established inside the selected sq-through-eq span. The user
+  request, page title, video title, and any previous clip are not spoken setup. Expand sq
+  backward to the shortest complete spoken setup that names the referent; omit the unit only
+  when no clean self-contained span can establish it.
 - A worked example cannot end at its question, setup, or first substituted value. Either
   include its reasoning and answer through end_quote or end the candidate before that
   optional example begins.
@@ -2370,9 +2381,14 @@ def _compact_output_guide() -> str:
   id and each q proves fulfillment of that constraint. For a SUPPORTING unit, ie contains at
   least one id and each q grounds the unit's substantive educational connection to that
   constraint; it need not claim full fulfillment. At least one supporting ie item must ground
-  a named subject, object, or relationship, or an explicitly named technical method used in the
-  same subject family. Generic task, format, or outcome evidence alone is insufficient. Never
-  use supporting ie to falsely claim a mismatched object or outcome. Do not output a role; the
+  the same named subject, object, or relationship, or an explicitly named technical method used
+  in the same subject family. Every q must ground the SAME referent and relationship named by
+  its id, not merely contain one of its words, symbols, variables, dimensions, or units. Apply
+  a same-referent test before adding every item: read the constraint's source_phrase and q
+  literally; if q teaches a different law, equation, relationship, object, or use of a shared
+  variable, it cannot ground that constraint. Generic
+  task, format, or outcome evidence alone is insufficient. Never use supporting ie to falsely
+  claim a mismatched object or outcome. Do not output a role; the
   backend mechanically derives primary
   only from direct=true plus full grounded coverage, otherwise supporting, and never rejects a
   unit based on that role.
@@ -2391,6 +2407,14 @@ rearranges Coulomb's equation. Those overlaps do not teach Newton's second law, 
 quantities, or a technical method unique to that request. Such a unit qualifies only when one
 complete span explicitly connects the electric force back to F=ma, for example by using that
 force to calculate mass or acceleration. Generic algebraic isolation is not that connection.
+Also omit an impulse-momentum theorem unit F delta t = delta p and a linear-momentum unit p=mv
+that merely mention force, mass, or SI units. They teach different governing relationships and
+cannot evidence the Newton's-law, mass-in-F=ma, or F=ma-units constraints. They qualify only
+when the complete spoken span explicitly derives or connects them to Newton's second law or
+F=ma. WRONG ie: a Newton's-law id paired with "impulse, f delta t, is equal to the change in
+momentum". WRONG ie: an F=ma mass id paired with "linear momentum is defined as mass times
+velocity". By contrast, a complete standalone definition of acceleration as the rate of change
+of velocity can be foundational support because it teaches the requested quantity itself.
 
 Worked format example — understand the boundary logic, but never copy its content or scores:
 All examples below assume no learner-level restriction. They demonstrate only schema and
@@ -2411,6 +2435,13 @@ Context example:
 [32] 04:06 Divide that change by elapsed time to obtain acceleration.
 Do not start at line 32 with "Divide that change" because "that change" depends on omitted
 setup. Include line 31 and begin sq at "To calculate acceleration" so self and stand are true.
+
+Named-referent context example:
+[50] 08:00 Newton's second law describes how net force changes an object's motion.
+[51] 08:06 This law tells us force equals mass times acceleration.
+Do not start at line 51 with "This law tells us". The original request and video title are not
+spoken context. Include line 50 and begin sq at "Newton's second law" so the referent is audible
+inside the clip.
 
 Named worked-example boundary example:
 [40] 06:00 This is simply equal to five. So that's the derivative of five x minus four. It's five. Now let's try another example. So let's say if f of x is equal to x squared, what is the first derivative?
@@ -2606,7 +2637,12 @@ def _boundary_prompts(
         "consequence of an analogy whose actors and mapping were omitted. Never end inside "
         "a list, next-topic phrase, recap, contextual bridge, or outro. Use a one-word quote "
         "when that is the exact clean edge; never pad an edge quote with nearby speech. "
-        "Keep opening and ending edges clean, including generic lead-ins and bracketed "
+        "An opening demonstrative or pronoun such as 'this law', 'this equation', 'that "
+        "change', 'the second law', 'it', 'they', or 'these' must have its specific referent "
+        "named inside sq-through-eq; the request, page title, video title, title, obj, facet, "
+        "cq, ie, and a previous clip are metadata and do not supply that spoken context. "
+        "Expand backward to the shortest complete setup "
+        "that names it. Keep opening and ending edges clean, including generic lead-ins and bracketed "
         "non-speech markers. Split around an internal interruption when separate complete "
         "units remain and return only contiguous complete sides. If no clean side is "
         "independently complete, omit the candidate; internal filler may never remain. "

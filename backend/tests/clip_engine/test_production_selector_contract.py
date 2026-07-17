@@ -1643,7 +1643,7 @@ def test_specific_request_prompt_returns_primary_and_complete_supporting_units()
     assert "whole-span completeness check" in normalized.casefold()
 
 
-def test_newtons_second_law_prompt_excludes_unanchored_coulomb_support() -> None:
+def test_newtons_second_law_prompt_requires_subject_anchoring_and_context() -> None:
     exact_request = (
         "Explain Newton's second law F=ma from intuition to worked examples, "
         "including net force, mass, acceleration, units, and solving for each variable"
@@ -1653,8 +1653,11 @@ def test_newtons_second_law_prompt_excludes_unanchored_coulomb_support() -> None
             "[0] 00:00 Newton's second law says net force equals mass times acceleration.",
             "[1] 00:10 Coulomb's law computes electric force in newtons.",
             "[2] 00:20 Rearrange Coulomb's equation to solve for either charge.",
+            "[3] 00:30 The impulse-momentum theorem says F delta t equals delta p.",
+            "[4] 00:40 Linear momentum is mass times velocity in SI units.",
+            "[5] 00:50 This law tells us force equals mass times acceleration.",
         ]),
-        3,
+        6,
         exact_request,
     )
     normalized = " ".join(f"{system}\n{user}".split()).casefold()
@@ -1662,7 +1665,7 @@ def test_newtons_second_law_prompt_excludes_unanchored_coulomb_support() -> None
     assert exact_request.casefold() in normalized
     assert (
         "every supporting unit must stay anchored to the request by either (a) "
-        "teaching a named subject, object, or relationship from the request, or "
+        "teaching the same named subject, object, or relationship from the request, or "
         "(b) applying an explicitly named technical method or mechanism within "
         "the same subject family"
     ) in normalized
@@ -1683,6 +1686,49 @@ def test_newtons_second_law_prompt_excludes_unanchored_coulomb_support() -> None
         "electric force back to f=ma"
     ) in normalized
     assert "generic algebraic isolation is not that connection" in normalized
+    assert "evidence must refer to the same thing and relationship as the request" in normalized
+    assert (
+        "using the component only as an operand inside a different law or equation "
+        "does not teach the requested component"
+    ) in normalized
+    assert "apply a same-referent test before adding every item" in normalized
+    assert (
+        "every q must ground the same referent and relationship named by its id, "
+        "not merely contain one of its words, symbols, variables, dimensions, or units"
+    ) in normalized
+    assert (
+        "also omit an impulse-momentum theorem unit f delta t = delta p and a "
+        "linear-momentum unit p=mv"
+    ) in normalized
+    assert (
+        "they teach different governing relationships and cannot evidence the "
+        "newton's-law, mass-in-f=ma, or f=ma-units constraints"
+    ) in normalized
+    assert (
+        'wrong ie: a newton\'s-law id paired with "impulse, f delta t, is equal to '
+        'the change in momentum"'
+    ) in normalized
+    assert (
+        'wrong ie: an f=ma mass id paired with "linear momentum is defined as mass '
+        'times velocity"'
+    ) in normalized
+    assert (
+        "a complete standalone definition of acceleration as the rate of change of "
+        "velocity can be foundational support"
+    ) in normalized
+    assert "the semantic opening may not rely on an unresolved referent" in normalized
+    assert (
+        'do not start at line 51 with "this law tells us"'
+    ) in normalized
+    assert (
+        "the original request and video title are not spoken context"
+    ) in normalized
+    assert (
+        "title, obj, facet, cq, ie, and a previous clip are metadata and do not supply "
+        "that spoken context"
+    ) in normalized
+    assert "begin sq at \"newton's second law\"" in normalized
+    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v7"
 
 
 def test_boundary_prompt_stays_transcript_only_when_video_is_requested() -> None:
