@@ -911,7 +911,7 @@ def test_generation_job_reels_reuses_unseen_source_inventory_without_redelivery(
         conn.close()
 
 
-def test_fast_final_keeps_mixed_difficulty_inventory_up_to_ceiling() -> None:
+def test_fast_final_surfaces_only_matching_difficulty_inventory() -> None:
     conn = _conn()
     generation_id = main._create_generation_row(
         conn,
@@ -965,9 +965,11 @@ def test_fast_final_keeps_mixed_difficulty_inventory_up_to_ceiling() -> None:
         )
 
         assert [reel["reel_id"] for reel in reels] == [
-            f"mixed-reel-{index}" for index in range(8)
+            "mixed-reel-0",
+            "mixed-reel-1",
         ]
         assert main._count_generation_reels(conn, generation_id) == 13
+        assert main._count_generation_surfaceable_reels(conn, generation_id) == 2
         assert main._count_material_ready_reels(conn, "m1") == 13
     finally:
         conn.close()
@@ -1075,7 +1077,7 @@ def test_reusable_generation_requires_every_quality_score_at_threshold(
         conn.close()
 
 
-def test_gemini_authority_reuse_bypasses_semantics_but_keeps_boundary_safety() -> None:
+def test_gemini_authority_reuse_bypasses_semantic_and_boundary_gates() -> None:
     conn = _conn()
     generation_id = "gemini-authority-generation"
     created_at = "2026-07-10T00:00:00+00:00"
@@ -1125,6 +1127,7 @@ def test_gemini_authority_reuse_bypasses_semantics_but_keeps_boundary_safety() -
             material_id="m1",
         ) is True
         assert main._count_generation_reels(conn, generation_id) == 1
+        assert main._count_generation_surfaceable_reels(conn, generation_id) == 1
         assert main._count_material_ready_reels(conn, "m1") == 1
         assert main._usable_boundary_reel_ids(
             conn, ["gemini-authority-reel"]
@@ -1142,8 +1145,41 @@ def test_gemini_authority_reuse_bypasses_semantics_but_keeps_boundary_safety() -
             conn,
             generation_id=generation_id,
             material_id="m1",
+        ) is True
+        assert main._count_generation_reels(conn, generation_id) == 1
+        assert main._count_generation_surfaceable_reels(conn, generation_id) == 1
+        assert main._count_material_ready_reels(conn, "m1") == 1
+        assert main._usable_boundary_reel_ids(
+            conn, ["gemini-authority-reel"]
+        ) == {"gemini-authority-reel"}
+
+        conn.execute(
+            "UPDATE reels SET t_start = -10, t_end = -1 "
+            "WHERE id = 'gemini-authority-reel'"
+        )
+        assert main._verified_reusable_generation_chain(
+            conn,
+            generation_id=generation_id,
+            material_id="m1",
         ) is False
         assert main._count_generation_reels(conn, generation_id) == 0
+        assert main._count_generation_surfaceable_reels(conn, generation_id) == 0
+        assert main._count_material_ready_reels(conn, "m1") == 0
+        assert main._usable_boundary_reel_ids(
+            conn, ["gemini-authority-reel"]
+        ) == set()
+
+        conn.execute(
+            "UPDATE reels SET t_start = 10, t_end = 10 "
+            "WHERE id = 'gemini-authority-reel'"
+        )
+        assert main._verified_reusable_generation_chain(
+            conn,
+            generation_id=generation_id,
+            material_id="m1",
+        ) is False
+        assert main._count_generation_reels(conn, generation_id) == 0
+        assert main._count_generation_surfaceable_reels(conn, generation_id) == 0
         assert main._count_material_ready_reels(conn, "m1") == 0
         assert main._usable_boundary_reel_ids(
             conn, ["gemini-authority-reel"]
@@ -1178,6 +1214,7 @@ def test_transcript_aligned_inventory_counts_reuses_and_replays_only_current_sur
             boundary_status="context_aligned",
         )
         assert main._count_generation_reels(conn, generation_id) == 1
+        assert main._count_generation_surfaceable_reels(conn, generation_id) == 1
         assert main._verified_reusable_generation_chain(
             conn,
             generation_id=generation_id,
@@ -1197,6 +1234,7 @@ def test_transcript_aligned_inventory_counts_reuses_and_replays_only_current_sur
             (json.dumps(context), "transcript-boundary-reel"),
         )
         assert main._count_generation_reels(conn, generation_id) == 0
+        assert main._count_generation_surfaceable_reels(conn, generation_id) == 0
         assert main._usable_boundary_reel_ids(
             conn, ["transcript-boundary-reel"]
         ) == set()
@@ -1207,6 +1245,7 @@ def test_transcript_aligned_inventory_counts_reuses_and_replays_only_current_sur
             (json.dumps(context), "transcript-boundary-reel"),
         )
         assert main._count_generation_reels(conn, generation_id) == 1
+        assert main._count_generation_surfaceable_reels(conn, generation_id) == 0
         assert main._usable_boundary_reel_ids(
             conn, ["transcript-boundary-reel"]
         ) == {"transcript-boundary-reel"}
@@ -1217,6 +1256,7 @@ def test_transcript_aligned_inventory_counts_reuses_and_replays_only_current_sur
             (json.dumps(context), "transcript-boundary-reel"),
         )
         assert main._count_generation_reels(conn, generation_id) == 0
+        assert main._count_generation_surfaceable_reels(conn, generation_id) == 0
         assert main._usable_boundary_reel_ids(
             conn, ["transcript-boundary-reel"]
         ) == set()
@@ -1703,7 +1743,7 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
         conn.close()
 
 
-def test_deferred_only_generation_surfaces_as_reusable_inventory(
+def test_deferred_only_generation_persists_reusable_inventory_without_current_surface(
     monkeypatch,
 ) -> None:
     conn = _conn()
@@ -1768,10 +1808,17 @@ def test_deferred_only_generation_surfaces_as_reusable_inventory(
         terminal_job = generation_jobs.get_job(conn, job["id"])
         assert terminal_job is not None
         generation_id = str(terminal_job["result_generation_id"] or "")
-        assert terminal_job["status"] == "completed"
+        assert terminal_job["status"] == "partial"
         assert generation_id
         assert terminal_job["terminal_error_code"] is None
         assert main._count_generation_reels(conn, generation_id) == 1
+        assert main._count_generation_surfaceable_reels(conn, generation_id) == 0
+        stored_context = json.loads(str(conn.execute(
+            "SELECT search_context_json FROM reels WHERE id = 'deferred-only-reel'"
+        ).fetchone()["search_context_json"]))
+        assert stored_context["surface_eligible"] is False
+        assert stored_context["surface_reason"] == "level_mismatch"
+        assert stored_context["deferred_level"] is True
 
         generation = conn.execute(
             "SELECT status, reel_count, error_text FROM reel_generations WHERE id = ?",
@@ -1789,10 +1836,10 @@ def test_deferred_only_generation_surfaces_as_reusable_inventory(
         terminal_event = next(event for event in events if event["type"] == "terminal")
         assert [
             reel["reel_id"] for reel in final_event["payload"]["reels"]
-        ] == ["deferred-only-reel"]
+        ] == []
         assert final_event["payload"]["generation_id"] == generation_id
         assert final_event["payload"]["authoritative"] is True
-        assert terminal_event["payload"]["status"] == "completed"
+        assert terminal_event["payload"]["status"] == "partial"
         assert terminal_event["payload"]["result_generation_id"] == generation_id
 
         assert main._verified_cross_request_source_generation(
@@ -1808,7 +1855,7 @@ def test_deferred_only_generation_surfaces_as_reusable_inventory(
         conn.close()
 
 
-def test_generation_worker_finalizes_a_rankable_nearest_level_fallback(
+def test_generation_worker_persists_a_nearest_level_clip_for_later_reuse(
     monkeypatch,
 ) -> None:
     conn = _conn()
@@ -1900,6 +1947,7 @@ def test_generation_worker_finalizes_a_rankable_nearest_level_fallback(
         generation_id = str(terminal_job["result_generation_id"] or "")
         assert generation_id
         assert main._count_generation_reels(conn, generation_id) == 1
+        assert main._count_generation_surfaceable_reels(conn, generation_id) == 0
         assert main._verified_reusable_generation_chain(
             conn,
             generation_id=generation_id,
@@ -1910,7 +1958,7 @@ def test_generation_worker_finalizes_a_rankable_nearest_level_fallback(
         final_event = next(event for event in events if event["type"] == "final")
         assert [
             reel["reel_id"] for reel in final_event["payload"]["reels"]
-        ] == ["usable-intermediate-fallback"]
+        ] == []
         assert final_event["payload"]["generation_id"] == generation_id
         terminal_event = next(
             event for event in events if event["type"] == "terminal"
@@ -2257,7 +2305,7 @@ def test_continuation_returns_any_unseen_cache_before_a_fresh_source_budget(
     )
     monkeypatch.setattr(
         main,
-        "_count_generation_reels",
+        "_count_generation_surfaceable_reels",
         lambda _conn, generation_id: (
             0 if generation_id == source_generation_id else generated_count
         ),
@@ -2443,7 +2491,11 @@ def test_continuations_carry_consumed_sources_and_stop_after_cursor_exhaustion(
         "_current_level_reusable_generation_reel_count",
         lambda *_args, **_kwargs: 0,
     )
-    monkeypatch.setattr(main, "_count_generation_reels", lambda *_args: 0)
+    monkeypatch.setattr(
+        main,
+        "_count_generation_surfaceable_reels",
+        lambda *_args: 0,
+    )
     monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
     monkeypatch.setattr(main, "_generation_job_reels", lambda *_args, **_kwargs: [])
     try:
@@ -2576,7 +2628,7 @@ def test_fast_source_actual_completion_count_controls_slow_top_up(
     )
     monkeypatch.setattr(
         main,
-        "_count_generation_reels",
+        "_count_generation_surfaceable_reels",
         lambda _conn, generation_id: (
             0 if generation_id == source_generation_id else generated_count
         ),
@@ -2792,7 +2844,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
     monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
     monkeypatch.setattr(
         main,
-        "_count_generation_reels",
+        "_count_generation_surfaceable_reels",
         lambda *_args, **_kwargs: generated_count,
     )
     monkeypatch.setattr(

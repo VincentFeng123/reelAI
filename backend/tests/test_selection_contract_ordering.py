@@ -546,7 +546,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ["v6-quality"],
         )
 
-    def test_gemini_authority_bypasses_semantic_gates_but_keeps_boundary_safety(
+    def test_gemini_authority_bypasses_semantic_and_boundary_gates(
         self,
     ) -> None:
         self._insert_versioned_reel(
@@ -655,7 +655,59 @@ class SelectionContractOrderingTests(unittest.TestCase):
                 require_verified_boundaries=True,
             )
 
-        self.assertEqual(unsafe, [])
+        self.assertEqual(
+            [item["reel_id"] for item in unsafe],
+            ["gemini-authoritative"],
+        )
+
+    def test_gemini_authority_keeps_context_aligned_clip_with_padded_start(self) -> None:
+        self._insert_versioned_reel(
+            reel_id="gemini-padded-start",
+            video_id="video-a",
+            start=10,
+            difficulty=0.15,
+            base_score=0.8,
+        )
+        row = self.conn.execute(
+            "SELECT search_context_json FROM reels WHERE id = 'gemini-padded-start'"
+        ).fetchone()
+        context = json.loads(row[0])
+        context.update({
+            "selection_contract_version": "quality_silence_v38",
+            "selection_authority": "gemini",
+            "surface_eligible": True,
+            "boundary_status": "context_aligned",
+            "speech_corridor_verified": True,
+            "selection_caption_cues": [{
+                "cue_id": "first-coarse-cue",
+                "start": 10.64,
+                "end": 30.0,
+                "text": "Newton's second law relates force and acceleration.",
+            }],
+            "boundary_diagnostics": {
+                "method": "transcript_context",
+                "context_aligned": True,
+                "acoustic_verified": False,
+                "transcript": {
+                    "context_aligned": True,
+                    "stage": "analyze",
+                    "reason": "start_silence_not_found",
+                    "required_speech_range": [10.0, 29.0],
+                    "semantic_range": [3.4, 30.0],
+                    "final_range": [10.0, 30.0],
+                },
+            },
+        })
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? "
+            "WHERE id = 'gemini-padded-start'",
+            (json.dumps(context),),
+        )
+
+        self.assertEqual(
+            [item["reel_id"] for item in self._ranked(require_verified_boundaries=True)],
+            ["gemini-padded-start"],
+        )
 
     def test_ranked_feed_order_is_difficulty_first_and_stable(self) -> None:
         self._insert_versioned_reel(
@@ -721,7 +773,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ["hard-v3", "easy-v3"],
         )
 
-    def test_v13_reservoir_orders_every_valid_level_by_nearest_first(self) -> None:
+    def test_v13_reservoir_keeps_deferred_levels_out_of_the_current_feed(self) -> None:
         def insert_current(
             reel_id: str,
             video_id: str,
@@ -772,14 +824,14 @@ class SelectionContractOrderingTests(unittest.TestCase):
 
         self.assertEqual(
             [item["reel_id"] for item in self._ranked(require_verified_boundaries=True)],
-            ["intermediate", "advanced"],
+            [],
         )
 
         insert_current("beginner", "video-c", 0.15, surface_eligible=True)
         self.conn.execute("DELETE FROM ranked_feed_cache")
         self.assertEqual(
             [item["reel_id"] for item in self._ranked(require_verified_boundaries=True)],
-            ["beginner", "intermediate", "advanced"],
+            ["beginner"],
         )
 
         self.service.set_learner_level(
@@ -787,7 +839,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         )
         self.assertEqual(
             [item["reel_id"] for item in self._ranked(require_verified_boundaries=True)],
-            ["advanced", "intermediate", "beginner"],
+            ["advanced", "beginner"],
         )
 
     def test_nearest_level_order_is_stable_and_never_drops_valid_inventory(self) -> None:
@@ -1183,7 +1235,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             )
         self.assertEqual(missing_snapshot[0]["captions"], [])
 
-    def test_v4_deferred_boundary_clips_all_release_in_nearest_level_order(self) -> None:
+    def test_v4_deferred_boundary_clips_release_only_at_their_matching_level(self) -> None:
         cases = (
             ("bin-33", "video-a", 10, 0.33),
             ("bin-34", "video-b", 20, 0.34),
@@ -1224,9 +1276,9 @@ class SelectionContractOrderingTests(unittest.TestCase):
             )
 
         expected_by_level = {
-            "beginner": ["bin-33", "bin-34", "bin-66", "bin-67"],
-            "intermediate": ["bin-34", "bin-66", "bin-33", "bin-67"],
-            "advanced": ["bin-67", "bin-34", "bin-66", "bin-33"],
+            "beginner": ["bin-33"],
+            "intermediate": ["bin-34", "bin-66"],
+            "advanced": ["bin-67"],
         }
         for level, expected in expected_by_level.items():
             self.service.set_learner_level(
@@ -1377,7 +1429,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             {"strict-verified", "transcript-aligned"},
         )
 
-    def test_level_mismatched_verified_clip_surfaces_without_level_rejection(self) -> None:
+    def test_gemini_level_mismatched_clip_is_reused_when_the_level_matches(self) -> None:
         self._insert_versioned_reel(
             reel_id="advanced-reservoir",
             video_id="video-a",
@@ -1391,6 +1443,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         context = json.loads(row[0])
         context.update({
             "selection_contract_version": "quality_silence_v38",
+            "selection_authority": "gemini",
             "self_contained": True,
             "topic_evidence_quote": (
                 "Chemical bonding explains how atoms share or transfer electrons"
@@ -1420,7 +1473,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
                 item["reel_id"]
                 for item in self._ranked(require_verified_boundaries=True)
             ],
-            ["advanced-reservoir"],
+            [],
         )
 
         self.service.set_learner_level(

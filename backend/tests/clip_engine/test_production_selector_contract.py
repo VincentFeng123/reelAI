@@ -1812,6 +1812,67 @@ def test_trusted_live_net_force_complement_recovers_split_copula() -> None:
     )
 
 
+def test_trusted_live_net_force_candidate_skips_prior_proportionality_conclusion() -> None:
+    """A stale model start must not pull the preceding acceleration conclusion in."""
+    raw_cues = [
+        (36, 102.99, 104.88, "that the acceleration an object"),
+        (37, 104.88, 107.189, "experiences will be directly"),
+        (38, 107.189, 110.25, "proportional to the force applied and"),
+        (39, 110.25, 114.149, "inversely proportional to its mass. It is"),
+        (40, 114.149, 116.67, "important to note that the net force is"),
+        (41, 116.67, 119.28, "the sum of all the forces acting on an"),
+        (42, 119.28, 122.28, "object. If multiple forces are acting on"),
+        (43, 122.28, 124.68, "an object, which is often the case, we"),
+        (44, 124.68, 126.63, "will need to represent them all in a"),
+        (45, 126.63, 129.569, "free body diagram and then add up all"),
+        (46, 129.569, 132.81, "the vectors to find the net force, which"),
+        (47, 132.81, 133.49, "will tell us"),
+        (48, 133.49, 135.71, "the direction of the acceleration that"),
+        (49, 135.71, 138.23, "will occur in response to the net force."),
+    ]
+    segments = [
+        {
+            "cue_id": f"xzA6IBWUEDE:cue:{cue}",
+            "start": start,
+            "end": end,
+            "text": text,
+        }
+        for cue, start, end, text in raw_cues
+    ]
+    claim = "the net force is the sum of all the forces"
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote="experiences will be directly proportional",
+        end_quote="in response to the net force.",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "net-force-and-vector-addition-stale-start",
+            "start_line": 1,
+            "end_line": 13,
+            "title": "Calculating Net Force",
+            "learning_objective": "Explain how to find net force using vector addition",
+            "facet": "net force definition",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "xzA6IBWUEDE:cue:39"
+    assert clip["start_quote"] == "It is"
+    assert clip["_clip_text"].startswith("It is important to note")
+    assert "inversely proportional to its mass" not in clip["_clip_text"]
+
+
 def test_trusted_live_weight_candidate_advances_to_its_complete_setup() -> None:
     raw_cues = [
         (

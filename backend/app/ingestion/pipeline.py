@@ -655,6 +655,48 @@ def _best_effort_gemini_transcript_clip(
     return clip
 
 
+def _apply_gemini_playable_boundary_fallback(
+    transcript: dict[str, Any],
+    clip: dict[str, Any],
+    *,
+    source_end_sec: float,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Retain a Gemini selection at its best playable transcript interval."""
+
+    if not _gemini_selection_is_authoritative(clip):
+        return None
+    repaired = _best_effort_gemini_transcript_clip(transcript, clip)
+    clip.clear()
+    clip.update(repaired)
+    try:
+        source_end = float(source_end_sec)
+        start = float(clip.get("start"))
+        end = float(clip.get("end"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        not math.isfinite(source_end)
+        or source_end <= 0.0
+        or not math.isfinite(start)
+        or not math.isfinite(end)
+    ):
+        return None
+    start = max(0.0, min(start, source_end))
+    end = max(0.0, min(end, source_end))
+    if end <= start:
+        return None
+    clip["start"] = round(start, 3)
+    clip["end"] = round(end, 3)
+    return {
+        "method": "gemini_playable_fallback",
+        "acoustic_verified": False,
+        "reason": str(reason or "boundary_refinement_unavailable"),
+        "final_range": [clip["start"], clip["end"]],
+        "source_end_sec": round(source_end, 3),
+    }
+
+
 def _required_speech_bounds(
     raw_clip: dict[str, Any],
     caption_diagnostics: dict[str, Any],
@@ -3502,8 +3544,27 @@ def _verified_direct_adapter_clips(
         candidates, verification_results, strict=True
     ):
         raise_if_cancelled(should_cancel)
+        clip = dict(raw_clip)
+        gemini_authoritative = _gemini_selection_is_authoritative(clip)
+        best_effort_boundary: dict[str, Any] | None = None
         if caption is None:
-            continue
+            best_effort_boundary = _apply_gemini_playable_boundary_fallback(
+                transcript,
+                clip,
+                source_end_sec=media_end,
+                reason="caption_boundary_unavailable",
+            )
+            if best_effort_boundary is None:
+                continue
+            caption = best_effort_boundary
+            speech_bounds = (float(clip["start"]), float(clip["end"]))
+            projection = {}
+            acoustic = clip_engine_silence.SilenceVerificationResult(
+                "context_aligned",
+                speech_bounds[0],
+                speech_bounds[1],
+                {**best_effort_boundary, "context_aligned": True},
+            )
         if acoustic is None or not (
             bool(getattr(acoustic, "verified", False))
             or str(getattr(acoustic, "status", "")) == "context_aligned"
@@ -3597,9 +3658,25 @@ def _verified_direct_adapter_clips(
                 acoustic,
                 source_end_sec=media_end,
             )
+        if not boundary_range_is_safe and gemini_authoritative:
+            best_effort_boundary = _apply_gemini_playable_boundary_fallback(
+                transcript,
+                clip,
+                source_end_sec=media_end,
+                reason="refined_boundary_unplayable",
+            )
+            if best_effort_boundary is not None:
+                acoustic = clip_engine_silence.SilenceVerificationResult(
+                    "context_aligned",
+                    float(clip["start"]),
+                    float(clip["end"]),
+                    {**best_effort_boundary, "context_aligned": True},
+                )
+                strict_acoustic = False
+                context_aligned = True
+                boundary_range_is_safe = True
         if not boundary_range_is_safe:
             continue
-        clip = dict(raw_clip)
         clip.pop("_quality_scores", None)
         clip.pop("_grounded_topic_evidence_quote", None)
         clip["start"] = round(float(acoustic.start_sec), 3)
@@ -3623,7 +3700,6 @@ def _verified_direct_adapter_clips(
         quality_mean = (
             informativeness + topic_relevance + educational_importance
         ) / 3.0
-        gemini_authoritative = _gemini_selection_is_authoritative(clip)
         search_context = dict(clip.get("search_context") or {})
         if gemini_authoritative:
             search_context.pop("surface_reason", None)
@@ -3665,7 +3741,7 @@ def _verified_direct_adapter_clips(
                 if gemini_authoritative
                 else True
             ),
-            speech_corridor_verified=True,
+            speech_corridor_verified=best_effort_boundary is None,
             transcript_artifact_key=str(
                 transcript.get("artifact_key") or ""
             ).strip(),
@@ -3694,20 +3770,35 @@ def _verified_direct_adapter_clips(
             source_rank=0,
             surface_eligible=True,
             deferred_level=False,
-            boundary_status=("verified" if strict_acoustic else "context_aligned"),
-            boundary_diagnostics={
-                "method": "energy_silence" if strict_acoustic else "transcript_context",
-                "acoustic_verified": strict_acoustic,
-                "final_range": [clip["start"], clip["end"]],
-                **({"context_aligned": True} if context_aligned else {}),
-                "caption": caption,
-                **(
-                    {"acoustic": dict(acoustic.diagnostics or {})}
-                    if strict_acoustic
-                    else {"transcript": dict(acoustic.diagnostics or {})}
-                ),
-                **({"lexical_projection": projection} if projection else {}),
-            },
+            boundary_status=(
+                "best_effort"
+                if best_effort_boundary is not None
+                else "verified"
+                if strict_acoustic
+                else "context_aligned"
+            ),
+            boundary_diagnostics=(
+                {
+                    **best_effort_boundary,
+                    "caption": caption,
+                }
+                if best_effort_boundary is not None
+                else {
+                    "method": (
+                        "energy_silence" if strict_acoustic else "transcript_context"
+                    ),
+                    "acoustic_verified": strict_acoustic,
+                    "final_range": [clip["start"], clip["end"]],
+                    **({"context_aligned": True} if context_aligned else {}),
+                    "caption": caption,
+                    **(
+                        {"acoustic": dict(acoustic.diagnostics or {})}
+                        if strict_acoustic
+                        else {"transcript": dict(acoustic.diagnostics or {})}
+                    ),
+                    **({"lexical_projection": projection} if projection else {}),
+                }
+            ),
         )
         clip["search_context"] = search_context
         verified.append(clip)
@@ -4960,7 +5051,6 @@ class IngestionPipeline:
             nonlocal stored_count
             v, kept, engine_out = result
             persisted_by_index: dict[int, ReelOutWithAttribution] = {}
-            level_deferred_by_index: dict[int, ReelOutWithAttribution] = {}
             callback_indices: set[int] = set()
             if persistence_cap is not None and stored_count >= persistence_cap:
                 return []
@@ -5432,15 +5522,46 @@ class IngestionPipeline:
                 surface_eligible = semantic_eligible and prerequisites_ready
                 boundary_verified_for_storage = False
                 permanently_rejected = False
+
+                def retain_gemini_boundary_fallback(reason: str) -> bool:
+                    fallback = _apply_gemini_playable_boundary_fallback(
+                        engine_out["transcript"],
+                        clip,
+                        source_end_sec=media_end,
+                        reason=reason,
+                    )
+                    if fallback is None:
+                        return False
+                    core_cue_ids = list(clip.get("cue_ids") or [])
+                    search_context.update(
+                        boundary_status="best_effort",
+                        boundary_diagnostics=fallback,
+                        speech_corridor_verified=False,
+                        selection_core_cue_ids=core_cue_ids,
+                        selection_caption_cues=_selected_caption_cues(
+                            engine_out["transcript"],
+                            clip,
+                            boundary_bounds=(clip["start"], clip["end"]),
+                        ),
+                    )
+                    return True
+
                 if not prerequisites_ready:
                     search_context["surface_reason"] = "prerequisite_not_surfaceable"
 
                 if generation_context is not None and caption_diagnostics is None:
-                    surface_eligible = False
-                    permanently_rejected = True
-                    search_context["boundary_status"] = "unavailable"
-                    search_context["surface_reason"] = "supadata_boundary_unavailable"
-                    record_boundary_unavailable("supadata_boundary_unavailable")
+                    if not retain_gemini_boundary_fallback(
+                        "supadata_boundary_unavailable"
+                    ):
+                        surface_eligible = False
+                        permanently_rejected = True
+                        search_context["boundary_status"] = "unavailable"
+                        search_context["surface_reason"] = (
+                            "supadata_boundary_unavailable"
+                        )
+                        record_boundary_unavailable(
+                            "supadata_boundary_unavailable"
+                        )
                 elif semantic_eligible and generation_context is not None:
                     if acoustic is not None:
                         assert acoustic is not None
@@ -5540,19 +5661,21 @@ class IngestionPipeline:
                             )
                         search_context["boundary_diagnostics"] = boundary_diagnostics
                         if not boundary_range_is_safe:
-                            surface_eligible = False
-                            permanently_rejected = True
-                            search_context["boundary_status"] = "unavailable"
-                            search_context["surface_reason"] = str(
+                            fallback_reason = str(
                                 acoustic_diagnostics.get("reason")
                                 or "acoustic_boundary_outside_source_or_required_speech"
                             )
-                            failure_stage = str(
-                                acoustic_diagnostics.get("stage") or "verify"
-                            ).strip()
-                            record_boundary_unavailable(
-                                f"{failure_stage}:{search_context['surface_reason']}"
-                            )
+                            if not retain_gemini_boundary_fallback(fallback_reason):
+                                surface_eligible = False
+                                permanently_rejected = True
+                                search_context["boundary_status"] = "unavailable"
+                                search_context["surface_reason"] = fallback_reason
+                                failure_stage = str(
+                                    acoustic_diagnostics.get("stage") or "verify"
+                                ).strip()
+                                record_boundary_unavailable(
+                                    f"{failure_stage}:{fallback_reason}"
+                                )
                         else:
                             boundary_verified_for_storage = acoustic_range_is_safe
                             clip["start"] = round(float(acoustic.start_sec), 3)
@@ -5584,17 +5707,9 @@ class IngestionPipeline:
                 else:
                     search_context.setdefault("boundary_status", "caption_aligned")
 
-                if (
-                    surface_eligible
-                    and not gemini_authoritative
-                    and bool(search_context.get("deferred_level"))
-                ):
+                if surface_eligible and bool(search_context.get("deferred_level")):
                     surface_eligible = False
                     search_context["surface_reason"] = "level_mismatch"
-
-                if gemini_authoritative and surface_eligible:
-                    search_context["deferred_level"] = False
-                    search_context.pop("surface_reason", None)
 
                 search_context["surface_eligible"] = bool(surface_eligible)
                 clip["search_context"] = search_context
@@ -5648,15 +5763,6 @@ class IngestionPipeline:
                             generation_context.increment_counter(
                                 "level_deferred_clips"
                             )
-                    if search_context.get("surface_reason") == "level_mismatch":
-                        level_deferred_by_index[candidate_index] = reel
-                        if on_reel_created is not None and (
-                            surface_limit is None
-                            or preferred_candidate_rank[candidate_index]
-                            < surface_limit
-                        ):
-                            on_reel_created(reel)
-                            callback_indices.add(candidate_index)
                     continue
                 persisted_by_index[candidate_index] = reel
                 if on_reel_created is not None and (
@@ -5666,13 +5772,9 @@ class IngestionPipeline:
                     on_reel_created(reel)
                     callback_indices.add(candidate_index)
 
-            # Difficulty organizes valid inventory; it never removes it. Keep
-            # the requested stage first, then the nearest remaining stages,
-            # while preserving selector order inside each stage.
-            selected_reels = {
-                **persisted_by_index,
-                **level_deferred_by_index,
-            }
+            # Level-mismatched clips remain stored for a later learner level;
+            # only clips surfaceable now consume this batch's target.
+            selected_reels = persisted_by_index
             selected_indices = sorted(
                 selected_reels,
                 key=lambda candidate_index: (
@@ -6163,17 +6265,11 @@ class IngestionPipeline:
                     engine_out["transcript"], clip
                 ),
                 "surface_eligible": True,
-                "deferred_level": (
-                    False
-                    if gemini_authoritative
-                    else not difficulty_matches_knowledge_level(
-                        difficulty,
-                        str(v.get("_knowledge_level") or ""),
-                    )
+                "deferred_level": not difficulty_matches_knowledge_level(
+                    difficulty,
+                    str(v.get("_knowledge_level") or ""),
                 ),
             }
-            if gemini_authoritative:
-                search_context.pop("surface_reason", None)
             if has_selector_metadata:
                 importance = educational_importance
                 boundary_confidence = unit(clip.get("boundary_confidence"), 0.5)

@@ -969,7 +969,7 @@ def test_topic_generation_reconciles_shared_gemini_cue_before_persistence(
         retrieval_profile="deep",
     )
 
-    assert reels == ["reel-preferred-left", "reel-secondary-right"]
+    assert reels == ["reel-preferred-left"]
     assert set(verification_calls) == {(0.0, 12.0), (8.0, 30.0)}
     by_id = {
         str(clip["selection_candidate_id"]).split("::")[-1]: clip
@@ -3544,7 +3544,7 @@ def test_topic_generation_dedupes_groq_refinement_for_one_shared_cue_video(
         retrieval_profile="deep",
     )
 
-    assert reels == ["reel-preferred-left", "reel-secondary-right"]
+    assert reels == ["reel-preferred-left"]
     assert len(stored) == 2
     assert groq_words.call_count == 1
     by_id = {
@@ -5139,6 +5139,165 @@ def test_production_transcript_boundary_surfaces_without_audio_work(
     assert context.counters()["permanently_rejected_clips"] == 0
 
 
+def test_gemini_clip_persists_when_caption_boundary_mapping_is_missing(
+    monkeypatch,
+) -> None:
+    transcript = _transcript()
+    transcript["segments"] = transcript["segments"][:1]
+    engine_out = {
+        "clips": [
+            _quality_clip(
+                cue_id="missing-cue",
+                start=12.0,
+                end=18.0,
+                quote="",
+                candidate_id="gemini-coarse-boundary",
+                selection_authority="gemini",
+            )
+        ],
+        "transcript": transcript,
+        "notes": "",
+    }
+    monkeypatch.setattr(
+        pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery()
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out
+    )
+    stored: list[dict] = []
+    pipeline = _pipeline()
+
+    def persist(*, clip, **_kwargs):
+        stored.append(clip)
+        return ("gemini-coarse-reel", mock.sentinel.metadata)
+
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+    context = GenerationContext("fast", require_acoustic_boundaries=False)
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=context,
+        retrieval_profile="deep",
+        max_videos=1,
+        max_reels=1,
+    )
+
+    assert reels == ["gemini-coarse-reel"]
+    assert len(stored) == 1
+    assert (stored[0]["start"], stored[0]["end"]) == (12.0, 18.0)
+    boundary = stored[0]["search_context"]
+    assert boundary["boundary_status"] == "best_effort"
+    assert boundary["surface_eligible"] is True
+    assert boundary["speech_corridor_verified"] is False
+    assert boundary.get("surface_reason") is None
+    assert context.counters()["stored_clips"] == 1
+    assert context.counters()["permanently_rejected_clips"] == 0
+
+
+def test_gemini_clip_uses_coarse_boundary_when_refinement_is_unsafe(
+    monkeypatch,
+) -> None:
+    engine_out = {
+        "clips": [
+            _quality_clip(
+                candidate_id="gemini-unsafe-refinement",
+                selection_authority="gemini",
+            )
+        ],
+        "transcript": _transcript(),
+        "notes": "",
+    }
+    monkeypatch.setattr(
+        pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery()
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_context_result_range_is_safe",
+        lambda *_args, **_kwargs: False,
+    )
+    stored: list[dict] = []
+    pipeline = _pipeline()
+
+    def persist(*, clip, **_kwargs):
+        stored.append(clip)
+        return ("gemini-fallback-reel", mock.sentinel.metadata)
+
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+    context = GenerationContext("fast", require_acoustic_boundaries=False)
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=context,
+        retrieval_profile="deep",
+        max_videos=1,
+        max_reels=1,
+    )
+
+    assert reels == ["gemini-fallback-reel"]
+    assert len(stored) == 1
+    boundary = stored[0]["search_context"]
+    assert boundary["boundary_status"] == "best_effort"
+    assert boundary["boundary_diagnostics"]["method"] == (
+        "gemini_playable_fallback"
+    )
+    assert boundary["surface_eligible"] is True
+    assert context.counters()["stored_clips"] == 1
+    assert context.counters()["permanently_rejected_clips"] == 0
+
+
+def test_gemini_clip_rejects_only_structurally_unplayable_boundary(
+    monkeypatch,
+) -> None:
+    transcript = _transcript()
+    transcript["segments"] = transcript["segments"][:1]
+    engine_out = {
+        "clips": [
+            _quality_clip(
+                cue_id="missing-cue",
+                start=24.0,
+                end=30.0,
+                quote="",
+                candidate_id="gemini-unplayable-boundary",
+                selection_authority="gemini",
+            )
+        ],
+        "transcript": transcript,
+        "notes": "",
+    }
+    monkeypatch.setattr(
+        pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery()
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out
+    )
+    pipeline = _pipeline()
+    persist = mock.Mock()
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+    context = GenerationContext("fast", require_acoustic_boundaries=False)
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=context,
+        retrieval_profile="deep",
+        max_videos=1,
+        max_reels=1,
+    )
+
+    assert reels == []
+    persist.assert_not_called()
+    assert context.counters()["stored_clips"] == 0
+    assert context.counters()["permanently_rejected_clips"] == 1
+
+
 def test_unsafe_refinement_fallback_surfaces_transcript_boundary(
     monkeypatch,
 ) -> None:
@@ -5474,7 +5633,7 @@ def test_hard_gemini_contract_rejects_off_topic_candidates(
     assert clips == []
 
 
-def test_gemini_authority_bypasses_material_semantic_and_level_filters(
+def test_gemini_authority_bypasses_material_semantic_but_not_level_filters(
     monkeypatch,
 ) -> None:
     engine_out = _one_cue_selector_result(
@@ -5509,7 +5668,7 @@ def test_gemini_authority_bypasses_material_semantic_and_level_filters(
     context = clips[0]["search_context"]
     assert context["selection_authority"] == "gemini"
     assert context["surface_eligible"] is True
-    assert context["deferred_level"] is False
+    assert context["deferred_level"] is True
     assert context["directly_teaches_topic"] is False
     assert context["topic_evidence_quote"] == (
         "evidence words absent from the selected transcript"
@@ -5789,7 +5948,7 @@ def test_candidate_plan_prioritizes_level_eligible_then_difficulty(
     ] == expected_deferred
 
 
-def test_all_deferred_source_streams_nearest_valid_level_immediately(
+def test_all_deferred_source_stores_for_later_without_filling_current_batch(
     monkeypatch,
 ) -> None:
     engine_out = {
@@ -5837,18 +5996,18 @@ def test_all_deferred_source_streams_nearest_valid_level_immediately(
         on_reel_created=emitted.append,
     )
 
-    assert reels == ["nearest-level-reel"]
-    assert emitted == ["nearest-level-reel"]
+    assert reels == []
+    assert emitted == []
     assert stored[0]["search_context"]["deferred_level"] is True
     assert stored[0]["search_context"]["surface_reason"] == "level_mismatch"
     assert stored[0]["search_context"]["surface_eligible"] is False
     assert context.counters()["stored_clips"] == 1
     assert context.counters()["deferred_clips"] == 1
     assert context.counters()["level_deferred_clips"] == 1
-    assert context.counters()["persisted_clips"] == 1
+    assert context.counters()["persisted_clips"] == 0
 
 
-def test_gemini_authority_is_not_level_deferred_during_persistence(
+def test_gemini_authority_is_level_deferred_during_persistence(
     monkeypatch,
 ) -> None:
     engine_out = {
@@ -5900,15 +6059,15 @@ def test_gemini_authority_is_not_level_deferred_during_persistence(
         max_persisted_reels=1,
     )
 
-    assert reels == ["authoritative-reel"]
+    assert reels == []
     context = stored[0]["search_context"]
     assert context["selection_authority"] == "gemini"
-    assert context["surface_eligible"] is True
-    assert context["deferred_level"] is False
-    assert "surface_reason" not in context
+    assert context["surface_eligible"] is False
+    assert context["deferred_level"] is True
+    assert context["surface_reason"] == "level_mismatch"
 
 
-def test_all_deferred_source_streams_all_valid_clips_by_difficulty_proximity(
+def test_all_deferred_source_stores_all_valid_clips_without_streaming(
     monkeypatch,
 ) -> None:
     transcript = _transcript()
@@ -5970,14 +6129,8 @@ def test_all_deferred_source_streams_all_valid_clips_by_difficulty_proximity(
         on_reel_created=emitted.append,
     )
 
-    assert reels == [
-        "dQw4w9WgXcQ::intermediate-python",
-        "dQw4w9WgXcQ::advanced-python",
-    ]
-    assert emitted == [
-        "dQw4w9WgXcQ::intermediate-python",
-        "dQw4w9WgXcQ::advanced-python",
-    ]
+    assert reels == []
+    assert emitted == []
 
 
 def test_current_level_candidate_precedes_without_suppressing_other_levels(
@@ -6042,8 +6195,8 @@ def test_current_level_candidate_precedes_without_suppressing_other_levels(
     )
 
     assert stored == ["beginner-python", "advanced-python"]
-    assert reels == ["reel-beginner-python", "reel-advanced-python"]
-    assert emitted == ["reel-beginner-python", "reel-advanced-python"]
+    assert reels == ["reel-beginner-python"]
+    assert emitted == ["reel-beginner-python"]
 
 
 def test_candidate_plan_prioritizes_primary_intent_only_within_difficulty_stage(
@@ -6877,6 +7030,11 @@ def test_selector_transport_failure_preserves_transcript_and_provider_counters(
         lambda: False,
     )
     monkeypatch.setattr(gemini_client_module, "generate_json_v3", fail_selector)
+    monkeypatch.setattr(
+        gemini_client_module,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 1_000,
+    )
     monkeypatch.setattr(
         pipeline_module.clip_engine_silence,
         "prepare_audio_source",

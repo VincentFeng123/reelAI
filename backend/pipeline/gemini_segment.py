@@ -12218,8 +12218,8 @@ def _trusted_compact_plan_to_report(
             final_start_left = start_span[0]
         claim_sentence_selected = final_start_text[final_start_left:]
         relational_sentence_before_claim = bool(
-            final_start_is_clipped
-            and claim_location is not None
+            claim_location is not None
+            and model_start_misses_claim_quote
             and _trusted_relational_sentence_before_claim(
                 segments,
                 selected_line=a,
@@ -12228,24 +12228,24 @@ def _trusted_compact_plan_to_report(
             )
         )
         claim_sentence_frame = (
-            "ordinal"
-            if _TRUSTED_SUBJECTLESS_PREDICATE_OPENING_RE.match(
-                claim_sentence_selected
+            "note"
+            if (
+                _OPENING_BARE_RELATIONAL_PREDICATE_RE.match(
+                    claim_sentence_selected
+                )
+                or relational_sentence_before_claim
             )
             else (
-                "note"
-                if (
-                    _OPENING_BARE_RELATIONAL_PREDICATE_RE.match(
-                        claim_sentence_selected
-                    )
-                    or relational_sentence_before_claim
+                "ordinal"
+                if _TRUSTED_SUBJECTLESS_PREDICATE_OPENING_RE.match(
+                    claim_sentence_selected
                 )
                 else ""
             )
         )
         claim_sentence_scope = final_scope_text
         if (
-            final_start_is_clipped
+            (final_start_is_clipped or relational_sentence_before_claim)
             and not trusted_structural_onset_applied
             and claim_location is not None
             and a <= claim_location[0] <= claim_location[2] <= b
@@ -12260,8 +12260,11 @@ def _trusted_compact_plan_to_report(
                 is not None
             )
             and _ATOMIC_WORKED_SCOPE_RE.search(claim_sentence_scope) is None
-            and _TRUSTED_WORKED_TASK_SCOPE_RE.search(claim_sentence_scope)
-            is None
+            and (
+                _TRUSTED_WORKED_TASK_SCOPE_RE.search(claim_sentence_scope)
+                is None
+                or relational_sentence_before_claim
+            )
             and _ATOMIC_CAUSAL_SCOPE_RE.search(claim_sentence_scope) is None
             and _TRUSTED_CLAIM_SENTENCE_ARC_SCOPE_RE.search(
                 claim_sentence_scope

@@ -98,6 +98,11 @@ def test_standalone_pro_boundary_fallback_dispatches_with_bounded_selector(monke
         )
 
     monkeypatch.setattr(run, "GenerationContext", context_factory)
+    monkeypatch.setattr(
+        gemini_client,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 1_000,
+    )
     monkeypatch.setattr(gemini_client, "generate_json_v3", fake_generate)
 
     output = run.pro_boundary_fallback(
@@ -152,6 +157,11 @@ def test_production_url_records_one_text_only_pro_selector_call(monkeypatch):
 
     context = GenerationContext("slow", generation_id="production-text-only-pro")
     monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(
+        gemini_client,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 1_000,
+    )
     monkeypatch.setattr(gemini_client, "generate_json_v3", fake_generate)
     monkeypatch.setattr(
         run.gemini_segment.config,
@@ -233,6 +243,11 @@ def test_production_pro_failure_never_dispatches_flash_or_lite(monkeypatch):
         )
 
     monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(
+        gemini_client,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 1_000,
+    )
     monkeypatch.setattr(gemini_client, "generate_json_v3", fail_pro)
     monkeypatch.setattr(
         run.gemini_segment.config,

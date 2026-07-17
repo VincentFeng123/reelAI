@@ -1309,7 +1309,7 @@ class IngestTopicProgressTests(unittest.TestCase):
         self.assertLess(elapsed, 0.2)
         self.assertTrue(stalled_cancelled.wait(0.1))
 
-    def test_deferred_valid_clip_streams_and_slow_source_still_finishes(self) -> None:
+    def test_deferred_valid_clip_stores_and_slow_surface_clip_still_finishes(self) -> None:
         pipeline = self._pipeline()
         videos = [self._video("slow-video"), self._video("deferred-video")]
         slow_started = threading.Event()
@@ -1372,9 +1372,9 @@ class IngestTopicProgressTests(unittest.TestCase):
             )
             elapsed = time.monotonic() - started
 
-        self.assertEqual(reels, ["slow-video", "deferred-video"])
+        self.assertEqual(reels, ["slow-video"])
         self.assertEqual(stored, ["deferred-video", "slow-video"])
-        self.assertEqual(streamed, ["deferred-video", "slow-video"])
+        self.assertEqual(streamed, ["slow-video"])
         self.assertGreaterEqual(elapsed, 0.05)
         self.assertLess(elapsed, 0.3)
 
@@ -1656,6 +1656,7 @@ class IngestTopicProgressTests(unittest.TestCase):
 
         def clip_and_filter(video, *_args):
             calls.append(video["id"])
+            surface_eligible = video["id"] == "video-2"
             return video, [{
                 "title": video["id"],
                 "start": 0.0,
@@ -1663,7 +1664,11 @@ class IngestTopicProgressTests(unittest.TestCase):
                 "cue_ids": ["cue-1"],
                 "selection_candidate_id": video["id"],
                 "search_context": {
-                    "surface_eligible": video["id"] == "video-2",
+                    "surface_eligible": surface_eligible,
+                    "surface_reason": (
+                        "" if surface_eligible else "level_mismatch"
+                    ),
+                    "deferred_level": not surface_eligible,
                 },
             }], {"transcript": {
                 "source": "supadata",

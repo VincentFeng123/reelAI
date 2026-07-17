@@ -265,6 +265,35 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
         caption = clips[0]["search_context"]["boundary_diagnostics"]["caption"]
         self.assertTrue(caption["recovered_from_timestamp_range"])
 
+    def test_gemini_direct_clip_keeps_playable_coarse_boundary(self) -> None:
+        engine_out = _media_tail_engine_out()
+        engine_out["transcript"]["duration"] = 20.0
+        engine_out["clips"][0].update({
+            "start": 12.0,
+            "end": 18.0,
+            "cue_ids": ["missing-cue"],
+            "topic_evidence_quote": "",
+            "selection_authority": "gemini",
+        })
+
+        clips = pipeline_module._verified_direct_adapter_clips(
+            source_url=SOURCE_URL,
+            engine_out=engine_out,
+            should_cancel=None,
+        )
+
+        self.assertEqual(len(clips), 1)
+        self.assertEqual((clips[0]["start"], clips[0]["end"]), (12.0, 18.0))
+        context = clips[0]["search_context"]
+        self.assertEqual(context["selection_authority"], "gemini")
+        self.assertEqual(context["boundary_status"], "best_effort")
+        self.assertFalse(context["speech_corridor_verified"])
+        self.assertTrue(context["surface_eligible"])
+        self.assertEqual(
+            context["boundary_diagnostics"]["method"],
+            "gemini_playable_fallback",
+        )
+
     def test_direct_adapter_falls_back_when_acoustic_crosses_next_cue(self) -> None:
         engine_out = _media_tail_engine_out()
         engine_out["transcript"]["segments"].append(

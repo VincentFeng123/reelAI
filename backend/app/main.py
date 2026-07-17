@@ -2564,9 +2564,21 @@ def _search_context_has_usable_boundary(
     t_start: object | None = None,
     t_end: object | None = None,
 ) -> bool:
-    if not isinstance(context, dict) or not persisted_boundary_is_usable(
-        context, t_start=t_start, t_end=t_end
-    ):
+    if not isinstance(context, dict):
+        return False
+    if _gemini_selection_is_authoritative(context):
+        try:
+            start = float(t_start)
+            end = float(t_end)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return (
+            math.isfinite(start)
+            and math.isfinite(end)
+            and start >= 0.0
+            and end > start
+        )
+    if not persisted_boundary_is_usable(context, t_start=t_start, t_end=t_end):
         return False
     return bool(
         str(context.get("selection_contract_version") or "").strip()
@@ -2583,7 +2595,12 @@ def _gemini_selection_is_authoritative(context: object) -> bool:
     )
 
 
-def _count_generation_reels(conn, generation_id: str) -> int:
+def _count_generation_reels(
+    conn,
+    generation_id: str,
+    *,
+    include_level_deferred: bool = True,
+) -> int:
     try:
         rows = fetch_all(
             conn,
@@ -2608,6 +2625,8 @@ def _count_generation_reels(conn, generation_id: str) -> int:
                 "1", "true", "yes", "on",
             }
         surface_reason = str(context.get("surface_reason") or "").strip().lower()
+        if surface_reason == "level_mismatch" and not include_level_deferred:
+            continue
         if (
             not _gemini_selection_is_authoritative(context)
             and surface_eligible is not True
@@ -2620,6 +2639,16 @@ def _count_generation_reels(conn, generation_id: str) -> int:
             continue
         count += 1
     return count
+
+
+def _count_generation_surfaceable_reels(conn, generation_id: str) -> int:
+    """Count clips that can fill the learner's current generation batch."""
+
+    return _count_generation_reels(
+        conn,
+        generation_id,
+        include_level_deferred=False,
+    )
 
 
 def _count_material_ready_reels(conn, material_id: str) -> int:
@@ -4565,7 +4594,7 @@ def _run_leased_generation_job(
                     retrieved_video_ids=retrieved_video_ids,
                 )
 
-            current_count = source_reel_count + _count_generation_reels(
+            current_count = source_reel_count + _count_generation_surfaceable_reels(
                 conn, generation_id
             )
             if (
@@ -4585,8 +4614,9 @@ def _run_leased_generation_job(
                     analyzed_video_ids=completed_source_ids,
                     retrieved_video_ids=retrieved_video_ids,
                 )
-                current_count = source_reel_count + _count_generation_reels(
-                    conn, generation_id
+                current_count = (
+                    source_reel_count
+                    + _count_generation_surfaceable_reels(conn, generation_id)
                 )
                 if not update_generation_progress(
                     conn,
@@ -4600,8 +4630,9 @@ def _run_leased_generation_job(
                         f"generation job lease is no longer active: {job_id}"
                     )
 
-            cumulative_count = source_reel_count + _count_generation_reels(
-                conn, generation_id
+            cumulative_count = (
+                source_reel_count
+                + _count_generation_surfaceable_reels(conn, generation_id)
             )
             has_verified_reservoir = (
                 False

@@ -1219,8 +1219,9 @@ class ReelService:
     # v39: require the v32 post-closure edge-preview contract.
     # v40: require the v33 grounded atomic-claim selector contract.
     # v41: require authoritative Flash word edges and outward-only silence refinement.
+    # v42: retain Gemini-authoritative clips when boundary refinement is incomplete.
     # The separate contract key below invalidates prior inventory under v38.
-    RANKED_FEED_CACHE_VERSION = 41
+    RANKED_FEED_CACHE_VERSION = 42
     RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v38"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
@@ -7436,17 +7437,22 @@ class ReelService:
                 }
                 else legacy_difficulty_matches_level
             )
+            # A level-deferred clip is stored as reusable inventory, not a
+            # nearest-level fallback. It may return only once this learner's
+            # current level matches the clip's difficulty.
             deferred_level_candidate = (
                 surface_reason == "level_mismatch"
-                and (
-                    difficulty_matches_level
-                    or selection_version in self.DIFFICULTY_FALLBACK_CONTRACTS
+                and difficulty_matches_knowledge_level(
+                    self._difficulty(row),
+                    str(progress.get("selected_level") or "beginner"),
                 )
             )
             prerequisite_may_become_ready = (
                 surface_reason == "prerequisite_not_surfaceable"
                 and difficulty_matches_level
             )
+            if surface_reason == "level_mismatch" and not deferred_level_candidate:
+                continue
             if (
                 not gemini_selection_authoritative
                 and surface_eligible is False
@@ -7458,7 +7464,7 @@ class ReelService:
             boundary_status = selection_metadata.get(
                 "_selection_boundary_status"
             )
-            if require_verified_boundaries:
+            if not gemini_selection_authoritative and require_verified_boundaries:
                 # The legacy argument name now means "require a proven usable
                 # boundary". Prefer measured silence, but do not discard a
                 # high-quality clip merely because YouTube audio is blocked or
@@ -7512,7 +7518,10 @@ class ReelService:
                     )
                 ):
                     continue
-            elif boundary_status == "unavailable":
+            elif (
+                not gemini_selection_authoritative
+                and boundary_status == "unavailable"
+            ):
                 continue
             if selection_metadata and not gemini_selection_authoritative:
                 if selection_version in {
