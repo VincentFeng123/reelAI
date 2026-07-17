@@ -71,7 +71,7 @@ def _key(transcript: dict, settings: dict | None = None, *, topic: str = "physic
 def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> None:
     transcript = _transcript()
     baseline = _key(transcript)
-    assert baseline.startswith("clip-segmentation:quality_silence_v38:v33:")
+    assert baseline.startswith("clip-segmentation:quality_silence_v38:v34:")
 
     changed_text = deepcopy(transcript)
     changed_text["segments"][0]["text"] = "changed lesson"

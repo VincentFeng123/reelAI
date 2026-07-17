@@ -3124,6 +3124,59 @@ def _response_generation_ids(conn, generation_id: str | None) -> list[str]:
     return ordered
 
 
+def _authoritative_release_reel_ids(
+    conn,
+    generation_id: str | None,
+) -> list[str] | None:
+    """Return the exact released chain order, or None for wholly legacy data."""
+    ordered_ids: list[str] = []
+    seen_ids: set[str] = set()
+    found_authoritative_release = False
+    for current_generation_id in _response_generation_ids(conn, generation_id):
+        jobs = fetch_all(
+            conn,
+            """
+            SELECT id
+            FROM reel_generation_jobs
+            WHERE result_generation_id = ?
+              AND status IN ('completed', 'partial', 'exhausted')
+            ORDER BY completed_at DESC, updated_at DESC, created_at DESC, id DESC
+            LIMIT 20
+            """,
+            (current_generation_id,),
+        )
+        for job in jobs:
+            authoritative_payload: dict[str, Any] | None = None
+            events = replay_generation_events(
+                conn,
+                job_id=str(job.get("id") or ""),
+            )
+            for event in reversed(events):
+                if str(event.get("type") or "") != "final":
+                    continue
+                payload = event.get("payload")
+                if isinstance(payload, dict) and payload.get("authoritative") is True:
+                    authoritative_payload = payload
+                    break
+            if authoritative_payload is None:
+                continue
+            found_authoritative_release = True
+            reels = authoritative_payload.get("reels")
+            if isinstance(reels, list):
+                for reel in reels:
+                    if not isinstance(reel, dict):
+                        continue
+                    reel_id = str(reel.get("reel_id") or "").strip()
+                    if not reel_id or reel_id in seen_ids:
+                        continue
+                    seen_ids.add(reel_id)
+                    ordered_ids.append(reel_id)
+            # The latest terminal job for this generation is authoritative,
+            # including an explicit empty or malformed release.
+            break
+    return ordered_ids if found_authoritative_release else None
+
+
 def _verified_reusable_generation_chain(
     conn,
     *,
@@ -3596,6 +3649,7 @@ def _ranked_request_reels(
     learner_id: str = LEGACY_LEARNER_ID,
     exclude_reel_ids: list[str] | None = None,
     include_source_chain: bool = True,
+    released_only: bool = False,
 ) -> list[dict[str, Any]]:
     try:
         material_row = fetch_one(conn, "SELECT subject_tag, source_type FROM materials WHERE id = ?", (material_id,))
@@ -3632,6 +3686,16 @@ def _ranked_request_reels(
         if include_source_chain
         else ([generation_id] if generation_id else [])
     )
+    authoritative_release_ids = (
+        _authoritative_release_reel_ids(conn, generation_id)
+        if released_only and include_source_chain
+        else None
+    )
+    authoritative_release_id_set = (
+        set(authoritative_release_ids)
+        if authoritative_release_ids is not None
+        else None
+    )
     difficulty_progress: dict[str, Any] | None = None
     if generation_ids:
         ranked_batches: list[list[dict[str, Any]]] = []
@@ -3649,6 +3713,13 @@ def _ranked_request_reels(
                 content_fingerprint=content_fingerprint,
                 require_verified_boundaries=True,
             )
+            if authoritative_release_id_set is not None:
+                batch = [
+                    reel
+                    for reel in batch
+                    if str(reel.get("reel_id") or "").strip()
+                    in authoritative_release_id_set
+                ]
             ranked_batches.append(batch)
         if ranked_batches and all(
             str(reel.get("selection_contract_version") or "").strip()
@@ -3706,6 +3777,19 @@ def _ranked_request_reels(
             ranked,
             str(difficulty_progress.get("selected_level") or "beginner"),
         )
+    if authoritative_release_ids is not None:
+        by_id: dict[str, dict[str, Any]] = {}
+        for reel in ranked:
+            reel_id = str(reel.get("reel_id") or "").strip()
+            if reel_id and reel_id not in by_id:
+                ordered_reel = dict(reel)
+                ordered_reel["_selection_ordered"] = True
+                by_id[reel_id] = ordered_reel
+        ranked = [
+            by_id[reel_id]
+            for reel_id in authoritative_release_ids
+            if reel_id in by_id
+        ]
     seen_reel_ids = _learner_seen_reel_ids(
         conn,
         material_id=material_id,
@@ -3754,11 +3838,12 @@ def _ranked_request_reels(
             reel for reel in ranked
             if str(reel.get("reel_id") or "") not in excluded_reel_id_set
         ]
-    ranked = _apply_generation_lesson_order(
-        conn,
-        generation_id=generation_id,
-        reels=ranked,
-    )
+    if authoritative_release_ids is None:
+        ranked = _apply_generation_lesson_order(
+            conn,
+            generation_id=generation_id,
+            reels=ranked,
+        )
 
     if page <= 1:
         shaped = _shape_request_page_reels(
@@ -3982,6 +4067,11 @@ def _generation_job_reels(
     )
     stored_order_ids = _stored_generation_lesson_order_ids(conn, generation_id)
     ranking_limit = max(requested, len(stored_order_ids or []))
+    released_only = str(job_row.get("status") or "").strip() in {
+        "completed",
+        "partial",
+        "exhausted",
+    }
     ranked = _ranked_request_reels(
         conn,
         material_id=str(job_row.get("material_id") or ""),
@@ -4003,6 +4093,7 @@ def _generation_job_reels(
             continuation_token,
         ),
         include_source_chain=True,
+        released_only=released_only,
     )
     internal_reels = [
         _public_generation_reel(
@@ -6993,6 +7084,7 @@ def feed(
                 limit=limit,
                 learner_id=learner_id,
                 exclude_reel_ids=excluded_reels,
+                released_only=True,
             )
         )
         legacy_page_start = (page - 1) * limit

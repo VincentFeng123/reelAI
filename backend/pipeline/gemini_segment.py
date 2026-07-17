@@ -10175,6 +10175,37 @@ def _trusted_speaker_setup_start_span(text: str) -> tuple[int, int] | None:
     return _quote_character_span(source, quote) if quote else None
 
 
+def _trusted_weak_prior_start_span(
+    prior_text: str,
+    selected_text: str,
+) -> tuple[int, int] | None:
+    """Recover the exact prior-sentence onset of a split caption phrase."""
+    source = str(prior_text or "")
+    selected = str(selected_text or "").strip()
+    if (
+        not source.strip()
+        or not selected
+        or source.rstrip().endswith("?")
+        or not _cue_has_weak_end(
+            source,
+            selected,
+            ignore_caption_case=True,
+        )
+    ):
+        return None
+    sentence_spans = _sentence_character_spans(source)
+    setup_left = sentence_spans[-1][0] if sentence_spans else 0
+    setup = source[setup_left:].strip()
+    joined = f"{setup} {selected}"
+    if not (
+        _opening_clause_is_standalone(joined)
+        or _local_example_setup_is_complete(joined)
+    ):
+        return None
+    quote = _exact_boundary_quote(source[setup_left:], want="start")
+    return _quote_character_span(source, quote) if quote else None
+
+
 def _trusted_subjectless_predicate_context(
     segments: list[dict],
     start_line: int,
@@ -10265,6 +10296,9 @@ def _trusted_start_context_repair(
     segments: list[dict],
     start_line: int,
     start_span: tuple[int, int] | None,
+    *,
+    force_clipped_start: bool = False,
+    min_start_line: int = 0,
 ) -> tuple[int, tuple[int, int] | None, list[str]]:
     """Expand a trusted Gemini start to spoken context, but never reject it."""
     text = str(segments[start_line].get("text") or "")
@@ -10273,6 +10307,7 @@ def _trusted_start_context_repair(
         if start_span is not None
         else text.strip()
     )
+    cue_start_is_clipped = bool(force_clipped_start)
     has_same_cue_prefix = bool(
         start_span is not None
         and _WORD_RE.search(text[:start_span[0]]) is not None
@@ -10305,8 +10340,13 @@ def _trusted_start_context_repair(
         and _local_example_setup_is_complete(selected)
     )
     unsafe_projection = bool(
-        start_span is not None
-        and not _projected_start_is_standalone(text, start_span)
+        (
+            force_clipped_start
+            or (
+                start_span is not None
+                and not _projected_start_is_standalone(text, start_span)
+            )
+        )
         and not projected_complete_setup
     )
     unresolved_opening = bool(
@@ -10341,7 +10381,8 @@ def _trusted_start_context_repair(
     if reset_span is not None:
         return start_line, reset_span, ["expanded_projected_start_context"]
     if (
-        _opening_clause_is_standalone(text)
+        not cue_start_is_clipped
+        and _opening_clause_is_standalone(text)
         and _TRUSTED_SUBJECTLESS_PREDICATE_OPENING_RE.match(selected) is None
         and _TRUSTED_CONTEXTUAL_CUE_OPENING_RE.match(text) is None
         and _trusted_opening_reference_is_resolved(selected, prefix)
@@ -10350,6 +10391,8 @@ def _trusted_start_context_repair(
 
     prior_parts = [prefix] if prefix else []
     for candidate in range(start_line - 1, -1, -1):
+        if candidate < max(0, min_start_line):
+            break
         try:
             gap = (
                 float(segments[candidate + 1].get("start", 0.0))
@@ -10361,6 +10404,15 @@ def _trusted_start_context_repair(
             break
         candidate_text = str(segments[candidate].get("text") or "")
         prior_parts.insert(0, candidate_text)
+        weak_prior_span = (
+            _trusted_weak_prior_start_span(candidate_text, selected)
+            if cue_start_is_clipped and candidate == start_line - 1
+            else None
+        )
+        if weak_prior_span is not None:
+            return candidate, weak_prior_span, [
+                "expanded_split_cue_start_context"
+            ]
         scenario_span = _trusted_scenario_start_span(candidate_text)
         if scenario_span is not None:
             return candidate, scenario_span, ["expanded_start_context"]
@@ -10627,6 +10679,7 @@ def _trusted_compact_plan_to_report(
                 end_span = end_anchor.last_span
 
         structural_start_trimmed = False
+        trusted_structural_onset_applied = False
         if claim_location is not None:
             claim_start_line, claim_left, claim_end_line, claim_right = claim_location
             if claim_start_line < a:
@@ -10922,12 +10975,14 @@ def _trusted_compact_plan_to_report(
                         start_span,
                     )
                     structural_start_trimmed = True
+                    trusted_structural_onset_applied = True
                     diagnostics.append(
                         "trimmed_clipped_start_to_claim_setup"
                     )
                 elif scenario_start is not None:
                     a, start_span = scenario_start
                     structural_start_trimmed = True
+                    trusted_structural_onset_applied = True
                     diagnostics.append("trimmed_scenario_before_claim")
                 elif section_start != a:
                     a = section_start
@@ -10965,13 +11020,70 @@ def _trusted_compact_plan_to_report(
                     structural_span,
                 )
                 diagnostics.append("trimmed_same_cue_unit_before")
+                trusted_structural_onset_applied = True
 
-        if not structural_start_trimmed:
+        final_start_text = str(segments[a].get("text") or "")
+        final_start_left = start_span[0] if start_span is not None else 0
+        if structural_start_trimmed:
+            # A non-zero projected span is the explicit claim/scenario handoff
+            # selected above. Do not walk backward and undo that repair. Only
+            # recover a structural trim that still lands at a clipped cue edge.
+            final_start_is_clipped = bool(
+                final_start_left == 0
+                and (
+                    _cue_opens_mid_thought_at(
+                        segments,
+                        a,
+                        ignore_caption_case=True,
+                    )
+                    or (
+                        start_span is None
+                        and not _opening_clause_is_standalone(final_start_text)
+                    )
+                )
+            )
+        else:
+            final_start_is_clipped = bool(
+                (
+                    start_span is not None
+                    and start_span[0] > 0
+                    and not _projected_start_is_standalone(
+                        final_start_text,
+                        start_span,
+                    )
+                )
+                or (
+                    final_start_left == 0
+                    and _cue_opens_mid_thought_at(
+                        segments,
+                        a,
+                        ignore_caption_case=True,
+                    )
+                )
+                or (
+                    start_span is None
+                    and not _opening_clause_is_standalone(final_start_text)
+                )
+            )
+        should_repair_start_context = bool(
+            not structural_start_trimmed
+            or (
+                final_start_is_clipped
+                and not trusted_structural_onset_applied
+            )
+        )
+        if should_repair_start_context:
             a, start_span, start_context_diagnostics = (
                 _trusted_start_context_repair(
                     segments,
                     a,
                     start_span,
+                    force_clipped_start=(
+                        final_start_is_clipped and structural_start_trimmed
+                    ),
+                    min_start_line=(
+                        max(0, a - 1) if structural_start_trimmed else 0
+                    ),
                 )
             )
             diagnostics.extend(start_context_diagnostics)

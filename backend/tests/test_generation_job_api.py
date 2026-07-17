@@ -506,6 +506,308 @@ def _terminal_job_for_generation(
     return {**job, "status": status, "result_generation_id": generation_id}
 
 
+def _append_authoritative_release(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    reel_ids: list[str],
+) -> None:
+    generation_jobs.append_event(
+        conn,
+        job_id=job_id,
+        event_type="final",
+        payload={
+            "reels": [{"reel_id": reel_id} for reel_id in reel_ids],
+            "authoritative": True,
+        },
+    )
+
+
+def _released_feed_reel(reel_id: str, index: int) -> dict:
+    return {
+        "reel_id": reel_id,
+        "video_id": f"video-{reel_id}",
+        "t_start": float(index * 40),
+        "t_end": float(index * 40 + 30),
+        "difficulty": 0.1,
+        "_selection_quality_floor": 0.9,
+        "_selection_quality_mean": 0.9,
+        "_selection_topic_relevance": 0.9,
+        "_selection_source_rank": index,
+        "_selection_ordered": True,
+        "selection_contract_version": "quality_silence_v38",
+    }
+
+
+def _released_generation_chain(
+    conn: sqlite3.Connection,
+    batches: list[tuple[list[str], list[str]]],
+) -> tuple[str, dict[str, list[dict]], list[dict]]:
+    source_generation_id: str | None = None
+    prior_job_id: str | None = None
+    rows_by_generation: dict[str, list[dict]] = {}
+    jobs: list[dict] = []
+    row_index = 0
+    completed_at = datetime.now(timezone.utc)
+    for batch_index, (released_ids, raw_ids) in enumerate(batches):
+        generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=f"released-generation-{batch_index}",
+            generation_mode="slow",
+            retrieval_profile="unified",
+            source_generation_id=source_generation_id,
+        )
+        request_params = {"generation_mode": "slow", "num_reels": 20}
+        if prior_job_id:
+            request_params["continuation_token"] = prior_job_id
+        job = _terminal_job_for_generation(
+            conn,
+            request_key=f"released-job-{batch_index}",
+            generation_id=generation_id,
+            completed_at=(completed_at + timedelta(seconds=batch_index)).isoformat(),
+            request_params=request_params,
+        )
+        _append_authoritative_release(
+            conn,
+            job_id=str(job["id"]),
+            reel_ids=released_ids,
+        )
+        rows_by_generation[generation_id] = [
+            _released_feed_reel(reel_id, row_index + index)
+            for index, reel_id in enumerate(raw_ids)
+        ]
+        row_index += len(raw_ids)
+        source_generation_id = generation_id
+        prior_job_id = str(job["id"])
+        jobs.append(job)
+    assert source_generation_id is not None
+    return source_generation_id, rows_by_generation, jobs
+
+
+def _patch_released_ranked_feed(
+    monkeypatch,
+    rows_by_generation: dict[str, list[dict]],
+) -> None:
+    monkeypatch.setattr(
+        main.reel_service,
+        "ranked_feed",
+        lambda *_args, **kwargs: list(rows_by_generation[kwargs["generation_id"]]),
+    )
+    monkeypatch.setattr(
+        main.reel_service,
+        "learner_progress",
+        lambda *_args, **_kwargs: {"selected_level": "beginner"},
+    )
+
+
+def _rank_released_feed(
+    conn: sqlite3.Connection,
+    *,
+    generation_id: str,
+    exclude_reel_ids: list[str] | None = None,
+    exclude_video_ids: list[str] | None = None,
+    released_only: bool = True,
+) -> list[dict]:
+    return main._ranked_request_reels(
+        conn,
+        material_id="m1",
+        fast_mode=False,
+        generation_id=generation_id,
+        min_relevance=None,
+        preferred_video_duration="any",
+        target_clip_duration_sec=0,
+        target_clip_duration_min_sec=None,
+        target_clip_duration_max_sec=None,
+        exclude_video_ids=exclude_video_ids,
+        exclude_reel_ids=exclude_reel_ids,
+        page=1,
+        limit=20,
+        released_only=released_only,
+    )
+
+
+def test_released_feed_reconstructs_exact_batch_order_and_hides_raw_reservoir(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    latest_generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [
+            (["r1", "r2", "r3", "r4"], ["r1", "r2", "r3", "r4"]),
+            (["r5", "r6", "r7"], ["r5", "r6", "r7"]),
+            (["r8", "r9"], ["r8", "r9", "raw-private"]),
+        ],
+    )
+    _patch_released_ranked_feed(monkeypatch, rows)
+    try:
+        ranked = _rank_released_feed(
+            conn,
+            generation_id=latest_generation_id,
+        )
+
+        assert [reel["reel_id"] for reel in ranked] == [
+            "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9",
+        ]
+    finally:
+        conn.close()
+
+
+def test_released_feed_treats_authoritative_empty_as_empty(monkeypatch) -> None:
+    conn = _conn()
+    generation_id, rows, _jobs = _released_generation_chain(
+        conn, [([], ["raw-private"])]
+    )
+    _patch_released_ranked_feed(monkeypatch, rows)
+    try:
+        assert _rank_released_feed(conn, generation_id=generation_id) == []
+    finally:
+        conn.close()
+
+
+def test_released_feed_omits_missing_rows_without_raw_substitution(monkeypatch) -> None:
+    conn = _conn()
+    generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [
+            (
+                ["released-present", "released-missing"],
+                ["raw-private", "released-present"],
+            )
+        ],
+    )
+    _patch_released_ranked_feed(monkeypatch, rows)
+    try:
+        ranked = _rank_released_feed(conn, generation_id=generation_id)
+
+        assert [reel["reel_id"] for reel in ranked] == ["released-present"]
+    finally:
+        conn.close()
+
+
+def test_released_feed_stably_deduplicates_and_preserves_exclusion_order(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    child_generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [
+            (["r1", "r2"], ["r1", "r2"]),
+            (["r2", "r3", "r4"], ["r2", "r3", "r4"]),
+        ],
+    )
+    _patch_released_ranked_feed(monkeypatch, rows)
+    try:
+        ranked = _rank_released_feed(
+            conn,
+            generation_id=child_generation_id,
+            exclude_reel_ids=["r2"],
+            exclude_video_ids=["video-r3"],
+        )
+
+        assert [reel["reel_id"] for reel in ranked] == ["r1", "r4"]
+    finally:
+        conn.close()
+
+
+def test_terminal_status_and_replay_use_only_current_released_batch(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _generation_id, rows, jobs = _released_generation_chain(
+        conn,
+        [
+            (["r1", "r2"], ["r1", "r2"]),
+            (["r4", "r3"], ["r3", "raw-private", "r4"]),
+        ],
+    )
+    _patch_released_ranked_feed(monkeypatch, rows)
+    terminal = generation_jobs.get_job(conn, str(jobs[-1]["id"]))
+    assert terminal is not None
+    try:
+        status = main._generation_job_status_payload(conn, terminal)
+        replay = main._sanitize_generation_replay_events(
+            conn,
+            terminal,
+            generation_jobs.replay_events(conn, job_id=str(terminal["id"])),
+        )
+
+        assert [reel["reel_id"] for reel in status["reels"]] == ["r4", "r3"]
+        final = next(event for event in replay if event["type"] == "final")
+        assert [reel["reel_id"] for reel in final["payload"]["reels"]] == [
+            "r4", "r3",
+        ]
+    finally:
+        conn.close()
+
+
+def test_terminal_authoritative_empty_does_not_expose_raw_inventory(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _generation_id, rows, jobs = _released_generation_chain(
+        conn, [([], ["raw-private"])]
+    )
+    _patch_released_ranked_feed(monkeypatch, rows)
+    terminal = generation_jobs.get_job(conn, str(jobs[-1]["id"]))
+    assert terminal is not None
+    try:
+        status = main._generation_job_status_payload(conn, terminal)
+        replay = main._sanitize_generation_replay_events(
+            conn,
+            terminal,
+            generation_jobs.replay_events(conn, job_id=str(terminal["id"])),
+        )
+
+        assert status["reels"] == []
+        final = next(event for event in replay if event["type"] == "final")
+        assert final["payload"]["reels"] == []
+    finally:
+        conn.close()
+
+
+def test_raw_generation_ranking_does_not_require_a_terminal_release(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="running-raw-generation",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    monkeypatch.setattr(
+        main,
+        "_authoritative_release_reel_ids",
+        lambda *_args, **_kwargs: pytest.fail(
+            "raw worker ranking must not read terminal releases"
+        ),
+    )
+    monkeypatch.setattr(
+        main.reel_service,
+        "ranked_feed",
+        lambda *_args, **_kwargs: [_released_feed_reel("raw-candidate", 0)],
+    )
+    monkeypatch.setattr(
+        main.reel_service,
+        "learner_progress",
+        lambda *_args, **_kwargs: {"selected_level": "beginner"},
+    )
+    try:
+        ranked = _rank_released_feed(
+            conn,
+            generation_id=generation_id,
+            released_only=False,
+        )
+
+        assert [reel["reel_id"] for reel in ranked] == ["raw-candidate"]
+    finally:
+        conn.close()
+
+
 def test_generation_job_reels_promote_internal_current_metadata_and_source(
     monkeypatch,
 ) -> None:
@@ -3851,7 +4153,13 @@ def test_feed_reload_reports_the_latest_continuation_batch(monkeypatch) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
     monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
-    monkeypatch.setattr(main, "_ranked_request_reels", lambda *_args, **_kwargs: [])
+    ranked_kwargs: dict[str, object] = {}
+
+    def ranked(*_args, **kwargs):
+        ranked_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr(main, "_ranked_request_reels", ranked)
     try:
         queued = main.feed(object(), material_id="m1", autofill=True)
         root_job = generation_jobs.get_job(conn, queued["generation_job_id"])
@@ -3914,6 +4222,7 @@ def test_feed_reload_reports_the_latest_continuation_batch(monkeypatch) -> None:
         assert response["generation_job_status"] == "partial"
         assert response["continuation_token"] == continuation_job["id"]
         assert response["generation_id"] == continuation_generation_id
+        assert ranked_kwargs["released_only"] is True
     finally:
         conn.close()
 

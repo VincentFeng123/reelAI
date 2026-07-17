@@ -2542,6 +2542,323 @@ def test_trusted_claim_mismatch_ignores_unrelated_teaching_handoff() -> None:
     )
 
 
+def test_trusted_live_dependent_answer_recovers_its_question_context() -> None:
+    segments = [
+        {
+            "cue_id": "vxFYfumAAlY:cue:3",
+            "start": 102.42,
+            "end": 130.58,
+            "text": (
+                "Will acceleration be involved here? Yes, because the velocity is "
+                "changing. It was zero initially, and at the end of five seconds "
+                "it's 20 kilometers per hour. In another scenario, assume that a "
+                "body is moving at 30 kilometers an hour, and then it moves right at "
+                "30 kilometers an hour and continues traveling at the same speed of "
+                "30 kilometers per hour. Will there be acceleration in this case?"
+            ),
+        },
+        {
+            "cue_id": "vxFYfumAAlY:cue:4",
+            "start": 135.32,
+            "end": 169.56,
+            "text": (
+                "The answer is yes ! As the direction is changing, the velocity will "
+                "also change. The only thing constant in this example is speed. But "
+                "the velocity changes as the direction changes! So this was the most "
+                "important concept you had to know about acceleration. It will exist "
+                "only when there is a change in velocity!"
+            ),
+        },
+    ]
+    claim = "As the direction is changing, the velocity will also change"
+    plan = _compact_custom_plan(
+        request="acceleration",
+        start_quote="The answer is yes ! As the",
+        end_quote="It will exist only when there is a change in velocity!",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "when-does-acceleration-exist",
+            "start_line": 1,
+            "end_line": 1,
+            "title": "When Does Acceleration Exist?",
+            "learning_objective": (
+                "Identify that acceleration occurs whenever speed or direction changes"
+            ),
+            "facet": "acceleration and changing velocity",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "vxFYfumAAlY:cue:3"
+    assert "In another scenario, assume" in clip["_clip_text"]
+    assert "Will there be acceleration in this case? The answer is yes" in (
+        clip["_clip_text"]
+    )
+    assert not clip["_clip_text"].startswith("The answer is yes")
+
+
+def test_trusted_live_weight_fragment_recovers_split_definition() -> None:
+    segments = [
+        {
+            "cue_id": "pL2YfC-22Uc:cue:9",
+            "start": 306.12,
+            "end": 351.039,
+            "text": (
+                "Mass is measured in units of kilograms. Weight is different from "
+                "mass. Weight is a force. Weight is equal to mass time gravitational "
+                "acceleration. Weight is simply the force of"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:10",
+            "start": 348.0,
+            "end": 399.88,
+            "text": (
+                "gravity that is acting on you. And so weight is a downward force. "
+                "Consider this 20 kg object. What is the weight force acting on it? "
+                "Go ahead and calculate it. So the weight force is always equal to mg "
+                "mass time gravitational acceleration. On Earth the gravitational "
+                "acceleration is 9.8 meters per second squared. So 20 times 9.8 is "
+                "about 196 newtons. So that's the weight force."
+            ),
+        },
+    ]
+    claim = "weight force is always equal to mg mass time gravitational acceleration"
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote="gravity that is acting on you",
+        end_quote="So that's the weight force.",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "weight-force-calculation",
+            "start_line": 1,
+            "end_line": 1,
+            "title": "Calculating Weight Force",
+            "learning_objective": (
+                "Apply F=ma to solve for weight using mass and gravity"
+            ),
+            "facet": "calculating weight force",
+            "intent_evidence": [
+                gemini_segment._CompactIntentEvidence.model_validate({
+                    "id": "subject",
+                    "q": "Weight is equal to mass time gravitational acceleration",
+                }),
+            ],
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:9"
+    assert clip["start_quote"] == "Weight is simply the force of"
+    assert clip["_clip_text"].startswith("Weight is simply the force of gravity")
+    assert clip["edge_projection"]["start"]["quote"] == (
+        "Weight is simply the force of"
+    )
+
+
+def test_trusted_live_skating_fragment_never_starts_mid_phrase() -> None:
+    segments = [
+        {
+            "cue_id": "pL2YfC-22Uc:cue:14",
+            "start": 513.279,
+            "end": 527.839,
+            "text": (
+                "Newton's third law states that for every action force there is an "
+                "equal but opposite reaction force. So let's say if you have two people"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:15",
+            "start": 530.36,
+            "end": 573.04,
+            "text": (
+                "skating I'm just going to draw stick figures and one person has more "
+                "mass than the other person. So if the smaller person applies a force "
+                "of 100 newtons on the larger person, what force will the larger person "
+                "apply on the smaller person? The forces are equal and opposite."
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:16",
+            "start": 570.92,
+            "end": 614.72,
+            "text": (
+                "Now, let's say if the mass of the smaller person is 50 kg and the "
+                "mass of the larger person is 100 kg, who experiences the greater "
+                "acceleration? Let's say if they're on ice."
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:17",
+            "start": 612.279,
+            "end": 657.519,
+            "text": (
+                "However, the acceleration is not the same. If you use F equals ma, "
+                "the force acting on the smaller person is 100 and the mass is 50. So "
+                "solving for the acceleration, you can see that he's going to experience "
+                "an acceleration of 2 meters per second squared."
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:18",
+            "start": 654.2,
+            "end": 693.68,
+            "text": (
+                "The larger person has a mass of 100, so the acceleration is one. "
+                "The smaller person moves further because the acceleration is greater."
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:19",
+            "start": 689.839,
+            "end": 697.936,
+            "text": "he's not going to move back very much since he experiences a smaller acceleration.",
+        },
+    ]
+    claim = (
+        "solving for the acceleration, you can see that he's going to experience "
+        "an acceleration"
+    )
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote="skating I'm just going to draw",
+        end_quote="since he experiences a smaller acceleration.",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "solving-for-acceleration",
+            "start_line": 1,
+            "end_line": 5,
+            "title": "Solving for Acceleration",
+            "learning_objective": (
+                "Use F=ma to solve for acceleration given mass and force"
+            ),
+            "facet": "solving for acceleration",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert not clip["_clip_text"].startswith("skating")
+    assert clip["start_cue_id"] in {
+        "pL2YfC-22Uc:cue:14",
+        "pL2YfC-22Uc:cue:16",
+    }
+
+
+@pytest.mark.parametrize(
+    "independent_opening",
+    [
+        "No external force acts on the object.",
+        "Correct acceleration requires the net force.",
+        "Exactly one net force vector determines the acceleration.",
+    ],
+)
+def test_trusted_independent_opening_does_not_import_prior_sentence(
+    independent_opening: str,
+) -> None:
+    prefix = "Photosynthesis stores light energy."
+    text = f"{prefix} {independent_opening}"
+    plan = _compact_custom_plan(
+        request="acceleration",
+        start_quote=independent_opening,
+        end_quote=independent_opening,
+        claim_quote=independent_opening,
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 8.0, "text": text}],
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"] == independent_opening.rstrip(".")
+    assert prefix not in clip["_clip_text"]
+
+
+def test_trusted_lowercase_complete_cue_does_not_import_complete_prior_cue() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "Photosynthesis stores light energy.",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 4.1,
+            "end": 9.0,
+            "text": "acceleration equals net force divided by mass.",
+        },
+    ]
+    claim = "acceleration equals net force divided by mass"
+    plan = _compact_custom_plan(
+        request="acceleration",
+        start_quote=claim,
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 1,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "cue-1"
+    assert clip["_clip_text"] == claim
+
+
 @pytest.mark.parametrize(
     "later_setup",
     [
