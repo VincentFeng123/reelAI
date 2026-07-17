@@ -2062,31 +2062,41 @@ def test_trusted_live_acceleration_candidate_advances_to_its_mass_setup() -> Non
 
 
 @pytest.mark.parametrize(
-    ("model_start_line", "model_start_quote", "model_end_line", "model_end_quote"),
+    (
+        "model_start_line",
+        "model_start_quote",
+        "model_end_line",
+        "model_end_quote",
+        "combined_acceleration_tail",
+    ),
     [
         (
             1,
             "units for speed so if you're",
             3,
             "speed doesn't change you are accelerating",
+            True,
         ),
         (
             0,
             "meters per second these are all examples",
             3,
             "speed doesn't change you are accelerating",
+            False,
         ),
         (
             1,
             "units for speed so if you're",
             2,
             "common units for acceleration",
+            False,
         ),
         (
             1,
             "units of speed so if you're",
             2,
             "common units for acceleration",
+            False,
         ),
     ],
     ids=[
@@ -2101,6 +2111,7 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
     model_start_quote: str,
     model_end_line: int,
     model_end_quote: str,
+    combined_acceleration_tail: bool,
 ) -> None:
     raw_cues = [
         (
@@ -2159,7 +2170,11 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
         }
         for cue, start, end, text in raw_cues
     ]
-    claim = "meters per second squared are common units for acceleration"
+    claim = (
+        "meters per second squared are common units for acceleration"
+        if combined_acceleration_tail
+        else "meters per second squared are common units"
+    )
     plan = _compact_custom_plan(
         request="Newton's second law",
         start_quote=model_start_quote,
@@ -2168,18 +2183,32 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
     )
     plan = plan.model_copy(update={
         "topics": [plan.topics[0].model_copy(update={
-            "candidate_id": "acceleration-definition-units",
+            "candidate_id": (
+                "acceleration-and-units"
+                if combined_acceleration_tail
+                else "acceleration-definition-units"
+            ),
             "start_line": model_start_line,
             "end_line": model_end_line,
-            "title": "Defining Acceleration and Its Units",
-            "learning_objective": (
-                "Define acceleration as the rate of velocity change and identify its units."
+            "title": (
+                "Acceleration and its Units"
+                if combined_acceleration_tail
+                else "Defining Acceleration and Its Units"
             ),
-            "facet": "acceleration definition",
+            "learning_objective": (
+                "Define acceleration, state its units, and identify causes of acceleration"
+                if combined_acceleration_tail
+                else "Define acceleration as the rate of velocity change and identify its units"
+            ),
+            "facet": (
+                "speed and acceleration definition and units"
+                if combined_acceleration_tail
+                else "acceleration definition and units"
+            ),
             "directly_teaches_topic": False,
         })],
     })
-    if model_end_line == 2:
+    if model_end_line == 2 or combined_acceleration_tail:
         exact_request = (
             "Explain Newton's second law F=ma from intuition through worked examples, "
             "including net force, mass, acceleration, units, and solving for each variable"
@@ -2212,14 +2241,14 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
                     gemini_segment._CompactIntentEvidence.model_validate({
                         "id": "acceleration",
                         "q": (
-                            "acceleration which is simply the rate at which velocity changes"
+                            "the rate at which velocity changes"
+                            if combined_acceleration_tail
+                            else "you're now ready to understand acceleration"
                         ),
                     }),
                     gemini_segment._CompactIntentEvidence.model_validate({
                         "id": "units",
-                        "q": (
-                            "meters per second squared are common units for acceleration"
-                        ),
+                        "q": claim,
                     }),
                 ],
             })],
@@ -2328,6 +2357,187 @@ def test_trusted_recovered_misaligned_start_uses_later_claim_handoff() -> None:
     }
     assert "range_recovered_from_edges" in clip["_boundary_fallback_reasons"]
     assert "trimmed_clipped_start_to_claim_setup" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_claim_quote_mismatch_beats_polluted_metadata_anchor() -> None:
+    speed_setup = "Speed uses units such as miles an hour"
+    claim = "meters per second squared are common units for acceleration"
+    segments = [
+        {
+            "cue_id": "Jyiw6KkedDY:cue:1",
+            "start": 31.08,
+            "end": 60.48,
+            "text": f"{speed_setup}.",
+        },
+        {
+            "cue_id": "Jyiw6KkedDY:cue:2",
+            "start": 60.48,
+            "end": 95.729,
+            "text": (
+                "with that knowledge in hand you're now ready to understand "
+                "acceleration which is simply the rate at which velocity changes "
+                "and meters per second squared are common units for acceleration"
+            ),
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="acceleration",
+        start_quote=speed_setup,
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "acceleration-and-units",
+            "start_line": 0,
+            "end_line": 1,
+            "title": "Acceleration and its Units",
+            "learning_objective": (
+                "Define acceleration, state its units, and identify causes of acceleration"
+            ),
+            # Deliberately repeats both start-quote anchors. The atomic claim,
+            # not polluted metadata, must control this strong teaching handoff.
+            "facet": "speed and acceleration definition and units",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "Jyiw6KkedDY:cue:2"
+    assert clip["start_quote"] == "you're now ready to understand acceleration"
+    assert clip["edge_projection"]["start"] == {
+        "required": True,
+        "cue_id": "Jyiw6KkedDY:cue:2",
+        "quote": "you're now ready to understand acceleration",
+    }
+    assert speed_setup not in clip["_clip_text"]
+    assert "trimmed_clipped_start_to_claim_setup" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_claim_mismatch_preserves_complete_wagon_setup() -> None:
+    wagon_setup = (
+        "Picture a loaded wagon that barely changes its motion when shoved"
+    )
+    claim = (
+        "Newton's second law says acceleration equals net force divided by mass"
+    )
+    segments = [
+        {
+            "cue_id": "wagon:cue:0",
+            "start": 0.0,
+            "end": 6.0,
+            "text": f"{wagon_setup}.",
+        },
+        {
+            "cue_id": "wagon:cue:1",
+            "start": 6.0,
+            "end": 14.0,
+            "text": (
+                "with that knowledge in hand you're now ready to understand "
+                f"{claim}."
+            ),
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote=wagon_setup,
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "title": "Newton's Second Law",
+            "learning_objective": (
+                "Explain how Newton's second law relates force, mass, and acceleration"
+            ),
+            # This makes the broad metadata anchor overlap the opening while
+            # the atomic claim remains lexically distinct from it.
+            "facet": "loaded wagon motion under Newton's second law",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "wagon:cue:0"
+    assert clip["start_quote"] == wagon_setup
+    assert clip["_clip_text"].startswith(wagon_setup)
+    assert "trimmed_clipped_start_to_claim_setup" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_claim_mismatch_ignores_unrelated_teaching_handoff() -> None:
+    speed_setup = "Speed uses units such as miles an hour"
+    claim = "meters per second squared are common units for acceleration"
+    segments = [
+        {
+            "cue_id": "energy:cue:0",
+            "start": 0.0,
+            "end": 6.0,
+            "text": f"{speed_setup}.",
+        },
+        {
+            "cue_id": "energy:cue:1",
+            "start": 6.0,
+            "end": 15.0,
+            "text": (
+                "with that knowledge in hand you're now ready to understand "
+                "energy through work and power, while meters per second squared "
+                "are common units for acceleration"
+            ),
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="acceleration",
+        start_quote=speed_setup,
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "title": "Acceleration and its Units",
+            "learning_objective": "Define acceleration and state its units",
+            "facet": "speed and acceleration definition and units",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "energy:cue:0"
+    assert clip["start_quote"] == speed_setup
+    assert clip["_clip_text"].startswith(speed_setup)
+    assert "trimmed_clipped_start_to_claim_setup" not in (
         clip["_boundary_fallback_reasons"]
     )
 

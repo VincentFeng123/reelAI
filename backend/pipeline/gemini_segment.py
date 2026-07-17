@@ -10047,7 +10047,7 @@ _TRUSTED_POSSESSIVE_OPENING_RE = re.compile(
 )
 _TRUSTED_PROJECTED_SETUP_RE = re.compile(
     r"^\s*(?:(?:now|so)\s*[,;:]?\s+)*"
-    r"(?:consider|imagine|suppose|take|let(?:['’]?s|\s+us)?)\b",
+    r"(?:consider|imagine|picture|suppose|take|let(?:['’]?s|\s+us)?)\b",
     re.IGNORECASE,
 )
 _TRUSTED_CONTEXTUAL_CUE_OPENING_RE = re.compile(
@@ -10418,6 +10418,7 @@ def _trusted_claim_setup_start(
     claim_location: tuple[int, int, int, int],
     anchor_text: str,
     teaching_handoff_only: bool = False,
+    teaching_subject_anchor_text: str = "",
 ) -> tuple[int, tuple[int, int]] | None:
     """Advance a Gemini edge to a later explicit, complete setup for its claim."""
     claim_line, claim_left, _claim_end_line, _claim_right = claim_location
@@ -10432,6 +10433,32 @@ def _trusted_claim_setup_start(
                 and handoff.group("teaching_setup") is None
             ):
                 continue
+            if (
+                teaching_subject_anchor_text
+                and handoff.group("teaching_setup") is not None
+            ):
+                subject_tail = source[handoff.end("teaching_setup"):]
+                subject_phrase = re.split(
+                    r"[,;:.!?]|\b(?:after|and|are|as|before|but|because|"
+                    r"describes?|if|is|means?|once|refers?|so|that|then|"
+                    r"when|where|whereas|which|while|who|why)\b",
+                    subject_tail,
+                    maxsplit=1,
+                    flags=re.IGNORECASE,
+                )[0]
+                generic_subject_tokens = {
+                    "concept", "idea", "lesson", "material", "principle",
+                    "subject", "thing", "topic",
+                }
+                subject_tokens = (
+                    _content_tokens(subject_phrase) - generic_subject_tokens
+                )
+                claim_tokens = (
+                    _content_tokens(teaching_subject_anchor_text)
+                    - generic_subject_tokens
+                )
+                if not subject_tokens.intersection(claim_tokens):
+                    continue
             setup_left = (
                 handoff.start("teaching_setup")
                 if handoff.group("teaching_setup") is not None
@@ -10776,6 +10803,13 @@ def _trusted_compact_plan_to_report(
                 )
                 < 2
             )
+            model_start_misses_claim_quote = (
+                len(
+                    _content_tokens(model_start_quote)
+                    & _content_tokens(model_claim_quote)
+                )
+                < 2
+            )
             claim_setup_start: tuple[int, tuple[int, int]] | None = None
             current_start_text = str(segments[a].get("text") or "")
             current_start_left = start_span[0] if start_span is not None else 0
@@ -10801,7 +10835,31 @@ def _trusted_compact_plan_to_report(
                     and not _opening_clause_is_standalone(current_start_text)
                 )
             )
-            if current_start_is_clipped or model_start_misses_claim_anchor:
+            claim_mismatch_only = bool(
+                model_start_misses_claim_quote
+                and not current_start_is_clipped
+                and not model_start_misses_claim_anchor
+            )
+            current_selected = current_start_text[current_start_left:]
+            current_sentences = _sentence_character_spans(current_selected)
+            current_opening = (
+                current_selected[:current_sentences[0][1]]
+                if current_sentences
+                else current_selected
+            )
+            preserve_complete_local_setup = bool(
+                claim_mismatch_only
+                and _TRUSTED_PROJECTED_SETUP_RE.match(current_opening)
+                and _local_example_setup_is_complete(current_opening)
+            )
+            if (
+                not preserve_complete_local_setup
+                and (
+                    current_start_is_clipped
+                    or model_start_misses_claim_anchor
+                    or model_start_misses_claim_quote
+                )
+            ):
                 claim_setup_start = _trusted_claim_setup_start(
                     segments,
                     selected_line=a,
@@ -10809,6 +10867,9 @@ def _trusted_compact_plan_to_report(
                     claim_location=claim_location,
                     anchor_text=claim_anchor_text,
                     teaching_handoff_only=not current_start_is_clipped,
+                    teaching_subject_anchor_text=(
+                        model_claim_quote if claim_mismatch_only else ""
+                    ),
                 )
                 if (
                     claim_setup_start is not None
