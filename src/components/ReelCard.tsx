@@ -39,6 +39,8 @@ const RESUME_MASK_MS = 480;
 const AUTOPLAY_RETRY_DELAY_MS = 320;
 const AUTOPLAY_MAX_RETRIES = 5;
 const CLIP_END_POLL_INTERVAL_MS = 20;
+const BACKWARD_SEEK_PREROLL_SEC = 1;
+const NEAR_ZERO_SEEK_CONFIRM_SEC = 0.05;
 const PLAYBACK_SPEED_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as const;
 
 function detectTouchLikeDevice(): boolean {
@@ -124,6 +126,18 @@ function hasReachedVerifiedClipEnd(playerTime: number, clipEnd: number): boolean
   return Number.isFinite(playerTime) && playerTime + 0.01 >= clipEnd;
 }
 
+function hasReachedVerifiedClipStart(playerTime: number, clipStart: number): boolean {
+  return Number.isFinite(playerTime) && playerTime >= clipStart;
+}
+
+function hasObservedBoundarySeek(playerTime: number, targetTime: number): boolean {
+  return Number.isFinite(playerTime) && (
+    targetTime <= NEAR_ZERO_SEEK_CONFIRM_SEC
+      ? playerTime <= NEAR_ZERO_SEEK_CONFIRM_SEC
+      : playerTime < targetTime
+  );
+}
+
 function formatClock(seconds: number): string {
   const s = Math.max(0, Math.floor(seconds));
   const m = Math.floor(s / 60);
@@ -164,12 +178,18 @@ export function ReelCard({
   const didUserInteractRef = useRef(false);
   const manualPauseRequestedRef = useRef(false);
   const isMutedRef = useRef(mutedPreference);
+  const mutedPreferenceRef = useRef(mutedPreference);
+  const isTouchLikeDeviceRef = useRef(false);
+  const boundaryGateTargetRef = useRef<number | null>(null);
+  const boundaryGateArmedRef = useRef(false);
+  const boundaryGateAwaitingSeekRef = useRef(false);
 
   const [isReady, setIsReady] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(mutedPreference);
   const [isSurfaceVisible, setIsSurfaceVisible] = useState(false);
   const [isResumeMaskVisible, setIsResumeMaskVisible] = useState(false);
+  const [isBoundaryMaskVisible, setIsBoundaryMaskVisible] = useState(false);
   const [currentSec, setCurrentSec] = useState(0);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isTouchLikeDevice, setIsTouchLikeDevice] = useState(false);
@@ -196,6 +216,10 @@ export function ReelCard({
   useEffect(() => {
     isMutedRef.current = isMuted;
   }, [isMuted]);
+
+  useEffect(() => {
+    mutedPreferenceRef.current = mutedPreference;
+  }, [mutedPreference]);
 
   useEffect(() => {
     autoplayEnabledRef.current = autoplayEnabled;
@@ -227,7 +251,9 @@ export function ReelCard({
     }
     const mediaQuery = window.matchMedia?.("(pointer: coarse)");
     const update = () => {
-      setIsTouchLikeDevice(detectTouchLikeDevice());
+      const touchLike = detectTouchLikeDevice();
+      isTouchLikeDeviceRef.current = touchLike;
+      setIsTouchLikeDevice(touchLike);
       setIsMobilePhoneDevice(detectMobilePhoneDevice());
     };
     update();
@@ -326,6 +352,59 @@ export function ReelCard({
     }
   }, []);
 
+  const armBoundaryGate = useCallback((player: YouTubePlayer, targetTime: number) => {
+    boundaryGateTargetRef.current = targetTime;
+    boundaryGateArmedRef.current = true;
+    player.mute();
+    isMutedRef.current = true;
+    setIsMuted(true);
+    setIsBoundaryMaskVisible(true);
+  }, []);
+
+  const seekToBoundary = useCallback((player: YouTubePlayer, targetTime: number) => {
+    const playerTime = player.getCurrentTime();
+    const isBackwardSeek = Number.isFinite(playerTime) && playerTime > targetTime;
+    armBoundaryGate(player, targetTime);
+    boundaryGateAwaitingSeekRef.current = isBackwardSeek;
+    player.seekTo(
+      isBackwardSeek
+        ? Math.max(0, targetTime - BACKWARD_SEEK_PREROLL_SEC)
+        : targetTime,
+      true,
+    );
+  }, [armBoundaryGate]);
+
+  const releaseBoundaryGate = useCallback((player: YouTubePlayer) => {
+    boundaryGateTargetRef.current = null;
+    boundaryGateArmedRef.current = false;
+    boundaryGateAwaitingSeekRef.current = false;
+    setIsBoundaryMaskVisible(false);
+    setIsResumeMaskVisible(false);
+    setIsSurfaceVisible(true);
+    const keepMuted =
+      mutedPreferenceRef.current ||
+      (isTouchLikeDeviceRef.current && !didUserInteractRef.current);
+    if (keepMuted) {
+      player.mute();
+      isMutedRef.current = true;
+      setIsMuted(true);
+      return;
+    }
+    player.unMute();
+    isMutedRef.current = false;
+    setIsMuted(false);
+  }, []);
+
+  const coverBoundaryAndMute = useCallback((player: YouTubePlayer) => {
+    boundaryGateTargetRef.current = null;
+    boundaryGateArmedRef.current = true;
+    boundaryGateAwaitingSeekRef.current = false;
+    player.mute();
+    isMutedRef.current = true;
+    setIsMuted(true);
+    setIsBoundaryMaskVisible(true);
+  }, []);
+
   const startProgressTimer = useCallback(() => {
     stopProgressTimer();
     progressTimerRef.current = setInterval(() => {
@@ -336,6 +415,34 @@ export function ReelCard({
       const playerTime = player.getCurrentTime();
       if (!Number.isFinite(playerTime)) {
         return;
+      }
+      if (boundaryGateArmedRef.current) {
+        const gateTarget = boundaryGateTargetRef.current;
+        if (
+          gateTarget !== null &&
+          boundaryGateAwaitingSeekRef.current
+        ) {
+          if (!hasObservedBoundarySeek(playerTime, gateTarget)) {
+            player.mute();
+            isMutedRef.current = true;
+            setIsMuted(true);
+            setIsBoundaryMaskVisible(true);
+            return;
+          }
+          boundaryGateAwaitingSeekRef.current = false;
+        }
+        if (
+          gateTarget !== null &&
+          hasReachedVerifiedClipStart(playerTime, gateTarget)
+        ) {
+          releaseBoundaryGate(player);
+        } else {
+          player.mute();
+          isMutedRef.current = true;
+          setIsMuted(true);
+          setIsBoundaryMaskVisible(true);
+          return;
+        }
       }
       const now = clamp(playerTime, clipStart, clipEnd);
       const fraction = clipDuration > 0 ? clamp((now - clipStart) / clipDuration, 0, 1) : 0;
@@ -350,9 +457,9 @@ export function ReelCard({
         if (!didHandleClipEndRef.current) {
           didHandleClipEndRef.current = true;
           manualPauseRequestedRef.current = true;
+          coverBoundaryAndMute(player);
           player.pauseVideo();
           setIsPlaying(false);
-          setIsResumeMaskVisible(false);
           setCurrentSec(clipDuration);
           stopProgressTimer();
           if (autoplayEnabledRef.current && isActive && onRequestNextReel) {
@@ -364,7 +471,17 @@ export function ReelCard({
       const rel = clamp(now - clipStart, 0, clipDuration);
       setCurrentSec(rel);
     }, CLIP_END_POLL_INTERVAL_MS);
-  }, [clipDuration, clipEnd, clipStart, isActive, onPlaybackProgress, onRequestNextReel, stopProgressTimer]);
+  }, [
+    clipDuration,
+    clipEnd,
+    clipStart,
+    coverBoundaryAndMute,
+    isActive,
+    onPlaybackProgress,
+    onRequestNextReel,
+    releaseBoundaryGate,
+    stopProgressTimer,
+  ]);
 
   useEffect(() => {
     if (!isYouTubeVideo || !isActive || !isReady || !isPlaying) {
@@ -474,6 +591,10 @@ export function ReelCard({
     setIsMuted(mutedPreference);
     setIsSurfaceVisible(false);
     setIsResumeMaskVisible(false);
+    boundaryGateTargetRef.current = isYouTubeVideo && isActive ? clipStart : null;
+    boundaryGateArmedRef.current = isYouTubeVideo && isActive;
+    boundaryGateAwaitingSeekRef.current = false;
+    setIsBoundaryMaskVisible(isYouTubeVideo && isActive);
     setLoadError(null);
     didUserInteractRef.current = false;
     manualPauseRequestedRef.current = false;
@@ -489,11 +610,16 @@ export function ReelCard({
       setCurrentSec(0);
       setIsSurfaceVisible(true);
       setIsResumeMaskVisible(false);
+      setIsBoundaryMaskVisible(false);
       setLoadError(null);
       return;
     }
     if (!videoId) {
       setLoadError("Invalid YouTube clip URL");
+      boundaryGateArmedRef.current = false;
+      boundaryGateTargetRef.current = null;
+      boundaryGateAwaitingSeekRef.current = false;
+      setIsBoundaryMaskVisible(false);
       return;
     }
     if (!hostContainerRef.current) {
@@ -509,6 +635,10 @@ export function ReelCard({
         const yt = (window as any).YT;
         if (!yt?.Player) {
           setLoadError("YouTube player API unavailable");
+          boundaryGateArmedRef.current = false;
+          boundaryGateTargetRef.current = null;
+          boundaryGateAwaitingSeekRef.current = false;
+          setIsBoundaryMaskVisible(false);
           return;
         }
         clearHostContainer();
@@ -543,10 +673,7 @@ export function ReelCard({
                 if (cancelled || !isActive || didUserInteractRef.current) {
                   return;
                 }
-                event.target.mute();
-                isMutedRef.current = true;
-                setIsMuted(true);
-                event.target.seekTo(clipStart, true);
+                seekToBoundary(event.target as YouTubePlayer, clipStart);
                 event.target.playVideo();
               };
               const queueAutoplayRetry = () => {
@@ -590,6 +717,17 @@ export function ReelCard({
               const playerState = yt.PlayerState;
               if (state === playerState.PLAYING) {
                 clearAutoplayRetryTimer();
+                if (
+                  boundaryGateArmedRef.current &&
+                  boundaryGateTargetRef.current === null
+                ) {
+                  manualPauseRequestedRef.current = true;
+                  coverBoundaryAndMute(event.target as YouTubePlayer);
+                  event.target.pauseVideo();
+                  setIsPlaying(false);
+                  stopProgressTimer();
+                  return;
+                }
                 autoplayRetryCountRef.current = 0;
                 didHandleClipEndRef.current = false;
                 manualPauseRequestedRef.current = false;
@@ -603,6 +741,7 @@ export function ReelCard({
                 if (
                   isActive
                   && !manualPauseRequestedRef.current
+                  && !didUserInteractRef.current
                   && autoplayRetryCountRef.current < AUTOPLAY_MAX_RETRIES
                 ) {
                   clearAutoplayRetryTimer();
@@ -612,14 +751,7 @@ export function ReelCard({
                       return;
                     }
                     autoplayRetryCountRef.current += 1;
-                    if (isMutedRef.current) {
-                      event.target.mute();
-                      setIsMuted(true);
-                    } else {
-                      event.target.unMute();
-                      setIsMuted(false);
-                    }
-                    event.target.seekTo(clipStart, true);
+                    seekToBoundary(event.target as YouTubePlayer, clipStart);
                     event.target.playVideo();
                   }, AUTOPLAY_RETRY_DELAY_MS);
                 }
@@ -629,9 +761,9 @@ export function ReelCard({
                 if (!didHandleClipEndRef.current) {
                   didHandleClipEndRef.current = true;
                   manualPauseRequestedRef.current = true;
+                  coverBoundaryAndMute(event.target as YouTubePlayer);
                   event.target.pauseVideo();
                   setIsPlaying(false);
-                  setIsResumeMaskVisible(false);
                   setCurrentSec(clipDuration);
                   stopProgressTimer();
                   if (autoplayEnabledRef.current && isActive && onRequestNextReel) {
@@ -641,11 +773,18 @@ export function ReelCard({
                 return;
               } else if ((state === playerState.UNSTARTED || state === playerState.CUED) && isActive) {
                 // Retry autoplay for devices that initially report cued/unstarted.
+                if (
+                  boundaryGateArmedRef.current &&
+                  boundaryGateTargetRef.current === null
+                ) {
+                  coverBoundaryAndMute(event.target as YouTubePlayer);
+                  return;
+                }
                 manualPauseRequestedRef.current = false;
                 if (autoplayRetryCountRef.current < AUTOPLAY_MAX_RETRIES) {
                   autoplayRetryCountRef.current += 1;
                 }
-                if (isMutedRef.current) {
+                if (boundaryGateArmedRef.current || isMutedRef.current) {
                   event.target.mute();
                   setIsMuted(true);
                 } else {
@@ -663,6 +802,10 @@ export function ReelCard({
               setLoadError("Could not load this YouTube clip");
               setIsSurfaceVisible(false);
               setIsResumeMaskVisible(false);
+              boundaryGateArmedRef.current = false;
+              boundaryGateTargetRef.current = null;
+              boundaryGateAwaitingSeekRef.current = false;
+              setIsBoundaryMaskVisible(false);
               setIsPlaying(false);
               stopProgressTimer();
             },
@@ -672,6 +815,10 @@ export function ReelCard({
       .catch(() => {
         if (!cancelled) {
           setLoadError("Could not initialize the YouTube player");
+          boundaryGateArmedRef.current = false;
+          boundaryGateTargetRef.current = null;
+          boundaryGateAwaitingSeekRef.current = false;
+          setIsBoundaryMaskVisible(false);
         }
       });
 
@@ -691,8 +838,10 @@ export function ReelCard({
     clipDuration,
     clipEnd,
     clipStart,
+    coverBoundaryAndMute,
     isActive,
     scheduleSurfaceReveal,
+    seekToBoundary,
     showResumeMask,
     startProgressTimer,
     stopProgressTimer,
@@ -712,6 +861,12 @@ export function ReelCard({
     }
     const player = playerRef.current;
     if (!player || !isActive || !isReady) {
+      return;
+    }
+    if (boundaryGateArmedRef.current) {
+      player.mute();
+      isMutedRef.current = true;
+      setIsMuted(true);
       return;
     }
     if (isTouchLikeDevice && !didUserInteractRef.current) {
@@ -739,7 +894,11 @@ export function ReelCard({
     }
     didUserInteractRef.current = true;
     clearAutoplayRetryTimer();
-    if (!isPlaying && !mutedPreference) {
+    if (
+      !isPlaying &&
+      !mutedPreference &&
+      !boundaryGateArmedRef.current
+    ) {
       player.unMute();
       isMutedRef.current = false;
       setIsMuted(false);
@@ -756,7 +915,7 @@ export function ReelCard({
     if (clipDuration > 0 && currentSec >= clipDuration - 0.05) {
       didHandleClipEndRef.current = false;
       setCurrentSec(0);
-      player.seekTo(clipStart, true);
+      seekToBoundary(player, clipStart);
     }
     manualPauseRequestedRef.current = false;
     showResumeMask(RESUME_MASK_MS);
@@ -775,6 +934,7 @@ export function ReelCard({
     isYouTubeVideo,
     mutedPreference,
     scheduleSurfaceReveal,
+    seekToBoundary,
     showResumeMask,
     startProgressTimer,
     stopProgressTimer,
@@ -793,14 +953,21 @@ export function ReelCard({
     manualPauseRequestedRef.current = false;
     clearAutoplayRetryTimer();
     const nextMuted = !isMuted;
+    mutedPreferenceRef.current = nextMuted;
     if (nextMuted) {
       player.mute();
       isMutedRef.current = true;
       setIsMuted(true);
     } else {
-      player.unMute();
-      isMutedRef.current = false;
-      setIsMuted(false);
+      if (boundaryGateArmedRef.current) {
+        player.mute();
+        isMutedRef.current = true;
+        setIsMuted(true);
+      } else {
+        player.unMute();
+        isMutedRef.current = false;
+        setIsMuted(false);
+      }
     }
     onMutedPreferenceChange(nextMuted);
   }, [clearAutoplayRetryTimer, isMuted, isReady, isYouTubeVideo, onMutedPreferenceChange]);
@@ -844,10 +1011,13 @@ export function ReelCard({
         return;
       }
       const rel = clamp(Number(event.target.value), 0, clipDuration);
+      didUserInteractRef.current = true;
+      clearAutoplayRetryTimer();
       didHandleClipEndRef.current = false;
       setCurrentSec(rel);
       manualPauseRequestedRef.current = false;
-      player.seekTo(clipStart + rel, true);
+      const targetTime = clipStart + rel;
+      seekToBoundary(player, targetTime);
       if (!isPlaying && isActive) {
         showResumeMask(RESUME_MASK_MS);
         scheduleSurfaceReveal(PLAYER_REVEAL_DELAY_MS);
@@ -857,7 +1027,19 @@ export function ReelCard({
         startProgressTimer();
       }
     },
-    [clipDuration, clipStart, isActive, isPlaying, isReady, isYouTubeVideo, scheduleSurfaceReveal, showResumeMask, startProgressTimer],
+    [
+      clearAutoplayRetryTimer,
+      clipDuration,
+      clipStart,
+      isActive,
+      isPlaying,
+      isReady,
+      isYouTubeVideo,
+      scheduleSurfaceReveal,
+      seekToBoundary,
+      showResumeMask,
+      startProgressTimer,
+    ],
   );
 
   const stopFeedGesturePropagation = useCallback((event: React.SyntheticEvent<HTMLElement>) => {
@@ -908,6 +1090,7 @@ export function ReelCard({
 
   const hidePlayerSurface = isActive && isYouTubeVideo && (!isReady || !isPlaying || !isSurfaceVisible || Boolean(loadError));
   const showTransitionMask = isActive && isYouTubeVideo && isResumeMaskVisible;
+  const showBoundaryMask = isActive && isYouTubeVideo && isBoundaryMaskVisible;
   const canToggleFromSurface = isYouTubeVideo && isActive && isReady && !loadError;
   const surfaceAriaLabel = isPlaying ? "Pause clip" : "Play clip";
   const controlsEnabled = isReady && isActive && isYouTubeVideo;
@@ -953,14 +1136,20 @@ export function ReelCard({
       )}
 
       <div
-        className={`pointer-events-none absolute inset-0 z-10 bg-black transition-opacity duration-200 ${
-          hidePlayerSurface ? "opacity-95" : "opacity-0"
+        className={`pointer-events-none absolute inset-0 z-10 bg-black ${
+          hidePlayerSurface ? "opacity-100" : "opacity-0"
         }`}
       />
 
       <div
         className={`pointer-events-none absolute inset-0 z-[14] bg-black ${
-          showTransitionMask ? "opacity-92" : "opacity-0"
+          showTransitionMask ? "opacity-100" : "opacity-0"
+        }`}
+      />
+
+      <div
+        className={`pointer-events-none absolute inset-0 z-[14] bg-black ${
+          showBoundaryMask ? "opacity-100" : "opacity-0"
         }`}
       />
 

@@ -1206,14 +1206,18 @@ def test_production_new_example_handoff_licenses_only_grounded_start_repair(
     )
     assert repaired is should_advance
     if should_advance:
-        assert clip["_clip_text"].startswith(evidence_quote)
+        assert evidence_quote in clip["_clip_text"]
         assert "five x minus four" not in clip["_clip_text"]
-        assert clip["edge_projection"]["start"]["quote"] == evidence_quote
+        projected_start = clip["edge_projection"]["start"]["quote"]
+        assert (
+            projected_start == evidence_quote
+            or projected_start.startswith("Now let's try another example")
+        )
     else:
         assert clip["_clip_text"].startswith("This is simply equal to 5")
 
 
-def test_production_preserves_gemini_range_without_semantic_expansion() -> None:
+def test_production_expands_anaphoric_start_without_semantic_rejection() -> None:
     segments = [
         {
             "cue_id": "cue-0",
@@ -1264,12 +1268,12 @@ def test_production_preserves_gemini_range_without_semantic_expansion() -> None:
     assert report.accepted_count == report.proposed_count == 1
     assert report.rejected_reasons == []
     [clip] = report.clips
-    assert clip["cue_ids"] == ["cue-1", "cue-2"]
+    assert clip["cue_ids"] == ["cue-0", "cue-1", "cue-2"]
     assert clip["_clip_text"] == " ".join(
-        segment["text"] for segment in segments[1:]
+        segment["text"] for segment in segments
     )
     assert "end_expanded_to_claim" in clip["_boundary_fallback_reasons"]
-    assert "context_expanded_start" not in clip["_boundary_fallback_reasons"]
+    assert "expanded_start_context" in clip["_boundary_fallback_reasons"]
 
 
 def test_production_preserves_restated_worked_example_start_inside_coarse_cue() -> None:
@@ -1454,6 +1458,596 @@ def test_production_preserves_gemini_fragment_projection_without_rejection() -> 
         "and its enclosing scope"
     )
     assert "expanded_incomplete_start" not in clip["_boundary_fallback_reasons"]
+
+
+def test_trusted_candidate_expands_ordinal_opening_to_spoken_antecedent() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 6.0,
+            "text": (
+                "Newton's second law says net force equals mass times acceleration."
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 6.0,
+            "end": 12.0,
+            "text": "For a fixed mass, more net force produces more acceleration.",
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 12.0,
+            "end": 19.0,
+            "text": (
+                "The second law can be rephrased to state that acceleration is "
+                "proportional to net force."
+            ),
+        },
+    ]
+    claim = "acceleration is proportional to net force"
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote="The second law can be rephrased",
+        end_quote="proportional to net force",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 2,
+            "end_line": 2,
+            "intent_evidence": [gemini_segment._CompactIntentEvidence(
+                id="subject", q=claim,
+            )],
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-0", "cue-1", "cue-2"]
+    assert clip["_clip_text"].startswith("Newton's second law")
+    assert "expanded_start_context" in clip["_boundary_fallback_reasons"]
+
+
+def test_trusted_candidate_expands_unsafe_mid_cue_definition_start() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "Newton's second law connects net force, mass, and acceleration."
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 8.0,
+            "end": 18.0,
+            "text": (
+                "With that knowledge in hand, you are now ready to understand "
+                "acceleration which is simply the rate at which velocity changes."
+            ),
+        },
+    ]
+    claim = "acceleration which is simply the rate at which velocity changes"
+    plan = _compact_custom_plan(
+        request="acceleration",
+        start_quote="acceleration which is simply the rate",
+        end_quote="rate at which velocity changes",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 1,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-0", "cue-1"]
+    assert clip["_clip_text"].startswith("Newton's second law")
+    assert "expanded_start_context" in clip["_boundary_fallback_reasons"]
+
+
+def test_trusted_ordinal_context_drops_speaker_tag_before_named_setup() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 1.89,
+            "text": "Professor Dave again, I want to tell you",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 1.89,
+            "end": 3.85,
+            "text": "about Newton's second law.",
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 3.85,
+            "end": 8.0,
+            "text": "For a fixed mass, more net force produces more acceleration.",
+        },
+        {
+            "cue_id": "cue-3",
+            "start": 8.0,
+            "end": 15.0,
+            "text": (
+                "The second law can be rephrased to state that acceleration is "
+                "proportional to net force."
+            ),
+        },
+    ]
+    claim = "acceleration is proportional to net force"
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote="The second law can be rephrased",
+        end_quote="proportional to net force",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 3,
+            "end_line": 3,
+            "intent_evidence": [gemini_segment._CompactIntentEvidence(
+                id="subject", q=claim,
+            )],
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-0", "cue-1", "cue-2", "cue-3"]
+    assert clip["_clip_text"].startswith(
+        "I want to tell you about Newton's second law"
+    )
+    assert not clip["_clip_text"].startswith("Professor Dave again")
+    assert clip["edge_projection"]["start"]["quote"] == (
+        "I want to tell you"
+    )
+    assert "trimmed_speaker_framing_prefix" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_candidate_recovers_handoff_cut_before_its_subject() -> None:
+    text = (
+        "earth's gravitational field now let's talk more about the acceleration "
+        "due to gravity which is approximately 9.8 meters per second squared"
+    )
+    claim = "acceleration due to gravity which is approximately 9.8"
+    plan = _compact_custom_plan(
+        request="meaning of acceleration",
+        start_quote="the acceleration due to gravity",
+        end_quote="9.8 meters per second squared",
+        claim_quote=claim,
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith(
+        "now let's talk more about the acceleration"
+    )
+    assert not clip["_clip_text"].startswith("earth's gravitational field")
+    assert clip["edge_projection"]["start"]["quote"] == (
+        "now let's talk more about the"
+    )
+    assert "expanded_projected_start_context" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_candidate_keeps_unresolved_start_across_section_gap() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 3.0,
+            "text": "An unrelated earlier section ends here.",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 12.0,
+            "end": 18.0,
+            "text": "The second law says acceleration increases with net force.",
+        },
+    ]
+    claim = "acceleration increases with net force"
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote="The second law says",
+        end_quote="increases with net force",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 1,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-1"]
+    assert "unresolved_start_context" in clip["_boundary_fallback_reasons"]
+
+
+def test_trusted_candidate_recovers_same_cue_downward_scenario_start() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 20.0,
+            "text": "Tension is the pulling force exerted by a rope.",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 20.0,
+            "end": 45.0,
+            "text": (
+                "For the upward-moving box, the tension must be larger than its "
+                "weight, so the net force points upward."
+            ),
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 45.0,
+            "end": 70.0,
+            "text": (
+                "Now if you want to compare it to the weight force, the weight force "
+                "is greater. But now what if the rope is being used to allow the box "
+                "to slowly descend? Intuitively, tension must be less than the weight "
+                "force. So let's get the answer for part b."
+            ),
+        },
+        {
+            "cue_id": "cue-3",
+            "start": 70.0,
+            "end": 95.0,
+            "text": (
+                "The forces are weight downward and tension upward. Weight minus "
+                "tension equals mass times the downward acceleration."
+            ),
+        },
+        {
+            "cue_id": "cue-4",
+            "start": 95.0,
+            "end": 115.0,
+            "text": (
+                "With m equal to 50 and g equal to 9.8, solving the equation gives a "
+                "tension of 452.5 newtons, which is less than the weight force."
+            ),
+        },
+    ]
+    claim = "Weight minus tension equals mass times the downward acceleration"
+    plan = _compact_custom_plan(
+        request="tension while a box accelerates downward",
+        start_quote="what if the rope is being used to allow the box",
+        end_quote="less than the weight force",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "request_intent": gemini_segment._RequestIntent.model_validate({
+            "exact_request": plan.request_intent.exact_request,
+            "constraints": [
+                {
+                    "constraint_id": "accel",
+                    "kind": "subject",
+                    "source_phrase": "downward acceleration",
+                    "requirement": "Use downward acceleration",
+                },
+                {
+                    "constraint_id": "units",
+                    "kind": "format",
+                    "source_phrase": "newtons",
+                    "requirement": "Give the answer in newtons",
+                },
+                {
+                    "constraint_id": "mass",
+                    "kind": "subject",
+                    "source_phrase": "mass",
+                    "requirement": "Use the given mass",
+                },
+                {
+                    "constraint_id": "format",
+                    "kind": "format",
+                    "source_phrase": "worked example",
+                    "requirement": "Work through part b",
+                },
+            ],
+        }),
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 2,
+            "end_line": 4,
+            "title": "Tension While a Box Descends",
+            "learning_objective": (
+                "Solve for tension while a rope lowers an accelerating box."
+            ),
+            "facet": "Downward-acceleration tension scenario",
+            "intent_evidence": [
+                gemini_segment._CompactIntentEvidence(id="accel", q=claim),
+                gemini_segment._CompactIntentEvidence(
+                    id="units", q="tension of 452.5 newtons",
+                ),
+                gemini_segment._CompactIntentEvidence(
+                    id="mass", q="With m equal to 50 and g equal to 9.8",
+                ),
+                gemini_segment._CompactIntentEvidence(
+                    id="format", q="So let's get the answer for part b",
+                ),
+            ],
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["intent_coverage"] == 1.0
+    assert clip["cue_ids"] == ["cue-2", "cue-3", "cue-4"]
+    assert clip["_clip_text"].startswith(
+        "But now what if the rope is being used to allow the box to slowly descend"
+    )
+    assert "compare it to the weight force" not in clip["_clip_text"]
+    assert "trimmed_scenario_before_claim" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_candidate_does_not_widen_clean_unit_to_prior_scenario() -> None:
+    text = (
+        "What if scenario A doubles its input? Scenario A would increase its output. "
+        "Now let's discuss concept B. Concept B is a separate clean concept with its "
+        "own complete explanation."
+    )
+    claim = "Concept B is a separate clean concept with its own complete explanation"
+    plan = _compact_custom_plan(
+        request="concept B",
+        start_quote="Concept B is a separate clean concept",
+        end_quote="its own complete explanation",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "title": "Concept B",
+            "learning_objective": "Explain concept B as its own unit.",
+            "facet": "concept B",
+            "intent_evidence": [gemini_segment._CompactIntentEvidence(
+                id="subject", q=claim,
+            )],
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 18.0, "text": text}],
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith("Now let's discuss concept B")
+    assert "What if scenario A" not in clip["_clip_text"]
+    assert "scenario A" not in clip["_clip_text"]
+
+
+def test_trusted_candidate_trims_next_problem_tail_without_rejection() -> None:
+    text = (
+        "For part b, the acceleration is negative 0.75 meters per second squared. "
+        "The tension is 452.5 newtons, so it is less than the weight force "
+        "during downward acceleration. Now let's work on this problem what is "
+        "the tension in the two ropes in the picture shown below, and the crate "
+        "or the box, whatever you want to call it."
+    )
+    claim = "The tension is 452.5 newtons"
+    plan = _compact_custom_plan(
+        request="tension during downward acceleration",
+        start_quote="For part b, the acceleration is negative 0.75",
+        end_quote="whatever you want to call it",
+        claim_quote=claim,
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 40.0, "text": text}],
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].endswith("during downward acceleration")
+    assert "work on this problem" not in clip["_clip_text"]
+    assert {
+        "trimmed_same_cue_unit_after",
+        "trimmed_trailing_edge_noise",
+    } & set(clip["_boundary_fallback_reasons"])
+
+
+def test_trusted_candidate_atomizes_broad_span_around_gemini_claim() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 40.0,
+            "text": (
+                "However, the acceleration is not the same. Solving for the "
+                "acceleration, you can see that the smaller person accelerates more."
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 40.0,
+            "end": 80.0,
+            "text": (
+                "Another example of Newton's third law is gravitational force "
+                "between Earth and the moon."
+            ),
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 80.0,
+            "end": 120.0,
+            "text": "The resultant vector has a direction of 190.9 degrees.",
+        },
+        {
+            "cue_id": "cue-3",
+            "start": 120.0,
+            "end": 165.0,
+            "text": (
+                "Now, let's get back to tension. So let's say if we have a "
+                "horizontal surface and two blocks connected by a rope. A force of "
+                "60 newtons pulls to the right."
+            ),
+        },
+        {
+            "cue_id": "cue-4",
+            "start": 165.0,
+            "end": 210.0,
+            "text": (
+                "To find the tension, we find the acceleration. Using this equation F "
+                "is equal to MA we have a net force of 60 newtons and a total mass of "
+                "30 kilograms."
+            ),
+        },
+        {
+            "cue_id": "cue-5",
+            "start": 210.0,
+            "end": 250.0,
+            "text": (
+                "The acceleration is 2 meters per second squared, so isolate the "
+                "20 kilogram block and subtract its tension from 60 newtons."
+            ),
+        },
+        {
+            "cue_id": "cue-6",
+            "start": 250.0,
+            "end": 285.0,
+            "text": (
+                "The tension is 20 newtons and the net force is 40 newtons that "
+                "propels the block to the right."
+            ),
+        },
+    ]
+    constraints = [
+        {"constraint_id": "subject", "kind": "subject", "source_phrase": "F=ma", "requirement": "Use F=ma"},
+        {"constraint_id": "format", "kind": "format", "source_phrase": "worked example", "requirement": "Give a worked example"},
+        {"constraint_id": "components", "kind": "subject", "source_phrase": "net force", "requirement": "Use net force"},
+        {"constraint_id": "task", "kind": "task", "source_phrase": "solve", "requirement": "Solve for acceleration"},
+    ]
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": "Use F=ma in a worked two-block example",
+            "constraints": constraints,
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="f-ma-two-blocks-tension",
+            start_line=0,
+            end_line=6,
+            start_quote="However, the acceleration is not the same",
+            end_quote="propels the block to the right",
+            claim_quote="Using this equation F is equal to MA we have a net force of 60",
+            title="Applying F=ma to a Two-Block System",
+            learning_objective=(
+                "Use Newton's second law to solve for acceleration and tension in a "
+                "two-block system."
+            ),
+            facet="Worked example: Two connected blocks",
+            informativeness=0.9,
+            topic_relevance=0.95,
+            educational_importance=0.9,
+            difficulty=0.35,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[
+                {"id": "subject", "q": "Using this equation F is equal to MA"},
+                {"id": "format", "q": "let's say if we have a horizontal surface"},
+                {"id": "components", "q": "we have a net force of 60 newtons"},
+                {"id": "task", "q": "Solving for the acceleration, you can see that"},
+            ],
+        )],
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-3", "cue-4", "cue-5", "cue-6"]
+    assert clip["_clip_text"].startswith("Now, let's get back to tension")
+    assert "smaller person" not in clip["_clip_text"]
+    assert "resultant vector" not in clip["_clip_text"]
+    assert clip["intent_coverage"] == pytest.approx(0.75)
+    assert "trimmed_adjacent_unit_before" in clip["_boundary_fallback_reasons"]
 
 
 @pytest.mark.parametrize(
@@ -1728,7 +2322,13 @@ def test_newtons_second_law_prompt_requires_subject_anchoring_and_context() -> N
         "that spoken context"
     ) in normalized
     assert "begin sq at \"newton's second law\"" in normalized
-    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v7"
+    assert (
+        "a worked numerical example for a dimensioned quantity cannot end at a "
+        "unitless result"
+    ) in normalized
+    assert "include the contiguous spoken unit" in normalized
+    assert "end eq after the unit" in normalized
+    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v8"
 
 
 def test_boundary_prompt_stays_transcript_only_when_video_is_requested() -> None:

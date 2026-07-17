@@ -604,6 +604,10 @@ _FORWARD_TOPIC_TRANSITION_RE = re.compile(
     rf"{_TOPIC_NAVIGATION_ACTION_PATTERN}|"
     r"let(?:['’]?s|\s+us)\s+(?:back\s+up|move\s+on|turn\s+to))|"
     r"(?:(?:now|next)\s*[,;:]?\s+)?"
+    r"let(?:['’]?s|\s+us)\s+(?:solve|work\s+on|work\s+through)\s+"
+    r"(?:this|that|the)\s+"
+    r"(?:calculation|case|derivation|example|exercise|problem|proof)|"
+    r"(?:(?:now|next)\s*[,;:]?\s+)?"
     r"(?:let(?:['’]?s|\s+us)\s+(?:consider|do|go\s+through|look\s+at|take|"
     r"try|work\s+out|work\s+through)|consider|for|try)\s+"
     r"(?:another|one\s+more|the\s+next|a\s+(?:different|new))\s+"
@@ -737,8 +741,9 @@ _STRONG_RECAP_EXIT_RE = re.compile(
 )
 _HARD_TOPIC_RESET_RE = re.compile(
     r"(?<!\w)(?:(?:all right|alright|okay|ok|so)\s*[,;:]?\s+)*"
-    r"(?:(?:now\s+)?let(?:['’]?s|\s+us)\s+(?:move\s+on\s+to|switch\s+to|"
-    r"shift\s+to|turn\s+to|talk\s+about|discuss|cover|look\s+at)|"
+    r"(?:(?:now\s*[,;:]?\s+)?let(?:['’]?s|\s+us)\s+(?:move\s+on\s+to|switch\s+to|"
+    r"shift\s+to|turn\s+to|talk\s+(?:more\s+)?about|discuss|cover|look\s+at|"
+    r"(?:get|go)\s+back\s+to|return\s+to)|"
     r"(?:now\s+)?we(?:['’]re|\s+are)\s+(?:moving\s+on|switching|shifting|"
     r"turning)\s+to|"
     r"next\s+(?:we|i)(?:['’]ll|\s+will)\s+(?:move\s+on\s+to|switch\s+to|"
@@ -1537,6 +1542,15 @@ _TRAILING_EDGE_NOISE_RE = re.compile(
     rf"{_UNCONDITIONAL_TRAILING_EDGE_NOISE_PATTERN}|"
     rf"{_TRAILING_VERSION_EDGE_NOISE_PATTERN}|"
     r"(?:(?:all\s+right|alright|okay|ok|so)\s*[,;:]?\s+)?"
+    r"(?:now\s+)?let(?:['’]?s|\s+us)\s+"
+    r"(?:solve|work\s+on|work\s+through)\s+(?:this|that|the)\s+"
+    r"(?:calculation|case|derivation|example|exercise|problem|proof)\b|"
+    r"(?:(?:all\s+right|alright|okay|ok|so)\s*[,;:]?\s+)?"
+    r"(?:now\s+)?before\s+(?:i|we)\s+"
+    r"(?:go\s+over|start|work\s+through)\b[^.!?\n]{0,140}?"
+    r"(?:i|we)\s+(?:first\s+)?(?:have|need|want)\s+to\s+"
+    r"(?:cover|discuss|introduce|talk\s+(?:more\s+)?about)\b|"
+    r"(?:(?:all\s+right|alright|okay|ok|so)\s*[,;:]?\s+)?"
     r"(?:now\s+)?let(?:['’]?s|\s+us)(?:\s+(?:talk|discuss|cover|define|"
     r"introduce|move\s+on|"
     r"head(?:\s+(?:over|on))?|turn|switch|begin(?:\s+our\s+discussion)?)\b|"
@@ -1655,7 +1669,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v1"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v7"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v8"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -2070,6 +2084,11 @@ _POLICY_AND_EXAMPLES = """Policy:
   viewer hearing the clip without seeing the original video.
 - Include every necessary setup or prerequisite through the explanation's natural
   conclusion. For a worked example, include the question or setup, reasoning, and answer.
+- For a worked numerical example that solves for a dimensioned physical quantity, a bare
+  number is not a complete answer. Continue through the contiguous spoken unit statement
+  (for example, "two meters per second squared") and place eq after that unit. A later
+  general explanation of the unit may also be its own candidate only when it independently
+  contains substantive teaching beyond merely labeling the worked answer.
 - Give each candidate exactly one coherent learning objective. Split every independent,
   genuinely related facet or worked example into its own candidate. For a constrained
   request, distinguish exact PRIMARY units from related SUPPORTING units; do not collapse the
@@ -2157,6 +2176,8 @@ _POLICY_AND_EXAMPLES = """Policy:
 - A worked example cannot end at its question, setup, or first substituted value. Either
   include its reasoning and answer through end_quote or end the candidate before that
   optional example begins.
+- A worked numerical example for a dimensioned quantity cannot end at a unitless result.
+  Include the contiguous spoken unit as part of its answer and end eq after the unit.
 - A claim ending with an unfilled predicate such as "it can tell you" is incomplete. Continue
   through the spoken answer or omit that candidate. A terminal "uh" or "um" is never a
   conclusion. Split around internal filler or omit the candidate when no clean complete side
@@ -5704,7 +5725,7 @@ def _trailing_edge_noise_start(
         same_unit_navigation = bool(
             containing_sentence is not None
             and _SAME_UNIT_NAVIGATION_RE.search(
-                raw_text[containing_sentence[0]:containing_sentence[1]]
+                raw_text[start:containing_sentence[1]]
             )
         )
         if containing_sentence is not None and not same_unit_navigation:
@@ -9944,13 +9965,247 @@ def _best_effort_evidence_quote(text: str) -> str:
     return str(text or "")[chosen[0].start():chosen[-1].end()]
 
 
+_TRUSTED_ORDINAL_OPENING_RE = re.compile(
+    r"^\s*(?:(?:and|but|now|so)\s*[,;:]?\s+)?the\s+"
+    r"(?P<ordinal>first|second|third|fourth|fifth|sixth|seventh|eighth|"
+    r"ninth|tenth|\d+(?:st|nd|rd|th))\s+"
+    r"(?P<head>[a-z][\w'’-]*)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_DEMONSTRATIVE_OPENING_RE = re.compile(
+    r"^\s*(?:(?:and|but|now|so)\s*[,;:]?\s+)?"
+    r"(?:this|that|these|those)\s+"
+    r"(?P<head>answer|concept|equation|example|expression|formula|law|method|"
+    r"principle|problem|process|proof|relationship|result|rule|solution|step|"
+    r"system|value)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_POSSESSIVE_OPENING_RE = re.compile(
+    r"^\s*(?:(?:and|but|now|so)\s*[,;:]?\s+)?(?:its|their)\s+"
+    r"(?P<head>[a-z][\w'’-]*)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_PROJECTED_SETUP_RE = re.compile(
+    r"^\s*(?:(?:now|so)\s*[,;:]?\s+)*"
+    r"(?:consider|imagine|suppose|take|let(?:['’]?s|\s+us)?)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_CONTEXTUAL_CUE_OPENING_RE = re.compile(
+    r"^\s*about\b|"
+    r"^\s*(?:after|based\s+on|using|with)\s+"
+    r"(?:this|that|these|those|such)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_SCENARIO_HANDOFF_RE = re.compile(
+    r"(?<!\w)(?:(?:and|but|so)\s+)?(?:now\s+)?(?P<setup>what\s+if\b)",
+    re.IGNORECASE,
+)
+_TRUSTED_SPEAKER_FRAMING_SETUP_RE = re.compile(
+    r"^\s*(?:professor|doctor|dr\.?)\s+[^,;:!?]{1,60}"
+    r"[,;:—-]\s*(?P<setup>(?:i|we)\s+(?:want|would\s+like)\s+to\s+"
+    r"(?:explain|show|teach|tell)\b)",
+    re.IGNORECASE,
+)
+
+
+def _trusted_opening_reference_is_resolved(
+    opening_text: str,
+    prior_text: str,
+) -> bool:
+    """Require a literal spoken antecedent for a trusted dependent opening."""
+    opening = str(opening_text or "").strip()
+    prior = str(prior_text or "")
+    ordinal = _TRUSTED_ORDINAL_OPENING_RE.match(opening)
+    if ordinal is not None:
+        phrase = re.compile(
+            rf"\b{re.escape(ordinal.group('ordinal'))}\s+"
+            rf"{re.escape(ordinal.group('head'))}\b",
+            re.IGNORECASE,
+        )
+        for match in phrase.finditer(prior):
+            if re.search(r"\bthe\s*$", prior[:match.start()], re.IGNORECASE):
+                continue
+            return True
+        return False
+
+    demonstrative = _TRUSTED_DEMONSTRATIVE_OPENING_RE.match(opening)
+    if demonstrative is not None:
+        return bool(re.search(
+            rf"\b{re.escape(demonstrative.group('head'))}s?\b",
+            prior,
+            re.IGNORECASE,
+        ))
+
+    possessive = _TRUSTED_POSSESSIVE_OPENING_RE.match(opening)
+    if possessive is not None:
+        return bool(re.search(
+            rf"\b{re.escape(possessive.group('head'))}s?\b",
+            prior,
+            re.IGNORECASE,
+        ))
+
+    from .discourse import _has_unresolved_opening_back_reference
+
+    return not _has_unresolved_opening_back_reference(
+        opening,
+        prior_text=prior,
+    )
+
+
+def _trusted_hard_reset_start_span(
+    text: str,
+    *,
+    before: int | None = None,
+) -> tuple[int, int] | None:
+    """Keep a named structural handoff while dropping rolling-caption text before it."""
+    source = str(text or "")
+    resets = [
+        reset
+        for reset in _HARD_TOPIC_RESET_RE.finditer(source)
+        if before is None or reset.start() < before
+    ]
+    if not resets:
+        return None
+    reset = resets[-1]
+    quote = _exact_boundary_quote(source[reset.start():], want="start")
+    return _quote_character_span(source, quote) if quote else None
+
+
+def _trusted_scenario_start_span(text: str) -> tuple[int, int] | None:
+    """Recover a literal fresh what-if setup inside a coarse prior cue."""
+    source = str(text or "")
+    handoffs = list(_TRUSTED_SCENARIO_HANDOFF_RE.finditer(source))
+    if not handoffs:
+        return None
+    setup_left = handoffs[-1].start()
+    suffix = source[setup_left:]
+    if len(_toks(suffix)) < 6:
+        return None
+    quote = _exact_boundary_quote(suffix, want="start")
+    return _quote_character_span(source, quote) if quote else None
+
+
+def _trusted_speaker_setup_start_span(text: str) -> tuple[int, int] | None:
+    """Drop a speaker tag while retaining its complete first-person topic setup."""
+    source = str(text or "")
+    framing = _TRUSTED_SPEAKER_FRAMING_SETUP_RE.match(source)
+    if framing is None:
+        return None
+    setup_left = framing.start("setup")
+    quote = _exact_boundary_quote(source[setup_left:], want="start")
+    return _quote_character_span(source, quote) if quote else None
+
+
+def _trusted_start_context_repair(
+    segments: list[dict],
+    start_line: int,
+    start_span: tuple[int, int] | None,
+) -> tuple[int, tuple[int, int] | None, list[str]]:
+    """Expand a trusted Gemini start to spoken context, but never reject it."""
+    text = str(segments[start_line].get("text") or "")
+    selected = (
+        text[start_span[0]:].strip()
+        if start_span is not None
+        else text.strip()
+    )
+    projected_complete_setup = bool(
+        start_span is not None
+        and _TRUSTED_PROJECTED_SETUP_RE.match(selected)
+        and _local_example_setup_is_complete(selected)
+    )
+    unsafe_projection = bool(
+        start_span is not None
+        and not _projected_start_is_standalone(text, start_span)
+        and not projected_complete_setup
+    )
+    unresolved_opening = bool(
+        start_span is None and not _opening_clause_is_standalone(selected)
+    )
+    prefix = text[:start_span[0]] if start_span is not None else ""
+    scenario_prefix = text[:start_span[1]] if start_span is not None else ""
+    scenario_span = _trusted_scenario_start_span(scenario_prefix)
+    scenario_overlaps_start = bool(
+        scenario_span is not None
+        and start_span is not None
+        and scenario_span[1] > start_span[0]
+    )
+    if scenario_span is not None and (
+        unsafe_projection or unresolved_opening or scenario_overlaps_start
+    ):
+        return start_line, scenario_span, ["expanded_projected_start_context"]
+    if not unsafe_projection and not unresolved_opening:
+        return start_line, start_span, []
+
+    original_line = start_line
+    original_span = start_span
+    reset_span = (
+        _trusted_hard_reset_start_span(text, before=start_span[0])
+        if start_span is not None
+        else None
+    )
+    if reset_span is not None:
+        return start_line, reset_span, ["expanded_projected_start_context"]
+    if (
+        _opening_clause_is_standalone(text)
+        and _TRUSTED_CONTEXTUAL_CUE_OPENING_RE.match(text) is None
+        and _trusted_opening_reference_is_resolved(selected, prefix)
+    ):
+        return start_line, None, ["expanded_projected_start_context"]
+
+    prior_parts = [prefix] if prefix else []
+    for candidate in range(start_line - 1, -1, -1):
+        try:
+            gap = (
+                float(segments[candidate + 1].get("start", 0.0))
+                - float(segments[candidate].get("end", 0.0))
+            )
+        except (TypeError, ValueError, OverflowError):
+            break
+        if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+            break
+        candidate_text = str(segments[candidate].get("text") or "")
+        prior_parts.insert(0, candidate_text)
+        scenario_span = _trusted_scenario_start_span(candidate_text)
+        if scenario_span is not None:
+            return candidate, scenario_span, ["expanded_start_context"]
+        reset_span = _trusted_hard_reset_start_span(candidate_text)
+        if reset_span is not None:
+            return candidate, reset_span, ["expanded_start_context"]
+        if (
+            _opening_clause_is_standalone(candidate_text)
+            and _TRUSTED_CONTEXTUAL_CUE_OPENING_RE.match(candidate_text) is None
+            and _trusted_opening_reference_is_resolved(
+                selected,
+                " ".join(prior_parts),
+            )
+        ):
+            speaker_setup_span = _trusted_speaker_setup_start_span(
+                candidate_text
+            )
+            if speaker_setup_span is not None:
+                retained_prior = " ".join([
+                    candidate_text[speaker_setup_span[0]:],
+                    *prior_parts[1:],
+                ])
+                if _trusted_opening_reference_is_resolved(
+                    selected,
+                    retained_prior,
+                ):
+                    return candidate, speaker_setup_span, [
+                        "expanded_start_context",
+                        "trimmed_speaker_framing_prefix",
+                    ]
+            return candidate, None, ["expanded_start_context"]
+
+    return original_line, original_span, ["unresolved_start_context"]
+
+
 def _trusted_compact_plan_to_report(
     plan: _CompactBoundaryPlan,
     segments: list[dict],
     settings: dict,
 ) -> _Conversion:
-    """Pass every schema-valid Gemini topic; reconcile only literal transcript edges."""
-    del settings
+    """Pass every schema-valid Gemini topic; repair only structural boundaries."""
     report = _Conversion(proposed_count=len(plan.topics))
     n = len(segments)
     if not n:
@@ -10047,6 +10302,7 @@ def _trusted_compact_plan_to_report(
                 b = end_anchor.last_line
                 end_span = end_anchor.last_span
 
+        structural_start_trimmed = False
         if claim_location is not None:
             claim_start_line, claim_left, claim_end_line, claim_right = claim_location
             if claim_start_line < a:
@@ -10169,6 +10425,122 @@ def _trusted_compact_plan_to_report(
             start_span = end_span = None
             diagnostics.append("reversed_range_repaired")
 
+        if claim_location is not None:
+            objective_for_section = " ".join(
+                str(value or "")
+                for value in (proposal.title, proposal.facet)
+            )
+            atomic_scope_text = " ".join(
+                str(value or "")
+                for value in (
+                    proposal.title,
+                    objective_for_section,
+                    proposal.facet,
+                )
+            )
+            relationship_bridge_allowed = bool(
+                _compact_evidence_explicitly_relates_sections(
+                    model_claim_quote
+                )
+                and _objective_explicitly_relates_sections(
+                    objective_for_section
+                )
+            )
+            transitions = _candidate_topic_transitions(
+                segments,
+                a,
+                b,
+                evidence_quote=model_claim_quote,
+                learning_objective=objective_for_section,
+                relationship_bridge_allowed=relationship_bridge_allowed,
+                atomic_claim_required=True,
+                atomic_scope_text=atomic_scope_text,
+            )
+            section_start, _section_end = _single_objective_section_bounds(
+                segments,
+                a,
+                b,
+                evidence_location=claim_location,
+                transitions=transitions,
+            )
+            scenario_start: tuple[int, tuple[int, int]] | None = None
+            if (
+                start_anchor is not None
+                and a <= start_anchor.first_line <= claim_location[0]
+            ):
+                anchor_text = str(
+                    segments[start_anchor.first_line].get("text") or ""
+                )
+                scenario_text = anchor_text[:start_anchor.first_span[1]]
+                scenario_span = _trusted_scenario_start_span(scenario_text)
+                anchor_selected = anchor_text[start_anchor.first_span[0]:]
+                anchor_projected_setup = bool(
+                    _TRUSTED_PROJECTED_SETUP_RE.match(anchor_selected)
+                    and _local_example_setup_is_complete(anchor_selected)
+                )
+                anchor_is_unsafe = bool(
+                    not _projected_start_is_standalone(
+                        anchor_text,
+                        start_anchor.first_span,
+                    )
+                    and not anchor_projected_setup
+                )
+                scenario_overlaps_start = bool(
+                    scenario_span is not None
+                    and scenario_span[1] > start_anchor.first_span[0]
+                )
+                if scenario_span is not None and (
+                    scenario_overlaps_start
+                    or (
+                        start_anchor.first_line >= section_start
+                        and anchor_is_unsafe
+                    )
+                ):
+                    scenario_start = start_anchor.first_line, scenario_span
+            if (
+                section_start <= claim_location[0]
+                and claim_location[2] <= b
+            ):
+                if scenario_start is not None:
+                    a, start_span = scenario_start
+                    structural_start_trimmed = True
+                    diagnostics.append("trimmed_scenario_before_claim")
+                elif section_start != a:
+                    a = section_start
+                    start_span = None
+                    structural_start_trimmed = True
+                    diagnostics.append("trimmed_adjacent_unit_before")
+
+        if structural_start_trimmed:
+            structural_start_text = str(segments[a].get("text") or "")
+            scenario_span = _trusted_scenario_start_span(structural_start_text)
+            reset_span = _trusted_hard_reset_start_span(
+                structural_start_text
+            )
+            structural_span = max(
+                (span for span in (scenario_span, reset_span) if span is not None),
+                default=None,
+                key=lambda span: span[0],
+            )
+            if structural_span is not None:
+                start_span = structural_span
+                effective_start_quote = _literal_source_quote(
+                    structural_start_text,
+                    "",
+                    structural_span,
+                )
+                diagnostics.append("trimmed_same_cue_unit_before")
+
+        if not structural_start_trimmed:
+            a, start_span, start_context_diagnostics = (
+                _trusted_start_context_repair(
+                    segments,
+                    a,
+                    start_span,
+                )
+            )
+            diagnostics.extend(start_context_diagnostics)
+
         start_text = str(segments[a].get("text") or "")
         end_text = str(segments[b].get("text") or "")
         start_quote = (
@@ -10181,6 +10553,28 @@ def _trusted_compact_plan_to_report(
             if end_span is not None
             else _exact_boundary_quote(end_text, want="end")
         )
+        trimmed_end_quote, trimmed_edge_noise = _trim_end_quote_before_edge_noise(
+            end_text,
+            end_quote,
+            evidence_quote=model_claim_quote,
+            learning_objective=str(proposal.learning_objective or ""),
+            preferred_span=end_span,
+        )
+        if trimmed_edge_noise:
+            trimmed_end_anchor = _unique_boundary_anchor(
+                segments,
+                trimmed_end_quote,
+                b,
+                b,
+            )
+            if trimmed_end_anchor is not None:
+                end_span = trimmed_end_anchor.last_span
+                end_quote = _literal_source_quote(
+                    end_text,
+                    trimmed_end_quote,
+                    end_span,
+                )
+                diagnostics.append("trimmed_trailing_edge_noise")
 
         if (
             a == b

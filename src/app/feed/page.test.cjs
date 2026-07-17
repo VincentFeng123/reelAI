@@ -1666,6 +1666,8 @@ test("legacy duration settings are readable but removed from newly written feed 
 test("YouTube playback honors float boundaries with a sub-50ms end watchdog", () => {
   assert.match(reelCardSource, /const CLIP_END_POLL_INTERVAL_MS = 20;/);
   assert.match(reelCardSource, /clipEndRaw > clipStart \? clipEndRaw : clipStart/);
+  assert.match(reelCardSource, /start: Math\.floor\(clipStart\)/);
+  assert.match(reelCardSource, /end: Math\.ceil\(clipEnd\)/);
   assert.match(reelCardSource, /if \(hasReachedVerifiedClipEnd\(playerTime, clipEnd\)\)/);
   assert.match(
     reelCardSource,
@@ -1685,13 +1687,82 @@ test("YouTube playback honors float boundaries with a sub-50ms end watchdog", ()
   assert.equal(hasReachedVerifiedClipEnd(55.389, 55.4), false);
   assert.equal(hasReachedVerifiedClipEnd(55.391, 55.4), true);
   assert.equal(hasReachedVerifiedClipEnd(55.8, 55.4), true);
-  assert.match(reelCardSource, /event\.target\.seekTo\(clipStart, true\)/);
+
+  const startBoundaryDeclaration = reelCardSource.match(
+    /function hasReachedVerifiedClipStart\([\s\S]*?\n}/,
+  )?.[0];
+  assert.ok(startBoundaryDeclaration);
+  const compiledStartBoundary = ts.transpile(startBoundaryDeclaration, {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.CommonJS,
+  });
+  const hasReachedVerifiedClipStart = new Function(
+    `${compiledStartBoundary}\nreturn hasReachedVerifiedClipStart;`,
+  )();
+  assert.equal(hasReachedVerifiedClipStart(1217.704, 1217.705), false);
+  assert.equal(hasReachedVerifiedClipStart(1217.705, 1217.705), true);
+  assert.equal(hasReachedVerifiedClipStart(1217.706, 1217.705), true);
+  assert.match(
+    reelCardSource,
+    /if \(boundaryGateArmedRef\.current\) \{[\s\S]*?hasReachedVerifiedClipStart\(playerTime, gateTarget\)[\s\S]*?releaseBoundaryGate\(player\)/,
+  );
+  assert.match(
+    reelCardSource,
+    /const armBoundaryGate = useCallback\([\s\S]*?player\.mute\(\);[\s\S]*?setIsBoundaryMaskVisible\(true\)/,
+  );
+  assert.match(
+    reelCardSource,
+    /const targetTime = clipStart \+ rel;[\s\S]*?seekToBoundary\(player, targetTime\)/,
+  );
+  assert.doesNotMatch(reelCardSource, /opacity-9[25]/);
+  assert.match(reelCardSource, /seekToBoundary\(event\.target as YouTubePlayer, clipStart\)/);
   assert.doesNotMatch(reelCardSource, /clipStart \+ 1/);
+
+  const seekObservedDeclaration = reelCardSource.match(
+    /function hasObservedBoundarySeek\([\s\S]*?\n}/,
+  )?.[0];
+  assert.ok(seekObservedDeclaration);
+  const compiledSeekObserved = ts.transpile(seekObservedDeclaration, {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.CommonJS,
+  });
+  const hasObservedBoundarySeek = new Function(
+    `const NEAR_ZERO_SEEK_CONFIRM_SEC = 0.05;\n${compiledSeekObserved}\nreturn hasObservedBoundarySeek;`,
+  )();
+  assert.equal(hasObservedBoundarySeek(80, 40), false);
+  assert.equal(hasObservedBoundarySeek(39.8, 40), true);
+  assert.equal(hasObservedBoundarySeek(0.02, 0), true);
+  assert.equal(hasObservedBoundarySeek(1, 0), false);
+  assert.match(
+    reelCardSource,
+    /const seekToBoundary = useCallback\([\s\S]*?const isBackwardSeek =[\s\S]*?boundaryGateAwaitingSeekRef\.current = isBackwardSeek;[\s\S]*?targetTime - BACKWARD_SEEK_PREROLL_SEC/,
+  );
+  assert.match(
+    reelCardSource,
+    /boundaryGateAwaitingSeekRef\.current[\s\S]*?hasObservedBoundarySeek\(playerTime, gateTarget\)[\s\S]*?boundaryGateAwaitingSeekRef\.current = false;[\s\S]*?hasReachedVerifiedClipStart/,
+  );
+  assert.match(
+    reelCardSource,
+    /currentSec >= clipDuration - 0\.05[\s\S]*?seekToBoundary\(player, clipStart\)/,
+  );
+  assert.match(reelCardSource, /mutedPreferenceRef\.current = nextMuted;/);
+  assert.match(
+    reelCardSource,
+    /state === playerState\.PLAYING[\s\S]*?boundaryGateTargetRef\.current === null[\s\S]*?event\.target\.pauseVideo\(\)/,
+  );
+  assert.match(
+    reelCardSource,
+    /state === playerState\.UNSTARTED \|\| state === playerState\.CUED[\s\S]*?boundaryGateTargetRef\.current === null[\s\S]*?coverBoundaryAndMute/,
+  );
 
   const endedHandler = reelCardSource.match(
     /else if \(state === playerState\.ENDED\) \{([\s\S]*?)\n\s*} else if \(/,
   )?.[1] || "";
   assert.match(endedHandler, /event\.target\.pauseVideo\(\)/);
+  assert.match(
+    endedHandler,
+    /coverBoundaryAndMute\(event\.target as YouTubePlayer\);[\s\S]*?event\.target\.pauseVideo\(\)/,
+  );
   assert.match(endedHandler, /setCurrentSec\(clipDuration\)/);
   assert.doesNotMatch(endedHandler, /seekTo\(clipStart/);
   assert.doesNotMatch(endedHandler, /playVideo\(\)/);
