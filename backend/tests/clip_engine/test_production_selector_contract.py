@@ -1569,6 +1569,680 @@ def test_trusted_candidate_expands_unsafe_mid_cue_definition_start() -> None:
     assert "expanded_start_context" in clip["_boundary_fallback_reasons"]
 
 
+def test_trusted_live_proportionality_predicate_expands_to_spoken_equation() -> None:
+    raw_cues = [
+        (12, 37.559, 41.94, "equation, F = ma. What it means is that we can do"),
+        (13, 41.94, 44.28, "quantitative calculations relating the"),
+        (14, 44.28, 46.469, "magnitude of a force applied to an"),
+        (15, 46.469, 49.32, "object, the mass of the object, and the"),
+        (16, 49.32, 51.36, "magnitude of the acceleration that"),
+        (17, 51.36, 54.3, "object will experience, and it shows the"),
+        (18, 54.3, 57.27, "derivation of the Newton as the SI unit"),
+        (19, 57.27, 60.629, "of force when we plug in 1 kilogram and"),
+        (20, 60.629, 63.18, "one meter per second squared for mass"),
+        (21, 63.18, 66.33, "and acceleration. There are a number of"),
+        (22, 66.33, 68.25, "things we can say about this equation,"),
+        (23, 68.25, 71.58, "which is tiny but powerful. First it"),
+        (24, 71.58, 74.13, "means that heavier objects will require"),
+        (25, 74.13, 76.92, "the application of greater force in"),
+        (26, 76.92, 78.93, "order to achieve the same acceleration"),
+        (27, 78.93, 82.409, "as lighter objects, with acceleration being"),
+        (28, 82.409, 85.74, "equal to force divided by mass. If we"),
+        (29, 85.74, 88.14, "want these objects of varying masses"),
+        (30, 88.14, 90.42, "each to accelerate at one meter per"),
+        (31, 90.42, 91.59, "second squared,"),
+        (32, 91.59, 94.259, "these are the magnitudes of the forces"),
+        (33, 94.259, 96.93, "that must be applied in order for the"),
+        (34, 96.93, 100.17, "math to work out. This also means that"),
+        (35, 100.17, 102.99, "the second law can be rephrased to state"),
+        (36, 102.99, 104.88, "that the acceleration an object"),
+        (37, 104.88, 107.189, "experiences will be directly"),
+        (38, 107.189, 110.25, "proportional to the force applied and"),
+        (39, 110.25, 114.149, "inversely proportional to its mass. It is"),
+    ]
+    segments = [
+        {
+            "cue_id": f"xzA6IBWUEDE:cue:{cue}",
+            "start": start,
+            "end": end,
+            "text": text,
+        }
+        for cue, start, end, text in raw_cues
+    ]
+    claim = "acceleration an object experiences will be directly proportional"
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote="means that heavier objects will require",
+        end_quote="inversely proportional to its mass.",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "second-law-proportionality-intuition",
+            "start_line": 12,
+            "end_line": 27,
+            "title": "Intuition Behind Newton's Second Law",
+            "learning_objective": (
+                "Understand how force, mass, and acceleration relate proportionally"
+            ),
+            "facet": "proportionality and intuition",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["selection_candidate_id"] == (
+        "second-law-proportionality-intuition"
+    )
+    assert clip["start_cue_id"] == "xzA6IBWUEDE:cue:12"
+    assert clip["start_quote"] == "F = ma. What it means is"
+    assert clip["_clip_text"].startswith("F = ma. What it means is")
+    assert "means that heavier objects will require" in clip["_clip_text"]
+    assert claim in clip["_clip_text"]
+    assert "expanded_subjectless_predicate_context" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_predicate_context_never_crosses_topic_reset_for_old_equation() -> None:
+    segments = [
+        {
+            "cue_id": "cue-old-equation",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "For the old calculation, x = 5.",
+        },
+        {
+            "cue_id": "cue-topic-reset",
+            "start": 4.0,
+            "end": 8.0,
+            "text": (
+                "Now let us discuss photosynthesis. Chlorophyll absorbs light and"
+            ),
+        },
+        {
+            "cue_id": "cue-model-start",
+            "start": 8.0,
+            "end": 13.0,
+            "text": "means that plants can store energy as chemical energy",
+        },
+        {
+            "cue_id": "cue-explanation-end",
+            "start": 13.0,
+            "end": 18.0,
+            "text": "using chlorophyll during the light-dependent reactions.",
+        },
+    ]
+    claim = "plants can store energy as chemical energy"
+    plan = _compact_custom_plan(
+        request="photosynthesis",
+        start_quote="means that plants can store energy",
+        end_quote="during the light-dependent reactions.",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 2,
+            "end_line": 3,
+            "title": "Photosynthesis",
+            "learning_objective": "Explain how plants store light energy",
+            "facet": "light-dependent reactions",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "cue-topic-reset"
+    assert clip["_clip_text"].startswith(
+        "Now let us discuss photosynthesis. Chlorophyll absorbs light and"
+    )
+    assert "means that plants can store energy" in clip["_clip_text"]
+    assert "x = 5" not in clip["_clip_text"]
+    assert "expanded_subjectless_predicate_context" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_live_net_force_complement_recovers_split_copula() -> None:
+    raw_cues = [
+        (39, 110.25, 114.149, "inversely proportional to its mass. It is"),
+        (40, 114.149, 116.67, "important to note that the net force is"),
+        (41, 116.67, 119.28, "the sum of all the forces acting on an"),
+        (42, 119.28, 122.28, "object. If multiple forces are acting on"),
+        (43, 122.28, 124.68, "an object, which is often the case, we"),
+        (44, 124.68, 126.63, "will need to represent them all in a"),
+        (45, 126.63, 129.569, "free body diagram and then add up all"),
+        (46, 129.569, 132.81, "the vectors to find the net force, which"),
+        (47, 132.81, 133.49, "will tell us"),
+        (48, 133.49, 135.71, "the direction of the acceleration that"),
+        (49, 135.71, 138.23, "will occur in response to the net force."),
+    ]
+    segments = [
+        {
+            "cue_id": f"xzA6IBWUEDE:cue:{cue}",
+            "start": start,
+            "end": end,
+            "text": text,
+        }
+        for cue, start, end, text in raw_cues
+    ]
+    claim = "the net force is the sum of all the forces"
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote="important to note that the net",
+        end_quote="in response to the net force.",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "net-force-and-vector-addition",
+            "start_line": 1,
+            "end_line": 10,
+            "title": "Calculating Net Force",
+            "learning_objective": "Explain how to find net force using vector addition",
+            "facet": "net force definition",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["selection_candidate_id"] == "net-force-and-vector-addition"
+    assert clip["start_cue_id"] == "xzA6IBWUEDE:cue:39"
+    assert clip["start_quote"] == "It is"
+    assert clip["_clip_text"].startswith("It is important to note")
+    assert "inversely proportional to its mass" not in clip["_clip_text"]
+    assert claim in clip["_clip_text"]
+    assert "expanded_split_copula_context" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_live_weight_candidate_advances_to_its_complete_setup() -> None:
+    raw_cues = [
+        (
+            3,
+            98.84,
+            149.84,
+            "force. Newton's first law of motion is also known as the law of "
+            "inertia. Now you might be wondering well what exactly is inertia? "
+            "Inertia is the tendency of an object to maintain its state of rest or "
+            "uniform motion. Inertia is related to mass. As the mass of an object "
+            "increases, the inertia increases as well. So let's say if we have a "
+            "100 kg object and 1,00 kg object, which one has more inertia? So which "
+            "object wants to maintain its state of rest? If we apply a force to the "
+            "smaller object, it's",
+        ),
+        (
+            4,
+            147.36,
+            181.04,
+            "going to be relatively easy to move. We can easily move it from a "
+            "state of rest. Now, the larger object, it's going to be difficult to "
+            "get it going. It requires a greater force to move it. So, it's harder "
+            "to move it from a state of rest. So, the the more massive object has "
+            "more inertia. And so that's the main idea behind inertia, which is the "
+            "tendency of an object to resist or maintain its state of rest. It's "
+            "going to resist any changes in motion that you try to apply to it.",
+        ),
+        (5, 179.599, 186.08, "Now the next law that you need to be familiar with is Newton's second"),
+        (
+            6,
+            188.519,
+            246.56,
+            "law. Newton's second law is basically this equation. Force is equal "
+            "to mass time acceleration. And this of course is the net force. So "
+            "let's say if you have a mass of 5 kg and the acceleration on it is 2 "
+            "m/s squared. The force is 10 newtons and this is the net force. A "
+            "newton is equivalent to 1 kilogram times a meter over second squ. It "
+            "turns out that the newton is not the only unit for force. Force can be "
+            "measured in pounds. It turns out one pound is approximately 4.45 newtons.",
+        ),
+        (
+            7,
+            244.879,
+            291.6,
+            "So now you know how to convert from newtons to pounds. So let's say if "
+            "you have about 100 newtons, how many pounds of force does that "
+            "represent? So to convert it, let's use the conversion factor that I "
+            "just gave you. So we said that there's 4.45 newtons per pound. So you "
+            "want to set it up in such a way that the unit newtons cancel. So to "
+            "convert newtons into pounds, simply divide the force by 4.45 and you "
+            "should get 22.5 lb",
+        ),
+        (
+            8,
+            296.36,
+            304.24,
+            "approximately. Now what is the weight force? What's the difference "
+            "between mass and weight?",
+        ),
+        (
+            9,
+            306.12,
+            351.039,
+            "Mass is measured in units of kilograms. So in physics whenever you see "
+            "kilograms it's associated with mass. Weight is different from mass. "
+            "Weight is a force. And so weight is measured in newtons sometimes "
+            "pounds. Weight is equal to mass time gravitational acceleration. the "
+            "same way as force is equal to mass time acceleration. As you can see, "
+            "these two are the same. When you see G, G is a type of acceleration "
+            "and weight is a type of force. Weight is simply the force of",
+        ),
+        (
+            10,
+            348.0,
+            399.88,
+            "gravity that is acting on you. And so weight is a downward force. "
+            "Consider this 20 kg object. What is the weight force? acting on it. Go "
+            "ahead and calculate it. So the weight force is always equal to mg mass "
+            "time gravitational acceleration. And on Earth the gravitational "
+            "acceleration is 9.8 m/s squared. So this is going to be about 200. You "
+            "could round that to 10 if you want, but let's use the exact value. So "
+            "20 * 9.8 is about 196 newtons. So that's the weight force.",
+        ),
+    ]
+    segments = [
+        {
+            "cue_id": f"pL2YfC-22Uc:cue:{cue}",
+            "start": start,
+            "end": end,
+            "text": text,
+        }
+        for cue, start, end, text in raw_cues
+    ]
+    claim = (
+        "Weight is equal to mass time gravitational acceleration. the same way "
+        "as force is equal to mass time acceleration."
+    )
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote="going to be relatively easy to",
+        end_quote="So 20 * 9.8 is about 196 newtons. So that's the weight force.",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "weight-force-calculation",
+            "start_line": 1,
+            "end_line": 7,
+            "title": "Calculating Weight Force",
+            "learning_objective": (
+                "Calculate the weight force of an object using mass and "
+                "gravitational acceleration."
+            ),
+            "facet": "Weight vs mass",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:8"
+    assert clip["start_quote"] == "Now what is the weight force"
+    assert clip["_clip_text"].startswith("Now what is the weight force?")
+    assert "going to be relatively easy" not in clip["_clip_text"]
+    assert "trimmed_clipped_start_to_claim_setup" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_live_acceleration_candidate_advances_to_its_mass_setup() -> None:
+    raw_cues = [
+        (
+            14,
+            513.279,
+            527.839,
+            "Newton's third law of motion states that for every action force there "
+            "is an equal but opposite reaction force. So let's say if you have two people",
+        ),
+        (
+            15,
+            530.36,
+            573.04,
+            "skating I'm just going to draw stick figures and one person has more "
+            "mass than the other person. So if the smaller person applies a force "
+            "of 100 newtons on the larger person, what force will the larger person "
+            "apply on the smaller person? According to Newton's third law, for "
+            "every action force, there is an equal but opposite reaction force. So "
+            "the other person is going to apply a force of 100 newtons. They have "
+            "to be equal, but they're opposite in direction. So, the forces are always the",
+        ),
+        (
+            16,
+            570.92,
+            614.72,
+            "same. You might see a question like this on a test. Just remember the "
+            "forces are equal and opposite in direction. Now, let's say if the mass "
+            "of the smaller person is 50 kg and the mass of the larger person is "
+            "100 kg, who experiences the greater acceleration? and who's going to "
+            "move further. Let's say if they're on ice. So, as each of these "
+            "individuals, as they push against each other, they're going to move "
+            "apart. This person is going to move this way. The other person is "
+            "going to move that way.",
+        ),
+        (
+            17,
+            612.279,
+            657.519,
+            "However, the acceleration is not the same. If you use the equation F "
+            "is equal to m8, the force acting on a smaller person is 100 and he has "
+            "a mass of 50 kg. So solving for the acceleration, you can see that "
+            "he's going to experience an acceleration of 2 m/s squared. Now the "
+            "person on the right, he's going to experience a small acceleration "
+            "because he has a larger mass. he has more inertia so it's going to be "
+            "harder to move the larger person. So using equation F is equal to",
+        ),
+        (
+            18,
+            654.2,
+            693.68,
+            "mA he experiences a force of 100 but since he has a mass of 100 the "
+            "acceleration is going to be one. So because he experiences a small "
+            "acceleration he's not going to move very far. the smaller person, he's "
+            "going to move a lot further than the larger person because he's "
+            "smaller and he experiences a greater acceleration.",
+        ),
+    ]
+    segments = [
+        {
+            "cue_id": f"pL2YfC-22Uc:cue:{cue}",
+            "start": start,
+            "end": end,
+            "text": text,
+        }
+        for cue, start, end, text in raw_cues
+    ]
+    claim = (
+        "solving for the acceleration, you can see that he's going to experience "
+        "an acceleration of 2 m/s squared."
+    )
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote="skating I'm just going to draw",
+        end_quote=(
+            "smaller person, he's going to move a lot further than the larger "
+            "person because he's smaller and he experiences a greater acceleration."
+        ),
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "f-equals-ma-acceleration",
+            "start_line": 1,
+            "end_line": 4,
+            "title": "Calculating Acceleration from Force and Mass",
+            "learning_objective": (
+                "Calculate acceleration given force and mass using F=ma."
+            ),
+            "facet": "Solving for acceleration",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:16"
+    assert clip["start_quote"] == "Now, let's say if the mass"
+    assert clip["_clip_text"].startswith("Now, let's say if the mass")
+    assert "skating I'm just going to draw" not in clip["_clip_text"]
+    assert "trimmed_clipped_start_to_claim_setup" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_live_units_candidate_advances_to_acceleration_handoff() -> None:
+    raw_cues = [
+        (
+            0,
+            0.269,
+            33.84,
+            "thanks for stopping by I'm Virgil Rick's and this is 2-minute "
+            "classroom today we're talking about motion specifically we're talking "
+            "about speed velocity and acceleration and let's clear up a few things "
+            "right off the bat first of all speed and velocity are different and "
+            "acceleration is much more than just speeding up speed is the rate at "
+            "which something changes its position it's represented as distance over "
+            "time miles per hour kilometers per hour meters per second these are all "
+            "examples of the",
+        ),
+        (
+            1,
+            31.08,
+            63.27,
+            "units for speed so if you're driving in your car at 72 miles per hour "
+            "then that's your speed in fact it's your instantaneous speed or your "
+            "speed and that exact moment if you get to the end of your trip and "
+            "realize that it took you two hours to drive 120 miles then your overall "
+            "speed was 60 miles per hour and this is also known as your average "
+            "speed velocity is a lot like speed except for one important difference "
+            "it's a vector which means it has a direction attached to it",
+        ),
+        (
+            2,
+            60.48,
+            95.729,
+            "so while your speed may have been 72 miles per hour your velocity was "
+            "72 miles per hour east or 72 miles per hour towards the beach there "
+            "just has to be some direction attached to the speed to make it a "
+            "velocity with that knowledge in hand you're now ready to understand "
+            "acceleration which is simply the rate at which velocity changes it's "
+            "represented as distance per time per time or distance per time squared "
+            "for example meters per second squared are common units for acceleration",
+        ),
+        (
+            3,
+            92.75,
+            128.97,
+            "anytime you change your velocity you are accelerating that can be "
+            "speeding up or slowing down which is also known as negative "
+            "acceleration but Direction is also a component of velocity so when you "
+            "change your direction even if your speed doesn't change you are accelerating",
+        ),
+    ]
+    segments = [
+        {
+            "cue_id": f"Jyiw6KkedDY:cue:{cue}",
+            "start": start,
+            "end": end,
+            "text": text,
+        }
+        for cue, start, end, text in raw_cues
+    ]
+    claim = "meters per second squared are common units for acceleration"
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote="units for speed so if you're",
+        end_quote="speed doesn't change you are accelerating",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "acceleration-definition-units",
+            "start_line": 1,
+            "end_line": 3,
+            "title": "Acceleration and Its Units",
+            "learning_objective": (
+                "Define acceleration and identify its standard units of measurement"
+            ),
+            "facet": "acceleration and units",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "Jyiw6KkedDY:cue:2"
+    assert clip["start_quote"] == "you're now ready to understand acceleration"
+    assert clip["_clip_text"].startswith(
+        "you're now ready to understand acceleration"
+    )
+    assert "with that knowledge" not in clip["_clip_text"]
+    assert "units for speed" not in clip["_clip_text"]
+    assert "trimmed_clipped_start_to_claim_setup" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_candidate_does_not_advance_to_an_unresolved_question() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "A cart begins accelerating after a push and",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 4.8,
+            "end": 14.0,
+            "text": (
+                "continues speeding up. Now what force causes this acceleration? "
+                "Net force causes this acceleration according to Newton's second law."
+            ),
+        },
+    ]
+    claim = "Net force causes this acceleration according to Newton's second law"
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote="continues speeding up",
+        end_quote="according to Newton's second law",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 1,
+            "title": "Force and Acceleration",
+            "learning_objective": "Explain which force causes acceleration",
+            "facet": "net force and acceleration",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_quote"] == "continues speeding up"
+    assert clip["_clip_text"].startswith("continues speeding up")
+    assert "trimmed_clipped_start_to_claim_setup" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_claim_setup_ignores_later_same_cue_topic_reset() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "We were discussing motion and",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 3.8,
+            "end": 18.0,
+            "text": (
+                "continuing from before. Now how are force and acceleration "
+                "related? Force equals mass times acceleration. Now let us move "
+                "on to energy. Energy is conserved."
+            ),
+        },
+    ]
+    claim = "Force equals mass times acceleration"
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote="continuing from before",
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 1,
+            "title": "Force and Acceleration",
+            "learning_objective": "Explain how force and acceleration are related",
+            "facet": "force and acceleration relationship",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith(
+        "Now how are force and acceleration related?"
+    )
+    assert claim in clip["_clip_text"]
+    assert "move on to energy" not in clip["_clip_text"]
+    assert clip["model_claim_quote"] == clip["topic_evidence_quote"] == claim
+    assert "claim_quote_reanchored" not in clip["_boundary_fallback_reasons"]
+
+
 def test_trusted_ordinal_context_drops_speaker_tag_before_named_setup() -> None:
     segments = [
         {

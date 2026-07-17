@@ -5510,6 +5510,23 @@ def _recover_start_forward_across_cues(
     return None
 
 
+def _opening_has_unresolved_setup_reference(opening: str) -> bool:
+    """Require a setup to name any object referenced by pronoun or demonstrative."""
+    references = [
+        match
+        for pattern in (
+            _OPENING_ANAPHORIC_SETUP_REFERENCE_RE,
+            _OPENING_SETUP_PRONOUN_REFERENCE_RE,
+        )
+        if (match := pattern.search(opening)) is not None
+    ]
+    if not references:
+        return False
+    first_reference = min(references, key=lambda match: match.start())
+    local_prefix = opening[:first_reference.start()]
+    return _LOCAL_EXPLICIT_PROBLEM_RE.search(local_prefix) is None
+
+
 def _trim_initial_instructional_preview(
     segments: list[dict],
     start_line: int,
@@ -5535,21 +5552,6 @@ def _trim_initial_instructional_preview(
     if _CROSS_CUE_INSTRUCTIONAL_PREVIEW_RE.match(preview_head) is None:
         return None
 
-    def has_unresolved_setup_reference(opening: str) -> bool:
-        references = [
-            match
-            for pattern in (
-                _OPENING_ANAPHORIC_SETUP_REFERENCE_RE,
-                _OPENING_SETUP_PRONOUN_REFERENCE_RE,
-            )
-            if (match := pattern.search(opening)) is not None
-        ]
-        if not references:
-            return False
-        first_reference = min(references, key=lambda match: match.start())
-        local_prefix = opening[:first_reference.start()]
-        return _LOCAL_EXPLICIT_PROBLEM_RE.search(local_prefix) is None
-
     for line in range(start_line + 1, end_line + 1):
         current = str(segments[line].get("text") or "").strip()
         if _PEDAGOGICAL_SETUP_ONSET_RE.match(current) is None:
@@ -5562,7 +5564,7 @@ def _trim_initial_instructional_preview(
                 opening_candidates.insert(0, without_marker)
         if not any(
             _opening_clause_is_standalone(opening)
-            and not has_unresolved_setup_reference(opening)
+            and not _opening_has_unresolved_setup_reference(opening)
             for opening in opening_candidates
         ):
             continue
@@ -9996,6 +9998,25 @@ _TRUSTED_CONTEXTUAL_CUE_OPENING_RE = re.compile(
     r"(?:this|that|these|those|such)\b",
     re.IGNORECASE,
 )
+_TRUSTED_SUBJECTLESS_PREDICATE_OPENING_RE = re.compile(
+    r"^\s*(?:means?|implies?|indicates?|shows?|suggests?)\s+(?:that\b|how\b|why\b)",
+    re.IGNORECASE,
+)
+_TRUSTED_SPLIT_COPULA_COMPLEMENT_OPENING_RE = re.compile(
+    r"^\s*(?:(?:helpful|important|necessary|useful)\s+to\b|"
+    r"(?:clear|crucial|essential|likely|possible|unlikely)\s+that\b)",
+    re.IGNORECASE,
+)
+_TRUSTED_TRAILING_SUBJECT_COPULA_RE = re.compile(
+    r"(?P<setup>\b(?:it|that|this)\s+(?:is|was|"
+    r"(?:can|could|may|might|must|should|will|would)\s+be))\s*$",
+    re.IGNORECASE,
+)
+_TRUSTED_SYMBOLIC_EQUATION_RE = re.compile(
+    r"(?<!\w)[a-z][a-z0-9_]*\s*=\s*"
+    r"[a-z0-9][a-z0-9_]*(?:\s*[+\-*/^]\s*[a-z0-9][a-z0-9_]*)*",
+    re.IGNORECASE,
+)
 _TRUSTED_SCENARIO_HANDOFF_RE = re.compile(
     r"(?<!\w)(?:(?:and|but|so)\s+)?(?:now\s+)?(?P<setup>what\s+if\b)",
     re.IGNORECASE,
@@ -10096,6 +10117,92 @@ def _trusted_speaker_setup_start_span(text: str) -> tuple[int, int] | None:
     return _quote_character_span(source, quote) if quote else None
 
 
+def _trusted_subjectless_predicate_context(
+    segments: list[dict],
+    start_line: int,
+    selected: str,
+) -> tuple[int, tuple[int, int]] | None:
+    """Ground a bare predicate in the nearest contiguous spoken equation."""
+    if _TRUSTED_SUBJECTLESS_PREDICATE_OPENING_RE.match(selected) is None:
+        return None
+    reset_patterns = (
+        _HARD_TOPIC_RESET_RE,
+        _INDEPENDENT_UNIT_RESET_RE,
+        _NAMED_UNIT_LABEL_RESET_RE,
+        _NAMED_METHOD_CONTRAST_RESET_RE,
+        _NEXT_DISTINCT_UNIT_RESET_RE,
+        _FORWARD_TOPIC_TRANSITION_RE,
+    )
+    for candidate in range(start_line - 1, -1, -1):
+        try:
+            gap = (
+                float(segments[candidate + 1].get("start", 0.0))
+                - float(segments[candidate].get("end", 0.0))
+            )
+        except (TypeError, ValueError, OverflowError):
+            break
+        if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+            break
+        candidate_text = str(segments[candidate].get("text") or "")
+        following_text = str(segments[candidate + 1].get("text") or "")
+        joined = f"{candidate_text} {following_text}"
+        split = len(candidate_text) + 1
+        if any(
+            reset.start() < split < reset.end()
+            for pattern in reset_patterns
+            for reset in pattern.finditer(joined)
+        ):
+            break
+        resets = [
+            reset
+            for pattern in reset_patterns
+            for reset in pattern.finditer(candidate_text)
+        ]
+        if resets:
+            break
+        equations = list(
+            _TRUSTED_SYMBOLIC_EQUATION_RE.finditer(candidate_text)
+        )
+        if not equations:
+            continue
+        equation = equations[-1]
+        quote = _exact_boundary_quote(
+            candidate_text[equation.start():],
+            want="start",
+        )
+        span = _quote_character_span(candidate_text, quote) if quote else None
+        if span is not None:
+            return candidate, span
+    return None
+
+
+def _trusted_split_copula_context(
+    segments: list[dict],
+    start_line: int,
+    selected: str,
+) -> tuple[int, tuple[int, int]] | None:
+    """Recover a subject and copula stranded at the prior caption edge."""
+    if (
+        start_line <= 0
+        or _TRUSTED_SPLIT_COPULA_COMPLEMENT_OPENING_RE.match(selected) is None
+    ):
+        return None
+    try:
+        gap = (
+            float(segments[start_line].get("start", 0.0))
+            - float(segments[start_line - 1].get("end", 0.0))
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+        return None
+    prior_text = str(segments[start_line - 1].get("text") or "")
+    setup = _TRUSTED_TRAILING_SUBJECT_COPULA_RE.search(prior_text)
+    if setup is None:
+        return None
+    return start_line - 1, setup.span("setup")
+
+
 def _trusted_start_context_repair(
     segments: list[dict],
     start_line: int,
@@ -10108,6 +10215,32 @@ def _trusted_start_context_repair(
         if start_span is not None
         else text.strip()
     )
+    has_same_cue_prefix = bool(
+        start_span is not None
+        and _WORD_RE.search(text[:start_span[0]]) is not None
+    )
+    split_copula_context = (
+        _trusted_split_copula_context(
+            segments,
+            start_line,
+            selected,
+        )
+        if not has_same_cue_prefix
+        else None
+    )
+    if split_copula_context is not None:
+        repaired_line, repaired_span = split_copula_context
+        return repaired_line, repaired_span, ["expanded_split_copula_context"]
+    predicate_context = (
+        _trusted_subjectless_predicate_context(segments, start_line, selected)
+        if not has_same_cue_prefix
+        else None
+    )
+    if predicate_context is not None:
+        repaired_line, repaired_span = predicate_context
+        return repaired_line, repaired_span, [
+            "expanded_subjectless_predicate_context"
+        ]
     projected_complete_setup = bool(
         start_span is not None
         and _TRUSTED_PROJECTED_SETUP_RE.match(selected)
@@ -10119,7 +10252,11 @@ def _trusted_start_context_repair(
         and not projected_complete_setup
     )
     unresolved_opening = bool(
-        start_span is None and not _opening_clause_is_standalone(selected)
+        _TRUSTED_SUBJECTLESS_PREDICATE_OPENING_RE.match(selected)
+        or (
+            start_span is None
+            and not _opening_clause_is_standalone(selected)
+        )
     )
     prefix = text[:start_span[0]] if start_span is not None else ""
     scenario_prefix = text[:start_span[1]] if start_span is not None else ""
@@ -10147,6 +10284,7 @@ def _trusted_start_context_repair(
         return start_line, reset_span, ["expanded_projected_start_context"]
     if (
         _opening_clause_is_standalone(text)
+        and _TRUSTED_SUBJECTLESS_PREDICATE_OPENING_RE.match(selected) is None
         and _TRUSTED_CONTEXTUAL_CUE_OPENING_RE.match(text) is None
         and _trusted_opening_reference_is_resolved(selected, prefix)
     ):
@@ -10198,6 +10336,101 @@ def _trusted_start_context_repair(
             return candidate, None, ["expanded_start_context"]
 
     return original_line, original_span, ["unresolved_start_context"]
+
+
+_TRUSTED_CLAIM_SETUP_HANDOFF_RE = re.compile(
+    r"(?<!\w)(?:"
+    r"(?P<teaching>with\s+that\s+knowledge\s+in\s+hand\b"
+    r"[^.!?]{0,60}?(?P<teaching_setup>you(?:['’]re|\s+are)\s+"
+    r"(?:now\s+)?ready\s+to\s+understand\b))|"
+    r"(?P<conditional>(?:(?:and|but|so)\s*[,;:]?\s+)?"
+    r"(?:now\s*[,;:]?\s+)?let(?:['’]?s|\s+us)\s+say\s+if\b)|"
+    r"(?P<question>now\s*[,;:]?\s+"
+    r"(?:how|what|when|where|which|who|why)\b)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _trusted_claim_setup_start(
+    segments: list[dict],
+    *,
+    selected_line: int,
+    selected_left: int,
+    claim_location: tuple[int, int, int, int],
+    anchor_text: str,
+) -> tuple[int, tuple[int, int]] | None:
+    """Advance a clipped Gemini edge to a later complete setup for its claim."""
+    claim_line, claim_left, _claim_end_line, _claim_right = claim_location
+    anchor_tokens = _content_tokens(anchor_text)
+    candidates: list[tuple[int, tuple[int, int]]] = []
+    for line in range(selected_line, claim_line + 1):
+        source = str(segments[line].get("text") or "")
+        upper = claim_left if line == claim_line else len(source)
+        for handoff in _TRUSTED_CLAIM_SETUP_HANDOFF_RE.finditer(source, 0, upper):
+            setup_left = (
+                handoff.start("teaching_setup")
+                if handoff.group("teaching_setup") is not None
+                else handoff.start()
+            )
+            if (line, setup_left) <= (selected_line, selected_left):
+                continue
+            retained = source[setup_left:]
+            sentence_spans = _sentence_character_spans(retained)
+            opening_right = (
+                sentence_spans[0][1] if sentence_spans else len(retained)
+            )
+            opening = retained[:opening_right]
+            if len(_content_tokens(opening) & anchor_tokens) < 2:
+                continue
+            standalone_opening = (
+                _exact_boundary_quote(retained, want="start")
+                if handoff.group("teaching_setup") is not None
+                else opening
+            )
+            discourse_marker = _LEADING_DISCOURSE_MARKER_RE.match(
+                standalone_opening
+            )
+            if discourse_marker is not None:
+                standalone_opening = standalone_opening[
+                    discourse_marker.end():
+                ]
+            standalone_opening = re.sub(
+                r"^\s*now\s*[,;:]?\s+",
+                "",
+                standalone_opening,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            if (
+                not _opening_clause_is_standalone(standalone_opening)
+                or _opening_has_unresolved_setup_reference(
+                    standalone_opening
+                )
+            ):
+                continue
+            if handoff.group("conditional") is not None:
+                condition = source[handoff.end():setup_left + opening_right]
+                condition_words = _toks(condition)
+                if (
+                    not condition_words
+                    or condition_words[0] in {
+                        "he", "her", "him", "his", "it", "its", "she",
+                        "that", "their", "them", "these", "they", "this",
+                        "those", "we", "you",
+                    }
+                    or _WORKED_UNIT_QUESTION_TOKEN_RE.search(condition) is None
+                ):
+                    continue
+            quote = _exact_boundary_quote(retained, want="start")
+            span = _quote_character_span(source, quote) if quote else None
+            if span is not None:
+                candidates.append((line, span))
+    return max(
+        candidates,
+        default=None,
+        key=lambda item: (item[0], item[1][0]),
+    )
 
 
 def _trusted_compact_plan_to_report(
@@ -10463,6 +10696,52 @@ def _trusted_compact_plan_to_report(
                 evidence_location=claim_location,
                 transitions=transitions,
             )
+            claim_setup_start: tuple[int, tuple[int, int]] | None = None
+            current_start_text = str(segments[a].get("text") or "")
+            current_start_left = start_span[0] if start_span is not None else 0
+            current_start_is_clipped = bool(
+                (
+                    start_span is not None
+                    and start_span[0] > 0
+                    and not _projected_start_is_standalone(
+                        current_start_text,
+                        start_span,
+                    )
+                )
+                or (
+                    (start_span is None or start_span[0] == 0)
+                    and _cue_opens_mid_thought_at(
+                        segments,
+                        a,
+                        ignore_caption_case=True,
+                    )
+                )
+                or (
+                    start_span is None
+                    and not _opening_clause_is_standalone(current_start_text)
+                )
+            )
+            if current_start_is_clipped:
+                claim_setup_start = _trusted_claim_setup_start(
+                    segments,
+                    selected_line=a,
+                    selected_left=current_start_left,
+                    claim_location=claim_location,
+                    anchor_text=" ".join(
+                        str(value or "")
+                        for value in (
+                            proposal.title,
+                            proposal.learning_objective,
+                            proposal.facet,
+                            model_claim_quote,
+                        )
+                    ),
+                )
+                if (
+                    claim_setup_start is not None
+                    and claim_setup_start[0] < section_start
+                ):
+                    claim_setup_start = None
             scenario_start: tuple[int, tuple[int, int]] | None = None
             if (
                 start_anchor is not None
@@ -10501,7 +10780,18 @@ def _trusted_compact_plan_to_report(
                 section_start <= claim_location[0]
                 and claim_location[2] <= b
             ):
-                if scenario_start is not None:
+                if claim_setup_start is not None:
+                    a, start_span = claim_setup_start
+                    effective_start_quote = _literal_source_quote(
+                        str(segments[a].get("text") or ""),
+                        "",
+                        start_span,
+                    )
+                    structural_start_trimmed = True
+                    diagnostics.append(
+                        "trimmed_clipped_start_to_claim_setup"
+                    )
+                elif scenario_start is not None:
                     a, start_span = scenario_start
                     structural_start_trimmed = True
                     diagnostics.append("trimmed_scenario_before_claim")
@@ -10517,8 +10807,19 @@ def _trusted_compact_plan_to_report(
             reset_span = _trusted_hard_reset_start_span(
                 structural_start_text
             )
+            structural_left = start_span[0] if start_span is not None else 0
+            structural_right = (
+                claim_location[1]
+                if claim_location is not None and a == claim_location[0]
+                else len(structural_start_text)
+            )
             structural_span = max(
-                (span for span in (scenario_span, reset_span) if span is not None),
+                (
+                    span
+                    for span in (scenario_span, reset_span)
+                    if span is not None
+                    and structural_left <= span[0] <= structural_right
+                ),
                 default=None,
                 key=lambda span: span[0],
             )
