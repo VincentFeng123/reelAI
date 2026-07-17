@@ -1665,6 +1665,8 @@ test("legacy duration settings are readable but removed from newly written feed 
 
 test("YouTube playback decodes before float starts with a sub-25ms end watchdog", () => {
   assert.match(reelCardSource, /const CLIP_END_POLL_INTERVAL_MS = 10;/);
+  assert.match(reelCardSource, /const BOUNDARY_SEEK_MAX_RETRIES = 2;/);
+  assert.match(reelCardSource, /const BOUNDARY_SEEK_RETRY_GRACE_MS = 250;/);
   assert.match(reelCardSource, /clipEndRaw > clipStart \? clipEndRaw : clipStart/);
   assert.match(reelCardSource, /start: Math\.floor\(clipStart\)/);
   assert.match(reelCardSource, /end: Math\.ceil\(clipEnd\)/);
@@ -1727,10 +1729,12 @@ test("YouTube playback decodes before float starts with a sub-25ms end watchdog"
     module: ts.ModuleKind.CommonJS,
   });
   const hasObservedBoundarySeek = new Function(
-    `const BOUNDARY_SEEK_CONFIRM_TOLERANCE_SEC = 0.25;\n${compiledSeekObserved}\nreturn hasObservedBoundarySeek;`,
+    `const BOUNDARY_SEEK_PREROLL_SEC = 1;\nconst BOUNDARY_SEEK_CONFIRM_TOLERANCE_SEC = 0.25;\n${compiledSeekObserved}\nreturn hasObservedBoundarySeek;`,
   )();
   assert.equal(hasObservedBoundarySeek(80, 40), false);
   assert.equal(hasObservedBoundarySeek(39.8, 40), true);
+  assert.equal(hasObservedBoundarySeek(0, 1217.705), false);
+  assert.equal(hasObservedBoundarySeek(1216.5, 1217.705), true);
   assert.equal(hasObservedBoundarySeek(40.06, 40), true);
   assert.equal(hasObservedBoundarySeek(0.06, 0), true);
   assert.equal(hasObservedBoundarySeek(0.251, 0), false);
@@ -1743,6 +1747,15 @@ test("YouTube playback decodes before float starts with a sub-25ms end watchdog"
     reelCardSource,
     /boundaryGateAwaitingSeekRef\.current[\s\S]*?hasObservedBoundarySeek\(playerTime, gateTarget\)[\s\S]*?boundaryGateAwaitingSeekRef\.current = false;[\s\S]*?hasReachedVerifiedClipStart/,
   );
+  assert.match(
+    reelCardSource,
+    /boundarySeekRetryCountRef\.current < BOUNDARY_SEEK_MAX_RETRIES[\s\S]*?player\.seekTo\([\s\S]*?gateTarget - BOUNDARY_SEEK_PREROLL_SEC[\s\S]*?retryAgeMs < BOUNDARY_SEEK_RETRY_GRACE_MS[\s\S]*?boundaryGateAwaitingSeekRef\.current = false/,
+  );
+  assert.match(
+    reelCardSource,
+    /playerTime < gateTarget[\s\S]*?BOUNDARY_SEEK_ACCEPTABLE_OVERSHOOT_SEC[\s\S]*?setLoadError\(BOUNDARY_ALIGNMENT_ERROR\)[\s\S]*?stopProgressTimer\(\)/,
+  );
+  assert.match(reelCardSource, /onClick=\{retryBoundaryAlignment\}[\s\S]*?>\s*Retry\s*<\/button>/);
   assert.match(
     reelCardSource,
     /currentSec >= clipDuration - 0\.05[\s\S]*?seekToBoundary\(player, clipStart\)/,

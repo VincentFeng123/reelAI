@@ -1163,6 +1163,7 @@ def test_released_reels_get_grounded_fallbacks_when_question_provider_fails(conn
         "FROM reel_assessment_questions ORDER BY reel_id"
     ).fetchall()
     assert [row["reel_id"] for row in stored] == sorted(reel_ids)
+    assert all(row["prompt"] == "Which exact excerpt begins this clip?" for row in stored)
     assert all(len(json.loads(row["options_json"])) == 4 for row in stored)
     assert all("Gravity" in row["explanation"] for row in stored)
 
@@ -1198,12 +1199,20 @@ def test_transcript_fallback_is_collision_free_and_skips_provider(conn) -> None:
     assert result == {"requested": 1, "prepared": 1, "fallback": 1}
     assert calls == 0
     row = conn.execute(
-        "SELECT options_json, correct_index FROM reel_assessment_questions "
+        "SELECT prompt, options_json, correct_index FROM reel_assessment_questions "
         "WHERE reel_id = 'fallback-collision'"
     ).fetchone()
     options = json.loads(row["options_json"])
+    assert row["prompt"] == "Which exact excerpt begins this clip?"
     assert len(options) == len(set(options)) == 4
     assert options[row["correct_index"]] == supported
+    supported_key = supported.casefold()
+    assert all(
+        not supported_key.startswith(option.casefold())
+        and not option.casefold().startswith(supported_key)
+        for index, option in enumerate(options)
+        if index != row["correct_index"]
+    )
 
 
 def test_released_reel_preparation_caps_slow_model_before_local_fallback(

@@ -41,6 +41,10 @@ const AUTOPLAY_MAX_RETRIES = 5;
 const CLIP_END_POLL_INTERVAL_MS = 10;
 const BOUNDARY_SEEK_PREROLL_SEC = 1;
 const BOUNDARY_SEEK_CONFIRM_TOLERANCE_SEC = 0.25;
+const BOUNDARY_SEEK_MAX_RETRIES = 2;
+const BOUNDARY_SEEK_RETRY_GRACE_MS = 250;
+const BOUNDARY_SEEK_ACCEPTABLE_OVERSHOOT_SEC = 1;
+const BOUNDARY_ALIGNMENT_ERROR = "Could not align this clip to its exact start.";
 const PLAYBACK_SPEED_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as const;
 
 function detectTouchLikeDevice(): boolean {
@@ -131,7 +135,12 @@ function hasReachedVerifiedClipStart(playerTime: number, clipStart: number): boo
 }
 
 function hasObservedBoundarySeek(playerTime: number, targetTime: number): boolean {
+  const earliestExpectedTime = Math.max(
+    0,
+    targetTime - BOUNDARY_SEEK_PREROLL_SEC - BOUNDARY_SEEK_CONFIRM_TOLERANCE_SEC,
+  );
   return Number.isFinite(playerTime)
+    && playerTime >= earliestExpectedTime
     && playerTime <= targetTime + BOUNDARY_SEEK_CONFIRM_TOLERANCE_SEC;
 }
 
@@ -180,6 +189,8 @@ export function ReelCard({
   const boundaryGateTargetRef = useRef<number | null>(null);
   const boundaryGateArmedRef = useRef(false);
   const boundaryGateAwaitingSeekRef = useRef(false);
+  const boundarySeekRetryCountRef = useRef(0);
+  const boundarySeekRetryAtRef = useRef<number | null>(null);
 
   const [isReady, setIsReady] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -352,6 +363,8 @@ export function ReelCard({
   const armBoundaryGate = useCallback((player: YouTubePlayer, targetTime: number) => {
     boundaryGateTargetRef.current = targetTime;
     boundaryGateArmedRef.current = true;
+    boundarySeekRetryCountRef.current = 0;
+    boundarySeekRetryAtRef.current = null;
     player.mute();
     isMutedRef.current = true;
     setIsMuted(true);
@@ -369,6 +382,8 @@ export function ReelCard({
     boundaryGateTargetRef.current = null;
     boundaryGateArmedRef.current = false;
     boundaryGateAwaitingSeekRef.current = false;
+    boundarySeekRetryCountRef.current = 0;
+    boundarySeekRetryAtRef.current = null;
     setIsBoundaryMaskVisible(false);
     setIsResumeMaskVisible(false);
     setIsSurfaceVisible(true);
@@ -390,6 +405,8 @@ export function ReelCard({
     boundaryGateTargetRef.current = null;
     boundaryGateArmedRef.current = true;
     boundaryGateAwaitingSeekRef.current = false;
+    boundarySeekRetryCountRef.current = 0;
+    boundarySeekRetryAtRef.current = null;
     player.mute();
     isMutedRef.current = true;
     setIsMuted(true);
@@ -418,7 +435,42 @@ export function ReelCard({
             isMutedRef.current = true;
             setIsMuted(true);
             setIsBoundaryMaskVisible(true);
-            return;
+            const nowMs = Date.now();
+            const lastRetryAt = boundarySeekRetryAtRef.current;
+            const retryAgeMs = lastRetryAt === null ? Infinity : nowMs - lastRetryAt;
+            if (
+              boundarySeekRetryCountRef.current < BOUNDARY_SEEK_MAX_RETRIES
+              && retryAgeMs >= BOUNDARY_SEEK_RETRY_GRACE_MS
+            ) {
+              boundarySeekRetryCountRef.current += 1;
+              boundarySeekRetryAtRef.current = nowMs;
+              player.seekTo(
+                Math.max(0, gateTarget - BOUNDARY_SEEK_PREROLL_SEC),
+                true,
+              );
+              return;
+            }
+            if (
+              boundarySeekRetryCountRef.current < BOUNDARY_SEEK_MAX_RETRIES
+              || retryAgeMs < BOUNDARY_SEEK_RETRY_GRACE_MS
+            ) {
+              return;
+            }
+            if (
+              playerTime < gateTarget
+              || playerTime > gateTarget + BOUNDARY_SEEK_ACCEPTABLE_OVERSHOOT_SEC
+            ) {
+              boundaryGateAwaitingSeekRef.current = false;
+              manualPauseRequestedRef.current = true;
+              player.pauseVideo();
+              setIsPlaying(false);
+              setLoadError(BOUNDARY_ALIGNMENT_ERROR);
+              stopProgressTimer();
+              return;
+            }
+          } else {
+            boundarySeekRetryCountRef.current = 0;
+            boundarySeekRetryAtRef.current = null;
           }
           boundaryGateAwaitingSeekRef.current = false;
         }
@@ -473,6 +525,20 @@ export function ReelCard({
     releaseBoundaryGate,
     stopProgressTimer,
   ]);
+
+  const retryBoundaryAlignment = useCallback(() => {
+    const player = playerRef.current;
+    if (!player) {
+      return;
+    }
+    setLoadError(null);
+    manualPauseRequestedRef.current = false;
+    seekToBoundary(player, clipStart);
+    applyPlaybackRateToPlayer(player, playbackRateRef.current);
+    player.playVideo();
+    setIsPlaying(true);
+    startProgressTimer();
+  }, [applyPlaybackRateToPlayer, clipStart, seekToBoundary, startProgressTimer]);
 
   useEffect(() => {
     if (!isYouTubeVideo || !isActive || !isReady || !isPlaying) {
@@ -1333,7 +1399,21 @@ export function ReelCard({
             <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-white/60">Platform-managed playback</p>
           )}
 
-          {loadError ? <p className="mt-2 inline-flex rounded-full bg-black/76 px-3 py-1 text-xs text-white/78">{loadError}</p> : null}
+          {loadError ? (
+            <div className="mt-2 inline-flex items-center gap-2 rounded-full bg-black/76 px-3 py-1 text-xs text-white/78">
+              <span>{loadError}</span>
+              {loadError === BOUNDARY_ALIGNMENT_ERROR ? (
+                <button
+                  type="button"
+                  data-reel-control="true"
+                  onClick={retryBoundaryAlignment}
+                  className="rounded-full bg-white/14 px-2 py-0.5 font-semibold text-white hover:bg-white/22"
+                >
+                  Retry
+                </button>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       </div>
     </section>

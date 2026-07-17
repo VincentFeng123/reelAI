@@ -165,14 +165,26 @@ def _grounded_fallback_question(
     if not supported_option or not support_quote:
         return None
     distractors: list[str] = []
-    seen = {supported_option.casefold()}
+    supported_key = supported_option.casefold()
+    seen = {supported_key}
+
+    def add_distractor(option: str) -> None:
+        clean_option = option.strip()
+        option_key = clean_option.casefold()
+        if (
+            not clean_option
+            or option_key in seen
+            or supported_key.startswith(option_key)
+            or option_key.startswith(supported_key)
+        ):
+            return
+        distractors.append(clean_option)
+        seen.add(option_key)
+
     for alternative in alternative_rows or []:
         if str(alternative.get("reel_id") or "") == str(row.get("reel_id") or ""):
             continue
-        option = _transcript_option(alternative)
-        if option and option.casefold() not in seen:
-            distractors.append(option)
-            seen.add(option.casefold())
+        add_distractor(_transcript_option(alternative))
         if len(distractors) == 3:
             break
     for option in (
@@ -183,17 +195,14 @@ def _grounded_fallback_question(
     ):
         if len(distractors) == 3:
             break
-        if option.casefold() in seen:
-            continue
-        distractors.append(option)
-        seen.add(option.casefold())
+        add_distractor(option)
     if len(distractors) != 3:
         return None
     correct_index = int(_question_fingerprint(row)[:2], 16) % 4
     options = list(distractors)
     options.insert(correct_index, supported_option)
     return {
-        "prompt": "Which statement is directly supported by this clip?",
+        "prompt": "Which exact excerpt begins this clip?",
         "options": options,
         "correct_index": correct_index,
         "explanation": support_quote,
