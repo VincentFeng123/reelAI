@@ -128,6 +128,9 @@ SPEECH_OWNERSHIP_EPSILON_SEC = 0.001
 MAX_PLAUSIBLE_CAPTION_WORDS_PER_SEC = 8.0
 CAPTION_PROJECTION_START_PREROLL_SEC = 0.15
 PROJECTED_END_COVERAGE_SEC = 0.002
+GROQ_BOUNDARY_START_PREROLL_SEC = 0.06
+GROQ_BOUNDARY_END_POSTROLL_SEC = 0.06
+GROQ_BOUNDARY_NEIGHBOR_GUARD_SEC = 0.01
 GROQ_BOUNDARY_WINDOW_SEC = 12.0
 GROQ_BOUNDARY_WINDOW_MARGIN_SEC = 2.0
 GROQ_BOUNDARY_TIMEOUT_SEC = 8.0
@@ -1164,6 +1167,8 @@ def _projected_speech_bounds(
             or None,
         )
         projection_mode = "projected" if is_projected else "cue_edge"
+        quote_last_end_sec: float | None = None
+        groq_word_span_verified = False
         if anchor is None:
             if not is_projected:
                 continue
@@ -1195,30 +1200,71 @@ def _projected_speech_bounds(
             projection_mode = "caption_token_interpolation"
         else:
             excluded_sec = float(anchor.excluded_neighbor_onset_sec)
-            required_sec = (
-                float(anchor.quote_start_sec)
-                if edge == "start"
-                else (
+            quote_start_sec = float(anchor.quote_start_sec)
+            quote_last_onset_sec = float(anchor.quote_last_onset_sec)
+            raw_quote_last_end = getattr(anchor, "quote_last_end_sec", None)
+            raw_excluded_end = getattr(anchor, "excluded_neighbor_end_sec", None)
+            quote_last_end_sec = (
+                float(raw_quote_last_end)
+                if isinstance(raw_quote_last_end, (int, float))
+                and math.isfinite(float(raw_quote_last_end))
+                else None
+            )
+            excluded_neighbor_end_sec = (
+                float(raw_excluded_end)
+                if isinstance(raw_excluded_end, (int, float))
+                and math.isfinite(float(raw_excluded_end))
+                else None
+            )
+            if edge == "start":
+                required_sec = quote_start_sec
+                if (
+                    lexical_timing_source == "groq_boundary_asr"
+                    and excluded_neighbor_end_sec is not None
+                    and excluded_neighbor_end_sec <= quote_start_sec
+                ):
+                    required_sec = max(
+                        excluded_neighbor_end_sec,
+                        quote_start_sec - GROQ_BOUNDARY_START_PREROLL_SEC,
+                    )
+            elif (
+                lexical_timing_source == "groq_boundary_asr"
+                and quote_last_end_sec is not None
+                and quote_last_onset_sec <= quote_last_end_sec <= excluded_sec
+            ):
+                groq_word_span_verified = True
+                required_sec = max(
+                    quote_last_end_sec,
                     min(
-                        float(anchor.quote_last_onset_sec)
-                        + PROJECTED_END_COVERAGE_SEC,
-                        (
-                            float(anchor.quote_last_onset_sec)
-                            + excluded_sec
-                        )
-                        / 2.0,
+                        quote_last_end_sec + GROQ_BOUNDARY_END_POSTROLL_SEC,
+                        max(
+                            quote_last_end_sec,
+                            excluded_sec - GROQ_BOUNDARY_NEIGHBOR_GUARD_SEC,
+                        ),
+                    ),
+                )
+            else:
+                required_sec = (
+                    min(
+                        quote_last_onset_sec + PROJECTED_END_COVERAGE_SEC,
+                        (quote_last_onset_sec + excluded_sec) / 2.0,
                     )
                     if is_projected
-                    else float(anchor.quote_last_onset_sec)
+                    else quote_last_onset_sec
                 )
-            )
         if (
             not math.isfinite(required_sec)
             or not math.isfinite(excluded_sec)
             or (
                 excluded_sec >= required_sec
                 if edge == "start"
-                else excluded_sec <= required_sec
+                else (
+                    excluded_sec < required_sec
+                    or (
+                        excluded_sec == required_sec
+                        and not groq_word_span_verified
+                    )
+                )
             )
         ):
             if is_projected:
@@ -1237,6 +1283,11 @@ def _projected_speech_bounds(
             **(
                 {"timing_source": lexical_timing_source}
                 if anchor is not None and lexical_timing_source
+                else {}
+            ),
+            **(
+                {"quote_last_end_sec": round(quote_last_end_sec, 3)}
+                if quote_last_end_sec is not None
                 else {}
             ),
         }
@@ -2447,15 +2498,20 @@ def _transcript_aligned_result(
                 overlap_fallback_end = display_end
                 semantic_end = max(semantic_end, display_end)
     final_start = required_start
-    final_end = (
-        overlap_fallback_end
-        if overlap_fallback_end is not None
-        else (
-            semantic_end
-            if isinstance(projection_diagnostics.get("end"), dict)
-            else required_end
-        )
+    end_projection = projection_diagnostics.get("end")
+    groq_end_verified = bool(
+        isinstance(end_projection, dict)
+        and end_projection.get("timing_source") == "groq_boundary_asr"
+        and isinstance(end_projection.get("quote_last_end_sec"), (int, float))
     )
+    if overlap_fallback_end is not None:
+        final_end = overlap_fallback_end
+    elif groq_end_verified:
+        final_end = required_end
+    elif isinstance(end_projection, dict):
+        final_end = semantic_end
+    else:
+        final_end = required_end
     if (
         not all(
             math.isfinite(value)

@@ -134,9 +134,16 @@ def _absolute_words(
         ):
             return ()
         absolute_start = window_start_sec + local_start
-        if not math.isfinite(absolute_start):
+        absolute_end = window_start_sec + local_end
+        if not math.isfinite(absolute_start) or not math.isfinite(absolute_end):
             return ()
-        words.append(LexicalWord(text=text.strip(), onset_sec=absolute_start))
+        words.append(
+            LexicalWord(
+                text=text.strip(),
+                onset_sec=absolute_start,
+                end_sec=absolute_end,
+            )
+        )
         previous_end = local_end
     return tuple(words)
 
@@ -245,7 +252,7 @@ def transcribe_boundary_words(
     timeout_sec: float,
     cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[LexicalWord, ...]:
-    """Return validated Groq word onsets in absolute source time.
+    """Return validated Groq word spans in absolute source time.
 
     Only the requested bounded WAV is uploaded. An empty tuple is the complete
     fail-open contract, including cancellation and all provider failures.

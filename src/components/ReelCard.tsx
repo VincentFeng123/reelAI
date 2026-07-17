@@ -38,9 +38,9 @@ const PLAYER_REVEAL_DELAY_MS = 0;
 const RESUME_MASK_MS = 480;
 const AUTOPLAY_RETRY_DELAY_MS = 320;
 const AUTOPLAY_MAX_RETRIES = 5;
-const CLIP_END_POLL_INTERVAL_MS = 20;
-const BACKWARD_SEEK_PREROLL_SEC = 1;
-const NEAR_ZERO_SEEK_CONFIRM_SEC = 0.05;
+const CLIP_END_POLL_INTERVAL_MS = 10;
+const BOUNDARY_SEEK_PREROLL_SEC = 1;
+const BOUNDARY_SEEK_CONFIRM_TOLERANCE_SEC = 0.25;
 const PLAYBACK_SPEED_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as const;
 
 function detectTouchLikeDevice(): boolean {
@@ -131,11 +131,8 @@ function hasReachedVerifiedClipStart(playerTime: number, clipStart: number): boo
 }
 
 function hasObservedBoundarySeek(playerTime: number, targetTime: number): boolean {
-  return Number.isFinite(playerTime) && (
-    targetTime <= NEAR_ZERO_SEEK_CONFIRM_SEC
-      ? playerTime <= NEAR_ZERO_SEEK_CONFIRM_SEC
-      : playerTime < targetTime
-  );
+  return Number.isFinite(playerTime)
+    && playerTime <= targetTime + BOUNDARY_SEEK_CONFIRM_TOLERANCE_SEC;
 }
 
 function formatClock(seconds: number): string {
@@ -362,16 +359,10 @@ export function ReelCard({
   }, []);
 
   const seekToBoundary = useCallback((player: YouTubePlayer, targetTime: number) => {
-    const playerTime = player.getCurrentTime();
-    const isBackwardSeek = Number.isFinite(playerTime) && playerTime > targetTime;
+    const decodeStart = Math.max(0, targetTime - BOUNDARY_SEEK_PREROLL_SEC);
     armBoundaryGate(player, targetTime);
-    boundaryGateAwaitingSeekRef.current = isBackwardSeek;
-    player.seekTo(
-      isBackwardSeek
-        ? Math.max(0, targetTime - BACKWARD_SEEK_PREROLL_SEC)
-        : targetTime,
-      true,
-    );
+    boundaryGateAwaitingSeekRef.current = true;
+    player.seekTo(decodeStart, true);
   }, [armBoundaryGate]);
 
   const releaseBoundaryGate = useCallback((player: YouTubePlayer) => {

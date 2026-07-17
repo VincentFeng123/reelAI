@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -25,12 +26,12 @@ from ..clip_engine.errors import CancellationError, ProviderError
 
 
 COMPLETION_FRACTION = 0.80
-MIN_CADENCE_TARGET = 3
-MAX_CADENCE_TARGET = 5
+REEL_BATCH_SIZE = 3
 SESSION_QUESTION_TARGET = 3
 CONCEPT_ADJUSTMENT_BOUND = 0.25
 BACKFILL_CACHE_PREFIX = "assessment_question_backfill:"
 NEGATIVE_BACKFILL_CACHE_TTL_SECONDS = 30
+RECALL_PREPARATION_TIMEOUT_SECONDS = 8.0
 
 _WORD_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 _GROUNDING_STOP_WORDS = {
@@ -140,6 +141,62 @@ def _validated_question(
         "options": clean_options,
         "correct_index": answer_index,
         "explanation": clean_explanation,
+    }
+
+
+def _transcript_option(row: dict[str, Any], *, word_limit: int = 8) -> str:
+    transcript = " ".join(str(row.get("transcript_snippet") or "").split())
+    words = transcript.split()
+    return " ".join(words[:word_limit]).strip(" ,.;:!?\"'")
+
+
+def _grounded_fallback_question(
+    row: dict[str, Any],
+    *,
+    alternative_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Build an immediate transcript-only recall question without provider I/O."""
+    transcript = " ".join(str(row.get("transcript_snippet") or "").split())
+    words = transcript.split()
+    if not words:
+        return None
+    supported_option = _transcript_option(row)
+    support_quote = " ".join(words[:24]).strip()
+    if not supported_option or not support_quote:
+        return None
+    distractors: list[str] = []
+    seen = {supported_option.casefold()}
+    for alternative in alternative_rows or []:
+        if str(alternative.get("reel_id") or "") == str(row.get("reel_id") or ""):
+            continue
+        option = _transcript_option(alternative)
+        if option and option.casefold() not in seen:
+            distractors.append(option)
+            seen.add(option.casefold())
+        if len(distractors) == 3:
+            break
+    for option in (
+        "The clip contains only course scheduling details",
+        "The clip is an advertisement with no explanation",
+        "The clip makes the opposite claim without support",
+        "The clip never discusses the lesson topic",
+    ):
+        if len(distractors) == 3:
+            break
+        if option.casefold() in seen:
+            continue
+        distractors.append(option)
+        seen.add(option.casefold())
+    if len(distractors) != 3:
+        return None
+    correct_index = int(_question_fingerprint(row)[:2], 16) % 4
+    options = list(distractors)
+    options.insert(correct_index, supported_option)
+    return {
+        "prompt": "Which statement is directly supported by this clip?",
+        "options": options,
+        "correct_index": correct_index,
+        "explanation": support_quote,
     }
 
 
@@ -282,25 +339,9 @@ class AssessmentService:
         recent_accuracy: float | None,
         scroll_rows: list[dict[str, Any]],
     ) -> int:
-        """Choose a stable 3-5 reel cadence, then adapt it to current evidence."""
-        seed = f"{learner_id}|{material_id}|{window_cutoff or 'initial'}"
-        digest = hashlib.sha256(seed.encode("utf-8")).digest()
-        target = MIN_CADENCE_TARGET + digest[0] % (
-            MAX_CADENCE_TARGET - MIN_CADENCE_TARGET + 1
-        )
-        if recent_accuracy is not None:
-            if float(recent_accuracy) < 0.70:
-                target -= 1
-            elif float(recent_accuracy) >= 0.90:
-                target += 1
-        if len(scroll_rows) >= 2:
-            # Lock the continuity adjustment to the window's opening pair so
-            # readiness cannot flap as later scroll events arrive.
-            previous_concept = str(scroll_rows[0].get("concept_id") or "")
-            current_concept = str(scroll_rows[1].get("concept_id") or "")
-            if previous_concept and current_concept:
-                target += 1 if previous_concept == current_concept else -1
-        return max(MIN_CADENCE_TARGET, min(MAX_CADENCE_TARGET, target))
+        """Match recall readiness to the feed's fixed three-reel batch boundary."""
+        del learner_id, material_id, window_cutoff, recent_accuracy, scroll_rows
+        return REEL_BATCH_SIZE
 
     @staticmethod
     def _cadence_session_id(
@@ -443,11 +484,15 @@ class AssessmentService:
             SELECT
                 q.id,
                 q.reel_id,
+                q.fingerprint,
                 q.prompt,
                 q.options_json,
                 q.created_at,
                 r.concept_id,
                 r.video_id,
+                r.t_start,
+                r.t_end,
+                r.transcript_snippet,
                 r.difficulty,
                 c.title AS concept_title,
                 p.scrolled_at
@@ -475,7 +520,12 @@ class AssessmentService:
             except (TypeError, json.JSONDecodeError):
                 options = []
             row["options"] = options if isinstance(options, list) else []
-        return [row for row in rows if len(row.get("options") or []) == 4]
+        return [
+            row
+            for row in rows
+            if len(row.get("options") or []) == 4
+            and str(row.get("fingerprint") or "") == _question_fingerprint(row)
+        ]
 
     def _readiness_state(self, conn: Any, learner_id: str, material_id: str) -> dict[str, Any]:
         pending = self._pending_row(conn, learner_id, material_id)
@@ -685,7 +735,9 @@ class AssessmentService:
         ]
         plan = llm_json(
             (
-                "Create one grounded four-option recall question for each supplied clip. "
+                "Use only the supplied transcript text; no video, image, audio, frame, or "
+                "other media is attached or permitted. Create one grounded four-option "
+                "recall question for each supplied clip. "
                 "Every option must be distinct. The explanation must be supported by that clip's transcript. "
                 "Keep each prompt at most 16 words, each option at most 8 words, and each "
                 "explanation one sentence and at most 24 words. "
@@ -713,6 +765,29 @@ class AssessmentService:
         material_id: str,
         source_rows: list[dict[str, Any]],
         should_cancel: Callable[[], bool] | None,
+        question_target: int | None = None,
+        write_negative_cache: bool = True,
+    ) -> None:
+        self._ensure_question_pool_core(
+            conn,
+            learner_id=learner_id,
+            material_id=material_id,
+            source_rows=source_rows,
+            should_cancel=should_cancel,
+            question_target=question_target,
+            write_negative_cache=write_negative_cache,
+        )
+
+    def _ensure_question_pool_core(
+        self,
+        conn: Any,
+        *,
+        learner_id: str,
+        material_id: str,
+        source_rows: list[dict[str, Any]],
+        should_cancel: Callable[[], bool] | None,
+        question_target: int | None,
+        write_negative_cache: bool,
     ) -> None:
         del learner_id, material_id  # content is reel-scoped; eligibility is learner-scoped.
         uncached: list[dict[str, Any]] = []
@@ -730,8 +805,13 @@ class AssessmentService:
                 seen_concepts.add(concept_id)
             else:
                 repeated_concepts.append(row)
-        question_target = min(
-            SESSION_QUESTION_TARGET,
+        requested_target = (
+            SESSION_QUESTION_TARGET
+            if question_target is None
+            else max(0, int(question_target))
+        )
+        effective_target = min(
+            requested_target,
             len(
                 {
                     str(row.get("reel_id") or row.get("id") or "")
@@ -740,9 +820,11 @@ class AssessmentService:
                 }
             ),
         )
+        if effective_target <= 0:
+            return
 
         def pool_complete() -> bool:
-            return question_target > 0 and len(satisfied_reels) >= question_target
+            return effective_target > 0 and len(satisfied_reels) >= effective_target
 
         candidates: list[dict[str, Any]] = []
         for row in [*distinct_concepts, *repeated_concepts]:
@@ -800,7 +882,7 @@ class AssessmentService:
             projected_reels = satisfied_reels | {
                 str(candidate.get("reel_id") or "") for candidate in uncached
             }
-            if len(projected_reels) >= question_target:
+            if len(projected_reels) >= effective_target:
                 break
         if not uncached:
             return
@@ -857,7 +939,113 @@ class AssessmentService:
                         **validated,
                     )
             _check_cancelled(should_cancel)
-            self._write_cached_backfill(conn, str(row["fingerprint"]), cached_value)
+            if cached_value is not None or write_negative_cache:
+                self._write_cached_backfill(
+                    conn, str(row["fingerprint"]), cached_value
+                )
+
+    def prepare_reel_questions(
+        self,
+        conn: Any,
+        *,
+        reel_ids: list[str],
+        should_cancel: Callable[[], bool] | None = None,
+        use_model: bool = True,
+    ) -> dict[str, int]:
+        """Prepare one private recall question for every reel in a released batch."""
+        normalized_ids = list(
+            dict.fromkeys(
+                clean_id
+                for value in reel_ids
+                if (clean_id := str(value or "").strip())
+            )
+        )
+        if not normalized_ids:
+            return {"requested": 0, "prepared": 0, "fallback": 0}
+        placeholders = ", ".join(["?"] * len(normalized_ids))
+        rows = fetch_all(
+            conn,
+            f"""
+            SELECT
+                r.id AS reel_id,
+                r.concept_id,
+                r.video_id,
+                r.t_start,
+                r.t_end,
+                r.transcript_snippet,
+                c.title AS concept_title
+            FROM reels r
+            JOIN concepts c ON c.id = r.concept_id
+            WHERE r.id IN ({placeholders})
+            """,
+            tuple(normalized_ids),
+        )
+        by_id = {str(row.get("reel_id") or ""): row for row in rows}
+        ordered_rows = [by_id[reel_id] for reel_id in normalized_ids if reel_id in by_id]
+        fallback_count = 0
+        if use_model:
+            preparation_deadline = time.monotonic() + RECALL_PREPARATION_TIMEOUT_SECONDS
+
+            def preparation_cancelled() -> bool:
+                return bool(
+                    (should_cancel is not None and should_cancel())
+                    or time.monotonic() >= preparation_deadline
+                )
+
+            try:
+                self._ensure_question_pool_core(
+                    conn,
+                    learner_id="",
+                    material_id="",
+                    source_rows=ordered_rows,
+                    should_cancel=preparation_cancelled,
+                    question_target=len(ordered_rows),
+                    write_negative_cache=False,
+                )
+            except AssessmentCancelledError:
+                if should_cancel is not None and should_cancel():
+                    raise
+            except Exception:
+                # Provider-backed enrichment is optional. The deterministic
+                # transcript questions below are the readiness guarantee.
+                pass
+        for row in ordered_rows:
+            _check_cancelled(should_cancel)
+            fingerprint = _question_fingerprint(row)
+            existing = fetch_one(
+                conn,
+                "SELECT id FROM reel_assessment_questions "
+                "WHERE reel_id = ? AND fingerprint = ?",
+                (row["reel_id"], fingerprint),
+            )
+            if existing:
+                continue
+            fallback = _grounded_fallback_question(
+                row,
+                alternative_rows=ordered_rows,
+            )
+            if fallback and store_reel_assessment_question(
+                conn,
+                reel_id=str(row["reel_id"]),
+                fingerprint=fingerprint,
+                **fallback,
+            ):
+                fallback_count += 1
+        prepared = sum(
+            1
+            for row in ordered_rows
+            if fetch_one(
+                conn,
+                "SELECT id FROM reel_assessment_questions "
+                "WHERE reel_id = ? AND fingerprint = ?",
+                (row["reel_id"], _question_fingerprint(row)),
+            )
+        )
+        return {
+            "requested": len(ordered_rows),
+            "prepared": prepared,
+            "fallback": fallback_count,
+        }
 
     def _desired_question_count(self, conn: Any, state: dict[str, Any]) -> int:
         del conn
@@ -1023,12 +1211,14 @@ class AssessmentService:
         state = self._readiness_state(conn, learner_id, material_id)
         if state["pending"]:
             if not self._exposable_pending_session(conn, state["pending"]):
-                self._ensure_question_pool(
+                self.prepare_reel_questions(
                     conn,
-                    learner_id=learner_id,
-                    material_id=material_id,
-                    source_rows=state["scroll_rows"],
+                    reel_ids=[
+                        str(row.get("reel_id") or "")
+                        for row in state["scroll_rows"]
+                    ],
                     should_cancel=should_cancel,
+                    use_model=False,
                 )
                 state = self._readiness_state(conn, learner_id, material_id)
                 state["pending"] = self._repair_pending_session(
@@ -1054,12 +1244,14 @@ class AssessmentService:
             state["numeric_due"]
             and not bool(state["question_pool_complete"])
         ):
-            self._ensure_question_pool(
+            self.prepare_reel_questions(
                 conn,
-                learner_id=learner_id,
-                material_id=material_id,
-                source_rows=state["scroll_rows"],
+                reel_ids=[
+                    str(row.get("reel_id") or "")
+                    for row in state["scroll_rows"]
+                ],
                 should_cancel=should_cancel,
+                use_model=False,
             )
             state = self._readiness_state(conn, learner_id, material_id)
         if not state["assessment_ready"]:

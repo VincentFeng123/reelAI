@@ -157,7 +157,23 @@ def test_selector_contract_allows_short_exact_edges_without_padding() -> None:
 
     schema = gemini_segment._CompactBoundaryTopic.model_json_schema()
     assert "first spoken word" in schema["properties"]["sq"]["description"]
-    assert "final spoken word" in schema["properties"]["eq"]["description"]
+    assert "whole same-objective teaching arc" in schema["properties"]["eq"]["description"]
+    assert "intermediate result is not an endpoint" in schema["properties"]["eq"]["description"]
+
+
+def test_selector_contract_prioritizes_wholeness_over_clip_length() -> None:
+    system, user = gemini_segment._boundary_prompts(
+        "[0] 00:00 State the result. [1] 02:00 Explain why the same result holds.",
+        2,
+        "the result and its explanation",
+    )
+    prompt = f"{system}\n{user}".casefold()
+
+    assert "context and wholeness have absolute priority over concision" in prompt
+    assert "if completeness and brevity conflict, choose the longer complete span" in prompt
+    assert "a locally grammatical sentence or intermediate result is not an endpoint" in prompt
+    assert "there is no numeric duration cap" in prompt
+    assert "shortest concise span" not in prompt
 
 
 def test_compact_selector_preserves_the_models_exact_word_interval() -> None:
@@ -3023,7 +3039,7 @@ def test_newtons_second_law_prompt_requires_subject_anchoring_and_context() -> N
     ) in normalized
     assert "include the contiguous spoken unit" in normalized
     assert "end eq after the unit" in normalized
-    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v9"
+    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v10"
 
 
 def test_boundary_prompt_stays_transcript_only_when_video_is_requested() -> None:
@@ -3795,7 +3811,7 @@ def test_flash_selector_fails_over_immediately_after_one_503(monkeypatch) -> Non
                 gemini_client.GeminiCallTelemetry(
                     model=model,
                     operation="flash_boundary_selector",
-                    prompt_version="flash_split_v2",
+                    prompt_version="flash_split_v3",
                     thinking_level="low",
                     latency_ms=5.0,
                     retries=0,
@@ -3843,7 +3859,7 @@ def test_flash_selector_fails_over_immediately_after_one_503(monkeypatch) -> Non
         timeout_s=10.0,
         deadline_monotonic=time.monotonic() + 10.0,
         operation="flash_boundary_selector",
-        prompt_version="flash_split_v2",
+        prompt_version="flash_split_v3",
         cancelled=None,
         max_retries=0,
         failover_model="gemini-3.1-flash-lite",

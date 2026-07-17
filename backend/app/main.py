@@ -4448,6 +4448,35 @@ def _run_leased_generation_job(
                     else None
                 ),
             )
+            if final_reels:
+                try:
+                    recall_preparation = assessment_service.prepare_reel_questions(
+                        conn,
+                        reel_ids=[
+                            str(reel.get("reel_id") or "") for reel in final_reels
+                        ],
+                        use_model=False,
+                    )
+                    log_recall_preparation = (
+                        logger.info
+                        if recall_preparation["prepared"]
+                        == recall_preparation["requested"]
+                        else logger.warning
+                    )
+                    log_recall_preparation(
+                        "recall preparation job_id=%s requested=%d prepared=%d fallback=%d",
+                        job_id,
+                        recall_preparation["requested"],
+                        recall_preparation["prepared"],
+                        recall_preparation["fallback"],
+                    )
+                except Exception:
+                    # Clips are already terminal and visible. Recall preparation is
+                    # best-effort here; the request-time transcript path remains a fallback.
+                    logger.exception(
+                        "recall preparation failed after clip release job_id=%s",
+                        job_id,
+                    )
     except GenerationCancelledError:
         with get_conn(transactional=True) as conn:
             if generation_cancellation_requested(conn, job_id):

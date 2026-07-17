@@ -113,8 +113,10 @@ def _prompts(lines: str, n: int, topic: str = "") -> tuple[str, str]:
         "at end_line's cue end.\n" + topic_rule +
         "Acceptable kind values are content or educational; label intros, admin, promos, "
         "and outros truthfully so they can be removed. Return informativeness, "
-        "topic_relevance, self_contained, and difficulty on a 0..1 scale. Prefer complete "
-        "20-90 second ideas, but complete clips may be 1-180 seconds. "
+        "topic_relevance, self_contained, and difficulty on a 0..1 scale. Select the whole "
+        "coherent teaching arc first. Clip length is not a selection criterion; choose a "
+        "tighter boundary only between equally complete spans, never by removing required "
+        "setup, context, reasoning, answers, qualifications, or explanation. "
         "Every non-empty summary must include summary_cue_ids; every takeaway must have "
         "a same-position takeaway_cue_ids list; every match_reason must include "
         "match_reason_cue_ids; assessment must include cue_ids alongside prompt, exactly "
@@ -294,7 +296,7 @@ def _plan_to_clips(plan: _Plan, segs: list[dict], words: list[dict], settings: d
             continue
         start = round(float(start_cue["start"]), 3)
         end = round(float(end_cue["end"]), 3)
-        if not 1.0 <= end - start <= 180.0:
+        if end - start < 1.0:
             continue
         selected_cues = segments[start_index:end_index + 1]
         cue_ids = [_cue_id(cue, start_index + offset) for offset, cue in enumerate(selected_cues)]

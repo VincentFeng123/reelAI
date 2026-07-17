@@ -3239,6 +3239,94 @@ function FeedPageInner() {
     requestReadyBatch,
   ]);
 
+  const reportForwardScrollForReel = useCallback((outgoingReel: Reel | undefined) => {
+    if (
+      assessmentStartRequestRef.current
+      || assessmentBootstrapPending
+      || assessmentGatePending
+      || assessmentSession
+    ) {
+      return;
+    }
+    const reelId = String(outgoingReel?.reel_id || "").trim();
+    const reelMaterialId = String(outgoingReel?.material_id || materialId || "").trim();
+    if (!reelId || !reelMaterialId || reelId.startsWith("community:")) {
+      return;
+    }
+
+    const searchScope = activeSearchScopeRef.current;
+    const reportKey = `${searchScope.key}:${searchScope.seq}:${reelId}`;
+    if (reportedForwardScrollKeysRef.current.has(reportKey)) {
+      return;
+    }
+    reportedForwardScrollKeysRef.current.add(reportKey);
+
+    void (async () => {
+      try {
+        const scroll = await reportReelScroll({
+          reelId,
+          signal: searchScope.controller.signal,
+        });
+        if (!isSearchScopeActive(searchScope) || !scroll.assessment_ready || assessmentStartRequestRef.current) {
+          return;
+        }
+
+        const assessmentRequest = { key: searchScope.key, seq: searchScope.seq, reelId };
+        assessmentStartRequestRef.current = assessmentRequest;
+        setAssessmentGatePending(true);
+        setAssessmentError(null);
+        let openedAssessment = false;
+        try {
+          const response = await startNextAssessment({
+            materialId: String(scroll.material_id || reelMaterialId).trim(),
+            signal: searchScope.controller.signal,
+          });
+          if (!isSearchScopeActive(searchScope)) {
+            return;
+          }
+          if (!response.session || response.session.questions.length === 0) {
+            return;
+          }
+
+          const nextSession = withAssessmentAccuracy(response.session, response);
+          openedAssessment = true;
+          setAssessmentSession(nextSession);
+          setAssessmentQuestionIndex(clamp(nextSession.current_index, 0, nextSession.questions.length - 1));
+          setAssessmentAnswerReveal(null);
+          setAssessmentResultsVisible(nextSession.answered_count >= nextSession.question_count);
+          setAssessmentAdvanceAfterClose(false);
+          setAssessmentGatePending(false);
+          setAssessmentError(null);
+        } catch (error) {
+          if (isSearchScopeActive(searchScope) && !isRequestInterruptedError(error)) {
+            console.warn("Could not start recall check:", error);
+          }
+        } finally {
+          if (!openedAssessment) {
+            reportedForwardScrollKeysRef.current.delete(reportKey);
+            if (assessmentStartRequestRef.current === assessmentRequest) {
+              assessmentStartRequestRef.current = null;
+              if (isSearchScopeActive(searchScope)) {
+                setAssessmentGatePending(false);
+              }
+            }
+          }
+        }
+      } catch (error) {
+        reportedForwardScrollKeysRef.current.delete(reportKey);
+        if (isSearchScopeActive(searchScope) && !isRequestInterruptedError(error)) {
+          console.warn(`Could not record forward scroll for ${reelId}:`, error);
+        }
+      }
+    })();
+  }, [
+    assessmentBootstrapPending,
+    assessmentGatePending,
+    assessmentSession,
+    isSearchScopeActive,
+    materialId,
+  ]);
+
   const shouldBlockDownwardAtEnd = useCallback(
     (direction: 1 | -1): boolean => {
       if (direction <= 0 || reels.length === 0) {
@@ -3247,6 +3335,7 @@ function FeedPageInner() {
       if (activeIndexRef.current < reels.length - 1) {
         return false;
       }
+      reportForwardScrollForReel(reelsRef.current[activeIndexRef.current]);
       const canWaitForMore = hasMore
         || canRequestMore
         || isGeneratingRef.current
@@ -3264,7 +3353,7 @@ function FeedPageInner() {
       wheelAccumRef.current = 0;
       return true;
     },
-    [canRequestMore, hasMore, maybeLoadMore, reels.length],
+    [canRequestMore, hasMore, maybeLoadMore, reels.length, reportForwardScrollForReel],
   );
 
   const maybeResumeProgress = useCallback(() => {
@@ -3615,91 +3704,28 @@ function FeedPageInner() {
 
       const currentReels = reelsRef.current;
       const currentIndex = activeIndexRef.current;
+      if (currentReels.length === 0) {
+        maybeLoadMore();
+        return;
+      }
+      const outgoingReel = currentReels[currentIndex];
       const nextIndex = Math.min(currentReels.length - 1, currentIndex + 1);
-      if (currentReels.length === 0 || nextIndex <= currentIndex) {
+      if (nextIndex <= currentIndex) {
+        reportForwardScrollForReel(outgoingReel);
         maybeLoadMore();
         return;
       }
 
-      const outgoingReel = currentReels[currentIndex];
-      const reelId = String(outgoingReel?.reel_id || "").trim();
-      const reelMaterialId = String(outgoingReel?.material_id || materialId || "").trim();
       commitOneReelMove(1);
-      if (!reelId || !reelMaterialId || reelId.startsWith("community:")) {
-        return;
-      }
-
-      const searchScope = activeSearchScopeRef.current;
-      const reportKey = `${searchScope.key}:${searchScope.seq}:${reelId}`;
-      if (reportedForwardScrollKeysRef.current.has(reportKey)) {
-        return;
-      }
-      reportedForwardScrollKeysRef.current.add(reportKey);
-
-      void (async () => {
-        try {
-          const scroll = await reportReelScroll({
-            reelId,
-            signal: searchScope.controller.signal,
-          });
-          if (!isSearchScopeActive(searchScope) || !scroll.assessment_ready || assessmentStartRequestRef.current) {
-            return;
-          }
-
-          const assessmentRequest = { key: searchScope.key, seq: searchScope.seq, reelId };
-          assessmentStartRequestRef.current = assessmentRequest;
-          setAssessmentGatePending(true);
-          setAssessmentError(null);
-          let openedAssessment = false;
-          try {
-            const response = await startNextAssessment({
-              materialId: String(scroll.material_id || reelMaterialId).trim(),
-              signal: searchScope.controller.signal,
-            });
-            if (!isSearchScopeActive(searchScope)) {
-              return;
-            }
-            if (!response.session || response.session.questions.length === 0) {
-              return;
-            }
-
-            const nextSession = withAssessmentAccuracy(response.session, response);
-            openedAssessment = true;
-            setAssessmentSession(nextSession);
-            setAssessmentQuestionIndex(clamp(nextSession.current_index, 0, nextSession.questions.length - 1));
-            setAssessmentAnswerReveal(null);
-            setAssessmentResultsVisible(nextSession.answered_count >= nextSession.question_count);
-            setAssessmentAdvanceAfterClose(false);
-            setAssessmentGatePending(false);
-            setAssessmentError(null);
-          } catch (error) {
-            if (isSearchScopeActive(searchScope) && !isRequestInterruptedError(error)) {
-              console.warn("Could not start recall check:", error);
-            }
-          } finally {
-            if (!openedAssessment && assessmentStartRequestRef.current === assessmentRequest) {
-              assessmentStartRequestRef.current = null;
-              if (isSearchScopeActive(searchScope)) {
-                setAssessmentGatePending(false);
-              }
-            }
-          }
-        } catch (error) {
-          reportedForwardScrollKeysRef.current.delete(reportKey);
-          if (isSearchScopeActive(searchScope) && !isRequestInterruptedError(error)) {
-            console.warn(`Could not record forward scroll for ${reelId}:`, error);
-          }
-        }
-      })();
+      reportForwardScrollForReel(outgoingReel);
     },
     [
       assessmentBootstrapPending,
       assessmentGatePending,
       assessmentSession,
       commitOneReelMove,
-      isSearchScopeActive,
-      materialId,
       maybeLoadMore,
+      reportForwardScrollForReel,
     ],
   );
 
@@ -4338,8 +4364,14 @@ function FeedPageInner() {
   const handleActivePlaybackProgress = useCallback((maxFraction: number, naturalEnd: boolean) => {
     if (activeReel) {
       reportActiveReelProgress(activeReel, maxFraction, naturalEnd);
+      if (
+        naturalEnd
+        && activeIndexRef.current >= reelsRef.current.length - 1
+      ) {
+        reportForwardScrollForReel(activeReel);
+      }
     }
-  }, [activeReel, reportActiveReelProgress]);
+  }, [activeReel, reportActiveReelProgress, reportForwardScrollForReel]);
 
   const submitActiveFeedback = useCallback(
     async (action: FeedbackAction) => {

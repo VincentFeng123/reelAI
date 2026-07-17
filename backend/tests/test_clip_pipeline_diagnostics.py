@@ -3878,6 +3878,80 @@ def test_projected_one_token_answer_end_advances_past_its_caption_onset() -> Non
     assert projection["end"]["excluded_neighbor_onset_sec"] > bounds[1]
 
 
+def test_groq_word_spans_add_safe_cushions_without_reaching_neighbor() -> None:
+    text = "before alpha beta finish next topic"
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:groq-word-spans",
+        "duration": 6.0,
+        "segments": [
+            {"cue_id": "unit", "start": 0.0, "end": 6.0, "text": text}
+        ],
+    }
+    clip = _quality_clip(
+        cue_id="unit",
+        start=0.0,
+        end=6.0,
+        quote="alpha beta finish",
+        edge_projection={
+            "start": {"cue_id": "unit", "quote": "alpha beta"},
+            "end": {"cue_id": "unit", "quote": "finish"},
+        },
+    )
+    caption = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert caption is not None
+    word = pipeline_module.clip_engine_silence.lexical_timing.LexicalWord
+    groq_words = tuple(
+        word(value, onset, end)
+        for value, onset, end in (
+            ("before", 0.5, 0.9),
+            ("alpha", 1.0, 1.2),
+            ("beta", 1.3, 1.6),
+            ("finish", 2.0, 2.4),
+            ("next", 2.6, 2.8),
+            ("topic", 2.9, 3.2),
+        )
+    )
+
+    bounds, projection, error = pipeline_module._projected_speech_bounds(
+        transcript,
+        clip,
+        caption,
+        None,
+        lexical_words=groq_words,
+        lexical_timing_source="groq_boundary_asr",
+    )
+    search_limits = pipeline_module._selected_speech_corridor(
+        transcript,
+        clip,
+        caption,
+        source_end_sec=6.0,
+        required_speech_bounds=bounds,
+        projection_diagnostics=projection,
+    )[:2]
+    aligned = pipeline_module._transcript_aligned_result(
+        pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "unavailable",
+            bounds[0],
+            bounds[1],
+            {"stage": "groq_boundary_asr", "reason": "silence_not_detected"},
+        ),
+        speech_bounds=bounds,
+        search_limits=search_limits,
+        projection_diagnostics=projection,
+    )
+
+    assert error is None
+    assert bounds == pytest.approx((0.94, 2.46))
+    assert projection["end"]["quote_last_end_sec"] == 2.4
+    assert search_limits == pytest.approx((0.5, 2.6))
+    assert aligned.status == "context_aligned"
+    assert aligned.start_sec == pytest.approx(0.94)
+    assert aligned.end_sec == pytest.approx(2.46)
+    assert aligned.end_sec < projection["end"]["excluded_neighbor_onset_sec"]
+
+
 def test_first_occurrence_projection_handles_a_repeated_formula_operand() -> None:
     text = "X What is the derivative of X squared when X is positive"
     transcript = {

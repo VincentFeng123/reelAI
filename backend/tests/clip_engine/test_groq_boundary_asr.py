@@ -118,9 +118,9 @@ def test_uploads_only_bounded_wav_and_returns_absolute_word_onsets(
         timeout_sec=5.0,
     )
 
-    assert [(word.text, word.onset_sec) for word in words] == [
-        ("cell", 10.25),
-        ("division", 10.65),
+    assert [(word.text, word.onset_sec, word.end_sec) for word in words] == [
+        ("cell", 10.25, 10.65),
+        ("division", 10.65, 11.4),
     ]
     assert decode["window_start_sec"] == 10.0
     assert decode["window_end_sec"] == 12.0

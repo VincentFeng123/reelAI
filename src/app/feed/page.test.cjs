@@ -1663,8 +1663,8 @@ test("legacy duration settings are readable but removed from newly written feed 
   assert.doesNotMatch(feedQuerySource, /params\.set\("target_clip_duration/);
 });
 
-test("YouTube playback honors float boundaries with a sub-50ms end watchdog", () => {
-  assert.match(reelCardSource, /const CLIP_END_POLL_INTERVAL_MS = 20;/);
+test("YouTube playback decodes before float starts with a sub-25ms end watchdog", () => {
+  assert.match(reelCardSource, /const CLIP_END_POLL_INTERVAL_MS = 10;/);
   assert.match(reelCardSource, /clipEndRaw > clipStart \? clipEndRaw : clipStart/);
   assert.match(reelCardSource, /start: Math\.floor\(clipStart\)/);
   assert.match(reelCardSource, /end: Math\.ceil\(clipEnd\)/);
@@ -1727,15 +1727,17 @@ test("YouTube playback honors float boundaries with a sub-50ms end watchdog", ()
     module: ts.ModuleKind.CommonJS,
   });
   const hasObservedBoundarySeek = new Function(
-    `const NEAR_ZERO_SEEK_CONFIRM_SEC = 0.05;\n${compiledSeekObserved}\nreturn hasObservedBoundarySeek;`,
+    `const BOUNDARY_SEEK_CONFIRM_TOLERANCE_SEC = 0.25;\n${compiledSeekObserved}\nreturn hasObservedBoundarySeek;`,
   )();
   assert.equal(hasObservedBoundarySeek(80, 40), false);
   assert.equal(hasObservedBoundarySeek(39.8, 40), true);
-  assert.equal(hasObservedBoundarySeek(0.02, 0), true);
+  assert.equal(hasObservedBoundarySeek(40.06, 40), true);
+  assert.equal(hasObservedBoundarySeek(0.06, 0), true);
+  assert.equal(hasObservedBoundarySeek(0.251, 0), false);
   assert.equal(hasObservedBoundarySeek(1, 0), false);
   assert.match(
     reelCardSource,
-    /const seekToBoundary = useCallback\([\s\S]*?const isBackwardSeek =[\s\S]*?boundaryGateAwaitingSeekRef\.current = isBackwardSeek;[\s\S]*?targetTime - BACKWARD_SEEK_PREROLL_SEC/,
+    /const seekToBoundary = useCallback\([\s\S]*?const decodeStart = Math\.max\(0, targetTime - BOUNDARY_SEEK_PREROLL_SEC\);[\s\S]*?boundaryGateAwaitingSeekRef\.current = true;[\s\S]*?player\.seekTo\(decodeStart, true\)/,
   );
   assert.match(
     reelCardSource,
@@ -1774,9 +1776,115 @@ test("a tail gesture is retained until the next reel arrives", () => {
   assert.match(source, /Your next swipe will continue automatically\./);
 });
 
+test("every terminal tail path reports the third reel before recall", () => {
+  const reportStart = source.indexOf("const reportForwardScrollForReel = useCallback(");
+  const reportEnd = source.indexOf("const shouldBlockDownwardAtEnd", reportStart);
+  assert.ok(reportStart >= 0 && reportEnd > reportStart);
+  const helperText = source.slice(reportStart, reportEnd);
+  assert.match(helperText, /reportedForwardScrollKeysRef\.current\.has\(reportKey\)/);
+  assert.match(helperText, /reportReelScroll\(/);
+  assert.match(helperText, /startNextAssessment\(/);
+
+  const tailBlockStart = source.indexOf("const shouldBlockDownwardAtEnd");
+  const tailBlockEnd = source.indexOf("const maybeResumeProgress", tailBlockStart);
+  assert.match(
+    source.slice(tailBlockStart, tailBlockEnd),
+    /reportForwardScrollForReel\(reelsRef\.current\[activeIndexRef\.current\]\)/,
+  );
+
+  const jumpStart = source.indexOf("const jumpOneReel = useCallback(");
+  const jumpEnd = source.indexOf("const requestAutoplayAdvance", jumpStart);
+  assert.match(
+    source.slice(jumpStart, jumpEnd),
+    /if \(nextIndex <= currentIndex\) \{\s+reportForwardScrollForReel\(outgoingReel\);\s+maybeLoadMore\(\)/,
+  );
+
+  const playbackStart = source.indexOf("const handleActivePlaybackProgress");
+  const playbackEnd = source.indexOf("const submitActiveFeedback", playbackStart);
+  assert.match(
+    source.slice(playbackStart, playbackEnd),
+    /naturalEnd[\s\S]*?activeIndexRef\.current >= reelsRef\.current\.length - 1[\s\S]*?reportForwardScrollForReel\(activeReel\)/,
+  );
+});
+
+test("a failed or empty recall start can retry the same terminal reel", async () => {
+  const reportedForwardScrollKeysRef = { current: new Set() };
+  const assessmentStartRequestRef = { current: null };
+  const searchScope = {
+    key: "material-a",
+    seq: 1,
+    controller: new AbortController(),
+  };
+  let scrollCalls = 0;
+  let assessmentCalls = 0;
+  const openedSessions = [];
+  const callback = compileUseCallback("reportForwardScrollForReel", {
+    assessmentStartRequestRef,
+    assessmentBootstrapPending: false,
+    assessmentGatePending: false,
+    assessmentSession: null,
+    materialId: "material-a",
+    activeSearchScopeRef: { current: searchScope },
+    reportedForwardScrollKeysRef,
+    reportReelScroll: async () => {
+      scrollCalls += 1;
+      return { assessment_ready: true, material_id: "material-a" };
+    },
+    isSearchScopeActive: () => true,
+    setAssessmentGatePending: () => {},
+    setAssessmentError: () => {},
+    startNextAssessment: async () => {
+      assessmentCalls += 1;
+      if (assessmentCalls === 1) {
+        throw new Error("recall provider unavailable");
+      }
+      if (assessmentCalls === 2) {
+        return { session: null };
+      }
+      return {
+        session: {
+          questions: [{ question_id: "question-1" }],
+          current_index: 0,
+          answered_count: 0,
+          question_count: 1,
+        },
+      };
+    },
+    withAssessmentAccuracy: (session) => session,
+    setAssessmentSession: (session) => openedSessions.push(session),
+    setAssessmentQuestionIndex: () => {},
+    clamp: (value, min, max) => Math.max(min, Math.min(max, value)),
+    setAssessmentAnswerReveal: () => {},
+    setAssessmentResultsVisible: () => {},
+    setAssessmentAdvanceAfterClose: () => {},
+    isRequestInterruptedError: () => false,
+    console: { warn: () => {} },
+  });
+
+  callback({ reel_id: "reel-3", material_id: "material-a" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reportedForwardScrollKeysRef.current.size, 0);
+  assert.equal(assessmentStartRequestRef.current, null);
+
+  callback({ reel_id: "reel-3", material_id: "material-a" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scrollCalls, 2, "the backend-idempotent scroll report may be safely retried");
+  assert.equal(assessmentCalls, 2);
+  assert.equal(reportedForwardScrollKeysRef.current.size, 0);
+
+  callback({ reel_id: "reel-3", material_id: "material-a" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scrollCalls, 3);
+  assert.equal(assessmentCalls, 3);
+  assert.equal(openedSessions.length, 1);
+  assert.equal(reportedForwardScrollKeysRef.current.size, 1);
+});
+
 test("terminal tail gestures and autoplay never show a false search spinner", () => {
+  let reportedTail = 0;
   const shared = {
     reels: [{ reel_id: "only" }],
+    reelsRef: { current: [{ reel_id: "only" }] },
     activeIndexRef: { current: 0 },
     hasMore: false,
     canRequestMore: false,
@@ -1786,6 +1894,9 @@ test("terminal tail gestures and autoplay never show a false search spinner", ()
     setPendingTailAdvance: (value) => pendingStates.push(value),
     maybeLoadMore: () => {
       loadAttempts += 1;
+    },
+    reportForwardScrollForReel: () => {
+      reportedTail += 1;
     },
   };
   const pendingStates = [];
@@ -1808,6 +1919,7 @@ test("terminal tail gestures and autoplay never show a false search spinner", ()
   autoplay();
 
   assert.equal(loadAttempts, 0);
+  assert.equal(reportedTail, 1);
   assert.deepEqual(pendingStates, [false, false]);
   assert.equal(shared.pendingAutoplayAdvanceRef.current, false);
 });

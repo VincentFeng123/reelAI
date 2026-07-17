@@ -285,7 +285,7 @@ def test_embedded_subject_split_across_captions_keeps_its_predicate() -> None:
     assert "confidence interval" not in clip["_clip_text"].casefold()
 
 
-def test_boundary_prompt_demands_shortest_complete_unit_without_duration_cap() -> None:
+def test_boundary_prompt_demands_whole_unit_without_duration_cap() -> None:
     _system, user = G._boundary_prompts(
         "[0] 00:00 A sampling distribution describes repeated samples.\n"
         "[1] 00:08 A confidence interval estimates a parameter.",
@@ -294,7 +294,9 @@ def test_boundary_prompt_demands_shortest_complete_unit_without_duration_cap() -
     )
     prompt = user.casefold()
 
-    assert "shortest concise" in prompt
+    assert "context and wholeness have absolute priority over concision" in prompt
+    assert "if completeness and brevity conflict, choose the longer complete span" in prompt
+    assert "shortest concise" not in prompt
     assert "necessary setup and context" in prompt
     assert "ignore acoustic silence" in prompt
     assert "only expand outward" in prompt

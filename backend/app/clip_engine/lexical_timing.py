@@ -56,10 +56,11 @@ class Json3CaptionTrack:
 
 @dataclass(frozen=True)
 class LexicalWord:
-    """A lexical token with a provider-supplied onset (never interpolated)."""
+    """A lexical token with provider-supplied timing (never interpolated)."""
 
     text: str
     onset_sec: float
+    end_sec: float | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,8 @@ class EdgeAnchor:
     quote_start_sec: float
     quote_last_onset_sec: float
     excluded_neighbor_onset_sec: float
+    quote_last_end_sec: float | None = None
+    excluded_neighbor_end_sec: float | None = None
 
 
 def _normalize_language(value: object) -> str:
@@ -585,4 +588,8 @@ def align_edge_anchor(
         quote_start_sec=quote_start_word.onset_sec,
         quote_last_onset_sec=quote_last_word.onset_sec,
         excluded_neighbor_onset_sec=excluded_neighbor.onset_sec,
+        quote_last_end_sec=_number(getattr(quote_last_word, "end_sec", None)),
+        excluded_neighbor_end_sec=_number(
+            getattr(excluded_neighbor, "end_sec", None)
+        ),
     )

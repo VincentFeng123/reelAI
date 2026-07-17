@@ -127,19 +127,25 @@ class TestDurationContract:
         assert clips[0]["start"] == 0.0
         assert clips[0]["end"] == 180.0
 
-    def test_above_one_eighty_rejected_without_truncation_or_fallback(self):
-        assert _run([_topic(0, 6)]) == []
+    def test_above_one_eighty_kept_intact(self):
+        clips = _run([_topic(0, 6)])
+        assert len(clips) == 1
+        assert clips[0]["start"] == 0.0
+        assert clips[0]["end"] == 210.0
 
     def test_one_second_validity_guard(self):
         segs = [{"start": 1.0, "end": 1.999, "text": "tiny"}]
         assert _plan_to_clips(_Plan(topics=[_topic(0, 0)]), segs, [], {}) == []
 
-    def test_duration_gate_uses_canonical_millisecond_timestamps(self):
-        accepted = [{"start": 0.0, "end": 180.0004, "text": "complete"}]
-        rejected = [{"start": 0.0, "end": 180.0006, "text": "complete"}]
+    def test_canonical_millisecond_timestamps_do_not_impose_an_upper_cap(self):
+        rounds_to_180 = [{"start": 0.0, "end": 180.0004, "text": "complete"}]
+        rounds_above_180 = [{"start": 0.0, "end": 180.0006, "text": "complete"}]
         topic = _topic(0, 0, start_quote="complete", end_quote="complete")
-        assert _plan_to_clips(_Plan(topics=[topic]), accepted, [], {})[0]["end"] == 180.0
-        assert _plan_to_clips(_Plan(topics=[topic]), rejected, [], {}) == []
+        assert _plan_to_clips(_Plan(topics=[topic]), rounds_to_180, [], {})[0]["end"] == 180.0
+        assert (
+            _plan_to_clips(_Plan(topics=[topic]), rounds_above_180, [], {})[0]["end"]
+            == 180.001
+        )
 
     def test_safety_ceiling_remains_forty(self):
         segs = _segs(45, sec=1.0)

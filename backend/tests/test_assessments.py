@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+import time
 from types import SimpleNamespace
 
 import pytest
 
 import backend.app.services.assessments as assessments_module
 from backend.app.db import SCHEMA
-from backend.app.clip_engine.errors import ProviderTransientError
+from backend.app.clip_engine.errors import CancellationError, ProviderTransientError
 from backend.app.services.assessments import (
     AssessmentCancelledError,
     AssessmentService,
@@ -269,7 +271,7 @@ def test_scroll_is_idempotent_and_preserves_partial_watch_analytics(conn) -> Non
     assert row["completed_at"] is None
 
 
-def test_scroll_cadence_is_deterministic_adaptive_and_bounded(conn) -> None:
+def test_scroll_cadence_matches_each_three_reel_feed_batch(conn) -> None:
     service = AssessmentService()
     changed = [{"concept_id": "a"}, {"concept_id": "b"}]
     same = [{"concept_id": "a"}, {"concept_id": "a"}]
@@ -278,28 +280,18 @@ def test_scroll_cadence_is_deterministic_adaptive_and_bounded(conn) -> None:
         "material_id": MATERIAL,
         "window_cutoff": "",
     }
-    neutral = service._cadence_target(
+    assert service._cadence_target(
         **common, recent_accuracy=None, scroll_rows=changed
-    )
-    assert neutral == service._cadence_target(
-        **common, recent_accuracy=None, scroll_rows=changed
-    )
-    low = service._cadence_target(
+    ) == 3
+    assert service._cadence_target(
         **common, recent_accuracy=0.4, scroll_rows=changed
-    )
-    strong = service._cadence_target(
+    ) == 3
+    assert service._cadence_target(
         **common, recent_accuracy=1.0, scroll_rows=changed
-    )
-    continuous = service._cadence_target(
+    ) == 3
+    assert service._cadence_target(
         **common, recent_accuracy=None, scroll_rows=same
-    )
-    assert neutral == service._cadence_target(
-        **common,
-        recent_accuracy=None,
-        scroll_rows=[*changed, {"concept_id": "b"}],
-    )
-    assert 3 <= low <= neutral <= strong <= 5
-    assert neutral <= continuous <= 5
+    ) == 3
 
 
 def test_distinct_scrolls_become_ready_at_backend_owned_target(conn) -> None:
@@ -319,7 +311,7 @@ def test_distinct_scrolls_become_ready_at_backend_owned_target(conn) -> None:
     final = results[-1]
     assert final["assessment_ready"] is True
     assert final["scroll_count"] == final["cadence_target"]
-    assert 3 <= final["cadence_target"] <= 5
+    assert final["cadence_target"] == 3
     rows = conn.execute(
         "SELECT max_fraction, completed_at FROM learner_reel_progress "
         "WHERE learner_id = ? AND scrolled_at IS NOT NULL",
@@ -543,7 +535,7 @@ def test_session_uses_three_distinct_watched_reels_and_concepts(conn) -> None:
     assert {question["reel_id"] for question in session["questions"]} <= set(reel_ids[:3])
 
 
-def test_next_session_backfill_allows_repeated_concepts(conn) -> None:
+def test_next_session_prepares_repeated_concepts_without_provider_wait(conn) -> None:
     generated_reels: list[str] = []
 
     def generator(rows, _should_cancel=None):
@@ -581,7 +573,7 @@ def test_next_session_backfill_allows_repeated_concepts(conn) -> None:
     session = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)[
         "session"
     ]
-    assert generated_reels == ["second-concept"]
+    assert generated_reels == []
     assert session["question_count"] == 3
     assert len({question["reel_id"] for question in session["questions"]}) == 3
     assert {question["concept_id"] for question in session["questions"]} == {
@@ -590,7 +582,7 @@ def test_next_session_backfill_allows_repeated_concepts(conn) -> None:
     }
 
 
-def test_due_session_is_not_exposed_when_only_one_question_is_grounded(conn) -> None:
+def test_due_session_is_immediately_completed_from_saved_transcripts(conn) -> None:
     calls = 0
 
     def unavailable_generator(*_args):
@@ -612,16 +604,16 @@ def test_due_session_is_not_exposed_when_only_one_question_is_grounded(conn) -> 
     assert progress["assessment_ready"] is True
     assert calls == 0
     created = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
-    assert created["status"] == "not_ready"
+    assert created["status"] == "ready"
     assert created["assessment_ready"] is True
-    assert created["session"] is None
+    assert created["session"]["question_count"] == 3
     assert conn.execute(
         "SELECT COUNT(*) FROM assessment_sessions WHERE status = 'pending'"
-    ).fetchone()[0] == 0
-    assert calls == 1
+    ).fetchone()[0] == 1
+    assert calls == 0
 
 
-def test_transient_generation_failure_keeps_due_state_and_retries(conn) -> None:
+def test_request_time_question_preparation_never_calls_provider(conn) -> None:
     calls = 0
 
     def transient_generator(rows, _should_cancel=None):
@@ -659,11 +651,8 @@ def test_transient_generation_failure_keeps_due_state_and_retries(conn) -> None:
 
     assert progress["assessment_ready"] is True
     assert calls == 0
-    first = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
-    assert first["status"] == "not_ready"
-    assert first["assessment_ready"] is True
     created = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
-    assert calls == 2
+    assert calls == 0
     assert created["status"] == "ready"
     assert created["session"]["question_count"] == 3
 
@@ -1002,43 +991,13 @@ def test_snooze_reports_an_already_completed_session_as_completed(conn) -> None:
     ) == {"status": "completed", "assessment_ready": False}
 
 
-def test_malformed_backfill_cache_is_isolated_and_retried_at_next_session(conn) -> None:
+def test_request_time_fallback_ignores_negative_model_cache(conn) -> None:
     _seed_completed_accuracy(conn, session_id="backfill-history", correct_count=5)
     calls: list[list[str]] = []
 
     def generator(rows, _should_cancel=None):
         calls.append([str(row["reel_id"]) for row in rows])
-        if len(calls) > 1:
-            return {
-                "questions": [
-                    {
-                        "reel_id": row["reel_id"],
-                        "prompt": "What pulls an object toward Earth?",
-                        "options": ["Gravity", "Sound", "Heat", "Light"],
-                        "correct_index": 0,
-                        "explanation": "Gravity pulls an object toward Earth.",
-                    }
-                    for row in rows
-                ]
-            }
-        return {
-            "questions": [
-                {
-                    "reel_id": rows[0]["reel_id"],
-                    "prompt": "What pulls an object toward Earth?",
-                    "options": ["Gravity", "Sound", "Heat", "Light"],
-                    "correct_index": 0,
-                    "explanation": "Gravity pulls an object toward Earth.",
-                },
-                {
-                    "reel_id": rows[1]["reel_id"],
-                    "prompt": "Malformed",
-                    "options": ["Gravity", "Gravity", "Heat", "Light"],
-                    "correct_index": 0,
-                    "explanation": "Gravity pulls an object toward Earth.",
-                },
-            ]
-        }
+        return {"questions": []}
 
     service = AssessmentService(question_generator=generator)
     for index in range(3):
@@ -1049,60 +1008,26 @@ def test_malformed_backfill_cache_is_isolated_and_retried_at_next_session(conn) 
             video_id=f"legacy-v{index}",
             with_question=False,
         )
+        row = conn.execute(
+            "SELECT id AS reel_id, t_start, t_end, transcript_snippet "
+            "FROM reels WHERE id = ?",
+            (f"legacy-{index}",),
+        ).fetchone()
+        service._write_cached_backfill(
+            conn,
+            _question_fingerprint(dict(row)),
+            None,
+        )
         _complete(service, conn, f"legacy-{index}")
     assert calls == []
-    first = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
-    assert first["status"] == "not_ready"
-    assert first["assessment_ready"] is True
-    assert first["session"] is None
-    assert len(calls) == 1
-    assert conn.execute("SELECT COUNT(*) FROM reel_assessment_questions").fetchone()[0] == 1
+    ready = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
+    assert ready["status"] == "ready"
+    assert ready["session"]["question_count"] == 3
+    assert calls == []
+    assert conn.execute("SELECT COUNT(*) FROM reel_assessment_questions").fetchone()[0] == 3
     assert conn.execute(
         "SELECT COUNT(*) FROM llm_cache WHERE cache_key LIKE 'assessment_question_backfill:%'"
     ).fetchone()[0] == 3
-
-    cached_learner = "owner:learner-b"
-    _seed_completed_accuracy(
-        conn,
-        session_id="cached-backfill-history",
-        correct_count=5,
-        learner=cached_learner,
-    )
-    for index in range(3):
-        service.record_scroll(
-            conn, learner_id=cached_learner, reel_id=f"legacy-{index}"
-        )
-    cached = service.next_session(
-        conn, learner_id=cached_learner, material_id=MATERIAL
-    )
-    assert cached["status"] == "not_ready"
-    assert cached["assessment_ready"] is True
-    assert cached["session"] is None
-    assert len(calls) == 1
-
-    conn.execute(
-        "UPDATE llm_cache SET created_at = '2020-01-01T00:00:00+00:00' "
-        "WHERE response_json LIKE '%null%'"
-    )
-
-    retry_learner = "owner:backfill-retry"
-    _seed_completed_accuracy(
-        conn,
-        session_id="retry-backfill-history",
-        correct_count=5,
-        learner=retry_learner,
-    )
-    for index in range(3):
-        service.record_scroll(
-            conn, learner_id=retry_learner, reel_id=f"legacy-{index}"
-        )
-    retried = service.next_session(
-        conn, learner_id=retry_learner, material_id=MATERIAL
-    )
-    assert len(calls) == 2
-    assert retried["status"] == "ready"
-    assert retried["session"]["question_count"] == 3
-    assert conn.execute("SELECT COUNT(*) FROM reel_assessment_questions").fetchone()[0] == 3
 
 
 def test_legacy_backfill_scans_past_cached_old_rows(conn) -> None:
@@ -1153,6 +1078,182 @@ def test_legacy_backfill_scans_past_cached_old_rows(conn) -> None:
     )
     assert calls == [["starved-13", "starved-12", "starved-11"]]
     assert conn.execute("SELECT COUNT(*) FROM reel_assessment_questions").fetchone()[0] == 3
+
+
+def test_released_nine_reel_reservoir_prepares_every_question_in_one_call(conn) -> None:
+    calls: list[list[str]] = []
+
+    def generator(rows, _should_cancel=None):
+        calls.append([str(row["reel_id"]) for row in rows])
+        return {
+            "questions": [
+                {
+                    "reel_id": row["reel_id"],
+                    "prompt": "What pulls an object toward Earth?",
+                    "options": ["Gravity", "Sound", "Heat", "Light"],
+                    "correct_index": 0,
+                    "explanation": "Gravity pulls an object toward Earth.",
+                }
+                for row in rows
+            ]
+        }
+
+    service = AssessmentService(question_generator=generator)
+    reel_ids = [f"prepared-{index}" for index in range(9)]
+    for index, reel_id in enumerate(reel_ids):
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=f"prepared-c{index}",
+            video_id=f"prepared-v{index}",
+            with_question=False,
+        )
+
+    result = service.prepare_reel_questions(conn, reel_ids=reel_ids)
+
+    assert result == {"requested": 9, "prepared": 9, "fallback": 0}
+    assert len(calls) == 1
+    assert set(calls[0]) == set(reel_ids)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM reel_assessment_questions"
+    ).fetchone()[0] == 9
+
+    for reel_id in reel_ids[:3]:
+        scroll = service.record_scroll(conn, learner_id=LEARNER, reel_id=reel_id)
+    assert scroll["assessment_ready"] is True
+    ready = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
+    assert ready["status"] == "ready"
+    assert ready["session"]["question_count"] == 3
+    assert len(calls) == 1
+
+    replay = service.prepare_reel_questions(conn, reel_ids=reel_ids)
+    assert replay == {"requested": 9, "prepared": 9, "fallback": 0}
+    assert len(calls) == 1
+
+
+def test_released_reels_get_grounded_fallbacks_when_question_provider_fails(conn) -> None:
+    calls = 0
+
+    def unavailable_generator(_rows, _should_cancel=None):
+        nonlocal calls
+        calls += 1
+        raise ProviderTransientError(
+            "temporary assessment provider failure",
+            provider="gemini",
+            operation="assessment",
+        )
+
+    service = AssessmentService(question_generator=unavailable_generator)
+    reel_ids = [f"fallback-{index}" for index in range(6)]
+    for index, reel_id in enumerate(reel_ids):
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=f"fallback-c{index}",
+            video_id=f"fallback-v{index}",
+            with_question=False,
+        )
+
+    result = service.prepare_reel_questions(conn, reel_ids=reel_ids)
+
+    assert result == {"requested": 6, "prepared": 6, "fallback": 6}
+    assert calls == 1
+    stored = conn.execute(
+        "SELECT reel_id, prompt, options_json, explanation "
+        "FROM reel_assessment_questions ORDER BY reel_id"
+    ).fetchall()
+    assert [row["reel_id"] for row in stored] == sorted(reel_ids)
+    assert all(len(json.loads(row["options_json"])) == 4 for row in stored)
+    assert all("Gravity" in row["explanation"] for row in stored)
+
+
+def test_transcript_fallback_is_collision_free_and_skips_provider(conn) -> None:
+    calls = 0
+
+    def unexpected_generator(*_args):
+        nonlocal calls
+        calls += 1
+        return {"questions": []}
+
+    _seed_reel(
+        conn,
+        reel_id="fallback-collision",
+        concept_id="fallback-collision-c",
+        video_id="fallback-collision-v",
+        with_question=False,
+    )
+    supported = "The clip contains only course scheduling details"
+    conn.execute(
+        "UPDATE reels SET transcript_snippet = ? WHERE id = 'fallback-collision'",
+        (supported,),
+    )
+    service = AssessmentService(question_generator=unexpected_generator)
+
+    result = service.prepare_reel_questions(
+        conn,
+        reel_ids=["fallback-collision"],
+        use_model=False,
+    )
+
+    assert result == {"requested": 1, "prepared": 1, "fallback": 1}
+    assert calls == 0
+    row = conn.execute(
+        "SELECT options_json, correct_index FROM reel_assessment_questions "
+        "WHERE reel_id = 'fallback-collision'"
+    ).fetchone()
+    options = json.loads(row["options_json"])
+    assert len(options) == len(set(options)) == 4
+    assert options[row["correct_index"]] == supported
+
+
+def test_released_reel_preparation_caps_slow_model_before_local_fallback(
+    conn, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        assessments_module, "RECALL_PREPARATION_TIMEOUT_SECONDS", 0.01
+    )
+
+    def slow_generator(_rows, should_cancel=None):
+        while should_cancel is not None and not should_cancel():
+            time.sleep(0.001)
+        raise CancellationError("assessment preparation deadline reached")
+
+    service = AssessmentService(question_generator=slow_generator)
+    _seed_reel(
+        conn,
+        reel_id="slow-preparation",
+        concept_id="slow-preparation-c",
+        video_id="slow-preparation-v",
+        with_question=False,
+    )
+
+    started = time.monotonic()
+    result = service.prepare_reel_questions(
+        conn, reel_ids=["slow-preparation"]
+    )
+
+    assert time.monotonic() - started < 0.25
+    assert result == {"requested": 1, "prepared": 1, "fallback": 1}
+
+
+def test_boundary_change_hides_stale_prepared_question(conn) -> None:
+    reel_id = "changed-boundary"
+    _seed_reel(
+        conn,
+        reel_id=reel_id,
+        concept_id="changed-boundary-c",
+        video_id="changed-boundary-v",
+    )
+    service = AssessmentService()
+    service.record_scroll(conn, learner_id=LEARNER, reel_id=reel_id)
+    assert len(service._available_questions(conn, LEARNER, MATERIAL, "")) == 1
+
+    conn.execute(
+        "UPDATE reels SET t_start = 1.25, transcript_snippet = ? WHERE id = ?",
+        ("Updated gravity wording for the repaired exact clip boundary.", reel_id),
+    )
+
+    assert service._available_questions(conn, LEARNER, MATERIAL, "") == []
 
 
 def test_question_count_uses_distinct_reels_even_when_concepts_repeat(conn) -> None:
@@ -1358,24 +1459,16 @@ def test_next_session_backfill_observes_cancellation_before_any_write(conn) -> N
             video_id=f"cancel-v{index}",
             with_question=False,
         )
-    cancelled = False
-
-    def generator(_rows, _probe=None):
-        nonlocal cancelled
-        cancelled = True
-        return {"questions": []}
-
-    service = AssessmentService(question_generator=generator)
+    service = AssessmentService()
     service.record_scroll(conn, learner_id=LEARNER, reel_id="cancel-0")
     service.record_scroll(conn, learner_id=LEARNER, reel_id="cancel-1")
     service.record_scroll(conn, learner_id=LEARNER, reel_id="cancel-2")
-    assert cancelled is False
     with pytest.raises(AssessmentCancelledError):
         service.next_session(
             conn,
             learner_id=LEARNER,
             material_id=MATERIAL,
-            should_cancel=lambda: cancelled,
+            should_cancel=lambda: True,
         )
     assert conn.execute("SELECT COUNT(*) FROM reel_assessment_questions").fetchone()[0] == 0
     assert conn.execute(

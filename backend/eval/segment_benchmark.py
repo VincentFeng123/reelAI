@@ -27,7 +27,7 @@ EXPECTED_REPEATS = 3
 PROFILE_PRODUCTION_PRO = "production_pro_v0"
 PROFILE_CORRECTED_PRO = "corrected_pro_v1"
 PROFILE_FLASH_SINGLE = "flash_single_v1"
-PROFILE_FLASH_SPLIT = "flash_split_v2"
+PROFILE_FLASH_SPLIT = "flash_split_v3"
 PROFILE_SIMULATED_HYBRID = "simulated_hybrid_v1"
 BENCHMARK_PROFILES = (
     PROFILE_PRODUCTION_PRO,
@@ -633,7 +633,7 @@ def synthesize_hybrid_rows(real_rows: Iterable[dict], *, flash_profile: str,
                            pricing_path: Path = PRICING_SNAPSHOT_PATH) -> list[dict]:
     """Build hybrid rows after real profiles are complete, without another model call."""
     if flash_profile not in {PROFILE_FLASH_SINGLE, PROFILE_FLASH_SPLIT}:
-        raise ValueError("flash_profile must be flash_single_v1 or flash_split_v2")
+        raise ValueError("flash_profile must be flash_single_v1 or flash_split_v3")
     if pro_profile not in {PROFILE_PRODUCTION_PRO, PROFILE_CORRECTED_PRO}:
         raise ValueError("pro_profile must be production_pro_v0 or corrected_pro_v1")
     indexed: dict[tuple[str, int, str], dict] = {}

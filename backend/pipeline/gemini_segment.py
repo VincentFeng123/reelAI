@@ -1668,8 +1668,8 @@ _NonBlank = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1
 PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
-FLASH_SPLIT_PROFILE = "flash_split_v2"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v9"
+FLASH_SPLIT_PROFILE = "flash_split_v3"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v10"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -1944,7 +1944,9 @@ class _CompactBoundaryTopic(_StrictModel):
         alias="eq",
         description=(
             "Shortest unique exact transcript quote whose final spoken word is the "
-            "final word of this unit's first complete conclusion. It must occur uniquely "
+            "final required word after this unit's whole same-objective teaching arc. A "
+            "locally complete sentence or intermediate result is not an endpoint when the "
+            "same objective continues with reasoning, qualification, or explanation. It must occur uniquely "
             "inside the s:e range and may begin across adjacent caption lines; ignore "
             "acoustic silence and never include later speech for a pause."
         ),
@@ -2371,7 +2373,9 @@ def _compact_output_guide() -> str:
   is the exact first word the viewer should hear. sq may cross adjacent lines. Do not include
   earlier greeting, filler, transition, or context solely to make the quote longer or unique.
 - eq = end_quote: 1-16 exact consecutive transcript words inside s:e. Its LAST spoken word is
-  the exact final word the viewer should hear. eq may cross adjacent lines. Do not include a
+  the exact final required word after the whole same-objective teaching arc. A grammatical
+  sentence or intermediate answer is not an endpoint when its reasoning, qualification, or
+  explanation continues. eq may cross adjacent lines. Do not include a
   later transition, recap, outro, joke, or next topic.
 - cq = claim_quote: 5-16 exact consecutive transcript words between the chosen semantic edges
   containing the core educational claim, explanation, result, or answer. cq proves where the
@@ -2642,14 +2646,19 @@ def _boundary_prompts(
         "quality bar merely to produce more clips. Return qualifying moments up to "
         f"{_MAX_SELECTOR_CANDIDATES} for this source; "
         "do not stop after the first few units or at an arbitrary count below that cap.\n"
-        "3. For every qualifying unit, verify its timestamps and choose the minimum complete "
-        "span containing necessary setup, reasoning, and the natural conclusion. Choose the "
-        "shortest concise span that remains self-contained. There is no numeric duration cap. "
+        "3. For every qualifying unit, verify its timestamps and choose one whole coherent "
+        "teaching arc containing all contiguous same-objective setup, reasoning, answer, "
+        "qualification, and explanation through its natural conclusion. Context and wholeness "
+        "have absolute priority over concision. Only choose a tighter boundary when two spans "
+        "are equally complete and no required word, context, reasoning, answer, qualification, "
+        "or explanation is lost; if completeness and brevity conflict, choose the longer complete "
+        "span. A locally grammatical sentence or intermediate result is not an endpoint when "
+        "the same objective continues. There is no numeric duration cap. "
         "Duration must be the consequence of the exact semantic scope; it is not permission "
         "to include an earlier completed example or a later adjacent topic. Preserve all "
         "necessary setup and context, "
-        "even when that makes the clip longer. End immediately after the first complete "
-        "conclusion of that one learning objective and before a new concept begins. Choose "
+        "even when that makes the clip longer. End immediately after the whole teaching arc's "
+        "natural conclusion and before a new concept begins. Choose "
         "the exact semantic first and final required spoken words and ignore acoustic silence "
         "when choosing them. Do not widen or shorten the semantic unit to guess a pause: "
         "downstream audio processing may only expand outward from your exact interval to "
