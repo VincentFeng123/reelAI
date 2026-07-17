@@ -734,8 +734,8 @@ def test_production_flash_is_compact_exhaustive_boundary_first():
     assert "every distinct qualifying primary and supporting moment" in prompt
     assert "arbitrary count" in prompt
     assert "up to 40" in prompt
-    assert "never add filler or incomplete material" in prompt
-    assert "difficulty is metadata, not an eligibility filter" in prompt
+    assert "brief unavoidable filler does not invalidate" in prompt
+    assert "difficulty is always metadata, never an eligibility filter" in prompt
     assert "learning details and assessments are generated later" in prompt
 
 

@@ -898,13 +898,13 @@ def test_production_passes_primary_and_multiple_supporting_units_from_one_source
             "stand": True,
             "ie": evidence,
         }))
-    plan = gemini_segment._CompactBoundaryPlan.model_validate({
-        "request_intent": {
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
             "exact_request": request,
             "constraints": constraints,
         },
-        "topics": topics,
-    })
+        topics=topics,
+    )
     segments = [
         {
             "cue_id": f"cue-{index}",
@@ -2163,7 +2163,10 @@ def test_trusted_live_second_law_intro_starts_at_the_named_law_handoff() -> None
                 "let's say if you have a mass of 5 kg and the acceleration on it is "
                 "2 m/s squared. The force is 10 newtons and this is the net force. "
                 "A newton is equivalent to 1 kilogram times a meter over second squ. "
-                "It turns out that the newton is not the only unit for force."
+                "It turns out that the newton is not the only unit for force. Force "
+                "can be measured in pounds. It turns out one pound is approximately "
+                "4.45 newtons. Photosynthesis converts sunlight into stored chemical "
+                "energy."
             ),
         },
     ]
@@ -2203,6 +2206,14 @@ def test_trusted_live_second_law_intro_starts_at_the_named_law_handoff() -> None
     assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:5"
     assert clip["start_quote"] == "Now the next law that you"
     assert clip["_clip_text"].startswith("Now the next law that you need")
+    assert clip["end_quote"] == "pound is approximately 4.45 newtons."
+    assert clip["_clip_text"].endswith(
+        "It turns out one pound is approximately 4.45 newtons."
+    )
+    assert "Photosynthesis" not in clip["_clip_text"]
+    assert "completed_truncated_caption_word" in (
+        clip["_boundary_fallback_reasons"]
+    )
     assert "going to be relatively easy" not in clip["_clip_text"]
 
 
@@ -3442,6 +3453,132 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
     assert "units for speed" not in clip["_clip_text"]
     assert "trimmed_clipped_start_to_claim_setup" in (
         clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_pro_boundary_route_recovers_start_from_intent_when_claim_is_unanchored(
+    monkeypatch,
+) -> None:
+    segments = [
+        {
+            "cue_id": "Jyiw6KkedDY:cue:1",
+            "start": 31.08,
+            "end": 63.27,
+            "text": (
+                "units for speed so if you're driving in your car at 72 miles per "
+                "hour then that's your speed. Velocity is a lot like speed except "
+                "it has a direction attached to it"
+            ),
+        },
+        {
+            "cue_id": "Jyiw6KkedDY:cue:2",
+            "start": 60.48,
+            "end": 95.729,
+            "text": (
+                "so your velocity may be 72 miles per hour east. With that knowledge "
+                "in hand you're now ready to understand acceleration which is simply "
+                "the rate at which velocity changes. Meters per second squared are "
+                "common units for acceleration"
+            ),
+        },
+        {
+            "cue_id": "Jyiw6KkedDY:cue:3",
+            "start": 92.75,
+            "end": 128.97,
+            "text": (
+                "Anytime you change your velocity you are accelerating, including "
+                "when your direction changes even if your speed does not."
+            ),
+        },
+    ]
+    raw_claim = "acceleration measures velocity changing across each elapsed interval"
+    raw_plan = {
+        "request_intent": {
+            "exact_request": "Explain acceleration and its units",
+            "constraints": [
+                {
+                    "constraint_id": "acceleration",
+                    "kind": "subject",
+                    "source_phrase": "acceleration",
+                    "requirement": "Explain acceleration",
+                },
+                {
+                    "constraint_id": "units",
+                    "kind": "outcome",
+                    "source_phrase": "units",
+                    "requirement": "Give its units",
+                },
+            ],
+        },
+        "topics": [{
+            "id": "acceleration-definition-units",
+            "s": -4,
+            "e": 99,
+            "sq": "units for speed so if you're",
+            "eq": "even if your speed does not.",
+            "cq": raw_claim,
+            "title": "Defining Acceleration and Its Units",
+            "obj": "Define acceleration, give its units, and explain direction changes",
+            "facet": "acceleration definition and units",
+            "info": 0.94,
+            "rel": 0.96,
+            "imp": 0.93,
+            "diff": 0.25,
+            "direct": True,
+            "sub": True,
+            "fact": True,
+            "self": True,
+            "stand": True,
+            "ie": [
+                {
+                    "id": "acceleration",
+                    "q": "acceleration which is simply the rate at which velocity changes",
+                },
+                {
+                    "id": "units",
+                    "q": "Meters per second squared are common units for acceleration",
+                },
+            ],
+        }],
+    }
+    parsed, schema_rejections = gemini_segment._validate_model_response(
+        gemini_segment._CompactBoundaryPlan,
+        json.dumps(raw_plan),
+    )
+    assert schema_rejections == []
+    assert isinstance(parsed, gemini_segment._CompactBoundaryPlan)
+    plan = parsed
+
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        lambda *_args, **_kwargs: (
+            plan,
+            {
+                "model": "gemini-3.1-pro-preview",
+                "prompt_tokens": 100,
+                "candidate_tokens": 100,
+                "total_tokens": 200,
+            },
+        ),
+    )
+
+    result = gemini_segment.run_segment_profile(
+        {"segments": segments, "words": [], "source": "supadata"},
+        {"_knowledge_level": "beginner"},
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic="Explain acceleration and its units",
+    )
+
+    assert result.error is None
+    assert result.proposed_count == result.accepted_count == 1
+    assert result.rejection_reasons == []
+    [clip] = result.clips
+    assert clip["start_cue_id"] == "Jyiw6KkedDY:cue:2"
+    assert clip["start_quote"] == "you're now ready to understand acceleration"
+    assert clip["model_claim_quote"] == raw_claim
+    assert clip["topic_evidence_quote"] == (
+        "acceleration which is simply the rate at which velocity changes"
     )
 
 
@@ -5383,7 +5520,10 @@ def test_specific_request_prompt_returns_primary_and_complete_supporting_units()
     assert "all examples below assume no learner-level restriction" in (
         normalized.casefold()
     )
-    assert "never override a supplied learner band" in normalized.casefold()
+    assert "return an otherwise qualifying unit at any difficulty" in (
+        normalized.casefold()
+    )
+    assert "backend stores it" in normalized.casefold()
     assert "one q never" in normalized.casefold()
     assert "whole-span completeness check" in normalized.casefold()
 
@@ -5491,7 +5631,7 @@ def test_newtons_second_law_prompt_requires_subject_anchoring_and_context() -> N
     ) in normalized
     assert "include the contiguous spoken unit" in normalized
     assert "end eq after the unit" in normalized
-    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v10"
+    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v11"
 
 
 def test_boundary_prompt_stays_transcript_only_when_video_is_requested() -> None:
@@ -5513,13 +5653,14 @@ def test_boundary_prompt_stays_transcript_only_when_video_is_requested() -> None
     assert "only the supplied spoken transcript" in prompt
     assert "inspect the audio and visual streams jointly" not in prompt
     assert "attached-video grounding" not in prompt
-    assert "omit material that requires an unseen visual" in prompt
+    assert "do not omit a related substantive unit solely" in prompt
     assert "factually_grounded" in prompt
     assert "current level is advanced" in prompt
-    assert "level fit is a gemini selection eligibility rule" in prompt
-    assert "difficulty band 0.60-1.00" in prompt
-    assert "genuinely advanced reasoning or application" in prompt
-    assert "obey its eligibility band" in prompt
+    assert "level is metadata, never selection eligibility" in prompt
+    assert "current-fit difficulty band is 0.60-1.00" in prompt
+    assert "return every otherwise qualifying relevant, substantive unit" in prompt
+    assert "backend stores every returned unit" in prompt
+    assert "difficulty is always metadata, never an eligibility filter" in prompt
     assert "sq=start_quote" in prompt
     assert "eq=end_quote" in prompt
     assert "cq=claim_quote" in prompt
@@ -5595,9 +5736,14 @@ def test_boundary_selector_never_attaches_video_even_when_requested(
     assert isinstance(contents, str)
     assert "Transcript (1 lines" in contents
     assert "current level is beginner" in contents
-    assert "difficulty band 0.00-0.40" in contents
+    assert "current-fit difficulty band is 0.00-0.40" in contents
     assert "assume no topic-specific background" in contents
     assert "never prepend a separately complete prerequisite/background lesson" in contents
+    assert (
+        "return every otherwise qualifying relevant, substantive unit"
+        in contents.lower()
+    )
+    assert "defers or reuses out-of-level units" in contents.lower()
     assert "youtube.com" not in contents
     assert call["media_resolution"] is None
     assert call.get("estimated_media_tokens", 0) == 0
@@ -9136,12 +9282,18 @@ def test_selector_prompt_is_exhaustive_for_primary_and_supporting_units() -> Non
         "informativeness, topic_relevance, and educational_importance\n"
         "  are each at least 0.75"
     ) in (_system + user)
-    assert "difficulty band 0.00-0.40" in user
-    assert "level fit is a gemini selection eligibility rule" in user.lower()
+    assert "current-fit difficulty band is 0.00-0.40" in user
+    assert "level is metadata, never selection eligibility" in user.lower()
+    assert "defers or reuses out-of-level units" in user.lower()
     assert "unseen visual" in user
     assert "every distinct qualifying primary and supporting moment" in user
     assert "internal interruption" in (_system + user)
-    assert "internal filler may never remain" in (_system + user).lower()
+    assert "brief unavoidable filler is not a rejection reason" in (
+        _system + user
+    ).lower()
+    assert "boundary uncertainty alone is never an omission reason" in (
+        _system + user
+    ).lower()
     assert "otherwise keep it" not in (_system + user).lower()
     assert "may remain when cutting around it" not in (_system + user).lower()
     assert "never stop after one exact match" in (_system + user).lower()

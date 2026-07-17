@@ -1672,7 +1672,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v3"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v10"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v11"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -1937,8 +1937,16 @@ class _CompactBoundaryTopic(_StrictModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     candidate_id: _CompactCandidateId = Field(alias="id")
-    start_line: int = Field(ge=0, strict=True, alias="s")
-    end_line: int = Field(ge=0, strict=True, alias="e")
+    start_line: int = Field(
+        strict=True,
+        alias="s",
+        json_schema_extra={"minimum": 0},
+    )
+    end_line: int = Field(
+        strict=True,
+        alias="e",
+        json_schema_extra={"minimum": 0},
+    )
     start_quote: _CompactBoundaryQuote = Field(
         alias="sq",
         description=(
@@ -2129,16 +2137,17 @@ _POLICY_AND_EXAMPLES = """Policy:
   recaps, outros, atmospheric hooks, scene-setting, music/applause caption markers,
   colorful flourishes, audience banter, post-conclusion jokes, tangents, repeated
   restatements, and partial explanations.
-- Never add filler or incomplete material. Never retain filler at an opening, ending, or
-  inside a clip. If an internal interruption divides teaching, return only a contiguous side
-  that is independently complete and contains the grounded objective, or return separate
-  complete candidates for the clean sides. If no clean side is independently complete, omit
-  the candidate.
+- Trim filler from an opening, ending, or internal interruption whenever an exact contiguous
+  cut preserves the complete teaching arc. Brief unavoidable filler does not invalidate an
+  otherwise substantive, coherent unit. Omit only when filler or transcript noise dominates
+  the material (for example, roughly 90 percent) or no coherent teaching remains.
 - Course operations such as enrollment, pass/fail or grading rules, assignment and exam
   scheduling, registration, attendance, office hours, and course requirements are not
   educational context for the subject. Exclude them from clip openings and endings.
-- Omit teaching that depends on a diagram, screen, gesture, drawing, or other missing
-  visual context. Mark self_contained and is_standalone false for such material.
+- A reference to a diagram, screen, gesture, drawing, or other unseen visual is not by itself
+  a reason to omit a related substantive unit. Judge only the spoken transcript, never invent
+  visual evidence, and mark self_contained and is_standalone false when the words alone do not
+  establish the context.
 - Exhaustively enumerate every distinct teaching unit genuinely related to the topical center,
   up to 40 per source. Prefer an empty slot to a merely broad-field, filler, or incomplete idea.
   Do not shorten a complete idea to fit a target length; clip duration is never a selection
@@ -2193,17 +2202,18 @@ _POLICY_AND_EXAMPLES = """Policy:
   "this equation", "that change", "the second law", "it", "they", or "these" is invalid when
   the specific referent is not established inside the selected sq-through-eq span. The user
   request, page title, video title, and any previous clip are not spoken setup. Expand sq
-  backward to the shortest complete spoken setup that names the referent; omit the unit only
-  when no clean self-contained span can establish it.
+  backward to the shortest complete spoken setup that names the referent. If the coarse
+  transcript makes that exact edge uncertain, return the best whole grounded span and mark
+  self_contained and is_standalone honestly; boundary uncertainty is not an omission reason.
 - A worked example cannot end at its question, setup, or first substituted value. Either
   include its reasoning and answer through end_quote or end the candidate before that
   optional example begins.
 - A worked numerical example for a dimensioned quantity cannot end at a unitless result.
   Include the contiguous spoken unit as part of its answer and end eq after the unit.
 - A claim ending with an unfilled predicate such as "it can tell you" is incomplete. Continue
-  through the spoken answer or omit that candidate. A terminal "uh" or "um" is never a
-  conclusion. Split around internal filler or omit the candidate when no clean complete side
-  remains; internal filler may never remain in a selected clip.
+  through the spoken answer. A terminal "uh" or "um" is never a conclusion. Trim filler where
+  exact boundaries permit, but preserve an otherwise coherent teaching arc when brief filler
+  cannot be removed cleanly.
 - Do not provide chain-of-thought or hidden reasoning.
 
 Examples:
@@ -2307,22 +2317,22 @@ def _learner_rule(level: str) -> str:
         ),
         "intermediate": (
             "0.30-0.70",
-            "assume foundational topic knowledge but no advanced specialization; omit units "
-            "that rely on unexplained advanced notation or theory",
+            "assume foundational topic knowledge but no advanced specialization when "
+            "judging the unit's current fit",
         ),
         "advanced": (
             "0.60-1.00",
-            "assume strong foundations and return genuinely advanced reasoning or application; "
-            "omit units whose teaching is only elementary review",
+            "assume strong foundations when judging the unit's current fit",
         ),
     }
     score_band, accessibility = level_contracts[normalized]
     return (
-        f"The viewer's current level is {normalized}. Level fit is a Gemini selection "
-        f"eligibility rule, not a ranking preference. Return only units in difficulty band "
-        f"{score_band}: {accessibility}. Judge required prior knowledge after accounting for "
-        "setup included inside the clip. If an otherwise relevant unit is outside this band, "
-        "do not return it; never expect the backend to filter it later."
+        f"The viewer's current level is {normalized}, whose current-fit difficulty band is "
+        f"{score_band}: {accessibility}. Level is metadata, never selection eligibility. "
+        "Return every otherwise qualifying relevant, substantive unit at every difficulty, "
+        "score diff accurately after accounting for setup inside the clip, and never omit a "
+        "unit merely because it is outside the current-fit band. The backend stores every "
+        "returned unit and defers or reuses out-of-level units for a matching learner level."
     )
 
 
@@ -2417,8 +2427,8 @@ def _compact_output_guide() -> str:
 - rel = topic_relevance, 0.0-1.0: how strongly this exact unit serves the exact user request.
 - imp = educational_importance, 0.0-1.0: how valuable this unit is for learning that request.
 - diff = difficulty, 0.0-1.0: required prior knowledge only; 0.00-0.33 beginner,
-  0.34-0.66 intermediate, 0.67-1.00 advanced. When a learner level is supplied, obey its
-  explicit eligibility band; without one, difficulty alone never disqualifies a unit.
+  0.34-0.66 intermediate, 0.67-1.00 advanced. Difficulty never disqualifies an otherwise
+  qualifying unit; the backend stores it and decides when its learner level should surface.
 - direct = directly_teaches_topic: true only for a PRIMARY unit that fulfills every required
   non-scope constraint in the original prompt. Use false for a valid SUPPORTING unit; false is
   honest metadata and does not mean omit the supporting unit.
@@ -2475,8 +2485,9 @@ of velocity can be foundational support because it teaches the requested quantit
 
 Worked format example — understand the boundary logic, but never copy its content or scores:
 All examples below assume no learner-level restriction. They demonstrate only schema and
-boundary behavior. Their inclusion and diff values never override a supplied learner band:
-recompute difficulty for the actual span and omit it when it falls outside that band.
+boundary behavior. Their diff values never override accurate scoring for the actual span.
+Return an otherwise qualifying unit at any difficulty; the backend stores it and decides when
+its learner level should surface.
 Example transcript:
 [18] 02:10 Welcome back. A small p value
 [19] 02:15 provides stronger evidence against the null hypothesis. Next, confidence intervals measure uncertainty.
@@ -2623,7 +2634,11 @@ def _boundary_prompts(
         "Use required visuals only when they are present and legible inside the selected "
         "span; otherwise omit the unit.\n"
         if video_grounded
-        else "Omit material that requires an unseen visual.\n"
+        else (
+            "Do not omit a related substantive unit solely because its speech references an "
+            "unseen visual; judge only the transcript, never invent visual evidence, and set "
+            "self and stand honestly.\n"
+        )
     )
     factual_rule = (
         "For video-dependent teaching, factually_grounded covers both streams and may be "
@@ -2729,31 +2744,33 @@ def _boundary_prompts(
         "Expand backward to the shortest complete setup "
         "that names it. Keep opening and ending edges clean, including generic lead-ins and bracketed "
         "non-speech markers. Split around an internal interruption when separate complete "
-        "units remain and return only contiguous complete sides. If no clean side is "
-        "independently complete, omit the candidate; internal filler may never remain. "
+        "units remain and return only contiguous complete sides. If an exact clean cut is "
+        "uncertain, preserve the whole substantive teaching arc and return the closest exact "
+        "grounded boundaries; brief unavoidable filler is not a rejection reason. "
         "Before returning, verify every sq and eq token-for-token inside its selected s:e range, "
         "including the 1-16 word limit, and verify every cq is 5-16 exact words. The backend "
         "treats every topic you return as semantically approved: it will not second-guess or "
         "reject that topic, and will only repair or expand transcript boundaries when needed. "
         "Do not omit an otherwise good, complete, relevant unit solely because coarse captions "
         "make the exact cut uncertain; return your closest grounded s:e, sq, and eq so the "
-        "backend can repair the cut. Omit only when content, context, or "
-        "topic meaning is too uncertain to support grounded "
-        "teaching; severe transcript noise counts as content uncertainty. "
+        "backend can repair the cut. Boundary uncertainty alone is never an omission reason. "
+        "Omit only when the spoken material itself is unrelated or lacks a substantive, "
+        "coherent teaching unit, such as material dominated by filler or transcript noise. "
         f"{visual_rule}"
         "4. Score topic relevance, information density, educational value, and difficulty "
         "honestly. Return a unit only when topic_relevance, informativeness, and "
         "educational_importance are each at least 0.75. Difficulty records prior knowledge "
         "only: 0.00-0.33 means beginner, 0.34-0.66 means intermediate, and 0.67-1.00 means "
-        "advanced. When a learner-level rule appears above, obey its eligibility band. When "
-        "no learner level is supplied, difficulty is metadata, not an eligibility filter, and "
-        "qualifying units may span the entire scale.\n"
+        "advanced. Difficulty is always metadata, never an eligibility filter. Qualifying "
+        "units may span the entire scale; the backend stores and defers units outside the "
+        "current learner's fit.\n"
         "5. Return every distinct qualifying unit. Set substantive and factually_grounded true "
         "only for academically sound teaching; "
         f"{factual_rule}"
         "course logistics and institutional framing are "
-        "not teaching units. Each unit must be standalone, use a unique "
-        "candidate_id, and include required setup inside its span.\n"
+        "not teaching units. Each unit must be a coherent educational moment, use a unique "
+        "candidate_id, include the best available setup inside its span, and set self and "
+        "stand honestly. A false self or stand value alone is not an omission reason.\n"
         f"{_compact_output_guide()}\n"
         f"Return only the object {{request_intent, topics}}. Every topic must contain "
         f"{_selection_fields(enriched=False, compact=True)}. The ie list must be nonempty and "
@@ -2782,8 +2799,10 @@ def _boundary_repair_prompts(
     system = (
         "You repair transcript-cue boundaries for already selected educational moments. "
         "Use only the displayed neighboring cues. Return at most one item per candidate, "
-        "omit a candidate when no clean self-contained boundary exists, and copy each edge "
-        "quote exactly from its selected cue. Do not summarize, enrich, or add assessments."
+        "always return the best grounded boundary you can find for each candidate even when "
+        "no perfectly clean self-contained cut exists, and copy each edge quote exactly from "
+        "its selected cue. Never omit an already selected candidate because boundary repair "
+        "is uncertain. Do not summarize, enrich, or add assessments."
     )
     blocks: list[str] = []
     allowed: dict[str, tuple[set[int], set[int]]] = {}
@@ -5917,6 +5936,47 @@ def _last_safe_complete_prefix(text: str) -> str:
         if classify_terminator(prefix) and safe(prefix):
             return prefix
     return ""
+
+
+def _completed_truncated_caption_end(
+    text: str,
+    quote_span: tuple[int, int] | None,
+    *,
+    scope_text: str,
+) -> tuple[tuple[int, int], str] | None:
+    """Move past Supadata's ``squ.`` fragment when ``squared`` is in the cue."""
+    if quote_span is None:
+        return None
+    raw_text = str(text or "")
+    if quote_span[1] >= len(raw_text) or _WORD_RE.search(raw_text[quote_span[1]:]) is None:
+        return None
+    selected_words = list(_WORD_RE.finditer(raw_text[:quote_span[1]]))
+    if not selected_words:
+        return None
+    fragment = _toks(selected_words[-1].group(0))[0]
+    if fragment != "squ" or "squared" not in _toks(raw_text):
+        return None
+    suffix = raw_text[quote_span[1]:]
+    connected_tokens = _content_tokens(scope_text)
+    retained_right: int | None = None
+    for left, right in _sentence_character_spans(suffix):
+        sentence_tokens = _content_tokens(suffix[left:right])
+        if not sentence_tokens:
+            continue
+        if not (sentence_tokens & connected_tokens):
+            break
+        retained_right = quote_span[1] + right
+        connected_tokens.update(sentence_tokens)
+    if retained_right is None:
+        return None
+    complete = _last_safe_complete_prefix(raw_text[:retained_right])
+    if len(complete) <= quote_span[1]:
+        return None
+    words = list(_WORD_RE.finditer(complete))
+    if not words:
+        return None
+    quote_left = words[max(0, len(words) - 6)].start()
+    return (quote_left, len(complete)), complete[quote_left:]
 
 
 def _trim_end_quote_before_edge_noise(
@@ -11508,7 +11568,10 @@ def _trusted_compact_plan_to_report(
         if not proposed_range_valid:
             diagnostics.append("bad_index")
 
-        model_claim_quote = " ".join(str(proposal.claim_quote or "").split())
+        raw_model_claim_quote = " ".join(
+            str(proposal.claim_quote or "").split()
+        )
+        model_claim_quote = raw_model_claim_quote
         claim_location = _unique_evidence_location(
             segments, model_claim_quote, 0, n - 1,
         )
@@ -11530,6 +11593,22 @@ def _trusted_compact_plan_to_report(
             grounded_intent_locations.append(
                 (constraint_id, str(item.evidence_quote), location)
             )
+        if claim_location is None:
+            grounded_claim_anchors = [
+                (evidence_quote, location)
+                for constraint_id, evidence_quote, location
+                in grounded_intent_locations
+                if constraint_kinds[constraint_id]
+                is not _IntentConstraintKind.SCOPE
+            ]
+            if grounded_claim_anchors:
+                model_claim_quote, claim_location = min(
+                    grounded_claim_anchors,
+                    key=lambda item: (item[1][0], item[1][1]),
+                )
+                diagnostics.append(
+                    "claim_anchor_recovered_from_intent_evidence"
+                )
         model_start_quote = str(proposal.start_quote or "").strip()
         effective_start_quote = model_start_quote
         model_end_quote = str(proposal.end_quote or "").strip()
@@ -12328,6 +12407,15 @@ def _trusted_compact_plan_to_report(
             b, end_span, effective_end_quote = worked_arc_end
             diagnostics.append("completed_projected_worked_arc")
 
+        completed_caption_end = _completed_truncated_caption_end(
+            str(segments[b].get("text") or ""),
+            end_span,
+            scope_text=final_scope_text,
+        )
+        if completed_caption_end is not None:
+            end_span, effective_end_quote = completed_caption_end
+            diagnostics.append("completed_truncated_caption_word")
+
         start_text = str(segments[a].get("text") or "")
         end_text = str(segments[b].get("text") or "")
         start_quote = (
@@ -12393,11 +12481,15 @@ def _trusted_compact_plan_to_report(
             end_span is not None and _WORD_RE.search(end_text[end_span[1]:])
         )
         topic_evidence_quote = (
-            model_claim_quote
-            if _contains_quote(clip_text, model_claim_quote)
-            else _best_effort_evidence_quote(clip_text)
+            raw_model_claim_quote
+            if _contains_quote(clip_text, raw_model_claim_quote)
+            else (
+                model_claim_quote
+                if _contains_quote(clip_text, model_claim_quote)
+                else _best_effort_evidence_quote(clip_text)
+            )
         )
-        if topic_evidence_quote != model_claim_quote:
+        if topic_evidence_quote != raw_model_claim_quote:
             diagnostics.append("claim_quote_reanchored")
 
         base_id = str(proposal.candidate_id or f"candidate-{index + 1}")
@@ -12469,7 +12561,7 @@ def _trusted_compact_plan_to_report(
             "self_contained": bool(proposal.self_contained),
             "is_standalone": bool(proposal.is_standalone),
             "topic_evidence_quote": topic_evidence_quote,
-            "model_claim_quote": model_claim_quote,
+            "model_claim_quote": raw_model_claim_quote,
             "boundary_confidence": 1.0 if not diagnostics else 0.75,
             "boundary_repair_mode": "exact" if not diagnostics else "best_effort",
             "selection_authority": "gemini",
