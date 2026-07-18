@@ -81,6 +81,13 @@ def _normalize_text(value: object) -> str:
     return " ".join(str(value or "").split())
 
 
+def _settle_search_quota(conn: Any, job_id: str) -> None:
+    # Imported lazily to keep the durable job repository usable in isolation.
+    from .billing import settle_job_reservation
+
+    settle_job_reservation(conn, job_id)
+
+
 @contextmanager
 def _atomic_write(conn: Any):
     """Make multi-statement repository writes atomic on autocommit connections.
@@ -572,6 +579,7 @@ def expire_stale_queued_job(
                 payload=_terminal_payload(row),
                 now=timestamp,
             )
+            _settle_search_quota(conn, job_id)
     return True
 
 
@@ -623,6 +631,7 @@ def _fail_unclaimable_job(conn: Any, job_id: str, now_text: str) -> None:
                     payload=_terminal_payload(row),
                     now=now_text,
                 )
+                _settle_search_quota(conn, job_id)
 
 
 def lease_job(
@@ -860,6 +869,7 @@ def request_cancellation(
                 payload=_terminal_payload(row),
                 now=timestamp,
             )
+            _settle_search_quota(conn, job_id)
             row = get_job(conn, job_id)
         return row
 
@@ -1012,6 +1022,7 @@ def transition_terminal(
                 payload=_terminal_payload(row),
                 now=timestamp,
             )
+            _settle_search_quota(conn, job_id)
         return get_job(conn, job_id)
 
 

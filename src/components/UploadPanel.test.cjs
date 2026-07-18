@@ -41,11 +41,6 @@ test("topic, text, and file submissions use the selected learner level", () => {
   );
   assert.match(
     callbackText,
-    /topicList\.map\([\s\S]*knowledgeLevel,/,
-    "multi-topic upload must use the selected level",
-  );
-  assert.match(
-    callbackText,
     /const material = await uploadMaterial\(\{[\s\S]*knowledgeLevel,/,
     "topic, text, and file uploads must all use the selected level",
   );
@@ -61,7 +56,6 @@ test("topic, text, and file submissions use the selected learner level", () => {
   assert.match(source, /type="radio"/);
   assert.match(source, /name="knowledge-level"/);
   assert.match(source, /knowledgeLevel\?: KnowledgeLevel;/);
-  assert.match(callbackText, /knowledgeLevel,\s*title: topic,/);
   assert.match(callbackText, /knowledgeLevel,\s*title,/);
   assert.doesNotMatch(
     callbackText,
@@ -70,58 +64,15 @@ test("topic, text, and file submissions use the selected learner level", () => {
   );
 });
 
-test("partial multi-topic uploads preserve each fulfilled topic and material pairing", () => {
+test("topic mode accepts exactly one topic", () => {
   const filePath = path.join(__dirname, "UploadPanel.tsx");
   const source = fs.readFileSync(filePath, "utf8");
-  const sourceFile = ts.createSourceFile(
-    filePath,
-    source,
-    ts.ScriptTarget.Latest,
-    true,
-    ts.ScriptKind.TSX,
-  );
-  let pairingFunction;
-  function visit(node) {
-    if (ts.isFunctionDeclaration(node) && node.name?.text === "pairFulfilledTopicMaterials") {
-      pairingFunction = node;
-      return;
-    }
-    ts.forEachChild(node, visit);
-  }
-  visit(sourceFile);
-  assert.ok(pairingFunction, "the fulfilled topic/material pairing helper must remain discoverable");
-  const compiled = ts.transpile(
-    `${pairingFunction.getText(sourceFile)}\nmodule.exports = pairFulfilledTopicMaterials;`,
-    { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
-  );
-  const module = { exports: {} };
-  new Function("module", "exports", compiled)(module, module.exports);
-  const pairFulfilledTopicMaterials = module.exports;
-  const fulfilled = (materialId) => ({ status: "fulfilled", value: { material_id: materialId } });
-  const rejected = { status: "rejected", reason: new Error("upload failed") };
-
-  assert.deepEqual(
-    pairFulfilledTopicMaterials(
-      ["biology", "photosynthesis", "chain rule"],
-      [fulfilled("material-biology"), rejected, fulfilled("material-chain")],
-    ),
-    [
-      { topic: "biology", materialId: "material-biology" },
-      { topic: "chain rule", materialId: "material-chain" },
-    ],
-  );
-  assert.deepEqual(
-    pairFulfilledTopicMaterials(
-      ["biology", "photosynthesis", "chain rule"],
-      [rejected, fulfilled("material-photo"), fulfilled("material-chain")],
-    ),
-    [
-      { topic: "photosynthesis", materialId: "material-photo" },
-      { topic: "chain rule", materialId: "material-chain" },
-    ],
-  );
-  assert.match(source, /materialIds = fulfilledTopicMaterials\.map\(\(\{ materialId \}\) => materialId\)/);
-  assert.match(source, /fulfilledTopicMaterials\.forEach\(\(\{ topic, materialId \}, index\) =>/);
+  assert.match(source, /const \[topic, setTopic\] = useState\(""\)/);
+  assert.match(source, /htmlFor="material-topic"/);
+  assert.match(source, /id="material-topic"/);
+  assert.match(source, /const topicValue = inputMode === "topic" \? topic\.trim\(\) : ""/);
+  assert.doesNotMatch(source, /Add topic|Promise\.allSettled|partial_topics|topicOperations/);
+  assert.match(source, /<span>Uses 1 search<\/span>/);
 });
 
 test("URL ingestion primes every returned reel with a legacy single-reel fallback", () => {

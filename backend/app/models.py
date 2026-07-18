@@ -17,6 +17,43 @@ class MaterialResponse(BaseModel):
     extracted_concepts: list[ConceptOut]
 
 
+class BillingPlanOut(BaseModel):
+    code: Literal["free", "plus", "pro"]
+    name: str
+    monthly_price_cents: int
+    daily_limit: int
+
+
+class BillingPlansResponse(BaseModel):
+    plans: list[BillingPlanOut]
+
+
+class BillingSubscriptionOut(BaseModel):
+    provider: Literal["stripe"]
+    plan: Literal["plus", "pro"]
+    status: str
+    current_period_end: str | None = None
+    cancel_at_period_end: bool = False
+    product_id: str
+
+
+class BillingStatusResponse(BaseModel):
+    plan: Literal["free", "plus", "pro"]
+    daily_limit: int
+    used_searches: int
+    remaining_searches: int
+    reset_at: str
+    subscriptions: list[BillingSubscriptionOut] = Field(default_factory=list)
+
+
+class BillingCheckoutRequest(BaseModel):
+    plan: Literal["plus", "pro"]
+
+
+class BillingRedirectResponse(BaseModel):
+    url: str
+
+
 class ReelsGenerateRequest(BaseModel):
     material_id: str = Field(min_length=1, max_length=128)
     concept_id: str | None = Field(default=None, max_length=128)

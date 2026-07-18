@@ -2190,6 +2190,7 @@ function HomePageContent() {
           <div className={visibleSidebarTab === "search" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
             <UploadPanel
               active={visibleSidebarTab === "search"}
+              account={communityAccount}
               onMaterialCreated={onUploadMaterialCreated}
               onScrollOffsetChange={onSearchPanelScrollOffsetChange}
               onScrollGesture={triggerTopChromeGesture}

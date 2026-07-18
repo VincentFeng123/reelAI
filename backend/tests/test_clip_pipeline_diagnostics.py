@@ -7698,6 +7698,7 @@ def test_direct_ingest_endpoints_map_provider_errors_consistently(monkeypatch) -
         )
 
     monkeypatch.setattr(main, "_enforce_rate_limit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_begin_sync_search_quota", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main, "_run_disconnect_cancellable", run_immediately)
     monkeypatch.setattr(main, "SERVERLESS_MODE", False)
 

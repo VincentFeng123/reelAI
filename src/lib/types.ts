@@ -97,6 +97,42 @@ export type TypedApiError = {
   details?: Record<string, unknown> | null;
 };
 
+export type BillingPlanCode = "free" | "plus" | "pro";
+
+export type BillingPlan = {
+  code: BillingPlanCode;
+  name: string;
+  monthly_price_cents: number;
+  daily_limit: number;
+};
+
+export type BillingSubscription = {
+  provider: "stripe";
+  plan: BillingPlanCode;
+  status: string;
+  current_period_end: string | null;
+  cancel_at_period_end: boolean;
+  product_id: string | null;
+};
+
+export type BillingStatus = {
+  plan: BillingPlanCode;
+  daily_limit: number;
+  used_searches: number;
+  remaining_searches: number;
+  reset_at: string;
+  subscriptions: BillingSubscription[];
+};
+
+export type DailySearchLimitDetail = {
+  code: "daily_search_limit_reached";
+  plan: BillingPlanCode;
+  limit: number;
+  used: number;
+  remaining: number;
+  reset_at: string;
+};
+
 export type GenerationQueuedResponse = {
   job_id: string;
   status: "queued" | "running";

@@ -3,6 +3,7 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
+import { BillingGateDialog, type BillingGateReason } from "@/components/BillingGateDialog";
 import { FullscreenLoadingScreen } from "@/components/FullscreenLoadingScreen";
 import { RecallCheck, type RecallAnswerReveal } from "@/components/RecallCheck";
 import { ReelCard } from "@/components/ReelCard";
@@ -16,9 +17,11 @@ import {
   fetchFeed,
   fetchPendingAssessment,
   generateReelsStream,
+  isDailySearchLimitError,
   isRequestInterruptedError,
   isSessionExpiredError,
   isTransportError,
+  isVerifiedAccountRequiredError,
   queueCommunityHistorySync,
   readCommunityAuthSession,
   reportReelProgress,
@@ -27,7 +30,6 @@ import {
   snoozeAssessment,
   startNextAssessment,
   type CommunitySessionContext,
-  uploadMaterial,
 } from "@/lib/api";
 import { applySearchFeedSettingsToParams, mergeSearchFeedQuerySettings, readSearchFeedQuerySettings } from "@/lib/feedQuery";
 import {
@@ -38,6 +40,7 @@ import {
   writeScopedHistorySnapshot,
 } from "@/lib/historyStorage";
 import { useLoadingScreenGate } from "@/lib/useLoadingScreenGate";
+import { requestBillingStatusRefresh } from "@/lib/useBillingStatus";
 import {
   type GenerationMode,
   type PreferredVideoDuration,
@@ -99,6 +102,7 @@ const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
 const MAX_SAVED_FEED_PROGRESS = 240;
 const MAX_SAVED_FEED_SESSIONS = 24;
 const MAX_HISTORY_ITEMS = 120;
+const SAVED_SESSION_UNAVAILABLE_MESSAGE = "This saved session is no longer available. Start a new search to continue.";
 const MAX_REELS_PER_FEED_SESSION = 300;
 const COMPACT_REELS_PER_FEED_SESSION = 48;
 const MINIMAL_REELS_PER_FEED_SESSION = 20;
@@ -1062,6 +1066,7 @@ function FeedPageInner() {
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [billingGate, setBillingGate] = useState<{ reason: BillingGateReason; requiredSearches: number } | null>(null);
   const [invalidCommunityHandoff, setInvalidCommunityHandoff] = useState(false);
   const [generatingMore, setGeneratingMore] = useState(false);
   const [bootstrappingFirstReels, setBootstrappingFirstReels] = useState(false);
@@ -1123,8 +1128,6 @@ function FeedPageInner() {
   const desktopShellRef = useRef<HTMLDivElement | null>(null);
   const rightColumnRef = useRef<HTMLDivElement | null>(null);
   const dragModeRef = useRef<"lr" | "tb" | null>(null);
-  const isRecoveringMissingMaterialRef = useRef(false);
-  const recoveryAttemptedIdsRef = useRef<Set<string>>(new Set());
   const pendingResumeRef = useRef<FeedProgressEntry | null>(null);
   const resumeAppliedRef = useRef(false);
   const resumeLoadingRef = useRef(false);
@@ -1152,6 +1155,11 @@ function FeedPageInner() {
   const recoveryRequestIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const visibleTransportErrorRef = useRef(false);
   const transportFailureStreakRef = useRef(0);
+  const billingWorkBlockedRef = useRef(false);
+  const billingBlockedMaterialIdRef = useRef<string | null>(null);
+  const billingBlockedAccountIdRef = useRef<string | null>(null);
+  const billingBlockedSessionTokenRef = useRef<string | null>(null);
+  const billingBlockedReasonRef = useRef<BillingGateReason | null>(null);
   const activeRecoveryRequestRef = useRef<ActiveRecoveryRequest | null>(null);
   const chatAbortControllerRef = useRef<AbortController | null>(null);
   const assessmentProgressMaxRef = useRef<Map<string, number>>(new Map());
@@ -1203,7 +1211,6 @@ function FeedPageInner() {
     isFetchingRef.current = false;
     isGeneratingRef.current = false;
     isRefreshingFeedRef.current = false;
-    isRecoveringMissingMaterialRef.current = false;
     generationConsumerByMaterialRef.current.clear();
     generationBatchTokensRef.current.clear();
     resumeLoadingRef.current = false;
@@ -1470,7 +1477,9 @@ function FeedPageInner() {
       generationJobByMaterialRef.current.set(materialIdValue, { jobId, status: status ?? "running" });
       // A local snapshot's terminal flag belongs to an older request unless
       // the backend confirms a successful terminal for the current key.
-      setCanRequestMore(true);
+      if (!billingWorkBlockedRef.current) {
+        setCanRequestMore(true);
+      }
       return;
     }
     if (status && status !== "queued" && status !== "running") {
@@ -1522,15 +1531,64 @@ function FeedPageInner() {
     return shouldSurface;
   }, [setVisibleFeedError]);
 
+  const clearBillingWorkBlock = useCallback(() => {
+    if (!billingWorkBlockedRef.current) {
+      return;
+    }
+    billingWorkBlockedRef.current = false;
+    billingBlockedMaterialIdRef.current = null;
+    billingBlockedAccountIdRef.current = null;
+    billingBlockedSessionTokenRef.current = null;
+    billingBlockedReasonRef.current = null;
+    const feedMaterialIds = materialIdsForFeedRef.current;
+    const hasOpenMaterial = feedMaterialIds.length === 0
+      || feedMaterialIds.some((id) => !generationFinishedRef.current.has(id));
+    setCanRequestMore(hasOpenMaterial);
+    if (hasOpenMaterial) {
+      bootstrapAttemptedRef.current = false;
+    }
+  }, []);
+
+  const blockBillingWork = useCallback((reason: BillingGateReason) => {
+    const session = readCommunityAuthSession();
+    billingWorkBlockedRef.current = true;
+    billingBlockedMaterialIdRef.current = materialId || null;
+    billingBlockedAccountIdRef.current = session?.account.id?.trim() || null;
+    billingBlockedSessionTokenRef.current = session?.sessionToken || null;
+    billingBlockedReasonRef.current = reason;
+    bootstrapAttemptedRef.current = true;
+    setCanRequestMore(false);
+    setBootstrappingFirstReels(false);
+    clearPendingTailAdvance();
+  }, [clearPendingTailAdvance, materialId]);
+
   const noteFeedFailure = useCallback((failure: unknown) => {
     transportFailureStreakRef.current = 0;
+    if (isDailySearchLimitError(failure)) {
+      blockBillingWork("quota");
+      setVisibleFeedError(null);
+      setBillingGate({ reason: "quota", requiredSearches: 1 });
+      requestBillingStatusRefresh();
+      return;
+    }
+    if (isVerifiedAccountRequiredError(failure)) {
+      blockBillingWork("sign_in");
+      setVisibleFeedError(null);
+      setBillingGate({ reason: "sign_in", requiredSearches: 1 });
+      return;
+    }
     const message = failure instanceof Error
       ? failure.message
       : typeof failure === "string"
         ? failure.trim()
         : "";
     setVisibleFeedError(message || "Feed failed to load");
-  }, [setVisibleFeedError]);
+  }, [blockBillingWork, setVisibleFeedError]);
+
+  const resumeAfterBillingRefresh = useCallback(() => {
+    clearBillingWorkBlock();
+    setBillingGate(null);
+  }, [clearBillingWorkBlock]);
 
   const markPagedFeedExhausted = useCallback(() => {
     const visibleCount = reelsRef.current.length;
@@ -1618,7 +1676,20 @@ function FeedPageInner() {
       return;
     }
     const syncAuthAccountId = () => {
-      setAuthAccountId(readCommunityAuthSession()?.account?.id?.trim() || null);
+      const session = readCommunityAuthSession();
+      const nextAccountId = session?.account?.id?.trim() || null;
+      if (
+        billingWorkBlockedRef.current
+        && (
+          nextAccountId !== billingBlockedAccountIdRef.current
+          || (session?.sessionToken || null) !== billingBlockedSessionTokenRef.current
+          || (billingBlockedReasonRef.current === "sign_in" && Boolean(session?.account.isVerified))
+        )
+      ) {
+        clearBillingWorkBlock();
+        setBillingGate(null);
+      }
+      setAuthAccountId(nextAccountId);
       setAuthScopeHydrated(true);
     };
     syncAuthAccountId();
@@ -1626,7 +1697,7 @@ function FeedPageInner() {
     return () => {
       window.removeEventListener(COMMUNITY_AUTH_CHANGED_EVENT, syncAuthAccountId);
     };
-  }, []);
+  }, [clearBillingWorkBlock]);
 
   useEffect(() => {
     if (generationModeParam === "fast" || generationModeParam === "slow") {
@@ -1846,78 +1917,9 @@ function FeedPageInner() {
     [generationMode, materialId, mergeFeedSettingsSnapshot, params, router],
   );
 
-  const recoverMissingMaterial = useCallback(
-    async (missingMaterialId: string): Promise<boolean> => {
-      if (typeof window === "undefined" || isRecoveringMissingMaterialRef.current) {
-        return false;
-      }
-      const searchScope = activeSearchScopeRef.current;
-
-      const seeds = parseMaterialSeeds(window.localStorage.getItem(MATERIAL_SEEDS_STORAGE_KEY));
-      const seed = seeds[missingMaterialId];
-      const topic = String(seed?.topic || "").trim();
-      const text = String(seed?.text || "").trim();
-      if (!topic && !text) {
-        return false;
-      }
-
-      isRecoveringMissingMaterialRef.current = true;
-      setVisibleFeedError("Session expired on server. Rebuilding your material...");
-      try {
-        const rebuilt = await uploadMaterial({
-          subjectTag: topic || undefined,
-          text: text || undefined,
-          knowledgeLevel: seed?.knowledgeLevel,
-          signal: searchScope.controller.signal,
-        });
-        if (!isSearchScopeActive(searchScope)) {
-          return false;
-        }
-        const rebuiltId = rebuilt.material_id;
-        seeds[rebuiltId] = {
-          ...seed,
-          topic: topic || undefined,
-          text: text || undefined,
-          updatedAt: Date.now(),
-        };
-        delete seeds[missingMaterialId];
-        safeLocalStorageSetItem(MATERIAL_SEEDS_STORAGE_KEY, JSON.stringify(seeds));
-        const groups = parseMaterialGroups(window.localStorage.getItem(MATERIAL_GROUPS_STORAGE_KEY));
-        const nextGroups: Record<string, MaterialGroup> = {};
-        for (const [groupId, group] of Object.entries(groups)) {
-          const nextMaterialIds = Array.from(
-            new Set(group.materialIds.map((id) => (id === missingMaterialId ? rebuiltId : id)).filter(Boolean)),
-          );
-          if (nextMaterialIds.length === 0) {
-            continue;
-          }
-          const nextGroupId = groupId === missingMaterialId ? rebuiltId : groupId;
-          nextGroups[nextGroupId] = {
-            ...group,
-            materialIds: nextMaterialIds,
-            updatedAt: Date.now(),
-          };
-        }
-        safeLocalStorageSetItem(MATERIAL_GROUPS_STORAGE_KEY, JSON.stringify(nextGroups));
-
-        const nextParams = new URLSearchParams(params.toString());
-        nextParams.set("material_id", rebuiltId);
-        router.replace(`/feed?${nextParams.toString()}`);
-        return true;
-      } catch (e) {
-        if (!isSearchScopeActive(searchScope) || isRequestInterruptedError(e)) {
-          return false;
-        }
-        setVisibleFeedError(e instanceof Error ? e.message : "Could not rebuild material.");
-        return false;
-      } finally {
-        if (isSearchScopeActive(searchScope)) {
-          isRecoveringMissingMaterialRef.current = false;
-        }
-      }
-    },
-    [isSearchScopeActive, params, router, setVisibleFeedError],
-  );
+  const showSavedSessionUnavailable = useCallback(() => {
+    setVisibleFeedError(SAVED_SESSION_UNAVAILABLE_MESSAGE);
+  }, [setVisibleFeedError]);
 
   const feedNeedsBootstrapTopUp = useCallback((): boolean => {
     const feedMaterialIds = getFeedMaterialIds();
@@ -2092,6 +2094,9 @@ function FeedPageInner() {
       } catch (error) {
         if (isSearchScopeActive(searchScope) && !isRequestInterruptedError(error)) {
           console.warn(`Feed generation stream failed for topic material ${materialIdValue}:`, error);
+          if (isDailySearchLimitError(error) || isVerifiedAccountRequiredError(error)) {
+            noteFeedFailure(error);
+          }
         }
       } finally {
         if (isSearchScopeActive(searchScope)) {
@@ -2107,6 +2112,7 @@ function FeedPageInner() {
     clearPendingTailAdvance,
     isSearchScopeActive,
     markRecoveryProgress,
+    noteFeedFailure,
     noteGenerationTerminal,
     settleGenerationContinuation,
     claimGenerationConsumer,
@@ -2134,7 +2140,11 @@ function FeedPageInner() {
         const tuning = getFeedTuningSettings();
         const requestGenerationMode = options?.generationMode ?? generationMode;
         const requestLimit = adaptiveExcludeReelIdsRef.current.length > 0 ? 25 : PAGE_SIZE;
-        const allowServerAutofill = (options?.autofill ?? true) && feedMaterialIds.length === 1;
+        const allowServerAutofill = (
+          (options?.autofill ?? true)
+          && feedMaterialIds.length === 1
+          && !billingWorkBlockedRef.current
+        );
         const rows = await Promise.all(
           feedMaterialIds.map(async (id) => {
             try {
@@ -2167,8 +2177,15 @@ function FeedPageInner() {
           if (targetPage > 1 && reelsRef.current.length > 0) {
             markPagedFeedExhausted();
           }
-          const firstError = rows[0]?.error;
-          if (isTransportError(firstError)) {
+          const billingFailureRow = rows.find((row) => (
+            isDailySearchLimitError(row.error) || isVerifiedAccountRequiredError(row.error)
+          ));
+          const selectedFailureRow = billingFailureRow ?? rows[0];
+          const firstError = selectedFailureRow?.error;
+          const isBillingFailure = Boolean(billingFailureRow);
+          if (isBillingFailure) {
+            noteFeedFailure(firstError);
+          } else if (isTransportError(firstError)) {
             noteFeedTransportFailure(firstError, {
               forceVisible: targetPage === 1 && reelsRef.current.length === 0,
             });
@@ -2178,20 +2195,17 @@ function FeedPageInner() {
               return { addedCount: 0, exhausted: feedPagesExhausted };
             }
             const message = firstError instanceof Error ? firstError.message : "Feed failed to load";
-            const missingMaterialId = String(rows[0]?.materialId || materialId || "").trim();
+            const missingMaterialId = String(selectedFailureRow?.materialId || materialId || "").trim();
             if (
               feedMaterialIds.length === 1 &&
               /material_id not found/i.test(message) &&
-              missingMaterialId &&
-              !recoveryAttemptedIdsRef.current.has(missingMaterialId)
+              missingMaterialId
             ) {
-              recoveryAttemptedIdsRef.current.add(missingMaterialId);
-              const recovered = await recoverMissingMaterial(missingMaterialId);
-              if (recovered) {
-                return { addedCount: 0, exhausted: false };
-              }
+              showSavedSessionUnavailable();
+              setRecoveryPhase("idle");
+              return { addedCount: 0, exhausted: feedPagesExhausted };
             }
-            if (!isTransportError(firstError)) {
+            if (!isTransportError(firstError) && !isBillingFailure) {
               noteFeedFailure(firstError ?? message);
             }
           }
@@ -2247,8 +2261,15 @@ function FeedPageInner() {
         clearRecoveredTransportError();
 
         if (successful.length < rows.length) {
-          const failedIds = rows.filter((row) => !row.data).map((row) => row.materialId);
+          const failedRows = rows.filter((row) => !row.data);
+          const failedIds = failedRows.map((row) => row.materialId);
           console.warn("Some topic feeds failed to load:", failedIds);
+          const billingFailure = failedRows.find((row) => (
+            isDailySearchLimitError(row.error) || isVerifiedAccountRequiredError(row.error)
+          ));
+          if (billingFailure?.error) {
+            noteFeedFailure(billingFailure.error);
+          }
         }
         setRecoveryPhase("idle");
         for (const row of successful) {
@@ -2272,7 +2293,11 @@ function FeedPageInner() {
           noteFeedTransportFailure(e, {
             forceVisible: targetPage === 1 && reelsRef.current.length === 0,
           });
-        } else if (targetPage === 1) {
+        } else if (
+          targetPage === 1
+          || isDailySearchLimitError(e)
+          || isVerifiedAccountRequiredError(e)
+        ) {
           noteFeedFailure(e);
         }
         setRecoveryPhase("idle");
@@ -2311,11 +2336,11 @@ function FeedPageInner() {
       markPagedFeedExhausted,
       noteFeedFailure,
       noteFeedTransportFailure,
-      recoverMissingMaterial,
       reconcileGeneratedReels,
       rememberFeedContinuationToken,
       rememberFeedGenerationJob,
       settingsScopeReady,
+      showSavedSessionUnavailable,
       syncGenerationLockState,
       updateSessionReels,
       finishActiveRecoveryRequest,
@@ -2328,7 +2353,13 @@ function FeedPageInner() {
     requestedCount?: number;
   }): Promise<Reel[]> => {
     const allFeedMaterialIds = getFeedMaterialIds();
-    if (!settingsScopeReady || allFeedMaterialIds.length === 0 || isGeneratingRef.current || !canRequestMore) {
+    if (
+      !settingsScopeReady
+      || allFeedMaterialIds.length === 0
+      || isGeneratingRef.current
+      || !canRequestMore
+      || billingWorkBlockedRef.current
+    ) {
       return [];
     }
     // Ingest-search / ingest-scratch reels are already primed into the feed
@@ -2454,7 +2485,10 @@ function FeedPageInner() {
       if (!isSearchScopeActive(searchScope)) {
         return [];
       }
-      const firstFailedRow = generatedRows.find((row) => row?.error);
+      const billingFailureRow = generatedRows.find((row) => (
+        isDailySearchLimitError(row?.error) || isVerifiedAccountRequiredError(row?.error)
+      ));
+      const firstFailedRow = billingFailureRow ?? generatedRows.find((row) => row?.error);
       const firstFailureMessage =
         firstFailedRow?.error instanceof Error ? firstFailedRow.error.message : "";
       if (isRequestInterruptedError(firstFailedRow?.error)) {
@@ -2463,19 +2497,19 @@ function FeedPageInner() {
         }
         return [];
       }
+      if (billingFailureRow?.error) {
+        noteFeedFailure(billingFailureRow.error);
+        setGenerationProgress(null);
+        setRecoveryPhase("idle");
+        return [];
+      }
       const missingMaterialId = String(firstFailedRow?.materialId || materialId || "").trim();
       if (
         feedMaterialIds.length === 1 &&
         /material_id not found/i.test(firstFailureMessage) &&
         missingMaterialId
       ) {
-        if (!recoveryAttemptedIdsRef.current.has(missingMaterialId)) {
-          recoveryAttemptedIdsRef.current.add(missingMaterialId);
-          const recovered = await recoverMissingMaterial(missingMaterialId);
-          if (recovered) {
-            return [];
-          }
-        }
+        showSavedSessionUnavailable();
         clearPendingTailAdvance();
         return [];
       }
@@ -2592,12 +2626,12 @@ function FeedPageInner() {
     noteFeedFailure,
     noteFeedTransportFailure,
     noteGenerationTerminal,
-    recoverMissingMaterial,
     reconcileGeneratedReels,
     releaseGenerationConsumer,
     settingsScopeReady,
     settleGenerationContinuation,
     setVisibleFeedError,
+    showSavedSessionUnavailable,
     syncGenerationLockState,
     finishActiveRecoveryRequest,
   ]);
@@ -2614,6 +2648,9 @@ function FeedPageInner() {
       targetCount + MAX_ZERO_GROWTH_CONTINUATIONS,
     );
     for (let attempt = 0; attempt < maxAttempts && addedTotal < targetCount; attempt += 1) {
+      if (billingWorkBlockedRef.current) {
+        break;
+      }
       const openMaterialIds = getFeedMaterialIds().filter((id) => !isGenerationFinished(id));
       if (openMaterialIds.length === 0 || isGeneratingRef.current) {
         break;
@@ -2646,6 +2683,13 @@ function FeedPageInner() {
   }, [getFeedMaterialIds, isGenerationFinished, requestMore]);
 
   useEffect(() => {
+    if (
+      billingWorkBlockedRef.current
+      && billingBlockedMaterialIdRef.current !== (materialId || null)
+    ) {
+      clearBillingWorkBlock();
+      setBillingGate(null);
+    }
     mutedRestoredFromSnapshotRef.current = false;
     autoplayRestoredFromSnapshotRef.current = false;
     if (!materialId) {
@@ -2760,7 +2804,6 @@ function FeedPageInner() {
     resumeAppliedRef.current = false;
     resumeLoadingRef.current = false;
     pendingAutoplayAdvanceRef.current = false;
-    recoveryAttemptedIdsRef.current.clear();
     setLoading(!restoredSession || restoredSession.reels.length === 0);
     updateSessionReels([]);
     setPage(1);
@@ -2864,7 +2907,7 @@ function FeedPageInner() {
     } else {
       void loadPage(1, { autofill: true });
     }
-  }, [communityHandoffIdParam, communityPreviewReel, generationModeParam, isSearchScopeActive, loadPage, materialId, mergeSessionReels, settingsScopeReady, setVisibleFeedError, updateSessionReels]);
+  }, [clearBillingWorkBlock, communityHandoffIdParam, communityPreviewReel, generationModeParam, isSearchScopeActive, loadPage, materialId, mergeSessionReels, settingsScopeReady, setVisibleFeedError, updateSessionReels]);
 
   useEffect(() => {
     if (!materialId || sessionHydrated || loading) {
@@ -3096,7 +3139,7 @@ function FeedPageInner() {
 
   const bootstrapFirstReels = useCallback(
     async (manual = false) => {
-      if (!materialId || isGeneratingRef.current || !canRequestMore) {
+      if (!materialId || isGeneratingRef.current || !canRequestMore || billingWorkBlockedRef.current) {
         return;
       }
       // Ingest materials: feed is pre-populated via the primed session snapshot.
@@ -4584,7 +4627,7 @@ function FeedPageInner() {
       >
         <i className="fa-solid fa-arrow-left text-xs" aria-hidden="true" />
       </button>
-      {error ? (
+      {error && error !== SAVED_SESSION_UNAVAILABLE_MESSAGE ? (
         <div className="absolute left-0 right-0 top-3 z-[2147483647] mx-auto w-fit">
           <div className="relative flex items-center gap-3 overflow-hidden rounded-xl border border-gray-300/45 bg-white/10 px-4 py-2 text-xs text-white shadow-[0_12px_28px_rgba(0,0,0,0.35)] backdrop-blur-xl backdrop-saturate-150">
             <div aria-hidden="true" className="pointer-events-none absolute inset-0 bg-black/45" />
@@ -4598,6 +4641,16 @@ function FeedPageInner() {
             </button>
           </div>
         </div>
+      ) : null}
+
+      {billingGate ? (
+        <BillingGateDialog
+          reason={billingGate.reason}
+          account={readCommunityAuthSession()?.account ?? null}
+          requiredSearches={billingGate.requiredSearches}
+          onBillingAvailable={resumeAfterBillingRefresh}
+          onClose={() => setBillingGate(null)}
+        />
       ) : null}
 
       {assessmentSession ? (
@@ -4671,7 +4724,19 @@ function FeedPageInner() {
             {reels.length === 0 ? (
               <div className="absolute inset-0 grid place-items-center p-6">
                 <div className="max-w-sm rounded-3xl border border-white/20 bg-black/68 px-5 py-4 text-center text-white backdrop-blur">
-                  {loading || bootstrappingFirstReels || generatingMore ? (
+                  {error === SAVED_SESSION_UNAVAILABLE_MESSAGE ? (
+                    <>
+                      <p className="text-sm font-semibold">Saved session unavailable</p>
+                      <p className="mt-2 text-xs text-white/72">{SAVED_SESSION_UNAVAILABLE_MESSAGE}</p>
+                      <button
+                        type="button"
+                        onClick={navigateBackToPreviousPage}
+                        className="mt-3 rounded-xl border border-white/25 bg-white px-3.5 py-2 text-xs font-semibold text-black"
+                      >
+                        Start a new search
+                      </button>
+                    </>
+                  ) : loading || bootstrappingFirstReels || generatingMore ? (
                     <GenerationStageStatus
                       ready={reels.length}
                       reconnecting={generationProgress?.reconnecting ?? false}

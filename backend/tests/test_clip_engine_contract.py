@@ -144,6 +144,13 @@ class ClipEngineContractTests(unittest.TestCase):
         self._verify_patch.start()
         self.addCleanup(self._prepare_patch.stop)
         self.addCleanup(self._verify_patch.stop)
+        self._provider_account_patch = mock.patch.object(
+            main_module,
+            "_require_verified_provider_account",
+            return_value={"id": "clip-contract-test-account"},
+        )
+        self._provider_account_patch.start()
+        self.addCleanup(self._provider_account_patch.stop)
         with db_module.get_conn(transactional=True) as conn:
             db_module.insert(
                 conn,

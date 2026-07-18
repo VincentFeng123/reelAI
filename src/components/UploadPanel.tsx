@@ -3,11 +3,19 @@
 import { type DragEvent, type FormEvent, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { ingestUrl, isRequestInterruptedError, uploadMaterial } from "@/lib/api";
+import { BillingGateDialog, type BillingGateReason } from "@/components/BillingGateDialog";
+import {
+  ingestUrl,
+  isDailySearchLimitError,
+  isRequestInterruptedError,
+  isVerifiedAccountRequiredError,
+  uploadMaterial,
+} from "@/lib/api";
 import { safeStorageSetItem } from "@/lib/browserStorage";
 import { buildSearchFeedQuery } from "@/lib/feedQuery";
 import { type GenerationMode, type SearchInputMode, readStudyReelsSettings, subscribeToStudyReelsSettings } from "@/lib/settings";
-import { CURRENT_SELECTION_CONTRACT_VERSION, type Reel } from "@/lib/types";
+import { requestBillingStatusRefresh, useBillingStatus } from "@/lib/useBillingStatus";
+import { CURRENT_SELECTION_CONTRACT_VERSION, type CommunityAccount, type Reel } from "@/lib/types";
 
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
@@ -91,17 +99,6 @@ type MaterialSeed = {
   title: string;
   updatedAt: number;
 };
-
-function pairFulfilledTopicMaterials(
-  topics: string[],
-  settled: PromiseSettledResult<Awaited<ReturnType<typeof uploadMaterial>>>[],
-): Array<{ topic: string; materialId: string }> {
-  return settled.flatMap((result, index) => {
-    const topic = String(topics[index] || "").trim();
-    const materialId = result.status === "fulfilled" ? String(result.value.material_id || "").trim() : "";
-    return topic && materialId ? [{ topic, materialId }] : [];
-  });
-}
 
 type MaterialGroup = {
   materialIds: string[];
@@ -195,6 +192,7 @@ function parseMaterialGroups(raw: string | null): Record<string, MaterialGroup> 
 
 type UploadPanelProps = {
   active?: boolean;
+  account?: CommunityAccount | null;
   onMaterialCreated?: (params: {
     materialId: string;
     title: string;
@@ -302,11 +300,11 @@ function buildMaterialTitle(params: { topic: string; text: string; fileName: str
   return "New Study Session";
 }
 
-export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetChange, onScrollGesture, onScrollabilityChange, heroTitleRef }: UploadPanelProps) {
+export function UploadPanel({ active = true, account, onMaterialCreated, onScrollOffsetChange, onScrollGesture, onScrollabilityChange, heroTitleRef }: UploadPanelProps) {
   const router = useRouter();
   const touchStartYRef = useRef<number | null>(null);
   const formRef = useRef<HTMLFormElement | null>(null);
-  const [topics, setTopics] = useState<string[]>([""]);
+  const [topic, setTopic] = useState("");
   const [text, setText] = useState("");
   const [file, setFile] = useState<File | undefined>();
   const [reelUrl, setReelUrl] = useState("");
@@ -315,9 +313,15 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [billingGate, setBillingGate] = useState<{ reason: BillingGateReason; requiredSearches: number } | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const [generationMode, setGenerationMode] = useState<GenerationMode>("slow");
   const selectedFileName = file?.name ?? "";
+  // The parent hydrates this account after mount. Avoid reading localStorage during
+  // render, which would make the first browser render differ from the server HTML.
+  const verifiedAccount = account?.isVerified ? account : null;
+  const { status: billingStatus } = useBillingStatus(verifiedAccount);
+  const searchCost = 1;
 
   useEffect(() => {
     const saved = readStudyReelsSettings();
@@ -334,7 +338,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
       return true;
     }
     if (inputMode === "topic") {
-      return !topics.some((t) => t.trim());
+      return !topic.trim();
     }
     if (inputMode === "source") {
       return !text.trim();
@@ -343,7 +347,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
       return !isLikelyIngestUrl(reelUrl);
     }
     return !file;
-  }, [file, inputMode, loading, reelUrl, text, topics]);
+  }, [file, inputMode, loading, reelUrl, text, topic]);
 
   useEffect(() => {
     return () => {
@@ -372,6 +376,14 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
   const onSubmit = useCallback(async (event: FormEvent) => {
     event.preventDefault();
     if (!active) {
+      return;
+    }
+    if (!verifiedAccount?.isVerified) {
+      setBillingGate({ reason: "sign_in", requiredSearches: searchCost });
+      return;
+    }
+    if (billingStatus && billingStatus.remaining_searches < searchCost) {
+      setBillingGate({ reason: "quota", requiredSearches: searchCost });
       return;
     }
     abortControllerRef.current?.abort();
@@ -456,12 +468,12 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
           settings: activeSettings,
         });
         router.push(`/feed?${ingestFeedQuery}&active_reel_id=${encodeURIComponent(ingestedReel.reel_id)}`);
+        requestBillingStatusRefresh();
         setReelUrl("");
         return;
       }
 
-      const topicList = inputMode === "topic" ? topics.map((t) => t.trim()).filter(Boolean) : [];
-      const topicValue = topicList.join(", ");
+      const topicValue = inputMode === "topic" ? topic.trim() : "";
       const textValue = inputMode === "source" ? text.trim() : "";
       const fileValue = inputMode === "file" ? file : undefined;
       const title = buildMaterialTitle({
@@ -470,47 +482,17 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
         fileName: fileValue?.name ?? "",
       });
       let materialIds: string[] = [];
-      let fulfilledTopicMaterials: Array<{ topic: string; materialId: string }> = [];
-      if (inputMode === "topic" && topicList.length > 1) {
-        // Multi-topic: accept partial success. A failed upload for one topic
-        // must not orphan successfully-created materials for the others —
-        // Promise.all rejects the whole batch and would do exactly that.
-        const settled = await Promise.allSettled(
-          topicList.map((topic) => uploadMaterial({ subjectTag: topic, knowledgeLevel, signal: controller.signal })),
-        );
-        if (controller.signal.aborted) {
-          return;
-        }
-        fulfilledTopicMaterials = pairFulfilledTopicMaterials(topicList, settled);
-        materialIds = fulfilledTopicMaterials.map(({ materialId }) => materialId);
-        const failedCount = settled.length - fulfilledTopicMaterials.length;
-        if (materialIds.length === 0) {
-          throw new Error(
-            failedCount > 0
-              ? `All ${failedCount} topic upload${failedCount > 1 ? "s" : ""} failed.`
-              : "No materials were created.",
-          );
-        }
-        if (failedCount > 0) {
-          // Log-only: the user proceeds into the feed with the subset that
-          // worked rather than losing every successful upload.
-          console.warn(
-            `${failedCount} of ${topicList.length} topic uploads failed; continuing with ${materialIds.length}.`,
-          );
-        }
-      } else {
-        const material = await uploadMaterial({
-          text: textValue || undefined,
-          file: fileValue,
-          subjectTag: topicValue || undefined,
-          knowledgeLevel,
-          signal: controller.signal,
-        });
-        if (controller.signal.aborted) {
-          return;
-        }
-        materialIds = [material.material_id];
+      const material = await uploadMaterial({
+        text: textValue || undefined,
+        file: fileValue,
+        subjectTag: topicValue || undefined,
+        knowledgeLevel,
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) {
+        return;
       }
+      materialIds = [material.material_id];
 
       const primaryMaterialId = materialIds[0];
       if (!primaryMaterialId) {
@@ -520,40 +502,20 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
       if (typeof window !== "undefined") {
         const seeds = parseMaterialSeeds(window.localStorage.getItem(MATERIAL_SEEDS_STORAGE_KEY));
         const now = Date.now();
-        if (inputMode === "topic" && topicList.length > 1) {
-          fulfilledTopicMaterials.forEach(({ topic, materialId }, index) => {
-            seeds[materialId] = {
-              topic,
-              text: undefined,
-              knowledgeLevel,
-              title: topic,
-              updatedAt: now - index,
-            };
-          });
-        } else {
-          seeds[primaryMaterialId] = {
-            topic: topicValue || undefined,
-            text: textValue ? textValue.slice(0, MAX_SEED_TEXT_CHARS) : undefined,
-            knowledgeLevel,
-            title,
-            updatedAt: now,
-          };
-        }
+        seeds[primaryMaterialId] = {
+          topic: topicValue || undefined,
+          text: textValue ? textValue.slice(0, MAX_SEED_TEXT_CHARS) : undefined,
+          knowledgeLevel,
+          title,
+          updatedAt: now,
+        };
         const ordered = Object.entries(seeds)
           .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
           .slice(0, MAX_MATERIAL_SEEDS);
         safeStorageSetItem(window.localStorage, MATERIAL_SEEDS_STORAGE_KEY, JSON.stringify(Object.fromEntries(ordered)));
 
         const groups = parseMaterialGroups(window.localStorage.getItem(MATERIAL_GROUPS_STORAGE_KEY));
-        if (inputMode === "topic" && topicList.length > 1) {
-          groups[primaryMaterialId] = {
-            materialIds,
-            title,
-            updatedAt: now,
-          };
-        } else {
-          delete groups[primaryMaterialId];
-        }
+        delete groups[primaryMaterialId];
         const orderedGroups = Object.entries(groups)
           .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
           .slice(0, MAX_MATERIAL_GROUPS);
@@ -584,8 +546,18 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
         settings: activeSettings,
       });
       router.push(`/feed?${nextQuery}`);
+      requestBillingStatusRefresh();
     } catch (e) {
       if (isRequestInterruptedError(e) || (e instanceof DOMException && e.name === "AbortError")) {
+        return;
+      }
+      if (isDailySearchLimitError(e)) {
+        setBillingGate({ reason: "quota", requiredSearches: searchCost });
+        requestBillingStatusRefresh();
+        return;
+      }
+      if (isVerifiedAccountRequiredError(e)) {
+        setBillingGate({ reason: "sign_in", requiredSearches: searchCost });
         return;
       }
       setError(e instanceof Error ? e.message : "Something failed");
@@ -595,7 +567,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
         setLoading(false);
       }
     }
-  }, [active, file, inputMode, knowledgeLevel, onMaterialCreated, reelUrl, router, text, topics]);
+  }, [active, billingStatus, file, inputMode, knowledgeLevel, onMaterialCreated, reelUrl, router, searchCost, text, topic, verifiedAccount]);
 
   const onFileDrop = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();
@@ -641,7 +613,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
 
   useEffect(() => {
     reportScrollability();
-  }, [inputMode, reportScrollability, topics.length, text, selectedFileName, error]);
+  }, [inputMode, reportScrollability, text, selectedFileName, error]);
 
   return (
     <form
@@ -751,42 +723,15 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
       <div className="relative z-20 mt-6 h-[160px] min-h-[160px] md:mt-4 md:h-[175px] md:min-h-[175px]">
         {inputMode === "topic" ? (
           <>
-            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Topics</label>
-            <div className="h-full min-h-[160px] md:min-h-[175px] flex flex-col gap-2 overflow-y-auto">
-              {topics.map((t, i) => (
-                <div key={i} className="pr-1">
-                  <div className="relative w-full rounded-2xl border border-white/15 bg-white/[0.08] backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 focus-within:bg-white/[0.12]">
-                    <input
-                      className="h-12 w-full rounded-2xl border-0 bg-transparent px-4 pr-11 text-sm text-white outline-none placeholder:text-white/40"
-                      placeholder={i === 0 ? "e.g. linear regression" : "e.g. another topic"}
-                      value={t}
-                      onChange={(e) => {
-                        const next = [...topics];
-                        next[i] = e.target.value;
-                        setTopics(next);
-                      }}
-                    />
-                    {topics.length > 1 ? (
-                      <button
-                        type="button"
-                        onClick={() => setTopics(topics.filter((_, j) => j !== i))}
-                        className="absolute right-3 top-1/2 -translate-y-1/2 text-white/60 transition-colors duration-200 hover:text-white"
-                        aria-label="Remove topic"
-                      >
-                        <i className="fa-solid fa-xmark text-xs" aria-hidden="true" />
-                      </button>
-                    ) : null}
-                  </div>
-                </div>
-              ))}
-              <button
-                type="button"
-                onClick={() => setTopics([...topics, ""])}
-                className="mt-1 flex w-fit items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold text-white/60 transition hover:text-white/90"
-              >
-                <i className="fa-solid fa-plus text-[10px]" aria-hidden="true" />
-                Add topic
-              </button>
+            <label htmlFor="material-topic" className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Topic</label>
+            <div className="w-full rounded-2xl border border-white/15 bg-white/[0.08] backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 focus-within:bg-white/[0.12]">
+              <input
+                id="material-topic"
+                className="h-12 w-full rounded-2xl border-0 bg-transparent px-4 text-sm text-white outline-none placeholder:text-white/40"
+                placeholder="e.g. linear regression"
+                value={topic}
+                onChange={(event) => setTopic(event.target.value)}
+              />
             </div>
           </>
         ) : null}
@@ -857,6 +802,16 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
       </div>
 
       <div className="relative z-20 mt-6 shrink-0 flex flex-col gap-2 md:mt-6">
+        <div className="flex min-h-5 flex-wrap items-center justify-between gap-x-3 gap-y-1 text-[11px] font-medium text-white/58">
+          <span>
+            {!verifiedAccount?.isVerified
+              ? "Sign in with a verified account to search"
+              : billingStatus
+                ? `${billingStatus.remaining_searches} of ${billingStatus.daily_limit} searches left today`
+                : "Daily usage is checked when you start"}
+          </span>
+          <span>Uses 1 search</span>
+        </div>
         <p className="min-h-5 text-sm text-white/80">{error ?? ""}</p>
         <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
           {inputMode !== "url" ? (
@@ -904,6 +859,14 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
           </button>
         </div>
       </div>
+      {billingGate ? (
+        <BillingGateDialog
+          reason={billingGate.reason}
+          account={verifiedAccount}
+          requiredSearches={billingGate.requiredSearches}
+          onClose={() => setBillingGate(null)}
+        />
+      ) : null}
     </form>
   );
 }

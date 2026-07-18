@@ -2,6 +2,10 @@ import type {
   AssessmentAnswerResponse,
   AssessmentSnoozeResponse,
   AssessmentStatusResponse,
+  BillingPlan,
+  BillingPlanCode,
+  BillingStatus,
+  BillingSubscription,
   ChatMessage,
   ChatResponse,
   CommunityAccount,
@@ -82,7 +86,134 @@ const COMMUNITY_SESSION_TOKEN_STORAGE_KEY = "studyreels-community-session-token"
 const COMMUNITY_OWNER_HEADER = "X-StudyReels-Owner-Key";
 const COMMUNITY_SESSION_HEADER = "X-StudyReels-Session-Token";
 export const COMMUNITY_AUTH_CHANGED_EVENT = "studyreels-community-auth-changed";
+export const BILLING_STATUS_REFRESH_EVENT = "studyreels-billing-status-refresh";
+const PENDING_IDEMPOTENCY_STORAGE_PREFIX = "studyreels-pending-api-operation-v1:";
 let communityOwnerKeyMemoryFallback: string | null = null;
+const pendingIdempotencyKeyMemoryFallback = new Map<string, string>();
+
+function createOperationId(prefix: string): string {
+  const suffix = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : createCommunityOwnerKey();
+  return `${prefix}-${suffix}`;
+}
+
+function canonicalRequestIdentity(value: Record<string, unknown>): string {
+  const normalize = (row: unknown): unknown => {
+    if (Array.isArray(row)) {
+      return row.map(normalize);
+    }
+    if (row && typeof row === "object") {
+      return Object.fromEntries(
+        Object.entries(row as Record<string, unknown>)
+          .filter(([, item]) => item !== undefined)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, item]) => [key, normalize(item)]),
+      );
+    }
+    return row;
+  };
+  return JSON.stringify(normalize(value));
+}
+
+function fallbackBytesHash(bytes: Uint8Array): string {
+  let left = 0x811c9dc5;
+  let right = 0x9e3779b9;
+  for (const byte of bytes) {
+    left = Math.imul(left ^ byte, 0x01000193);
+    right = Math.imul(right ^ byte, 0x85ebca6b);
+  }
+  return `${(left >>> 0).toString(16).padStart(8, "0")}${(right >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) {
+    return fallbackBytesHash(new Uint8Array(bytes));
+  }
+  const digest = await subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function requestFingerprint(value: Record<string, unknown>): Promise<string> {
+  const identity = canonicalRequestIdentity(value);
+  return sha256Hex(new TextEncoder().encode(identity).buffer as ArrayBuffer);
+}
+
+async function materialRequestFingerprint(params: {
+  text?: string;
+  file?: File;
+  subjectTag?: string;
+  knowledgeLevel?: "beginner" | "intermediate" | "advanced";
+}): Promise<string> {
+  const fileSha256 = params.file ? await sha256Hex(await params.file.arrayBuffer()) : "";
+  return requestFingerprint({
+    version: 1,
+    subject_tag: String(params.subjectTag || ""),
+    text: String(params.text || ""),
+    knowledge_level: String(params.knowledgeLevel || ""),
+    file_name: String(params.file?.name || ""),
+    file_sha256: fileSha256,
+  });
+}
+
+function pendingIdempotencyStorageKey(scope: string, fingerprint: string): string {
+  return `${PENDING_IDEMPOTENCY_STORAGE_PREFIX}${scope}:${fingerprint}`;
+}
+
+function readPendingIdempotencyKey(scope: string, fingerprint: string): string {
+  const storageKey = pendingIdempotencyStorageKey(scope, fingerprint);
+  if (typeof window !== "undefined") {
+    try {
+      const stored = String(window.localStorage.getItem(storageKey) || "").trim();
+      if (stored) {
+        pendingIdempotencyKeyMemoryFallback.set(storageKey, stored);
+        return stored;
+      }
+    } catch {
+      // This tab can still reuse its in-memory key when storage is unavailable.
+    }
+  }
+  return pendingIdempotencyKeyMemoryFallback.get(storageKey) || "";
+}
+
+function savePendingIdempotencyKey(scope: string, fingerprint: string, idempotencyKey: string): void {
+  const storageKey = pendingIdempotencyStorageKey(scope, fingerprint);
+  pendingIdempotencyKeyMemoryFallback.set(storageKey, idempotencyKey);
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.setItem(storageKey, idempotencyKey);
+  } catch {
+    // The in-memory key still covers retries in this tab.
+  }
+}
+
+function clearPendingIdempotencyKey(scope: string, fingerprint: string, idempotencyKey: string): void {
+  const storageKey = pendingIdempotencyStorageKey(scope, fingerprint);
+  if (pendingIdempotencyKeyMemoryFallback.get(storageKey) === idempotencyKey) {
+    pendingIdempotencyKeyMemoryFallback.delete(storageKey);
+  }
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    if (window.localStorage.getItem(storageKey) === idempotencyKey) {
+      window.localStorage.removeItem(storageKey);
+    }
+  } catch {
+    // A retained key remains safe to replay.
+  }
+}
+
+function reservePendingIdempotencyKey(scope: string, fingerprint: string, suppliedKey?: string): string {
+  const idempotencyKey = String(suppliedKey || "").trim()
+    || readPendingIdempotencyKey(scope, fingerprint)
+    || createOperationId(scope);
+  savePendingIdempotencyKey(scope, fingerprint, idempotencyKey);
+  return idempotencyKey;
+}
 
 function apiUrl(path: string): string {
   const cleanPath = path.startsWith("/") ? path : `/${path}`;
@@ -730,6 +861,160 @@ export async function logoutCommunityAccount(): Promise<void> {
   }
 }
 
+function normalizeBillingPlanCode(value: unknown): BillingPlanCode | null {
+  return value === "free" || value === "plus" || value === "pro" ? value : null;
+}
+
+function normalizeBillingPlan(raw: unknown): BillingPlan | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const row = raw as Record<string, unknown>;
+  const code = normalizeBillingPlanCode(row.code);
+  const name = typeof row.name === "string" ? row.name.trim() : "";
+  const monthlyPriceCents = Number(row.monthly_price_cents);
+  const dailyLimit = Number(row.daily_limit);
+  if (!code || !name || !Number.isFinite(monthlyPriceCents) || !Number.isFinite(dailyLimit)) {
+    return null;
+  }
+  return {
+    code,
+    name,
+    monthly_price_cents: Math.max(0, Math.floor(monthlyPriceCents)),
+    daily_limit: Math.max(0, Math.floor(dailyLimit)),
+  };
+}
+
+function normalizeBillingSubscription(raw: unknown): BillingSubscription | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const row = raw as Record<string, unknown>;
+  const plan = normalizeBillingPlanCode(row.plan);
+  const status = typeof row.status === "string" ? row.status.trim() : "";
+  if (row.provider !== "stripe" || !plan || !status) {
+    return null;
+  }
+  return {
+    provider: "stripe",
+    plan,
+    status,
+    current_period_end: typeof row.current_period_end === "string" && row.current_period_end.trim()
+      ? row.current_period_end.trim()
+      : null,
+    cancel_at_period_end: Boolean(row.cancel_at_period_end),
+    product_id: typeof row.product_id === "string" && row.product_id.trim() ? row.product_id.trim() : null,
+  };
+}
+
+function normalizeBillingStatus(raw: unknown): BillingStatus | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const row = raw as Record<string, unknown>;
+  const plan = normalizeBillingPlanCode(row.plan);
+  const dailyLimit = Number(row.daily_limit);
+  const usedSearches = Number(row.used_searches);
+  const remainingSearches = Number(row.remaining_searches);
+  const resetAt = typeof row.reset_at === "string" ? row.reset_at.trim() : "";
+  if (
+    !plan
+    || !Number.isFinite(dailyLimit)
+    || !Number.isFinite(usedSearches)
+    || !Number.isFinite(remainingSearches)
+    || !resetAt
+  ) {
+    return null;
+  }
+  const subscriptions = Array.isArray(row.subscriptions)
+    ? row.subscriptions.flatMap((subscription) => {
+        const normalized = normalizeBillingSubscription(subscription);
+        return normalized ? [normalized] : [];
+      })
+    : [];
+  return {
+    plan,
+    daily_limit: Math.max(0, Math.floor(dailyLimit)),
+    used_searches: Math.max(0, Math.floor(usedSearches)),
+    remaining_searches: Math.max(0, Math.floor(remainingSearches)),
+    reset_at: resetAt,
+    subscriptions,
+  };
+}
+
+export async function fetchBillingPlans(signal?: AbortSignal): Promise<BillingPlan[]> {
+  const res = await safeFetch(apiUrl("/billing/plans"), { cache: "no-store", signal });
+  const json = await parseJsonResponse<{ plans?: unknown }>(res);
+  const plans = Array.isArray(json?.plans)
+    ? json.plans.flatMap((plan) => {
+        const normalized = normalizeBillingPlan(plan);
+        return normalized ? [normalized] : [];
+      })
+    : [];
+  if (plans.length === 0) {
+    throw new Error("Backend returned an invalid billing plans response.");
+  }
+  return plans;
+}
+
+export async function fetchBillingStatus(signal?: AbortSignal): Promise<BillingStatus> {
+  const res = await safeFetch(apiUrl("/billing/status"), {
+    cache: "no-store",
+    headers: { ...communitySessionHeaders() },
+    signal,
+  });
+  const status = normalizeBillingStatus(await parseJsonResponse<unknown>(res));
+  if (!status) {
+    throw new Error("Backend returned an invalid billing status response.");
+  }
+  return status;
+}
+
+function validatedStripeRedirectUrl(raw: unknown, expectedHost: "checkout.stripe.com" | "billing.stripe.com"): string {
+  const value = typeof raw === "string" ? raw.trim() : "";
+  try {
+    const parsed = new URL(value);
+    if (
+      parsed.protocol !== "https:"
+      || parsed.hostname.toLowerCase() !== expectedHost
+      || parsed.username
+      || parsed.password
+      || parsed.port
+    ) {
+      throw new Error("invalid Stripe redirect URL");
+    }
+    return value;
+  } catch {
+    throw new Error(
+      expectedHost === "checkout.stripe.com"
+        ? "Backend returned an invalid Stripe Checkout URL."
+        : "Backend returned an invalid Stripe Customer Portal URL.",
+    );
+  }
+}
+
+export async function createStripeCheckout(plan: Exclude<BillingPlanCode, "free">): Promise<string> {
+  const res = await safeFetch(apiUrl("/billing/stripe/checkout"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...communitySessionHeaders(),
+    },
+    body: JSON.stringify({ plan }),
+  });
+  const json = await parseJsonResponse<{ url?: unknown }>(res);
+  return validatedStripeRedirectUrl(json?.url, "checkout.stripe.com");
+}
+
+export async function createStripePortal(): Promise<string> {
+  const res = await safeFetch(apiUrl("/billing/stripe/portal"), {
+    method: "POST",
+    headers: { ...communitySessionHeaders() },
+  });
+  const json = await parseJsonResponse<{ url?: unknown }>(res);
+  return validatedStripeRedirectUrl(json?.url, "billing.stripe.com");
+}
+
 export async function deleteCommunityAccount(params: {
   currentPassword: string;
 }): Promise<void> {
@@ -777,6 +1062,7 @@ export async function uploadMaterial(params: {
   file?: File;
   subjectTag?: string;
   knowledgeLevel?: "beginner" | "intermediate" | "advanced";
+  idempotencyKey?: string;
   signal?: AbortSignal;
 }): Promise<MaterialResponse> {
   const form = new FormData();
@@ -793,15 +1079,20 @@ export async function uploadMaterial(params: {
     form.append("knowledge_level", params.knowledgeLevel);
   }
 
+  const fingerprint = await materialRequestFingerprint(params);
+  const idempotencyKey = reservePendingIdempotencyKey("material", fingerprint, params.idempotencyKey);
   const res = await safeFetch(apiUrl("/material"), {
     method: "POST",
     headers: {
+      "Idempotency-Key": idempotencyKey,
       ...communityRequestHeaders(),
     },
     body: form,
     signal: params.signal,
   });
-  return parseJsonResponse<MaterialResponse>(res);
+  const response = await parseJsonResponse<MaterialResponse>(res);
+  clearPendingIdempotencyKey("material", fingerprint, idempotencyKey);
+  return response;
 }
 
 export async function updateMaterialLevel(params: {
@@ -944,6 +1235,7 @@ type IngestUrlParams = {
   targetClipDurationMinSec?: number;
   targetClipDurationMaxSec?: number;
   language?: string;
+  idempotencyKey?: string;
   signal?: AbortSignal;
 };
 
@@ -957,6 +1249,7 @@ type IngestSearchParams = {
   targetClipDurationMaxSec?: number;
   language?: string;
   excludeVideoIds?: string[];
+  idempotencyKey?: string;
   signal?: AbortSignal;
 };
 
@@ -977,10 +1270,15 @@ export async function ingestSearch(params: IngestSearchParams): Promise<IngestSe
     exclude_video_ids: params.excludeVideoIds,
   };
 
+  const fingerprint = await requestFingerprint({ contract: "ingest-search-v1", ...body });
+  const idempotencyKey = reservePendingIdempotencyKey("ingest-search", fingerprint, params.idempotencyKey);
+
   const res = await safeFetch(apiUrl("/ingest/search"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      "Idempotency-Key": idempotencyKey,
+      ...communityRequestHeaders(),
     },
     body: JSON.stringify(body),
     signal: params.signal,
@@ -988,7 +1286,9 @@ export async function ingestSearch(params: IngestSearchParams): Promise<IngestSe
     keepSignalAliveThroughBody: true,
   });
 
-  return parseJsonResponse<IngestSearchResult>(res);
+  const response = await parseJsonResponse<IngestSearchResult>(res);
+  clearPendingIdempotencyKey("ingest-search", fingerprint, idempotencyKey);
+  return response;
 }
 
 export async function ingestUrl(params: IngestUrlParams): Promise<IngestResult> {
@@ -999,10 +1299,15 @@ export async function ingestUrl(params: IngestUrlParams): Promise<IngestResult> 
     language: params.language,
   };
 
+  const fingerprint = await requestFingerprint({ contract: "ingest-url-v1", ...body });
+  const idempotencyKey = reservePendingIdempotencyKey("ingest-url", fingerprint, params.idempotencyKey);
+
   const res = await safeFetch(apiUrl("/ingest/url"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      "Idempotency-Key": idempotencyKey,
+      ...communityRequestHeaders(),
     },
     body: JSON.stringify(body),
     signal: params.signal,
@@ -1010,7 +1315,9 @@ export async function ingestUrl(params: IngestUrlParams): Promise<IngestResult> 
     keepSignalAliveThroughBody: true,
   });
 
-  return parseJsonResponse<IngestResult>(res);
+  const response = await parseJsonResponse<IngestResult>(res);
+  clearPendingIdempotencyKey("ingest-url", fingerprint, idempotencyKey);
+  return response;
 }
 
 function isQueuedGeneration(value: ReelsGenerateSubmission): value is GenerationQueuedResponse {
@@ -2372,18 +2679,28 @@ async function buildApiError(response: Response): Promise<ApiError> {
       const row = detail as Record<string, unknown>;
       const code = typeof row.code === "string" ? row.code.trim() : "";
       const typedMessage = typeof row.message === "string" ? row.message.trim() : "";
-      if (code && typedMessage) {
-        const retryAfter = Number(row.retry_after_sec);
+      if (code) {
+        const retryAfterFromBody = row.retry_after_sec == null ? Number.NaN : Number(row.retry_after_sec);
+        const retryAfterHeader = response.headers.get("Retry-After");
+        const retryAfterFromHeader = retryAfterHeader == null ? Number.NaN : Number(retryAfterHeader);
+        const retryAfter = Number.isFinite(retryAfterFromBody)
+          ? retryAfterFromBody
+          : retryAfterFromHeader;
+        const nestedDetails = row.details && typeof row.details === "object" && !Array.isArray(row.details)
+          ? row.details as Record<string, unknown>
+          : {};
+        const topLevelDetails = Object.fromEntries(
+          Object.entries(row).filter(([key]) => !["code", "message", "provider", "retry_after_sec", "details"].includes(key)),
+        );
+        const details = { ...topLevelDetails, ...nestedDetails };
         typedError = {
           code,
-          message: typedMessage,
+          message: typedMessage || `Request failed (${response.status})`,
           provider: typeof row.provider === "string" ? row.provider : null,
           retry_after_sec: Number.isFinite(retryAfter) ? retryAfter : null,
-          details: row.details && typeof row.details === "object" && !Array.isArray(row.details)
-            ? row.details as Record<string, unknown>
-            : null,
+          details: Object.keys(details).length > 0 ? details : null,
         };
-        message = typedMessage;
+        message = typedError.message;
       } else if (typeof json?.message === "string" && json.message.trim()) {
         message = json.message.trim();
       }
@@ -2405,4 +2722,16 @@ export function isSessionExpiredError(error: unknown): boolean {
     return /session expired|sign in/i.test(error.message);
   }
   return false;
+}
+
+export function isDailySearchLimitError(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.code === "daily_search_limit_reached";
+}
+
+export function isVerifiedAccountRequiredError(error: unknown): error is ApiError {
+  return error instanceof ApiError && [
+    "verified_account_required",
+    "account_verification_required",
+    "authentication_required",
+  ].includes(error.code || "");
 }

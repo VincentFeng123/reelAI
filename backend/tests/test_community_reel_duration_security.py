@@ -1,7 +1,9 @@
+import hashlib
 import os
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -29,6 +31,32 @@ class CommunityReelDurationSecurityTests(unittest.TestCase):
         main_module.settings = get_settings()
         self.client = TestClient(app)
         self.addCleanup(self.client.close)
+        db_module.init_db()
+        account_id = str(uuid.uuid4())
+        session_token = f"duration-test-session-{uuid.uuid4().hex}"
+        timestamp = db_module.now_iso()
+        with db_module.get_conn(transactional=True) as conn:
+            db_module.insert(conn, "community_accounts", {
+                "id": account_id,
+                "username": f"duration-{account_id[:8]}",
+                "username_normalized": f"duration-{account_id[:8]}",
+                "email": f"{account_id[:8]}@example.com",
+                "email_normalized": f"{account_id[:8]}@example.com",
+                "password_hash": "hash",
+                "password_salt": "salt",
+                "verified_at": timestamp,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            })
+            db_module.insert(conn, "community_sessions", {
+                "id": str(uuid.uuid4()),
+                "account_id": account_id,
+                "token_hash": hashlib.sha256(session_token.encode("utf-8")).hexdigest(),
+                "created_at": timestamp,
+                "last_used_at": timestamp,
+                "expires_at": "2099-01-01T00:00:00+00:00",
+            })
+        self.verified_headers = {main_module.COMMUNITY_SESSION_HEADER: session_token}
 
     def _restore_environment(self) -> None:
         if self.previous_data_dir is None:
@@ -57,6 +85,7 @@ class CommunityReelDurationSecurityTests(unittest.TestCase):
             response = self.client.get(
                 "/api/community/reels/duration",
                 params={"source_url": "https://www.instagram.com/reel/test-id/"},
+                headers=self.verified_headers,
             )
 
         self.assertEqual(response.status_code, 200, response.text)
@@ -74,6 +103,7 @@ class CommunityReelDurationSecurityTests(unittest.TestCase):
             response = self.client.get(
                 "/api/community/reels/duration",
                 params={"source_url": "https://www.instagram.com/reel/test-id/"},
+                headers=self.verified_headers,
             )
 
         self.assertEqual(response.status_code, 200, response.text)
@@ -96,6 +126,7 @@ class CommunityReelDurationSecurityTests(unittest.TestCase):
             response = self.client.get(
                 "/api/community/reels/duration",
                 params={"source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"},
+                headers=self.verified_headers,
             )
 
         self.assertEqual(response.status_code, 200, response.text)

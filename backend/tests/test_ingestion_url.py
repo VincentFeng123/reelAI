@@ -93,10 +93,18 @@ class IngestionUrlTests(unittest.TestCase):
         # back-to-back without bumping against the endpoint's own sliding-window limiter.
         main_module._rate_limit_hits.clear()
 
+        self._patch_provider_account = mock.patch.object(
+            main_module,
+            "_require_verified_provider_account",
+            return_value={"id": "ingestion-url-test-account"},
+        )
+        self._patch_provider_account.start()
+
         self.client = TestClient(app)
         self.addCleanup(self.client.close)
 
     def _restore_environment(self) -> None:
+        self._patch_provider_account.stop()
         if self.previous_data_dir is None:
             os.environ.pop("DATA_DIR", None)
         else:

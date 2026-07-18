@@ -14,6 +14,7 @@ import {
   verifyCommunityAccount,
   verifyCommunitySignupEmail,
 } from "@/lib/api";
+import { BillingPlanUsageCard } from "@/components/BillingPlanUsageCard";
 import { ViewportModalPortal } from "@/components/ViewportModalPortal";
 import type { CommunityAccount } from "@/lib/types";
 
@@ -739,6 +740,9 @@ export function CommunityAccountScreen({
                         <p className="text-sm leading-6 text-[#ffb4b4]">
                           This action cannot be undone.
                         </p>
+                        <p className="text-xs leading-5 text-white/65">
+                          Any active Stripe subscription is canceled automatically when your account is deleted.
+                        </p>
                         <input
                           type="password"
                           value={deleteAccountPassword}
@@ -759,7 +763,7 @@ export function CommunityAccountScreen({
                     </div>
                   ) : account.isVerified ? (
                     <div
-                      className={`flex flex-1 flex-col justify-center pb-6 transition-opacity duration-150 lg:pb-0 ${
+                      className={`flex flex-1 flex-col justify-start overflow-y-auto py-4 transition-opacity duration-150 lg:py-2 ${
                         authContentVisible ? "opacity-100" : "pointer-events-none opacity-0"
                       }`}
                     >
@@ -776,10 +780,12 @@ export function CommunityAccountScreen({
                         {account.email ? <p className="mt-2 text-sm text-white">{account.email}</p> : null}
                       </div>
 
+                      <BillingPlanUsageCard account={account} />
+
                       {error ? <p className="mt-4 text-sm text-[#ffb4b4]">{error}</p> : null}
                       {success ? <p className="mt-4 text-sm text-[#9ef8cb]">{success}</p> : null}
 
-                      <div className="mt-7 flex flex-col gap-3">
+                      <div className="mt-4 flex flex-col gap-3">
                         <button
                           type="button"
                           onClick={onOpenChangePassword}

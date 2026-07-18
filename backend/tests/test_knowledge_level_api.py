@@ -61,14 +61,21 @@ class KnowledgeLevelApiTests(unittest.TestCase):
             "embed_texts",
             side_effect=_fake_embed,
         )
+        self._patch_provider_account = mock.patch.object(
+            main_module,
+            "_require_verified_provider_account",
+            return_value={"id": "knowledge-level-test-account"},
+        )
         self._patch_concepts.start()
         self._patch_embed.start()
+        self._patch_provider_account.start()
 
         self.client = TestClient(app)
         self.addCleanup(self.client.close)
         self.addCleanup(self._restore)
 
     def _restore(self) -> None:
+        self._patch_provider_account.stop()
         self._patch_embed.stop()
         self._patch_concepts.stop()
         if self._prev is None:

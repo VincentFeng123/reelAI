@@ -275,6 +275,11 @@ def test_chat_provider_exhaustion_is_typed_503(monkeypatch) -> None:
     monkeypatch.setattr(main, "_run_disconnect_cancellable", run_now)
     monkeypatch.setattr(main, "_enforce_rate_limit", lambda *args, **kwargs: None)
     monkeypatch.setattr(
+        main,
+        "_require_verified_provider_account",
+        lambda *_args, **_kwargs: {"id": "account-1"},
+    )
+    monkeypatch.setattr(
         main.material_intelligence_service,
         "chat_assistant",
         lambda **kwargs: (_ for _ in ()).throw(llm_router.TextLLMUnavailableError()),
@@ -300,6 +305,11 @@ def test_chat_endpoint_prefers_configured_dedicated_key(monkeypatch) -> None:
     monkeypatch.setenv("GEMINI_API_KEY_2", "dedicated-key")
     monkeypatch.setattr(main, "_run_disconnect_cancellable", run_now)
     monkeypatch.setattr(main, "_enforce_rate_limit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "_require_verified_provider_account",
+        lambda *_args, **_kwargs: {"id": "account-1"},
+    )
 
     def answer(**kwargs):
         captured.append(kwargs)

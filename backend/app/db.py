@@ -221,6 +221,26 @@ CREATE TABLE IF NOT EXISTS generation_job_events (
 CREATE INDEX IF NOT EXISTS idx_generation_job_events_job_seq
 ON generation_job_events(job_id, seq);
 
+CREATE TABLE IF NOT EXISTS api_idempotency_records (
+    scope TEXT NOT NULL,
+    learner_id TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'in_progress',
+    resource_id TEXT NOT NULL,
+    attempt_token TEXT NOT NULL DEFAULT '',
+    response_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(scope, learner_id, key_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_idempotency_records_updated
+ON api_idempotency_records(status, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_api_idempotency_records_resource
+ON api_idempotency_records(scope, resource_id);
+
 CREATE TABLE IF NOT EXISTS reels (
     id TEXT PRIMARY KEY,
     generation_id TEXT,
@@ -582,6 +602,93 @@ CREATE TABLE IF NOT EXISTS community_account_settings (
     updated_at TEXT NOT NULL,
     FOREIGN KEY(account_id) REFERENCES community_accounts(id)
 );
+
+CREATE TABLE IF NOT EXISTS billing_provider_customers (
+    account_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_environment TEXT NOT NULL DEFAULT 'Unknown',
+    external_customer_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(account_id, provider, provider_environment),
+    UNIQUE(provider, provider_environment, external_customer_id),
+    FOREIGN KEY(account_id) REFERENCES community_accounts(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS billing_subscriptions (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_environment TEXT NOT NULL DEFAULT 'Unknown',
+    external_subscription_id TEXT NOT NULL,
+    external_product_id TEXT NOT NULL,
+    plan_code TEXT NOT NULL,
+    status TEXT NOT NULL,
+    current_period_end TEXT,
+    cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
+    provider_event_created_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(provider, external_subscription_id),
+    FOREIGN KEY(account_id) REFERENCES community_accounts(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_billing_subscriptions_account_status_end
+ON billing_subscriptions(account_id, status, current_period_end);
+
+CREATE TABLE IF NOT EXISTS billing_provider_events (
+    provider TEXT NOT NULL,
+    external_event_id TEXT NOT NULL,
+    external_event_created_at TEXT,
+    event_type TEXT NOT NULL,
+    processed_at TEXT NOT NULL,
+    PRIMARY KEY(provider, external_event_id)
+);
+
+CREATE TABLE IF NOT EXISTS daily_search_usage (
+    account_id TEXT NOT NULL,
+    usage_day TEXT NOT NULL,
+    used_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(account_id, usage_day),
+    FOREIGN KEY(account_id) REFERENCES community_accounts(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS search_quota_reservations (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    operation_key TEXT NOT NULL,
+    usage_day TEXT NOT NULL,
+    surface TEXT NOT NULL,
+    plan_code TEXT NOT NULL DEFAULT 'free',
+    material_id TEXT,
+    generation_job_id TEXT,
+    status TEXT NOT NULL DEFAULT 'reserved',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finalized_at TEXT,
+    UNIQUE(account_id, operation_key),
+    FOREIGN KEY(account_id) REFERENCES community_accounts(id) ON DELETE CASCADE,
+    FOREIGN KEY(generation_job_id) REFERENCES reel_generation_jobs(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_quota_reservations_day_status
+ON search_quota_reservations(account_id, usage_day, status);
+
+CREATE INDEX IF NOT EXISTS idx_search_quota_reservations_generation_job
+ON search_quota_reservations(generation_job_id);
+
+CREATE TABLE IF NOT EXISTS search_quota_reservation_jobs (
+    reservation_id TEXT NOT NULL,
+    generation_job_id TEXT NOT NULL,
+    attached_at TEXT NOT NULL,
+    PRIMARY KEY(reservation_id, generation_job_id),
+    FOREIGN KEY(reservation_id) REFERENCES search_quota_reservations(id) ON DELETE CASCADE,
+    FOREIGN KEY(generation_job_id) REFERENCES reel_generation_jobs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_quota_reservation_jobs_generation
+ON search_quota_reservation_jobs(generation_job_id);
 
 CREATE TABLE IF NOT EXISTS rate_limit_events (
     id TEXT PRIMARY KEY,
@@ -1171,6 +1278,231 @@ def _migrate_assessment_checkpoint_postgres(conn: Any) -> None:
         )
 
 
+def _migrate_api_idempotency_sqlite(conn: sqlite3.Connection) -> None:
+    """Add owner fencing to idempotency rows created by older builds."""
+    _sqlite_add_missing_columns(
+        conn,
+        "api_idempotency_records",
+        (("attempt_token", "TEXT NOT NULL DEFAULT ''"),),
+    )
+
+
+def _migrate_api_idempotency_postgres(conn: Any) -> None:
+    """Add owner fencing to idempotency rows created by older builds."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE api_idempotency_records "
+            "ADD COLUMN IF NOT EXISTS attempt_token TEXT NOT NULL DEFAULT ''"
+        )
+
+
+def _migrate_billing_subscription_environment_sqlite(
+    conn: sqlite3.Connection,
+) -> None:
+    """Fail closed when upgrading rows created before environment isolation."""
+    _sqlite_add_missing_columns(
+        conn,
+        "billing_subscriptions",
+        (("provider_environment", "TEXT NOT NULL DEFAULT 'Unknown'"),),
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS "
+        "idx_billing_subscriptions_account_environment_status_end "
+        "ON billing_subscriptions("
+        "account_id, provider_environment, status, current_period_end)"
+    )
+
+
+def _migrate_billing_provider_customer_environment_sqlite(
+    conn: sqlite3.Connection,
+) -> None:
+    """Re-key legacy mappings so test and live Stripe IDs cannot collide."""
+    table_info = conn.execute(
+        "PRAGMA table_info(billing_provider_customers)"
+    ).fetchall()
+    columns = {str(row[1]) for row in table_info}
+    primary_key = tuple(
+        str(row[1])
+        for row in sorted(table_info, key=lambda row: int(row[5] or 0))
+        if int(row[5] or 0) > 0
+    )
+    unique_columns: set[tuple[str, ...]] = set()
+    for index_row in conn.execute(
+        "PRAGMA index_list(billing_provider_customers)"
+    ).fetchall():
+        if not int(index_row[2] or 0):
+            continue
+        index_name = str(index_row[1]).replace('"', '""')
+        index_columns = tuple(
+            str(row[2])
+            for row in conn.execute(f'PRAGMA index_info("{index_name}")').fetchall()
+        )
+        unique_columns.add(index_columns)
+    if (
+        "provider_environment" in columns
+        and primary_key == ("account_id", "provider", "provider_environment")
+        and (
+            "provider",
+            "provider_environment",
+            "external_customer_id",
+        ) in unique_columns
+    ):
+        return
+    environment_expression = (
+        "COALESCE(NULLIF(TRIM(provider_environment), ''), 'Unknown')"
+        if "provider_environment" in columns
+        else "'Unknown'"
+    )
+    conn.execute(
+        "ALTER TABLE billing_provider_customers "
+        "RENAME TO billing_provider_customers_legacy_environment"
+    )
+    conn.execute(
+        """
+        CREATE TABLE billing_provider_customers (
+            account_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            provider_environment TEXT NOT NULL DEFAULT 'Unknown',
+            external_customer_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(account_id, provider, provider_environment),
+            UNIQUE(provider, provider_environment, external_customer_id),
+            FOREIGN KEY(account_id) REFERENCES community_accounts(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        INSERT INTO billing_provider_customers (
+            account_id, provider, provider_environment, external_customer_id,
+            created_at, updated_at
+        )
+        SELECT account_id, provider, {environment_expression}, external_customer_id,
+               created_at, updated_at
+        FROM billing_provider_customers_legacy_environment
+        """
+    )
+    conn.execute("DROP TABLE billing_provider_customers_legacy_environment")
+
+
+def _migrate_billing_subscription_environment_postgres(conn: Any) -> None:
+    """Fail closed when upgrading rows created before environment isolation."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE billing_subscriptions "
+            "ADD COLUMN IF NOT EXISTS provider_environment "
+            "TEXT NOT NULL DEFAULT 'Unknown'"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS "
+            "idx_billing_subscriptions_account_environment_status_end "
+            "ON billing_subscriptions("
+            "account_id, provider_environment, status, current_period_end)"
+        )
+
+
+def _migrate_search_quota_reservation_plan_sqlite(
+    conn: sqlite3.Connection,
+) -> None:
+    """Snapshot the effective plan for historical provider-cost reporting."""
+    _sqlite_add_missing_columns(
+        conn,
+        "search_quota_reservations",
+        (("plan_code", "TEXT NOT NULL DEFAULT 'free'"),),
+    )
+
+
+def _migrate_search_quota_reservation_plan_postgres(conn: Any) -> None:
+    """Snapshot the effective plan for historical provider-cost reporting."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE search_quota_reservations "
+            "ADD COLUMN IF NOT EXISTS plan_code TEXT NOT NULL DEFAULT 'free'"
+        )
+
+
+def _migrate_search_quota_reservation_jobs_sqlite(conn: sqlite3.Connection) -> None:
+    """Backfill the multi-job association table from the legacy single-job link."""
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO search_quota_reservation_jobs (
+            reservation_id, generation_job_id, attached_at
+        )
+        SELECT id, generation_job_id, updated_at
+        FROM search_quota_reservations
+        WHERE generation_job_id IS NOT NULL
+        """
+    )
+
+
+def _migrate_search_quota_reservation_jobs_postgres(conn: Any) -> None:
+    """Backfill the multi-job association table from the legacy single-job link."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO search_quota_reservation_jobs (
+                reservation_id, generation_job_id, attached_at
+            )
+            SELECT id, generation_job_id, updated_at
+            FROM search_quota_reservations
+            WHERE generation_job_id IS NOT NULL
+            ON CONFLICT (reservation_id, generation_job_id) DO NOTHING
+            """
+        )
+
+
+def _migrate_billing_provider_customer_environment_postgres(conn: Any) -> None:
+    """Re-key legacy mappings so test and live Stripe IDs cannot collide."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE billing_provider_customers "
+            "ADD COLUMN IF NOT EXISTS provider_environment "
+            "TEXT NOT NULL DEFAULT 'Unknown'"
+        )
+        cur.execute(
+            """
+            SELECT conname, contype, pg_get_constraintdef(oid)
+            FROM pg_constraint
+            WHERE conrelid = 'billing_provider_customers'::regclass
+              AND contype IN ('p', 'u')
+            """
+        )
+        constraints = list(cur.fetchall())
+        normalized = [
+            (str(row[0]), str(row[1]), str(row[2]).replace('"', "").lower())
+            for row in constraints
+        ]
+        has_primary_key = any(
+            kind == "p"
+            and "(account_id, provider, provider_environment)" in definition
+            for _name, kind, definition in normalized
+        )
+        has_scoped_customer_unique = any(
+            kind == "u"
+            and "(provider, provider_environment, external_customer_id)" in definition
+            for _name, kind, definition in normalized
+        )
+        if has_primary_key and has_scoped_customer_unique:
+            return
+        for name, _kind, _definition in normalized:
+            quoted_name = name.replace('"', '""')
+            cur.execute(
+                f'ALTER TABLE billing_provider_customers '
+                f'DROP CONSTRAINT "{quoted_name}"'
+            )
+        cur.execute(
+            "ALTER TABLE billing_provider_customers "
+            "ADD CONSTRAINT billing_provider_customers_pkey "
+            "PRIMARY KEY (account_id, provider, provider_environment)"
+        )
+        cur.execute(
+            "ALTER TABLE billing_provider_customers "
+            "ADD CONSTRAINT billing_provider_customers_provider_environment_customer_key "
+            "UNIQUE (provider, provider_environment, external_customer_id)"
+        )
+
+
 def _migrate_durable_generation_foundation_sqlite(conn: sqlite3.Connection) -> None:
     """Idempotently upgrade legacy SQLite tables for durable generation work."""
     _sqlite_add_missing_columns(conn, "reel_generation_jobs", _DURABLE_JOB_SQLITE_COLUMNS)
@@ -1481,6 +1813,11 @@ def init_db() -> None:
             _migrate_durable_generation_foundation_postgres(conn)
             _migrate_lesson_order_postgres(conn)
             _migrate_assessment_checkpoint_postgres(conn)
+            _migrate_api_idempotency_postgres(conn)
+            _migrate_billing_provider_customer_environment_postgres(conn)
+            _migrate_billing_subscription_environment_postgres(conn)
+            _migrate_search_quota_reservation_plan_postgres(conn)
+            _migrate_search_quota_reservation_jobs_postgres(conn)
             _migrate_reels_unique_clip_index_postgres(conn)
             _migrate_reel_feedback_uniqueness_postgres(conn)
             _migrate_assessment_scroll_postgres(conn)
@@ -1681,6 +2018,11 @@ def init_db() -> None:
         _migrate_durable_generation_foundation_sqlite(conn)
         _migrate_lesson_order_sqlite(conn)
         _migrate_assessment_checkpoint_sqlite(conn)
+        _migrate_api_idempotency_sqlite(conn)
+        _migrate_billing_provider_customer_environment_sqlite(conn)
+        _migrate_billing_subscription_environment_sqlite(conn)
+        _migrate_search_quota_reservation_plan_sqlite(conn)
+        _migrate_search_quota_reservation_jobs_sqlite(conn)
         _migrate_reels_unique_clip_index_sqlite(conn)
         _migrate_knowledge_level_sqlite(conn)
         _migrate_reel_learning_content_sqlite(conn)

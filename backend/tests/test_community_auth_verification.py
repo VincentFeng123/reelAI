@@ -547,6 +547,26 @@ class CommunityDeleteAccountTests(_VerificationTestBase):
                     "updated_at": timestamp,
                 },
             )
+            for learner_id, scope in (
+                (account_id, "billing:ingest-search"),
+                (f"account:{account_id}", "material"),
+            ):
+                insert(
+                    conn,
+                    "api_idempotency_records",
+                    {
+                        "scope": scope,
+                        "learner_id": learner_id,
+                        "key_hash": hashlib.sha256(scope.encode("utf-8")).hexdigest(),
+                        "request_fingerprint": f"fingerprint-{scope}",
+                        "status": "completed",
+                        "resource_id": f"resource-{scope}",
+                        "attempt_token": f"attempt-{scope}",
+                        "response_json": "{}",
+                        "created_at": timestamp,
+                        "updated_at": timestamp,
+                    },
+                )
 
         delete_response = self.client.post(
             "/api/community/auth/delete-account",
@@ -561,6 +581,14 @@ class CommunityDeleteAccountTests(_VerificationTestBase):
             self.assertIsNone(fetch_one(conn, "SELECT id FROM community_sets WHERE owner_account_id = ? LIMIT 1", (account_id,)))
             self.assertIsNone(fetch_one(conn, "SELECT material_id FROM community_material_history WHERE account_id = ? LIMIT 1", (account_id,)))
             self.assertIsNone(fetch_one(conn, "SELECT account_id FROM community_account_settings WHERE account_id = ? LIMIT 1", (account_id,)))
+            self.assertIsNone(
+                fetch_one(
+                    conn,
+                    "SELECT resource_id FROM api_idempotency_records "
+                    "WHERE learner_id = ? OR learner_id = ? LIMIT 1",
+                    (account_id, f"account:{account_id}"),
+                )
+            )
 
         login_response = self.client.post(
             "/api/community/auth/login",
@@ -589,6 +617,40 @@ class CommunityDeleteAccountTests(_VerificationTestBase):
         with get_conn(transactional=True) as conn:
             self.assertIsNotNone(fetch_one(conn, "SELECT id FROM community_accounts WHERE id = ? LIMIT 1", (account_id,)))
             self.assertIsNotNone(fetch_one(conn, "SELECT id FROM community_sessions WHERE account_id = ? LIMIT 1", (account_id,)))
+
+    def test_delete_account_locks_billing_before_stripe_cancellation(self) -> None:
+        password = "correct-password"
+        account_id, session_token = self._register_and_verify(
+            owner_key="delete-lock-owner-key-abcdefghijklmnopqrstuvwxyz",
+            username="deletelockorder",
+            password=password,
+        )
+        calls: list[tuple[str, str]] = []
+
+        with (
+            mock.patch.object(
+                main_module,
+                "lock_billing_account",
+                side_effect=lambda _conn, locked_account_id: calls.append(
+                    ("lock", locked_account_id)
+                ),
+            ),
+            mock.patch.object(
+                main_module,
+                "cancel_stripe_for_account",
+                side_effect=lambda _conn, canceled_account_id: calls.append(
+                    ("cancel", canceled_account_id)
+                ),
+            ),
+        ):
+            response = self.client.post(
+                "/api/community/auth/delete-account",
+                headers={COMMUNITY_SESSION_HEADER: session_token},
+                json={"current_password": password},
+            )
+
+        self.assertEqual(response.status_code, 204, response.text)
+        self.assertEqual(calls, [("lock", account_id), ("cancel", account_id)])
 
 
 class VerificationDisabledModeTests(_VerificationTestBase):

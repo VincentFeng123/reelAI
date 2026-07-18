@@ -47,9 +47,16 @@ function compileUseCallback(name, bindings) {
     `const callback = ${callback.getText(sourceFile)};`,
     { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
   );
-  const names = Object.keys(bindings);
+  const effectiveBindings = {
+    billingWorkBlockedRef: { current: false },
+    isDailySearchLimitError: () => false,
+    isVerifiedAccountRequiredError: () => false,
+    isTransportError: () => false,
+    ...bindings,
+  };
+  const names = Object.keys(effectiveBindings);
   const factory = new Function(...names, `${compiled}\nreturn callback;`);
-  return factory(...names.map((key) => bindings[key]));
+  return factory(...names.map((key) => effectiveBindings[key]));
 }
 
 function compileFunctionDeclaration(name, bindings = {}) {
@@ -510,6 +517,9 @@ test("a recovered generation stream failure clears pending tail advance", async 
     },
     isSearchScopeActive: () => true,
     isRequestInterruptedError: () => false,
+    isDailySearchLimitError: () => false,
+    isVerifiedAccountRequiredError: () => false,
+    noteFeedFailure: () => {},
     noteGenerationTerminal: () => {},
     settleGenerationContinuation: () => {},
     appendGeneratedReels: () => ({ reels: [], addedReels: [], addedCount: 0, updatedCount: 0 }),
@@ -710,6 +720,10 @@ test("feed failure copy preserves an explicit string message", () => {
   const messages = [];
   const callback = compileUseCallback("noteFeedFailure", {
     transportFailureStreakRef: { current: 2 },
+    isDailySearchLimitError: () => false,
+    isVerifiedAccountRequiredError: () => false,
+    setBillingGate: () => {},
+    requestBillingStatusRefresh: () => {},
     setVisibleFeedError: (message) => messages.push(message),
   });
 
@@ -1076,7 +1090,7 @@ test("a restored feed reconciles durable inventory with its restored mode and a 
   assert.match(loadPageText, /generationMode: requestGenerationMode/);
   assert.match(
     loadPageText,
-    /const allowServerAutofill = \(options\?\.autofill \?\? true\) && feedMaterialIds\.length === 1/,
+    /const allowServerAutofill = \([\s\S]*options\?\.autofill \?\? true[\s\S]*feedMaterialIds\.length === 1[\s\S]*!billingWorkBlockedRef\.current/,
   );
   assert.match(loadPageText, /autofill: allowServerAutofill/);
   assert.match(
@@ -1605,13 +1619,28 @@ test("authoritative finals lock the watched prefix and retain server order for t
   assert.match(source, /watchedFrontierIndex: dedupedReels\.length > 0/);
 });
 
-test("missing-material recovery preserves the level saved with the material seed", () => {
-  const recoveryStart = source.indexOf("const recoverMissingMaterial = useCallback(");
-  const recoveryEnd = source.indexOf("const feedNeedsBootstrapTopUp", recoveryStart);
-  assert.ok(recoveryStart >= 0 && recoveryEnd > recoveryStart);
-  const callbackText = source.slice(recoveryStart, recoveryEnd);
-  assert.match(source, /knowledgeLevel\?: KnowledgeLevel;/);
-  assert.match(callbackText, /knowledgeLevel: seed\?\.knowledgeLevel/);
+test("missing-material history reopening stays free and surfaces an unavailable-session result", () => {
+  const unavailableStart = source.indexOf("const showSavedSessionUnavailable = useCallback(");
+  const unavailableEnd = source.indexOf("const feedNeedsBootstrapTopUp", unavailableStart);
+  assert.ok(unavailableStart >= 0 && unavailableEnd > unavailableStart);
+  const callbackText = source.slice(unavailableStart, unavailableEnd);
+  assert.doesNotMatch(source, /\buploadMaterial\b/, "history reopening must never create another metered material");
+  assert.match(
+    source,
+    /SAVED_SESSION_UNAVAILABLE_MESSAGE = "This saved session is no longer available\. Start a new search to continue\."/,
+  );
+  assert.match(callbackText, /setVisibleFeedError\(SAVED_SESSION_UNAVAILABLE_MESSAGE\)/);
+  assert.match(source, /material_id not found[\s\S]*showSavedSessionUnavailable\(\)/);
+  assert.match(source, /error === SAVED_SESSION_UNAVAILABLE_MESSAGE[\s\S]*Saved session unavailable/);
+  assert.match(source, /onClick=\{navigateBackToPreviousPage\}[\s\S]*Start a new search/);
+});
+
+test("feed billing failures block automatic provider retries until billing becomes available", () => {
+  assert.match(source, /billingWorkBlockedRef\.current = true/);
+  assert.match(source, /setCanRequestMore\(false\)/);
+  assert.match(source, /&& !billingWorkBlockedRef\.current/);
+  assert.match(source, /if \(billingFailureRow\?\.error\) \{[\s\S]*noteFeedFailure\(billingFailureRow\.error\)[\s\S]*return \[\]/);
+  assert.match(source, /onBillingAvailable=\{resumeAfterBillingRefresh\}/);
 });
 
 test("same-source clips remain distinct when their authoritative float ranges differ", () => {
@@ -2203,6 +2232,9 @@ test("an already-running failed page fetch clears a later pending tail gesture",
       fetchStarted();
     }),
     isSearchScopeActive: (scope) => scope === searchScope,
+    isRequestInterruptedError: () => false,
+    isDailySearchLimitError: () => false,
+    isVerifiedAccountRequiredError: () => false,
     markRecoveryProgress: () => {},
     markPagedFeedExhausted: () => {},
     isTransportError: () => false,

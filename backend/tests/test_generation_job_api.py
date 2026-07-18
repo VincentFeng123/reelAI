@@ -318,6 +318,11 @@ def _patch_request_context(monkeypatch, conn: sqlite3.Connection) -> None:
 
     monkeypatch.setattr(main, "get_conn", connection)
     monkeypatch.setattr(main, "_require_community_client_identity", lambda _request: "owner")
+    monkeypatch.setattr(
+        main,
+        "_require_verified_provider_account",
+        lambda *_args, **_kwargs: {"id": "account-1"},
+    )
     monkeypatch.setattr(main, "_enforce_rate_limit", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main, "_resolve_learner_identity", lambda *_args, **_kwargs: "learner-1")
     monkeypatch.setattr(
@@ -1983,6 +1988,11 @@ def test_deferred_only_slow_reservoir_queues_current_batch_after_level_change(
     )
     monkeypatch.setattr(
         main, "_resolve_learner_identity", lambda *_args, **_kwargs: "learner-1"
+    )
+    monkeypatch.setattr(
+        main,
+        "_require_verified_provider_account",
+        lambda *_args, **_kwargs: {"id": "account-1"},
     )
     monkeypatch.setattr(main, "_enforce_rate_limit", lambda *_args, **_kwargs: None)
     wake = mock.Mock()
@@ -3960,7 +3970,7 @@ def test_boundary_only_failure_surfaces_strict_transcript_fallback_in_feed_and_r
     conn.close()
 
 
-def test_preflight_uses_one_metadata_search_and_no_generation(monkeypatch) -> None:
+def test_preflight_is_cache_only_and_does_not_generate(monkeypatch) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
 
@@ -3990,9 +4000,9 @@ def test_preflight_uses_one_metadata_search_and_no_generation(monkeypatch) -> No
             object(),
             ReelsGenerateRequest(material_id="m1", concept_id="c1"),
         )
-        assert result["availability"] == "available"
-        assert result["candidate_count"] == 1
-        assert len(provider_calls) == 1
+        assert result["availability"] == "unknown"
+        assert result["candidate_count"] == 0
+        assert provider_calls == []
     finally:
         conn.close()
 

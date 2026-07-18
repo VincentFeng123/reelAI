@@ -52,6 +52,10 @@ from .models import (
     AssessmentNextRequest,
     AssessmentSnoozeResponse,
     AssessmentWrapperResponse,
+    BillingCheckoutRequest,
+    BillingPlansResponse,
+    BillingRedirectResponse,
+    BillingStatusResponse,
     ChatRequest,
     ChatResponse,
     CommunityAuthMeResponse,
@@ -117,7 +121,37 @@ from .services.assessments import (
 from .services.email import send_welcome_email
 from .services.embeddings import EmbeddingService
 from .services.material_intelligence import MaterialIntelligenceService
+from .services.billing import (
+    DailySearchLimitReached,
+    attach_reservation_to_job,
+    billing_enforcement_enabled,
+    billing_status,
+    plans_payload,
+    reserve_search,
+    settle_operation,
+)
+from .services.billing_providers import (
+    BillingAccountNotFoundError,
+    BillingConfigurationError,
+    BillingVerificationError,
+    DuplicateSubscriptionError,
+    cancel_stripe_for_account,
+    construct_stripe_event,
+    create_stripe_checkout,
+    create_stripe_portal,
+    lock_billing_account,
+    process_stripe_event,
+)
 from .services.lesson_ordering import LESSON_ORDER_PROMPT_VERSION, order_lesson_batch
+from .services.idempotency import (
+    IdempotencyConflictError,
+    complete_idempotency_key,
+    lock_idempotency_attempt,
+    normalize_idempotency_key,
+    release_idempotency_key,
+    request_fingerprint as build_idempotency_fingerprint,
+    reserve_idempotency_key,
+)
 from .services.parsers import ParseError, extract_text_from_file
 from .services.reels import GenerationCancelledError, ReelService
 from .services.search_query_plan import build_search_query_plan
@@ -135,7 +169,7 @@ from .ingestion.errors import (
 )
 from .clip_engine.errors import CancellationError as ClipEngineCancellationError, EngineError as ClipEngineError
 from .clip_engine.errors import ProviderError as ClipEngineProviderError
-from .clip_engine.provider_cache import DatabaseProviderCache
+from .clip_engine.provider_cache import DatabaseProviderCache, TRANSCRIPT_SCHEMA_VERSION
 from .clip_engine.provider_cache import normalize_filters as normalize_provider_filters
 from .clip_engine.provider_cache import search_cache_key
 from .clip_engine.provider_runtime import GenerationContext, ProviderUsageRecord
@@ -1327,6 +1361,151 @@ def _require_verified_community_account(conn, request: Request) -> dict[str, obj
     return account
 
 
+def _require_verified_provider_account(
+    conn: Any,
+    request: Request,
+) -> dict[str, object]:
+    """Apply the typed account gate to billing and newly-created provider work."""
+    try:
+        return _require_verified_community_account(conn, request)
+    except HTTPException as exc:
+        message = (
+            "Sign in to a verified ReelAI account to start a new search."
+            if exc.status_code == 401
+            else "Verify your ReelAI account to start a new search."
+        )
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": "verified_account_required", "message": message},
+        ) from exc
+
+
+def _reserve_search_or_http(conn: Any, **kwargs: Any) -> dict[str, Any] | None:
+    try:
+        return reserve_search(conn, **kwargs)
+    except DailySearchLimitReached as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=exc.detail(),
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
+
+
+def _begin_sync_search_quota(
+    request: Request,
+    *,
+    surface: str,
+    request_fingerprint: str,
+    material_id: str | None = None,
+    charge_search: bool = True,
+) -> dict[str, Any] | None:
+    with get_conn(transactional=True) as conn:
+        account = _require_verified_provider_account(conn, request)
+        account_id = str(account["id"])
+        enforcement_enabled = billing_enforcement_enabled()
+        try:
+            idempotency_key = normalize_idempotency_key(
+                request.headers.get("Idempotency-Key")
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not idempotency_key:
+            if enforcement_enabled:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "idempotency_key_required",
+                        "message": "Idempotency-Key is required for a new search.",
+                    },
+                )
+            return None
+        operation_hash = hashlib.sha256(
+            f"{surface}:{idempotency_key}".encode("utf-8")
+        ).hexdigest()
+        operation_key = f"{surface}:{operation_hash}"
+        try:
+            idempotency = reserve_idempotency_key(
+                conn,
+                scope=f"billing:{surface}",
+                learner_id=account_id,
+                raw_key=idempotency_key,
+                fingerprint=request_fingerprint,
+                resource_id=operation_key,
+                stale_after_seconds=2 * 60 * 60,
+            )
+        except IdempotencyConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "idempotency_key_reused", "message": str(exc)},
+            ) from exc
+        if not idempotency.owner:
+            if idempotency.status == "completed" and idempotency.response is not None:
+                return {"replay_response": idempotency.response}
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "idempotency_in_progress",
+                    "message": "This search is already being processed.",
+                },
+                headers={"Retry-After": "1"},
+            )
+        if enforcement_enabled and charge_search:
+            _reserve_search_or_http(
+                conn,
+                account_id=account_id,
+                operation_key=operation_key,
+                surface=surface,
+                material_id=material_id,
+            )
+    return {
+        "account_id": account_id,
+        "operation_key": operation_key,
+        "idempotency_key": idempotency_key,
+        "attempt_token": str(idempotency.attempt_token or ""),
+    }
+
+
+def _settle_sync_search_quota(
+    quota: dict[str, Any] | None,
+    *,
+    usable_result: bool,
+    response: dict[str, Any] | None = None,
+) -> None:
+    if quota is None or quota.get("replay_response") is not None:
+        return
+    with get_conn(transactional=True) as conn:
+        settle_operation(
+            conn,
+            account_id=str(quota["account_id"]),
+            operation_key=str(quota["operation_key"]),
+            usable_result=usable_result,
+        )
+        scope = f"billing:{str(quota['operation_key']).split(':', 1)[0]}"
+        if response is not None:
+            completed = complete_idempotency_key(
+                conn,
+                scope=scope,
+                learner_id=str(quota["account_id"]),
+                raw_key=str(quota["idempotency_key"]),
+                resource_id=str(quota["operation_key"]),
+                attempt_token=str(quota["attempt_token"]),
+                response=response,
+            )
+            if not completed:
+                raise RuntimeError("search idempotency reservation was lost")
+        else:
+            released = release_idempotency_key(
+                conn,
+                scope=scope,
+                learner_id=str(quota["account_id"]),
+                raw_key=str(quota["idempotency_key"]),
+                resource_id=str(quota["operation_key"]),
+                attempt_token=str(quota["attempt_token"]),
+            )
+            if not released:
+                raise RuntimeError("search idempotency reservation was lost")
+
+
 def _require_community_set_owner_access(
     stored_owner_account_id: object,
     account_id: str,
@@ -1670,6 +1849,30 @@ def _resolve_community_reel_duration_sec(source_url: str) -> float | None:
         return _normalize_duration_seconds(artifact.duration_sec)
 
     return _fetch_duration_from_source_page(normalized_source_url)
+
+
+def _cached_community_reel_duration_sec(source_url: str) -> tuple[bool, float | None]:
+    """Return a cached YouTube duration without allowing provider or page I/O."""
+    normalized_source_url = _normalize_community_duration_source_url(source_url)
+    parsed = urlparse(normalized_source_url)
+    host = (parsed.hostname or "").lower()
+    if "youtube.com" not in host and host != "youtu.be":
+        return False, None
+    video_id = normalize_youtube_video_id(normalized_source_url)
+    if video_id is None:
+        return False, None
+    store = DatabaseProviderCache()
+    for native_mode in (True, False):
+        artifact = store.get_transcript(
+            video_id=video_id,
+            provider="supadata",
+            requested_language="en",
+            native_mode=native_mode,
+            schema_version=TRANSCRIPT_SCHEMA_VERSION,
+        )
+        if artifact is not None:
+            return True, _normalize_duration_seconds(artifact.duration_sec)
+    return False, None
 
 
 def _normalize_community_tags(raw_tags: list[str]) -> list[str]:
@@ -5918,6 +6121,85 @@ def change_community_password(request: Request, payload: CommunityChangePassword
     return {"status": "ok"}
 
 
+@app.get("/api/billing/plans", response_model=BillingPlansResponse)
+def get_billing_plans():
+    return plans_payload()
+
+
+@app.get("/api/billing/status", response_model=BillingStatusResponse)
+def get_billing_status(request: Request):
+    with get_conn(transactional=True) as conn:
+        account = _require_verified_provider_account(conn, request)
+        return billing_status(conn, str(account["id"]))
+
+
+@app.post(
+    "/api/billing/stripe/checkout",
+    response_model=BillingRedirectResponse,
+)
+def start_stripe_checkout(request: Request, payload: BillingCheckoutRequest):
+    try:
+        with get_conn(transactional=True) as conn:
+            account = _require_verified_provider_account(conn, request)
+            return {
+                "url": create_stripe_checkout(
+                    conn,
+                    account=dict(account),
+                    plan_code=payload.plan,
+                )
+            }
+    except DuplicateSubscriptionError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "subscription_already_active",
+                "provider": "stripe",
+                "message": str(exc),
+            },
+        ) from exc
+    except BillingAccountNotFoundError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "verified_account_required",
+                "message": "Sign in to a verified ReelAI account to start a new search.",
+            },
+        ) from exc
+    except BillingConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/billing/stripe/portal",
+    response_model=BillingRedirectResponse,
+)
+def start_stripe_portal(request: Request):
+    try:
+        with get_conn(transactional=True) as conn:
+            account = _require_verified_provider_account(conn, request)
+            return {"url": create_stripe_portal(conn, account_id=str(account["id"]))}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except BillingConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/billing/stripe/webhook")
+async def stripe_billing_webhook(request: Request):
+    signature = str(request.headers.get("Stripe-Signature") or "").strip()
+    if not signature:
+        raise HTTPException(status_code=400, detail="Missing Stripe-Signature header.")
+    try:
+        event = construct_stripe_event(await request.body(), signature)
+        with get_conn(transactional=True) as conn:
+            processed = process_stripe_event(conn, event)
+    except BillingConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (BillingVerificationError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid Stripe webhook.") from exc
+    return {"received": True, "processed": processed}
+
+
 @app.post("/api/community/auth/delete-account", status_code=204)
 def delete_community_account(request: Request, payload: CommunityDeleteAccountRequest):
     _enforce_rate_limit(request, "community-auth", limit=COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW)
@@ -5936,9 +6218,27 @@ def delete_community_account(request: Request, payload: CommunityDeleteAccountRe
             str(full_account.get("password_hash") or ""),
         ):
             raise HTTPException(status_code=401, detail="Current password is incorrect.")
+        try:
+            lock_billing_account(conn, account_id)
+            cancel_stripe_for_account(conn, account_id)
+        except BillingAccountNotFoundError as exc:
+            raise HTTPException(status_code=401, detail="Session expired. Sign in again.") from exc
+        except BillingConfigurationError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "stripe_cancellation_unavailable",
+                    "message": "Stripe billing could not be cancelled. Try account deletion again.",
+                },
+            ) from exc
         execute_modify(conn, "DELETE FROM community_sets WHERE owner_account_id = ?", (account_id,))
         execute_modify(conn, "DELETE FROM community_material_history WHERE account_id = ?", (account_id,))
         execute_modify(conn, "DELETE FROM community_account_settings WHERE account_id = ?", (account_id,))
+        execute_modify(
+            conn,
+            "DELETE FROM api_idempotency_records WHERE learner_id = ? OR learner_id = ?",
+            (account_id, f"account:{account_id}"),
+        )
         execute_modify(conn, "DELETE FROM community_sessions WHERE account_id = ?", (account_id,))
         execute_modify(conn, "DELETE FROM community_accounts WHERE id = ?", (account_id,))
     return Response(status_code=204)
@@ -5965,22 +6265,47 @@ async def create_material(
         normalized_level = normalize_knowledge_level(knowledge_level)
     except ValueError:
         raise HTTPException(status_code=422, detail="knowledge_level must be beginner, intermediate, or advanced")
+    quota_account_id: str | None = None
+    with get_conn(transactional=True) as identity_conn:
+        provider_account = _require_verified_provider_account(identity_conn, request)
+        quota_account_id = str(provider_account["id"])
+        learner_id = _resolve_learner_identity(
+            identity_conn,
+            request,
+            required=False,
+        ) or f"account:{quota_account_id}"
+    try:
+        idempotency_key = normalize_idempotency_key(
+            request.headers.get("Idempotency-Key")
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if billing_enforcement_enabled() and not idempotency_key:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "idempotency_key_required",
+                "message": "Idempotency-Key is required for a new material search.",
+            },
+        )
 
     source_parts: list[str] = []
     source_type = "mixed"
     source_path = None
+    file_content: bytes | None = None
+    file_name = ""
 
     if file:
-        content = await file.read()
-        if not content:
+        file_content = await file.read()
+        file_name = file.filename or "material"
+        if not file_content:
             raise HTTPException(status_code=400, detail="Uploaded file is empty")
         try:
-            file_text = extract_text_from_file(file.filename or "upload.txt", content)
+            file_text = extract_text_from_file(file.filename or "upload.txt", file_content)
         except ParseError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         if file_text.strip():
             source_parts.append(file_text)
-        source_path = storage.save_bytes(content, file.filename or "material")
         source_type = "file"
 
     if text and text.strip():
@@ -6005,63 +6330,186 @@ async def create_material(
     material_id = str(uuid.uuid4())
     created_at = now_iso()
 
-    with get_conn() as conn:
-        learner_id = _resolve_learner_identity(conn, request, required=False)
-        concept_limit = 6 if SERVERLESS_MODE else 12
-        concepts, objectives = material_intelligence_service.extract_concepts_and_objectives(
-            conn,
-            raw_text,
-            subject_tag=subject_tag,
-            max_concepts=concept_limit,
-        )
-        if objectives and len(concepts) < concept_limit and not any(c["title"].lower() == "learning objectives" for c in concepts):
-            concepts.append(
-                {
-                    "id": str(uuid.uuid4()),
-                    "title": "Learning Objectives",
-                    "keywords": [o[:40] for o in objectives][:5],
-                    "summary": objectives[0][:240],
-                }
-            )
-
-        upsert(
-            conn,
-            "materials",
+    idempotency_learner = str(learner_id or "anonymous")
+    reservation_owned = False
+    reservation_attempt_token = ""
+    reservation_reclaimed = False
+    if idempotency_key:
+        fingerprint = build_idempotency_fingerprint(
             {
-                "id": material_id,
-                "subject_tag": subject_tag,
-                "raw_text": raw_text,
-                "source_type": source_type,
-                "source_path": source_path,
-                "created_at": created_at,
+                "version": 1,
+                "subject_tag": str(subject_tag or ""),
+                "text": str(text or ""),
                 "knowledge_level": normalized_level,
-            },
+                "source_type": source_type,
+                "file_name": file_name,
+                "file_sha256": (
+                    hashlib.sha256(file_content).hexdigest()
+                    if file_content is not None
+                    else ""
+                ),
+            }
         )
-
-        for concept in concepts:
-            concept_text = (
-                f"{concept['title']}. Keywords: {' '.join(concept['keywords'])}. Summary: {concept['summary']}"
+        try:
+            with get_conn(transactional=True) as idempotency_conn:
+                reservation = reserve_idempotency_key(
+                    idempotency_conn,
+                    scope="material",
+                    learner_id=idempotency_learner,
+                    raw_key=idempotency_key,
+                    fingerprint=fingerprint,
+                    resource_id=material_id,
+                    stale_after_seconds=30 * 60,
+                )
+        except IdempotencyConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "idempotency_key_reused",
+                    "message": str(exc),
+                },
+            ) from exc
+        material_id = reservation.resource_id
+        reservation_owned = reservation.owner
+        reservation_attempt_token = str(reservation.attempt_token or "")
+        reservation_reclaimed = reservation.reclaimed
+        if not reservation.owner:
+            if reservation.status == "completed" and reservation.response:
+                return reservation.response
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "idempotency_in_progress",
+                    "message": "This material submission is already being processed.",
+                },
+                headers={"Retry-After": "1"},
             )
-            emb = embedding_service.embed_texts(conn, [concept_text])[0]
+
+    quota_operation_key = f"material:{material_id}"
+    if quota_account_id:
+        try:
+            with get_conn(transactional=True) as quota_conn:
+                _reserve_search_or_http(
+                    quota_conn,
+                    account_id=quota_account_id,
+                    operation_key=quota_operation_key,
+                    surface="material",
+                    material_id=material_id,
+                )
+        except Exception:
+            if idempotency_key and reservation_owned:
+                with get_conn(transactional=True) as idempotency_conn:
+                    release_idempotency_key(
+                        idempotency_conn,
+                        scope="material",
+                        learner_id=idempotency_learner,
+                        raw_key=idempotency_key,
+                        resource_id=material_id,
+                        attempt_token=reservation_attempt_token,
+                    )
+            raise
+
+    try:
+        with get_conn() as provider_conn:
+            concept_limit = 6 if SERVERLESS_MODE else 12
+            concepts, objectives = material_intelligence_service.extract_concepts_and_objectives(
+                provider_conn,
+                raw_text,
+                subject_tag=subject_tag,
+                max_concepts=concept_limit,
+            )
+            if objectives and len(concepts) < concept_limit and not any(
+                c["title"].lower() == "learning objectives" for c in concepts
+            ):
+                concepts.append(
+                    {
+                        "id": str(uuid.uuid4()),
+                        "title": "Learning Objectives",
+                        "keywords": [o[:40] for o in objectives][:5],
+                        "summary": objectives[0][:240],
+                    }
+                )
+
+            concept_embeddings = []
+            for concept in concepts:
+                concept_text = (
+                    f"{concept['title']}. Keywords: {' '.join(concept['keywords'])}. Summary: {concept['summary']}"
+                )
+                concept_embeddings.append(
+                    embedding_service.embed_texts(provider_conn, [concept_text])[0]
+                )
+            chunk_embeddings = (
+                embedding_service.embed_texts(provider_conn, chunks) if chunks else []
+            )
+
+        if file_content is not None and not reservation_owned:
+            source_path = storage.save_bytes(file_content, file_name)
+        response_payload = {
+            "material_id": material_id,
+            "extracted_concepts": concepts,
+        }
+        with get_conn(transactional=True) as persist_conn:
+            if idempotency_key and reservation_owned:
+                if not lock_idempotency_attempt(
+                    persist_conn,
+                    scope="material",
+                    learner_id=idempotency_learner,
+                    raw_key=idempotency_key,
+                    resource_id=material_id,
+                    attempt_token=reservation_attempt_token,
+                ):
+                    raise RuntimeError("material idempotency reservation was lost")
+                if file_content is not None:
+                    # Hold the exact-key row lock through storage publication so
+                    # an owner fenced out during provider work cannot orphan a
+                    # duplicate upload object.
+                    source_path = storage.save_bytes(file_content, file_name)
+                if reservation_reclaimed:
+                    # Cleanup and replacement are protected by the same row lock
+                    # and commit as publication of this fenced attempt.
+                    execute_modify(
+                        persist_conn,
+                        "DELETE FROM material_chunks WHERE material_id = ?",
+                        (material_id,),
+                    )
+                    execute_modify(
+                        persist_conn,
+                        "DELETE FROM concepts WHERE material_id = ?",
+                        (material_id,),
+                    )
+
             upsert(
-                conn,
-                "concepts",
+                persist_conn,
+                "materials",
                 {
-                    "id": concept["id"],
-                    "material_id": material_id,
-                    "title": concept["title"],
-                    "keywords_json": dumps_json(concept["keywords"]),
-                    "summary": concept["summary"],
-                    "embedding_json": dumps_json(emb.tolist()),
+                    "id": material_id,
+                    "subject_tag": subject_tag,
+                    "raw_text": raw_text,
+                    "source_type": source_type,
+                    "source_path": source_path,
                     "created_at": created_at,
+                    "knowledge_level": normalized_level,
                 },
             )
 
-        if chunks:
-            chunk_embeddings = embedding_service.embed_texts(conn, chunks)
+            for concept, emb in zip(concepts, concept_embeddings):
+                upsert(
+                    persist_conn,
+                    "concepts",
+                    {
+                        "id": concept["id"],
+                        "material_id": material_id,
+                        "title": concept["title"],
+                        "keywords_json": dumps_json(concept["keywords"]),
+                        "summary": concept["summary"],
+                        "embedding_json": dumps_json(emb.tolist()),
+                        "created_at": created_at,
+                    },
+                )
+
             for i, (chunk, emb) in enumerate(zip(chunks, chunk_embeddings)):
                 upsert(
-                    conn,
+                    persist_conn,
                     "material_chunks",
                     {
                         "id": str(uuid.uuid4()),
@@ -6072,13 +6520,73 @@ async def create_material(
                         "created_at": created_at,
                     },
                 )
-        if learner_id:
-            reel_service.learner_progress(conn, material_id, learner_id)
+            if learner_id:
+                reel_service.learner_progress(
+                    persist_conn,
+                    material_id,
+                    learner_id,
+                )
 
-    return {
-        "material_id": material_id,
-        "extracted_concepts": concepts,
-    }
+            if quota_account_id:
+                settle_operation(
+                    persist_conn,
+                    account_id=quota_account_id,
+                    operation_key=quota_operation_key,
+                    usable_result=bool(concepts),
+                )
+
+            if idempotency_key and reservation_owned:
+                if not complete_idempotency_key(
+                    persist_conn,
+                    scope="material",
+                    learner_id=idempotency_learner,
+                    raw_key=idempotency_key,
+                    resource_id=material_id,
+                    attempt_token=reservation_attempt_token,
+                    response=response_payload,
+                ):
+                    raise RuntimeError("material idempotency reservation was lost")
+        return response_payload
+    except asyncio.CancelledError:
+        if quota_account_id:
+            with get_conn(transactional=True) as quota_conn:
+                settle_operation(
+                    quota_conn,
+                    account_id=quota_account_id,
+                    operation_key=quota_operation_key,
+                    usable_result=False,
+                )
+        if idempotency_key and reservation_owned:
+            with get_conn(transactional=True) as idempotency_conn:
+                release_idempotency_key(
+                    idempotency_conn,
+                    scope="material",
+                    learner_id=idempotency_learner,
+                    raw_key=idempotency_key,
+                    resource_id=material_id,
+                    attempt_token=reservation_attempt_token,
+                )
+        raise
+    except Exception:
+        if quota_account_id:
+            with get_conn(transactional=True) as quota_conn:
+                settle_operation(
+                    quota_conn,
+                    account_id=quota_account_id,
+                    operation_key=quota_operation_key,
+                    usable_result=False,
+                )
+        if idempotency_key and reservation_owned:
+            with get_conn(transactional=True) as idempotency_conn:
+                release_idempotency_key(
+                    idempotency_conn,
+                    scope="material",
+                    learner_id=idempotency_learner,
+                    raw_key=idempotency_key,
+                    resource_id=material_id,
+                    attempt_token=reservation_attempt_token,
+                )
+        raise
 
 
 @app.patch("/api/materials/{material_id}/level")
@@ -6264,7 +6772,20 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 )
             ):
                 request_params["fresh_source_budget"] = True
-        job_row, _created = _submit_bounded_generation_job(
+        quota_account: dict[str, str] = {}
+        quota_operation_key = f"material:{payload.material_id}"
+
+        def before_generation_create() -> None:
+            _enforce_rate_limit(
+                request,
+                "generation-submit",
+                limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW,
+            )
+            account = _require_verified_provider_account(conn, request)
+            account_id = str(account["id"])
+            quota_account["id"] = account_id
+
+        job_row, created = _submit_bounded_generation_job(
             conn,
             material_id=payload.material_id,
             concept_id=payload.concept_id,
@@ -6273,12 +6794,16 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             learner_id=learner_id,
             request_params=request_params,
             source_generation_id=source_generation_id,
-            before_create=lambda: _enforce_rate_limit(
-                request,
-                "generation-submit",
-                limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW,
-            ),
+            before_create=before_generation_create,
         )
+        if created and quota_account.get("id"):
+            attach_reservation_to_job(
+                conn,
+                account_id=quota_account["id"],
+                operation_key=quota_operation_key,
+                generation_job_id=str(job_row["id"]),
+                material_id=payload.material_id,
+            )
     _wake_generation_worker()
     job_id = str(job_row.get("id") or "")
     status = str(job_row.get("status") or "queued")
@@ -6513,6 +7038,20 @@ async def ingest_url_endpoint(request: Request, payload: IngestRequest) -> Inges
             },
         )
 
+    quota = _begin_sync_search_quota(
+        request,
+        surface="ingest-url",
+        request_fingerprint=build_idempotency_fingerprint(
+            {
+                "contract": "ingest_url_v1",
+                **payload.model_dump(),
+                "source_url": canonical_source_url,
+            }
+        ),
+        material_id=payload.material_id,
+    )
+    if quota and quota.get("replay_response") is not None:
+        return IngestResult.model_validate(quota["replay_response"])
     try:
         result = await _run_disconnect_cancellable(
             request,
@@ -6528,8 +7067,10 @@ async def ingest_url_endpoint(request: Request, payload: IngestRequest) -> Inges
             ),
         )
     except ClipEngineCancellationError as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         raise HTTPException(status_code=499, detail="Ingestion cancelled.") from exc
     except ClipEngineProviderError as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         raise _provider_error_to_http(exc) from exc
     except (
         IngestUnsupportedSourceError,
@@ -6539,6 +7080,7 @@ async def ingest_url_endpoint(request: Request, payload: IngestRequest) -> Inges
         IngestServerlessUnavailable,
         IngestRateLimitedError,
     ) as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         logger.warning(
             "ingest_url failed: %s",
             json.dumps(
@@ -6552,8 +7094,20 @@ async def ingest_url_endpoint(request: Request, payload: IngestRequest) -> Inges
         )
         raise _ingest_error_to_http(exc) from exc
     except IngestError as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         logger.exception("ingest_url crashed for %s", payload.source_url)
         raise _ingest_error_to_http(exc) from exc
+    except asyncio.CancelledError:
+        _settle_sync_search_quota(quota, usable_result=False)
+        raise
+    except Exception:
+        _settle_sync_search_quota(quota, usable_result=False)
+        raise
+    _settle_sync_search_quota(
+        quota,
+        usable_result=True,
+        response=result.model_dump(mode="json"),
+    )
     return result
 
 
@@ -6583,6 +7137,20 @@ async def ingest_topic_cut_endpoint(request: Request, payload: IngestTopicCutReq
             },
         )
 
+    quota = _begin_sync_search_quota(
+        request,
+        surface="ingest-topic-cut",
+        request_fingerprint=build_idempotency_fingerprint(
+            {
+                "contract": "ingest_topic_cut_v1",
+                **payload.model_dump(),
+                "source_url": canonical_source_url,
+            }
+        ),
+        material_id=payload.material_id,
+    )
+    if quota and quota.get("replay_response") is not None:
+        return IngestTopicCutResult.model_validate(quota["replay_response"])
     try:
         result = await _run_disconnect_cancellable(
             request,
@@ -6597,8 +7165,10 @@ async def ingest_topic_cut_endpoint(request: Request, payload: IngestTopicCutReq
             ),
         )
     except ClipEngineCancellationError as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         raise HTTPException(status_code=499, detail="Ingestion cancelled.") from exc
     except ClipEngineProviderError as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         raise _provider_error_to_http(exc) from exc
     except (
         IngestUnsupportedSourceError,
@@ -6608,6 +7178,7 @@ async def ingest_topic_cut_endpoint(request: Request, payload: IngestTopicCutReq
         IngestServerlessUnavailable,
         IngestRateLimitedError,
     ) as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         logger.warning(
             "ingest_topic_cut failed: %s",
             json.dumps(
@@ -6621,8 +7192,20 @@ async def ingest_topic_cut_endpoint(request: Request, payload: IngestTopicCutReq
         )
         raise _ingest_error_to_http(exc) from exc
     except IngestError as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         logger.exception("ingest_topic_cut crashed for %s", payload.source_url)
         raise _ingest_error_to_http(exc) from exc
+    except asyncio.CancelledError:
+        _settle_sync_search_quota(quota, usable_result=False)
+        raise
+    except Exception:
+        _settle_sync_search_quota(quota, usable_result=False)
+        raise
+    _settle_sync_search_quota(
+        quota,
+        usable_result=result.reel_count > 0,
+        response=result.model_dump(mode="json"),
+    )
     return result
 
 
@@ -6642,6 +7225,17 @@ async def ingest_search_endpoint(request: Request, payload: IngestSearchRequest)
             },
         )
 
+    quota = _begin_sync_search_quota(
+        request,
+        surface="ingest-search",
+        request_fingerprint=build_idempotency_fingerprint(
+            {"contract": "ingest_search_v1", **payload.model_dump()}
+        ),
+        material_id=payload.material_id,
+        charge_search=not bool(payload.exclude_video_ids),
+    )
+    if quota and quota.get("replay_response") is not None:
+        return IngestSearchResult.model_validate(quota["replay_response"])
     try:
         result = await _run_disconnect_cancellable(
             request,
@@ -6660,8 +7254,10 @@ async def ingest_search_endpoint(request: Request, payload: IngestSearchRequest)
             ),
         )
     except ClipEngineCancellationError as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         raise HTTPException(status_code=499, detail="Ingestion cancelled.") from exc
     except ClipEngineProviderError as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         raise _provider_error_to_http(exc) from exc
     except (
         IngestUnsupportedSourceError,
@@ -6669,6 +7265,7 @@ async def ingest_search_endpoint(request: Request, payload: IngestSearchRequest)
         IngestServerlessUnavailable,
         IngestRateLimitedError,
     ) as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         logger.warning(
             "ingest_search failed: %s",
             json.dumps(
@@ -6683,8 +7280,20 @@ async def ingest_search_endpoint(request: Request, payload: IngestSearchRequest)
         )
         raise _ingest_error_to_http(exc) from exc
     except IngestError as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         logger.exception("ingest_search crashed for query=%s", payload.query)
         raise _ingest_error_to_http(exc) from exc
+    except asyncio.CancelledError:
+        _settle_sync_search_quota(quota, usable_result=False)
+        raise
+    except Exception:
+        _settle_sync_search_quota(quota, usable_result=False)
+        raise
+    _settle_sync_search_quota(
+        quota,
+        usable_result=result.succeeded > 0,
+        response=result.model_dump(mode="json"),
+    )
     return result
 
 
@@ -6710,6 +7319,20 @@ async def ingest_feed_endpoint(request: Request, payload: IngestFeedRequest) -> 
             },
         )
 
+    quota = _begin_sync_search_quota(
+        request,
+        surface="ingest-feed",
+        request_fingerprint=build_idempotency_fingerprint(
+            {
+                "contract": "ingest_feed_v1",
+                **payload.model_dump(),
+                "feed_url": canonical_feed_url,
+            }
+        ),
+        material_id=payload.material_id,
+    )
+    if quota and quota.get("replay_response") is not None:
+        return IngestFeedResult.model_validate(quota["replay_response"])
     try:
         result = await _run_disconnect_cancellable(
             request,
@@ -6726,8 +7349,10 @@ async def ingest_feed_endpoint(request: Request, payload: IngestFeedRequest) -> 
             ),
         )
     except ClipEngineCancellationError as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         raise HTTPException(status_code=499, detail="Ingestion cancelled.") from exc
     except ClipEngineProviderError as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         raise _provider_error_to_http(exc) from exc
     except (
         IngestUnsupportedSourceError,
@@ -6735,6 +7360,7 @@ async def ingest_feed_endpoint(request: Request, payload: IngestFeedRequest) -> 
         IngestServerlessUnavailable,
         IngestRateLimitedError,
     ) as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         logger.warning(
             "ingest_feed failed: %s",
             json.dumps(
@@ -6748,8 +7374,20 @@ async def ingest_feed_endpoint(request: Request, payload: IngestFeedRequest) -> 
         )
         raise _ingest_error_to_http(exc) from exc
     except IngestError as exc:
+        _settle_sync_search_quota(quota, usable_result=False)
         logger.exception("ingest_feed crashed for %s", payload.feed_url)
         raise _ingest_error_to_http(exc) from exc
+    except asyncio.CancelledError:
+        _settle_sync_search_quota(quota, usable_result=False)
+        raise
+    except Exception:
+        _settle_sync_search_quota(quota, usable_result=False)
+        raise
+    _settle_sync_search_quota(
+        quota,
+        usable_result=result.succeeded > 0,
+        response=result.model_dump(mode="json"),
+    )
     return result
 
 
@@ -6867,13 +7505,19 @@ def can_generate_reels(request: Request, payload: ReelsGenerateRequest):
     try:
         with get_conn() as conn:
             query = _material_preflight_query(conn, payload.material_id, payload.concept_id)
-        evidence = _preflight_evidence(query=query, filters=filters, allow_provider=True)
+        evidence = _preflight_evidence(
+            query=query,
+            filters=filters,
+            allow_provider=False,
+        )
     except ClipEngineProviderError as exc:
         raise _provider_error_to_http(exc) from exc
     evidence["message"] = (
-        "YouTube search found matching candidates."
+        "Cached YouTube evidence contains matching candidates."
         if evidence["availability"] == "available"
         else "No matching YouTube candidates were found."
+        if evidence["availability"] == "unavailable"
+        else "No cached search evidence is available yet."
     )
     evidence.pop("provider_called", None)
     return evidence
@@ -6930,32 +7574,9 @@ def can_generate_reels_any(request: Request, payload: ReelsCanGenerateAnyRequest
             result.pop("provider_called", None)
             return result
 
-    provider_result: dict[str, Any] | None = None
-    first_missing = next(
-        (index for index, result in enumerate(cached_results) if result["availability"] == "unknown"),
-        None,
-    )
-    if first_missing is not None:
-        try:
-            provider_result = _preflight_evidence(
-                query=queries[first_missing][1],
-                filters=filters,
-                allow_provider=True,
-            )
-        except ClipEngineProviderError as exc:
-            raise _provider_error_to_http(exc) from exc
-        cached_results[first_missing] = provider_result
-        if provider_result["availability"] == "available":
-            provider_result["materials_checked"] = len(queries)
-            provider_result["message"] = "YouTube search found matching candidates."
-            provider_result.pop("provider_called", None)
-            return provider_result
-
     known = [result for result in cached_results if result["availability"] != "unknown"]
     all_known = len(known) == len(cached_results)
-    evidence_source = "provider" if provider_result and provider_result.get("provider_called") else (
-        "cache" if known else "none"
-    )
+    evidence_source = "cache" if known else "none"
     ages = [float(result["evidence_age_sec"]) for result in known if result.get("evidence_age_sec") is not None]
     return {
         "availability": "unavailable" if all_known else "unknown",
@@ -6965,9 +7586,9 @@ def can_generate_reels_any(request: Request, payload: ReelsCanGenerateAnyRequest
         "filters_applied": normalize_provider_filters(filters),
         "materials_checked": len(queries),
         "message": (
-            "Cached and provider evidence found no matching YouTube candidates."
+            "Cached evidence found no matching YouTube candidates."
             if all_known
-            else "Some materials have no fresh search evidence; no more than one provider search was issued."
+            else "Some materials have no cached search evidence yet."
         ),
     }
 
@@ -7171,7 +7792,20 @@ def feed(
         ):
             target_total = max(1, initial_ready_target)
             try:
-                active_job, _created = _submit_bounded_generation_job(
+                quota_account: dict[str, str] = {}
+                quota_operation_key = f"material:{material_id}"
+
+                def before_feed_generation_create() -> None:
+                    _enforce_rate_limit(
+                        request,
+                        "generation-submit",
+                        limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW,
+                    )
+                    account = _require_verified_provider_account(conn, request)
+                    account_id = str(account["id"])
+                    quota_account["id"] = account_id
+
+                active_job, created = _submit_bounded_generation_job(
                     conn,
                     material_id=material_id,
                     concept_id=None,
@@ -7184,14 +7818,21 @@ def feed(
                         "fresh_source_budget": fresh_cross_request_budget,
                     },
                     source_generation_id=generation_id,
-                    before_create=lambda: _enforce_rate_limit(
-                        request,
-                        "generation-submit",
-                        limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW,
-                    ),
+                    before_create=before_feed_generation_create,
                 )
+                if created and quota_account.get("id"):
+                    attach_reservation_to_job(
+                        conn,
+                        account_id=quota_account["id"],
+                        operation_key=quota_operation_key,
+                        generation_job_id=str(active_job["id"]),
+                        material_id=material_id,
+                    )
             except HTTPException as exc:
                 if exc.status_code != 429:
+                    raise
+                detail = exc.detail if isinstance(exc.detail, dict) else {}
+                if detail.get("code") == "daily_search_limit_reached":
                     raise
             else:
                 job_submitted = True
@@ -7225,6 +7866,8 @@ def feed(
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: Request, payload: ChatRequest):
     _enforce_rate_limit(request, "chat", limit=CHAT_RATE_LIMIT_PER_WINDOW)
+    with get_conn(transactional=True) as conn:
+        _require_verified_provider_account(conn, request)
     history = [{"role": m.role, "content": m.content} for m in payload.history]
     # Prefer the dedicated chat key. MaterialIntelligenceService retries the
     # primary rotation pool if this credential cannot complete the request.
@@ -7443,6 +8086,11 @@ def get_community_reel_duration(request: Request, source_url: str):
         raise HTTPException(status_code=400, detail="source_url is required.")
     normalized_url = _normalize_community_duration_source_url(normalized_url)
 
+    cache_hit, cached_duration_sec = _cached_community_reel_duration_sec(normalized_url)
+    if cache_hit:
+        return {"duration_sec": cached_duration_sec}
+    with get_conn(transactional=True) as conn:
+        _require_verified_provider_account(conn, request)
     duration_sec = _resolve_community_reel_duration_sec(normalized_url)
     return {"duration_sec": duration_sec}
 
