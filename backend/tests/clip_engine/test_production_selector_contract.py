@@ -7965,6 +7965,737 @@ def test_trusted_universal_start_recovers_same_cue_equation_antecedent() -> None
         assert evidence.evidence_quote in clip["_clip_text"]
 
 
+def test_trusted_universal_start_advances_to_named_teaching_handoff() -> None:
+    segments = [
+        {
+            "cue_id": "pL2YfC-22Uc:cue:2",
+            "start": 83.52,
+            "end": 95.52,
+            "text": (
+                "An object in motion will continue in motion unless acted on by"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:3",
+            "start": 98.84,
+            "end": 149.84,
+            "text": (
+                "force. Newton's first law is also known as the law of inertia. "
+                "If we apply a force to the smaller object, it's"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:4",
+            "start": 147.36,
+            "end": 181.04,
+            "text": (
+                "going to be relatively easy to move. The larger object is "
+                "harder to move because it has more inertia."
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:5",
+            "start": 179.599,
+            "end": 186.08,
+            "text": (
+                "Now the next law that you need to be familiar with is "
+                "Newton's second"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:6",
+            "start": 188.519,
+            "end": 246.56,
+            "text": (
+                "law. Newton's second law is basically this equation. Force is "
+                "equal to mass time acceleration. A newton is equivalent to one "
+                "kilogram times a meter over second squ."
+            ),
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="Newton's second law F equals ma",
+        start_quote="going to be relatively easy to move",
+        end_quote="times a meter over second squ",
+        claim_quote="Force is equal to mass time acceleration",
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 2,
+            "end_line": 4,
+            "title": "Newton's Second Law and Force Units",
+            "learning_objective": (
+                "Explain Newton's second law, net force, mass, acceleration, "
+                "and force units."
+            ),
+            "facet": "Newton's second law definition and units",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:5"
+    assert clip["_clip_text"].startswith(
+        "Now the next law that you need to be familiar with is Newton's second"
+    )
+    assert "going to be relatively easy to move" not in clip["_clip_text"]
+    assert "Force is equal to mass time acceleration" in clip["_clip_text"]
+    assert "advanced_clipped_start_to_named_handoff" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_start_expands_incremental_example_setup() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 6.0,
+            "text": "Consider a thirty kilogram block on a rough surface.",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 6.0,
+            "end": 12.0,
+            "text": (
+                "The baseline applied force is one hundred newtons. Static "
+                "friction prevents motion and kinetic friction would be sixty "
+                "newtons."
+            ),
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 12.0,
+            "end": 18.0,
+            "text": (
+                "Now let's increase the applied force to two hundred ten "
+                "newtons. What is the acceleration at this point?"
+            ),
+        },
+        {
+            "cue_id": "cue-3",
+            "start": 18.0,
+            "end": 24.0,
+            "text": (
+                "The net force is one hundred fifty newtons, so the acceleration "
+                "is five meters per second squared."
+            ),
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="solve acceleration from net force and mass",
+        start_quote="Now let's increase the applied force",
+        end_quote="five meters per second squared",
+        claim_quote="the acceleration is five meters per second squared",
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 2,
+            "end_line": 3,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "cue-0"
+    assert clip["_clip_text"].startswith("Consider a thirty kilogram block")
+    assert "The baseline applied force is one hundred newtons" in (
+        clip["_clip_text"]
+    )
+    assert "Now let's increase" in clip["_clip_text"]
+
+
+@pytest.mark.parametrize(
+    "opening",
+    [
+        "We can increase the sample size to reduce variance.",
+        "You can adjust brightness to make the image easier to read.",
+    ],
+)
+def test_trusted_universal_start_keeps_standalone_adjustment_advice(
+    opening: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "Remember to subscribe before the next lesson.",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 5.0,
+            "end": 10.0,
+            "text": opening,
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="practical adjustment advice",
+        start_quote=opening,
+        end_quote=opening,
+        claim_quote=opening,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 1,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "cue-1"
+    assert clip["_clip_text"] == opening.rstrip(".")
+    assert "subscribe" not in clip["_clip_text"]
+
+
+@pytest.mark.parametrize(
+    ("unrelated_prior", "opening"),
+    [
+        (
+            "Consider a monthly subscription to support the channel.",
+            "Now we can increase the sample size to reduce variance.",
+        ),
+        (
+            "Remember to subscribe before the next lesson.",
+            "We can return the current date from this function.",
+        ),
+        (
+            "Remember to subscribe before the next lesson.",
+            "We can change the original variable without mutating the input.",
+        ),
+        (
+            (
+                "Consider a force of one hundred newtons in this promotional "
+                "animation."
+            ),
+            (
+                "Now let us increase the applied force to two hundred ten "
+                "newtons."
+            ),
+        ),
+    ],
+)
+def test_trusted_universal_start_does_not_import_unrelated_incremental_setup(
+    unrelated_prior: str,
+    opening: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": unrelated_prior,
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 5.0,
+            "end": 10.0,
+            "text": opening,
+        },
+    ]
+    plan = _compact_custom_plan(
+        request=opening,
+        start_quote=opening,
+        end_quote=opening,
+        claim_quote=opening,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 1,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "cue-1"
+    assert unrelated_prior.rstrip(".") not in clip["_clip_text"]
+    assert any(
+        reason in {
+            "unresolved_incremental_context",
+            "unresolved_start_context",
+        }
+        for reason in clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_named_handoff_preserves_required_model_setup() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "For a Gaussian model, the baseline variance is",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 5.0,
+            "end": 10.0,
+            "text": (
+                "estimated from prior observations. This baseline controls "
+                "the model's uncertainty."
+            ),
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 10.0,
+            "end": 15.0,
+            "text": "The next concept is posterior predictive variance.",
+        },
+        {
+            "cue_id": "cue-3",
+            "start": 15.0,
+            "end": 20.0,
+            "text": (
+                "Posterior predictive variance combines this baseline with "
+                "observation noise."
+            ),
+        },
+    ]
+    claim = (
+        "Posterior predictive variance combines this baseline with observation noise"
+    )
+    plan = _compact_custom_plan(
+        request="explain posterior predictive variance from the Gaussian baseline",
+        start_quote="baseline variance is",
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 0,
+            "end_line": 3,
+            "title": "Posterior Predictive Variance",
+            "learning_objective": (
+                "Explain posterior predictive variance from the Gaussian baseline."
+            ),
+            "facet": "posterior predictive variance",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "cue-0"
+    assert clip["_clip_text"].startswith("baseline variance is estimated")
+    assert "This baseline controls" in clip["_clip_text"]
+    assert "Posterior predictive variance combines this baseline" in (
+        clip["_clip_text"]
+    )
+    assert "advanced_clipped_start_to_named_handoff" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_named_handoff_keeps_protected_symbol_definition() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": (
+                "The first equation defines sigma as observation variance and"
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 5.0,
+            "end": 10.0,
+            "text": (
+                "tau as parameter variance. Both symbols will appear below."
+            ),
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 10.0,
+            "end": 15.0,
+            "text": (
+                "The next equation is the second equation, predictive variance."
+            ),
+        },
+        {
+            "cue_id": "cue-3",
+            "start": 15.0,
+            "end": 20.0,
+            "text": (
+                "Predictive variance equals sigma squared plus tau squared."
+            ),
+        },
+    ]
+    claim = "Predictive variance equals sigma squared plus tau squared"
+    plan = _compact_custom_plan(
+        request="explain the second predictive variance equation",
+        start_quote="tau as parameter variance",
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 3,
+            "title": "Second Equation: Predictive Variance",
+            "learning_objective": "Explain the predictive variance equation.",
+            "facet": "predictive variance equation",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "cue-1"
+    assert clip["_clip_text"].startswith("tau as parameter variance")
+    assert "tau as parameter variance" in clip["_clip_text"]
+    assert "sigma squared plus tau squared" in clip["_clip_text"]
+    assert "advanced_clipped_start_to_named_handoff" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_start_expands_visual_demonstrative_setup() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 6.0,
+            "text": "So where will the force be greatest?",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 6.0,
+            "end": 12.0,
+            "text": (
+                "It's where the spring has been compressed or stretched the most."
+            ),
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 12.0,
+            "end": 18.0,
+            "text": (
+                "So at these points here, at the points of maximum extension or "
+                "compression, you have the greatest amount of force."
+            ),
+        },
+        {
+            "cue_id": "cue-3",
+            "start": 18.0,
+            "end": 24.0,
+            "text": (
+                "The restoring force points back toward the equilibrium position."
+            ),
+        },
+        {
+            "cue_id": "cue-4",
+            "start": 24.0,
+            "end": 30.0,
+            "text": (
+                "At these end points, you have the least speed, but the greatest "
+                "force and acceleration."
+            ),
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="net force and acceleration in a spring",
+        start_quote="At these end points, you have the least speed",
+        end_quote="the greatest force and acceleration",
+        claim_quote="the greatest force and acceleration",
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 4,
+            "end_line": 4,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "cue-0"
+    assert clip["_clip_text"].startswith("So where will the force be greatest?")
+    assert "At these end points" in clip["_clip_text"]
+
+
+@pytest.mark.parametrize(
+    "unrelated_prior",
+    [
+        "The pointer points at the chart.",
+        "The data points are shown in blue.",
+        "The spring force data points are shown in blue.",
+        (
+            "The points on this chart show spring force and acceleration "
+            "measurements."
+        ),
+    ],
+)
+def test_trusted_universal_start_does_not_resolve_unrelated_point_homonym(
+    unrelated_prior: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": unrelated_prior,
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 5.0,
+            "end": 10.0,
+            "text": (
+                "At these end points, you have the least speed but the greatest "
+                "spring force."
+            ),
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="spring force at maximum extension and compression",
+        start_quote="At these end points, you have the least speed",
+        end_quote="the greatest spring force",
+        claim_quote="the greatest spring force",
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 1,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "cue-1"
+    assert unrelated_prior.rstrip(".") not in clip["_clip_text"]
+    assert "unresolved_start_context" in clip["_boundary_fallback_reasons"]
+
+
+@pytest.mark.parametrize(
+    ("unrelated_prior", "opening", "claim"),
+    [
+        (
+            "This gardening lesson explains how to prune tomato plants.",
+            (
+                "In this lesson, Bayes theorem updates a prior probability "
+                "using new evidence."
+            ),
+            "Bayes theorem updates a prior probability using new evidence",
+        ),
+        (
+            "This recipe example combines flour, butter, and sugar.",
+            "In this example, let x equal five and solve x plus two.",
+            "let x equal five and solve x plus two",
+        ),
+    ],
+)
+def test_trusted_universal_start_keeps_self_contained_generic_frame(
+    unrelated_prior: str,
+    opening: str,
+    claim: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": unrelated_prior,
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 5.0,
+            "end": 10.0,
+            "text": opening,
+        },
+    ]
+    plan = _compact_custom_plan(
+        request=claim,
+        start_quote=opening,
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 1,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "cue-1"
+    assert unrelated_prior.rstrip(".") not in clip["_clip_text"]
+
+
+@pytest.mark.parametrize(
+    ("antecedent", "opening"),
+    [
+        (
+            "A class groups students who share the same label.",
+            "In these classes, students receive the same label.",
+        ),
+        (
+            "An analysis compares observed and predicted values.",
+            "In these analyses, observed and predicted values are compared.",
+        ),
+        (
+            "Transition points occur where the system changes phase.",
+            "At these critical transition points, the system changes phase abruptly.",
+        ),
+    ],
+)
+def test_trusted_universal_start_resolves_specific_reference_phrase(
+    antecedent: str,
+    opening: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": antecedent,
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 5.0,
+            "end": 10.0,
+            "text": opening,
+        },
+    ]
+    plan = _compact_custom_plan(
+        request=opening,
+        start_quote=opening,
+        end_quote=opening,
+        claim_quote=opening,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 1,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "cue-0"
+    assert clip["_clip_text"].startswith(antecedent.rstrip("."))
+    assert opening.rstrip(".") in clip["_clip_text"]
+
+
 def test_trusted_universal_start_never_crosses_a_section_gap() -> None:
     segments = [
         {
@@ -8971,7 +9702,7 @@ def test_boundary_prompt_requires_cross_domain_subject_anchoring_and_context() -
     assert "the first word of sq and last word of eq are your proposed semantic edges" in normalized
     assert "one final transcript-only gemini audit" in normalized
     assert "do not rely on downstream code to fix an incomplete thought" in normalized
-    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v15"
+    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v16"
 
 
 @pytest.mark.parametrize(
