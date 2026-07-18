@@ -1674,7 +1674,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v3"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v14"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v15"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -6344,6 +6344,22 @@ def _completed_truncated_caption_end(
     if fragment != "squ" or "squared" not in _toks(raw_text):
         return None
     suffix = raw_text[quote_span[1]:]
+    direct_completion = re.match(
+        r"^[\s.,;:—-]*squared\b",
+        suffix,
+        re.IGNORECASE,
+    )
+    if direct_completion is not None:
+        retained_right = quote_span[1] + direct_completion.end()
+        retained = raw_text[:retained_right]
+        words = list(_WORD_RE.finditer(retained))
+        if not words:
+            return None
+        quote_left = words[max(0, len(words) - 6)].start()
+        return (
+            (quote_left, retained_right),
+            retained[quote_left:retained_right],
+        )
     connected_tokens = _content_tokens(scope_text)
     retained_right: int | None = None
     for left, right in _sentence_character_spans(suffix):
@@ -6371,6 +6387,7 @@ def _trusted_joined_unit_end(
     *,
     end_line: int,
     end_span: tuple[int, int] | None,
+    stop_at_structural_reset: bool = False,
 ) -> tuple[int, tuple[int, int], str] | None:
     """Extend Gemini's word edge through its unfinished spoken sentence."""
     if not (0 <= end_line < len(segments)):
@@ -6394,10 +6411,30 @@ def _trusted_joined_unit_end(
         line_ranges.append((line, joined_left, cursor))
     joined = "".join(parts)
     selected_right = end_right
+    completion_limit = len(joined)
+    if stop_at_structural_reset:
+        suffix = joined[selected_right:]
+        reset_starts = [
+            reset.start()
+            for pattern in (
+                _HARD_TOPIC_RESET_RE,
+                _INDEPENDENT_UNIT_RESET_RE,
+                _NAMED_UNIT_LABEL_RESET_RE,
+                _NAMED_METHOD_CONTRAST_RESET_RE,
+                _NEXT_DISTINCT_UNIT_RESET_RE,
+                _FORWARD_TOPIC_TRANSITION_RE,
+            )
+            for reset in pattern.finditer(suffix)
+        ]
+        if reset_starts:
+            completion_limit = selected_right + min(reset_starts)
     hard_boundaries = [
         boundary
         for boundary in _trusted_joined_unit_boundaries(joined)
-        if boundary.group(0)[0] in ".!?"
+        if (
+            boundary.group(0)[0] in ".!?"
+            and boundary.end() <= completion_limit
+        )
     ]
     if any(boundary.end() == selected_right for boundary in hard_boundaries):
         return None
@@ -6409,6 +6446,8 @@ def _trusted_joined_unit_end(
         ),
         None,
     )
+    if completion is None and completion_limit < len(joined):
+        return None
     completion_right = completion.end() if completion is not None else len(joined)
     if (
         completion_right <= selected_right
@@ -6434,6 +6473,307 @@ def _trusted_joined_unit_end(
     quote_left = words[max(0, len(words) - 6)].start()
     quote = retained[quote_left:source_right]
     return line, (quote_left, source_right), quote
+
+
+def _trusted_contiguous_section_bounds(
+    segments: list[dict],
+    line: int,
+) -> tuple[int, int]:
+    """Bound structural edge repair to one uninterrupted transcript section."""
+    floor = ceiling = min(max(line, 0), len(segments) - 1)
+    for candidate in range(floor - 1, -1, -1):
+        try:
+            gap = (
+                float(segments[candidate + 1].get("start", 0.0))
+                - float(segments[candidate].get("end", 0.0))
+            )
+        except (TypeError, ValueError, OverflowError):
+            break
+        if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+            break
+        floor = candidate
+    for candidate in range(ceiling + 1, len(segments)):
+        try:
+            gap = (
+                float(segments[candidate].get("start", 0.0))
+                - float(segments[candidate - 1].get("end", 0.0))
+            )
+        except (TypeError, ValueError, OverflowError):
+            break
+        if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+            break
+        ceiling = candidate
+    return floor, ceiling
+
+
+def _trusted_universal_start_context_edge(
+    segments: list[dict],
+    start_line: int,
+    start_span: tuple[int, int] | None,
+    *,
+    end_line: int,
+    end_span: tuple[int, int] | None,
+) -> tuple[int, tuple[int, int] | None, list[str]]:
+    """Widen only a structurally dependent Gemini start, never reject it."""
+
+    def needs_context(
+        line: int,
+        span: tuple[int, int] | None,
+    ) -> bool:
+        selected, _spans = _semantic_clip_slice(
+            segments,
+            line,
+            end_line,
+            start_span=span,
+            end_span=end_span,
+        )
+        coordinator = re.match(
+            r"^\s*(?:and|but|now|so)\s*[,;:]?\s+",
+            selected,
+            re.IGNORECASE,
+        )
+        if coordinator is not None:
+            independent = selected[coordinator.end():].strip()
+            if (
+                _opening_clause_is_standalone(independent)
+                and not _cue_opens_mid_thought(
+                    independent,
+                    ignore_caption_case=True,
+                )
+            ):
+                return False
+        return bool(
+            not _opening_clause_is_standalone(selected)
+            or _cue_opens_mid_thought(
+                selected,
+                ignore_caption_case=True,
+            )
+        )
+
+    if not needs_context(start_line, start_span):
+        return start_line, start_span, []
+
+    original_selected, _original_spans = _semantic_clip_slice(
+        segments,
+        start_line,
+        end_line,
+        start_span=start_span,
+        end_span=end_span,
+    )
+    opening_end = next(
+        (
+            boundary.end()
+            for boundary in _trusted_joined_unit_boundaries(original_selected)
+            if boundary.group(0)[0] in ".!?"
+        ),
+        len(original_selected),
+    )
+    original_opening = original_selected[:opening_end]
+    unresolved_head_match = re.search(
+        r"\b(?:this|that|these|those)\s+"
+        r"(?P<head>[a-z][\w'’-]*)\b",
+        original_opening,
+        re.IGNORECASE,
+    )
+    unresolved_head = (
+        unresolved_head_match.group("head").casefold()
+        if unresolved_head_match is not None
+        else ""
+    )
+
+    floor, _ceiling = _trusted_contiguous_section_bounds(
+        segments,
+        start_line,
+    )
+    window = segments[floor:]
+    current_line = start_line
+    current_span = start_span
+    diagnostics: list[str] = []
+
+    original_left = start_span[0] if start_span is not None else 0
+    hard_reset: tuple[int, tuple[int, int]] | None = None
+    for line in range(floor, start_line + 1):
+        reset_span = _trusted_hard_reset_start_span(
+            str(segments[line].get("text") or ""),
+            before=original_left if line == start_line else None,
+        )
+        if reset_span is not None:
+            hard_reset = (line, reset_span)
+
+    for _attempt in range(len(window) + 2):
+        if not needs_context(current_line, current_span):
+            break
+        current_source = str(segments[current_line].get("text") or "")
+        current_selected, _current_spans = _semantic_clip_slice(
+            segments,
+            current_line,
+            end_line,
+            start_span=current_span,
+            end_span=end_span,
+        )
+        force_reference_expansion = bool(
+            current_span is not None
+            and _projected_start_is_standalone(
+                current_source,
+                current_span,
+            )
+            and _cue_opens_mid_thought(
+                current_selected,
+                ignore_caption_case=True,
+            )
+        )
+        repaired_line, repaired_span, repair_diagnostics = (
+            _trusted_start_context_repair(
+                window,
+                current_line - floor,
+                current_span,
+                force_clipped_start=force_reference_expansion,
+                min_start_line=0,
+            )
+        )
+        repaired_line += floor
+        if hard_reset is not None:
+            reset_line, reset_span = hard_reset
+            reset_position = (reset_line, reset_span[0])
+            repaired_position = (
+                repaired_line,
+                repaired_span[0] if repaired_span is not None else 0,
+            )
+            if repaired_position < reset_position:
+                repaired_line, repaired_span = reset_line, reset_span
+                repair_diagnostics.append("bounded_start_at_hard_reset")
+        current_position = (
+            current_line,
+            current_span[0] if current_span is not None else 0,
+        )
+        repaired_position = (
+            repaired_line,
+            repaired_span[0] if repaired_span is not None else 0,
+        )
+        diagnostics.extend(repair_diagnostics)
+        if repaired_position >= current_position:
+            break
+        current_line, current_span = repaired_line, repaired_span
+
+    if (current_line, current_span) == (start_line, start_span):
+        diagnostics.append("unresolved_start_context")
+    else:
+        current_source = str(segments[current_line].get("text") or "")
+        equation = _TRUSTED_SYMBOLIC_EQUATION_RE.search(current_source)
+        if (
+            equation is not None
+            and re.fullmatch(
+                r"\s*(?:(?:this|that|the)\s+)?"
+                r"(?:equation|expression|formula|relationship)\s*[,;:—-]\s*",
+                current_source[:equation.start()],
+                re.IGNORECASE,
+            )
+        ):
+            quote = _exact_boundary_quote(
+                current_source[equation.start():],
+                want="start",
+            )
+            relative_span = _quote_character_span(
+                current_source[equation.start():],
+                quote,
+            )
+            if relative_span is not None:
+                current_span = (
+                    equation.start() + relative_span[0],
+                    equation.start() + relative_span[1],
+                )
+                diagnostics.append("trimmed_incomplete_equation_label")
+    if unresolved_head:
+        repaired_left = current_span[0] if current_span is not None else 0
+        original_left = start_span[0] if start_span is not None else 0
+        if current_line == start_line:
+            added_context = str(segments[start_line].get("text") or "")[
+                repaired_left:original_left
+            ]
+        else:
+            added_parts = [
+                str(segments[current_line].get("text") or "")[repaired_left:]
+            ]
+            added_parts.extend(
+                str(segments[line].get("text") or "")
+                for line in range(current_line + 1, start_line)
+            )
+            added_parts.append(
+                str(segments[start_line].get("text") or "")[:original_left]
+            )
+            added_context = " ".join(added_parts)
+        head_root = unresolved_head[:-1] if unresolved_head.endswith("s") else unresolved_head
+        named_antecedent = re.search(
+            rf"\b{re.escape(head_root)}s?\b",
+            added_context,
+            re.IGNORECASE,
+        )
+        symbolic_antecedent = bool(
+            unresolved_head in {
+                "equation", "equations", "expression", "expressions",
+                "formula", "formulas", "relationship", "relationships",
+            }
+            and (
+                _TRUSTED_SYMBOLIC_EQUATION_RE.search(added_context)
+                or re.search(
+                    r"\b(?:equal\s+to|equals?)\b",
+                    added_context,
+                    re.IGNORECASE,
+                )
+            )
+        )
+        if named_antecedent is None and not symbolic_antecedent:
+            diagnostics.append("unresolved_start_context")
+            return start_line, start_span, list(dict.fromkeys(diagnostics))
+    return (
+        current_line,
+        current_span,
+        list(dict.fromkeys(diagnostics)),
+    )
+
+
+def _trusted_universal_completed_end(
+    segments: list[dict],
+    *,
+    end_line: int,
+    end_span: tuple[int, int] | None,
+) -> tuple[int, tuple[int, int], str] | None:
+    """Complete one spoken sentence without crossing a transcript reset."""
+    _floor, section_ceiling = _trusted_contiguous_section_bounds(
+        segments,
+        end_line,
+    )
+    ceiling = min(section_ceiling, end_line + 6)
+    completed = _trusted_joined_unit_end(
+        segments[:ceiling + 1],
+        end_line=end_line,
+        end_span=end_span,
+        stop_at_structural_reset=True,
+    )
+    if completed is None:
+        return None
+    line, span, quote = completed
+    completed_source = str(segments[line].get("text") or "")[:span[1]]
+    if re.search(r"[.!?]+[\"'’”)]*\s*$", completed_source) is None:
+        if line != end_line + 1 or section_ceiling != line:
+            return None
+        original_source = str(segments[end_line].get("text") or "")
+        original_right = (
+            end_span[1] if end_span is not None else len(original_source)
+        )
+        completed_text = " ".join((
+            original_source[:original_right].strip(),
+            completed_source.strip(),
+        ))
+        if (
+            len(_toks(completed_source)) > 80
+            or _terminal_content_is_explicitly_incomplete(completed_text)
+            or _cue_has_explicit_dangling_end(completed_text, "")
+            or _TERMINAL_DANGLING_PREDICATE_HEAD_RE.search(completed_text)
+            or _TERMINAL_REQUIRED_COMPLEMENT_RE.search(completed_text)
+        ):
+            return None
+    return line, span, quote
 
 
 def _trim_end_quote_before_edge_noise(
@@ -14581,6 +14921,234 @@ def _trusted_universal_compact_plan_to_report(
                 end_span=None,
             )
             diagnostics.append("full_cue_boundary_fallback")
+
+        protected_quotes = list(dict.fromkeys(
+            normalized
+            for value in (
+                raw_model_claim_quote,
+                *(str(item.evidence_quote) for item in proposal.intent_evidence),
+            )
+            if (
+                (normalized := " ".join(str(value or "").split()))
+                and _contains_quote(clip_text, normalized)
+            )
+        ))
+
+        repaired_a, repaired_start_span, start_diagnostics = (
+            _trusted_universal_start_context_edge(
+                segments,
+                a,
+                start_span,
+                end_line=b,
+                end_span=end_span,
+            )
+        )
+        if (repaired_a, repaired_start_span) != (a, start_span):
+            repaired_clip_text, repaired_semantic_spans = _semantic_clip_slice(
+                segments,
+                repaired_a,
+                b,
+                start_span=repaired_start_span,
+                end_span=end_span,
+            )
+            if all(
+                _contains_quote(repaired_clip_text, quote)
+                for quote in protected_quotes
+            ):
+                a, start_span = repaired_a, repaired_start_span
+                clip_text = repaired_clip_text
+                semantic_spans_by_cue = repaired_semantic_spans
+                diagnostics.extend(start_diagnostics)
+            else:
+                diagnostics.append("start_repair_preserved_model_evidence")
+        elif start_diagnostics:
+            diagnostics.extend(start_diagnostics)
+
+        end_source = str(segments[b].get("text") or "")
+        immediate_squared = bool(
+            end_span is not None
+            and re.match(
+                r"^[\s.,;:—-]*squared\b",
+                end_source[end_span[1]:],
+                re.IGNORECASE,
+            )
+        )
+        completed_caption = (
+            _completed_truncated_caption_end(
+                end_source,
+                end_span,
+                scope_text=clip_text,
+            )
+            if immediate_squared
+            else None
+        )
+        if completed_caption is not None:
+            end_span, _completed_quote = completed_caption
+            diagnostics.append("completed_truncated_caption_word")
+            clip_text, semantic_spans_by_cue = _semantic_clip_slice(
+                segments,
+                a,
+                b,
+                start_span=start_span,
+                end_span=end_span,
+            )
+
+        end_right = end_span[1] if end_span is not None else len(end_source)
+        same_cue_following = end_source[end_right:]
+        following_text = (
+            same_cue_following
+            if _WORD_RE.search(same_cue_following)
+            else ""
+        )
+        if not following_text and b + 1 < n:
+            try:
+                next_gap = (
+                    float(segments[b + 1].get("start", 0.0))
+                    - float(segments[b].get("end", 0.0))
+                )
+            except (TypeError, ValueError, OverflowError):
+                next_gap = math.inf
+            if math.isfinite(next_gap) and next_gap < _SECTION_RESET_GAP_S:
+                following_text = str(segments[b + 1].get("text") or "")
+
+        following_prefix = re.split(
+            r"[,;.!?]",
+            following_text,
+            maxsplit=1,
+        )[0].strip()
+        following_starts_new_unit = bool(
+            re.match(
+                r"^\s*(?:(?:a|an|the)\s+)?"
+                r"(?:different|new|next|separate|unrelated)\s+"
+                r"(?:lesson|section|subject|topic)\b",
+                following_prefix,
+                re.IGNORECASE,
+            )
+        )
+        terminal_preposition_dangling = bool(
+            re.search(
+                r"\b[a-z][\w'’-]*ing\s+"
+                r"(?:at|by|for|from|in|into|of|on|onto|to|with|without)\s*$",
+                clip_text,
+                re.IGNORECASE,
+            )
+        )
+        terminal_preposition_continues = bool(
+            terminal_preposition_dangling
+            and following_prefix
+            and not following_starts_new_unit
+            and not re.match(
+                r"^\s*[a-z][\w'’-]*ing\b",
+                following_prefix,
+                re.IGNORECASE,
+            )
+        )
+        split_squared_unit = bool(
+            re.search(
+                r"(?:\bm\s*/\s*s|\bmeters?\s+per\s+second|"
+                r"\bper\s+second)\s*$",
+                clip_text,
+                re.IGNORECASE,
+            )
+            and re.match(r"^\s*squared\b", following_text, re.IGNORECASE)
+        )
+        dangling_end = bool(
+            _cue_has_explicit_dangling_end(clip_text, following_text)
+            or _terminal_content_is_explicitly_incomplete(clip_text)
+            or _TERMINAL_DANGLING_PREDICATE_HEAD_RE.search(clip_text)
+            or _TERMINAL_REQUIRED_COMPLEMENT_RE.search(clip_text)
+            or terminal_preposition_dangling
+            or split_squared_unit
+            or (
+                end_span is not None
+                and following_text
+                and re.match(r"^\s*[,;:—-]", same_cue_following)
+            )
+            or (
+                end_span is not None
+                and _projected_end_continues_same_sentence(
+                    end_source,
+                    end_span,
+                )
+            )
+        )
+        if dangling_end:
+            trimmed_end: tuple[int, tuple[int, int]] | None = None
+            complete_quote = _complete_prefix_end_quote(clip_text)
+            complete_spans = (
+                _quote_character_spans(clip_text, complete_quote)
+                if complete_quote
+                else []
+            )
+            trailing_unit = (
+                clip_text[complete_spans[-1][1]:]
+                if complete_spans
+                else ""
+            )
+            starts_fresh_unit = bool(
+                re.match(
+                    r"^[\s.!?\"'’”)]*(?:(?:and|but|so)\s+)?(?:"
+                    r"anytime|another\s+(?:case|example|problem)|consider|"
+                    r"here(?:['’]?s|\s+is)|imagine|next|now|suppose|"
+                    r"the\s+next|what\s+if|whenever)\b",
+                    trailing_unit,
+                    re.IGNORECASE,
+                )
+            )
+            complete_anchor = (
+                _unique_boundary_anchor(
+                    segments,
+                    complete_quote,
+                    a,
+                    b,
+                    allow_timing_gaps=True,
+                )
+                if complete_quote and starts_fresh_unit
+                else None
+            )
+            if complete_anchor is not None:
+                candidate_b = complete_anchor.last_line
+                candidate_end_span = complete_anchor.last_span
+                candidate_text, _candidate_spans = _semantic_clip_slice(
+                    segments,
+                    a,
+                    candidate_b,
+                    start_span=start_span,
+                    end_span=candidate_end_span,
+                )
+                if all(
+                    _contains_quote(candidate_text, quote)
+                    for quote in protected_quotes
+                ):
+                    trimmed_end = (candidate_b, candidate_end_span)
+            if trimmed_end is not None:
+                b, end_span = trimmed_end
+                diagnostics.append("trimmed_dangling_trailing_fragment")
+            else:
+                completed_end = (
+                    _trusted_universal_completed_end(
+                        segments,
+                        end_line=b,
+                        end_span=end_span,
+                    )
+                    if (
+                        not terminal_preposition_dangling
+                        or terminal_preposition_continues
+                    )
+                    else None
+                )
+                if completed_end is not None:
+                    b, end_span, _completed_quote = completed_end
+                    diagnostics.append("completed_unfinished_spoken_unit")
+                else:
+                    diagnostics.append("unresolved_dangling_end")
+            clip_text, semantic_spans_by_cue = _semantic_clip_slice(
+                segments,
+                a,
+                b,
+                start_span=start_span,
+                end_span=end_span,
+            )
 
         start_text = str(segments[a].get("text") or "")
         end_text = str(segments[b].get("text") or "")
