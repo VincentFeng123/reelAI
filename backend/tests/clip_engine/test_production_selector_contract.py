@@ -2064,7 +2064,15 @@ def test_trusted_live_acceleration_candidate_recovers_its_people_setup() -> None
             "acceleration is going to be one. So because he experiences a small "
             "acceleration he's not going to move very far. the smaller person, he's "
             "going to move a lot further than the larger person because he's "
-            "smaller and he experiences a greater acceleration.",
+                "smaller and he experiences a greater acceleration.",
+        ),
+        (
+            19,
+            689.839,
+            738.959,
+            "he's not going to move um back very much since he experiences a "
+            "smaller acceleration. Another example of Newton's third law is the "
+            "force of gravity that acts between the earth and the moon.",
         ),
     ]
     segments = [
@@ -2078,27 +2086,71 @@ def test_trusted_live_acceleration_candidate_recovers_its_people_setup() -> None
     ]
     claim = (
         "solving for the acceleration, you can see that he's going to experience "
-        "an acceleration of 2 m/s squared."
+        "an acceleration"
     )
     plan = _compact_custom_plan(
-        request="Newton's second law",
+        request="Newton's second law F=ma",
         start_quote="skating I'm just going to draw",
-        end_quote=(
-            "smaller person, he's going to move a lot further than the larger "
-            "person because he's smaller and he experiences a greater acceleration."
-        ),
+        end_quote="experiences a smaller acceleration.",
         claim_quote=claim,
     )
     plan = plan.model_copy(update={
-        "topics": [plan.topics[0].model_copy(update={
-            "candidate_id": "f-equals-ma-acceleration",
-            "start_line": 1,
-            "end_line": 4,
-            "title": "Calculating Acceleration from Force and Mass",
-            "learning_objective": (
-                "Calculate acceleration given force and mass using F=ma."
+        "request_intent": gemini_segment._RequestIntent(
+            exact_request=(
+                "Explain Newton's second law F=ma from intuition through worked "
+                "examples, including net force, mass, acceleration, units, and "
+                "solving for each variable"
             ),
-            "facet": "Solving for acceleration",
+            constraints=[
+                {
+                    "constraint_id": "solve",
+                    "kind": "task",
+                    "source_phrase": "solving for each variable",
+                    "requirement": "Solve for acceleration",
+                },
+                {
+                    "constraint_id": "format",
+                    "kind": "format",
+                    "source_phrase": "worked examples",
+                    "requirement": "Use a worked example",
+                },
+                {
+                    "constraint_id": "subject",
+                    "kind": "subject",
+                    "source_phrase": "Newton's second law F=ma",
+                    "requirement": "Use F=ma",
+                },
+            ],
+        ),
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "solve-for-acceleration-f-ma",
+            "start_line": 1,
+            "end_line": 5,
+            "title": "Solving for Acceleration Using F=ma",
+            "learning_objective": (
+                "Use Newton's second law to solve for an object's acceleration"
+            ),
+            "facet": "solving for acceleration",
+            "intent_evidence": [
+                gemini_segment._CompactIntentEvidence.model_validate({
+                    "id": "solve",
+                    "q": (
+                        "solving for the acceleration, you can see that he's going "
+                        "to experience an acceleration"
+                    ),
+                }),
+                gemini_segment._CompactIntentEvidence.model_validate({
+                    "id": "format",
+                    "q": (
+                        "solving for the acceleration, you can see that he's going "
+                        "to experience an acceleration"
+                    ),
+                }),
+                gemini_segment._CompactIntentEvidence.model_validate({
+                    "id": "subject",
+                    "q": "If you use the equation F is equal to m8",
+                }),
+            ],
         })],
     })
 
@@ -2124,7 +2176,7 @@ def test_trusted_live_acceleration_candidate_recovers_its_people_setup() -> None
     )
 
 
-def test_trusted_live_second_law_intro_starts_at_the_named_law_handoff() -> None:
+def test_trusted_live_second_law_intro_preserves_complete_model_end() -> None:
     segments = [
         {
             "cue_id": "pL2YfC-22Uc:cue:3",
@@ -2206,18 +2258,21 @@ def test_trusted_live_second_law_intro_starts_at_the_named_law_handoff() -> None
     assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:5"
     assert clip["start_quote"] == "Now the next law that you"
     assert clip["_clip_text"].startswith("Now the next law that you need")
-    assert clip["end_quote"] == "pound is approximately 4.45 newtons."
-    assert clip["_clip_text"].endswith(
-        "It turns out one pound is approximately 4.45 newtons."
+    assert clip["end_quote"] == (
+        "A newton is equivalent to 1 kilogram times a meter over second squ."
     )
+    assert clip["_clip_text"].endswith(
+        "A newton is equivalent to 1 kilogram times a meter over second squ"
+    )
+    assert "It turns out that the newton" not in clip["_clip_text"]
     assert "Photosynthesis" not in clip["_clip_text"]
-    assert "completed_truncated_caption_word" in (
+    assert "completed_truncated_caption_word" not in (
         clip["_boundary_fallback_reasons"]
     )
     assert "going to be relatively easy" not in clip["_clip_text"]
 
 
-def test_trusted_live_acceleration_candidate_completes_both_people() -> None:
+def test_trusted_live_acceleration_candidate_preserves_complete_model_result() -> None:
     raw_cues = [
         (
             14,
@@ -2321,10 +2376,11 @@ def test_trusted_live_acceleration_candidate_completes_both_people() -> None:
     assert clip["_clip_text"].startswith(
         "So let's say if you have two people skating I'm just going to draw"
     )
-    assert clip["end_cue_id"] == "pL2YfC-22Uc:cue:19"
-    assert clip["end_quote"] == "since he experiences a smaller acceleration."
-    assert "acceleration is going to be one" in clip["_clip_text"]
-    assert "Another example" not in clip["_clip_text"]
+    assert clip["end_cue_id"] == "pL2YfC-22Uc:cue:17"
+    assert clip["end_quote"] == (
+        "he's going to experience an acceleration of 2 m/s squared."
+    )
+    assert "Now the person on the right" not in clip["_clip_text"]
 
 
 def test_trusted_live_acceleration_definition_drops_completed_prerequisites() -> None:
@@ -2489,7 +2545,7 @@ def test_trusted_definition_keeps_a_single_required_prerequisite() -> None:
     assert clip["_clip_text"].startswith(prerequisite)
 
 
-def test_trusted_live_multi_block_candidate_keeps_question_and_answer() -> None:
+def test_trusted_live_multi_block_candidate_preserves_complete_model_end() -> None:
     raw_cues = [
         (
             121,
@@ -2592,11 +2648,12 @@ def test_trusted_live_multi_block_candidate_keeps_question_and_answer() -> None:
     [clip] = report.clips
     assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:122"
     assert clip["start_quote"] == "Here's a question for you"
-    assert clip["end_cue_id"] == "pL2YfC-22Uc:cue:127"
-    assert clip["end_quote"] == "to each other."
+    assert clip["end_cue_id"] == "pL2YfC-22Uc:cue:124"
+    assert clip["end_quote"] == (
+        "The net force acted on block B is m * A 10 * 3 which is 30 newtons."
+    )
     assert "Block A has a mass of 20 kg" in clip["_clip_text"]
-    assert "A exerts 30 newtons on B" in clip["_clip_text"]
-    assert "another example" not in clip["_clip_text"]
+    assert "So now let's focus on block A" not in clip["_clip_text"]
 
 
 def test_trusted_live_force_fragment_starts_at_same_cue_sentence() -> None:
@@ -3456,7 +3513,7 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
     )
 
 
-def test_pro_boundary_route_recovers_start_from_intent_when_claim_is_unanchored(
+def test_pro_boundary_route_preserves_model_start_when_claim_is_unanchored(
     monkeypatch,
 ) -> None:
     segments = [
@@ -3574,8 +3631,8 @@ def test_pro_boundary_route_recovers_start_from_intent_when_claim_is_unanchored(
     assert result.proposed_count == result.accepted_count == 1
     assert result.rejection_reasons == []
     [clip] = result.clips
-    assert clip["start_cue_id"] == "Jyiw6KkedDY:cue:2"
-    assert clip["start_quote"] == "you're now ready to understand acceleration"
+    assert clip["start_cue_id"] == "Jyiw6KkedDY:cue:1"
+    assert clip["start_quote"] == "units for speed so if you're"
     assert clip["model_claim_quote"] == raw_claim
     assert clip["topic_evidence_quote"] == (
         "acceleration which is simply the rate at which velocity changes"
@@ -3636,6 +3693,15 @@ def test_trusted_claim_handoff_requires_the_whole_subject_to_match() -> None:
 
 def _fresh_v34_xz_segments() -> list[dict]:
     texts = {
+        12: "equation, F = ma. What it means is that we can do",
+        13: "quantitative calculations relating the",
+        14: "magnitude of a force applied to an",
+        15: "object, the mass of the object, and the",
+        16: "magnitude of the acceleration that",
+        17: "object will experience, and it shows the",
+        18: "derivation of the Newton as the SI unit",
+        19: "of force when we plug in 1 kilogram and",
+        20: "one meter per second squared for mass",
         21: "and acceleration. There are a number of",
         22: "things we can say about this equation,",
         23: "which is tiny but powerful. First it",
@@ -3697,19 +3763,6 @@ def _fresh_v34_xz_segments() -> list[dict]:
     ),
     [
         (
-            24,
-            28,
-            "means that heavier objects will require",
-            "equal to force divided by mass",
-            "acceleration being equal to force divided by mass",
-            "F=ma proportionality intuition",
-            "Explain how mass changes the force needed for equal acceleration",
-            "force, mass, and acceleration proportionality",
-            23,
-            "First it",
-            "which is tiny but powerful",
-        ),
-        (
             38,
             53,
             "proportional to the force applied and",
@@ -3735,11 +3788,24 @@ def _fresh_v34_xz_segments() -> list[dict]:
             "It is",
             "experiences will be directly",
         ),
+        (
+            37,
+            49,
+            "will be directly proportional",
+            "in response to the net force",
+            "net force is the sum of all the forces acting",
+            "Calculating Net Force",
+            "Define net force as the vector sum of all forces acting on an object",
+            "net force",
+            39,
+            "It is",
+            "experiences will be directly",
+        ),
     ],
     ids=[
-        "fma-proportionality",
         "net-force-vector-addition",
         "fresh-v35-split-relational-tail",
+        "fresh-v11-late-relational-word",
     ],
 )
 def test_fresh_v34_relational_fragments_recover_the_claim_sentence(
@@ -3791,7 +3857,2288 @@ def test_fresh_v34_relational_fragments_recover_the_claim_sentence(
     assert clip["start_quote"] == expected_quote
     assert clip["_clip_text"].startswith(expected_quote)
     assert excluded_prefix not in clip["_clip_text"]
-    assert "trimmed_clipped_start_to_claim_sentence" in (
+    assert {
+        "trimmed_clipped_start_to_claim_sentence",
+        "finalized_incomplete_start_context",
+    }.intersection(clip["_boundary_fallback_reasons"])
+
+
+def test_fresh_v11_proportionality_recovers_the_spoken_equation_antecedent() -> None:
+    segments = _fresh_v34_xz_segments()
+    cue_to_line = {
+        int(segment["cue_id"].rsplit(":", 1)[1]): line
+        for line, segment in enumerate(segments)
+    }
+    exact_request = (
+        "Explain Newton's second law F=ma from intuition through worked examples, "
+        "including net force, mass, acceleration, units, and solving for each variable"
+    )
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": exact_request,
+            "constraints": [
+                {
+                    "constraint_id": "subject",
+                    "kind": "subject",
+                    "source_phrase": "Newton's second law F=ma",
+                    "requirement": "Explain Newton's second law F=ma",
+                },
+                {
+                    "constraint_id": "mass",
+                    "kind": "subject",
+                    "source_phrase": "mass",
+                    "requirement": "Explain the role of mass",
+                },
+                {
+                    "constraint_id": "acceleration",
+                    "kind": "subject",
+                    "source_phrase": "acceleration",
+                    "requirement": "Explain acceleration",
+                },
+                {
+                    "constraint_id": "solving",
+                    "kind": "task",
+                    "source_phrase": "solving for each variable",
+                    "requirement": "Show how to solve for acceleration",
+                },
+            ],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="intuition-and-proportionality",
+            start_line=cue_to_line[24],
+            end_line=cue_to_line[39],
+            start_quote="means that heavier objects will require",
+            end_quote="inversely proportional to its mass.",
+            claim_quote="directly proportional to the force applied",
+            title="Intuition for Acceleration",
+            learning_objective=(
+                "Explain how acceleration is proportional to force and inversely "
+                "proportional to mass."
+            ),
+            facet="proportionality in F=ma",
+            informativeness=0.95,
+            topic_relevance=0.95,
+            educational_importance=0.95,
+            difficulty=0.5,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[
+                {"id": "subject", "q": "the second law can be rephrased"},
+                {"id": "mass", "q": "inversely proportional to its mass"},
+                {
+                    "id": "acceleration",
+                    "q": "acceleration an object experiences will be directly",
+                },
+                {
+                    "id": "solving",
+                    "q": "acceleration being equal to force divided by mass",
+                },
+            ],
+        )],
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "xzA6IBWUEDE:cue:12"
+    assert clip["start_quote"] == "F = ma. What it means is"
+    assert clip["_clip_text"].startswith("F = ma. What it means is")
+    for evidence in plan.topics[0].intent_evidence:
+        assert evidence.evidence_quote in clip["_clip_text"]
+    assert "expanded_subjectless_predicate_context" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_fresh_v11_completed_example_advances_to_grounded_new_problem() -> None:
+    raw_cues = [
+        (
+            6,
+            159.76,
+            200.56,
+            "now if you want to compare it to the weight force the weight force is "
+            "mg so that's going to be 50 times 9.8 which is 490. so notice that "
+            "when the rope is used to lift up the object with an upward acceleration "
+            "the tension force is greater than the weight force but now what if the "
+            "rope is being used to allow the box to slowly descend intuitively we "
+            "know that the tension force should be less than a weight force if the "
+            "box is descending with a downward acceleration so let's get the answer "
+            "for part b",
+        ),
+        (
+            7,
+            198.879,
+            248.08,
+            "so m is 50 g is 9.8 but the acceleration because it's downward it's "
+            "going to be negative 0.75 instead of positive 0.75 so 9.8 minus 0.75 "
+            "that's 9.05 and then times 50 this is going to be 452.5 newtons so as "
+            "you can see the tension force is less than the weight force when the "
+            "object is slowly descending with a downward acceleration now let's work "
+            "on this problem what is the tension in the two ropes in the picture "
+            "shown below now notice that the crate or the box whatever you want to "
+            "call it",
+        ),
+        (
+            8,
+            245.599,
+            276.72,
+            "it's in equilibrium it's at rest so therefore the sum of all forces in "
+            "the x and in the y direction must add to zero so when you see a problem "
+            "like this you want to break down t1 and t2 and into its components t2 "
+            "has an x component and a y component t1 also has an x component and a "
+            "y component t1 y",
+        ),
+        (
+            9,
+            278.479,
+            326.479,
+            "and the crate also has a weight force now because the object is at rest "
+            "because it's an equilibrium the net force in the x direction and in the "
+            "y direction must be zero so let's focus on the forces in the x direction "
+            "this one is in the positive x direction so that's positive t 2 x this "
+            "one is in a negative x direction so it's negative t 1 x and because the "
+            "object is at rest the net force in the x direction is zero so if we add "
+            "t one x to both sides we can see that t one x is equal to t two x now",
+        ),
+        (
+            10,
+            322.8,
+            343.039,
+            "t ax is t cosine theta t y is t sine theta so t one x is going to be t "
+            "one cosine theta t two x is t two cosine theta you can call this cosine "
+            "theta two if you want and cosine theta 1 to distinguish these two angles",
+        ),
+        (
+            11,
+            345.6,
+            395.16,
+            "so for t1 the angle that's associated with it is 60. so t1 cosine 60 is "
+            "equal to t2 cosine 30. now cosine 60 in degree mode that's 0.866 actually "
+            "that's one half that's 0.5 cosine 30 is 0.866 so let's divide both sides "
+            "by 0.5 0.866 divided by 0.5 that's 1.732 so t1 is 1.732 times t2 so "
+            "let's save this equation for later",
+        ),
+        (
+            12,
+            401.039,
+            447.28,
+            "now let's focus on the forces in the y direction so we have two upward "
+            "forces t1 y and t2i so they're both going to be positive and we have a "
+            "weight force in the negative y direction so that's going to be negative "
+            "w now because the object is at rest the net force in the y direction is "
+            "zero so i'm going to add w to both sides so w is equal to t one y plus t "
+            "two y so these two upward tension forces must balance or support the "
+            "downward weight force so the weight which is basically mg",
+        ),
+        (
+            13,
+            447.599,
+            474.96,
+            "that's equal to t1y which is t one sine theta one plus t two y which is "
+            "t two sine theta two so m the mass is sixty g is nine point eight and t1 "
+            "we don't know what that is right now but theta 1 is 60 and theta 2 is 30.",
+        ),
+        (
+            14,
+            476.56,
+            530.839,
+            "now 60 times 9.8 that's 588 and sine 60 is 0.866 sine 30 is 0.5 so now "
+            "what i'm going to do is i'm going to replace t1 with 1.732 t2 so we got "
+            "to solve this using substitution anytime you have two variables you need "
+            "two equations to find or to solve those two variables so now this is "
+            "going to be 588 which is equal to 0.866 times 1.732 if you multiply those "
+            "two numbers you're going to get a number that's if rounded 1.5 and then "
+            "let's add this to it",
+        ),
+        (15, 545.36, 555.6, "so 1.5 plus 0.5 that's 2. so 588 is equal to 2 times t2"),
+        (
+            16,
+            556.72,
+            599.6,
+            "so 588 divided by 2 is 294. so that's the tension force in this rope now "
+            "using this equation we can find t1 so t1 is going to be 1.732 times 294 "
+            "so just take this number plug it into this equation and so t1 is about "
+            "509.2 newtons so now we have the two tension forces so this is well these "
+            "are the answers but now let's check our work",
+        ),
+    ]
+    segments = [
+        {
+            "cue_id": f"F5oqJ5t-pa4:cue:{cue}",
+            "start": start,
+            "end": end,
+            "text": text,
+        }
+        for cue, start, end, text in raw_cues
+    ]
+    claim = "net force in the x direction and in the y direction must be zero"
+    plan = _compact_custom_plan(
+        request="Newton's second law and net force",
+        start_quote="but now what if the rope",
+        end_quote="t1 is about 509.2 newtons",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "request_intent": gemini_segment._RequestIntent(
+            exact_request=(
+                "Explain Newton's second law F=ma from intuition through worked "
+                "examples, including net force, mass, acceleration, units, and "
+                "solving for each variable"
+            ),
+            constraints=[
+                {
+                    "constraint_id": "net_force",
+                    "kind": "subject",
+                    "source_phrase": "net force",
+                    "requirement": "Explain net force",
+                },
+                {
+                    "constraint_id": "solving",
+                    "kind": "task",
+                    "source_phrase": "solving for each variable",
+                    "requirement": "Solve the force equations",
+                },
+            ],
+        ),
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "net-force-equilibrium-2d",
+            "start_line": 0,
+            "end_line": 10,
+            "title": "Solving for Zero Net Force",
+            "learning_objective": (
+                "Solve for multiple unknown forces when the net force is zero"
+            ),
+            "facet": "zero net force in equilibrium",
+            "intent_evidence": [
+                gemini_segment._CompactIntentEvidence.model_validate({
+                    "id": "net_force",
+                    "q": claim,
+                }),
+                gemini_segment._CompactIntentEvidence.model_validate({
+                    "id": "solving",
+                    "q": "solve this using substitution anytime you have two variables",
+                }),
+            ],
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "F5oqJ5t-pa4:cue:7"
+    assert clip["start_quote"] == "now let's work on this problem"
+    assert clip["_clip_text"].startswith("now let's work on this problem")
+    assert "452.5 newtons" not in clip["_clip_text"]
+    assert "advanced_to_grounded_unit_handoff" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_fresh_v11_contextual_answer_advances_to_standalone_definition() -> None:
+    segments = [
+        {
+            "cue_id": "ZcZQsj6YAgU:cue:26",
+            "start": 56.246,
+            "end": 57.925,
+            "text": "but restore it to what?",
+        },
+        {
+            "cue_id": "ZcZQsj6YAgU:cue:27",
+            "start": 57.925,
+            "end": 60.722,
+            "text": "Restore the system to the equilibrium position.",
+        },
+        {
+            "cue_id": "ZcZQsj6YAgU:cue:28",
+            "start": 60.722,
+            "end": 63.402,
+            "text": "So every oscillator has an equilibrium position,",
+        },
+        {
+            "cue_id": "ZcZQsj6YAgU:cue:29",
+            "start": 63.402,
+            "end": 65.193,
+            "text": "and that would be the point at which",
+        },
+        {
+            "cue_id": "ZcZQsj6YAgU:cue:30",
+            "start": 65.193,
+            "end": 69.44,
+            "text": "there's no net force on the object that's oscillating.",
+        },
+        {
+            "cue_id": "ZcZQsj6YAgU:cue:31",
+            "start": 69.44,
+            "end": 71.503,
+            "text": "So for instance, for this mass,",
+        },
+        {
+            "cue_id": "ZcZQsj6YAgU:cue:32",
+            "start": 71.503,
+            "end": 73.175,
+            "text": "if this mass on the spring was sitting",
+        },
+        {
+            "cue_id": "ZcZQsj6YAgU:cue:33",
+            "start": 73.175,
+            "end": 74.705,
+            "text": "at the equilibrium position,",
+        },
+        {
+            "cue_id": "ZcZQsj6YAgU:cue:34",
+            "start": 74.705,
+            "end": 77.365,
+            "text": "the net force on that mass would be 0 because",
+        },
+        {
+            "cue_id": "ZcZQsj6YAgU:cue:35",
+            "start": 77.365,
+            "end": 79.956,
+            "text": "that's what we mean by the equilibrium position.",
+        },
+        {
+            "cue_id": "ZcZQsj6YAgU:cue:36",
+            "start": 79.956,
+            "end": 81.344,
+            "text": "In other words, if you just sat",
+        },
+        {
+            "cue_id": "ZcZQsj6YAgU:cue:37",
+            "start": 81.344,
+            "end": 82.916,
+            "text": "the mass there it would just stay there",
+        },
+        {
+            "cue_id": "ZcZQsj6YAgU:cue:38",
+            "start": 82.916,
+            "end": 84.242,
+            "text": "because there's no net force on it.",
+        },
+    ]
+    claim = "point at which there's no net force on the object"
+    plan = _compact_custom_plan(
+        request="equilibrium and net force",
+        start_quote="Restore the system to the equilibrium",
+        end_quote="because there's no net force on it.",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "request_intent": gemini_segment._RequestIntent(
+            exact_request=(
+                "Explain Newton's second law F=ma from intuition through worked "
+                "examples, including net force, mass, acceleration, units, and "
+                "solving for each variable"
+            ),
+            constraints=[{
+                "constraint_id": "subject-net-force",
+                "kind": "subject",
+                "source_phrase": "net force",
+                "requirement": "Explain net force",
+            }],
+        ),
+        "topics": [plan.topics[0].model_copy(update={
+            "candidate_id": "equilibrium-net-force",
+            "start_line": 1,
+            "end_line": 12,
+            "title": "Equilibrium and Net Force",
+            "learning_objective": (
+                "Explain how an equilibrium position is defined by zero net force."
+            ),
+            "facet": "net force at equilibrium",
+            "intent_evidence": [
+                gemini_segment._CompactIntentEvidence.model_validate({
+                    "id": "subject-net-force",
+                    "q": claim,
+                }),
+            ],
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "ZcZQsj6YAgU:cue:28"
+    assert clip["start_quote"] == "So every oscillator has an equilibrium"
+    assert clip["_clip_text"].startswith("So every oscillator")
+    assert "Restore the system" not in clip["_clip_text"]
+    assert "advanced_to_grounded_unit_handoff" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_contextual_answer_keeps_a_parameter_missing_from_the_later_claim() -> None:
+    segments = [
+        {
+            "cue_id": "contextual-parameter:cue:0",
+            "start": 0.0,
+            "end": 3.0,
+            "text": "Where should you place the mass?",
+        },
+        {
+            "cue_id": "contextual-parameter:cue:1",
+            "start": 3.0,
+            "end": 6.0,
+            "text": "Place the mass at x equals 2.",
+        },
+        {
+            "cue_id": "contextual-parameter:cue:2",
+            "start": 6.0,
+            "end": 9.0,
+            "text": "The net force is zero at that coordinate.",
+        },
+    ]
+    result = gemini_segment._trusted_grounded_forward_unit_start(
+        segments,
+        selected_line=1,
+        selected_left=0,
+        claim_location=(2, 0, 2, len(segments[2]["text"])),
+        intent_locations=[],
+        scope_text=(
+            "Place a Mass at Equilibrium Identify where net force is zero "
+            "equilibrium coordinate and net force"
+        ),
+    )
+
+    assert result is None
+
+
+def test_contextual_answer_keeps_a_quantity_repeated_only_by_name() -> None:
+    segments = [
+        {
+            "cue_id": "contextual-quantity:cue:0",
+            "start": 0.0,
+            "end": 3.0,
+            "text": "What angle should you set?",
+        },
+        {
+            "cue_id": "contextual-quantity:cue:1",
+            "start": 3.0,
+            "end": 6.0,
+            "text": "Set the system angle to 30 degrees.",
+        },
+        {
+            "cue_id": "contextual-quantity:cue:2",
+            "start": 6.0,
+            "end": 9.0,
+            "text": "The system angle determines the net force.",
+        },
+    ]
+
+    result = gemini_segment._trusted_grounded_forward_unit_start(
+        segments,
+        selected_line=1,
+        selected_left=0,
+        claim_location=(2, 0, 2, len(segments[2]["text"])),
+        intent_locations=[],
+        scope_text="system angle and net force",
+    )
+
+    assert result is None
+
+
+def test_contextual_answer_keeps_an_action_named_by_the_objective() -> None:
+    segments = [
+        {
+            "cue_id": "contextual-action:cue:0",
+            "start": 0.0,
+            "end": 3.0,
+            "text": "What should you do with the system?",
+        },
+        {
+            "cue_id": "contextual-action:cue:1",
+            "start": 3.0,
+            "end": 6.0,
+            "text": "Return the system to equilibrium.",
+        },
+        {
+            "cue_id": "contextual-action:cue:2",
+            "start": 6.0,
+            "end": 9.0,
+            "text": "The system at equilibrium has zero net force.",
+        },
+    ]
+
+    result = gemini_segment._trusted_grounded_forward_unit_start(
+        segments,
+        selected_line=1,
+        selected_left=0,
+        claim_location=(2, 0, 2, len(segments[2]["text"])),
+        intent_locations=[],
+        scope_text="Return the system to equilibrium and explain zero net force",
+    )
+
+    assert result is None
+
+
+def test_forward_caution_keeps_a_split_quantity() -> None:
+    segments = [
+        {
+            "cue_id": "caution-quantity:cue:0",
+            "start": 0.0,
+            "end": 3.0,
+            "text": "At this endpoint, the system angle is",
+        },
+        {
+            "cue_id": "caution-quantity:cue:1",
+            "start": 3.0,
+            "end": 5.0,
+            "text": "30 degrees.",
+        },
+        {
+            "cue_id": "caution-quantity:cue:2",
+            "start": 5.0,
+            "end": 8.0,
+            "text": "So be careful, the system angle determines",
+        },
+        {
+            "cue_id": "caution-quantity:cue:3",
+            "start": 8.0,
+            "end": 11.0,
+            "text": "the direction of the net force.",
+        },
+    ]
+
+    result = gemini_segment._trusted_grounded_forward_unit_start(
+        segments,
+        selected_line=1,
+        selected_left=0,
+        claim_location=(3, 0, 3, len(segments[3]["text"])),
+        intent_locations=[],
+        scope_text="system angle and net force direction",
+    )
+
+    assert result is None
+
+
+def test_forward_caution_keeps_context_needed_by_a_deictic_opening() -> None:
+    segments = [
+        {
+            "cue_id": "caution-deictic:cue:0",
+            "start": 0.0,
+            "end": 3.0,
+            "text": "At the left endpoint,",
+        },
+        {
+            "cue_id": "caution-deictic:cue:1",
+            "start": 3.0,
+            "end": 5.0,
+            "text": "the force is greatest.",
+        },
+        {
+            "cue_id": "caution-deictic:cue:2",
+            "start": 5.0,
+            "end": 8.0,
+            "text": "So be careful, the force points left here.",
+        },
+        {
+            "cue_id": "caution-deictic:cue:3",
+            "start": 8.0,
+            "end": 11.0,
+            "text": "The net force is equal to ma.",
+        },
+    ]
+
+    result = gemini_segment._trusted_grounded_forward_unit_start(
+        segments,
+        selected_line=1,
+        selected_left=0,
+        claim_location=(3, 0, 3, len(segments[3]["text"])),
+        intent_locations=[],
+        scope_text="force direction and Newton's second law",
+    )
+
+    assert result is None
+
+
+@pytest.mark.parametrize(
+    ("opening", "selected", "caution", "scope"),
+    [
+        (
+            "Because a larger mass resists the same force,",
+            "the acceleration is smaller.",
+            "Remember, acceleration decreases as mass increases.",
+            "Explain why acceleration decreases as mass increases",
+        ),
+        (
+            "Compared with a light cart,",
+            "the heavy cart accelerates less.",
+            "Remember, acceleration depends on mass.",
+            "Compare heavy and light carts",
+        ),
+        (
+            "Just as the applied force doubles,",
+            "the acceleration doubles too.",
+            "Remember, acceleration also doubles.",
+            "force and acceleration proportionality",
+        ),
+    ],
+)
+def test_forward_caution_keeps_causal_and_comparative_context(
+    opening: str,
+    selected: str,
+    caution: str,
+    scope: str,
+) -> None:
+    texts = [
+        opening,
+        selected,
+        caution,
+        "Newton's second law relates force, mass, and acceleration.",
+    ]
+    segments = [
+        {
+            "cue_id": f"caution-context:cue:{index}",
+            "start": float(index * 3),
+            "end": float(index * 3 + 3),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    result = gemini_segment._trusted_grounded_forward_unit_start(
+        segments,
+        selected_line=1,
+        selected_left=0,
+        claim_location=(3, 0, 3, len(segments[3]["text"])),
+        intent_locations=[],
+        scope_text=scope,
+    )
+
+    assert result is None
+
+
+def test_contextual_answer_keeps_comparative_context() -> None:
+    segments = [
+        {
+            "cue_id": "contextual-comparison:cue:0",
+            "start": 0.0,
+            "end": 3.0,
+            "text": "How should you configure the system for case B?",
+        },
+        {
+            "cue_id": "contextual-comparison:cue:1",
+            "start": 3.0,
+            "end": 6.0,
+            "text": "Set the system at equilibrium.",
+        },
+        {
+            "cue_id": "contextual-comparison:cue:2",
+            "start": 6.0,
+            "end": 9.0,
+            "text": "The system behaves similarly at equilibrium.",
+        },
+    ]
+
+    result = gemini_segment._trusted_grounded_forward_unit_start(
+        segments,
+        selected_line=1,
+        selected_left=0,
+        claim_location=(2, 0, 2, len(segments[2]["text"])),
+        intent_locations=[],
+        scope_text="system equilibrium behavior",
+    )
+
+    assert result is None
+
+
+def test_original_gemini_edge_can_advance_after_backward_context_expansion() -> None:
+    segments = [
+        {
+            "cue_id": "original-edge:cue:0",
+            "start": 0.0,
+            "end": 3.0,
+            "text": "We just finished discussing velocity.",
+        },
+        {
+            "cue_id": "original-edge:cue:1",
+            "start": 3.0,
+            "end": 5.0,
+            "text": "is zero.",
+        },
+        {
+            "cue_id": "original-edge:cue:2",
+            "start": 5.0,
+            "end": 9.0,
+            "text": "Remember, there is no net force at equilibrium.",
+        },
+    ]
+    claim = "no net force at equilibrium."
+    plan = _compact_custom_plan(
+        request="net force at equilibrium",
+        start_quote="is zero.",
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 2,
+            "title": "Net Force at Equilibrium",
+            "learning_objective": "Explain zero net force at equilibrium",
+            "facet": "equilibrium net force",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "original-edge:cue:2"
+    assert clip["_clip_text"].startswith("Remember, there is no net force")
+    assert "velocity" not in clip["_clip_text"]
+
+
+@pytest.mark.parametrize(
+    "current_condition",
+    [
+        "The solution is acidic, so now let us work on this problem.",
+        "The result is negative, so now let us work on this problem.",
+        "The answer is unknown, so now let us work on this problem.",
+    ],
+)
+def test_forward_worked_handoff_keeps_an_unclosed_current_condition(
+    current_condition: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "condition-handoff:cue:0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": current_condition,
+        },
+        {
+            "cue_id": "condition-handoff:cue:1",
+            "start": 4.0,
+            "end": 8.0,
+            "text": "Remember, the pH is below seven.",
+        },
+    ]
+
+    result = gemini_segment._trusted_grounded_forward_unit_start(
+        segments,
+        selected_line=0,
+        selected_left=0,
+        claim_location=(1, 0, 1, len(segments[1]["text"])),
+        intent_locations=[],
+        scope_text="worked example calculate pH for an acidic solution",
+    )
+
+    assert result is None
+
+
+def test_forward_worked_handoff_can_trim_a_closed_prior_answer() -> None:
+    segments = [
+        {
+            "cue_id": "closed-handoff:cue:0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "The answer is four. Now let us work on this problem.",
+        },
+        {
+            "cue_id": "closed-handoff:cue:1",
+            "start": 4.0,
+            "end": 8.0,
+            "text": "Remember, the pH is below seven.",
+        },
+    ]
+
+    result = gemini_segment._trusted_grounded_forward_unit_start(
+        segments,
+        selected_line=0,
+        selected_left=0,
+        claim_location=(1, 0, 1, len(segments[1]["text"])),
+        intent_locations=[],
+        scope_text="worked example calculate pH",
+    )
+
+    assert result is not None
+    line, span, _quote = result
+    assert line == 0
+    assert segments[line]["text"][span[0]:].startswith("Now let us work")
+
+
+@pytest.mark.parametrize(
+    "comparison",
+    [
+        "half as large",
+        "twice as large",
+        "smaller than before",
+        "larger than before",
+        "greater than before",
+        "less than before",
+    ],
+)
+def test_forward_caution_keeps_comparative_predicate_context(
+    comparison: str,
+) -> None:
+    texts = [
+        "For a cart",
+        "with twice the mass, the same force produces",
+        f"Remember, acceleration is {comparison} because a equals F over m.",
+    ]
+    segments = [
+        {
+            "cue_id": f"comparative-predicate:cue:{index}",
+            "start": float(index * 3),
+            "end": float(index * 3 + 3),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    result = gemini_segment._trusted_grounded_forward_unit_start(
+        segments,
+        selected_line=1,
+        selected_left=0,
+        claim_location=(2, 0, 2, len(segments[2]["text"])),
+        intent_locations=[],
+        scope_text="mass and acceleration",
+    )
+
+    assert result is None
+
+
+def test_fresh_v11_oscillator_fragment_advances_to_complete_caution() -> None:
+    raw_cues = [
+        (357, 738.987, 740.928, "So even though the speed is 0,"),
+        (358, 740.928, 742.515, "the force is greatest."),
+        (359, 742.515, 744.63, "So, be careful, force does not have to be"),
+        (360, 744.63, 746.456, "proportional to the speed."),
+        (361, 746.456, 747.836, "The force has to be proportional"),
+        (362, 747.836, 749.95, "to the acceleration, right?"),
+        (363, 749.95, 751.485, "Because we know net force,"),
+        (364, 751.485, 754.625, "we could say that the net force is equal to ma."),
+        (
+            365,
+            754.625,
+            757.028,
+            "So wherever you have the largest amount of force,",
+        ),
+        (
+            366,
+            757.028,
+            759.641,
+            "you'll have the largest amount of acceleration.",
+        ),
+        (367, 759.641, 761.563, "So we could also say at these endpoints,"),
+        (
+            368,
+            761.563,
+            764.248,
+            "you'll have not only the greatest magnitude of the force,",
+        ),
+        (
+            369,
+            764.248,
+            767.623,
+            "but the greatest magnitude of acceleration as well.",
+        ),
+        (
+            370,
+            767.623,
+            769.88,
+            "Because where you're pulling or pushing on something",
+        ),
+        (371, 769.88, 771.215, "with the greatest amount of force,"),
+        (372, 771.215, 772.723, "you're going to get the greatest amount"),
+        (
+            373,
+            772.723,
+            775.267,
+            "of acceleration according to Newton's Second Law.",
+        ),
+        (374, 775.267, 776.362, "So at these endpoints,"),
+        (
+            375,
+            776.362,
+            780.36,
+            "the force is greatest, the acceleration is also greatest.",
+        ),
+        (
+            376,
+            780.36,
+            782.745,
+            "The magnitude, the acceleration is also greatest",
+        ),
+        (
+            377,
+            782.745,
+            786.595,
+            "even though the speed is 0 at those points.",
+        ),
+    ]
+    segments = [
+        {
+            "cue_id": f"ZcZQsj6YAgU:cue:{cue}",
+            "start": start,
+            "end": end,
+            "text": text,
+        }
+        for cue, start, end, text in raw_cues
+    ]
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": (
+                "Explain Newton's second law F=ma from intuition through worked "
+                "examples, including net force, mass, acceleration, units, and "
+                "solving for each variable"
+            ),
+            "constraints": [
+                {
+                    "constraint_id": "subject-fma",
+                    "kind": "subject",
+                    "source_phrase": "Newton's second law F=ma",
+                    "requirement": "Explain Newton's second law F=ma",
+                },
+                {
+                    "constraint_id": "subject-net-force",
+                    "kind": "subject",
+                    "source_phrase": "net force",
+                    "requirement": "Connect net force to F=ma",
+                },
+                {
+                    "constraint_id": "subject-acceleration",
+                    "kind": "subject",
+                    "source_phrase": "acceleration",
+                    "requirement": "Connect force to acceleration",
+                },
+            ],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="newtons-second-law-oscillator",
+            start_line=1,
+            end_line=20,
+            start_quote="the force is greatest",
+            end_quote="even though the speed is 0 at those points.",
+            claim_quote="the net force is equal to ma.",
+            title="Applying Newton's Second Law",
+            learning_objective=(
+                "Use Newton's Second Law F=ma to connect force and acceleration."
+            ),
+            facet="Newton's second law F=ma",
+            informativeness=0.95,
+            topic_relevance=0.95,
+            educational_importance=0.95,
+            difficulty=0.5,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[
+                {"id": "subject-fma", "q": "the net force is equal to ma."},
+                {
+                    "id": "subject-net-force",
+                    "q": "we could say that the net force is equal",
+                },
+                {
+                    "id": "subject-acceleration",
+                    "q": "you'll have the largest amount of acceleration.",
+                },
+            ],
+        )],
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "ZcZQsj6YAgU:cue:359"
+    assert clip["start_quote"] == "So, be careful, force does not"
+    assert clip["_clip_text"].startswith("So, be careful, force does not have")
+    assert not clip["_clip_text"].startswith("the force is greatest")
+    assert "advanced_to_grounded_unit_handoff" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_forward_caution_never_discards_worked_example_givens() -> None:
+    segments = [
+        {
+            "cue_id": "worked-caution:cue:0",
+            "start": 0.0,
+            "end": 3.0,
+            "text": "For this cart, the mass is 5 kilograms and",
+        },
+        {
+            "cue_id": "worked-caution:cue:1",
+            "start": 3.0,
+            "end": 5.0,
+            "text": "the applied force is 10 newtons.",
+        },
+        {
+            "cue_id": "worked-caution:cue:2",
+            "start": 5.0,
+            "end": 8.0,
+            "text": "So be careful, use the net force before calculating.",
+        },
+        {
+            "cue_id": "worked-caution:cue:3",
+            "start": 8.0,
+            "end": 11.0,
+            "text": "The acceleration is 2 meters per second squared.",
+        },
+    ]
+    claim = "The acceleration is 2 meters per second squared."
+    plan = _compact_custom_plan(
+        request="worked F=ma example",
+        start_quote="the applied force is 10 newtons.",
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 3,
+            "title": "Calculate Acceleration from Force and Mass",
+            "learning_objective": (
+                "Solve a worked example using the given force and mass"
+            ),
+            "facet": "worked F=ma calculation",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] in {
+        "worked-caution:cue:0",
+        "worked-caution:cue:1",
+    }
+    assert "applied force is 10 newtons" in clip["_clip_text"]
+    assert not clip["_clip_text"].startswith("So be careful")
+
+
+def test_forward_worked_handoff_does_not_mistake_a_given_for_a_result() -> None:
+    segments = [
+        {
+            "cue_id": "worked-given:cue:0",
+            "start": 0.0,
+            "end": 6.0,
+            "text": (
+                "A cart has a mass of 5 kilograms. Now let us work on this problem: "
+                "what is its acceleration?"
+            ),
+        },
+        {
+            "cue_id": "worked-given:cue:1",
+            "start": 6.0,
+            "end": 10.0,
+            "text": (
+                "Using F equals ma, the acceleration is 2 meters per second squared."
+            ),
+        },
+    ]
+    claim = "the acceleration is 2 meters per second squared."
+    plan = _compact_custom_plan(
+        request="worked F=ma example",
+        start_quote="A cart has a mass of",
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 0,
+            "end_line": 1,
+            "title": "Calculate the Cart's Acceleration",
+            "learning_objective": "Solve a worked F=ma problem from the given mass",
+            "facet": "worked acceleration problem",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "worked-given:cue:0"
+    assert clip["_clip_text"].startswith("A cart has a mass of 5 kilograms")
+    assert "advanced_to_grounded_unit_handoff" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_forward_worked_handoff_keeps_new_givens_after_a_prior_result() -> None:
+    segments = [
+        {
+            "cue_id": "worked-new-givens:cue:0",
+            "start": 0.0,
+            "end": 7.0,
+            "text": (
+                "The answer is 4 newtons. A cart has a mass of 5 kilograms. "
+                "Now let us work on this problem: what is its acceleration?"
+            ),
+        },
+        {
+            "cue_id": "worked-new-givens:cue:1",
+            "start": 7.0,
+            "end": 11.0,
+            "text": (
+                "Using F equals ma, the acceleration is 2 meters per second squared."
+            ),
+        },
+    ]
+
+    result = gemini_segment._trusted_grounded_forward_unit_start(
+        segments,
+        selected_line=0,
+        selected_left=0,
+        claim_location=(1, 0, 1, len(segments[1]["text"])),
+        intent_locations=[],
+        scope_text="Solve a worked acceleration problem for the cart",
+    )
+
+    assert result is None
+
+
+@pytest.mark.parametrize(
+    "selected",
+    [
+        (
+            "A cart has a mass of 5 kilograms so as you can see it is heavy "
+            "now let us work on this problem: what is its acceleration?"
+        ),
+        (
+            "We find a cart with a mass of 5 kilograms so as you can see it is "
+            "heavy now let us work on this problem: what is its acceleration?"
+        ),
+        (
+            "It is a 5 kilogram cart so as you can see it is heavy now let us "
+            "work on this problem: what is its acceleration?"
+        ),
+        (
+            "That completes this problem now a cart experiences a 10-newton force "
+            "now let us work on this problem: what is its acceleration?"
+        ),
+    ],
+)
+def test_forward_worked_handoff_never_treats_givens_as_a_result(
+    selected: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "worked-result-guard:cue:0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": selected,
+        },
+        {
+            "cue_id": "worked-result-guard:cue:1",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "Using F equals ma, the acceleration is 2 m/s squared.",
+        },
+    ]
+
+    result = gemini_segment._trusted_grounded_forward_unit_start(
+        segments,
+        selected_line=0,
+        selected_left=0,
+        claim_location=(1, 0, 1, len(segments[1]["text"])),
+        intent_locations=[],
+        scope_text="Solve a worked acceleration problem for the cart",
+    )
+
+    assert result is None
+
+
+def test_split_answer_recovers_direct_scenario_with_generic_metadata() -> None:
+    segments = [
+        {
+            "cue_id": "split-direct:cue:0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": (
+                "A cart has a mass of 5 kilograms and a net force of 10 newtons. "
+                "What is the"
+            ),
+        },
+        {
+            "cue_id": "split-direct:cue:1",
+            "start": 5.0,
+            "end": 10.0,
+            "text": (
+                "answer? Using F equals ma, the acceleration is 2 meters per "
+                "second squared."
+            ),
+        },
+    ]
+    claim = "the acceleration is 2 meters per second squared."
+    plan = _compact_custom_plan(
+        request="cart acceleration",
+        start_quote="answer? Using F equals ma",
+        end_quote=claim,
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 1,
+            "title": "Cart Acceleration",
+            "learning_objective": "Solve a worked cart acceleration problem",
+            "facet": "worked cart acceleration",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "split-direct:cue:0"
+    assert clip["_clip_text"].startswith("A cart has a mass of 5 kilograms")
+    assert "expanded_split_answer_scenario" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_split_answer_recovers_a_scenario_spanning_multiple_cues() -> None:
+    segments = [
+        {
+            "cue_id": "split-multi:cue:0",
+            "start": 0.0,
+            "end": 3.0,
+            "text": "So let us say if a cart has a mass of 5 kilograms and",
+        },
+        {
+            "cue_id": "split-multi:cue:1",
+            "start": 3.0,
+            "end": 6.0,
+            "text": "a force of 10 newtons acts. What is the",
+        },
+        {
+            "cue_id": "split-multi:cue:2",
+            "start": 6.0,
+            "end": 10.0,
+            "text": (
+                "answer? Using F equals ma, the acceleration is 2 meters per "
+                "second squared."
+            ),
+        },
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=2,
+        selected_left=0,
+        scope_text="worked cart acceleration",
+    )
+
+    assert result is not None
+    line, span = result
+    assert line == 0
+    assert segments[line]["text"][span[0]:].startswith("So let us say if a cart")
+
+
+@pytest.mark.parametrize(
+    "question_tail",
+    [
+        "What is your",
+        "What is our",
+        "What is its",
+        "What's the",
+        "What would be the",
+        "What is the correct",
+        "What is the final",
+        "What is the numerical",
+        "What is the possible",
+        "Which is the correct",
+        "What would your final",
+        "What is the most likely",
+        "What is the correct numerical",
+        "What is the actual",
+        "What is the approximate",
+        "What is the exact",
+        "What is the complete",
+    ],
+)
+def test_split_answer_recovers_common_split_question_tails(
+    question_tail: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "split-tail:cue:0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": (
+                "A cart has a mass of 5 kilograms and a force of 10 newtons. "
+                f"{question_tail}"
+            ),
+        },
+        {
+            "cue_id": "split-tail:cue:1",
+            "start": 5.0,
+            "end": 10.0,
+            "text": (
+                "answer? Using F equals ma, the acceleration is 2 meters per "
+                "second squared."
+            ),
+        },
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=1,
+        selected_left=0,
+        scope_text="worked cart acceleration",
+    )
+
+    assert result is not None
+    line, span = result
+    assert line == 0
+    assert segments[line]["text"][span[0]:].startswith("A cart has a mass")
+
+
+def test_split_answer_keeps_all_givens_for_multiple_objects() -> None:
+    segments = [
+        {
+            "cue_id": "split-objects:cue:0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "A cart has a mass of 5 kilograms. A box has a mass of 10 "
+                "kilograms and is connected to the cart by a rope. What is the"
+            ),
+        },
+        {
+            "cue_id": "split-objects:cue:1",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "answer? Using F equals ma, their acceleration is 2 m/s squared.",
+        },
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=1,
+        selected_left=0,
+        scope_text="worked acceleration problem",
+    )
+
+    assert result is not None
+    line, span = result
+    assert line == 0
+    assert segments[line]["text"][span[0]:].startswith("A cart has a mass")
+
+
+def test_split_answer_recovers_a_five_cue_scenario() -> None:
+    texts = [
+        "A cart has a mass of 5 kilograms.",
+        "It starts from rest on a horizontal surface.",
+        "A horizontal force acts on the cart.",
+        "The force is 10 newtons.",
+        "What is the",
+        "answer? Using F equals ma, the acceleration is 2 m/s squared.",
+    ]
+    segments = [
+        {
+            "cue_id": f"split-five:cue:{index}",
+            "start": float(index * 3),
+            "end": float(index * 3 + 3),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=5,
+        selected_left=0,
+        scope_text="worked cart acceleration",
+    )
+
+    assert result is not None
+    line, span = result
+    assert line == 0
+    assert segments[line]["text"][span[0]:].startswith("A cart has a mass")
+
+
+def test_split_answer_recovers_punctuationless_new_scenario() -> None:
+    segments = [
+        {
+            "cue_id": "split-unpunctuated:cue:0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "That completes the first problem now a cart has a mass of 5 "
+                "kilograms and a force of 10 newtons What is the"
+            ),
+        },
+        {
+            "cue_id": "split-unpunctuated:cue:1",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "answer? Using F equals ma, the acceleration is 2 m/s squared.",
+        },
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=1,
+        selected_left=0,
+        scope_text="worked cart acceleration",
+    )
+
+    assert result is not None
+    line, span = result
+    assert line == 0
+    assert segments[line]["text"][span[0]:].startswith("a cart has a mass")
+
+
+@pytest.mark.parametrize(
+    "local_setup",
+    [
+        "The solution contains hydrochloric acid at a known concentration. What is the",
+        "This solution contains hydrochloric acid at a known concentration. What is the",
+    ],
+)
+def test_split_answer_prefers_a_local_cross_domain_scenario(
+    local_setup: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "split-domain:cue:0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": (
+                "A cart has a mass of 5 kilograms and accelerates under a force. "
+                "Its acceleration is 2 meters per second squared."
+            ),
+        },
+        {
+            "cue_id": "split-domain:cue:1",
+            "start": 5.0,
+            "end": 10.0,
+            "text": local_setup,
+        },
+        {
+            "cue_id": "split-domain:cue:2",
+            "start": 10.0,
+            "end": 14.0,
+            "text": "answer? Using the concentration, the pH is 3.",
+        },
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=2,
+        selected_left=0,
+        scope_text="Calculate the pH of a solution",
+    )
+
+    assert result is not None
+    line, span = result
+    assert line == 1
+    assert "solution contains hydrochloric acid" in (
+        segments[line]["text"][span[0]:]
+    )
+
+
+def test_split_answer_recovers_a_multi_cue_cross_domain_premise() -> None:
+    segments = [
+        {
+            "cue_id": "split-domain-multi:cue:0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "A cart has a mass of 5 kilograms. Its acceleration is 2 m/s squared.",
+        },
+        {
+            "cue_id": "split-domain-multi:cue:1",
+            "start": 5.0,
+            "end": 8.0,
+            "text": "For a solution with hydrogen ion concentration",
+        },
+        {
+            "cue_id": "split-domain-multi:cue:2",
+            "start": 8.0,
+            "end": 11.0,
+            "text": "0.001 molar, what is the",
+        },
+        {
+            "cue_id": "split-domain-multi:cue:3",
+            "start": 11.0,
+            "end": 14.0,
+            "text": "answer? The pH is 3.",
+        },
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=3,
+        selected_left=0,
+        scope_text="Calculate the pH of a solution",
+    )
+
+    assert result is not None
+    line, span = result
+    assert line == 1
+    assert segments[line]["text"][span[0]:].startswith("For a solution")
+
+
+def test_split_answer_keeps_chained_generic_premises() -> None:
+    texts = [
+        "For a cart with a mass of 5 kilograms,",
+        "for a force of 10 newtons acting to the right,",
+        "what is the",
+        "answer? Using F equals ma, the acceleration is 2 m/s squared.",
+    ]
+    segments = [
+        {
+            "cue_id": f"split-premises:cue:{index}",
+            "start": float(index * 3),
+            "end": float(index * 3 + 3),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=3,
+        selected_left=0,
+        scope_text="worked cart acceleration",
+    )
+
+    assert result is not None
+    line, span = result
+    assert line == 0
+    assert segments[line]["text"][span[0]:].startswith("For a cart")
+
+
+@pytest.mark.parametrize(
+    "local_frame",
+    [
+        "At equilibrium, what is the",
+        "When the concentration is 0.001 molar, what is the",
+        "If a cart has mass 5 kilograms, what is the",
+        "On a frictionless surface, what is the",
+        "For mass 5 kilograms, what is the",
+    ],
+)
+def test_split_answer_prefers_complete_local_question_frames(
+    local_frame: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "split-frame:cue:0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "Photosynthesis converts light into chemical energy.",
+        },
+        {
+            "cue_id": "split-frame:cue:1",
+            "start": 4.0,
+            "end": 8.0,
+            "text": local_frame,
+        },
+        {
+            "cue_id": "split-frame:cue:2",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "answer? The result follows from the stated conditions.",
+        },
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=2,
+        selected_left=0,
+        scope_text="worked question",
+    )
+
+    assert result is not None
+    line, _span = result
+    assert line == 1
+
+
+@pytest.mark.parametrize(
+    "local_frame",
+    [
+        "At that previously identified equilibrium position, what is the",
+        "With those previously computed values, what is the",
+        "Under these initial conditions, what is the",
+        "For that earlier example configuration, what is the",
+        "Under the stated conditions, what is the",
+        "With the given values, what is the",
+        "At the aforementioned position, what is the",
+        "On the indicated graph, what is the",
+        "Under the assumed conditions, what is the",
+        "With the supplied data, what is the",
+        "At the specified point, what is the",
+        "Under these conditions it is zero, what is the",
+        "With this setup it is stable, what is the",
+        "On this graph it is increasing, what is the",
+        "At this point it is zero, what is the",
+        "In this setup, what is the",
+        "For this cart, what is the",
+        "In this system, what is the",
+        "For that object, what is the",
+        "For this case, what is the",
+    ],
+)
+def test_split_answer_recovers_context_for_deictic_question_frames(
+    local_frame: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "split-deictic:cue:0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "The equilibrium position is x equals 2 meters.",
+        },
+        {
+            "cue_id": "split-deictic:cue:1",
+            "start": 4.0,
+            "end": 8.0,
+            "text": local_frame,
+        },
+        {
+            "cue_id": "split-deictic:cue:2",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "answer? The net force is zero.",
+        },
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=2,
+        selected_left=0,
+        scope_text="equilibrium net force",
+    )
+
+    assert result is not None
+    line, _span = result
+    assert line == 0
+
+
+@pytest.mark.parametrize(
+    "local_frame",
+    [
+        "If this cart has a mass of 5 kilograms, what is the",
+        "At this equilibrium position x equals 2 meters, what is the",
+        "With these values force 10 newtons and mass 5 kilograms, what is the",
+        (
+            "Under these conditions temperature is 20 degrees and pressure is "
+            "1 atmosphere, what is the"
+        ),
+        "With this cart initially at rest, what is the",
+        "Under these conditions the surface is frictionless, what is the",
+        "When this solution is acidic, what is the",
+        "If the result is negative, what is the",
+        "When the solution is saturated, what is the",
+        "If this molecule has three atoms, what is the",
+        "At this position the force vanishes, what is the",
+        "When this solution freezes, what is the",
+        "When the force vanishes, what is the",
+        "If this cart moves, what is the",
+        "When this solution contains acid, what is the",
+        "If this cart receives a force, what is the",
+        "When this system uses feedback, what is the",
+        "If this particle does decay, what is the",
+        "In a vacuum, what is the",
+        "In a moving cart, what is the",
+        "The solution is acidic. What is the",
+        "The result is negative. What is the",
+    ],
+)
+def test_split_answer_keeps_locally_grounded_deictic_frames(
+    local_frame: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "split-local-deictic:cue:0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "Photosynthesis converts light into chemical energy.",
+        },
+        {
+            "cue_id": "split-local-deictic:cue:1",
+            "start": 4.0,
+            "end": 8.0,
+            "text": local_frame,
+        },
+        {
+            "cue_id": "split-local-deictic:cue:2",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "answer? The result follows from the local givens.",
+        },
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=2,
+        selected_left=0,
+        scope_text="worked question",
+    )
+
+    assert result is not None
+    line, _span = result
+    assert line == 1
+
+
+@pytest.mark.parametrize(
+    ("antecedent", "reference"),
+    [
+        ("The result is negative.", "With that result, what is the"),
+        ("The solution is 2 meters.", "Using that solution, what is the"),
+        ("The answer is 5 newtons.", "Given that answer, what is the"),
+        (
+            "A 5 kilogram cart is acted on by a force of 10 newtons.",
+            "When this force is applied, what is the",
+        ),
+        ("The measured value is 5.", "When this value is substituted, what is the"),
+        ("The governing equation is F equals ma.", "When this equation is used, what is the"),
+        ("The cart's mass is 5 kilograms.", "If this mass is used, what is the"),
+        ("The computed result is 1.96.", "When this result is rounded, what is the"),
+        (
+            "A statistical test produced the reported result.",
+            "When this result is statistically significant, what is the",
+        ),
+        ("A force of 10 newtons acts.", "If that force acts, what is the"),
+        ("The initial conditions are fixed.", "When these conditions hold, what is the"),
+        ("A draft answer was supplied.", "When this answer is incomplete, what is the"),
+        ("The velocity is 20 meters per second.", "When this velocity is substituted, what is the"),
+        ("The speed is 20 meters per second.", "When this speed is used, what is the"),
+        ("The acceleration is 2 meters per second squared.", "When this acceleration is reused, what is the"),
+        ("The temperature is 20 degrees.", "When this temperature is substituted, what is the"),
+        ("The pressure is 1 atmosphere.", "When this pressure is used, what is the"),
+        ("The concentration is 0.1 molar.", "When this concentration is substituted, what is the"),
+        ("The angle is 30 degrees.", "When this angle is used, what is the"),
+        ("The distance is 5 meters.", "When this distance is substituted, what is the"),
+        ("The time is 2 seconds.", "When this time is used, what is the"),
+        ("The voltage is 12 volts.", "When this voltage is substituted, what is the"),
+    ],
+)
+def test_split_answer_preserves_an_immediately_referenced_result(
+    antecedent: str,
+    reference: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "split-referenced-result:cue:0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": antecedent,
+        },
+        {
+            "cue_id": "split-referenced-result:cue:1",
+            "start": 4.0,
+            "end": 8.0,
+            "text": reference,
+        },
+        {
+            "cue_id": "split-referenced-result:cue:2",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "answer? The explanation follows from that value.",
+        },
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=2,
+        selected_left=0,
+        scope_text="worked question",
+    )
+
+    assert result is not None
+    line, _span = result
+    assert line == 0
+
+
+@pytest.mark.parametrize(
+    "premise_cues",
+    [
+        ("When this solution", "is acidic, what is the"),
+        ("If the cart", "moves, what is the"),
+        ("At", "equilibrium, what is the"),
+        ("In a", "vacuum, what is the"),
+        ("When this", "solution is acidic, what is the"),
+        ("If this", "solution is acidic, what is the"),
+    ],
+)
+def test_split_answer_reassembles_a_caption_split_local_premise(
+    premise_cues: tuple[str, str],
+) -> None:
+    texts = [
+        "Photosynthesis converts light into chemical energy.",
+        *premise_cues,
+        "answer? The explanation follows from the local premise.",
+    ]
+    segments = [
+        {
+            "cue_id": f"split-local-premise:cue:{index}",
+            "start": float(index * 4),
+            "end": float(index * 4 + 4),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=3,
+        selected_left=0,
+        scope_text="worked question",
+    )
+
+    assert result is not None
+    line, _span = result
+    assert line == 1
+
+
+def test_split_question_reconstruction_is_invariant_to_every_word_cut() -> None:
+    words = (
+        "A cart has a mass of 5 kilograms and a force of 10 newtons. "
+        "What is the"
+    ).split()
+    partitions = [
+        (" ".join(words[:cut]), " ".join(words[cut:]))
+        for cut in range(1, len(words))
+    ]
+    for first, second in partitions:
+        texts = [
+            "Photosynthesis converts light into chemical energy.",
+            first,
+            second,
+            "answer? The acceleration is 2 meters per second squared.",
+        ]
+        segments = [
+            {
+                "cue_id": f"partition-invariant:cue:{index}",
+                "start": float(index * 3),
+                "end": float(index * 3 + 3),
+                "text": text,
+            }
+            for index, text in enumerate(texts)
+        ]
+
+        result = gemini_segment._trusted_split_answer_scenario_start(
+            segments,
+            selected_line=3,
+            selected_left=0,
+            scope_text="cart mass force acceleration",
+        )
+
+        assert result is not None, (first, second)
+        line, span = result
+        assert line == 1, (first, second, result)
+        assert span[0] == 0
+
+
+def test_split_question_reconstruction_accepts_one_word_cues() -> None:
+    words = (
+        "A cart has a mass of 5 kilograms and a force of 10 newtons. "
+        "What is the"
+    ).split()
+    texts = [
+        "Photosynthesis converts light into chemical energy.",
+        *words,
+        "answer? The acceleration is 2 meters per second squared.",
+    ]
+    segments = [
+        {
+            "cue_id": f"one-word-partition:cue:{index}",
+            "start": float(index),
+            "end": float(index + 1),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=len(segments) - 1,
+        selected_left=0,
+        scope_text="cart mass force acceleration",
+    )
+
+    assert result is not None
+    line, span = result
+    assert line == 1
+    assert span[0] == 0
+
+
+@pytest.mark.parametrize(
+    "question_completion",
+    [
+        "answer? The acceleration is 2 meters per second squared.",
+        "answer. The acceleration is 2 meters per second squared.",
+        "answer: The acceleration is 2 meters per second squared.",
+        "answer, the acceleration is 2 meters per second squared.",
+        "answer—The acceleration is 2 meters per second squared.",
+        "final answer? The acceleration is 2 meters per second squared.",
+        "the final answer? The acceleration is 2 meters per second squared.",
+        "correct answer? The acceleration is 2 meters per second squared.",
+        "acceleration? Using F equals ma, it is 2 meters per second squared.",
+        "tension force? It is 10 newtons.",
+        "pH? The pH is 3.",
+    ],
+)
+def test_split_question_reconstruction_ignores_completion_punctuation_and_noun(
+    question_completion: str,
+) -> None:
+    texts = [
+        "Photosynthesis converts light into chemical energy.",
+        "A cart has mass 5 kilograms and force 10 newtons. What is the",
+        question_completion,
+    ]
+    segments = [
+        {
+            "cue_id": f"completion-invariant:cue:{index}",
+            "start": float(index * 4),
+            "end": float(index * 4 + 4),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=2,
+        selected_left=0,
+        scope_text="cart mass force acceleration",
+    )
+
+    assert result is not None
+    line, _span = result
+    assert line == 1
+
+
+@pytest.mark.parametrize(
+    ("premise", "scope"),
+    [
+        ("The solution is acidic with a pH of three.", "acidic solution pH"),
+        ("The temperature equals twenty degrees.", "temperature degrees"),
+        ("The coefficient is positive.", "positive coefficient"),
+        ("Water freezes at zero degrees.", "water freezing point"),
+        (
+            "The triangle is right angled with sides three four and five.",
+            "right angled triangle sides",
+        ),
+        ("A spring stretches by two centimeters.", "spring stretch centimeters"),
+        ("The reaction releases ten joules.", "reaction energy joules"),
+        ("The cell divides every twenty minutes.", "cell division minutes"),
+    ],
+)
+def test_split_question_prefers_the_grounded_cross_domain_premise(
+    premise: str,
+    scope: str,
+) -> None:
+    texts = [
+        "A cart has mass five kilograms.",
+        premise,
+        "What is the",
+        "answer? The explanation follows from the current premise.",
+    ]
+    segments = [
+        {
+            "cue_id": f"cross-domain-premise:cue:{index}",
+            "start": float(index * 4),
+            "end": float(index * 4 + 4),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=3,
+        selected_left=0,
+        scope_text=scope,
+    )
+
+    assert result is not None
+    line, _span = result
+    assert line == 1
+
+
+def test_split_question_does_not_replace_grounded_context_with_sponsor_copy() -> None:
+    texts = [
+        "A cart has mass five kilograms and force ten newtons.",
+        "Our sponsor supports education.",
+        "What is the",
+        "answer? The acceleration is two meters per second squared.",
+    ]
+    segments = [
+        {
+            "cue_id": f"sponsor-barrier:cue:{index}",
+            "start": float(index * 4),
+            "end": float(index * 4 + 4),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=3,
+        selected_left=0,
+        scope_text="cart mass force acceleration",
+    )
+
+    assert result is not None
+    line, _span = result
+    assert line == 0
+
+
+@pytest.mark.parametrize(
+    "old_unit",
+    [
+        "For the first 100 users, our sponsor offers 20 percent off.",
+        "A solution contains hydrochloric acid. Its pH is 3.",
+        "Let's say if a box has 2 kilograms, it accelerates at 3 m/s squared.",
+        "For the old cart, the calculated acceleration is 3 meters per second squared.",
+    ],
+)
+def test_split_answer_prefers_a_later_scenario_after_a_strong_reset(
+    old_unit: str,
+) -> None:
+    texts = [
+        old_unit,
+        "A cart has a mass of 5 kilograms",
+        "and a force of 10 newtons acts. What is the",
+        "answer? Using F equals ma, the acceleration is 2 m/s squared.",
+    ]
+    segments = [
+        {
+            "cue_id": f"split-reset:cue:{index}",
+            "start": float(index * 4),
+            "end": float(index * 4 + 4),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=3,
+        selected_left=0,
+        scope_text="worked cart acceleration",
+    )
+
+    assert result is not None
+    line, span = result
+    assert line == 1
+    assert segments[line]["text"][span[0]:].startswith("A cart")
+
+
+def test_split_answer_does_not_merge_terminated_same_head_scenarios() -> None:
+    texts = [
+        "A solution contains sodium chloride. Its pH is 7.",
+        "The solution contains hydrochloric acid",
+        "at 0.001 molar. What is the",
+        "answer? The pH is 3.",
+    ]
+    segments = [
+        {
+            "cue_id": f"split-same-head:cue:{index}",
+            "start": float(index * 4),
+            "end": float(index * 4 + 4),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=3,
+        selected_left=0,
+        scope_text="calculate pH",
+    )
+
+    assert result is not None
+    line, span = result
+    assert line == 1
+    assert segments[line]["text"][span[0]:].startswith("The solution")
+
+
+def test_fresh_v11_split_answer_recovers_the_full_system_scenario() -> None:
+    segments = [
+        {
+            "cue_id": "pL2YfC-22Uc:cue:90",
+            "start": 3282.839,
+            "end": 3327.04,
+            "text": (
+                "vector. Now, let's get back to tension. So let's say if we have a "
+                "horizontal surface and we have two blocks connected by a rope and "
+                "let's exert a force of 60 newtons to the right. And let's say the "
+                "mass of the first object is 10 kg and the mass of the second object "
+                "is 20 kg. What is the tension force in this rope? What is the"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:91",
+            "start": 3328.92,
+            "end": 3378.16,
+            "text": (
+                "answer? Now the tension force in a rope that pulls the 20 kg object "
+                "to the right is equal to 60 newtons. Now to find the tension force "
+                "in a rope, we need to find the net acceleration of the system. So "
+                "we can treat these two objects as if it were a single mass of 30 kg. "
+                "So using this equation F is equal to MA we have a net force of 60 "
+                "newtons a total mass of 30 kg. So the net acceleration is 2 m/s "
+                "squared. Because these two objects are attached by rope. If the 20 "
+                "kg object moves with an"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:92",
+            "start": 3373.96,
+            "end": 3398.72,
+            "text": (
+                "acceleration of 2 m/s squared, the 10 kg object must accelerate at "
+                "the same rate because they're attached to the same rope. And so "
+                "they're going to move at the same speed along this horizontal "
+                "surface. Now let's focus on the 20 kilogram block. Let's isolate"
+            ),
+        },
+    ]
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": (
+                "Explain Newton's second law F=ma from intuition through worked "
+                "examples, including net force, mass, acceleration, units, and "
+                "solving for each variable"
+            ),
+            "constraints": [
+                {
+                    "constraint_id": "subject",
+                    "kind": "subject",
+                    "source_phrase": "Newton's second law F=ma",
+                    "requirement": "Use F=ma",
+                },
+                {
+                    "constraint_id": "net_force",
+                    "kind": "subject",
+                    "source_phrase": "net force",
+                    "requirement": "Use net force",
+                },
+                {
+                    "constraint_id": "format",
+                    "kind": "format",
+                    "source_phrase": "worked examples",
+                    "requirement": "Show a worked calculation",
+                },
+            ],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="f-ma-system-acceleration",
+            start_line=1,
+            end_line=2,
+            start_quote="answer? Now the tension force in",
+            end_quote="move at the same speed along this horizontal surface.",
+            claim_quote="using this equation F is equal to MA we have a net force of 60",
+            title="F=ma for a Multi-Block System",
+            learning_objective=(
+                "Apply Newton's second law to calculate a system's net acceleration"
+            ),
+            facet="system acceleration",
+            informativeness=0.95,
+            topic_relevance=0.95,
+            educational_importance=0.95,
+            difficulty=0.5,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[
+                {
+                    "id": "subject",
+                    "q": "using this equation F is equal to MA we have a net force of 60",
+                },
+                {
+                    "id": "net_force",
+                    "q": "we have a net force of 60 newtons",
+                },
+                {
+                    "id": "format",
+                    "q": "So the net acceleration is 2 m/s squared.",
+                },
+            ],
+        )],
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:90"
+    assert clip["start_quote"] == "So let's say if we have"
+    assert clip["_clip_text"].startswith("So let's say if we have a horizontal")
+    assert "vector. Now" not in clip["_clip_text"]
+    assert "expanded_split_answer_scenario" in (
         clip["_boundary_fallback_reasons"]
     )
 
@@ -4437,7 +6784,7 @@ def test_trusted_live_dependent_answer_recovers_its_question_context() -> None:
     assert not clip["_clip_text"].startswith("The answer is yes")
 
 
-def test_trusted_live_weight_fragment_recovers_split_definition() -> None:
+def test_trusted_live_weight_fragment_keeps_grounded_context_and_split_definition() -> None:
     segments = [
         {
             "cue_id": "pL2YfC-22Uc:cue:9",
@@ -4501,11 +6848,14 @@ def test_trusted_live_weight_fragment_recovers_split_definition() -> None:
     assert report.rejected_reasons == []
     [clip] = report.clips
     assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:9"
-    assert clip["start_quote"] == "Weight is simply the force of"
-    assert clip["_clip_text"].startswith("Weight is simply the force of gravity")
-    assert clip["edge_projection"]["start"]["quote"] == (
-        "Weight is simply the force of"
+    assert clip["_clip_text"].startswith(
+        "Weight is different from mass. Weight is a force."
     )
+    assert "Weight is equal to mass time gravitational acceleration" in (
+        clip["_clip_text"]
+    )
+    assert "Weight is simply the force of gravity" in clip["_clip_text"]
+    assert "Mass is measured in units of kilograms" not in clip["_clip_text"]
 
 
 def test_trusted_live_skating_fragment_never_starts_mid_phrase() -> None:
@@ -5169,7 +7519,7 @@ def test_trusted_candidate_does_not_widen_clean_unit_to_prior_scenario() -> None
     assert "scenario A" not in clip["_clip_text"]
 
 
-def test_trusted_candidate_trims_next_problem_tail_without_rejection() -> None:
+def test_trusted_candidate_preserves_complete_model_end_even_when_broad() -> None:
     text = (
         "For part b, the acceleration is negative 0.75 meters per second squared. "
         "The tension is 452.5 newtons, so it is less than the weight force "
@@ -5196,15 +7546,14 @@ def test_trusted_candidate_trims_next_problem_tail_without_rejection() -> None:
     assert report.accepted_count == report.proposed_count == 1
     assert report.rejected_reasons == []
     [clip] = report.clips
-    assert clip["_clip_text"].endswith("during downward acceleration")
-    assert "work on this problem" not in clip["_clip_text"]
-    assert {
-        "trimmed_same_cue_unit_after",
-        "trimmed_trailing_edge_noise",
-    } & set(clip["_boundary_fallback_reasons"])
+    assert clip["_clip_text"].endswith("whatever you want to call it")
+    assert "work on this problem" in clip["_clip_text"]
+    assert "trimmed_trailing_edge_noise" not in (
+        clip["_boundary_fallback_reasons"]
+    )
 
 
-def test_trusted_candidate_atomizes_broad_span_around_gemini_claim() -> None:
+def test_trusted_candidate_preserves_schema_valid_broad_model_span() -> None:
     segments = [
         {
             "cue_id": "cue-0",
@@ -5322,12 +7671,289 @@ def test_trusted_candidate_atomizes_broad_span_around_gemini_claim() -> None:
     assert report.accepted_count == report.proposed_count == 1
     assert report.rejected_reasons == []
     [clip] = report.clips
-    assert clip["cue_ids"] == ["cue-3", "cue-4", "cue-5", "cue-6"]
-    assert clip["_clip_text"].startswith("Now, let's get back to tension")
-    assert "smaller person" not in clip["_clip_text"]
-    assert "resultant vector" not in clip["_clip_text"]
-    assert clip["intent_coverage"] == pytest.approx(0.75)
-    assert "trimmed_adjacent_unit_before" in clip["_boundary_fallback_reasons"]
+    assert clip["cue_ids"] == [f"cue-{index}" for index in range(7)]
+    assert clip["_clip_text"].startswith(
+        "However, the acceleration is not the same"
+    )
+    assert "resultant vector" in clip["_clip_text"]
+    assert clip["_clip_text"].endswith("propels the block to the right")
+    assert clip["intent_coverage"] == pytest.approx(1.0)
+    assert "trimmed_adjacent_unit_before" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        [
+            "Unrelated material ends here. The archive remains consistent because "
+            "each writer uses a version token. Later material begins here today."
+        ],
+        [
+            "Unrelated material ends here. The archive",
+            "remains consistent because each writer uses",
+            "a version token. Later material begins here today.",
+        ],
+        [
+            "Unrelated",
+            "material",
+            "ends",
+            "here.",
+            "The",
+            "archive",
+            "remains",
+            "consistent",
+            "because",
+            "each",
+            "writer",
+            "uses",
+            "a",
+            "version",
+            "token.",
+            "Later",
+            "material",
+            "begins",
+            "here",
+            "today.",
+        ],
+    ],
+    ids=("one-cue", "three-cues", "twenty-cues"),
+)
+def test_trusted_model_edges_are_rechunking_invariant(
+    chunks: list[str],
+) -> None:
+    segments = [
+        {
+            "cue_id": f"cue-{index}",
+            "start": float(index),
+            "end": float(index + 1),
+            "text": chunk,
+        }
+        for index, chunk in enumerate(chunks)
+    ]
+    plan = _compact_custom_plan(
+        request="archive consistency",
+        start_quote="The archive remains consistent because",
+        end_quote="writer uses a version token.",
+        claim_quote="archive remains consistent because each writer uses",
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 0,
+            "end_line": len(segments) - 1,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith(
+        "The archive remains consistent because each writer uses"
+    )
+    assert clip["_clip_text"].endswith("a version token")
+    assert "Unrelated material" not in clip["_clip_text"]
+    assert "Later material" not in clip["_clip_text"]
+
+
+@pytest.mark.parametrize(
+    ("topic_request", "core", "follow_on"),
+    [
+        (
+            "seed germination",
+            "A seed germinates after it absorbs enough water.",
+            "The stem emerges during the next stage.",
+        ),
+        (
+            "the 1848 treaty",
+            "The treaty transferred the province in eighteen forty eight.",
+            "A later conflict changed the border again.",
+        ),
+        (
+            "conditional expressions",
+            "The conditional expression returns left when the flag is true.",
+            "A factorial operator serves a different purpose.",
+        ),
+    ],
+    ids=("biology", "history", "software"),
+)
+def test_trusted_complete_model_end_is_domain_invariant(
+    topic_request: str,
+    core: str,
+    follow_on: str,
+) -> None:
+    text = f"{core} {follow_on}"
+    core_words = core.split()
+    plan = _compact_custom_plan(
+        request=topic_request,
+        start_quote=" ".join(core_words[:5]),
+        end_quote=" ".join(core_words[-6:]),
+        claim_quote=" ".join(core_words[:8]),
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 20.0, "text": text}],
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=topic_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith(core.split(".")[0])
+    assert follow_on.split()[0] not in clip["_clip_text"]
+
+
+def test_trusted_conversion_never_invokes_downstream_topic_resegmentation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("trusted Gemini spans must not be topic-resegmented")
+
+    monkeypatch.setattr(gemini_segment, "_candidate_topic_transitions", forbidden)
+    monkeypatch.setattr(gemini_segment, "_single_objective_section_bounds", forbidden)
+    monkeypatch.setattr(gemini_segment, "_trusted_compact_plan_to_report", forbidden)
+    monkeypatch.setattr(gemini_segment, "_trusted_start_context_repair", forbidden)
+    monkeypatch.setattr(
+        gemini_segment,
+        "_trusted_grounded_forward_unit_start",
+        forbidden,
+    )
+    monkeypatch.setattr(gemini_segment, "_trusted_joined_unit_end", forbidden)
+    plan = _compact_custom_plan(
+        request="enzyme regulation",
+        start_quote="The inhibitor binds the enzyme",
+        end_quote="reduces the reaction rate.",
+        claim_quote="inhibitor binds the enzyme and reduces the reaction rate",
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": "The inhibitor binds the enzyme and reduces the reaction rate.",
+        }],
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+
+
+def test_trusted_duplicate_quotes_outside_model_range_cannot_move_edges() -> None:
+    repeated = "The archive remains consistent because writers use version tokens."
+    segments = [
+        {"cue_id": "cue-0", "start": 0.0, "end": 4.0, "text": repeated},
+        {
+            "cue_id": "cue-1",
+            "start": 4.0,
+            "end": 8.0,
+            "text": "A separate lesson appears between the duplicates.",
+        },
+        {"cue_id": "cue-2", "start": 8.0, "end": 12.0, "text": repeated},
+    ]
+    plan = _compact_custom_plan(
+        request="archive consistency",
+        start_quote="The archive remains consistent because",
+        end_quote="because writers use version tokens.",
+        claim_quote="archive remains consistent because writers use version tokens",
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 2,
+            "end_line": 2,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-2"]
+
+
+def test_trusted_malformed_edges_fall_outward_without_rejection() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "The enzyme changes shape when the inhibitor binds.",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 5.0,
+            "end": 10.0,
+            "text": "This lowers the measured reaction rate.",
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="enzyme inhibition",
+        start_quote="words absent from the transcript",
+        end_quote="another absent boundary phrase",
+        claim_quote="enzyme changes shape when the inhibitor binds",
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 0,
+            "end_line": 1,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-0", "cue-1"]
+    assert "bad_or_ambiguous_start_quote" in (
+        clip["_boundary_fallback_reasons"]
+    )
+    assert "bad_or_ambiguous_end_quote" in (
+        clip["_boundary_fallback_reasons"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -5528,7 +8154,7 @@ def test_specific_request_prompt_returns_primary_and_complete_supporting_units()
     assert "whole-span completeness check" in normalized.casefold()
 
 
-def test_newtons_second_law_prompt_requires_subject_anchoring_and_context() -> None:
+def test_boundary_prompt_requires_cross_domain_subject_anchoring_and_context() -> None:
     exact_request = (
         "Explain Newton's second law F=ma from intuition to worked examples, "
         "including net force, mass, acceleration, units, and solving for each variable"
@@ -5562,15 +8188,11 @@ def test_newtons_second_law_prompt_requires_subject_anchoring_and_context() -> N
         'sharing only the head word of a more specific phrase is also not enough: '
         '"force" does not ground "net force"'
     ) in normalized
-    assert (
-        "omit a coulomb's-law unit that merely mentions force or newtons, computes "
-        "net electric force, or rearranges coulomb's equation"
-    ) in normalized
-    assert (
-        "such a unit qualifies only when one complete span explicitly connects the "
-        "electric force back to f=ma"
-    ) in normalized
-    assert "generic algebraic isolation is not that connection" in normalized
+    assert "subject-anchor counterexamples — apply the same rule in every domain" in normalized
+    assert "for a biology request about pcr" in normalized
+    assert "for a law request about negligence" in normalized
+    assert "for a software request about quicksort" in normalized
+    assert "the rule is referent identity, not vocabulary overlap" in normalized
     assert "evidence must refer to the same thing and relationship as the request" in normalized
     assert (
         "using the component only as an operand inside a different law or equation "
@@ -5581,33 +8203,13 @@ def test_newtons_second_law_prompt_requires_subject_anchoring_and_context() -> N
         "every q must ground the same referent and relationship named by its id, "
         "not merely contain one of its words, symbols, variables, dimensions, or units"
     ) in normalized
-    assert (
-        "also omit an impulse-momentum theorem unit f delta t = delta p and a "
-        "linear-momentum unit p=mv"
-    ) in normalized
-    assert (
-        "they teach different governing relationships and cannot evidence the "
-        "newton's-law, mass-in-f=ma, or f=ma-units constraints"
-    ) in normalized
-    assert (
-        'wrong ie: a newton\'s-law id paired with "impulse, f delta t, is equal to '
-        'the change in momentum"'
-    ) in normalized
-    assert (
-        'wrong ie: an f=ma mass id paired with "linear momentum is defined as mass '
-        'times velocity"'
-    ) in normalized
-    assert (
-        "a complete standalone definition of acceleration as the rate of change of "
-        "velocity can be foundational support"
-    ) in normalized
     assert "background-detour boundary example" in normalized
     assert (
         "sq, eq, cq, every ie q, title, obj, and facet on the same atomic educational unit"
         in normalized
     )
-    assert 'use s=62, sq="you\'re now ready to understand acceleration"' in normalized
-    assert 'also wrong: an acceleration candidate uses ie q="units for speed"' in normalized
+    assert 'use s=62, sq="pcr uses repeated temperature cycles"' in normalized
+    assert 'also wrong: a pcr candidate uses ie q="cells copy dna before division"' in normalized
     assert "this rule still applies for a beginner viewer" in normalized
     assert (
         "do not fold the whole completed prerequisite into the later target unit"
@@ -5625,13 +8227,24 @@ def test_newtons_second_law_prompt_requires_subject_anchoring_and_context() -> N
         "that spoken context"
     ) in normalized
     assert "begin sq at \"newton's second law\"" in normalized
+    assert "split-caption boundary examples" in normalized
+    assert 'wrong sq="delegates reached a compromise"' in normalized
+    assert 'wrong sq="germinate after absorbing water"' in normalized
+    assert 'wrong sq="version when the writer arrives"' in normalized
+    assert 'never begin sq at "answer?"' in normalized
+    assert (
+        "do not treat caption-line starts, acoustic silence, or punctuation inside "
+        "a rolling caption as proof of a complete semantic start"
+    ) in normalized
     assert (
         "a worked numerical example for a dimensioned quantity cannot end at a "
         "unitless result"
     ) in normalized
     assert "include the contiguous spoken unit" in normalized
     assert "end eq after the unit" in normalized
-    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v11"
+    assert "the first word of sq and last word of eq are final semantic edges" in normalized
+    assert "do not rely on downstream code to fix an incomplete thought" in normalized
+    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v12"
 
 
 def test_boundary_prompt_stays_transcript_only_when_video_is_requested() -> None:
@@ -12736,3 +15349,343 @@ def test_rephrased_facet_is_deduped_but_distinct_facet_survives() -> None:
     assert [
         clip["selection_candidate_id"] for clip in report.clips
     ] == ["energy-better", "carbon-fixation"]
+
+
+def _universal_boundary_segments(texts: list[str]) -> list[dict]:
+    return [
+        {
+            "cue_id": f"universal:cue:{index}",
+            "start": float(index),
+            "end": float(index + 1),
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+
+
+def test_universal_question_reconstruction_has_no_depth_or_cue_limit() -> None:
+    transcript = " ".join([
+        "A machine starts with one unit.",
+        *(f"Then it adds {index} units." for index in range(1, 26)),
+        "What is its final value",
+    ])
+    texts = [*transcript.split(), "answer? It is the accumulated value."]
+    segments = _universal_boundary_segments(texts)
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=len(segments) - 1,
+        selected_left=0,
+        scope_text="machine final accumulated value",
+    )
+
+    assert result is not None
+    line, span = result
+    assert line == 0
+    assert segments[line]["text"][span[0]:].startswith("A")
+
+
+@pytest.mark.parametrize(
+    ("scenario", "scope"),
+    [
+        (
+            "A reaction starts with four moles and produces eight moles of "
+            "product. What is the",
+            "reaction moles product",
+        ),
+        (
+            "An account has principal one thousand dollars and earns interest. "
+            "What is the",
+            "account principal interest",
+        ),
+        (
+            "A database table contains twenty rows and receives five more rows. "
+            "What is the",
+            "database table rows",
+        ),
+    ],
+)
+def test_universal_question_reconstruction_is_domain_and_partition_invariant(
+    scenario: str,
+    scope: str,
+) -> None:
+    words = scenario.split()
+    for cut in range(1, len(words)):
+        segments = _universal_boundary_segments([
+            "Photosynthesis converts light into chemical energy.",
+            " ".join(words[:cut]),
+            " ".join(words[cut:]),
+            "answer? The result follows from the stated premise.",
+        ])
+
+        result = gemini_segment._trusted_split_answer_scenario_start(
+            segments,
+            selected_line=3,
+            selected_left=0,
+            scope_text=scope,
+        )
+
+        assert result is not None, cut
+        line, span = result
+        assert line == 1, (cut, result)
+        assert segments[line]["text"][span[0]:].startswith(words[0])
+
+
+@pytest.mark.parametrize("separator", [";", "\u2014"])
+def test_universal_question_reconstruction_honors_clause_resets(
+    separator: str,
+) -> None:
+    source = (
+        f"Photosynthesis captures light energy{separator}a cart has mass five "
+        "kilograms and force ten newtons. What is the"
+    )
+    segments = _universal_boundary_segments([
+        source,
+        "answer? Acceleration is two meters per second squared.",
+    ])
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=1,
+        selected_left=0,
+        scope_text="cart mass force acceleration",
+    )
+
+    assert result is not None
+    line, span = result
+    assert line == 0
+    assert segments[line]["text"][span[0]:].startswith("a cart")
+
+
+def test_universal_question_reconstruction_maps_the_current_repeated_setup() -> None:
+    source = (
+        "A cart has mass five kilograms. The old answer is nine. "
+        "A cart has mass five kilograms. It receives ten newtons. "
+        "What is its acceleration"
+    )
+    segments = _universal_boundary_segments([
+        source,
+        "answer? It is two meters per second squared.",
+    ])
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=1,
+        selected_left=0,
+        scope_text="cart acceleration",
+    )
+
+    assert result is not None
+    line, span = result
+    assert line == 0
+    assert span[0] == source.rindex("A cart has mass")
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Determine the final concentration",
+        "Calculate its acceleration",
+        "Does it have a low pH",
+        "What acceleration results",
+    ],
+)
+def test_universal_question_reconstruction_supports_commands_and_yes_no(
+    prompt: str,
+) -> None:
+    segments = _universal_boundary_segments([
+        "A solution contains 0.001 molar hydrogen ions.",
+        prompt,
+        "answer? The explanation follows from the premise.",
+    ])
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=2,
+        selected_left=0,
+        scope_text="solution concentration acceleration pH",
+    )
+
+    assert result is not None
+    line, span = result
+    assert line == 0
+    assert segments[line]["text"][span[0]:].startswith("A solution")
+
+
+def test_relative_wh_clause_cannot_trigger_question_reconstruction() -> None:
+    segments = _universal_boundary_segments([
+        "Velocity is a vector which means it has direction.",
+        "In short, acceleration is the rate of velocity change.",
+    ])
+
+    result = gemini_segment._trusted_split_answer_scenario_start(
+        segments,
+        selected_line=1,
+        selected_left=0,
+        scope_text="acceleration velocity change",
+    )
+
+    assert result is None
+
+
+def test_forward_refinement_never_selects_an_unrelated_caution() -> None:
+    segments = _universal_boundary_segments([
+        "because chlorophyll absorbs light.",
+        "Remember, never share your password.",
+        "Photosynthesis converts light into chemical energy.",
+    ])
+    claim = segments[2]["text"]
+
+    result = gemini_segment._trusted_grounded_forward_unit_start(
+        segments,
+        selected_line=0,
+        selected_left=0,
+        claim_location=(2, 0, 2, len(claim)),
+        intent_locations=[],
+        scope_text="photosynthesis chemical energy",
+    )
+
+    assert result is None or result[0] == 2
+
+
+def test_forward_caution_is_invariant_to_every_word_cut() -> None:
+    caution = "So be careful, force determines acceleration."
+    words = caution.split()
+    for cut in range(1, len(words)):
+        segments = _universal_boundary_segments([
+            "The old answer is complete.",
+            " ".join(words[:cut]),
+            " ".join(words[cut:]),
+            "Force equals mass times acceleration.",
+        ])
+        claim = segments[3]["text"]
+
+        result = gemini_segment._trusted_grounded_forward_unit_start(
+            segments,
+            selected_line=0,
+            selected_left=0,
+            claim_location=(3, 0, 3, len(claim)),
+            intent_locations=[],
+            scope_text="force mass acceleration",
+        )
+
+        assert result is not None, cut
+        line, span, _quote = result
+        assert line == 1
+        assert segments[line]["text"][span[0]:].startswith("So")
+
+
+def test_forward_worked_handoff_is_invariant_to_every_word_cut() -> None:
+    handoff = "Now let us work on this problem."
+    words = handoff.split()
+    for cut in range(1, len(words)):
+        segments = _universal_boundary_segments([
+            "The answer is five newtons.",
+            " ".join(words[:cut]),
+            " ".join(words[cut:]),
+            "The next result is grounded here.",
+        ])
+        claim = segments[3]["text"]
+
+        result = gemini_segment._trusted_grounded_forward_unit_start(
+            segments,
+            selected_line=0,
+            selected_left=0,
+            claim_location=(3, 0, 3, len(claim)),
+            intent_locations=[],
+            scope_text="worked result",
+        )
+
+        assert result is not None, cut
+        line, span, _quote = result
+        assert line == 1
+        assert segments[line]["text"][span[0]:].startswith("Now")
+
+
+@pytest.mark.parametrize(
+    "premise",
+    [
+        "now a resistor has resistance five ohms",
+        "now a solution contains acid",
+        "now a triangle has sides three four five",
+    ],
+)
+def test_forward_worked_handoff_preserves_fresh_cross_domain_givens(
+    premise: str,
+) -> None:
+    segments = _universal_boundary_segments([
+        f"The answer is four. {premise} now let us work on this problem.",
+        "The result follows from those givens.",
+    ])
+    claim = segments[1]["text"]
+
+    result = gemini_segment._trusted_grounded_forward_unit_start(
+        segments,
+        selected_line=0,
+        selected_left=0,
+        claim_location=(1, 0, 1, len(claim)),
+        intent_locations=[],
+        scope_text="worked result",
+    )
+
+    assert result is None
+
+
+def test_trusted_evidence_anchoring_is_stable_under_appended_duplicates() -> None:
+    claim = "there is no net force at equilibrium"
+    segments = _universal_boundary_segments([
+        "We just finished discussing velocity.",
+        f"Remember, {claim}.",
+    ])
+    plan = _compact_custom_plan(
+        request="net force at equilibrium",
+        start_quote="We just finished discussing velocity.",
+        end_quote=f"{claim}.",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 0,
+            "end_line": 1,
+            "title": "Net Force at Equilibrium",
+            "learning_objective": "Explain zero net force at equilibrium",
+            "facet": "equilibrium net force",
+        })],
+    })
+
+    base = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+    appended = gemini_segment._plan_to_report(
+        plan,
+        [
+            *segments,
+            {
+                "cue_id": "universal:cue:duplicate",
+                "start": 10.0,
+                "end": 11.0,
+                "text": f"Later repetition: {claim}.",
+            },
+        ],
+        [],
+        {"_segment_trust_gemini_semantics": True},
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert base.accepted_count == base.proposed_count == 1
+    assert appended.accepted_count == appended.proposed_count == 1
+    [base_clip] = base.clips
+    [appended_clip] = appended.clips
+    assert (
+        base_clip["start_cue_id"],
+        base_clip["end_cue_id"],
+        base_clip["_clip_text"],
+    ) == (
+        appended_clip["start_cue_id"],
+        appended_clip["end_cue_id"],
+        appended_clip["_clip_text"],
+    )

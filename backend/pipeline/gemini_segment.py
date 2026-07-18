@@ -1672,7 +1672,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v3"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v11"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v12"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -2466,22 +2466,18 @@ def _compact_output_guide() -> str:
   verify every requested transformation across the entire sq-through-eq span. One q never
   replaces the whole-span completeness check.
 
-Subject-anchor counterexample:
-For the exact request "Explain Newton's second law F=ma from intuition to worked examples,
-including net force, mass, acceleration, units, and solving for each variable", omit a
-Coulomb's-law unit that merely mentions force or newtons, computes net electric force, or
-rearranges Coulomb's equation. Those overlaps do not teach Newton's second law, F=ma, its named
-quantities, or a technical method unique to that request. Such a unit qualifies only when one
-complete span explicitly connects the electric force back to F=ma, for example by using that
-force to calculate mass or acceleration. Generic algebraic isolation is not that connection.
-Also omit an impulse-momentum theorem unit F delta t = delta p and a linear-momentum unit p=mv
-that merely mention force, mass, or SI units. They teach different governing relationships and
-cannot evidence the Newton's-law, mass-in-F=ma, or F=ma-units constraints. They qualify only
-when the complete spoken span explicitly derives or connects them to Newton's second law or
-F=ma. WRONG ie: a Newton's-law id paired with "impulse, f delta t, is equal to the change in
-momentum". WRONG ie: an F=ma mass id paired with "linear momentum is defined as mass times
-velocity". By contrast, a complete standalone definition of acceleration as the rate of change
-of velocity can be foundational support because it teaches the requested quantity itself.
+Subject-anchor counterexamples — apply the same rule in every domain:
+- For a biology request about PCR, a general DNA-replication unit does not qualify merely
+  because both mention DNA or polymerase. It qualifies only if the selected span explicitly
+  teaches PCR itself or connects the general mechanism to a requested PCR step.
+- For a law request about negligence, a contract-breach unit does not qualify merely because
+  both mention duties or damages. Its ie quote must teach the same legal test or an explicitly
+  requested prerequisite, not a neighboring doctrine with shared words.
+- For a software request about quicksort, a merge-sort unit does not qualify merely because
+  both use divide-and-conquer. It qualifies only when the span teaches quicksort or explicitly
+  compares the algorithms in service of the requested quicksort objective.
+The rule is referent identity, not vocabulary overlap: shared symbols, variables, units, names,
+or generic methods cannot stand in for the object and relationship in the original request.
 
 Worked format example — understand the boundary logic, but never copy its content or scores:
 All examples below assume no learner-level restriction. They demonstrate only schema and
@@ -2511,20 +2507,34 @@ Do not start at line 51 with "This law tells us". The original request and video
 spoken context. Include line 50 and begin sq at "Newton's second law" so the referent is audible
 inside the clip.
 
+Split-caption boundary examples:
+- If one cue ends "The treaty was signed after the" and the next begins "delegates reached a
+  compromise", WRONG sq="delegates reached a compromise". Begin with the complete treaty
+  sentence and any audible setup it requires.
+- If one cue ends "A dormant seed begins to" and the next begins "germinate after absorbing
+  water", WRONG sq="germinate after absorbing water". Begin with the complete subject.
+- If one cue ends "Suppose the cache contains an old" and the next begins "version when the
+  writer arrives", WRONG sq="version when the writer arrives". Begin sq at the complete
+  scenario setup, regardless of how many caption cues split it.
+- If a cue begins "answer?" because the preceding cue ends "What is the", include the complete
+  spoken question and its concrete scenario; never begin sq at "answer?" or at the answer alone.
+Do not treat caption-line starts, acoustic silence, or punctuation inside a rolling caption as
+proof of a complete semantic start. Read the neighboring words and choose the first word of the
+whole spoken sentence, scenario, question, or explanation.
+
 Background-detour boundary example:
-[60] 10:00 Speed measures how fast position changes, with units such as meters per second.
-[61] 10:08 Velocity is speed with a direction attached to it.
-[62] 10:16 With that knowledge in hand, you're now ready to understand acceleration, which is
-the rate at which velocity changes and is measured in meters per second squared.
-For an acceleration candidate whose obj is "Define acceleration and identify its units", lines
-60-61 are earlier completed background units, not permission to make the acceleration clip begin
-with a speed lesson. Use s=62, sq="you're now ready to understand acceleration", and a cq about
-the acceleration definition or its units. WRONG: title/obj/facet describe acceleration while sq
-or cq begins in the earlier speed or velocity lesson. Also WRONG: an acceleration candidate uses
-ie q="units for speed"; ie cannot pull a completed prerequisite into a different objective. This
-rule still applies for a beginner viewer. If an earlier prerequisite is independently relevant,
-return it as its own supporting candidate; do not fold the whole completed prerequisite into the
-later target unit merely because it comes first.
+[60] 10:00 DNA stores hereditary information in a sequence of bases.
+[61] 10:08 Cells copy DNA before division.
+[62] 10:16 With that background, PCR uses repeated temperature cycles to amplify a chosen DNA
+region through denaturation, primer binding, and extension.
+For a PCR candidate whose obj is "Explain the PCR cycle", lines 60-61 are earlier completed
+background units, not permission to make the PCR clip begin with a general DNA lesson. Use s=62,
+sq="PCR uses repeated temperature cycles", and a cq about the PCR cycle. WRONG: title/obj/facet
+describe PCR while sq or cq begins in the earlier general lesson. Also WRONG: a PCR candidate
+uses ie q="Cells copy DNA before division"; ie cannot pull a completed prerequisite into a
+different objective. This rule still applies for a beginner viewer. If an earlier prerequisite
+is independently relevant, return it as its own supporting candidate; do not fold the whole
+completed prerequisite into the later target unit merely because it comes first.
 
 Named worked-example boundary example:
 [40] 06:00 This is simply equal to five. So that's the derivative of five x minus four. It's five. Now let's try another example. So let's say if f of x is equal to x squared, what is the first derivative?
@@ -2750,7 +2760,14 @@ def _boundary_prompts(
         "Before returning, verify every sq and eq token-for-token inside its selected s:e range, "
         "including the 1-16 word limit, and verify every cq is 5-16 exact words. The backend "
         "treats every topic you return as semantically approved: it will not second-guess or "
-        "reject that topic, and will only repair or expand transcript boundaries when needed. "
+        "reject that topic. The first word of sq and last word of eq are final semantic edges: "
+        "the backend will not move either edge inward or use punctuation, topic vocabulary, "
+        "caption length, or silence to reinterpret it. It may only widen outward to include an "
+        "exact cq/ie quote you supplied or fall back to your enclosing s:e cue edges when an "
+        "edge quote is missing, repeated, or malformed. Do not rely on downstream code to fix "
+        "an incomplete thought, omitted referent, late start, early stop, or extra adjacent unit. "
+        "Perform a final cold-start/cold-stop reread from sq through eq yourself and correct "
+        "those words before returning. "
         "Do not omit an otherwise good, complete, relevant unit solely because coarse captions "
         "make the exact cut uncertain; return your closest grounded s:e, sq, and eq so the "
         "backend can repair the cut. Boundary uncertainty alone is never an omission reason. "
@@ -4577,6 +4594,8 @@ def _unique_boundary_anchor(
     quote: str,
     start_line: int,
     end_line: int,
+    *,
+    allow_timing_gaps: bool = False,
 ) -> _ModelBoundaryAnchor | None:
     """Locate one exact model edge inside its proposed contiguous cue range."""
     matches: list[_ModelBoundaryAnchor] = []
@@ -4587,7 +4606,11 @@ def _unique_boundary_anchor(
             for span in _quote_character_spans(text, quote)
         )
     for cross in _cross_cue_token_windows(
-        segments, quote, start_line, end_line,
+        segments,
+        quote,
+        start_line,
+        end_line,
+        allow_timing_gaps=allow_timing_gaps,
     ):
         matches.append(_ModelBoundaryAnchor(
             first_line=cross[0],
@@ -4603,6 +4626,8 @@ def _cross_cue_token_windows(
     quote: str,
     start_line: int,
     end_line: int,
+    *,
+    allow_timing_gaps: bool = False,
 ) -> list[tuple[int, int, int, int, int, int]]:
     """Locate exact full-token quote windows that cross contiguous cues."""
     quote_tokens = _toks(quote)
@@ -4633,16 +4658,17 @@ def _cross_cue_token_windows(
             if right != left + 1:
                 crosses_reset = True
                 break
-            try:
-                gap = float(segments[right].get("start")) - float(
-                    segments[left].get("end")
-                )
-            except (TypeError, ValueError, OverflowError):
-                crosses_reset = True
-                break
-            if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
-                crosses_reset = True
-                break
+            if not allow_timing_gaps:
+                try:
+                    gap = float(segments[right].get("start")) - float(
+                        segments[left].get("end")
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    crosses_reset = True
+                    break
+                if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+                    crosses_reset = True
+                    break
         if crosses_reset:
             continue
 
@@ -4724,6 +4750,139 @@ def _unique_evidence_location(
         # first occurrence deterministically avoids rejecting valid teaching.
         return locations[0]
     return None
+
+
+def _proposal_evidence_location(
+    segments: list[dict],
+    quote: str,
+    start_line: int,
+    end_line: int,
+    *,
+    start_anchor: _ModelBoundaryAnchor | None = None,
+    end_anchor: _ModelBoundaryAnchor | None = None,
+) -> tuple[int, int, int, int] | None:
+    """Ground trusted evidence at the occurrence nearest Gemini's frame."""
+    locations: set[tuple[int, int, int, int]] = set()
+    for line in range(len(segments)):
+        text = str(segments[line].get("text") or "")
+        locations.update(
+            (line, left, line, right)
+            for left, right in _quote_character_spans(text, quote)
+        )
+    locations.update(
+        (first_line, first_left, last_line, last_right)
+        for (
+            first_line,
+            last_line,
+            first_left,
+            _first_right,
+            _last_left,
+            last_right,
+        ) in _cross_cue_token_windows(
+            segments,
+            quote,
+            0,
+            len(segments) - 1,
+        )
+    )
+    line_offsets: list[int] = []
+    cursor = 0
+    for segment in segments:
+        line_offsets.append(cursor)
+        cursor += len(str(segment.get("text") or "")) + 1
+
+    def absolute_position(line: int, character: int) -> int:
+        return line_offsets[line] + character
+
+    frame_start = absolute_position(
+        start_anchor.first_line if start_anchor is not None else start_line,
+        start_anchor.first_span[0] if start_anchor is not None else 0,
+    )
+    frame_end_line = (
+        end_anchor.last_line if end_anchor is not None else end_line
+    )
+    frame_end = absolute_position(
+        frame_end_line,
+        end_anchor.last_span[1]
+        if end_anchor is not None
+        else len(str(segments[frame_end_line].get("text") or "")),
+    )
+
+    def proximity(location: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        first, left, last, right = location
+        location_start = absolute_position(first, left)
+        location_end = absolute_position(last, right)
+        if location_end < frame_start:
+            outside_distance = frame_start - location_end
+        elif location_start > frame_end:
+            outside_distance = location_start - frame_end
+        else:
+            outside_distance = 0
+        frame_distance = (
+            abs(location_start - frame_start)
+            + abs(location_end - frame_end)
+        )
+        return outside_distance, frame_distance, location_start, location_end
+
+    return min(locations, default=None, key=proximity)
+
+
+def _nearest_boundary_anchor(
+    segments: list[dict],
+    quote: str,
+    start_line: int,
+    end_line: int,
+    *,
+    want: str,
+) -> _ModelBoundaryAnchor | None:
+    """Locate a model edge nearest its frame without global-uniqueness drift."""
+    matches: list[_ModelBoundaryAnchor] = []
+    for line, segment in enumerate(segments):
+        text = str(segment.get("text") or "")
+        matches.extend(
+            _ModelBoundaryAnchor(line, line, span, span)
+            for span in _quote_character_spans(text, quote)
+        )
+    matches.extend(
+        _ModelBoundaryAnchor(
+            first_line=cross[0],
+            last_line=cross[1],
+            first_span=(cross[2], cross[3]),
+            last_span=(cross[4], cross[5]),
+        )
+        for cross in _cross_cue_token_windows(
+            segments,
+            quote,
+            0,
+            len(segments) - 1,
+        )
+    )
+
+    def proximity(anchor: _ModelBoundaryAnchor) -> tuple[int, int, int, int]:
+        if anchor.last_line < start_line:
+            outside_distance = start_line - anchor.last_line
+        elif anchor.first_line > end_line:
+            outside_distance = anchor.first_line - end_line
+        else:
+            outside_distance = 0
+        edge_distance = (
+            abs(anchor.first_line - start_line)
+            if want == "start"
+            else abs(anchor.last_line - end_line)
+        )
+        transcript_position = (
+            (anchor.first_line, anchor.first_span[0])
+            if want == "start"
+            else (-anchor.last_line, -anchor.last_span[1])
+        )
+        return (
+            outside_distance,
+            edge_distance,
+            transcript_position[0],
+            transcript_position[1],
+        )
+
+    return min(matches, default=None, key=proximity)
 
 
 def _proposal_evidence_anchor(
@@ -5977,6 +6136,76 @@ def _completed_truncated_caption_end(
         return None
     quote_left = words[max(0, len(words) - 6)].start()
     return (quote_left, len(complete)), complete[quote_left:]
+
+
+def _trusted_joined_unit_end(
+    segments: list[dict],
+    *,
+    end_line: int,
+    end_span: tuple[int, int] | None,
+) -> tuple[int, tuple[int, int], str] | None:
+    """Extend Gemini's word edge through its unfinished spoken sentence."""
+    if not (0 <= end_line < len(segments)):
+        return None
+    end_source = str(segments[end_line].get("text") or "")
+    end_right = end_span[1] if end_span is not None else len(end_source)
+    if not (0 <= end_right <= len(end_source)):
+        return None
+
+    parts: list[str] = []
+    line_ranges: list[tuple[int, int, int]] = []
+    cursor = 0
+    for line in range(end_line, len(segments)):
+        if parts:
+            parts.append(" ")
+            cursor += 1
+        source = str(segments[line].get("text") or "")
+        joined_left = cursor
+        parts.append(source)
+        cursor += len(source)
+        line_ranges.append((line, joined_left, cursor))
+    joined = "".join(parts)
+    selected_right = end_right
+    hard_boundaries = [
+        boundary
+        for boundary in _trusted_joined_unit_boundaries(joined)
+        if boundary.group(0)[0] in ".!?"
+    ]
+    if any(boundary.end() == selected_right for boundary in hard_boundaries):
+        return None
+    completion = next(
+        (
+            boundary
+            for boundary in hard_boundaries
+            if boundary.end() > selected_right
+        ),
+        None,
+    )
+    completion_right = completion.end() if completion is not None else len(joined)
+    if (
+        completion_right <= selected_right
+        or _WORD_RE.search(joined[selected_right:completion_right]) is None
+    ):
+        return None
+    mapped = next(
+        (
+            (line, completion_right - joined_left)
+            for line, joined_left, joined_right in line_ranges
+            if joined_left < completion_right <= joined_right
+        ),
+        None,
+    )
+    if mapped is None:
+        return None
+    line, source_right = mapped
+    source = str(segments[line].get("text") or "")
+    retained = source[:source_right]
+    words = list(_WORD_RE.finditer(retained))
+    if not words:
+        return None
+    quote_left = words[max(0, len(words) - 6)].start()
+    quote = retained[quote_left:source_right]
+    return line, (quote_left, source_right), quote
 
 
 def _trim_end_quote_before_edge_noise(
@@ -10101,9 +10330,7 @@ _TRUSTED_ORDINAL_OPENING_RE = re.compile(
 _TRUSTED_DEMONSTRATIVE_OPENING_RE = re.compile(
     r"^\s*(?:(?:and|but|now|so)\s*[,;:]?\s+)?"
     r"(?:this|that|these|those)\s+"
-    r"(?P<head>answer|concept|equation|example|expression|formula|law|method|"
-    r"principle|problem|process|proof|relationship|result|rule|solution|step|"
-    r"system|value)\b",
+    r"(?P<head>[a-z][\w'’-]*)\b",
     re.IGNORECASE,
 )
 _TRUSTED_POSSESSIVE_OPENING_RE = re.compile(
@@ -10268,9 +10495,9 @@ def _trusted_weak_prior_start_span(
         not re.search(r"[.!?][\"')\]]*\s*$", source)
         and (
             len(_toks(setup)) >= 3
-            or _TRUSTED_SPLIT_GENERIC_SUBJECT_RE.fullmatch(setup)
+            or _TRUSTED_SPLIT_SUBJECT_FRAGMENT_RE.fullmatch(setup)
         )
-        and _TRUSTED_SPLIT_LEXICAL_PREDICATE_RE.match(selected)
+        and _TRUSTED_SPLIT_FINITE_PREDICATE_RE.match(selected)
     )
     if not (
         _cue_has_weak_end(
@@ -10391,6 +10618,24 @@ def _trusted_start_context_repair(
         if start_span is not None
         else text.strip()
     )
+    # A contextual opening (for example, a pronoun or conjunction) is
+    # structurally dependent on preceding speech regardless of its subject
+    # matter.  Conservatively widen to the preceding spoken unit; do not try
+    # to infer the antecedent from a domain-specific noun list.
+    if _TRUSTED_CONTEXTUAL_START_RE.match(selected):
+        joined_repair = _trusted_joined_start_context_repair(
+            segments,
+            start_line,
+            start_span,
+            force_clipped_start=force_clipped_start,
+            min_start_line=min_start_line,
+        )
+        if (joined_repair[0], joined_repair[1]) != (start_line, start_span):
+            return (
+                joined_repair[0],
+                joined_repair[1],
+                ["expanded_start_context", *joined_repair[2]],
+            )
     cue_start_is_clipped = bool(force_clipped_start)
     has_same_cue_prefix = bool(
         start_span is not None
@@ -10420,8 +10665,13 @@ def _trusted_start_context_repair(
         ]
     projected_complete_setup = bool(
         start_span is not None
-        and _TRUSTED_PROJECTED_SETUP_RE.match(selected)
-        and _local_example_setup_is_complete(selected)
+        and (
+            (
+                _TRUSTED_PROJECTED_SETUP_RE.match(selected)
+                and _local_example_setup_is_complete(selected)
+            )
+            or _TRUSTED_JOINED_FRESH_DECLARATIVE_RE.match(selected)
+        )
     )
     unsafe_projection = bool(
         (
@@ -10532,6 +10782,144 @@ def _trusted_start_context_repair(
     return original_line, original_span, ["unresolved_start_context"]
 
 
+_TRUSTED_CONTEXTUAL_START_RE = re.compile(
+    r"^\s*(?:and|because|but|by|from|he|her|his|it|its|of|she|so|that|"
+    r"their|then|there|therefore|these|they|this|those|thus|to|we|when|"
+    r"where|which|while|who|whose|with)\b",
+    re.IGNORECASE,
+)
+
+
+def _trusted_joined_start_context_repair(
+    segments: list[dict],
+    start_line: int,
+    start_span: tuple[int, int] | None,
+    *,
+    force_clipped_start: bool = False,
+    min_start_line: int = 0,
+) -> tuple[int, tuple[int, int] | None, list[str]]:
+    """Close an unfinished spoken unit without using topic vocabulary.
+
+    Caption cues are only character-to-time containers.  The repair joins all
+    earlier transcript text, finds the nearest unambiguous sentence boundary,
+    and maps that character back to its source cue.  Ambiguity widens the
+    start; it never authorizes a later cut.
+    """
+    del min_start_line
+    if not (0 <= start_line < len(segments)):
+        return start_line, start_span, []
+    source = str(segments[start_line].get("text") or "")
+    start_left = start_span[0] if start_span is not None else 0
+    if not (0 <= start_left <= len(source)):
+        return start_line, start_span, []
+
+    selected = source[start_left:].lstrip()
+    same_cue_prefix = source[:start_left]
+    prefix_boundaries = [
+        boundary
+        for boundary in _trusted_joined_unit_boundaries(same_cue_prefix)
+        if boundary.group(0)[0] in ".!?"
+    ]
+    prefix_floor = prefix_boundaries[-1].end() if prefix_boundaries else 0
+    clipped_inside_cue = bool(
+        _WORD_RE.search(same_cue_prefix[prefix_floor:])
+    )
+
+    previous = (
+        str(segments[start_line - 1].get("text") or "").rstrip()
+        if start_line > 0 and start_left == 0
+        else ""
+    )
+    previous_boundaries = [
+        boundary
+        for boundary in _trusted_joined_unit_boundaries(previous)
+        if boundary.group(0)[0] in ".!?"
+    ]
+    previous_is_closed = bool(
+        previous_boundaries
+        and previous_boundaries[-1].end() == len(previous)
+    )
+    contextual_opening = bool(_TRUSTED_CONTEXTUAL_START_RE.match(selected))
+    lowercase_opening = bool(
+        selected
+        and selected[0].isalpha()
+        and selected[0].islower()
+    )
+    include_previous_closed_unit = bool(
+        previous.endswith("?") or contextual_opening
+    )
+    needs_context = bool(
+        force_clipped_start
+        or clipped_inside_cue
+        or (
+            start_line > 0
+            and start_left == 0
+            and (
+                not previous_is_closed
+                or include_previous_closed_unit
+                or lowercase_opening
+            )
+        )
+    )
+    if not needs_context:
+        return start_line, start_span, []
+
+    pieces: list[str] = []
+    line_ranges: list[tuple[int, int, int]] = []
+    cursor = 0
+    for line in range(0, start_line + 1):
+        if pieces:
+            pieces.append(" ")
+            cursor += 1
+        line_source = str(segments[line].get("text") or "")
+        right = start_left if line == start_line else len(line_source)
+        joined_left = cursor
+        pieces.append(line_source[:right])
+        cursor += right
+        line_ranges.append((line, joined_left, cursor))
+    joined = "".join(pieces)
+    boundaries = [
+        boundary
+        for boundary in _trusted_joined_unit_boundaries(joined)
+        if boundary.group(0)[0] in ".!?"
+    ]
+    candidate = boundaries[-1].end() if boundaries else 0
+    if include_previous_closed_unit and boundaries:
+        between = joined[boundaries[-1].end():]
+        if _WORD_RE.search(between) is None:
+            candidate = boundaries[-2].end() if len(boundaries) >= 2 else 0
+    while candidate < len(joined) and joined[candidate].isspace():
+        candidate += 1
+    if candidate >= len(joined):
+        return start_line, start_span, []
+
+    mapped = next(
+        (
+            (line, candidate - joined_left)
+            for line, joined_left, joined_right in line_ranges
+            if joined_left <= candidate < joined_right
+        ),
+        None,
+    )
+    if mapped is None or mapped >= (start_line, start_left):
+        return start_line, start_span, []
+    line, source_left = mapped
+    repaired_source = str(segments[line].get("text") or "")
+    quote = _exact_boundary_quote(repaired_source[source_left:], want="start")
+    relative_span = (
+        _quote_character_span(repaired_source[source_left:], quote)
+        if quote
+        else None
+    )
+    if relative_span is None:
+        return start_line, start_span, []
+    repaired_span = (
+        source_left + relative_span[0],
+        source_left + relative_span[1],
+    )
+    return line, repaired_span, ["expanded_unfinished_spoken_unit"]
+
+
 _TRUSTED_CLAIM_SETUP_HANDOFF_RE = re.compile(
     r"(?<!\w)(?:"
     r"(?P<teaching>with\s+that\s+knowledge\s+in\s+hand\b"
@@ -10608,15 +10996,16 @@ _TRUSTED_WORKED_RESULT_SIGNAL_RE = re.compile(
     r"-?\d+(?:\.\d+)?)\s+(?:kilograms?|meters?|newtons?|seconds?))\b",
     re.IGNORECASE,
 )
-_TRUSTED_SPLIT_LEXICAL_PREDICATE_RE = re.compile(
-    r"^\s*(?:accelerates?|acts?|becomes?|causes?|changes?|depends?|equals?|"
-    r"experiences?|gives?|increases?|means?|moves?|occurs?|produces?|"
-    r"requires?|results?|shows?|starts?|stops?)\b",
+_TRUSTED_SPLIT_FINITE_PREDICATE_RE = re.compile(
+    r"^\s*(?:(?:am|are|can|could|did|do|does|had|has|have|is|may|might|"
+    r"must|shall|should|was|were|will|would)\b|"
+    r"[a-z][\w'\u2019-]*(?:ed|es|s)\b)",
     re.IGNORECASE,
 )
-_TRUSTED_SPLIT_GENERIC_SUBJECT_RE = re.compile(
-    r"\s*(?:a|an|the|this|that)\s+"
-    r"(?:block|body|cart|object|particle|person|system)\s*",
+_TRUSTED_SPLIT_SUBJECT_FRAGMENT_RE = re.compile(
+    r"\s*(?:a|an|any|each|every|some|the|this|that|these|those)\s+"
+    r"(?:(?!(?:about|at|by|for|from|in|of|on|to|under|with)\b)"
+    r"[a-z][\w'\u2019-]*\s*){1,3}",
     re.IGNORECASE,
 )
 _TRUSTED_FRESH_EXAMPLE_RE = re.compile(
@@ -10625,6 +11014,398 @@ _TRUSTED_FRESH_EXAMPLE_RE = re.compile(
     r"(?:calculation|case|derivation|example|exercise|problem|proof)\b",
     re.IGNORECASE,
 )
+_TRUSTED_FORWARD_WORKED_HANDOFF_RE = re.compile(
+    r"(?<!\w)(?P<handoff>(?:now\s*[,;:]?\s+)?"
+    r"let(?:['’]?s|\s+us)\s+work\s+(?:on|through)\s+"
+    r"(?:this|that|the)\s+"
+    r"(?:calculation|case|derivation|example|exercise|problem|proof))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_FORWARD_WORKED_COMPLETION_RE = re.compile(
+    r"\bso\s+(?:as\s+you\s+can\s+(?:see|notice)|"
+    r"this\s+(?:demonstrates|shows))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_FORWARD_WORKED_RESULT_CLAUSE_RE = re.compile(
+    r"\b(?:(?:the\s+)?(?:answer|result|solution)\s+(?:is|equals?)|"
+    r"(?:it|that|this)\s+(?:equals?|is|will\s+be|is\s+going\s+to\s+be)"
+    r"\s+(?:(?:about|approximately|roughly)\s+)?"
+    r"(?:zero|one|two|three|four|five|six|seven|eight|"
+    r"nine|ten|-?\d+(?:\.\d+)?)\s+"
+    r"(?:kilograms?|meters?|newtons?|seconds?))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_CALCULATED_RESULT_RE = re.compile(
+    r"\b(?:calculated|computed|obtained)\s+"
+    r"[a-z][\w'’-]*(?:\s+[a-z][\w'’-]*){0,2}\s+"
+    r"(?:is|equals?)\s+(?:about\s+|approximately\s+|roughly\s+)?"
+    r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"-?\d+(?:\.\d+)?)\s+"
+    r"(?:kilograms?|meters?|newtons?|seconds?)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_FRESH_WORKED_SCENARIO_RE = re.compile(
+    r"(?:^|[.!?]\s+|[,;:]\s+|\b(?:now|next)\s*[,;:]?\s+)\s*(?:"
+    r"(?:for|in)\s+(?:(?:this|that|the)\s+)?"
+    r"(?:(?:next|new|other)\s+)?"
+    r"(?:block|body|box|cart|case|example|object|particle|problem|scenario|system)\b|"
+    r"(?:a|an)\s+(?:(?:next|new|other)\s+)?"
+    r"(?:block|body|box|cart|crate|object|particle|person|system)\b|"
+    r"the\s+(?:next|new|other)\s+"
+    r"(?:block|body|box|cart|crate|object|particle|person|system)\b|"
+    r"(?:the|this|that)\s+"
+    r"(?:block|body|box|cart|crate|object|particle|person|system)\b"
+    r"[^.!?]{0,120}\b(?:has|have|weighs?|experiences?|receives?|"
+    r"is\s+(?:acted\s+on|assigned|given))\b|"
+    r"(?:block|body|box|cart|crate|object|particle|person|system)\s+"
+    r"[a-z0-9]+\b[^.!?]{0,120}\b(?:has|have|weighs?|experiences?|"
+    r"receives?|is\s+(?:acted\s+on|assigned|given))\b|"
+    r"(?:consider|imagine|suppose|take)\s+(?:that\s+)?(?:a|an|the)\b|"
+    r"let(?:['’]?s|\s+us)\s+(?:say|suppose|take)\b)",
+    re.IGNORECASE,
+)
+_TRUSTED_WORKED_SCENARIO_ONSET_RE = re.compile(
+    r"(?:^|[.!?]\s+|\b(?:now|next)\s*[,;:]?\s+)\s*"
+    r"(?P<setup>(?:(?:now|so)\s*[,;:]?\s+)?(?:"
+    r"(?:a|an|the|this|that)\s+(?:(?:new|next|other)\s+)?"
+    r"(?:block|body|box|cart|crate|mass|object|particle|person|system)\b|"
+    r"(?:for|in)\s+(?:(?:this|that|the)\s+)?"
+    r"(?:(?:new|next|other)\s+)?"
+    r"(?:block|body|box|cart|crate|object|particle|person|system)\b|"
+    r"(?:assume|consider|imagine|suppose)\s+(?:that\s+)?"
+    r"(?:a|an|the)\s+(?:block|body|box|cart|crate|mass|object|particle|person|system)\b))",
+    re.IGNORECASE,
+)
+_TRUSTED_EXPLICIT_WORKED_SCENARIO_ONSET_RE = re.compile(
+    r"^\s*(?:(?:now|so)\s*[,;:]?\s+)?(?:"
+    r"(?:a|an|the|this|that)\s+(?:new|next|other)\s+"
+    r"(?:block|body|box|cart|crate|mass|object|particle|person|system)\b|"
+    r"(?:for|in)\s+(?:(?:this|that|the)\s+)?"
+    r"(?:(?:new|next|other)\s+)?"
+    r"(?:block|body|box|cart|crate|object|particle|person|system)\b|"
+    r"(?:assume|consider|imagine|suppose)\s+(?:that\s+)?"
+    r"(?:a|an|the)\s+(?:block|body|box|cart|crate|mass|object|particle|person|system)\b)",
+    re.IGNORECASE,
+)
+_TRUSTED_GENERIC_LOCAL_SCENARIO_RE = re.compile(
+    r"^\s*(?:(?:now|next)\s*[,;:]?\s+)?(?:"
+    r"(?:for|in)\s+(?:a|an|the|this|that)\s+[a-z][\w'’-]*\b|"
+    r"(?:assume|calculate|compute|consider|determine|evaluate|find|given|"
+    r"imagine|solve|suppose)\b)",
+    re.IGNORECASE,
+)
+_TRUSTED_COMPLETE_LOCAL_QUESTION_FRAME_RE = re.compile(
+    r"^\s*(?:(?:now|next|so)\s*[,;:]?\s+|"
+    r"(?:assume|consider|imagine|suppose)\s+(?:that\s+)?|"
+    r"(?:for|in)\s+(?:this|the)\s+(?:case|example)\s*[,;:]?\s+)?(?:"
+    r"(?:at|given|in|on|under|using|with)\s+"
+    r"(?!(?:this|that|the\s+same)\s+"
+    r"(?:case|example|point|problem)\b)[^.!?]{2,160}|"
+    r"for\s+(?!(?:this|that|the\s+same)\s+"
+    r"(?:case|example|problem)\b)[^.!?]{2,160}|"
+    r"(?:if|when)\s+(?:(?:a|an|the|this|that|these|those)\s+)?"
+    r"(?!(?:he|it|she|they|we|you)\b)[a-z][\w'’-]*"
+    r"[^.!?]{0,100}\b(?:are|contains?|does?|equals?|has|have|is|receives?|uses?|"
+    r"vanishes?|was|were|[a-z][\w'’-]*(?:ed|es|s))\b[^.!?]{0,100}|"
+    r"(?:a|an|the|this|that|these|those)\s+"
+    r"(?!(?:he|it|she|they|we|you)\b)[a-z][\w'’-]*"
+    r"[^.!?]{0,100}\b(?:are|contains?|does?|equals?|has|have|is|receives?|uses?|"
+    r"vanishes?|was|were|[a-z][\w'’-]*(?:ed|es|s))\b[^.!?]{0,100})"
+    r"\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_TRUSTED_LOCAL_FRAME_BACK_REFERENCE_RE = re.compile(
+    r"\b(?:above|below|computed|earlier|identified|previous|previously|"
+    r"that|these|this|those)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_LOCAL_FRAME_STRONG_BACK_REFERENCE_RE = re.compile(
+    r"\b(?:above|below|computed|earlier|identified|previous|previously)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_LOCAL_FRAME_ATTRIBUTED_REFERENCE_RE = re.compile(
+    r"\b(?:aforementioned|assumed|given|indicated|stated|supplied|specified)\s+"
+    r"[a-z][\w'’-]*(?:\s+[a-z][\w'’-]*){0,2}\b",
+    re.IGNORECASE,
+)
+_TRUSTED_LOCAL_FRAME_GENERIC_DEICTIC_REFERENCE_RE = re.compile(
+    r"\b(?:this|that|these|those)\s+(?!(?:a|an|the)\b)"
+    r"[a-z][\w'’-]*(?:\s+[a-z][\w'’-]*){0,2}\b",
+    re.IGNORECASE,
+)
+_TRUSTED_LOCAL_FRAME_REFERENTIAL_ACTION_RE = re.compile(
+    r"\b(?:this|that|these|those)\s+(?!(?:a|an|the)\b)"
+    r"[a-z][\w'’-]*(?:\s+[a-z][\w'’-]*){0,2}\s+"
+    r"(?:(?:has|have)\s+been|are|is|was|were)\s+"
+    r"[a-z][\w'’-]*(?:ed|en)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_LOCAL_FRAME_NAMED_SUBJECT_PREDICATE_RE = re.compile(
+    r"\b(?:a|an|the|this|that|these|those)\s+"
+    r"(?!(?:same|previous|prior)\b)"
+    r"[a-z][\w'’-]*(?:\s+[a-z][\w'’-]*){0,3}\s+"
+    r"(?:am|are|can|could|did|do|does|had|has|have|is|may|might|must|"
+    r"shall|should|was|were|will|would|"
+    r"[a-z][\w'’-]*(?:ed|es|s))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_LOCAL_FRAME_PRONOUN_PREDICATE_RE = re.compile(
+    r"\b(?:he|it|she|they)\s+(?:am|are|can|could|did|do|does|had|has|"
+    r"have|is|may|might|must|shall|should|was|were|will|would|"
+    r"[a-z][\w'’-]*(?:ed|es|s))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_LOCAL_IF_WHEN_SUBJECT_RE = re.compile(
+    r"^\s*(?:if|when)\s+(?:(?:a|an|the|this|that|these|those)\s+)?"
+    r"(?!(?:he|it|she|they|we|you)\b)[a-z][\w'’-]*\b",
+    re.IGNORECASE,
+)
+_TRUSTED_LOCAL_FRAME_STATE_RE = re.compile(
+    r"\b(?:am|are|can|could|did|do|does|had|has|have|is|may|might|must|"
+    r"shall|should|was|were|will|would|[a-z][\w'’-]*(?:ed|es|s))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_GENERIC_PREMISE_SCENARIO_RE = re.compile(
+    r"^\s*(?:(?:now|next)\s*[,;:]?\s+)?(?:"
+    r"(?:for|in)\s+(?:a|an|the|this|that)\s+"
+    r"(?!(?:earlier|first|old|previous|prior|quick|same)\b)"
+    r"[a-z][\w'’-]*\b|"
+    r"(?:assume|consider|given|imagine|suppose)\s+"
+    r"(?:that\s+)?(?:a|an|the)\s+[a-z][\w'’-]*\b)",
+    re.IGNORECASE,
+)
+_TRUSTED_GENERIC_LOCAL_DECLARATIVE_RE = re.compile(
+    r"^\s*(?:a|an|the|this|that)\s+(?P<head>[a-z][\w'’-]*)\b"
+    r"[^.!?]{0,100}\b(?:comprises?|consists?\s+of|contains?|has|have|"
+    r"includes?|receives?|requires?|uses?)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_PHYSICAL_SCENARIO_HEADS = frozenset({
+    "block", "body", "box", "cart", "crate", "mass", "object",
+    "particle", "person", "system",
+})
+_TRUSTED_GENERIC_DECLARATIVE_NONHEADS = frozenset({
+    "current", "earlier", "final", "first", "following", "last", "next",
+    "old", "previous", "prior", "same", "second", "third",
+})
+_TRUSTED_CAUTION_DEICTIC_RE = re.compile(
+    r"\b(?:(?:here|there)(?!\s+(?:is|are|was|were)\b)|"
+    r"this|that|these|those)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_COMPARATIVE_BACK_REFERENCE_RE = re.compile(
+    r"\b(?:also|again|accordingly|similarly|likewise|too|"
+    r"(?:half|twice|three\s+times|four\s+times)\s+as\b|"
+    r"(?:greater|higher|larger|less|lower|smaller)\b|"
+    r"(?:more|less)\s+[a-z][\w'’-]*(?:\s+[a-z][\w'’-]*){0,2}\s+than\b|"
+    r"as\s+well|correspondingly|follows?\s+suit|in\s+turn|"
+    r"in\s+response(?!\s+to\b)|once\s+more|proportionally|respectively|"
+    r"in\s+the\s+same\s+way|"
+    r"(?:the\s+)?(?:other|former|latter|same)\b|"
+    r"than\s+(?:before|earlier|previously|the\s+other))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_CONTEXTUAL_ANSWER_IMPERATIVE_RE = re.compile(
+    r"^\s*(?:move|place|put|restore|return|set)\s+"
+    r"(?:it|this|that|the\s+(?:body|mass|object|system))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_QUANTIFIED_FORWARD_CONTENT_RE = re.compile(
+    r"\d|(?:=|\bequals?\b)|\b(?:centimeters?|degrees?|feet|grams?|hours?|"
+    r"inches?|joules?|kilograms?|kilometers?|meters?|minutes?|newtons?|"
+    r"ohms?|pounds?|seconds?|volts?|watts?)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_FORWARD_CAUTION_HANDOFF_RE = re.compile(
+    r"^\s*(?:(?:and|but|so)\s*[,;:]?\s+)?(?:be\s+careful|"
+    r"keep\s+in\s+mind|note|notice|remember)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_RESULT_CLAUSE_RE = re.compile(
+    r"\b(?:the\s+)?(?:answer|result|solution)\s+(?:is|equals?)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_CONTEXT_DEPENDENT_SCOPE_RE = re.compile(
+    r"\b(?:because|caus(?:al|e|es|ed|ing)|compar(?:e|ed|ing|ison)|"
+    r"contrast|versus|why)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_SPLIT_ANSWER_OPENING_RE = re.compile(
+    r"^\s*(?:[a-z0-9][\w'’/-]*\s+){0,3}"
+    r"[a-z0-9][\w'’/-]*\s*[?,.:;—-]",
+    re.IGNORECASE,
+)
+_TRUSTED_INCOMPLETE_QUESTION_TAIL_RE = re.compile(
+    r"\b(?:(?:how|what|which|who)\s+"
+    r"(?:are|can|could|did|do|does|is|should|was|were|will|would)"
+    r"(?:\s+be)?|what(?:['’]s))"
+    r"(?:\s+(?:an?|her|his|its|my|our|the|their|this|that|your))?"
+    r"(?:\s+[a-z][\w'’-]*){0,3}\s*$",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_QUESTION_ONSET_RE = re.compile(
+    r"(?<!\w)(?:how|what|where|which|who|why)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_PROMPT_ONSET_RE = re.compile(
+    r"(?<!\w)(?P<wh>how|what|where|which|who|why)\b|"
+    r"(?<!\w)(?P<yes_no>am|are|can|could|did|do|does|had|has|have|is|"
+    r"may|might|must|shall|should|was|were|will|would)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_QUESTION_AUX_RE = re.compile(
+    r"^\s*(?:['\u2019]s\b|(?:am|are|can|could|did|do|does|had|has|have|is|"
+    r"may|might|must|shall|should|was|were|will|would)\b)",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_UNIT_BOUNDARY_RE = re.compile(
+    r"(?:[.!?]+(?=\s|$)|[;\u2014]+)"
+)
+
+
+def _trusted_joined_unit_boundaries(text: str) -> list[re.Match[str]]:
+    """Return only unambiguous spoken-unit punctuation boundaries.
+
+    A short token or a dotted token before a period may be an abbreviation.
+    Boundary repair must widen across that ambiguity instead of cutting there.
+    """
+    boundaries: list[re.Match[str]] = []
+    for boundary in _TRUSTED_JOINED_UNIT_BOUNDARY_RE.finditer(text):
+        mark = boundary.group(0)
+        if mark.startswith("."):
+            prefix = text[:boundary.start()]
+            token_match = re.search(r"([^\s]+)$", prefix)
+            token = token_match.group(1).strip("\"'()[]{}") if token_match else ""
+            letters = "".join(character for character in token if character.isalpha())
+            following = re.search(r"\s+([A-Za-z][\w'\u2019-]*)", text[boundary.end():])
+            following_word = following.group(1) if following is not None else ""
+            single_symbol_clause_end = bool(
+                len(letters) == 1
+                and re.search(
+                    r"\b(?:be|equal(?:s|led)?|is|then)\s+"
+                    + re.escape(token)
+                    + r"$",
+                    prefix,
+                    re.IGNORECASE,
+                )
+            )
+            title_like_abbreviation = bool(
+                letters
+                and len(letters) <= 5
+                and letters[0].isupper()
+                and following_word[:1].isupper()
+                and not single_symbol_clause_end
+                and following_word.casefold()
+                not in {
+                    "a", "an", "and", "assume", "but", "consider", "for",
+                    "how", "however", "if", "imagine", "in", "it", "let",
+                    "next", "now", "so", "suppose", "the", "then",
+                    "therefore", "this", "that", "what", "when", "where",
+                    "which", "who", "why", "with",
+                }
+            )
+            numeric_abbreviation = bool(
+                letters
+                and len(letters) <= 5
+                and re.match(r"\s+\d", text[boundary.end():])
+            )
+            if (
+                "." in token
+                and any(character.isalpha() for character in token)
+            ) or title_like_abbreviation or numeric_abbreviation:
+                continue
+        boundaries.append(boundary)
+    return boundaries
+
+
+_TRUSTED_JOINED_COMPLETION_RE = re.compile(
+    r"^\s*(?P<completion>[^\n.!?;:\u2014,]*?\b[^\n.!?;:\u2014,]*?)"
+    r"\s*(?P<mark>[?,.:;\u2014])",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_FRESH_SCENARIO_RE = re.compile(
+    r"\b(?:now|next|instead|turning\s+to)\s*[,;:]?\s+"
+    r"(?P<onset>(?:a|an|the|this|that)\s+[a-z][\w'\u2019-]*)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_FRESH_SETUP_RE = re.compile(
+    r"^\s*(?:(?:now|so)\s*[,;:]?\s+)?(?:assume|consider|imagine|"
+    r"suppose|let(?:'s|\s+us)\s+(?:say|suppose))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_GENERIC_QUANTITY_RE = re.compile(
+    r"\d|(?:=|\bequals?\b)|\b(?:zero|one|two|three|four|five|six|"
+    r"seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|"
+    r"sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|"
+    r"sixty|seventy|eighty|ninety|hundred|thousand|million|billion|"
+    r"trillion)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_GENERIC_DECLARATIVE_RE = re.compile(
+    r"^\s*(?:(?:and|but|consequently|hence|so|therefore|thus)\s*[,;:]?\s+)?"
+    r"(?:(?:if|when)\s+)?"
+    r"(?:a|an|any|each|every|some|the|this|that|these|those)\s+"
+    r"(?:[a-z0-9][\w'\u2019-]*\s+){1,7}?"
+    r"(?:am|are|can|could|did|do|does|had|has|have|is|may|might|must|"
+    r"shall|should|was|were|will|would|[a-z][\w'\u2019-]*(?:ed|es|s))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_FINITE_CLAUSE_RE = re.compile(
+    r"^\s*(?:(?:and|but|consequently|hence|so|therefore|thus)\s*[,;:]?\s+)?"
+    r"(?:(?:if|when)\s+)?(?:a|an|any|each|every|some|the|this|that|"
+    r"these|those)?\s*(?:[a-z0-9][\w'\u2019-]*\s+){1,8}?"
+    r"(?:am|are|can|could|did|do|does|had|has|have|is|may|might|must|"
+    r"shall|should|was|were|will|would|[a-z][\w'\u2019-]*(?:ed|es|s))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_FRESH_DECLARATIVE_RE = re.compile(
+    r"^\s*(?:(?:now|next)\s*[,;:]?\s+)?"
+    r"(?:a|an|any|each|every|some)\s+"
+    r"(?:[a-z0-9][\w'\u2019-]*\s+){1,7}?"
+    r"(?:am|are|can|could|did|do|does|had|has|have|is|may|might|must|"
+    r"shall|should|was|were|will|would|[a-z][\w'\u2019-]*(?:ed|es|s))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_ARTICLE_DECLARATIVE_ONSET_RE = re.compile(
+    r"(?<!\w)(?P<onset>"
+    r"(?:a|an|any|each|every|some|the|this|that|these|those)\s+"
+    r"(?:[a-z0-9][\w'\u2019-]*\s+){1,7}?"
+    r"(?:am|are|can|could|did|do|does|had|has|have|is|may|might|must|"
+    r"shall|should|was|were|will|would|[a-z][\w'\u2019-]*(?:ed|es|s))\b)",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_CONTINUATION_RE = re.compile(
+    r"^\s*(?:also|and|but|consequently|furthermore|hence|it|likewise|"
+    r"let(?:'s|\s+us)|moreover|next|so|then|therefore|they|thus)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_LEADING_DEFINITE_RE = re.compile(
+    r"^\s*(?:the|this|that|these|those)\s+(?P<head>[a-z][\w'\u2019-]*)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_DEFINITE_REFERENCE_RE = re.compile(
+    r"\b(?:the|this|that|these|those)\s+(?P<head>[a-z][\w'\u2019-]*)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_PARTICIPIAL_DEFINITE_REFERENCE_RE = re.compile(
+    r"\bthe\s+(?:[a-z][\w'\u2019-]*(?:ed|en))\s+"
+    r"[a-z][\w'\u2019-]*\b",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_NAMED_REFERENCE_RE = re.compile(
+    r"\b(?:its|their)\b|"
+    r"\b(?:compared|connected|relative)\s+to\s+(?:the|this|that)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_JOINED_META_BARRIER_RE = re.compile(
+    r"\b(?:administrative\s+(?:announcement|note)|channel|random\s+aside|"
+    r"sponsor(?:ed|ship)?|thanks?\s+for\s+watching)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_SPLIT_GROUNDING_GENERIC_TOKENS = frozenset({
+    "answer", "case", "example", "explanation", "final", "problem",
+    "question", "result", "solution", "value", "work", "worked",
+})
 
 
 def _trusted_named_teaching_handoff_start(
@@ -11519,6 +12300,2206 @@ def _trusted_claim_setup_start(
     )
 
 
+def _trusted_split_answer_scenario_start_legacy(
+    segments: list[dict],
+    *,
+    selected_line: int,
+    selected_left: int,
+    scope_text: str,
+) -> tuple[int, tuple[int, int]] | None:
+    """Recover the concrete scenario before a caption-split generic answer."""
+    selected_source = str(segments[selected_line].get("text") or "")
+    selected = selected_source[selected_left:]
+    question_line: int | None = None
+    question_tail_left: int | None = None
+    answer_line: int | None = None
+
+    if _TRUSTED_INCOMPLETE_QUESTION_TAIL_RE.match(selected):
+        answer_line = selected_line + 1
+        next_text = str(segments[answer_line].get("text") or "") if (
+            answer_line < len(segments)
+        ) else ""
+        if _TRUSTED_SPLIT_ANSWER_OPENING_RE.match(next_text):
+            question_line = selected_line
+            question_tail_left = selected_left
+    elif (
+        selected_line > 0
+        and _TRUSTED_SPLIT_ANSWER_OPENING_RE.match(selected)
+    ):
+        answer_line = selected_line
+        question_line = selected_line - 1
+        question_source = str(segments[question_line].get("text") or "")
+        tail = _TRUSTED_INCOMPLETE_QUESTION_TAIL_RE.search(question_source)
+        if tail is not None:
+            question_tail_left = tail.start()
+
+    if (
+        question_line is None
+        or question_tail_left is None
+        or answer_line is None
+        or answer_line >= len(segments)
+    ):
+        return None
+    try:
+        answer_gap = (
+            float(segments[answer_line].get("start", 0.0))
+            - float(segments[question_line].get("end", 0.0))
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(answer_gap) or answer_gap >= _SECTION_RESET_GAP_S:
+        return None
+
+    def completion_floor(
+        text: str,
+        upper: int,
+        *,
+        protect_question_prefix: bool = False,
+    ) -> tuple[bool, int]:
+        local_question_frame = _TRUSTED_COMPLETE_LOCAL_QUESTION_FRAME_RE.match(
+            text[:upper]
+        )
+        matches = []
+        for pattern in (
+            _SPLIT_CAPTION_COMPLETION_SIGNAL_RE,
+            _WORKED_UNIT_CLOSING_TAIL_RE,
+            _TRUSTED_CALCULATED_RESULT_RE,
+        ):
+            for match in pattern.finditer(text, 0, upper):
+                if re.match(
+                    r"\s*(?:never|not)\b",
+                    text[match.end():upper],
+                    re.IGNORECASE,
+                ) is not None:
+                    continue
+                # In a local condition, words such as "this solution is
+                # acidic" describe the current scenario; "solution is" is
+                # not a completed prior answer.
+                if (
+                    pattern is _SPLIT_CAPTION_COMPLETION_SIGNAL_RE
+                    and (
+                        protect_question_prefix
+                        or (
+                            local_question_frame is not None
+                            and match.end() <= local_question_frame.end()
+                        )
+                    )
+                ):
+                    continue
+                matches.append(match)
+        if not matches:
+            return False, 0
+        completion = max(matches, key=lambda match: match.end())
+        terminator = re.search(r"[.!?]", text[completion.end():upper])
+        fresh_scenario = _TRUSTED_WORKED_SCENARIO_ONSET_RE.search(
+            text,
+            completion.end(),
+            upper,
+        )
+        if (
+            fresh_scenario is not None
+            and (
+                terminator is None
+                or fresh_scenario.start("setup")
+                < completion.end() + terminator.end()
+            )
+        ):
+            return True, fresh_scenario.start("setup")
+        return (
+            True,
+            completion.end() + terminator.end()
+            if terminator is not None
+            else completion.end(),
+        )
+
+    question_source = str(segments[question_line].get("text") or "")
+    found_completion, question_floor = completion_floor(
+        question_source,
+        question_tail_left,
+        protect_question_prefix=True,
+    )
+    search_floors = {question_line: question_floor}
+    contiguous_lines = [question_line]
+    for line in range(question_line - 1, max(-1, question_line - 12), -1):
+        if found_completion:
+            break
+        try:
+            gap = (
+                float(segments[line + 1].get("start", 0.0))
+                - float(segments[line].get("end", 0.0))
+            )
+        except (TypeError, ValueError, OverflowError):
+            break
+        if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+            break
+        contiguous_lines.append(line)
+        source = str(segments[line].get("text") or "")
+        found_completion, floor = completion_floor(source, len(source))
+        search_floors[line] = floor
+
+    explicit_candidates: list[tuple[int, int]] = []
+    generic_premise_candidates: list[tuple[int, int]] = []
+    generic_declarative_candidates: list[tuple[int, int, str]] = []
+    scenario_candidates: list[tuple[int, int]] = []
+    scenario_candidate_heads: dict[tuple[int, int], str] = {}
+    for line in contiguous_lines:
+        source = str(segments[line].get("text") or "")
+        lower = search_floors.get(line, 0)
+        upper = question_tail_left if line == question_line else len(source)
+        local_fragment = source[lower:upper]
+        if _TRUSTED_GENERIC_PREMISE_SCENARIO_RE.match(local_fragment):
+            generic_premise_candidates.append((line, lower))
+        generic_declarative = _TRUSTED_GENERIC_LOCAL_DECLARATIVE_RE.match(
+            local_fragment
+        )
+        if (
+            generic_declarative is not None
+            and generic_declarative.group("head").casefold()
+            not in _TRUSTED_PHYSICAL_SCENARIO_HEADS
+            and generic_declarative.group("head").casefold()
+            not in _TRUSTED_GENERIC_DECLARATIVE_NONHEADS
+        ):
+            generic_declarative_candidates.append((
+                line,
+                lower,
+                generic_declarative.group("head").casefold(),
+            ))
+        explicit_candidates.extend(
+            (line, handoff.start("conditional"))
+            for handoff in _TRUSTED_CLAIM_SETUP_HANDOFF_RE.finditer(
+                source,
+                lower,
+                upper,
+            )
+            if handoff.group("conditional") is not None
+        )
+        for onset in _TRUSTED_WORKED_SCENARIO_ONSET_RE.finditer(
+            source,
+            lower,
+            upper,
+        ):
+            candidate = (line, onset.start("setup"))
+            scenario_candidates.append(candidate)
+            scenario_head = re.search(
+                r"\b(?:block|body|box|cart|crate|mass|object|particle|"
+                r"person|system)\b",
+                source[onset.start("setup"):onset.end("setup")],
+                re.IGNORECASE,
+            )
+            if scenario_head is not None:
+                scenario_candidate_heads[candidate] = (
+                    scenario_head.group(0).casefold()
+                )
+            if _TRUSTED_EXPLICIT_WORKED_SCENARIO_ONSET_RE.match(
+                source[onset.start("setup"):]
+            ):
+                explicit_candidates.append(candidate)
+    local_question_text = question_source[
+        question_floor:question_tail_left
+    ]
+    local_subject = re.match(
+        r"^\s*(?:a|an|the|this|that)\s+[a-z][\w'’-]*\b",
+        local_question_text,
+        re.IGNORECASE,
+    )
+    local_reference_tail = (
+        local_question_text[local_subject.end():]
+        if local_subject is not None
+        else local_question_text
+    )
+    local_has_embedded_reference = re.search(
+        r"\b(?:the|this|that|these|those)\s+[a-z][\w'’-]*\b",
+        local_reference_tail,
+        re.IGNORECASE,
+    ) is not None
+    local_generic_declarative = _TRUSTED_GENERIC_LOCAL_DECLARATIVE_RE.match(
+        local_question_text
+    )
+    local_unknown_declarative = bool(
+        local_generic_declarative is not None
+        and local_generic_declarative.group("head").casefold()
+        not in _TRUSTED_PHYSICAL_SCENARIO_HEADS
+        and local_generic_declarative.group("head").casefold()
+        not in _TRUSTED_GENERIC_DECLARATIVE_NONHEADS
+        and not local_has_embedded_reference
+    )
+    local_question_frame = _TRUSTED_COMPLETE_LOCAL_QUESTION_FRAME_RE.match(
+        local_question_text
+    )
+    local_deictic_is_self_grounded = bool(
+        _TRUSTED_LOCAL_FRAME_BACK_REFERENCE_RE.search(local_question_text)
+        and (
+            _TRUSTED_QUANTIFIED_FORWARD_CONTENT_RE.search(
+                local_question_text
+            )
+            or (
+                len(_content_tokens(local_question_text)) >= 2
+                and (
+                    _TRUSTED_LOCAL_IF_WHEN_SUBJECT_RE.match(
+                        local_question_text
+                    )
+                    or (
+                        _TRUSTED_LOCAL_FRAME_STATE_RE.search(
+                            local_question_text
+                        )
+                        and _TRUSTED_LOCAL_FRAME_PRONOUN_PREDICATE_RE.search(
+                            local_question_text
+                        ) is None
+                    )
+                )
+            )
+        )
+    )
+    local_frame_has_back_reference = bool(
+        (
+            _TRUSTED_LOCAL_FRAME_STRONG_BACK_REFERENCE_RE.search(
+                local_question_text
+            )
+            or _TRUSTED_LOCAL_FRAME_ATTRIBUTED_REFERENCE_RE.search(
+                local_question_text
+            )
+            or _TRUSTED_LOCAL_FRAME_REFERENTIAL_ACTION_RE.search(
+                local_question_text
+            )
+            or (
+                _TRUSTED_LOCAL_FRAME_GENERIC_DEICTIC_REFERENCE_RE.search(
+                    local_question_text
+                )
+                and _TRUSTED_QUANTIFIED_FORWARD_CONTENT_RE.search(
+                    local_question_text
+                ) is None
+                and _TRUSTED_LOCAL_FRAME_NAMED_SUBJECT_PREDICATE_RE.search(
+                    local_question_text
+                ) is None
+            )
+            or (
+                _TRUSTED_LOCAL_FRAME_BACK_REFERENCE_RE.search(
+                    local_question_text
+                )
+                and not local_deictic_is_self_grounded
+            )
+        )
+    )
+    if local_frame_has_back_reference:
+        explicit_candidates = [
+            candidate
+            for candidate in explicit_candidates
+            if candidate[0] != question_line
+        ]
+        generic_premise_candidates = [
+            candidate
+            for candidate in generic_premise_candidates
+            if candidate[0] != question_line
+        ]
+        generic_declarative_candidates = [
+            candidate
+            for candidate in generic_declarative_candidates
+            if candidate[0] != question_line
+        ]
+        scenario_candidates = [
+            candidate
+            for candidate in scenario_candidates
+            if candidate[0] != question_line
+        ]
+    local_complete_question_frame = bool(
+        local_question_frame
+        and not local_frame_has_back_reference
+        and _TRUSTED_COMPARATIVE_BACK_REFERENCE_RE.search(
+            local_question_text
+        ) is None
+    )
+    local_has_later_scenario_onset = any(
+        line == question_line and left > question_floor
+        for line, left in [
+            *explicit_candidates,
+            *generic_premise_candidates,
+            *scenario_candidates,
+        ]
+    )
+    local_question_tokens = _content_tokens(local_question_text)
+    local_frame_has_explicit_onset = re.match(
+        r"^\s*(?:at|for|given|if|in|on|under|using|when|with)\b",
+        local_question_text,
+        re.IGNORECASE,
+    ) is not None
+    local_frame_is_detached = bool(
+        question_line <= 0
+        or not _cue_has_weak_end(
+            str(segments[question_line - 1].get("text") or ""),
+            question_source,
+            ignore_caption_case=True,
+        )
+    )
+    local_question_candidate = bool(
+        not local_frame_has_back_reference
+        and not local_has_later_scenario_onset
+        and (
+            (
+                local_complete_question_frame
+                and len(local_question_tokens) >= 1
+                and (
+                    local_frame_has_explicit_onset
+                    or local_frame_is_detached
+                )
+            )
+            or (
+                len(local_question_tokens) >= 3
+                and (
+                    local_unknown_declarative
+                    or (
+                        _opening_clause_is_standalone(local_question_text)
+                        and not _cue_opens_mid_thought_at(
+                            segments,
+                            question_line,
+                            ignore_caption_case=True,
+                        )
+                        and (
+                            _TRUSTED_GENERIC_LOCAL_SCENARIO_RE.match(
+                                local_question_text
+                            )
+                            or not local_has_embedded_reference
+                        )
+                    )
+                )
+            )
+        )
+    )
+
+    def weakly_connected(start_line: int, end_line: int) -> bool:
+        return all(
+            _cue_has_weak_end(
+                str(segments[line].get("text") or ""),
+                str(segments[line + 1].get("text") or ""),
+                ignore_caption_case=True,
+            )
+            for line in range(start_line, end_line)
+        )
+
+    scenario_chain_start: tuple[int, int] | None = None
+    if scenario_candidates:
+        scenario_chain_start = max(scenario_candidates)
+        for candidate in sorted(scenario_candidates, reverse=True)[1:]:
+            current_context = " ".join(
+                str(segments[line].get("text") or "")[
+                    scenario_chain_start[1]
+                    if line == scenario_chain_start[0]
+                    else 0:(
+                        question_tail_left
+                        if line == question_line
+                        else None
+                    )
+                ]
+                for line in range(
+                    scenario_chain_start[0],
+                    question_line + 1,
+                )
+            )
+            candidate_head = scenario_candidate_heads.get(candidate, "")
+            refers_to_candidate = bool(
+                candidate_head
+                and re.search(
+                    rf"\b(?:the|this|that)\s+"
+                    rf"{re.escape(candidate_head)}\b",
+                    current_context,
+                    re.IGNORECASE,
+                )
+            )
+            if (
+                weakly_connected(candidate[0], scenario_chain_start[0])
+                or refers_to_candidate
+            ):
+                scenario_chain_start = candidate
+                continue
+            break
+
+    generic_declarative_chain_start: tuple[int, int, str] | None = None
+    if generic_declarative_candidates:
+        latest_generic = max(generic_declarative_candidates)
+        generic_declarative_chain_start = latest_generic
+        for candidate in sorted(
+            (
+                item
+                for item in generic_declarative_candidates
+                if item[2] == latest_generic[2]
+            ),
+            reverse=True,
+        )[1:]:
+            if not weakly_connected(
+                candidate[0],
+                generic_declarative_chain_start[0],
+            ):
+                break
+            generic_declarative_chain_start = candidate
+
+    structural_candidate = max(explicit_candidates, default=None)
+    if generic_premise_candidates:
+        latest_premise = max(generic_premise_candidates)
+        premise_chain_start = latest_premise
+        for premise in sorted(generic_premise_candidates, reverse=True)[1:]:
+            if not weakly_connected(premise[0], premise_chain_start[0]):
+                break
+            premise_chain_start = premise
+        later_explicit = [
+            candidate
+            for candidate in explicit_candidates
+            if candidate > latest_premise
+        ]
+        if later_explicit:
+            structural_candidate = max(later_explicit)
+        else:
+            structural_candidate = premise_chain_start
+            prior_explicit = [
+                candidate
+                for candidate in explicit_candidates
+                if candidate < premise_chain_start
+            ]
+            if prior_explicit:
+                nearest_explicit = max(prior_explicit)
+                if weakly_connected(
+                    nearest_explicit[0],
+                    premise_chain_start[0],
+                ):
+                    structural_candidate = nearest_explicit
+
+    competing_chain_starts = [
+        candidate
+        for candidate in (
+            structural_candidate,
+            generic_declarative_chain_start[:2]
+            if generic_declarative_chain_start is not None
+            else None,
+        )
+        if candidate is not None
+    ]
+    scenario_resets_prior_chains = bool(
+        scenario_chain_start is not None
+        and competing_chain_starts
+        and all(
+            scenario_chain_start > candidate
+            and not weakly_connected(
+                candidate[0],
+                scenario_chain_start[0],
+            )
+            for candidate in competing_chain_starts
+        )
+    )
+
+    if local_question_candidate:
+        source_line, source_left = question_line, question_floor
+    elif scenario_resets_prior_chains:
+        assert scenario_chain_start is not None
+        source_line, source_left = scenario_chain_start
+    elif (
+        structural_candidate is not None
+        or generic_declarative_candidates
+    ):
+        latest_generic = generic_declarative_chain_start
+        if (
+            latest_generic is not None
+            and (
+                structural_candidate is None
+                or latest_generic[:2] > structural_candidate
+            )
+        ):
+            source_line, source_left, _head = latest_generic
+        else:
+            assert structural_candidate is not None
+            source_line, source_left = structural_candidate
+    elif scenario_chain_start is not None:
+        source_line, source_left = scenario_chain_start
+    else:
+        fallback_line = (
+            question_line - 1
+            if (
+                local_frame_has_back_reference
+                and question_line - 1 in set(contiguous_lines)
+            )
+            else question_line
+        )
+        contiguous_set = set(contiguous_lines)
+        for line in range(question_line - 1, min(contiguous_lines) - 1, -1):
+            candidate_text = " ".join(
+                str(segments[candidate_line].get("text") or "")[
+                    search_floors.get(candidate_line, 0)
+                    if candidate_line == line
+                    else 0:(
+                        question_tail_left
+                        if candidate_line == question_line
+                        else None
+                    )
+                ]
+                for candidate_line in range(line, question_line + 1)
+            )
+            candidate_is_complete_local_frame = (
+                _TRUSTED_COMPLETE_LOCAL_QUESTION_FRAME_RE.match(
+                    candidate_text
+                ) is not None
+            )
+            if (
+                line not in contiguous_set
+                or (
+                    not candidate_is_complete_local_frame
+                    and not weakly_connected(line, fallback_line)
+                )
+            ):
+                break
+            fallback_line = line
+            if candidate_is_complete_local_frame:
+                break
+        fallback_left = search_floors.get(fallback_line, 0)
+        fallback_text = " ".join(
+            str(segments[line].get("text") or "")[
+                fallback_left if line == fallback_line else 0:(
+                    question_tail_left
+                    if line == question_line
+                    else None
+                )
+            ]
+            for line in range(fallback_line, question_line + 1)
+        )
+        if (
+            len(_content_tokens(fallback_text)) < 3
+            and not (
+                local_frame_has_back_reference
+                and fallback_line < question_line
+            )
+            and _TRUSTED_COMPLETE_LOCAL_QUESTION_FRAME_RE.match(
+                fallback_text
+            ) is None
+        ):
+            return None
+        source_line, source_left = fallback_line, fallback_left
+    scenario_parts = [
+        str(segments[line].get("text") or "")[
+            source_left if line == source_line else 0:
+        ]
+        for line in range(source_line, question_line + 1)
+    ]
+    scenario = " ".join(scenario_parts)
+    answer_text = str(segments[answer_line].get("text") or "")
+    answer_opening = _TRUSTED_SPLIT_ANSWER_OPENING_RE.match(answer_text)
+    if answer_opening is None:
+        return None
+    question_context = " ".join([
+        scenario,
+        answer_text[:answer_opening.end()],
+    ])
+    minimum_scenario_tokens = (
+        1
+        if (
+            (
+                source_line == question_line
+                and source_left == question_floor
+                and local_complete_question_frame
+            )
+            or _TRUSTED_COMPLETE_LOCAL_QUESTION_FRAME_RE.match(scenario)
+            is not None
+            or (
+                local_frame_has_back_reference
+                and source_line < question_line
+            )
+        )
+        else 3
+    )
+    if (
+        _WORKED_UNIT_QUESTION_TOKEN_RE.search(question_context) is None
+        or len(_content_tokens(scenario)) < minimum_scenario_tokens
+    ):
+        return None
+    source = str(segments[source_line].get("text") or "")
+    quote = _exact_boundary_quote(source[source_left:], want="start")
+    relative_span = (
+        _quote_character_span(source[source_left:], quote)
+        if quote
+        else None
+    )
+    span = (
+        (source_left + relative_span[0], source_left + relative_span[1])
+        if relative_span is not None
+        else None
+    )
+    return (source_line, span) if span is not None else None
+
+
+def _trusted_joined_split_question_start(
+    segments: list[dict],
+    *,
+    selected_line: int,
+    selected_left: int,
+    scope_text: str,
+) -> tuple[tuple[int, tuple[int, int]], str] | None:
+    """Recover a complete question setup without depending on caption cuts."""
+    if not (0 <= selected_line < len(segments)):
+        return None
+    selected_source = str(segments[selected_line].get("text") or "")
+    if not (0 <= selected_left <= len(selected_source)):
+        return None
+
+    first_line = selected_line
+    for line in range(selected_line - 1, -1, -1):
+        try:
+            gap = (
+                float(segments[line + 1].get("start", 0.0))
+                - float(segments[line].get("end", 0.0))
+            )
+        except (TypeError, ValueError, OverflowError):
+            break
+        if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+            break
+        first_line = line
+
+    parts: list[str] = []
+    line_ranges: list[tuple[int, int, int]] = []
+    cursor = 0
+    for line in range(first_line, selected_line + 1):
+        source = str(segments[line].get("text") or "")
+        right = selected_left if line == selected_line else len(source)
+        piece = source[:right]
+        if parts:
+            parts.append(" ")
+            cursor += 1
+        joined_left = cursor
+        parts.append(piece)
+        cursor += len(piece)
+        line_ranges.append((line, joined_left, cursor))
+    joined = "".join(parts)
+    if not joined.strip():
+        return None
+
+    completion_parts = [selected_source[selected_left:]]
+    completion = _TRUSTED_JOINED_COMPLETION_RE.match(completion_parts[0])
+    completion_line = selected_line
+    while completion is None and completion_line + 1 < len(segments):
+        try:
+            gap = (
+                float(segments[completion_line + 1].get("start", 0.0))
+                - float(segments[completion_line].get("end", 0.0))
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+            return None
+        completion_line += 1
+        completion_parts.append(
+            str(segments[completion_line].get("text") or "")
+        )
+        completion = _TRUSTED_JOINED_COMPLETION_RE.match(
+            " ".join(completion_parts)
+        )
+    if completion is None or not _WORD_RE.search(completion.group("completion")):
+        return None
+    completion_text = " ".join(completion_parts)
+    answer_tail = completion_text[completion.end():]
+    explicit_question_completion = bool(
+        completion.group("mark") == "?"
+        or re.search(
+            r"\b(?:answer|result|solution)\b",
+            completion.group("completion"),
+            re.IGNORECASE,
+        )
+    )
+    completion_is_question_edge = bool(
+        explicit_question_completion or completion.group("mark") == "."
+    )
+    if not completion_is_question_edge:
+        return None
+
+    unit_boundaries = _trusted_joined_unit_boundaries(joined)
+    prompt_floor = unit_boundaries[-1].end() if unit_boundaries else 0
+    prompt_context = joined[prompt_floor:]
+    wh_matches = []
+    other_prompt_matches = []
+    for match in _TRUSTED_JOINED_PROMPT_ONSET_RE.finditer(prompt_context):
+        if match.group("wh") is not None:
+            preceding = prompt_context[:match.start()]
+            if (
+                _TRUSTED_JOINED_QUESTION_AUX_RE.match(
+                    prompt_context[match.end():]
+                )
+                or not _WORD_RE.search(preceding)
+                or re.search(r"[,;:]\s*$", preceding)
+            ):
+                wh_matches.append(match)
+            continue
+        preceding = prompt_context[:match.start()]
+        if not _WORD_RE.search(preceding) or re.search(
+            r"\b(?:now|next|please|then)\s*$",
+            preceding,
+            re.IGNORECASE,
+        ):
+            other_prompt_matches.append(match)
+    prompt_matches = wh_matches or other_prompt_matches
+    if prompt_matches:
+        question_start = prompt_floor + prompt_matches[-1].start()
+    elif (
+        _WORD_RE.search(prompt_context)
+        and (
+            explicit_question_completion
+            or len(_toks(prompt_context)) == 1
+        )
+        and completion.group("mark") in {"?", "."}
+    ):
+        # An arbitrary imperative cannot be recognized from a universal verb
+        # list.  The final unclosed unit immediately before the selected
+        # completion is the conservative structural frame.
+        question_start = prompt_floor
+    else:
+        return None
+
+    grounding_tokens = (
+        _content_tokens(" ".join((scope_text, answer_tail)))
+        - _TRUSTED_SPLIT_GROUNDING_GENERIC_TOKENS
+    )
+
+    def context_tokens(text: str) -> set[str]:
+        return (
+            _content_tokens(text)
+            - _TRUSTED_SPLIT_GROUNDING_GENERIC_TOKENS
+        )
+
+    def is_meta_barrier(text: str) -> bool:
+        return _WORD_RE.search(text) is None
+
+    unit_spans: list[tuple[int, int]] = []
+    cursor = 0
+    for boundary in _trusted_joined_unit_boundaries(joined[:question_start]):
+        if _WORD_RE.search(joined[cursor:boundary.end()]):
+            unit_spans.append((cursor, boundary.end()))
+        cursor = boundary.end()
+    if _WORD_RE.search(joined[cursor:question_start]):
+        unit_spans.append((cursor, question_start))
+
+    local_start = prompt_floor
+    local_prefix = joined[local_start:question_start]
+    fresh_onsets = list(
+        _TRUSTED_JOINED_FRESH_SCENARIO_RE.finditer(local_prefix)
+    )
+    if fresh_onsets:
+        local_start += fresh_onsets[-1].start("onset")
+        local_prefix = joined[local_start:question_start]
+    else:
+        declarative_onsets = list(
+            _TRUSTED_JOINED_ARTICLE_DECLARATIVE_ONSET_RE.finditer(
+                local_prefix
+            )
+        )
+        fresh_declarative = next(
+            (
+                onset
+                for onset in reversed(declarative_onsets)
+                if not re.match(
+                    r"^\s*(?:at|for|from|given|if|in|on|under|using|"
+                    r"when|with)\b",
+                    local_prefix[:onset.start("onset")],
+                    re.IGNORECASE,
+                )
+            ),
+            None,
+        )
+        if fresh_declarative is not None:
+            local_start += fresh_declarative.start("onset")
+            local_prefix = joined[local_start:question_start]
+
+    if context_tokens(local_prefix):
+        start = local_start
+        seed_index = next(
+            (
+                index
+                for index, (left, right) in enumerate(unit_spans)
+                if left <= start < right
+            ),
+            len(unit_spans) - 1,
+        )
+    else:
+        prior_units = [
+            (index, left, right)
+            for index, (left, right) in enumerate(unit_spans)
+            if right <= question_start
+            and context_tokens(joined[left:right])
+            and not is_meta_barrier(joined[left:right])
+        ]
+        if not prior_units:
+            return None
+
+        grounded_prior_units = [
+            item
+            for item in prior_units
+            if context_tokens(joined[item[1]:item[2]]) & grounding_tokens
+        ]
+        seed_index, start, _seed_right = max(
+            grounded_prior_units or prior_units,
+            key=lambda item: item[0],
+        )
+
+    def locally_grounded(text: str) -> bool:
+        stripped = text.strip(" \t\r\n,;:\u2014-")
+        if not stripped:
+            return False
+        if _TRUSTED_JOINED_GENERIC_QUANTITY_RE.search(stripped):
+            return True
+        framed = re.match(
+            r"^(?:at|for|in|on|under|with)\s+"
+            r"(?:a|an|the|this|that|these|those)\s+"
+            r"[a-z][\w'\u2019-]*\b(?P<detail>.*)$",
+            stripped,
+            re.IGNORECASE,
+        )
+        if (
+            framed
+            and len(context_tokens(framed.group("detail"))) >= 2
+        ):
+            return True
+        if re.match(
+            r"^(?:at|for|from|given|in|on|under|using|with)\s+"
+            r"(?:this|that|these|those)\b",
+            stripped,
+            re.IGNORECASE,
+        ):
+            return False
+        if _TRUSTED_LOCAL_FRAME_NAMED_SUBJECT_PREDICATE_RE.search(stripped):
+            return True
+        return bool(
+            _TRUSTED_LOCAL_IF_WHEN_SUBJECT_RE.match(stripped)
+            and (
+                _TRUSTED_LOCAL_FRAME_STATE_RE.search(stripped)
+                or _TRUSTED_LOCAL_FRAME_NAMED_SUBJECT_PREDICATE_RE.search(
+                    stripped
+                )
+            )
+        )
+
+    def depends_on_previous(text: str, previous: str) -> bool:
+        stripped = text.strip(" \t\r\n,;:\u2014-")
+        previous_reference_tokens = _content_tokens(previous)
+        if not stripped or not previous_reference_tokens:
+            return False
+        if _TRUSTED_JOINED_FRESH_SETUP_RE.match(stripped):
+            return False
+        referential_action = bool(
+            _TRUSTED_LOCAL_FRAME_REFERENTIAL_ACTION_RE.search(stripped)
+        )
+        if _TRUSTED_JOINED_CONTINUATION_RE.match(stripped):
+            return True
+        predicate = _TRUSTED_LOCAL_FRAME_NAMED_SUBJECT_PREDICATE_RE.search(
+            stripped
+        )
+        if predicate is not None:
+            for reference in _TRUSTED_JOINED_DEFINITE_REFERENCE_RE.finditer(
+                stripped,
+                predicate.end(),
+            ):
+                if (
+                    _content_tokens(reference.group("head"))
+                    & previous_reference_tokens
+                    or _TRUSTED_JOINED_CONTINUATION_RE.match(previous)
+                    or _TRUSTED_LOCAL_FRAME_PRONOUN_PREDICATE_RE.search(
+                        previous
+                    )
+                ):
+                    return True
+        deictic_heads = {
+            token
+            for match in _TRUSTED_JOINED_DEFINITE_REFERENCE_RE.finditer(
+                stripped
+            )
+            if match.group(0).split(maxsplit=1)[0].casefold()
+            in {"this", "that", "these", "those"}
+            for token in _content_tokens(match.group("head"))
+        }
+        if (
+            deictic_heads & previous_reference_tokens
+            or (
+                deictic_heads
+                and _TRUSTED_JOINED_CONTINUATION_RE.match(previous)
+            )
+        ):
+            return True
+        if referential_action:
+            return True
+        if (
+            _TRUSTED_LOCAL_FRAME_ATTRIBUTED_REFERENCE_RE.search(stripped)
+            or _TRUSTED_LOCAL_FRAME_STRONG_BACK_REFERENCE_RE.search(stripped)
+            or _TRUSTED_JOINED_NAMED_REFERENCE_RE.search(stripped)
+            or _TRUSTED_LOCAL_FRAME_PRONOUN_PREDICATE_RE.search(stripped)
+        ):
+            return True
+        leading = _TRUSTED_JOINED_LEADING_DEFINITE_RE.match(stripped)
+        if (
+            leading is not None
+            and bool(
+                _content_tokens(leading.group("head"))
+                & previous_reference_tokens
+            )
+        ):
+            return True
+        if locally_grounded(stripped):
+            return False
+        if re.match(
+            r"^(?:at|for|from|given|in|on|under|using|with)\s+"
+            r"(?:the|this|that|these|those)\b",
+            stripped,
+            re.IGNORECASE,
+        ):
+            return True
+        return False
+
+    while seed_index > 0:
+        current = joined[start:unit_spans[seed_index][1]]
+        prior_left, prior_right = unit_spans[seed_index - 1]
+        previous = joined[prior_left:prior_right]
+        current_grounding = context_tokens(current) & grounding_tokens
+        previous_grounding = context_tokens(previous) & grounding_tokens
+        quantified_pair = bool(
+            locally_grounded(current)
+            and locally_grounded(previous)
+            and _TRUSTED_JOINED_GENERIC_QUANTITY_RE.search(current)
+            and _TRUSTED_JOINED_GENERIC_QUANTITY_RE.search(previous)
+        )
+        conditional_pair = bool(
+            re.match(r"^\s*(?:if|when)\b", current, re.IGNORECASE)
+            and re.match(
+                r"^\s*(?:if|when)\b",
+                previous,
+                re.IGNORECASE,
+            )
+        )
+        declarative_pair = bool(current_grounding and previous_grounding)
+        co_givens = bool(
+            (quantified_pair or conditional_pair or declarative_pair)
+            and (
+                conditional_pair
+                or not current_grounding
+                or bool(previous_grounding)
+            )
+            and _TRUSTED_JOINED_RESULT_CLAUSE_RE.search(previous) is None
+        )
+        if is_meta_barrier(previous) or not (
+            depends_on_previous(current, previous) or co_givens
+        ):
+            break
+        start = prior_left
+        seed_index -= 1
+
+    grounded_resets: list[int] = []
+    structural_unit_starts = [0, *(
+        boundary.end() for boundary in unit_boundaries
+    )]
+    for unit_start in structural_unit_starts:
+        if not (start < unit_start < question_start):
+            continue
+        candidate = joined[unit_start:question_start].lstrip()
+        leading_space = len(joined[unit_start:question_start]) - len(candidate)
+        if (
+            _TRUSTED_JOINED_FRESH_SETUP_RE.match(candidate)
+            and (
+                context_tokens(candidate) & grounding_tokens
+                or _TRUSTED_JOINED_GENERIC_QUANTITY_RE.search(candidate)
+            )
+        ):
+            grounded_resets.append(unit_start + leading_space)
+    for framed in re.finditer(
+        r"(?<!\w)(?:at|for|from|given|in|on|under|using|when|with)\s+"
+        r"(?:a|an)\s+",
+        joined[start:question_start],
+        re.IGNORECASE,
+    ):
+        framed_start = start + framed.start()
+        preceding_boundaries = [
+            boundary.end()
+            for boundary in unit_boundaries
+            if boundary.end() <= framed_start
+        ]
+        structural_floor = (
+            preceding_boundaries[-1] if preceding_boundaries else start
+        )
+        if _WORD_RE.search(joined[structural_floor:framed_start]):
+            continue
+        framed_text = joined[framed_start:question_start]
+        if (
+            context_tokens(framed_text) & grounding_tokens
+            or _TRUSTED_JOINED_GENERIC_QUANTITY_RE.search(framed_text)
+        ):
+            grounded_resets.append(framed_start)
+    for onset in _TRUSTED_JOINED_ARTICLE_DECLARATIVE_ONSET_RE.finditer(
+        joined,
+        start,
+        question_start,
+    ):
+        onset_start = onset.start("onset")
+        reset_start = onset_start
+        preceding_boundaries = [
+            boundary.end()
+            for boundary in unit_boundaries
+            if boundary.end() <= onset_start
+        ]
+        structural_floor = (
+            preceding_boundaries[-1] if preceding_boundaries else 0
+        )
+        structural_prefix = joined[structural_floor:onset_start]
+        prior_significant = joined[:onset_start].rstrip()
+        structural_onset = bool(
+            not prior_significant
+            or prior_significant.endswith((".", "!", "?", ";", ":", "\u2014"))
+        )
+        determiner_match = re.match(
+            r"(?P<determiner>a|an|any|each|every|some|the|this|that|"
+            r"these|those)\b",
+            onset.group("onset"),
+            re.IGNORECASE,
+        )
+        if (
+            determiner_match is not None
+            and determiner_match.group("determiner").casefold()
+            in {"this", "that", "these", "those"}
+        ):
+            continue
+        if re.fullmatch(
+            r"\s*(?:at|for|from|given|if|in|on|under|using|when|with)\s+",
+            structural_prefix,
+            re.IGNORECASE,
+        ):
+            structural_onset = True
+            reset_start = structural_floor
+        elif re.fullmatch(
+            r"\s*(?:(?:and|but|so|therefore|thus)\s*[,;:]?\s*)",
+            structural_prefix,
+            re.IGNORECASE,
+        ):
+            structural_onset = True
+            reset_start = structural_floor
+        if not structural_onset:
+            continue
+        candidate_right = next(
+            (
+                boundary.end()
+                for boundary in unit_boundaries
+                if boundary.end() > reset_start
+            ),
+            question_start,
+        )
+        candidate_text = joined[reset_start:candidate_right]
+        prior_text = joined[start:reset_start]
+        prior_ends = [
+            boundary.end()
+            for boundary in unit_boundaries
+            if boundary.end() <= reset_start
+        ]
+        prior_boundary = prior_ends[-2] if len(prior_ends) >= 2 else start
+        immediate_prior = joined[prior_boundary:reset_start]
+        head_match = re.match(
+            r"(?:a|an|any|each|every|some|the|this|that|these|those)\s+"
+            r"(?P<head>[a-z][\w'\u2019-]*)",
+            onset.group("onset"),
+            re.IGNORECASE,
+        )
+        repeated_head = bool(
+            head_match
+            and _content_tokens(head_match.group("head"))
+            & _content_tokens(prior_text)
+        )
+        head_in_immediate_prior = bool(
+            head_match
+            and _content_tokens(head_match.group("head"))
+            & _content_tokens(immediate_prior)
+        )
+        references_prior = any(
+            _content_tokens(reference.group("head"))
+            & _content_tokens(prior_text)
+            for reference in _TRUSTED_JOINED_DEFINITE_REFERENCE_RE.finditer(
+                candidate_text,
+                max(0, onset.end("onset") - reset_start),
+            )
+        )
+        if references_prior:
+            continue
+        if (
+            determiner_match is not None
+            and determiner_match.group("determiner").casefold() == "the"
+            and head_in_immediate_prior
+        ):
+            continue
+        candidate_grounding = context_tokens(candidate_text) & grounding_tokens
+        prior_grounding = context_tokens(prior_text) & grounding_tokens
+        framed_indefinite_reset = bool(
+            determiner_match is not None
+            and determiner_match.group("determiner").casefold() in {"a", "an"}
+            and re.fullmatch(
+                r"\s*(?:at|for|from|given|if|in|on|under|using|when|with)\s+",
+                structural_prefix,
+                re.IGNORECASE,
+            )
+            and (
+                candidate_grounding
+                or _TRUSTED_JOINED_GENERIC_QUANTITY_RE.search(candidate_text)
+            )
+        )
+        prior_head_match = re.search(
+            r"(?:^|[.!?;\u2014]\s+)(?:a|an|any|each|every|some|the)\s+"
+            r"(?P<head>[a-z][\w'\u2019-]*)",
+            prior_text,
+            re.IGNORECASE,
+        )
+        distinct_grounded_co_givens = bool(
+            not repeated_head
+            and head_match
+            and prior_head_match
+            and _content_tokens(head_match.group("head")) & grounding_tokens
+            and _content_tokens(prior_head_match.group("head"))
+            & grounding_tokens
+        )
+        if (
+            (candidate_grounding or repeated_head or framed_indefinite_reset)
+            and not distinct_grounded_co_givens
+        ):
+            grounded_resets.append(reset_start)
+    if grounded_resets:
+        start = max(start, grounded_resets[-1])
+
+    while start < len(joined) and joined[start].isspace():
+        start += 1
+    if start >= len(joined):
+        return None
+    source_line: int | None = None
+    source_left: int | None = None
+    for line, joined_left, joined_right in line_ranges:
+        if joined_left <= start < joined_right:
+            source_line = line
+            source_left = start - joined_left
+            break
+    if source_line is None or source_left is None:
+        return None
+    source = str(segments[source_line].get("text") or "")
+    quote = _exact_boundary_quote(source[source_left:], want="start")
+    relative_span = (
+        _quote_character_span(source[source_left:], quote)
+        if quote
+        else None
+    )
+    if relative_span is None:
+        return None
+    span = (
+        source_left + relative_span[0],
+        source_left + relative_span[1],
+    )
+    return (source_line, span), joined[start:question_start]
+
+
+def _trusted_split_answer_scenario_start(
+    segments: list[dict],
+    *,
+    selected_line: int,
+    selected_left: int,
+    scope_text: str,
+) -> tuple[int, tuple[int, int]] | None:
+    """Use only the cue-invariant repair; uncertainty keeps Gemini's edge."""
+    joined = _trusted_joined_split_question_start(
+        segments,
+        selected_line=selected_line,
+        selected_left=selected_left,
+        scope_text=scope_text,
+    )
+    return joined[0] if joined is not None else None
+
+
+def _trusted_grounded_forward_unit_start_legacy(
+    segments: list[dict],
+    *,
+    selected_line: int,
+    selected_left: int,
+    claim_location: tuple[int, int, int, int],
+    intent_locations: list[tuple[int, int, int, int]],
+    scope_text: str,
+) -> tuple[int, tuple[int, int], str] | None:
+    """Trim a completed prior unit only when Gemini's evidence starts later."""
+    grounded_positions = [
+        (location[0], location[1])
+        for location in [claim_location, *intent_locations]
+    ]
+    earliest_grounded = min(grounded_positions)
+    if earliest_grounded <= (selected_line, selected_left):
+        return None
+
+    scope = str(scope_text or "")
+    selected_fragment = str(segments[selected_line].get("text") or "")[
+        selected_left:
+    ]
+    if (
+        selected_left == 0
+        and _TRUSTED_QUANTIFIED_FORWARD_CONTENT_RE.search(selected_fragment)
+        is None
+        and _ATOMIC_WORKED_SCOPE_RE.search(scope) is None
+        and _TRUSTED_WORKED_TASK_SCOPE_RE.search(scope) is None
+        and _ATOMIC_CAUSAL_SCOPE_RE.search(scope) is None
+        and _ATOMIC_COHERENT_ARC_SCOPE_RE.search(scope) is None
+        and _TRUSTED_CLAIM_SENTENCE_ARC_SCOPE_RE.search(scope) is None
+        and _EXPLICIT_COMPARISON_OBJECTIVE_RE.search(scope) is None
+        and _cue_opens_mid_thought_at(
+            segments,
+            selected_line,
+            ignore_caption_case=True,
+        )
+    ):
+        for line in range(selected_line + 1, earliest_grounded[0] + 1):
+            try:
+                gap = (
+                    float(segments[line].get("start", 0.0))
+                    - float(segments[line - 1].get("end", 0.0))
+                )
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+                return None
+            source = str(segments[line].get("text") or "")
+            caution = _TRUSTED_FORWARD_CAUTION_HANDOFF_RE.match(source)
+            if caution is None:
+                continue
+            through_grounding = " ".join(
+                str(segments[index].get("text") or "")
+                for index in range(line, earliest_grounded[0] + 1)
+            )
+            retained = through_grounding[caution.end():].lstrip(" ,;:—-")
+            retained_sentences = _sentence_character_spans(retained)
+            retained_opening = (
+                retained[:retained_sentences[0][1]]
+                if retained_sentences
+                else retained
+            )
+            if (
+                not _opening_clause_is_standalone(retained)
+                or _opening_has_unresolved_setup_reference(retained_opening)
+                or _TRUSTED_CAUTION_DEICTIC_RE.search(retained_opening)
+                or _TRUSTED_COMPARATIVE_BACK_REFERENCE_RE.search(
+                    retained_opening
+                )
+            ):
+                continue
+            quote = _exact_boundary_quote(source, want="start")
+            span = _quote_character_span(source, quote) if quote else None
+            if span is not None:
+                return line, span, quote
+
+    if (
+        (
+            _ATOMIC_WORKED_SCOPE_RE.search(scope)
+            or _TRUSTED_WORKED_TASK_SCOPE_RE.search(scope)
+        )
+        and _EXPLICIT_COMPARISON_OBJECTIVE_RE.search(scope) is None
+        and _EXPLICIT_RELATIONAL_OBJECTIVE_RE.search(scope) is None
+    ):
+        prefix_parts: list[str] = []
+        worked_candidates: list[tuple[int, tuple[int, int], str]] = []
+        for line in range(selected_line, earliest_grounded[0] + 1):
+            source = str(segments[line].get("text") or "")
+            left = selected_left if line == selected_line else 0
+            right = earliest_grounded[1] if line == earliest_grounded[0] else len(source)
+            if right <= left:
+                continue
+            for handoff in _TRUSTED_FORWARD_WORKED_HANDOFF_RE.finditer(
+                source,
+                left,
+                right,
+            ):
+                before = " ".join([
+                    *prefix_parts,
+                    source[left:handoff.start("handoff")],
+                ])
+                completion_matches = [
+                    (match, pattern)
+                    for pattern in (
+                        _SPLIT_CAPTION_COMPLETION_SIGNAL_RE,
+                        _WORKED_UNIT_CLOSING_TAIL_RE,
+                        _TRUSTED_FORWARD_WORKED_COMPLETION_RE,
+                    )
+                    for match in pattern.finditer(before)
+                ]
+                if not completion_matches:
+                    continue
+                last_completion, _completion_pattern = max(
+                    completion_matches,
+                    key=lambda item: item[0].end(),
+                )
+                after_completion = before[last_completion.end():]
+                generic_completion_is_unclosed = bool(
+                    _completion_pattern
+                    is _SPLIT_CAPTION_COMPLETION_SIGNAL_RE
+                    and re.search(
+                        r"\b(?:final|fully|simplified)\b",
+                        last_completion.group(0),
+                        re.IGNORECASE,
+                    ) is None
+                    and re.search(r"[.!?]", after_completion) is None
+                )
+                if (
+                    (
+                        _completion_pattern
+                        is _TRUSTED_FORWARD_WORKED_COMPLETION_RE
+                        and _TRUSTED_FORWARD_WORKED_RESULT_CLAUSE_RE.search(
+                            before[
+                                max(0, last_completion.start() - 180):
+                                last_completion.start()
+                            ]
+                        ) is None
+                    )
+                    or
+                    generic_completion_is_unclosed
+                    or
+                    re.match(r"\s*(?:never|not)\b", after_completion, re.I)
+                    or re.search(r"[.!?]\s+\S", after_completion)
+                    or _TRUSTED_FRESH_WORKED_SCENARIO_RE.search(
+                        after_completion
+                    )
+                ):
+                    continue
+                quote = _exact_boundary_quote(
+                    source[handoff.start("handoff"):],
+                    want="start",
+                )
+                relative_span = (
+                    _quote_character_span(
+                        source[handoff.start("handoff"):],
+                        quote,
+                    )
+                    if quote
+                    else None
+                )
+                span = (
+                    (
+                        handoff.start("handoff") + relative_span[0],
+                        handoff.start("handoff") + relative_span[1],
+                    )
+                    if relative_span is not None
+                    else None
+                )
+                if span is not None:
+                    worked_candidates.append((line, span, quote))
+            prefix_parts.append(source[left:right])
+        if worked_candidates:
+            return max(
+                worked_candidates,
+                key=lambda item: (item[0], item[1][0]),
+            )
+
+    if selected_line <= 0:
+        return None
+    selected_text = str(segments[selected_line].get("text") or "")
+    selected_sentences = _sentence_character_spans(selected_text[selected_left:])
+    selected_opening = (
+        selected_text[selected_left:selected_left + selected_sentences[0][1]]
+        if selected_sentences
+        else selected_text[selected_left:]
+    )
+    previous_text = str(segments[selected_line - 1].get("text") or "").rstrip()
+    if (
+        not previous_text.endswith("?")
+        or _TRUSTED_CONTEXTUAL_ANSWER_IMPERATIVE_RE.match(selected_opening) is None
+        or _TRUSTED_QUANTIFIED_FORWARD_CONTENT_RE.search(selected_opening)
+        is not None
+    ):
+        return None
+
+    scope_tokens = _content_tokens(scope)
+    selected_opening_tokens = _content_tokens(selected_opening)
+    required_selected_tokens = selected_opening_tokens & scope_tokens
+    for line in range(selected_line + 1, earliest_grounded[0] + 1):
+        try:
+            gap = (
+                float(segments[line].get("start", 0.0))
+                - float(segments[line - 1].get("end", 0.0))
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+            return None
+        source = str(segments[line].get("text") or "")
+        check = source
+        marker = _LEADING_DISCOURSE_MARKER_RE.match(check)
+        if marker is not None:
+            check = check[marker.end():]
+        check = re.sub(
+            r"^\s*now\s*[,;:]?\s+",
+            "",
+            check,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        retained_through_grounding = " ".join(
+            str(segments[index].get("text") or "")
+            for index in range(line, earliest_grounded[0] + 1)
+        )
+        retained_tokens = _content_tokens(retained_through_grounding)
+        check_sentences = _sentence_character_spans(check)
+        check_opening = (
+            check[:check_sentences[0][1]]
+            if check_sentences
+            else check
+        )
+        if (
+            not _opening_clause_is_standalone(check)
+            or _TRUSTED_CAUTION_DEICTIC_RE.search(check_opening)
+            or _TRUSTED_COMPARATIVE_BACK_REFERENCE_RE.search(check_opening)
+            or len(_content_tokens(check) & scope_tokens) < 2
+            or len(retained_tokens & selected_opening_tokens) < 2
+            or not required_selected_tokens.issubset(retained_tokens)
+        ):
+            continue
+        quote = _exact_boundary_quote(source, want="start")
+        span = _quote_character_span(source, quote) if quote else None
+        if span is not None:
+            return line, span, quote
+    return None
+
+
+def _trusted_grounded_forward_unit_start(
+    segments: list[dict],
+    *,
+    selected_line: int,
+    selected_left: int,
+    claim_location: tuple[int, int, int, int],
+    intent_locations: list[tuple[int, int, int, int]],
+    scope_text: str,
+) -> tuple[int, tuple[int, int], str] | None:
+    """Advance only across a joined, structurally closed prior unit."""
+    if not (0 <= selected_line < len(segments)):
+        return None
+    selected_source = str(segments[selected_line].get("text") or "")
+    if not (0 <= selected_left <= len(selected_source)):
+        return None
+
+    locations = [claim_location, *intent_locations]
+    grounded = [
+        location
+        for location in locations
+        if 0 <= location[0] <= location[2] < len(segments)
+    ]
+    if not grounded:
+        return None
+    earliest = min(grounded, key=lambda item: (item[0], item[1]))
+    anchor_line, anchor_left, anchor_end_line, anchor_right = earliest
+    if (anchor_line, anchor_left) <= (selected_line, selected_left):
+        return None
+
+    for line in range(selected_line, anchor_end_line):
+        try:
+            gap = (
+                float(segments[line + 1].get("start", 0.0))
+                - float(segments[line].get("end", 0.0))
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+            return None
+
+    parts: list[str] = []
+    line_ranges: list[tuple[int, int, int, int]] = []
+    cursor = 0
+    for line in range(selected_line, anchor_end_line + 1):
+        source = str(segments[line].get("text") or "")
+        source_left = selected_left if line == selected_line else 0
+        source_right = anchor_right if line == anchor_end_line else len(source)
+        if source_right < source_left:
+            return None
+        if parts:
+            parts.append(" ")
+            cursor += 1
+        joined_left = cursor
+        piece = source[source_left:source_right]
+        parts.append(piece)
+        cursor += len(piece)
+        line_ranges.append((line, joined_left, cursor, source_left))
+    joined = "".join(parts)
+    if not joined.strip():
+        return None
+
+    anchor_offset = next(
+        (
+            joined_left + anchor_left - source_left
+            for line, joined_left, _joined_right, source_left in line_ranges
+            if line == anchor_line
+        ),
+        None,
+    )
+    if anchor_offset is None or anchor_offset <= 0:
+        return None
+
+    def location_text(location: tuple[int, int, int, int]) -> str:
+        first, left, last, right = location
+        if not (selected_line <= first <= last <= anchor_end_line):
+            return ""
+        pieces = []
+        for line in range(first, last + 1):
+            source = str(segments[line].get("text") or "")
+            piece_left = left if line == first else 0
+            piece_right = right if line == last else len(source)
+            if piece_right > piece_left:
+                pieces.append(source[piece_left:piece_right])
+        return " ".join(pieces)
+
+    anchor_tokens = _content_tokens(" ".join(
+        location_text(location) for location in grounded
+    )) - _TRUSTED_SPLIT_GROUNDING_GENERIC_TOKENS
+    scope_tokens = (
+        _content_tokens(scope_text) - _TRUSTED_SPLIT_GROUNDING_GENERIC_TOKENS
+    )
+    all_boundaries = _trusted_joined_unit_boundaries(joined)
+    boundaries = [
+        boundary
+        for boundary in all_boundaries
+        if boundary.end() <= anchor_offset
+    ]
+    selected_end = boundaries[0].end() if boundaries else anchor_offset
+    selected_unit = joined[:selected_end]
+    selected_scope_tokens = _content_tokens(selected_unit) & scope_tokens
+    selected_reference_tokens = _content_tokens(selected_unit)
+    selected_prompt = re.sub(
+        r"^\s*(?:(?:and|but|now|so|then)\s*[,;:]?\s+)+",
+        "",
+        selected_unit,
+        flags=re.IGNORECASE,
+    )
+    selected_is_prompt = bool(
+        _TRUSTED_JOINED_PROMPT_ONSET_RE.match(selected_prompt)
+        or _TRUSTED_JOINED_FRESH_SETUP_RE.match(selected_prompt)
+    )
+
+    previous_source = (
+        str(segments[selected_line - 1].get("text") or "").rstrip()
+        if selected_line > 0 and selected_left == 0
+        else ""
+    )
+    selected_first_word = _WORD_RE.search(selected_unit)
+    selected_action_tokens = (
+        _content_tokens(selected_first_word.group(0))
+        if selected_first_word is not None
+        else set()
+    )
+    if (
+        previous_source.endswith("?")
+        and selected_action_tokens & scope_tokens
+    ):
+        return None
+    if (
+        (
+            _ATOMIC_CAUSAL_SCOPE_RE.search(scope_text)
+            or _EXPLICIT_COMPARISON_OBJECTIVE_RE.search(scope_text)
+            or _EXPLICIT_RELATIONAL_OBJECTIVE_RE.search(scope_text)
+            or _TRUSTED_CONTEXT_DEPENDENT_SCOPE_RE.search(scope_text)
+        )
+        and (
+            _TRUSTED_COMPARATIVE_BACK_REFERENCE_RE.search(selected_unit)
+            or (
+                re.search(
+                    r"\b(?:because|since|whereas|while)\b",
+                    f"{previous_source} {selected_unit}",
+                    re.IGNORECASE,
+                )
+                and _TRUSTED_CONTEXT_DEPENDENT_SCOPE_RE.search(scope_text)
+            )
+        )
+    ):
+        return None
+
+    def next_boundary(position: int) -> int:
+        return next(
+            (
+                boundary.end()
+                for boundary in boundaries
+                if boundary.end() > position
+            ),
+            anchor_offset,
+        )
+
+    def normalized_opening(text: str) -> str:
+        opening = text.strip(" \t\r\n,;:\u2014-")
+        marker = _LEADING_DISCOURSE_MARKER_RE.match(opening)
+        if marker is not None:
+            opening = opening[marker.end():].lstrip(" ,;:\u2014-")
+        return re.sub(
+            r"^now\s*[,;:]?\s+",
+            "",
+            opening,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    def reuses_selected_reference(text: str) -> bool:
+        return any(
+            _content_tokens(reference.group("head")) & selected_reference_tokens
+            for reference in _TRUSTED_JOINED_DEFINITE_REFERENCE_RE.finditer(text)
+        )
+
+    candidates: list[int] = []
+    explicit_handoff_candidates: set[int] = set()
+
+    worked_handoffs = list(_TRUSTED_FORWARD_WORKED_HANDOFF_RE.finditer(
+        joined,
+        0,
+        anchor_offset,
+    ))
+    for handoff in worked_handoffs:
+        if handoff.start("handoff") <= 0:
+            continue
+        prefix = joined[:handoff.start("handoff")]
+        explicit_results = list(
+            _TRUSTED_JOINED_RESULT_CLAUSE_RE.finditer(prefix)
+        )
+        demonstrated_results = list(
+            _TRUSTED_FORWARD_WORKED_COMPLETION_RE.finditer(prefix)
+        )
+        demonstrated_result_is_calculated = bool(
+            len(list(_TRUSTED_JOINED_GENERIC_QUANTITY_RE.finditer(prefix))) >= 2
+            and re.search(
+                r"(?:=|\bequals?\b|\b(?:is|be)\s+(?:going\s+to\s+)?"
+                r"(?:about\s+|approximately\s+|roughly\s+)?"
+                r"(?:-?\d+(?:\.\d+)?|zero|one|two|three|four|five|six|"
+                r"seven|eight|nine|ten)\b)",
+                prefix,
+                re.IGNORECASE,
+            )
+            and re.search(
+                r"(?:[+*/=]|\b(?:divided|minus|multiplied|plus|times)\b)",
+                prefix,
+                re.IGNORECASE,
+            )
+        )
+        if (
+            demonstrated_results
+            and demonstrated_result_is_calculated
+        ):
+            demonstrated = demonstrated_results[-1]
+            demonstrated_boundary = next(
+                (
+                    boundary
+                    for boundary in _trusted_joined_unit_boundaries(prefix)
+                    if boundary.end() > demonstrated.end()
+                ),
+                None,
+            )
+            if (
+                demonstrated_boundary is not None
+                and _WORD_RE.search(prefix[demonstrated_boundary.end():])
+            ):
+                return None
+            candidates.append(handoff.start("handoff"))
+            explicit_handoff_candidates.add(handoff.start("handoff"))
+            continue
+        result_markers = list(explicit_results)
+        closed_results: list[int] = []
+        for result in result_markers:
+            closing = next(
+                (
+                    boundary.end()
+                    for boundary in _trusted_joined_unit_boundaries(prefix)
+                    if boundary.end() > result.end()
+                ),
+                None,
+            )
+            if closing is not None:
+                closed_results.append(closing)
+        if not closed_results:
+            continue
+        last_closed_result = max(closed_results)
+        if _WORD_RE.search(prefix[last_closed_result:]):
+            # Any intervening speech may be a premise, condition, or setup.
+            # Its vocabulary is irrelevant: ambiguity preserves Gemini's edge.
+            return None
+        candidates.append(handoff.start("handoff"))
+        explicit_handoff_candidates.add(handoff.start("handoff"))
+
+    if selected_is_prompt and not candidates:
+        return None
+
+    unit_starts = [
+        boundary.end()
+        for boundary in boundaries
+        if 0 < boundary.end() < anchor_offset
+    ]
+    for start in unit_starts:
+        while start < anchor_offset and joined[start].isspace():
+            start += 1
+        if start >= anchor_offset:
+            continue
+        unit_right = next(
+            (
+                boundary.end()
+                for boundary in all_boundaries
+                if boundary.end() > start
+            ),
+            len(joined),
+        )
+        unit = joined[start:unit_right]
+        caution = _TRUSTED_FORWARD_CAUTION_HANDOFF_RE.match(unit)
+        if caution is None:
+            continue
+        body = unit[caution.end():].lstrip(" ,;:\u2014-")
+        body_tokens = _content_tokens(body)
+        retained_before_anchor = _content_tokens(
+            joined[start + caution.end():anchor_offset]
+        )
+        caution_continues_into_anchor = unit_right > anchor_offset
+        if (
+            (not body_tokens and not caution_continues_into_anchor)
+            or not (
+                len(retained_before_anchor & anchor_tokens) >= 2
+                or len(retained_before_anchor & scope_tokens) >= 2
+                or caution_continues_into_anchor
+            )
+            or not _opening_clause_is_standalone(body)
+            or _opening_has_unresolved_setup_reference(body)
+            or _TRUSTED_PARTICIPIAL_DEFINITE_REFERENCE_RE.search(body)
+            or reuses_selected_reference(body)
+            or _TRUSTED_CAUTION_DEICTIC_RE.search(body)
+            or _TRUSTED_COMPARATIVE_BACK_REFERENCE_RE.search(body)
+        ):
+            continue
+        candidates.append(start)
+
+    for start in unit_starts:
+        while start < anchor_offset and joined[start].isspace():
+            start += 1
+        if start >= anchor_offset:
+            continue
+        unit_right = next_boundary(start)
+        unit = joined[start:unit_right]
+        opening = normalized_opening(unit)
+        opening_tokens = _content_tokens(opening)
+        if (
+            not opening_tokens
+            or _TRUSTED_FORWARD_CAUTION_HANDOFF_RE.match(unit)
+            or _TRUSTED_JOINED_PROMPT_ONSET_RE.match(opening)
+            or _TRUSTED_JOINED_FRESH_SETUP_RE.match(opening)
+            or re.match(
+                r"^let(?:'s|\s+us)\s+",
+                opening,
+                re.IGNORECASE,
+            )
+            or not _opening_clause_is_standalone(opening)
+            or _opening_has_unresolved_setup_reference(opening)
+            or _TRUSTED_JOINED_DEFINITE_REFERENCE_RE.match(opening)
+            or reuses_selected_reference(opening)
+            or _TRUSTED_COMPARATIVE_BACK_REFERENCE_RE.search(opening)
+            or not (
+                opening_tokens & anchor_tokens
+                or len(opening_tokens & scope_tokens) >= 2
+            )
+        ):
+            continue
+        candidates.append(start)
+
+    if not candidates:
+        return None
+    candidate = min(candidates)
+    candidate_is_explicit_handoff = candidate in explicit_handoff_candidates
+    retained_tokens = _content_tokens(joined[candidate:])
+    if (
+        not candidate_is_explicit_handoff
+        and len(selected_scope_tokens) >= 2
+        and not selected_scope_tokens.issubset(retained_tokens)
+    ):
+        return None
+    if (
+        not candidate_is_explicit_handoff
+        and _TRUSTED_JOINED_GENERIC_QUANTITY_RE.search(selected_unit)
+        and _TRUSTED_JOINED_RESULT_CLAUSE_RE.search(selected_unit) is None
+        and _TRUSTED_FORWARD_WORKED_COMPLETION_RE.search(selected_unit) is None
+    ):
+        return None
+
+    while candidate < len(joined) and joined[candidate].isspace():
+        candidate += 1
+    mapped = next(
+        (
+            (line, source_left + candidate - joined_left)
+            for line, joined_left, joined_right, source_left in line_ranges
+            if joined_left <= candidate < joined_right
+        ),
+        None,
+    )
+    if mapped is None:
+        return None
+    line, source_left = mapped
+    source = str(segments[line].get("text") or "")
+    quote = _exact_boundary_quote(source[source_left:], want="start")
+    relative_span = (
+        _quote_character_span(source[source_left:], quote) if quote else None
+    )
+    if relative_span is None:
+        return None
+    span = (
+        source_left + relative_span[0],
+        source_left + relative_span[1],
+    )
+    return line, span, quote
+
+
+def _trusted_authoritative_model_edges(
+    segments: list[dict],
+    *,
+    proposal_start: int,
+    proposal_end: int,
+    start_anchor: _ModelBoundaryAnchor | None,
+    end_anchor: _ModelBoundaryAnchor | None,
+    evidence_quotes: list[str],
+) -> tuple[
+    int,
+    tuple[int, int] | None,
+    int,
+    tuple[int, int] | None,
+    list[str],
+]:
+    """Preserve Gemini's semantic words; uncertainty widens but never rejects.
+
+    Only exact, unique Gemini-authored quotes inside the model's own ``s:e``
+    frame may affect the semantic interval.  Local punctuation, topic words,
+    cue casing, and timing gaps are deliberately irrelevant.  A claim or
+    required intent quote may widen the model edge outward, but no local rule
+    may advance the start or retract the end.
+    """
+    diagnostics: list[str] = []
+    n = len(segments)
+    start_line = min(max(proposal_start, 0), n - 1)
+    end_line = min(max(proposal_end, 0), n - 1)
+    if start_line > end_line:
+        start_line, end_line = end_line, start_line
+        diagnostics.append("reversed_model_range")
+
+    start_span: tuple[int, int] | None = None
+    end_span: tuple[int, int] | None = None
+    if start_anchor is None:
+        diagnostics.append("bad_or_ambiguous_start_quote")
+    else:
+        start_line = start_anchor.first_line
+        start_span = start_anchor.first_span
+    if end_anchor is None:
+        diagnostics.append("bad_or_ambiguous_end_quote")
+    else:
+        end_line = end_anchor.last_line
+        end_span = end_anchor.last_span
+
+    if (
+        start_anchor is not None
+        and end_anchor is not None
+        and start_anchor.first_word_position >= end_anchor.last_word_position
+    ):
+        start_line = min(max(proposal_start, 0), n - 1)
+        end_line = min(max(proposal_end, 0), n - 1)
+        if start_line > end_line:
+            start_line, end_line = end_line, start_line
+        start_span = end_span = None
+        diagnostics.append("reversed_model_boundary")
+
+    for quote in dict.fromkeys(
+        normalized
+        for value in evidence_quotes
+        if (normalized := " ".join(str(value or "").split()))
+    ):
+        evidence_anchor = _unique_boundary_anchor(
+            segments,
+            quote,
+            min(max(proposal_start, 0), n - 1),
+            min(max(proposal_end, 0), n - 1),
+            allow_timing_gaps=True,
+        )
+        if evidence_anchor is None:
+            diagnostics.append("ambiguous_model_evidence")
+            continue
+        first_line = evidence_anchor.first_line
+        first_left = evidence_anchor.first_span[0]
+        last_line = evidence_anchor.last_line
+        last_right = evidence_anchor.last_span[1]
+        current_start = (
+            start_line,
+            start_span[0] if start_span is not None else 0,
+        )
+        current_end = (
+            end_line,
+            end_span[1]
+            if end_span is not None
+            else len(str(segments[end_line].get("text") or "")),
+        )
+        if (first_line, first_left) < current_start:
+            source = str(segments[first_line].get("text") or "")
+            words = list(_WORD_RE.finditer(source, first_left))
+            start_line = first_line
+            start_span = (
+                (
+                    words[0].start(),
+                    words[min(5, len(words) - 1)].end(),
+                )
+                if words
+                else None
+            )
+            diagnostics.append("start_expanded_to_model_evidence")
+        if (last_line, last_right) > current_end:
+            source = str(segments[last_line].get("text") or "")
+            words = [
+                word
+                for word in _WORD_RE.finditer(source)
+                if word.start() < last_right
+            ]
+            end_line = last_line
+            end_span = (
+                (words[max(0, len(words) - 6)].start(), last_right)
+                if words
+                else None
+            )
+            diagnostics.append("end_expanded_to_model_evidence")
+
+    return (
+        start_line,
+        start_span,
+        end_line,
+        end_span,
+        list(dict.fromkeys(diagnostics)),
+    )
+
+
+def _trusted_universal_compact_plan_to_report(
+    plan: _CompactBoundaryPlan,
+    segments: list[dict],
+) -> _Conversion:
+    """Convert Gemini topics without executing local semantic repair code."""
+    report = _Conversion(proposed_count=len(plan.topics))
+    if not segments:
+        report.rejected_reasons.append("missing_segments")
+        return report
+
+    n = len(segments)
+    all_constraint_ids = [
+        str(constraint.constraint_id)
+        for constraint in plan.request_intent.constraints
+    ]
+    constraint_kinds = {
+        str(constraint.constraint_id): constraint.kind
+        for constraint in plan.request_intent.constraints
+    }
+    required_constraint_ids = {
+        str(constraint.constraint_id)
+        for constraint in plan.request_intent.constraints
+        if constraint.kind is not _IntentConstraintKind.SCOPE
+    }
+    used_candidate_ids: set[str] = set()
+
+    for index, proposal in enumerate(plan.topics):
+        diagnostics: list[str] = []
+        range_valid = 0 <= proposal.start_line <= proposal.end_line < n
+        proposal_start = min(max(proposal.start_line, 0), n - 1)
+        proposal_end = min(max(proposal.end_line, 0), n - 1)
+        if proposal_start > proposal_end:
+            proposal_start, proposal_end = proposal_end, proposal_start
+        if not range_valid:
+            diagnostics.append("bad_index")
+
+        model_start_quote = str(proposal.start_quote or "").strip()
+        model_end_quote = str(proposal.end_quote or "").strip()
+        raw_model_claim_quote = " ".join(
+            str(proposal.claim_quote or "").split()
+        )
+        start_anchor = _unique_boundary_anchor(
+            segments,
+            model_start_quote,
+            proposal_start,
+            proposal_end,
+            allow_timing_gaps=True,
+        )
+        end_anchor = _unique_boundary_anchor(
+            segments,
+            model_end_quote,
+            proposal_start,
+            proposal_end,
+            allow_timing_gaps=True,
+        )
+        evidence_quotes = [raw_model_claim_quote]
+        evidence_quotes.extend(
+            str(item.evidence_quote)
+            for item in proposal.intent_evidence
+            if constraint_kinds.get(str(item.constraint_id))
+            is not _IntentConstraintKind.SCOPE
+        )
+        a, start_span, b, end_span, edge_diagnostics = (
+            _trusted_authoritative_model_edges(
+                segments,
+                proposal_start=proposal_start,
+                proposal_end=proposal_end,
+                start_anchor=start_anchor,
+                end_anchor=end_anchor,
+                evidence_quotes=evidence_quotes,
+            )
+        )
+        diagnostics.extend(edge_diagnostics)
+
+        if (
+            a == b
+            and start_span is not None
+            and end_span is not None
+            and start_span[0] >= end_span[1]
+        ):
+            start_span = end_span = None
+            diagnostics.append("full_cue_boundary_fallback")
+
+        clip_text, semantic_spans_by_cue = _semantic_clip_slice(
+            segments,
+            a,
+            b,
+            start_span=start_span,
+            end_span=end_span,
+        )
+        if not clip_text:
+            start_span = end_span = None
+            clip_text, semantic_spans_by_cue = _semantic_clip_slice(
+                segments,
+                a,
+                b,
+                start_span=None,
+                end_span=None,
+            )
+            diagnostics.append("full_cue_boundary_fallback")
+
+        start_text = str(segments[a].get("text") or "")
+        end_text = str(segments[b].get("text") or "")
+        start_quote = (
+            _literal_source_quote(start_text, "", start_span)
+            if start_span is not None
+            else _exact_boundary_quote(start_text, want="start")
+        )
+        end_quote = (
+            _literal_source_quote(end_text, "", end_span)
+            if end_span is not None
+            else _exact_boundary_quote(end_text, want="end")
+        )
+        start_projected = bool(
+            start_span is not None
+            and _WORD_RE.search(start_text[:start_span[0]])
+        )
+        end_projected = bool(
+            end_span is not None
+            and _WORD_RE.search(end_text[end_span[1]:])
+        )
+
+        grounded_constraint_ids = {
+            str(item.constraint_id)
+            for item in proposal.intent_evidence
+            if str(item.constraint_id) in all_constraint_ids
+            and _contains_quote(clip_text, str(item.evidence_quote))
+        }
+        topic_evidence_quote = (
+            raw_model_claim_quote
+            if _contains_quote(clip_text, raw_model_claim_quote)
+            else next(
+                (
+                    str(item.evidence_quote)
+                    for item in proposal.intent_evidence
+                    if _contains_quote(clip_text, str(item.evidence_quote))
+                ),
+                _best_effort_evidence_quote(clip_text),
+            )
+        )
+        intent_coverage = (
+            len(grounded_constraint_ids & required_constraint_ids)
+            / len(required_constraint_ids)
+            if required_constraint_ids
+            else 1.0
+        )
+        intent_role = (
+            "primary"
+            if (
+                proposal.directly_teaches_topic is True
+                and required_constraint_ids.issubset(grounded_constraint_ids)
+            )
+            else "supporting"
+        )
+
+        base_id = str(proposal.candidate_id or f"candidate-{index + 1}")
+        candidate_id = base_id
+        suffix = 2
+        while candidate_id in used_candidate_ids:
+            candidate_id = f"{base_id}-{suffix}"
+            suffix += 1
+        used_candidate_ids.add(candidate_id)
+
+        cue_ids = [
+            str(segments[line].get("cue_id") or f"cue-{line}")
+            for line in range(a, b + 1)
+        ]
+        start, end = _padded_cue_bounds(segments, a, b)
+        edge_projection: dict[str, dict[str, object]] = {}
+        if start_projected:
+            edge_projection["start"] = {
+                "required": True,
+                "cue_id": cue_ids[0],
+                "quote": start_quote,
+            }
+        if end_projected:
+            edge_projection["end"] = {
+                "required": True,
+                "cue_id": cue_ids[-1],
+                "quote": end_quote,
+            }
+
+        diagnostics = list(dict.fromkeys(diagnostics))
+        clip = {
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "start_quote": start_quote,
+            "end_quote": end_quote,
+            "title": str(proposal.title or "").strip(),
+            "learning_objective": str(proposal.learning_objective or "").strip(),
+            "facet": str(proposal.facet or "").strip(),
+            "reason": str(proposal.learning_objective or "").strip(),
+            "kind": "educational",
+            "informativeness": float(proposal.informativeness),
+            "topic_relevance": float(proposal.topic_relevance),
+            "educational_importance": float(proposal.educational_importance),
+            "difficulty": float(proposal.difficulty),
+            "directly_teaches_topic": bool(proposal.directly_teaches_topic),
+            "substantive": bool(proposal.substantive),
+            "factually_grounded": bool(proposal.factually_grounded),
+            "self_contained": bool(proposal.self_contained),
+            "is_standalone": bool(proposal.is_standalone),
+            "topic_evidence_quote": topic_evidence_quote,
+            "model_claim_quote": raw_model_claim_quote,
+            "boundary_confidence": 1.0 if not diagnostics else 0.75,
+            "boundary_repair_mode": "exact" if not diagnostics else "best_effort",
+            "selection_authority": "gemini",
+            "surface_eligible": True,
+            "selection_candidate_id": candidate_id,
+            "cue_ids": cue_ids,
+            "start_cue_id": cue_ids[0],
+            "end_cue_id": cue_ids[-1],
+            "chain_id": "",
+            "chain_position": 0,
+            "prerequisite_ids": [],
+            "uncertainty": "low",
+            "uncertainty_reasons": [],
+            "intent_role": intent_role,
+            "intent_coverage": round(intent_coverage, 6),
+            "intent_evidence": [
+                {
+                    "constraint_id": str(item.constraint_id),
+                    "evidence_quote": str(item.evidence_quote),
+                }
+                for item in proposal.intent_evidence
+            ],
+            "summary": "",
+            "takeaways": [],
+            "match_reason": "",
+            "assessment": None,
+            "sequence_index": index + 1,
+            "_start_line": a,
+            "_end_line": b,
+            "_clip_id": f"clip-{index + 1:03d}-{a}-{b}",
+            "_clip_text": clip_text,
+            "_proposal_index": index,
+            "_semantic_spans_by_cue": semantic_spans_by_cue,
+            "_quote_repaired": bool(diagnostics),
+            "_boundary_fallback_reasons": diagnostics,
+        }
+        if edge_projection:
+            clip["edge_projection"] = edge_projection
+        report.clips.append(clip)
+
+    return report
+
+
 def _trusted_compact_plan_to_report(
     plan: _CompactBoundaryPlan,
     segments: list[dict],
@@ -11550,13 +14531,16 @@ def _trusted_compact_plan_to_report(
         quote: str,
         start_line: int,
         end_line: int,
+        *,
+        want: str,
     ) -> _ModelBoundaryAnchor | None:
-        anchor = _unique_boundary_anchor(
-            segments, quote, start_line, end_line,
+        return _nearest_boundary_anchor(
+            segments,
+            quote,
+            start_line,
+            end_line,
+            want=want,
         )
-        if anchor is None and (start_line != 0 or end_line != n - 1):
-            anchor = _unique_boundary_anchor(segments, quote, 0, n - 1)
-        return anchor
 
     for index, proposal in enumerate(plan.topics):
         diagnostics: list[str] = []
@@ -11565,15 +14549,37 @@ def _trusted_compact_plan_to_report(
         b = min(max(proposal.end_line, 0), n - 1)
         if a > b:
             a, b = b, a
+        proposal_start, proposal_end = a, b
         if not proposed_range_valid:
             diagnostics.append("bad_index")
 
+        model_start_quote = str(proposal.start_quote or "").strip()
+        effective_start_quote = model_start_quote
+        model_end_quote = str(proposal.end_quote or "").strip()
+        effective_end_quote = model_end_quote
+        start_anchor = boundary_anchor(
+            model_start_quote,
+            proposal_start,
+            proposal_end,
+            want="start",
+        )
+        end_anchor = boundary_anchor(
+            model_end_quote,
+            proposal_start,
+            proposal_end,
+            want="end",
+        )
         raw_model_claim_quote = " ".join(
             str(proposal.claim_quote or "").split()
         )
         model_claim_quote = raw_model_claim_quote
-        claim_location = _unique_evidence_location(
-            segments, model_claim_quote, 0, n - 1,
+        claim_location = _proposal_evidence_location(
+            segments,
+            model_claim_quote,
+            proposal_start,
+            proposal_end,
+            start_anchor=start_anchor,
+            end_anchor=end_anchor,
         )
         grounded_intent_locations: list[
             tuple[str, str, tuple[int, int, int, int]]
@@ -11582,8 +14588,13 @@ def _trusted_compact_plan_to_report(
             constraint_id = str(item.constraint_id)
             if constraint_id not in constraint_kinds:
                 continue
-            location = _unique_evidence_location(
-                segments, str(item.evidence_quote), 0, n - 1,
+            location = _proposal_evidence_location(
+                segments,
+                str(item.evidence_quote),
+                proposal_start,
+                proposal_end,
+                start_anchor=start_anchor,
+                end_anchor=end_anchor,
             )
             if location is None:
                 diagnostics.append(
@@ -11609,12 +14620,6 @@ def _trusted_compact_plan_to_report(
                 diagnostics.append(
                     "claim_anchor_recovered_from_intent_evidence"
                 )
-        model_start_quote = str(proposal.start_quote or "").strip()
-        effective_start_quote = model_start_quote
-        model_end_quote = str(proposal.end_quote or "").strip()
-        effective_end_quote = model_end_quote
-        start_anchor = boundary_anchor(model_start_quote, a, b)
-        end_anchor = boundary_anchor(model_end_quote, a, b)
         start_span: tuple[int, int] | None = None
         end_span: tuple[int, int] | None = None
 
@@ -11641,6 +14646,11 @@ def _trusted_compact_plan_to_report(
                 b = end_anchor.last_line
                 end_span = end_anchor.last_span
 
+        projected_model_start = (
+            (a, start_span)
+            if start_span is not None
+            else None
+        )
         structural_start_trimmed = False
         trusted_structural_onset_applied = False
         if claim_location is not None:
@@ -11766,43 +14776,10 @@ def _trusted_compact_plan_to_report(
             diagnostics.append("reversed_range_repaired")
 
         if claim_location is not None:
-            objective_for_section = " ".join(
-                str(value or "")
-                for value in (proposal.title, proposal.facet)
-            )
-            atomic_scope_text = " ".join(
-                str(value or "")
-                for value in (
-                    proposal.title,
-                    objective_for_section,
-                    proposal.facet,
-                )
-            )
-            relationship_bridge_allowed = bool(
-                _compact_evidence_explicitly_relates_sections(
-                    model_claim_quote
-                )
-                and _objective_explicitly_relates_sections(
-                    objective_for_section
-                )
-            )
-            transitions = _candidate_topic_transitions(
-                segments,
-                a,
-                b,
-                evidence_quote=model_claim_quote,
-                learning_objective=objective_for_section,
-                relationship_bridge_allowed=relationship_bridge_allowed,
-                atomic_claim_required=True,
-                atomic_scope_text=atomic_scope_text,
-            )
-            section_start, _section_end = _single_objective_section_bounds(
-                segments,
-                a,
-                b,
-                evidence_location=claim_location,
-                transitions=transitions,
-            )
+            # Gemini owns semantic topic selection.  The trusted conversion may
+            # repair spoken boundaries, but it must not re-segment a valid
+            # proposal with downstream topic/verb vocabularies.
+            section_start = a
             claim_anchor_text = " ".join(
                 str(value or "")
                 for value in (
@@ -12246,14 +15223,14 @@ def _trusted_compact_plan_to_report(
                     )
                     & _content_tokens(final_scope_text)
                 )
-                generic_subject = bool(
+                structural_subject = bool(
                     prior_span is not None
-                    and _TRUSTED_SPLIT_GENERIC_SUBJECT_RE.fullmatch(
+                    and _TRUSTED_SPLIT_SUBJECT_FRAGMENT_RE.fullmatch(
                         prior_text[prior_span[0]:]
                     )
                 )
                 if prior_span is not None and (
-                    len(prior_scope_overlap) >= 2 or generic_subject
+                    len(prior_scope_overlap) >= 2 or structural_subject
                 ):
                     split_claim_subject_start = a - 1, prior_span
         if split_claim_subject_start is not None:
@@ -12397,24 +15374,164 @@ def _trusted_compact_plan_to_report(
             )
             diagnostics.extend(start_context_diagnostics)
 
-        worked_arc_end = _trusted_projected_worked_arc_end(
+        split_answer_start = _trusted_split_answer_scenario_start(
+            segments,
+            selected_line=a,
+            selected_left=(start_span[0] if start_span is not None else 0),
+            scope_text=final_scope_text,
+        )
+        if split_answer_start is not None:
+            answer_line, answer_span = split_answer_start
+            if (answer_line, answer_span[0]) < (
+                a,
+                start_span[0] if start_span is not None else 0,
+            ):
+                a, start_span = answer_line, answer_span
+                effective_start_quote = _literal_source_quote(
+                    str(segments[a].get("text") or ""),
+                    "",
+                    start_span,
+                )
+                structural_start_trimmed = True
+                trusted_structural_onset_applied = True
+                diagnostics.append("expanded_split_answer_scenario")
+
+        forward_origins = [(
+            a,
+            start_span[0] if start_span is not None else 0,
+        )]
+        grounded_forward_candidates = [
+            candidate
+            for forward_line, forward_left in forward_origins
+            if claim_location is not None
+            for candidate in [
+                _trusted_grounded_forward_unit_start(
+                    segments,
+                    selected_line=forward_line,
+                    selected_left=forward_left,
+                    claim_location=claim_location,
+                    intent_locations=[
+                        location
+                        for constraint_id, _quote, location
+                        in grounded_intent_locations
+                        if constraint_kinds[constraint_id]
+                        is not _IntentConstraintKind.SCOPE
+                    ],
+                    scope_text=final_scope_text,
+                )
+            ]
+            if candidate is not None
+        ]
+        grounded_forward_start = max(
+            grounded_forward_candidates,
+            default=None,
+            key=lambda item: (item[0], item[1][0]),
+        )
+        if grounded_forward_start is not None:
+            forward_line, forward_span, forward_quote = grounded_forward_start
+            if (forward_line, forward_span[0]) > (
+                a,
+                start_span[0] if start_span is not None else 0,
+            ):
+                a, start_span = forward_line, forward_span
+                effective_start_quote = forward_quote
+                structural_start_trimmed = True
+                trusted_structural_onset_applied = True
+                diagnostics.append("advanced_to_grounded_unit_handoff")
+
+        # A prior branch can move a raw Gemini word edge and mark that move as
+        # trusted, yet still land on another caption fragment (for example,
+        # ``that heavier...`` -> ``means that heavier...``).  The trust bit
+        # records where the edge came from; it is not proof that the final
+        # spoken opening is complete.  Re-evaluate the effective edge once,
+        # and recover only the adjacent split cue after a structural trim so
+        # this guard cannot walk back into a completed unit we intentionally
+        # removed.  Boundary uncertainty never rejects the selected clip.
+        residual_start_text = str(segments[a].get("text") or "")
+        residual_start_left = start_span[0] if start_span is not None else 0
+        residual_start_needs_context = bool(
+            (
+                start_span is not None
+                and start_span[0] > 0
+                and not _projected_start_is_standalone(
+                    residual_start_text,
+                    start_span,
+                )
+            )
+            or (
+                residual_start_left == 0
+                and _cue_opens_mid_thought_at(
+                    segments,
+                    a,
+                    ignore_caption_case=True,
+                )
+            )
+            or (
+                start_span is None
+                and not _opening_clause_is_standalone(residual_start_text)
+            )
+        )
+        if (
+            residual_start_needs_context
+            and "expanded_projected_start_context" in diagnostics
+        ):
+            residual_claim_start = (
+                _trusted_claim_sentence_start(
+                    segments,
+                    selected_line=a,
+                    claim_location=claim_location,
+                    allowed_frame="note",
+                )
+                if (
+                    claim_location is not None
+                    and _trusted_relational_sentence_before_claim(
+                        segments,
+                        selected_line=a,
+                        selected_left=residual_start_left,
+                        claim_location=claim_location,
+                    )
+                )
+                else None
+            )
+            if residual_claim_start is not None:
+                residual_line, residual_span = residual_claim_start
+                residual_diagnostics = [
+                    "trimmed_clipped_start_to_claim_sentence"
+                ]
+            else:
+                residual_line, residual_span, residual_diagnostics = (
+                    _trusted_start_context_repair(
+                        segments,
+                        a,
+                        start_span,
+                        force_clipped_start=True,
+                        min_start_line=(
+                            max(0, a - 1) if structural_start_trimmed else 0
+                        ),
+                    )
+                )
+            if (residual_line, residual_span) != (a, start_span):
+                a, start_span = residual_line, residual_span
+                effective_start_quote = (
+                    _literal_source_quote(
+                        str(segments[a].get("text") or ""),
+                        "",
+                        start_span,
+                    )
+                    if start_span is not None
+                    else ""
+                )
+                diagnostics.extend(residual_diagnostics)
+                diagnostics.append("finalized_incomplete_start_context")
+
+        completed_unit_end = _trusted_joined_unit_end(
             segments,
             end_line=b,
             end_span=end_span,
-            scope_text=final_scope_text,
         )
-        if worked_arc_end is not None:
-            b, end_span, effective_end_quote = worked_arc_end
-            diagnostics.append("completed_projected_worked_arc")
-
-        completed_caption_end = _completed_truncated_caption_end(
-            str(segments[b].get("text") or ""),
-            end_span,
-            scope_text=final_scope_text,
-        )
-        if completed_caption_end is not None:
-            end_span, effective_end_quote = completed_caption_end
-            diagnostics.append("completed_truncated_caption_word")
+        if completed_unit_end is not None:
+            b, end_span, effective_end_quote = completed_unit_end
+            diagnostics.append("completed_unfinished_spoken_unit")
 
         start_text = str(segments[a].get("text") or "")
         end_text = str(segments[b].get("text") or "")
@@ -12428,29 +15545,6 @@ def _trusted_compact_plan_to_report(
             if end_span is not None
             else _exact_boundary_quote(end_text, want="end")
         )
-        trimmed_end_quote, trimmed_edge_noise = _trim_end_quote_before_edge_noise(
-            end_text,
-            end_quote,
-            evidence_quote=model_claim_quote,
-            learning_objective=str(proposal.learning_objective or ""),
-            preferred_span=end_span,
-        )
-        if trimmed_edge_noise:
-            trimmed_end_anchor = _unique_boundary_anchor(
-                segments,
-                trimmed_end_quote,
-                b,
-                b,
-            )
-            if trimmed_end_anchor is not None:
-                end_span = trimmed_end_anchor.last_span
-                end_quote = _literal_source_quote(
-                    end_text,
-                    trimmed_end_quote,
-                    end_span,
-                )
-                diagnostics.append("trimmed_trailing_edge_noise")
-
         if (
             a == b
             and start_span is not None
@@ -12620,6 +15714,8 @@ def _plan_to_report(
         isinstance(plan, _CompactBoundaryPlan)
         and settings.get("_segment_trust_gemini_semantics") is True
     ):
+        if settings.get("_segment_universal_boundaries") is True:
+            return _trusted_universal_compact_plan_to_report(plan, segments)
         return _trusted_compact_plan_to_report(plan, segments, settings)
 
     report = _Conversion(proposed_count=len(plan.topics))
@@ -15670,6 +18766,9 @@ def _run_selection_profile(
         profile == FLASH_SPLIT_PROFILE
     )
     conversion_settings["_segment_trust_gemini_semantics"] = boundary_profile
+    conversion_settings["_segment_universal_boundaries"] = (
+        profile == PRO_BOUNDARY_PROFILE
+    )
     conversion_settings.setdefault(
         "_segment_ignore_caption_case",
         str(transcript.get("source") or "").casefold() == "supadata",

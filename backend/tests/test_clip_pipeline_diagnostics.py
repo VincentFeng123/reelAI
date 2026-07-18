@@ -943,7 +943,7 @@ def test_gemini_without_shared_cue_keeps_boundary_streaming_lazy(
     groq_words.assert_not_called()
 
 
-def test_topic_generation_reconciles_shared_gemini_cue_before_persistence(
+def test_topic_generation_preserves_shared_gemini_cue_overlap_before_persistence(
     monkeypatch,
 ) -> None:
     engine_out = _shared_gemini_engine_out()
@@ -976,13 +976,13 @@ def test_topic_generation_reconciles_shared_gemini_cue_before_persistence(
         for clip in stored
     }
     assert by_id["preferred-left"]["end"] == 12.0
-    assert by_id["secondary-right"]["start"] == 12.0
-    assert by_id["preferred-left"]["end"] <= by_id["secondary-right"]["start"]
+    assert by_id["secondary-right"]["start"] == 8.0
+    assert by_id["preferred-left"]["end"] > by_id["secondary-right"]["start"]
     right_boundary = by_id["secondary-right"]["search_context"]
-    assert right_boundary["boundary_status"] == "context_aligned"
-    assert right_boundary["boundary_diagnostics"]["transcript"][
-        "adjacent_clip_handoff"
-    ][0]["donor_candidate_id"].endswith("::preferred-left")
+    assert right_boundary["boundary_status"] == "verified"
+    assert "adjacent_clip_handoff" not in str(
+        right_boundary["boundary_diagnostics"]
+    )
 
 
 def test_shared_gemini_cue_persistence_cap_keeps_preferred_candidate(
@@ -3564,7 +3564,7 @@ def test_topic_generation_dedupes_groq_refinement_for_one_shared_cue_video(
     assert context.counters()["permanently_rejected_clips"] == 0
 
 
-def test_adjacent_gemini_handoffs_clamp_both_unresolved_shared_cue_edges() -> None:
+def test_adjacent_gemini_handoffs_never_shrink_unresolved_shared_cue_edges() -> None:
     transcript = {
         "source": "supadata",
         "native_mode": False,
@@ -3681,14 +3681,9 @@ def test_adjacent_gemini_handoffs_clamp_both_unresolved_shared_cue_edges() -> No
     repaired = reconciled[1][1]
     assert repaired is not None
     assert repaired.status == "context_aligned"
-    assert (repaired.start_sec, repaired.end_sec) == (12.0, 24.0)
-    assert reconciled[1][3] == (12.0, 24.0)
-    handoffs = repaired.diagnostics["adjacent_clip_handoff"]
-    assert [item["target_side"] for item in handoffs] == ["start", "end"]
-    assert [item["donor_candidate_id"] for item in handoffs] == [
-        "linear",
-        "reciprocal",
-    ]
+    assert (repaired.start_sec, repaired.end_sec) == (8.0, 30.0)
+    assert reconciled[1][3] == (8.0, 30.0)
+    assert "adjacent_clip_handoff" not in repaired.diagnostics
 
 
 def test_adjacent_handoff_never_overrides_an_independently_resolved_edge() -> None:
@@ -3793,7 +3788,7 @@ def test_adjacent_handoff_never_overrides_an_independently_resolved_edge() -> No
     assert "adjacent_clip_handoff" not in fallback_reconciled[1][1].diagnostics
 
 
-def test_multi_clip_adapter_preserves_all_non_overlapping_shared_cue_units() -> None:
+def test_multi_clip_adapter_preserves_all_shared_cue_units_without_shrinking() -> None:
     transcript = {
         "source": "supadata",
         "native_mode": False,
@@ -3888,8 +3883,8 @@ def test_multi_clip_adapter_preserves_all_non_overlapping_shared_cue_units() -> 
         "reciprocal",
     }
     by_id = {clip["selection_candidate_id"]: clip for clip in verified}
-    assert by_id["linear"]["end"] <= by_id["x2"]["start"]
-    assert by_id["x2"]["end"] <= by_id["reciprocal"]["start"]
+    assert by_id["linear"]["end"] > by_id["x2"]["start"]
+    assert by_id["x2"]["end"] > by_id["reciprocal"]["start"]
     for clip in verified:
         context = clip["search_context"]
         assert pipeline_module.clip_engine_silence.persisted_boundary_is_usable(
