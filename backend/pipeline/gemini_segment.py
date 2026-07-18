@@ -1660,6 +1660,10 @@ _TERMINAL_STRANDED_PREPOSITION_RE = re.compile(
     r"[.!?][\"')\]]*$",
     re.IGNORECASE,
 )
+_POSTPOSITIVE_ANSWER_QUALIFIER_RE = re.compile(
+    r"^\s*(?P<qualifier>approximately|roughly|respectively)\s*[.!?]+(?:\s|$)",
+    re.IGNORECASE,
+)
 _STANDALONE_QUESTION_HEADS = frozenset({
     "what", "how", "why", "where", "when", "which", "who", "whose", "whom",
     "is", "are", "can", "could", "would", "should", "does", "do", "did",
@@ -1674,7 +1678,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v3"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v17"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v18"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -1785,7 +1789,9 @@ class _IntentConstraint(_StrictModel):
         description=(
             "A context-complete statement of the requested requirement. A nested term such "
             "as a component, variable, unit, or step must retain its governing named object "
-            "or relationship; never turn one shared word into an independent topical anchor."
+            "or relationship; never turn one shared word into an independent topical anchor. "
+            "Preserve universal quantifiers: when each, every, or all governs a named set, "
+            "enumerate every governed member inside this requirement."
         )
     )
 
@@ -2148,8 +2154,9 @@ _POLICY_AND_EXAMPLES = """Policy:
 - First understand the whole transcript and use that original exact request as the topical
   center. Return every distinct complete, substantive teaching unit that either fulfills the
   whole request or is genuinely related to its subject, method, mechanism, relationship,
-  prerequisite, application, or worked-example family. Every unit must make sense to a cold
-  viewer hearing the clip without seeing the original video.
+  prerequisite, application, or worked-example family. Choose the most independently
+  understandable span the supplied speech permits. Unavoidable missing visual context never
+  makes related substantive speech ineligible; return it and set self/stand honestly.
 - Include every indispensable unresolved premise and same-objective setup through the
   explanation's natural conclusion. Never prepend a separately complete prerequisite or
   background lesson merely because it appears earlier; return that as its own candidate when
@@ -2175,8 +2182,8 @@ _POLICY_AND_EXAMPLES = """Policy:
   comparison; do not append later history, a third thing, or a merely related example.
 - Omit greetings, credentials, sponsors, administration, promos, transitions, previews,
   recaps, outros, atmospheric hooks, scene-setting, music/applause caption markers,
-  colorful flourishes, audience banter, post-conclusion jokes, tangents, repeated
-  restatements, and partial explanations.
+  colorful flourishes, audience banter, post-conclusion jokes, tangents, and repeated
+  restatements.
 - Trim filler from an opening, ending, or internal interruption whenever an exact contiguous
   cut preserves the complete teaching arc. Brief unavoidable filler does not invalidate an
   otherwise substantive, coherent unit. Omit only when filler or transcript noise dominates
@@ -2189,7 +2196,8 @@ _POLICY_AND_EXAMPLES = """Policy:
   visual evidence, and mark self_contained and is_standalone false when the words alone do not
   establish the context.
 - Exhaustively enumerate every distinct teaching unit genuinely related to the topical center,
-  up to 40 per source. Prefer an empty slot to a merely broad-field, filler, or incomplete idea.
+  up to 40 per source. Prefer an empty slot to broad-field, filler-dominated, or non-substantive
+  material.
   Do not shorten a complete idea to fit a target length; clip duration is never a selection
   criterion.
 - Keep distinct informational facets from the same source. Do not return two clips that
@@ -2359,18 +2367,18 @@ def _learner_rule(level: str) -> str:
         return ""
     level_contracts = {
         "beginner": (
-            "0.00-0.40",
+            "0.00 <= diff < 0.34",
             "assume no topic-specific background; the selected same-objective span must "
             "plainly establish every symbol, term, unresolved premise, and local setup it "
             "needs, but never prepend a separately complete prerequisite/background lesson",
         ),
         "intermediate": (
-            "0.30-0.70",
+            "0.34 <= diff < 0.67",
             "assume foundational topic knowledge but no advanced specialization when "
             "judging the unit's current fit",
         ),
         "advanced": (
-            "0.60-1.00",
+            "0.67 <= diff <= 1.00",
             "assume strong foundations when judging the unit's current fit",
         ),
     }
@@ -2380,7 +2388,9 @@ def _learner_rule(level: str) -> str:
         f"{score_band}: {accessibility}. Level is metadata, never selection eligibility. "
         "Return every otherwise qualifying relevant, substantive unit at every difficulty, "
         "score diff accurately after accounting for setup inside the clip, and never omit a "
-        "unit merely because it is outside the current-fit band. The backend stores every "
+        "unit merely because it is outside the current-fit band. Score the same clip "
+        "identically regardless of the viewer's selected level; level never shifts diff, "
+        "selection eligibility, or semantic admission. The backend stores every "
         "returned unit and defers or reuses out-of-level units for a matching learner level."
     )
 
@@ -2472,11 +2482,15 @@ def _compact_output_guide() -> str:
   will understand or be able to do after this clip. Give exactly one objective.
 - facet = the narrow subtopic taught here, at most 12 words; be more specific than the broad
   user request whenever possible.
+  When context depends on a concrete actor, object, system, scenario, or referent, name that
+  concrete subject in title, obj, or facet; generic labels such as "force and acceleration"
+  do not identify a spring oscillator, cart pair, circuit, dataset, or other specific setup.
 - info = informativeness, 0.0-1.0: how much concrete, useful teaching the selected span contains.
 - rel = topic_relevance, 0.0-1.0: how strongly this exact unit serves the exact user request.
 - imp = educational_importance, 0.0-1.0: how valuable this unit is for learning that request.
-- diff = difficulty, 0.0-1.0: required prior knowledge only; 0.00-0.33 beginner,
-  0.34-0.66 intermediate, 0.67-1.00 advanced. Difficulty never disqualifies an otherwise
+- diff = difficulty, 0.0-1.0: required prior knowledge only; 0.00 <= diff < 0.34
+  beginner, 0.34 <= diff < 0.67 intermediate, 0.67 <= diff <= 1.00 advanced.
+  Difficulty never disqualifies an otherwise
   qualifying unit; the backend stores it and decides when its learner level should surface.
 - direct = directly_teaches_topic: true only for a PRIMARY unit that fulfills every required
   non-scope constraint in the original prompt. Use false for a valid SUPPORTING unit; false is
@@ -2749,7 +2763,17 @@ def _boundary_prompts(
         "return six separate candidates. Never invent, duplicate, fragment, or lower the "
         "quality bar merely to produce more clips. Return qualifying moments up to "
         f"{_MAX_SELECTOR_CANDIDATES} for this source; "
-        "do not stop after the first few units or at an arbitrary count below that cap.\n"
+        "do not stop after the first few units or at an arbitrary count below that cap. "
+        "MANDATORY REQUEST-COVERAGE AUDIT (silent): Build a checklist from every request "
+        "constraint and every member governed by words such as 'each', 'every', and 'all'. "
+        "Scan the entire transcript separately for every checklist item. Return every "
+        "distinct complete unit actually taught for each item; a candidate covering one "
+        "sibling item never covers the others. When the request asks to solve an equation "
+        "for each variable, separately look for every algebraic rearrangement and every "
+        "worked example that performs it. For F=ma, solving for force F=ma, mass m=F/a, "
+        "and acceleration a=F/m are three requested facets when taught. The same rule is "
+        "universal: for V=IR, separately look for V=IR, I=V/R, and R=V/I. Never invent a "
+        "missing facet and do not output this checklist.\n"
         "3. For every qualifying unit, verify its timestamps and choose one whole coherent "
         "teaching arc containing all contiguous same-objective setup, reasoning, answer, "
         "qualification, and explanation through its natural conclusion. Context and wholeness "
@@ -2800,7 +2824,13 @@ def _boundary_prompts(
         "change', 'the second law', 'it', 'they', or 'these' must have its specific referent "
         "named inside sq-through-eq; the request, page title, video title, title, obj, facet, "
         "cq, ie, and a previous clip are metadata and do not supply that spoken context. "
-        "Expand backward to the shortest complete setup "
+        "Resolve every referent anywhere inside sq-through-eq, not only in its opening "
+        "sentence. Comparative, ordinal, and inherited-case labels such as 'the smaller "
+        "person', 'the larger group', 'the former', 'the second case', 'Part B', and 'the "
+        "other one' require spoken introduction of the compared entities and any shared "
+        "givens, formula, baseline, or prior result. Internal phrases such as 'these "
+        "endpoints', 'that value', or 'this result' require their concrete referent earlier "
+        "in the same selected span. Expand backward to the shortest complete setup "
         "that names it. Keep opening and ending edges clean, including generic lead-ins and bracketed "
         "non-speech markers. Split around an internal interruption when separate complete "
         "units remain and return only contiguous complete sides. If an exact clean cut is "
@@ -2819,6 +2849,19 @@ def _boundary_prompts(
         "an incomplete thought, omitted referent, late start, early stop, or extra adjacent unit. "
         "Perform a final cold-start/cold-stop reread from sq through eq yourself and correct "
         "those words before returning. "
+        "A later case or Part B is not whole merely because its local arithmetic reaches "
+        "an answer. If it inherits the problem object, givens, formula, comparison baseline, "
+        "or result, begin at the nearest contiguous setup that establishes them. If the "
+        "later case restates everything, start at its own setup. If required shared setup is "
+        "separated by an earlier sibling part, preserve the smallest contiguous whole "
+        "multi-part example; context outranks brevity. For example, a clip beginning 'the "
+        "smaller person' must include the earlier speech introducing both people and their "
+        "shared force. A fully restated Part B may begin locally, but 'Part B' plus inherited "
+        "symbols or numbers may not. "
+        "When a unit depends on a concrete actor, object, system, scenario, or referent, "
+        "name that concrete subject in title, obj, or facet so the boundary audit can verify "
+        "the setup; a generic label such as 'force and acceleration' is insufficient for a "
+        "specific spring oscillator, cart pair, circuit, dataset, or other scenario. "
         "Do not omit an otherwise good, complete, relevant unit solely because coarse captions "
         "make the exact cut uncertain; return your closest grounded s:e, sq, and eq so the "
         "backend can repair the cut. Boundary uncertainty alone is never an omission reason. "
@@ -2828,8 +2871,9 @@ def _boundary_prompts(
         "4. Score topic relevance, information density, educational value, and difficulty "
         "honestly. These scores are metadata, never numeric eligibility gates. Return every "
         "related, coherent, substantive teaching unit admitted by the spoken-content rules "
-        "above. Difficulty records prior knowledge only: 0.00-0.33 means beginner, "
-        "0.34-0.66 means intermediate, and 0.67-1.00 means advanced. Difficulty is always "
+        "above. Difficulty records prior knowledge only: 0.00 <= diff < 0.34 means "
+        "beginner, 0.34 <= diff < 0.67 means intermediate, and 0.67 <= diff <= 1.00 "
+        "means advanced. Difficulty is always "
         "metadata, never an eligibility filter. Qualifying "
         "units may span the entire scale; the backend stores and defers units outside the "
         "current learner's fit.\n"
@@ -3068,6 +3112,13 @@ def _pro_boundary_audit_prompts(
           "independently complete prerequisite or different objective; it belongs in its own "
           "candidate. If a promised derivation, calculation, example, "
           "comparison, or explanation continues, include its stated result and conclusion.\n"
+          "Resolve referents throughout the whole candidate, not only at its first sentence. "
+          "'The smaller person' or 'the larger group' needs the spoken pair and shared "
+          "baseline; 'these endpoints' or 'that value' needs its concrete definition earlier "
+          "inside the returned span. A later case or Part B must include any inherited "
+          "problem object, givens, formula, comparison baseline, or prior result. It may start "
+          "locally only when the speech restates everything needed for that case. Context and "
+          "wholeness outrank duration and overlap with an earlier sibling part.\n"
           "The ending must finish the same-objective sentence, reasoning, answer, qualification, "
           "and conclusion. Caption punctuation, silence, and cue edges are not semantic endings. "
           "If a word or thought continues into a later cue, continue through the first complete "
@@ -7029,6 +7080,460 @@ def _trusted_universal_start_context_edge(
         current_span,
         list(dict.fromkeys(diagnostics)),
     )
+
+
+def _trusted_reference_head_forms(head: str) -> set[str]:
+    normalized = str(head or "").casefold()
+    aliases = {
+        "endpoint": {"endpoint", "endpoints"},
+        "endpoints": {"endpoint", "endpoints", "points"},
+        "people": {"people", "person", "persons"},
+        "person": {"people", "person", "persons"},
+    }
+    forms = set(aliases.get(normalized, {normalized}))
+    if normalized.endswith("ies") and len(normalized) > 3:
+        forms.add(f"{normalized[:-3]}y")
+    elif normalized.endswith("s") and not normalized.endswith("ss"):
+        forms.add(normalized[:-1])
+    elif normalized:
+        forms.add(f"{normalized}s")
+    return {form for form in forms if form}
+
+
+def _trusted_explicit_head_antecedent(text: str, head: str) -> bool:
+    """Recognize a locally named noun without treating another deictic as setup."""
+    forms = _trusted_reference_head_forms(head)
+    words = list(_WORD_RE.finditer(str(text or "")))
+    for index, word in enumerate(words):
+        if word.group(0).casefold() not in forms:
+            continue
+        previous = words[index - 1].group(0).casefold() if index else ""
+        before_previous = (
+            words[index - 2].group(0).casefold() if index >= 2 else ""
+        )
+        following = (
+            words[index + 1].group(0).casefold()
+            if index + 1 < len(words)
+            else ""
+        )
+        if previous in {"this", "that", "these", "those"}:
+            continue
+        if (
+            previous in {
+                "a", "an", "both", "each", "either", "first", "last",
+                "maximum", "minimum", "neither", "the", "two",
+            }
+            or before_previous in {"a", "an", "both", "the", "two"}
+            or following in {"are", "is", "of", "where"}
+        ):
+            return True
+    return False
+
+
+def _trusted_structural_backward_reset(text: str) -> bool:
+    return bool(
+        _TRUSTED_STRUCTURAL_BACKWARD_RESET_RE.search(text)
+        or _TRUSTED_STRONG_FRESH_WORKED_RESET_RE.search(text)
+        or _TRUSTED_FRESH_EXAMPLE_RE.search(text)
+        or _HARD_TOPIC_RESET_RE.search(text)
+        or _SPLIT_CAPTION_NEW_UNIT_FRAMING_RE.search(text)
+    )
+
+
+def _trusted_universal_comparative_pair_start(
+    segments: list[dict],
+    *,
+    start_line: int,
+    start_span: tuple[int, int] | None,
+    end_line: int,
+    end_span: tuple[int, int] | None,
+    scope_text: str = "",
+) -> tuple[int, tuple[int, int] | None, list[str]] | None:
+    """Recover a spoken pair before definite smaller/larger role labels."""
+    selected, _spans = _semantic_clip_slice(
+        segments,
+        start_line,
+        end_line,
+        start_span=start_span,
+        end_span=end_span,
+    )
+    roles = list(_TRUSTED_DEFINITE_COMPARATIVE_ROLE_RE.finditer(selected))
+    if len(roles) < 2:
+        return None
+    first_head = roles[0].group("head").casefold()
+    compatible = [
+        role
+        for role in roles
+        if role.group("head").casefold()
+        in _trusted_reference_head_forms(first_head)
+    ]
+    if len({role.group("role").casefold() for role in compatible}) < 2:
+        return None
+    selected_prefix = selected[:compatible[0].start()]
+    head_forms = _trusted_reference_head_forms(first_head)
+    if re.search(
+        r"\b(?:both|two)\s+(?:[a-z][\w'’-]*\s+){0,2}(?:"
+        + "|".join(re.escape(form) for form in sorted(head_forms))
+        + r")\b",
+        selected_prefix,
+        re.IGNORECASE,
+    ):
+        return None
+    if _trusted_explicit_head_antecedent(selected_prefix, first_head):
+        return None
+
+    floor, _ceiling = _trusted_contiguous_section_bounds(segments, start_line)
+    pair_line: int | None = None
+    pair_span: tuple[int, int] | None = None
+    for line in range(start_line - 1, max(floor, start_line - 4) - 1, -1):
+        source = str(segments[line].get("text") or "")
+        source_roles = [
+            role
+            for role in _TRUSTED_DEFINITE_COMPARATIVE_ROLE_RE.finditer(source)
+            if role.group("head").casefold() in head_forms
+        ]
+        role_pair = len({
+            role.group("role").casefold() for role in source_roles
+        }) >= 2
+        named_pair = re.search(
+            r"\b(?:both|two)\s+(?:[a-z][\w'’-]*\s+){0,2}(?:"
+            + "|".join(re.escape(form) for form in sorted(head_forms))
+            + r")\b",
+            source,
+            re.IGNORECASE,
+        )
+        if not role_pair and named_pair is None:
+            if _trusted_structural_backward_reset(source):
+                return None
+            if _trusted_explicit_head_antecedent(source, first_head):
+                return None
+            continue
+        ignored_pair_tokens = {
+            *head_forms,
+            "faster", "heavier", "higher", "larger", "lighter", "lower",
+            "slower", "smaller",
+        }
+        if len(
+            (_content_tokens(source) - ignored_pair_tokens)
+            & (_content_tokens(selected) - ignored_pair_tokens)
+        ) < 2:
+            return None
+        pair_line = line
+        pair_phrase_anchor = min(
+            [role.start() for role in source_roles]
+            + ([named_pair.start()] if named_pair is not None else [])
+        )
+        pair_anchor = pair_phrase_anchor
+        for sentence_left, sentence_right in _sentence_character_spans(source):
+            if sentence_left <= pair_phrase_anchor < sentence_right:
+                sentence_prefix = source[sentence_left:pair_phrase_anchor]
+                if _TRUSTED_BARE_DEMONSTRATIVE_PREDICATE_OPENING_RE.match(
+                    source[sentence_left:sentence_right]
+                ) is None:
+                    first_word = _WORD_RE.search(source, sentence_left, sentence_right)
+                    if first_word is not None:
+                        pair_anchor = first_word.start()
+                elif _WORD_RE.search(sentence_prefix) is None:
+                    pair_anchor = pair_phrase_anchor
+                break
+        quote = _exact_boundary_quote(source[pair_anchor:], want="start")
+        relative_span = (
+            _quote_character_span(source[pair_anchor:], quote)
+            if quote
+            else None
+        )
+        if relative_span is not None:
+            pair_span = (
+                pair_anchor + relative_span[0],
+                pair_anchor + relative_span[1],
+            )
+        break
+    if pair_line is None or pair_span is None:
+        return None
+
+    for line in range(pair_line, max(floor, pair_line - 2) - 1, -1):
+        source = str(segments[line].get("text") or "")
+        handoffs = [
+            handoff
+            for handoff in _TRUSTED_CLAIM_SETUP_HANDOFF_RE.finditer(source)
+            if handoff.group("conditional") is not None
+        ]
+        if not handoffs:
+            if line < pair_line and _trusted_structural_backward_reset(source):
+                break
+            continue
+        handoff = handoffs[-1]
+        conditional_source = source[handoff.start("conditional"):]
+        if not (head_forms & set(_toks(conditional_source))):
+            if line < pair_line and _trusted_structural_backward_reset(source):
+                break
+            continue
+        quote = _exact_boundary_quote(
+            conditional_source,
+            want="start",
+        )
+        relative_span = (
+            _quote_character_span(
+                conditional_source,
+                quote,
+            )
+            if quote
+            else None
+        )
+        if relative_span is None:
+            continue
+        span = (
+            handoff.start("conditional") + relative_span[0],
+            handoff.start("conditional") + relative_span[1],
+        )
+        return line, span, ["expanded_comparative_pair_setup"]
+
+    if (pair_line, pair_span) >= (
+        start_line,
+        start_span or (0, 0),
+    ):
+        return None
+    return (
+        pair_line,
+        pair_span,
+        ["expanded_comparative_pair_setup"],
+    )
+
+
+def _trusted_universal_internal_reference_start(
+    segments: list[dict],
+    *,
+    start_line: int,
+    start_span: tuple[int, int] | None,
+    end_line: int,
+    end_span: tuple[int, int] | None,
+    scope_text: str = "",
+) -> tuple[int, tuple[int, int] | None, list[str]] | None:
+    """Recover setup for a deictic noun first exposed later inside a clip."""
+    selected, _spans = _semantic_clip_slice(
+        segments,
+        start_line,
+        end_line,
+        start_span=start_span,
+        end_span=end_span,
+    )
+    unresolved: tuple[str, set[str]] | None = None
+    scope_tokens = _content_tokens(scope_text)
+    references = list(
+        _TRUSTED_INTERNAL_DEMONSTRATIVE_REFERENCE_RE.finditer(selected)
+    )
+    references.sort(key=lambda reference: (
+        reference.group("determiner").casefold() not in {"these", "those"},
+        reference.start(),
+    ))
+    for reference in references:
+        if reference.group("determiner").casefold() not in {"these", "those"}:
+            continue
+        head = reference.group("head").casefold()
+        if head in {"means", "shows", "implies", "indicates", "suggests"}:
+            continue
+        prefix = selected[:reference.start()]
+        if _trusted_explicit_head_antecedent(prefix, head):
+            continue
+        sentence_left = max(
+            selected.rfind(mark, 0, reference.start())
+            for mark in ".!?;"
+        ) + 1
+        following_boundaries = [
+            position
+            for mark in ".!?;"
+            if (position := selected.find(mark, reference.end())) >= 0
+        ]
+        sentence_right = (
+            min(following_boundaries) + 1
+            if following_boundaries
+            else len(selected)
+        )
+        anchor_tokens = (
+            _content_tokens(selected[sentence_left:sentence_right])
+            - _content_tokens(head)
+            - {"this", "that", "these", "those"}
+        )
+        local_sentence_suffix = selected[reference.end():sentence_right]
+        if re.match(
+            r"^\s*(?:(?:are|is|mean|means|refer(?:s|red)?\s+to)\b|"
+            r",\s*(?:at|namely|specifically|i\.e\.)\b)",
+            local_sentence_suffix,
+            re.IGNORECASE,
+        ):
+            continue
+        if (
+            anchor_tokens
+            and (
+                _trusted_reference_head_forms(head) & scope_tokens
+                or len(anchor_tokens & scope_tokens) >= 2
+            )
+        ):
+            unresolved = head, anchor_tokens
+            break
+    if unresolved is None:
+        return None
+    head, anchor_tokens = unresolved
+    scope_identity_tokens = (
+        scope_tokens
+        - anchor_tokens
+        - _trusted_reference_head_forms(head)
+        - _TRUSTED_SPLIT_GROUNDING_GENERIC_TOKENS
+        - _TRUSTED_NAMED_UNIT_GENERIC_TOKENS
+    )
+    if not scope_identity_tokens:
+        return None
+
+    floor, _ceiling = _trusted_contiguous_section_bounds(segments, start_line)
+    antecedent_line: int | None = None
+    for line in range(start_line - 1, floor - 1, -1):
+        line_text = str(segments[line].get("text") or "")
+        if _trusted_structural_backward_reset(line_text):
+            return None
+        source = " ".join(
+            str(segments[candidate].get("text") or "")
+            for candidate in range(line, min(start_line, line + 3))
+        )
+        if (
+            _trusted_explicit_head_antecedent(source, head)
+            and len(anchor_tokens & _content_tokens(source)) >= 2
+            and scope_identity_tokens & _content_tokens(source)
+        ):
+            antecedent_line = line
+            break
+    if antecedent_line is None:
+        return None
+
+    setup_line: int | None = None
+    for line in range(antecedent_line, max(floor, antecedent_line - 8) - 1, -1):
+        source = str(segments[line].get("text") or "")
+        if (
+            _cue_begins_standalone_question(source)
+            and len(anchor_tokens & _content_tokens(source)) >= 2
+        ):
+            setup_line = line
+            break
+    if setup_line is None:
+        return None
+    setup_source = str(segments[setup_line].get("text") or "")
+    setup_quote = _exact_boundary_quote(setup_source, want="start")
+    setup_span = (
+        _quote_character_span(setup_source, setup_quote)
+        if setup_quote
+        else None
+    )
+    if setup_span is None or (setup_line, setup_span) >= (
+        start_line,
+        start_span or (0, 0),
+    ):
+        return None
+    return (
+        setup_line,
+        setup_span,
+        ["expanded_internal_reference_setup"],
+    )
+
+
+def _trusted_universal_inherited_worked_start(
+    segments: list[dict],
+    *,
+    start_line: int,
+    start_span: tuple[int, int] | None,
+    end_line: int,
+    end_span: tuple[int, int] | None,
+    scope_text: str = "",
+) -> tuple[int, tuple[int, int], list[str]] | None:
+    """Recover a prior problem setup when a later worked part omits its formula."""
+    selected, _spans = _semantic_clip_slice(
+        segments,
+        start_line,
+        end_line,
+        start_span=start_span,
+        end_span=end_span,
+    )
+    inherited_objects = {
+        match.group("head").casefold()
+        for match in _TRUSTED_INHERITED_WORKED_OBJECT_RE.finditer(selected)
+    }
+    has_inherited_value = bool(
+        _TRUSTED_INHERITED_WORKED_VALUE_RE.search(selected)
+    )
+    referenced_objects = inherited_objects | {
+        match.group("head").casefold()
+        for match in _TRUSTED_WORKED_OBJECT_REFERENCE_RE.finditer(selected)
+        if match.group("head").casefold()
+        not in _TRUSTED_GENERIC_WORKED_REFERENCE_HEADS
+    }
+    if (
+        _TRUSTED_LATER_WORKED_PART_RE.search(selected) is None
+        or not (inherited_objects or has_inherited_value)
+        or not referenced_objects
+        or _TRUSTED_EXPLICIT_WORKED_RELATION_RE.search(selected) is not None
+        or _TRUSTED_QUANTIFIED_FORWARD_CONTENT_RE.search(selected) is None
+        or re.search(
+            r"\b(?:answer|calculat(?:e|ion)|compute|multiply|solve|times)\b",
+            selected,
+            re.IGNORECASE,
+        )
+        is None
+    ):
+        return None
+
+    floor, _ceiling = _trusted_contiguous_section_bounds(segments, start_line)
+    selected_tokens = _content_tokens(selected)
+    setup_line: int | None = None
+    setup_match: re.Match[str] | None = None
+    for line in range(start_line - 1, floor - 1, -1):
+        source = str(segments[line].get("text") or "")
+        setups = list(_TRUSTED_WORKED_PROBLEM_SETUP_RE.finditer(source))
+        if setups and any(
+            _trusted_reference_head_forms(head) & set(_toks(source))
+            for head in referenced_objects
+        ):
+            setup_line = line
+            setup_match = setups[-1]
+            break
+        if _trusted_structural_backward_reset(source):
+            return None
+    if setup_line is None or setup_match is None:
+        return None
+
+    relation_line = next(
+        (
+            line
+            for line in range(start_line - 1, setup_line - 1, -1)
+            if _TRUSTED_EXPLICIT_WORKED_RELATION_RE.search(
+                str(segments[line].get("text") or "")
+            )
+            and len(
+                _content_tokens(str(segments[line].get("text") or ""))
+                & selected_tokens
+            ) >= 2
+        ),
+        None,
+    )
+    if relation_line is None:
+        return None
+
+    source = str(segments[setup_line].get("text") or "")
+    quote = _exact_boundary_quote(source[setup_match.start():], want="start")
+    relative_span = (
+        _quote_character_span(source[setup_match.start():], quote)
+        if quote
+        else None
+    )
+    if relative_span is None:
+        return None
+    span = (
+        setup_match.start() + relative_span[0],
+        setup_match.start() + relative_span[1],
+    )
+    if (setup_line, span[0]) < (
+        start_line,
+        start_span[0] if start_span is not None else 0,
+    ):
+        return setup_line, span, ["expanded_inherited_worked_setup"]
+    return None
 
 
 def _trusted_universal_completed_end(
@@ -12243,6 +12748,61 @@ _TRUSTED_COMPARATIVE_BACK_REFERENCE_RE = re.compile(
     r"than\s+(?:before|earlier|previously|the\s+other))\b",
     re.IGNORECASE,
 )
+_TRUSTED_DEFINITE_COMPARATIVE_ROLE_RE = re.compile(
+    r"\bthe\s+(?P<role>smaller|larger|lower|higher|lighter|heavier|"
+    r"faster|slower)\s+(?P<head>[a-z][\w'’-]*)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_INTERNAL_DEMONSTRATIVE_REFERENCE_RE = re.compile(
+    r"\b(?P<determiner>this|that|these|those)\s+"
+    r"(?P<head>[a-z][\w'’-]*)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_LATER_WORKED_PART_RE = re.compile(
+    r"\b(?:part\s+(?:b|two|2)|second\s+(?:case|part))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_INHERITED_WORKED_OBJECT_RE = re.compile(
+    r"\b(?:same|original|previous|earlier|unchanged)\s+"
+    r"(?P<head>[a-z][\w'’-]*)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_INHERITED_WORKED_VALUE_RE = re.compile(
+    r"\b(?:as\s+before|from\s+part\s+a|instead\s+of|rather\s+than|"
+    r"unchanged\s+from|using\s+the\s+(?:earlier|previous|prior))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_WORKED_OBJECT_REFERENCE_RE = re.compile(
+    r"\b(?:the|this|that)\s+(?P<head>[a-z][\w'’-]*)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_GENERIC_WORKED_REFERENCE_HEADS = frozenset({
+    "acceleration", "answer", "calculation", "case", "equation", "force",
+    "mass", "number", "object", "part", "problem", "quantity", "result",
+    "tension", "value", "weight",
+})
+_TRUSTED_STRUCTURAL_BACKWARD_RESET_RE = re.compile(
+    r"\b(?:(?:now|next)\s*[,;:]?\s+)?"
+    r"(?:consider|imagine|suppose|take)\s+(?:a|an|the)\s+"
+    r"(?:another|different|new|separate)\b|"
+    r"\b(?:another|different|new|separate)\s+"
+    r"(?:[a-z][\w'’-]*\s+){0,2}"
+    r"(?:case|example|exercise|problem|scenario|topic)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_EXPLICIT_WORKED_RELATION_RE = re.compile(
+    r"(?:\b[a-z][a-z0-9_]*\s*=|"
+    r"\b(?:plus|minus|times|divided\s+by)\b[^.!?]{0,80}"
+    r"\b(?:equals?|is\s+equal\s+to)\b|"
+    r"\b(?:equals?|is\s+equal\s+to)\b[^.!?]{0,80}"
+    r"\b(?:plus|minus|times|divided\s+by)\b)",
+    re.IGNORECASE,
+)
+_TRUSTED_WORKED_PROBLEM_SETUP_RE = re.compile(
+    r"(?<!\w)(?:in\s+this\s+question|here(?:['’]s|\s+is)\s+"
+    r"(?:a|the)\s+question|consider|given|imagine|suppose)\b",
+    re.IGNORECASE,
+)
 _TRUSTED_CONTEXTUAL_ANSWER_IMPERATIVE_RE = re.compile(
     r"^\s*(?:move|place|put|restore|return|set)\s+"
     r"(?:it|this|that|the\s+(?:body|mass|object|system))\b",
@@ -15925,6 +16485,90 @@ def _trusted_universal_compact_plan_to_report(
         elif start_diagnostics:
             diagnostics.extend(start_diagnostics)
 
+        structural_start_widened = False
+        for structural_start_repair in (
+            _trusted_universal_inherited_worked_start,
+            _trusted_universal_comparative_pair_start,
+            _trusted_universal_internal_reference_start,
+        ):
+            structural_start = structural_start_repair(
+                segments,
+                start_line=a,
+                start_span=start_span,
+                end_line=b,
+                end_span=end_span,
+                scope_text=" ".join(str(value or "") for value in (
+                    proposal.title,
+                    proposal.learning_objective,
+                    proposal.facet,
+                    raw_model_claim_quote,
+                )),
+            )
+            if structural_start is None:
+                continue
+            candidate_a, candidate_start_span, structural_diagnostics = (
+                structural_start
+            )
+            candidate_text, candidate_spans = _semantic_clip_slice(
+                segments,
+                candidate_a,
+                b,
+                start_span=candidate_start_span,
+                end_span=end_span,
+            )
+            if all(
+                _contains_quote(candidate_text, quote)
+                for quote in protected_quotes
+            ):
+                a, start_span = candidate_a, candidate_start_span
+                clip_text = candidate_text
+                semantic_spans_by_cue = candidate_spans
+                diagnostics.extend(structural_diagnostics)
+                structural_start_widened = True
+            else:
+                diagnostics.append("start_repair_preserved_model_evidence")
+
+        # Generic context repair can expose a bare demonstrative that was not
+        # present at Gemini's original edge. Re-run the same guarded advance
+        # after widening so the repaired clip cannot open in the prior unit.
+        if (
+            not structural_start_widened
+            and claim_location is not None
+            and _TRUSTED_BARE_DEMONSTRATIVE_PREDICATE_OPENING_RE.match(
+                clip_text
+            )
+        ):
+            claim_sentence_start = _trusted_claim_sentence_start(
+                segments,
+                selected_line=a,
+                claim_location=claim_location,
+                allowed_frame="note",
+            )
+            current_left = start_span[0] if start_span is not None else 0
+            if (
+                claim_sentence_start is not None
+                and (claim_sentence_start[0], claim_sentence_start[1][0])
+                > (a, current_left)
+            ):
+                candidate_a, candidate_start_span = claim_sentence_start
+                candidate_text, candidate_spans = _semantic_clip_slice(
+                    segments,
+                    candidate_a,
+                    b,
+                    start_span=candidate_start_span,
+                    end_span=end_span,
+                )
+                if all(
+                    _contains_quote(candidate_text, quote)
+                    for quote in protected_quotes
+                ):
+                    a, start_span = candidate_a, candidate_start_span
+                    clip_text = candidate_text
+                    semantic_spans_by_cue = candidate_spans
+                    diagnostics.append(
+                        "advanced_anaphoric_start_to_claim_sentence"
+                    )
+
         end_source = str(segments[b].get("text") or "")
         immediate_squared = bool(
             end_span is not None
@@ -16077,6 +16721,22 @@ def _trusted_universal_compact_plan_to_report(
             )
             and re.match(r"^\s*squared\b", following_text, re.IGNORECASE)
         )
+        postpositive_qualifier = _POSTPOSITIVE_ANSWER_QUALIFIER_RE.match(
+            following_text
+        )
+        split_postpositive_qualifier = bool(
+            not re.search(r"[.!?]+[\"'’”)]*\s*$", clip_text)
+            and postpositive_qualifier
+            and (
+                postpositive_qualifier.group("qualifier").casefold()
+                == "respectively"
+                or re.search(
+                    r"\d(?:[\d.,]*)(?:\s*(?:%|[a-z][\w²/^.-]*)){0,3}\s*$",
+                    clip_text,
+                    re.IGNORECASE,
+                )
+            )
+        )
         dangling_end = bool(
             _cue_has_explicit_dangling_end(clip_text, following_text)
             or _terminal_content_is_explicitly_incomplete(clip_text)
@@ -16084,6 +16744,7 @@ def _trusted_universal_compact_plan_to_report(
             or _TERMINAL_REQUIRED_COMPLEMENT_RE.search(clip_text)
             or terminal_preposition_dangling
             or split_squared_unit
+            or split_postpositive_qualifier
             or (
                 end_span is not None
                 and following_text

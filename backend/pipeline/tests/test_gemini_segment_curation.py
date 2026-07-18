@@ -2355,10 +2355,10 @@ def test_boundary_prompt_labels_advanced_level_and_rejects_course_framing():
     )
     assert "current level is advanced" in user
     assert "level is metadata, never selection eligibility" in user.lower()
-    assert "current-fit difficulty band is 0.60-1.00" in user
+    assert "current-fit difficulty band is 0.67 <= diff <= 1.00" in user
     assert "return every otherwise qualifying relevant, substantive unit" in user.lower()
     assert "defers or reuses out-of-level units" in user.lower()
-    assert "0.00-0.33 means beginner" in user
+    assert "0.00 <= diff < 0.34 means beginner" in user
     assert "difficulty is always metadata, never an eligibility filter" in user.lower()
     assert "course logistics" in user
     assert "institutional framing" in user
