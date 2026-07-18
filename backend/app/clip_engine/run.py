@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 from . import config
 from . import segment_cache
@@ -22,6 +23,8 @@ from .errors import (
 )
 from .metadata import extract_video_id
 from .provider_runtime import GenerationContext
+
+_TRANSCRIPT_PHASE_TIMEOUT_S = 75.0
 
 
 def is_valid_timestamped_supadata_transcript(transcript: dict) -> bool:
@@ -186,8 +189,8 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
     settings.setdefault("segment_fine_snap", config.SEGMENT_FINE_SNAP)
     # Candidates are independently gated; one weak proposal must not poison others.
     settings.setdefault("segment_accept_partial_flash", True)
-    # This adapter is the production selector boundary. One Pro call is
-    # authoritative; stale env or request settings cannot reactivate Flash/hybrid.
+    # This adapter is the production selector boundary. The Pro selector and
+    # final audit are authoritative; stale settings cannot reactivate Flash/hybrid.
     settings["_segment_routing_mode"] = "pro_only"
     settings["_segment_thinking_level"] = "medium"
     settings["_segment_allow_flash_lite_failover"] = False
@@ -197,7 +200,23 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
     settings["_segment_video_url"] = canonical_url
     settings["_segment_video_grounding_required"] = False
     settings["_segment_media_resolution"] = "low"
-    transcript = _transcribe(canonical_url, video_id, settings)
+    had_deadline = "deadline_monotonic" in settings
+    configured_deadline = settings.get("deadline_monotonic")
+    transcript_deadline = time.monotonic() + _TRANSCRIPT_PHASE_TIMEOUT_S
+    try:
+        parsed_deadline = float(configured_deadline)
+    except (TypeError, ValueError, OverflowError):
+        parsed_deadline = float("nan")
+    if math.isfinite(parsed_deadline):
+        transcript_deadline = min(transcript_deadline, parsed_deadline)
+    settings["deadline_monotonic"] = transcript_deadline
+    try:
+        transcript = _transcribe(canonical_url, video_id, settings)
+    finally:
+        if had_deadline:
+            settings["deadline_monotonic"] = configured_deadline
+        else:
+            settings.pop("deadline_monotonic", None)
     raise_if_cancelled(should_cancel)
     if not (transcript.get("segments")):
         raise TranscriptError(f"Empty transcript for {video_id}")

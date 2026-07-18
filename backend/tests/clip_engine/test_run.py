@@ -1,4 +1,5 @@
 # backend/tests/clip_engine/test_run.py
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -68,6 +69,38 @@ def test_clip_builds_embed_urls_and_forwards_topic(monkeypatch):
     assert seen["segment_media_resolution"] == "low"
     assert isinstance(seen["generation_context"], GenerationContext)
     assert seen["generation_context"].budget.mode == "fast"
+
+
+def test_clip_reserves_separate_transcript_and_segmentation_deadlines(monkeypatch):
+    transcript = {
+        "segments": [{"start": 0.0, "end": 5.0, "text": "hello world"}],
+        "words": [],
+        "duration": 5.0,
+    }
+    observed: dict[str, float] = {}
+    overall_deadline = time.monotonic() + 210.0
+
+    def fake_transcribe(_url, _video_id, settings):
+        observed["transcript"] = float(settings["deadline_monotonic"])
+        return transcript
+
+    def fake_segment(_transcript, settings, **_kwargs):
+        observed["segmentation"] = float(settings["deadline_monotonic"])
+        return [], "No clips"
+
+    monkeypatch.setattr(run, "_transcribe", fake_transcribe)
+    monkeypatch.setattr(run.gemini_segment, "segment_clips", fake_segment)
+
+    run.clip(
+        "https://youtu.be/dQw4w9WgXcQ",
+        "topic",
+        settings={"deadline_monotonic": overall_deadline},
+    )
+
+    transcript_remaining = observed["transcript"] - time.monotonic()
+    assert 0.0 < transcript_remaining <= run._TRANSCRIPT_PHASE_TIMEOUT_S
+    assert observed["transcript"] < overall_deadline
+    assert observed["segmentation"] == overall_deadline
 
 
 def test_standalone_pro_boundary_fallback_dispatches_with_bounded_selector(monkeypatch):

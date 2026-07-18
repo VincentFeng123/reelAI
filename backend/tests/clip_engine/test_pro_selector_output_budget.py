@@ -51,6 +51,21 @@ def _newton_plan() -> gemini_segment._CompactBoundaryPlan:
     )
 
 
+def _newton_audit_plan() -> gemini_segment._ProCandidateAuditPlan:
+    return gemini_segment._ProCandidateAuditPlan(items=[{
+        "candidate_id": "candidate-1",
+        "decision": "keep",
+        "actual_objective": "Explain how net force, mass, and acceleration relate",
+        "evidence_quote": (
+            "net force on an object equals its mass times its acceleration"
+        ),
+        "start_line": 0,
+        "end_line": 0,
+        "start_quote": "Newton's second law says that",
+        "end_quote": "mass times its acceleration",
+    }])
+
+
 def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     monkeypatch,
 ) -> None:
@@ -71,15 +86,9 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
 
     def generate(_system, user, _schema, **kwargs):
         calls.append({"user": user, "schema": _schema, **kwargs})
-        if _schema is gemini_segment._BoundaryRepairPlan:
+        if _schema is gemini_segment._ProCandidateAuditPlan:
             return SimpleNamespace(
-                text=gemini_segment._BoundaryRepairPlan(items=[{
-                    "candidate_id": "candidate-1",
-                    "start_line": 0,
-                    "end_line": 0,
-                    "start_quote": "Newton's second law says that",
-                    "end_quote": "mass times its acceleration",
-                }]).model_dump_json(),
+                text=_newton_audit_plan().model_dump_json(),
                 telemetry={
                     "model": kwargs["model"],
                     "operation": kwargs["operation"],
@@ -176,10 +185,14 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     )
     assert result.calls[0]["video_grounded"] is False
     assert result.calls[0]["reserved_output_tokens"] == call["max_output_tokens"]
-    assert audit_call["schema"] is gemini_segment._BoundaryRepairPlan
+    assert audit_call["schema"] is gemini_segment._ProCandidateAuditPlan
     assert audit_call["operation"] == "pro_boundary_audit"
-    assert audit_call["thinking_level"] == "low"
+    assert audit_call["thinking_level"] == "medium"
     assert audit_call["media_resolution"] is None
+    assert (
+        audit_call["deadline_monotonic"] - call["deadline_monotonic"]
+        == pytest.approx(gemini_segment._PRO_FINAL_AUDIT_RESERVED_S)
+    )
     assert result.calls[1]["video_grounded"] is False
 
     budget = context.budget.snapshot()["gemini"]
@@ -232,14 +245,8 @@ def test_text_only_pro_retries_one_malformed_structured_response(
             for call in generated
         ) == 1:
             return SimpleNamespace(text="{malformed", telemetry=telemetry)
-        if schema is gemini_segment._BoundaryRepairPlan:
-            text = gemini_segment._BoundaryRepairPlan(items=[{
-                "candidate_id": "candidate-1",
-                "start_line": 0,
-                "end_line": 0,
-                "start_quote": "Newton's second law says that",
-                "end_quote": "mass times its acceleration",
-            }]).model_dump_json()
+        if schema is gemini_segment._ProCandidateAuditPlan:
+            text = _newton_audit_plan().model_dump_json()
         else:
             text = plan.model_dump_json(by_alias=True)
         return SimpleNamespace(text=text, telemetry=telemetry)
@@ -275,7 +282,7 @@ def test_text_only_pro_retries_one_malformed_structured_response(
     assert [call["schema"] for call in generated] == [
         gemini_segment._CompactBoundaryPlan,
         gemini_segment._CompactBoundaryPlan,
-        gemini_segment._BoundaryRepairPlan,
+        gemini_segment._ProCandidateAuditPlan,
     ]
     assert generated[0]["user"] == generated[1]["user"]
     assert isinstance(generated[0]["user"], str)
@@ -373,9 +380,9 @@ def test_text_only_pro_stops_after_two_malformed_structured_responses(
 
 @pytest.mark.parametrize(
     ("mode", "selector_count", "cost_limit"),
-    [("fast", 2, 0.45), ("slow", 3, 0.70)],
+    [("fast", 2, 1.00), ("slow", 3, 1.50)],
 )
-def test_pro_thought_headroom_fits_existing_job_cost_ceiling(
+def test_pro_selector_and_audit_headroom_fit_job_cost_ceiling(
     mode: str,
     selector_count: int,
     cost_limit: float,
@@ -387,22 +394,34 @@ def test_pro_thought_headroom_fits_existing_job_cost_ceiling(
         estimated_input_tokens=1_000,
         max_output_tokens=1_024,
     )
-    reservations = [
-        context.reserve_gemini_call(
+    selector_reservations = []
+    audit_reservations = []
+    for _ in range(selector_count):
+        selector_reservations.append(context.reserve_gemini_call(
             operation="pro_authoritative",
             model="gemini-3.1-pro-preview",
             estimated_input_tokens=30_000,
             max_output_tokens=gemini_segment._PRO_BOUNDARY_OUTPUT_TOKENS,
-        )
-        for _ in range(selector_count)
-    ]
+        ))
+        audit_reservations.append(context.reserve_gemini_call(
+            operation="pro_boundary_audit",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=30_000,
+            max_output_tokens=gemini_segment._PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS,
+        ))
 
     assert all(
         reservation["reserved_output_tokens"]
         == gemini_segment._PRO_BOUNDARY_OUTPUT_TOKENS
-        for reservation in reservations
+        for reservation in selector_reservations
+    )
+    assert all(
+        reservation["reserved_output_tokens"]
+        == gemini_segment._PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS
+        for reservation in audit_reservations
     )
     budget = context.budget.snapshot()["gemini"]
     assert budget["selector_calls"] == selector_count
+    assert budget["boundary_audit_calls"] == selector_count
     assert budget["cost_exposure_usd"] <= cost_limit
     assert budget["cost_limit_usd"] == pytest.approx(cost_limit)

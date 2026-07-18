@@ -132,11 +132,14 @@ class GenerationBudget:
     }
     _GEMINI_COST_LIMIT_USD: dict[GenerationMode, float] = {
         # Worst-case response reservations plus buffered input estimates cover
-        # one Flash-Lite expansion and a bounded number of normal-Flash selectors.
-        # These are job ceilings, not expected spend; billed usage is recorded
-        # from provider telemetry and is normally much lower.
-        "fast": 0.45,
-        "slow": 0.70,
+        # one Flash-Lite expansion and the bounded Pro selector/final-audit pair
+        # for each source. These are ceilings, not expected spend; billed usage
+        # comes from provider telemetry and is normally much lower.
+        # Each source may use one medium-thinking Pro selector plus one
+        # medium-thinking transcript-only final audit. Keep enough headroom for
+        # both bounded calls without allowing an audit to disappear at release.
+        "fast": 1.00,
+        "slow": 1.50,
     }
     _SELECTOR_CALL_LIMIT: dict[GenerationMode, int] = {
         "fast": 2,

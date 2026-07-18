@@ -8242,9 +8242,10 @@ def test_boundary_prompt_requires_cross_domain_subject_anchoring_and_context() -
     ) in normalized
     assert "include the contiguous spoken unit" in normalized
     assert "end eq after the unit" in normalized
-    assert "the first word of sq and last word of eq are final semantic edges" in normalized
+    assert "the first word of sq and last word of eq are your proposed semantic edges" in normalized
+    assert "one final transcript-only gemini audit" in normalized
     assert "do not rely on downstream code to fix an incomplete thought" in normalized
-    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v13"
+    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v14"
 
 
 @pytest.mark.parametrize(
@@ -8328,7 +8329,7 @@ def test_compact_schema_and_final_audit_require_context_complete_evidence_and_ed
     assert "never omit it solely for boundary uncertainty" in normalized
 
 
-def test_pro_boundary_audit_repairs_words_but_can_never_drop_a_candidate(
+def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = "Explain how mass changes acceleration under the same net force"
@@ -8391,15 +8392,28 @@ def test_pro_boundary_audit_repairs_words_but_can_never_drop_a_candidate(
         plan, segments, request,
     )
     normalized = " ".join(f"{system}\n{user}".split()).casefold()
-    assert "preserve every candidate" in normalized
-    assert "never add, remove, reject, merge, split" in normalized
+    assert "bad, early, late, incomplete, or uncertain cut can never cause rejection" in normalized
     assert "no video, image, audio, url, frame" in normalized
+    assert "reject_unrelated only" in normalized
+    assert "reject_filler_dominated only" in normalized
+    assert "first salvage the candidate's best related unit" in normalized
+    assert "a boundary problem, never a reason to reject" in normalized
+    assert "unless the exact request asks for that comparison" in normalized
+    assert "trimming filler and repairing the edges cannot recover" in normalized
     assert "coordinator plus a newly introduced subject" in normalized
     assert "<full_transcript_cues>" in user
-    assert "do not widen an already complete opening merely to include navigation" in normalized
+    assert "do not widen a complete opening merely for navigation" in normalized
+    assert "first it means" in normalized
+    assert "nearest complete same-objective naming/setup" in normalized
+    assert "not at the method-a recap" in normalized
+    assert "advanced but related material stays" in normalized
+    assert "current_boundary_reference" in normalized
 
-    audit = gemini_segment._BoundaryRepairPlan(items=[{
+    audit = gemini_segment._ProCandidateAuditPlan(items=[{
         "candidate_id": "candidate-1",
+        "decision": "keep",
+        "actual_objective": "Explain why more mass means less acceleration for one force",
+        "evidence_quote": "smaller person moves farther. And the larger person",
         "start_line": 0,
         "end_line": 1,
         "start_quote": "Both people experience the same force",
@@ -8413,7 +8427,7 @@ def test_pro_boundary_audit_repairs_words_but_can_never_drop_a_candidate(
             {"model": "gemini-3.1-pro-preview", "operation": "pro_boundary_audit"},
         ),
     )
-    repaired, calls = gemini_segment._audit_pro_boundaries(
+    repaired, calls, rejections = gemini_segment._audit_pro_boundaries(
         plan,
         segments,
         request,
@@ -8426,16 +8440,17 @@ def test_pro_boundary_audit_repairs_words_but_can_never_drop_a_candidate(
     assert repaired.topics[0].end_line == 1
     assert repaired.topics[0].end_quote == "since he experiences a smaller acceleration"
     assert calls[0]["video_grounded"] is False
+    assert rejections == []
 
     monkeypatch.setattr(
         gemini_segment,
         "_call_model",
         lambda *_args, **_kwargs: (
-            gemini_segment._BoundaryRepairPlan(items=[]),
+            gemini_segment._ProCandidateAuditPlan(items=[]),
             {"model": "gemini-3.1-pro-preview", "operation": "pro_boundary_audit"},
         ),
     )
-    retained, _calls = gemini_segment._audit_pro_boundaries(
+    retained, _calls, rejection_reasons = gemini_segment._audit_pro_boundaries(
         plan,
         segments,
         request,
@@ -8444,6 +8459,7 @@ def test_pro_boundary_audit_repairs_words_but_can_never_drop_a_candidate(
         cancelled=None,
     )
     assert retained == plan
+    assert rejection_reasons == []
 
 
 def test_pro_boundary_audit_schema_failure_is_not_retried(
@@ -8483,7 +8499,7 @@ def test_pro_boundary_audit_schema_failure_is_not_retried(
         )
 
     monkeypatch.setattr(gemini_segment, "_call_model", fail_audit)
-    retained, calls = gemini_segment._audit_pro_boundaries(
+    retained, calls, rejections = gemini_segment._audit_pro_boundaries(
         plan,
         segments,
         "Bayes' theorem",
@@ -8498,6 +8514,7 @@ def test_pro_boundary_audit_schema_failure_is_not_retried(
     assert calls[0]["operation"] == "pro_boundary_audit"
     assert calls[0]["error_type"] == "_SchemaResponseError"
     assert calls[0]["video_grounded"] is False
+    assert rejections == []
 
 
 def test_pro_boundary_audit_can_repair_beyond_two_coarse_cues(
@@ -8526,8 +8543,11 @@ def test_pro_boundary_audit_can_repair_beyond_two_coarse_cues(
         end_quote="and then",
         claim_quote="Bayesian updating begins with a prior probability and then",
     )
-    audit = gemini_segment._BoundaryRepairPlan(items=[{
+    audit = gemini_segment._ProCandidateAuditPlan(items=[{
         "candidate_id": "candidate-1",
+        "decision": "keep",
+        "actual_objective": "Explain how evidence produces a Bayesian posterior",
+        "evidence_quote": "Bayesian updating begins with a prior probability and then",
         "start_line": 0,
         "end_line": 5,
         "start_quote": "Bayesian updating begins with a prior probability",
@@ -8542,7 +8562,7 @@ def test_pro_boundary_audit_can_repair_beyond_two_coarse_cues(
         ),
     )
 
-    repaired, _calls = gemini_segment._audit_pro_boundaries(
+    repaired, _calls, rejections = gemini_segment._audit_pro_boundaries(
         plan,
         segments,
         request,
@@ -8556,6 +8576,265 @@ def test_pro_boundary_audit_can_repair_beyond_two_coarse_cues(
     assert repaired.topics[0].end_quote == (
         "the posterior probability after observing the evidence"
     )
+    assert rejections == []
+
+
+def test_pro_candidate_audit_can_reject_only_grounded_unrelated_or_filler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain Newton's second law F=ma"
+    cases = [
+        (
+            "Momentum equals mass times velocity and uses kilogram meters per second.",
+            "Momentum equals mass times velocity and uses kilogram meters per second",
+            "reject_unrelated",
+        ),
+        (
+            "Please subscribe to the channel and click the notification bell now.",
+            "subscribe to the channel and click the notification bell",
+            "reject_filler_dominated",
+        ),
+    ]
+    for text, evidence, decision in cases:
+        segments = [{
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": text,
+        }]
+        plan = _compact_custom_plan(
+            request=request,
+            start_quote=" ".join(text.split()[:4]),
+            end_quote=" ".join(text.rstrip(".").split()[-4:]),
+            claim_quote=evidence,
+        )
+        audit = gemini_segment._ProCandidateAuditPlan(items=[{
+            "candidate_id": "candidate-1",
+            "decision": decision,
+            "actual_objective": (
+                "Define momentum as mass times velocity"
+                if decision == "reject_unrelated"
+                else "Ask viewers to subscribe to a channel"
+            ),
+            "evidence_quote": evidence,
+            "start_line": 0,
+            "end_line": 0,
+            "start_quote": plan.topics[0].start_quote,
+            "end_quote": plan.topics[0].end_quote,
+        }])
+        monkeypatch.setattr(
+            gemini_segment,
+            "_call_model",
+            lambda *_args, _audit=audit, **_kwargs: (
+                _audit,
+                {"model": "gemini-3.1-pro-preview", "operation": "pro_boundary_audit"},
+            ),
+        )
+
+        audited, _calls, rejections = gemini_segment._audit_pro_boundaries(
+            plan,
+            segments,
+            request,
+            {},
+            deadline=time.monotonic() + 10.0,
+            cancelled=None,
+        )
+
+        assert audited.topics == []
+        assert rejections == [f"gemini_audit:candidate-1:{decision}"]
+
+
+def test_pro_candidate_audit_invalid_or_duplicate_rejection_retains_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain Newton's second law F=ma"
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "Newton's second law says net force equals mass times acceleration."
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 8.0,
+            "end": 16.0,
+            "text": "Momentum equals mass times velocity in classical mechanics.",
+        },
+    ]
+    claim = "net force equals mass times acceleration"
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="Newton's second law says",
+        end_quote="mass times acceleration",
+        claim_quote=claim,
+    )
+    invalid_reject = {
+        "candidate_id": "candidate-1",
+        "decision": "reject_unrelated",
+        "actual_objective": "Define momentum as mass times velocity",
+        "evidence_quote": "Momentum equals mass times velocity in classical mechanics",
+        "start_line": 1,
+        "end_line": 1,
+        "start_quote": "Momentum equals mass times velocity",
+        "end_quote": "velocity in classical mechanics",
+    }
+
+    for items in ([invalid_reject], [invalid_reject, invalid_reject]):
+        audit = gemini_segment._ProCandidateAuditPlan(items=items)
+        monkeypatch.setattr(
+            gemini_segment,
+            "_call_model",
+            lambda *_args, _audit=audit, **_kwargs: (
+                _audit,
+                {"model": "gemini-3.1-pro-preview", "operation": "pro_boundary_audit"},
+            ),
+        )
+        retained, _calls, rejections = gemini_segment._audit_pro_boundaries(
+            plan,
+            segments,
+            request,
+            {},
+            deadline=time.monotonic() + 10.0,
+            cancelled=None,
+        )
+
+        assert retained == plan
+        assert rejections == []
+
+
+def test_pro_candidate_audit_cannot_reject_from_unrelated_coarse_cue_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain Newton's second law F=ma"
+    segments = [{
+        "cue_id": "cue-0",
+        "start": 0.0,
+        "end": 14.0,
+        "text": (
+            "Newton's second law says net force equals mass times acceleration. "
+            "Next, momentum equals mass times velocity in classical mechanics."
+        ),
+    }]
+    claim = "net force equals mass times acceleration"
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="Newton's second law says",
+        end_quote="mass times acceleration",
+        claim_quote=claim,
+    )
+    audit = gemini_segment._ProCandidateAuditPlan(items=[{
+        "candidate_id": "candidate-1",
+        "decision": "reject_unrelated",
+        "actual_objective": "Define momentum as mass times velocity",
+        "evidence_quote": "momentum equals mass times velocity in classical mechanics",
+        "start_line": 0,
+        "end_line": 0,
+        "start_quote": plan.topics[0].start_quote,
+        "end_quote": plan.topics[0].end_quote,
+    }])
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        lambda *_args, **_kwargs: (
+            audit,
+            {"model": "gemini-3.1-pro-preview", "operation": "pro_boundary_audit"},
+        ),
+    )
+
+    retained, _calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert retained == plan
+    assert rejections == []
+
+
+def test_pro_candidate_audit_boundary_must_preserve_original_context_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain how Bayes theorem updates a posterior"
+    segments = [{
+        "cue_id": "cue-0",
+        "start": 0.0,
+        "end": 12.0,
+        "text": (
+            "Necessary setup establishes Bayes theorem before calculation. "
+            "Posterior probability combines prior evidence with likelihood."
+        ),
+    }]
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": [{
+                "constraint_id": "method",
+                "kind": "task",
+                "source_phrase": "Bayes theorem updates a posterior",
+                "requirement": "Explain how Bayes theorem updates a posterior",
+            }],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="bayes-update",
+            start_line=0,
+            end_line=0,
+            start_quote="Necessary setup establishes Bayes theorem",
+            end_quote="prior evidence with likelihood",
+            claim_quote="Posterior probability combines prior evidence with likelihood",
+            title="Bayesian updating",
+            learning_objective="Explain a Bayesian posterior update",
+            facet="posterior update",
+            informativeness=0.2,
+            topic_relevance=0.2,
+            educational_importance=0.2,
+            difficulty=0.95,
+            directly_teaches_topic=False,
+            substantive=False,
+            factually_grounded=False,
+            self_contained=False,
+            is_standalone=False,
+            intent_evidence=[{
+                "id": "method",
+                "q": "Necessary setup establishes Bayes theorem before calculation",
+            }],
+        )],
+    )
+    audit = gemini_segment._ProCandidateAuditPlan(items=[{
+        "candidate_id": "candidate-1",
+        "decision": "keep",
+        "actual_objective": "Explain how evidence updates a Bayesian posterior",
+        "evidence_quote": "Posterior probability combines prior evidence with likelihood",
+        "start_line": 0,
+        "end_line": 0,
+        "start_quote": "Posterior probability combines",
+        "end_quote": "prior evidence with likelihood",
+    }])
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        lambda *_args, **_kwargs: (
+            audit,
+            {"model": "gemini-3.1-pro-preview", "operation": "pro_boundary_audit"},
+        ),
+    )
+
+    retained, _calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert retained == plan
+    assert rejections == []
 
 
 def test_boundary_prompt_stays_transcript_only_when_video_is_requested() -> None:
@@ -9069,7 +9348,7 @@ def test_exact_preflight_prevents_high_entropy_text_from_exceeding_fast_ceiling(
     monkeypatch.setattr(
         gemini_client,
         "count_request_tokens",
-        lambda *_args, **_kwargs: 198_000,
+        lambda *_args, **_kwargs: 250_001,
     )
     monkeypatch.setattr(
         gemini_client,

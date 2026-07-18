@@ -719,10 +719,7 @@ def test_production_flash_is_compact_exhaustive_boundary_first():
     assert G.PRODUCTION_FLASH_PROFILE == G.FLASH_SPLIT_PROFILE
     assert "there is no numeric duration cap" in prompt
     assert "duration must be the consequence of the exact semantic scope" in prompt
-    assert (
-        "informativeness, topic_relevance, and educational_importance\n"
-        "  are each at least 0.75"
-    ) in prompt
+    assert "these scores are metadata, never numeric eligibility gates" in prompt
     assert "backend can repair the cut" in prompt
     assert (
         "do not omit an otherwise good, complete, relevant unit solely because coarse captions"
@@ -740,7 +737,7 @@ def test_production_flash_is_compact_exhaustive_boundary_first():
 
 
 def test_production_flash_has_a_bounded_latency_tail():
-    assert G._TOTAL_DEADLINE_S == 75.0
+    assert G._TOTAL_DEADLINE_S == 120.0
     assert G._FLASH_BOUNDARY_TIMEOUT_S == 45.0
     assert G._FLASH_BOUNDARY_TIMEOUT_S < G._TOTAL_DEADLINE_S
 

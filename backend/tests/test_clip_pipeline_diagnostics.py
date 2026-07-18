@@ -6692,9 +6692,10 @@ def test_clip_call_uses_one_medium_thinking_pro_selector_and_ignores_duration(
     assert clip_mock.call_count == 1
 
 
-def test_topic_deadlines_cover_one_bounded_flash_capacity_retry() -> None:
-    assert pipeline_module.INGEST_TOPIC_VIDEO_TIMEOUT_SEC >= 75.0
-    assert pipeline_module.INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC >= 75.0
+def test_topic_deadlines_cover_transcript_selector_and_final_audit_phases() -> None:
+    assert pipeline_module.INGEST_TOPIC_VIDEO_TIMEOUT_SEC >= 210.0
+    assert pipeline_module.INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC >= 210.0
+    assert pipeline_module.INGEST_TOPIC_USEFUL_INVENTORY_IDLE_TIMEOUT_SEC >= 45.0
 
 
 @pytest.mark.parametrize("mode", ["fast", "slow"])

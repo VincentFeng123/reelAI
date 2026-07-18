@@ -1,8 +1,9 @@
 """Guarded Gemini educational clip segmentation.
 
-Production uses one medium-thinking Pro boundary-selection call over the whole
-timestamped transcript as text, then applies deterministic quality, context,
-grounding, filler, and deduplication guards. Video media is not attached.
+Production uses one medium-thinking Pro selection call followed by one
+medium-thinking Pro candidate-and-boundary audit over timestamped transcript
+text. Deterministic code validates exact quotes and structure but makes no
+semantic admission decision. Video media is never attached.
 Legacy routing and enrichment helpers remain available only for isolated
 evaluation compatibility; the public production adapter never dispatches them.
 
@@ -1673,7 +1674,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v3"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v13"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v14"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -1687,21 +1688,23 @@ SEGMENT_PROFILES = (
     PRO_BOUNDARY_PROFILE,
 )
 
-_TOTAL_DEADLINE_S = 75.0
+_TOTAL_DEADLINE_S = 120.0
 _FLASH_SINGLE_TIMEOUT_S = 45.0
 _FLASH_BOUNDARY_TIMEOUT_S = 45.0
 _FLASH_REPAIR_TIMEOUT_S = 20.0
 _FLASH_ENRICH_TIMEOUT_S = 25.0
 _PRO_TIMEOUT_S = 90.0
+_PRO_FINAL_AUDIT_RESERVED_S = 45.0
 _SELECTION_OUTPUT_TOKENS = 24_576
 # Six thousand compact-schema tokens cover the exhaustive candidate payload.
 _BOUNDARY_OUTPUT_TOKENS = 6_000
 # Gemini Pro counts hidden thought tokens against max_output_tokens. Reserve a
-# separate thought allowance so medium reasoning cannot consume the candidate
-# payload budget; two Fast or three Slow 30k-token text-only selectors still fit
-# their existing hard job-cost ceilings.
+# separate allowance so medium reasoning cannot consume the structured payload;
+# provider runtime independently bounds the call count and total job exposure.
 _PRO_BOUNDARY_OUTPUT_TOKENS = 12_288
-_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS = 6_144
+# The final audit may return 40 decisions plus repaired edges, and medium
+# thinking tokens count against the same provider output ceiling.
+_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS = 12_288
 # Calls cheap enough under a byte-per-token upper bound may use the local
 # estimate. Anything larger gets the provider's free exact count first, so two
 # Fast or three Slow selectors cannot collectively under-reserve past the job
@@ -1720,7 +1723,7 @@ _SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
 _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
-_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_boundary_audit_v2"
+_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v1"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
 
 _PRICING_VERSION = "gemini-standard-2026-07-11"
@@ -2050,6 +2053,27 @@ class _BoundaryRepairItem(_StrictModel):
 
 class _BoundaryRepairPlan(_StrictModel):
     items: list[_BoundaryRepairItem] = Field(max_length=_MAX_CLIPS)
+
+
+class _ProAuditDecision(str, Enum):
+    KEEP = "keep"
+    REJECT_UNRELATED = "reject_unrelated"
+    REJECT_FILLER_DOMINATED = "reject_filler_dominated"
+
+
+class _ProCandidateAuditItem(_StrictModel):
+    candidate_id: _NonBlank
+    decision: _ProAuditDecision
+    actual_objective: _NonBlank
+    evidence_quote: _CompactEvidenceQuote
+    start_line: int = Field(ge=0, strict=True)
+    end_line: int = Field(ge=0, strict=True)
+    start_quote: _CompactBoundaryQuote
+    end_quote: _CompactBoundaryQuote
+
+
+class _ProCandidateAuditPlan(_StrictModel):
+    items: list[_ProCandidateAuditItem] = Field(max_length=_MAX_CLIPS)
 
 
 class _EnrichmentItem(_StrictModel):
@@ -2784,12 +2808,14 @@ def _boundary_prompts(
         "grounded boundaries; brief unavoidable filler is not a rejection reason. "
         "Before returning, verify every sq and eq token-for-token inside its selected s:e range, "
         "including the 1-16 word limit, and verify every cq is 5-16 exact words. The backend "
-        "treats every topic you return as semantically approved: it will not second-guess or "
-        "reject that topic. The first word of sq and last word of eq are final semantic edges: "
-        "the backend will not move either edge inward or use punctuation, topic vocabulary, "
-        "caption length, or silence to reinterpret it. It may only widen outward to include an "
-        "exact cq/ie quote you supplied or fall back to your enclosing s:e cue edges when an "
-        "edge quote is missing, repeated, or malformed. Do not rely on downstream code to fix "
+        "uses no local semantic filter. One final transcript-only Gemini audit will reread each "
+        "candidate against the exact request and may reject it only as genuinely unrelated or "
+        "roughly 90% filler-dominated; a boundary problem can never reject it. The first word "
+        "of sq and last word of eq are your proposed semantic edges. That final Gemini audit "
+        "may repair them, but non-AI code will not use punctuation, topic vocabulary, caption "
+        "length, or silence to reinterpret them. It may only preserve exact cq/ie evidence or "
+        "fall back to enclosing cue edges when an edge quote is missing, repeated, or malformed. "
+        "Do not rely on downstream code to fix "
         "an incomplete thought, omitted referent, late start, early stop, or extra adjacent unit. "
         "Perform a final cold-start/cold-stop reread from sq through eq yourself and correct "
         "those words before returning. "
@@ -2918,80 +2944,150 @@ def _pro_boundary_audit_prompts(
     plan: _CompactBoundaryPlan,
     segments: list[dict],
     topic: str,
-) -> tuple[
-    str,
-    str,
-    dict[str, tuple[int, set[int], set[int]]],
-]:
-    """Render one text-only, non-dropping audit of Gemini's own word edges."""
-    allowed: dict[str, tuple[int, set[int], set[int]]] = {}
+) -> tuple[str, str, dict[str, int]]:
+    """Render Gemini's final text-only semantic and boundary audit."""
+    allowed: dict[str, int] = {}
     blocks: list[str] = []
     cue_count = len(segments)
-    transcript_lines = set(range(cue_count))
     for index, candidate in enumerate(plan.topics):
         audit_id = f"candidate-{index + 1}"
-        start_lines = set(transcript_lines)
-        end_lines = set(transcript_lines)
-        allowed[audit_id] = (index, start_lines, end_lines)
+        allowed[audit_id] = index
+        evidence_lines = [f"claim cq: {candidate.claim_quote!r}"]
+        evidence_lines.extend(
+            f"intent {item.constraint_id}: {item.evidence_quote!r}"
+            for item in candidate.intent_evidence
+        )
         blocks.append(
             f"<candidate audit_id={audit_id!r}>\n"
-            f"original id: {candidate.candidate_id}\n"
-            f"title: {candidate.title}\n"
-            f"learning objective: {candidate.learning_objective}\n"
-            f"facet: {candidate.facet}\n"
+            "<current_boundary_reference>\n"
             f"current s/e: {candidate.start_line}/{candidate.end_line}\n"
             f"current sq: {candidate.start_quote!r}\n"
             f"current eq: {candidate.end_quote!r}\n"
             f"allowed start/end line ID range: 0-{cue_count - 1}\n"
+            "</current_boundary_reference>\n"
+            "<untrusted_selector_hypotheses>\n"
+            f"original id: {candidate.candidate_id}\n"
+            f"title: {candidate.title}\n"
+            f"learning objective: {candidate.learning_objective}\n"
+            f"facet: {candidate.facet}\n"
+            + "\n".join(evidence_lines)
+            + "\n"
+            "</untrusted_selector_hypotheses>\n"
             "</candidate>"
         )
 
+    constraints = "\n".join(
+        f"- {constraint.constraint_id} ({constraint.kind.value}): "
+        f"request words={constraint.source_phrase!r}; "
+        f"interpreted requirement={constraint.requirement!r}"
+        for constraint in plan.request_intent.constraints
+    )
     rendered_cues = "\n".join(
         f"[{index}] {_mmss(segments[index].get('start', 0.0))} "
         f"{str(segments[index].get('text') or '').strip()}"
         for index in range(cue_count)
     )
     system = (
-        "You are the final boundary auditor for educational clips already selected by "
-        "Gemini. You receive transcript text only; no video, image, audio, URL, frame, or "
-        "visual metadata is attached. Preserve every candidate and its semantic objective. "
-        "You may correct only start_line, end_line, start_quote, and end_quote. Never add, "
-        "remove, reject, merge, split, rank, or semantically reclassify a candidate. Return "
-        "exactly one item for every audit_id, even when the best answer is to repeat its "
-        "current boundaries. Do not provide reasoning."
+        "You are Gemini's final candidate auditor for educational clips. You receive only "
+        "the exact user request and timestamped transcript text. No video, image, audio, "
+        "URL, frame, thumbnail, file, or visual metadata is attached or available. Perform "
+        "two independent tasks for every candidate: decide semantic admission from its "
+        "literal speech, and choose context-complete word boundaries. A bad, early, late, "
+        "incomplete, or uncertain cut can NEVER cause rejection; keep the related candidate "
+        "and repair or retain its best grounded boundaries. Return exactly one item for every "
+        "audit_id. Never add, merge, split, rank, or omit candidates. Do not provide hidden "
+        "reasoning or prose outside the schema."
     )
     user = (
-        f"Exact user request: {topic.strip() or '(all educational topics)'}\n\n"
+        f"Exact original user request (the sole TOPIC): "
+        f"{topic.strip() or '(all educational topics)'}\n"
+        "The first selector's parsed constraints are navigation aids, not authority; the "
+        "exact original request above wins whenever they differ:\n"
+        f"{constraints}\n\n"
         "<full_transcript_cues>\n"
         f"{rendered_cues}\n"
         "</full_transcript_cues>\n\n"
         + "\n\n".join(blocks)
-        + "\n\nFor every candidate, reread its literal sq-through-eq speech as a cold "
-          "listener. Its first and final tokens must be complete spoken words. The opening "
-          "must include the candidate's own necessary setup and resolved referents. The ending "
-          "must finish its same-objective sentence, reasoning, answer, qualification, and "
-          "conclusion. Caption punctuation, cue edges, and silence are not semantic endings. "
-          "If a word or thought continues into a later cue, increase end_line and end only at "
-          "the first complete same-objective conclusion. If the current tail begins a new "
-          "clause or subject but leaves its predicate unfinished, either include that whole "
-          "same-objective thought or move end_quote back before the incomplete tail. Never "
-          "stop after a coordinator plus a newly introduced subject, such as 'And the second "
-          "subject'; continue through its predicate, or stop before the coordinator. If the "
-          "transcript corrupts a final word and then "
-          "starts a different objective, do not invent the missing letters and do not append "
-          "the different objective; move end_quote back to the last complete conclusion for "
-          "this candidate. Context and wholeness outrank brevity, and there is no duration "
-          "target. Boundary uncertainty is never a reason to omit a candidate.\n\n"
-          "Do not widen an already complete opening merely to include navigation or generic "
-          "framing such as 'Now the next law you need to know' or 'Now here is another "
-          "example.' When the following speech itself names the law, object, or scenario, "
-          "begin at that complete teaching setup and leave the navigation outside.\n\n"
-          "Each returned candidate_id must be the audit_id exactly. start_line and end_line "
-          "must be valid IDs from the supplied full transcript. "
-          "start_quote and end_quote must each be the shortest unique 1-16 exact consecutive "
-          "transcript words inside the returned inclusive line range. Their first/last words "
-          "are the semantic edges. Quotes may cross adjacent cues but may not skip, stitch, "
-          "reorder, paraphrase, or correct transcript text. Return only {items}."
+        + "\n\nADMISSION — decide independently of timing and selector labels/scores:\n"
+          "First salvage the candidate's best related unit. If any substantive coherent "
+          "teaching unit related to the exact request can be isolated by repairing the "
+          "candidate's edges or including its nearby same-objective continuation, decision "
+          "MUST be keep and the returned boundaries must isolate that unit. A coarse cut that "
+          "also contains an unrelated neighbor or lots of filler is a boundary problem, never "
+          "a reason to reject the recoverable related unit. Use a reject decision only when no "
+          "related substantive unit remains after the best grounded repair.\n"
+          "- decision=keep for every substantive coherent teaching unit genuinely related "
+          "to the exact original request. If the request explicitly asks for a named "
+          "component, a unit teaching that component's meaning, role, or requested "
+          "relationship qualifies even when it does not repeat the entire governing topic.\n"
+          "- decision=reject_unrelated ONLY when the speech's actual teaching objective is "
+          "genuinely unrelated. A shared noun, variable, symbol, unit, broad field, or use of "
+          "a component inside a different governing law, equation, theory, algorithm, system, "
+          "or domain is not a relationship—unless the exact request asks for that comparison, "
+          "derivation, or connection, or the speech explicitly teaches its connection to the "
+          "requested topic. When the exact request is '(all educational "
+          "topics)', no substantive coherent teaching objective is unrelated; only "
+          "filler-dominated material may be rejected.\n"
+          "- decision=reject_filler_dominated ONLY when trimming filler and repairing the "
+          "edges cannot recover any coherent substantive teaching unit—practically, roughly "
+          "90% or more is filler, administration, promotion, navigation, or transcript noise. "
+          "Brief filler around real teaching must be kept.\n"
+          "No other rejection reason exists. NEVER reject for a wrong/incomplete boundary, "
+          "unresolved context, duration, visual dependence, factual uncertainty, duplication, "
+          "repetition, self-contained/standalone status, any score, or learner difficulty. "
+          "Advanced but related material stays; downstream may store and defer it for later.\n"
+          "Examples: For 'Newton's second law F=ma,' a same-force/larger-mass/smaller-"
+          "acceleration explanation is KEEP, while a lesson whose actual objective is p=mv "
+          "momentum or impulse-momentum is REJECT_UNRELATED even though it shares force, mass, "
+          "velocity, or units. For 'Bayes theorem,' Bayesian prior-likelihood-posterior "
+          "teaching is KEEP, while maximum-likelihood estimation with no Bayesian connection "
+          "is REJECT_UNRELATED. For 'quicksort,' its partition mechanism is KEEP, while a "
+          "mergesort-only explanation is REJECT_UNRELATED. A related clip that starts late, "
+          "ends early, or is advanced is always KEEP.\n"
+          "For every decision, actual_objective must context-completely name what the literal "
+          "speech actually teaches—not a generic matching word. evidence_quote must be 5-16 "
+          "exact consecutive words inside the candidate's ORIGINAL current sq-through-eq "
+          "semantic speech that prove that actual objective. For a rejection this quote must "
+          "specifically ground the "
+          "unrelated objective or filler dominance. The quote itself must identify the "
+          "competing objective or unmistakable filler; if it is generic, depends on missing "
+          "context, or supports both related and unrelated readings, decision MUST be keep.\n\n"
+          "BOUNDARIES — perform this separately; a failure here never changes KEEP to reject:\n"
+          "Reread the literal current speech as a cold listener. The opening must include the "
+          "candidate's own necessary setup and resolve every referent. Openings such as 'This "
+          "law,' 'This equation,' 'First it means,' 'Second it means,' or a numbered/listed "
+          "consequence require the earlier speech that names the law/equation/referent and "
+          "establishes what is being enumerated. A title, request, earlier clip, or selector "
+          "label cannot supply spoken context. Resolve that context at the nearest complete "
+          "same-objective naming/setup, never by swallowing a completed earlier topic. If one "
+          "cue says 'We already finished method A; method B means ...', begin inside that cue "
+          "at 'method B means', not at the method-A recap. Likewise, a later 'this theorem' "
+          "needs the nearest sentence naming that theorem, not a completed previous theorem, "
+          "law, example, or detour. Include a prior sentence when it resolves a referent or "
+          "list/enumeration setup for this same objective. Exclude a conceptually helpful but "
+          "independently complete prerequisite or different objective; it belongs in its own "
+          "candidate. If a promised derivation, calculation, example, "
+          "comparison, or explanation continues, include its stated result and conclusion.\n"
+          "The ending must finish the same-objective sentence, reasoning, answer, qualification, "
+          "and conclusion. Caption punctuation, silence, and cue edges are not semantic endings. "
+          "If a word or thought continues into a later cue, continue through the first complete "
+          "same-objective conclusion. Never stop after a coordinator plus a newly introduced "
+          "subject such as 'And the larger person'; include its predicate or stop before it. "
+          "If the transcript corrupts a final word and then starts a different objective, do "
+          "not invent letters or append that objective; stop at the last complete grounded "
+          "conclusion. Context and wholeness outrank brevity and there is no duration target.\n"
+          "Use the nearest contiguous same-objective discourse. Do not jump across a long "
+          "silence, section reset, or intervening different topic merely to import setup or a "
+          "conclusion from elsewhere in the transcript.\n"
+          "Do not widen a complete opening merely for navigation such as 'Now here is another "
+          "example.' Any repaired span must still contain the supplied cq claim and every "
+          "non-scope ie intent quote from the original candidate.\n\n"
+          "Each candidate_id must equal its audit_id. start_line/end_line must be valid full-"
+          "transcript IDs. start_quote/end_quote must each be the shortest unique 1-16 exact "
+          "consecutive transcript words inside the returned inclusive range; their first/last "
+          "words are the semantic edges. Quotes may cross adjacent cues but may not skip, "
+          "stitch, reorder, paraphrase, or correct transcript text. For a rejected candidate, "
+          "repeat its current boundaries exactly. Return only {items}."
     )
     return system, user, allowed
 
@@ -18750,19 +18846,19 @@ def _audit_pro_boundaries(
     *,
     deadline: float,
     cancelled: CancelledCb,
-) -> tuple[_CompactBoundaryPlan, list[dict]]:
-    """Let Pro correct its word edges without ever dropping a selected topic."""
-    if not plan.topics:
-        return plan, []
+) -> tuple[_CompactBoundaryPlan, list[dict], list[str]]:
+    """Let Pro independently audit admission and word edges; all failures retain."""
+    if not plan.topics or not segments:
+        return plan, [], []
     system, user, allowed = _pro_boundary_audit_prompts(plan, segments, topic)
     sink = settings.get("_segment_telemetry")
     try:
         audit, call = _call_model(
             system,
             user,
-            _BoundaryRepairPlan,
+            _ProCandidateAuditPlan,
             model=config.SEGMENT_PRO_MODEL,
-            thinking_level="low",
+            thinking_level="medium",
             max_output_tokens=_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS,
             timeout_s=_PRO_TIMEOUT_S,
             deadline_monotonic=deadline,
@@ -18788,23 +18884,97 @@ def _audit_pro_boundaries(
             applied_count=0,
             reason=f"request_failure:{type(exc).__name__}",
         )
-        return plan, calls
+        return plan, calls, []
 
-    if not isinstance(audit, _BoundaryRepairPlan):
-        return plan, calls
+    if not isinstance(audit, _ProCandidateAuditPlan):
+        return plan, calls, []
 
-    replacements: dict[int, _CompactBoundaryTopic] = {}
-    seen: set[str] = set()
+    id_counts: dict[str, int] = {}
     for item in audit.items:
         audit_id = str(item.candidate_id)
-        permitted = allowed.get(audit_id)
-        if permitted is None or audit_id in seen:
+        id_counts[audit_id] = id_counts.get(audit_id, 0) + 1
+
+    constraint_kinds = {
+        str(constraint.constraint_id): constraint.kind
+        for constraint in plan.request_intent.constraints
+    }
+    replacements: dict[int, _CompactBoundaryTopic] = {}
+    rejected: dict[int, _ProAuditDecision] = {}
+    returned_ids: set[str] = set()
+    protected_boundary_failures = 0
+    for item in audit.items:
+        audit_id = str(item.candidate_id)
+        index = allowed.get(audit_id)
+        if index is None or id_counts.get(audit_id) != 1:
             continue
-        seen.add(audit_id)
-        index, start_lines, end_lines = permitted
+        returned_ids.add(audit_id)
+        proposal = plan.topics[index]
+        original_range_valid = (
+            0 <= proposal.start_line <= proposal.end_line < len(segments)
+        )
+        original_start_anchor = (
+            _unique_boundary_anchor(
+                segments,
+                proposal.start_quote,
+                proposal.start_line,
+                proposal.end_line,
+                allow_timing_gaps=True,
+            )
+            if original_range_valid
+            else None
+        )
+        original_end_anchor = (
+            _unique_boundary_anchor(
+                segments,
+                proposal.end_quote,
+                proposal.start_line,
+                proposal.end_line,
+                allow_timing_gaps=True,
+            )
+            if original_range_valid
+            else None
+        )
+        original_semantic_envelope_valid = bool(
+            original_start_anchor is not None
+            and original_end_anchor is not None
+            and original_start_anchor.first_word_position
+            <= original_end_anchor.last_word_position
+        )
+
+        if item.decision is not _ProAuditDecision.KEEP:
+            evidence_tokens = _toks(item.evidence_quote)
+            rejection_anchor = (
+                _unique_boundary_anchor(
+                    segments,
+                    item.evidence_quote,
+                    proposal.start_line,
+                    proposal.end_line,
+                    allow_timing_gaps=True,
+                )
+                if (
+                    original_semantic_envelope_valid
+                    and 5 <= len(evidence_tokens) <= 16
+                )
+                else None
+            )
+            if (
+                rejection_anchor is not None
+                and original_start_anchor is not None
+                and original_end_anchor is not None
+                and original_start_anchor.first_word_position
+                <= rejection_anchor.first_word_position
+                and rejection_anchor.last_word_position
+                <= original_end_anchor.last_word_position
+            ):
+                rejected[index] = item.decision
+            # A rejection item is not boundary authority. Invalid rejection
+            # evidence fails open to the untouched original candidate; valid
+            # rejection is applied independently of the repeated edge fields.
+            continue
+
         if (
-            item.start_line not in start_lines
-            or item.end_line not in end_lines
+            item.start_line < 0
+            or item.end_line >= len(segments)
             or item.end_line < item.start_line
             or not 1 <= len(_toks(item.start_quote)) <= 16
             or not 1 <= len(_toks(item.end_quote)) <= 16
@@ -18828,7 +18998,43 @@ def _audit_pro_boundaries(
             or start_anchor.first_word_position > end_anchor.last_word_position
         ):
             continue
-        replacements[index] = plan.topics[index].model_copy(update={
+
+        protected_quotes = [str(proposal.claim_quote)]
+        protected_quotes.extend(
+            str(evidence.evidence_quote)
+            for evidence in proposal.intent_evidence
+            if constraint_kinds.get(str(evidence.constraint_id))
+            is not _IntentConstraintKind.SCOPE
+        )
+        protected_anchors = [
+            anchor
+            for quote in dict.fromkeys(protected_quotes)
+            if original_semantic_envelope_valid
+            and (
+                anchor := _unique_boundary_anchor(
+                    segments,
+                    quote,
+                    proposal.start_line,
+                    proposal.end_line,
+                    allow_timing_gaps=True,
+                )
+            ) is not None
+            and original_start_anchor is not None
+            and original_end_anchor is not None
+            and original_start_anchor.first_word_position
+            <= anchor.first_word_position
+            and anchor.last_word_position
+            <= original_end_anchor.last_word_position
+        ]
+        if any(
+            start_anchor.first_word_position > anchor.first_word_position
+            or end_anchor.last_word_position < anchor.last_word_position
+            for anchor in protected_anchors
+        ):
+            protected_boundary_failures += 1
+            continue
+
+        replacements[index] = proposal.model_copy(update={
             "start_line": item.start_line,
             "end_line": item.end_line,
             "start_quote": item.start_quote,
@@ -18838,16 +19044,46 @@ def _audit_pro_boundaries(
     audited_topics = [
         replacements.get(index, topic_item)
         for index, topic_item in enumerate(plan.topics)
+        if index not in rejected
     ]
+    rejection_reasons = [
+        f"gemini_audit:candidate-{index + 1}:{decision.value}"
+        for index, decision in sorted(rejected.items())
+    ]
+    decision_counts = {
+        decision.value: sum(value is decision for value in rejected.values())
+        for decision in (
+            _ProAuditDecision.REJECT_UNRELATED,
+            _ProAuditDecision.REJECT_FILLER_DOMINATED,
+        )
+    }
     _emit(
         sink,
-        "boundary_audit",
+        "candidate_audit",
         attempted_count=len(plan.topics),
-        returned_count=len(seen),
-        applied_count=len(replacements),
-        retained_count=len(plan.topics) - len(replacements),
+        returned_count=len(returned_ids),
+        boundary_applied_count=sum(
+            index not in rejected for index in replacements
+        ),
+        boundary_retained_count=(
+            len(plan.topics) - len(rejected) - sum(
+                index not in rejected for index in replacements
+            )
+        ),
+        protected_boundary_retained_count=protected_boundary_failures,
+        rejected_count=len(rejected),
+        rejected_unrelated_count=decision_counts[
+            _ProAuditDecision.REJECT_UNRELATED.value
+        ],
+        rejected_filler_dominated_count=decision_counts[
+            _ProAuditDecision.REJECT_FILLER_DOMINATED.value
+        ],
     )
-    return plan.model_copy(update={"topics": audited_topics}), calls
+    return (
+        plan.model_copy(update={"topics": audited_topics}),
+        calls,
+        rejection_reasons,
+    )
 
 
 def _run_selection_profile(
@@ -18965,6 +19201,12 @@ def _run_selection_profile(
     )
     retry_capacity_once = retry_flash_capacity_once or retry_pro_capacity_once
     operation = str(settings.get("_segment_operation") or operation)
+    selector_deadline = (
+        deadline - _PRO_FINAL_AUDIT_RESERVED_S
+        if profile == PRO_BOUNDARY_PROFILE
+        else deadline
+    )
+
     def invoke_selector() -> tuple[BaseModel, dict]:
         return _call_model(
             system,
@@ -18974,7 +19216,7 @@ def _run_selection_profile(
             thinking_level=level,
             max_output_tokens=cap,
             timeout_s=timeout,
-            deadline_monotonic=deadline,
+            deadline_monotonic=selector_deadline,
             operation=operation,
             prompt_version=profile,
             cancelled=cancelled,
@@ -19020,7 +19262,7 @@ def _run_selection_profile(
             "schema_retry_attempt": 1,
             "schema_retry_reason": "invalid_structured_response",
         })
-        if _cancel_requested(cancelled) or deadline <= time.monotonic():
+        if _cancel_requested(cancelled) or selector_deadline <= time.monotonic():
             raise
         calls.append(first_call)
         try:
@@ -19042,8 +19284,9 @@ def _run_selection_profile(
         })
     call["video_grounded"] = video_grounded
     calls.append(call)
+    pro_audit_rejections: list[str] = []
     if profile == PRO_BOUNDARY_PROFILE and isinstance(parsed, _CompactBoundaryPlan):
-        parsed, boundary_audit_calls = _audit_pro_boundaries(
+        parsed, boundary_audit_calls, pro_audit_rejections = _audit_pro_boundaries(
             parsed,
             segments,
             topic,
@@ -19078,6 +19321,12 @@ def _run_selection_profile(
         topic=topic,
         require_enrichment=require_enrichment,
     )
+    if pro_audit_rejections:
+        report.proposed_count += len(pro_audit_rejections)
+        report.rejected_reasons = [
+            *pro_audit_rejections,
+            *report.rejected_reasons,
+        ]
     schema_rejections = call.get("schema_rejection_reasons")
     if isinstance(schema_rejections, list):
         clean_rejections = [

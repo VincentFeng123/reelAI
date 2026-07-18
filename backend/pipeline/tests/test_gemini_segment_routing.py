@@ -25,6 +25,7 @@ def test_provider_schemas_avoid_unsupported_additional_properties():
         G._CompactBoundaryPlan,
         G._IntentBoundaryPlan,
         G._BoundaryRepairPlan,
+        G._ProCandidateAuditPlan,
         G._EnrichmentPlan,
     ):
         assert "additionalProperties" not in str(GC._gemini3_json_schema(schema))
@@ -62,11 +63,11 @@ def test_public_selector_installs_a_local_cost_guard_for_direct_callers(monkeypa
     assert original_settings == {}
     assert callable(captured["_segment_budget_reserve"])
     assert callable(captured["_segment_budget_reconcile"])
-    with pytest.raises(ProviderBudgetExceededError, match=r"\$0\.45 maximum"):
+    with pytest.raises(ProviderBudgetExceededError, match=r"\$1\.00 maximum"):
         captured["_segment_budget_reserve"](
             operation="pro_authoritative",
             model="gemini-3.1-pro-preview",
-            estimated_input_tokens=200_001,
+            estimated_input_tokens=250_001,
             max_output_tokens=6_000,
         )
 
@@ -77,7 +78,7 @@ def test_direct_long_transcript_is_rejected_before_pro_dispatch(monkeypatch):
 
     def count_tokens(*args, **kwargs):
         count_calls.append((args, kwargs))
-        return 200_001
+        return 250_001
 
     def generate(*args, **kwargs):
         nonlocal dispatched
@@ -332,7 +333,7 @@ def test_route_event_uses_selected_authoritative_prompt_version(monkeypatch):
 
 @pytest.mark.parametrize(
     ("configured_deadline", "expected_deadline"),
-    [(None, 175.0), (120.0, 120.0), (200.0, 175.0)],
+    [(None, 220.0), (120.0, 120.0), (200.0, 200.0)],
 )
 def test_production_route_caps_and_respects_the_shared_deadline(
     monkeypatch,

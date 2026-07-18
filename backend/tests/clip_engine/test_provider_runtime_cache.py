@@ -201,12 +201,12 @@ def test_generation_context_enforces_actual_gemini_call_and_cost_budgets() -> No
     slow_budget = slow_flash.budget.snapshot()["gemini"]
     assert slow_budget["flash_selector_calls"] == 3
     assert slow_budget["flash_selector_limit"] == 3
-    assert slow_budget["cost_limit_usd"] == pytest.approx(0.70)
+    assert slow_budget["cost_limit_usd"] == pytest.approx(1.50)
 
 
 @pytest.mark.parametrize(
     ("mode", "selector_count", "cost_limit"),
-    [("fast", 2, 0.45), ("slow", 3, 0.70)],
+    [("fast", 2, 1.00), ("slow", 3, 1.50)],
 )
 def test_job_cost_budget_fits_expansion_and_typical_whole_transcript_selectors(
     mode: str,
@@ -330,7 +330,7 @@ def test_pro_reservation_applies_long_context_tier_before_dispatch() -> None:
         context.reserve_gemini_call(
             operation="pro_authoritative",
             model="gemini-3.1-pro-preview",
-            estimated_input_tokens=200_001,
+            estimated_input_tokens=300_001,
             max_output_tokens=100,
         )
     assert context.budget.snapshot()["gemini"]["pro_selector_calls"] == 1
@@ -370,7 +370,7 @@ def test_current_cost_diagnostics_do_not_report_lifetime_reservations_as_spend()
     assert summary["lifetime_reserved_worst_case_cost_usd"] == pytest.approx(0.786)
     assert summary["estimated_cost_usd"] == pytest.approx(0.096)
     assert summary["current_cost_exposure_usd"] == pytest.approx(0.096)
-    assert summary["cost_limit_usd"] == pytest.approx(0.70)
+    assert summary["cost_limit_usd"] == pytest.approx(1.50)
 
 
 @pytest.mark.parametrize(
@@ -430,7 +430,7 @@ def test_unknown_dispatched_usage_keeps_full_reservation_fail_closed() -> None:
     reservation = context.reserve_gemini_call(
         operation="flash_boundary_selector",
         model="gemini-3.5-flash",
-        estimated_input_tokens=110_000,
+        estimated_input_tokens=300_000,
         max_output_tokens=8_192,
     )
     context.record_gemini(
@@ -460,7 +460,7 @@ def test_unknown_dispatched_usage_keeps_full_reservation_fail_closed() -> None:
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
             model="gemini-3.5-flash",
-            estimated_input_tokens=110_000,
+            estimated_input_tokens=300_000,
             max_output_tokens=8_192,
         )
 
@@ -632,7 +632,7 @@ def test_blocked_cost_reservation_is_bounded_by_deadline_and_cancellation() -> N
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
             model="gemini-3.5-flash",
-            estimated_input_tokens=180_000,
+            estimated_input_tokens=580_000,
             max_output_tokens=8_192,
             deadline_monotonic=time.monotonic() + 0.05,
         )
@@ -643,7 +643,7 @@ def test_blocked_cost_reservation_is_bounded_by_deadline_and_cancellation() -> N
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
             model="gemini-3.5-flash",
-            estimated_input_tokens=180_000,
+            estimated_input_tokens=580_000,
             max_output_tokens=8_192,
             deadline_monotonic=time.monotonic() + 1.0,
             cancelled=lambda: True,
@@ -681,9 +681,9 @@ def test_committed_cost_that_can_never_fit_fails_without_waiting() -> None:
     committed = budget.reserve_gemini(
         model="gemini-3.1-flash-lite",
         operation="query_expansion",
-        estimated_cost_usd=0.44,
+        estimated_cost_usd=0.99,
     )
-    budget.reconcile_gemini(committed, actual_cost_usd=0.44)
+    budget.reconcile_gemini(committed, actual_cost_usd=0.99)
     budget.reserve_gemini(
         model="gemini-3.1-flash-lite",
         operation="query_expansion",
@@ -803,7 +803,7 @@ def test_generation_usage_payload_aggregates_stage_tokens_cost_and_fallbacks() -
         "request_failure:RuntimeError": 1,
     }
     assert payload["by_stage"]["selection"]["calls"] == 1
-    assert payload["budget"]["gemini"]["cost_limit_usd"] == 0.45
+    assert payload["budget"]["gemini"]["cost_limit_usd"] == 1.00
 
 
 def test_generation_usage_preserves_video_grounding_transport_fact() -> None:
