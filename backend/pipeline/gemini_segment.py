@@ -1674,7 +1674,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v3"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v16"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v17"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -6639,6 +6639,10 @@ def _trusted_universal_start_context_edge(
         original_opening,
         re.IGNORECASE,
     )
+    if _TRUSTED_BARE_DEMONSTRATIVE_PREDICATE_OPENING_RE.match(
+        original_opening
+    ):
+        unresolved_head_match = None
     phrase_tokens = (
         _toks(unresolved_phrase_match.group("phrase"))
         if unresolved_phrase_match is not None
@@ -7071,6 +7075,77 @@ def _trusted_universal_completed_end(
     return line, span, quote
 
 
+def _trusted_universal_structural_tail_end(
+    segments: list[dict],
+    *,
+    start_line: int,
+    start_span: tuple[int, int] | None,
+    end_line: int,
+    end_span: tuple[int, int] | None,
+    protected_quotes: list[str],
+) -> tuple[int, tuple[int, int]] | None:
+    """Trim an explicit next-unit handoff even when its final words are complete."""
+    # A structural handoff is removable only when it begins inside the final
+    # selected cue.  Searching older cues can mistake an intentionally selected
+    # second example or application for an unwanted tail merely because its
+    # introduction uses words such as ``now`` or ``work through``.
+    for line in (end_line,):
+        source = str(segments[line].get("text") or "")
+        left = start_span[0] if line == start_line and start_span else 0
+        right = end_span[1] if line == end_line and end_span else len(source)
+        local_selected = source[left:right]
+        search_offset = 0
+        while _WORD_RE.search(local_selected[search_offset:]):
+            local_noise = _trailing_edge_noise_start(
+                local_selected[search_offset:],
+                anchor_text=" ".join(protected_quotes),
+            )
+            if local_noise is None:
+                break
+            noise_start = search_offset + local_noise
+            navigation = local_selected[noise_start:]
+            search_offset = noise_start + 1
+            if _TRUSTED_SAME_ARC_NAVIGATION_RE.search(navigation):
+                continue
+            cut_right = left + noise_start
+            retained_source = source[:cut_right].rstrip(" ,;:—-")
+            retained_words = list(_WORD_RE.finditer(retained_source))
+            if not retained_words:
+                continue
+            candidate_end_span = (
+                retained_words[max(0, len(retained_words) - 6)].start(),
+                retained_words[-1].end(),
+            )
+            candidate_text, _candidate_spans = _semantic_clip_slice(
+                segments,
+                start_line,
+                line,
+                start_span=start_span,
+                end_span=candidate_end_span,
+            )
+            if (
+                len(_content_tokens(candidate_text)) < 5
+                or _terminal_content_is_explicitly_incomplete(candidate_text)
+                or _cue_has_explicit_dangling_end(
+                    candidate_text,
+                    navigation,
+                )
+                or _TERMINAL_DANGLING_PREDICATE_HEAD_RE.search(candidate_text)
+                or _cue_has_weak_end(
+                    candidate_text,
+                    navigation,
+                    ignore_caption_case=True,
+                )
+                or not all(
+                    _contains_quote(candidate_text, protected)
+                    for protected in protected_quotes
+                )
+            ):
+                continue
+            return line, candidate_end_span
+    return None
+
+
 def _trim_end_quote_before_edge_noise(
     text: str,
     quote: str,
@@ -7499,6 +7574,36 @@ def _recover_projected_start_within_cue(
         )
     )
     omitted_prefix = text[:quote_span[0]].strip()
+    teaching_setups = [
+        handoff
+        for handoff in _TRUSTED_CLAIM_SETUP_HANDOFF_RE.finditer(
+            text,
+            0,
+            quote_span[0],
+        )
+        if handoff.group("teaching_setup") is not None
+    ]
+    if (
+        suffix_is_grounded
+        and teaching_setups
+        and not _projected_start_is_standalone(text, quote_span)
+    ):
+        for handoff in reversed(teaching_setups):
+            setup_left = handoff.start("teaching_setup")
+            retained = text[setup_left:].lstrip()
+            retained_with_following = " ".join(
+                part for part in (retained, following_text) if part
+            )
+            if (
+                evidence_quote
+                and not _contains_quote(
+                    retained_with_following,
+                    evidence_quote,
+                )
+            ):
+                continue
+            if _opening_clause_is_standalone(retained):
+                return _exact_boundary_quote(retained, want="start")
     projected_suffix_is_complete = bool(
         _opening_clause_is_standalone(selected_suffix)
         or (
@@ -11816,6 +11921,17 @@ _TRUSTED_CLAIM_SETUP_HANDOFF_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+_TRUSTED_BARE_DEMONSTRATIVE_PREDICATE_OPENING_RE = re.compile(
+    r"^\s*(?:this|that|these|those)\s+(?:also\s+)?"
+    r"(?:means?|shows?|implies?|indicates?|suggests?)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_SAME_ARC_NAVIGATION_RE = re.compile(
+    r"\b(?:(?:next|second|third|final)\s+)?"
+    r"(?:step|part|stage|piece|proof|derivation|calculation|"
+    r"denominator|numerator)\b",
+    re.IGNORECASE,
+)
 _TRUSTED_CLAIM_SENTENCE_ONSET_RE = re.compile(
     r"(?<!\w)(?:(?P<ordinal>"
     r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth"
@@ -11891,6 +12007,31 @@ _TRUSTED_WORKED_RESULT_SIGNAL_RE = re.compile(
     r"derivation|example|exercise|problem|proof)|"
     r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|"
     r"-?\d+(?:\.\d+)?)\s+(?:kilograms?|meters?|newtons?|seconds?))\b",
+    re.IGNORECASE,
+)
+_TRUSTED_PENDING_WORKED_TARGET_RE = re.compile(
+    r"\bto\s+(?:find|calculate|compute|determine|evaluate|solve\s+for)\s+"
+    r"(?P<target>[a-z0-9][^.!?;:,]{2,100}?)"
+    r"(?:\s*[,;:]\s*|\s+)"
+    r"(?:(?:we|you)\s+)?(?:first\s+)?"
+    r"(?:need|have|must)\s+to\s+"
+    r"(?:find|calculate|compute|determine|evaluate|solve\s+for)\b",
+    re.IGNORECASE,
+)
+_TRUSTED_STRONG_FRESH_WORKED_RESET_RE = re.compile(
+    r"(?:^|[.!?]\s+)(?:(?:now|next)\s*[,;:]?\s+)?(?:"
+    r"this\s+time\s*[,;:]?\s+let(?:['’]?s|\s+us)\s+say\b|"
+    r"let(?:['’]?s|\s+us)\s+work\s+(?:on|through)\s+"
+    r"(?:this|that|another|the\s+next|a\s+new)\s+"
+    r"(?:calculation|case|derivation|example|exercise|problem|proof)\b|"
+    r"(?:another|one\s+more|the\s+next|a\s+(?:different|new))\s+"
+    r"(?:calculation|case|derivation|example|exercise|problem|proof)\b)",
+    re.IGNORECASE,
+)
+_TRUSTED_WORKED_CLOSING_CONTEXT_RE = re.compile(
+    r"\b(?:everything\s+(?:matches|works\s+out)|"
+    r"(?:as\s+you\s+can\s+see|therefore|thus|hence)|"
+    r"this\s+(?:confirms|demonstrates|shows))\b",
     re.IGNORECASE,
 )
 _TRUSTED_SPLIT_FINITE_PREDICATE_RE = re.compile(
@@ -12989,6 +13130,213 @@ def _trusted_projected_worked_arc_end(
     return None
 
 
+def _trusted_pending_worked_target_end(
+    segments: list[dict],
+    *,
+    start_line: int,
+    start_span: tuple[int, int] | None,
+    end_line: int,
+    end_span: tuple[int, int] | None,
+    scope_text: str,
+) -> tuple[tuple[int, tuple[int, int], str] | None, bool]:
+    """Finish a stated worked target after its prerequisite calculation."""
+    if (
+        not (0 <= start_line <= end_line < len(segments))
+        or (
+            _ATOMIC_WORKED_SCOPE_RE.search(scope_text) is None
+            and _TRUSTED_WORKED_TASK_SCOPE_RE.search(scope_text) is None
+        )
+    ):
+        return None, False
+    selected, _selected_spans = _semantic_clip_slice(
+        segments,
+        start_line,
+        end_line,
+        start_span=start_span,
+        end_span=end_span,
+    )
+    dependencies = list(_TRUSTED_PENDING_WORKED_TARGET_RE.finditer(selected))
+    if not dependencies:
+        return None, False
+    dependency = dependencies[-1]
+    target = re.split(
+        r"\b(?:for|in|of|on|with)\b",
+        dependency.group("target"),
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip(" ,;:—-")
+    target_tokens = _content_tokens(target)
+    if len(target_tokens) < 2:
+        return None, False
+    generic_target_tokens = {
+        "amount", "answer", "final", "force", "number", "quantity",
+        "result", "solution", "total", "value",
+    }
+    identity_words = [
+        token
+        for token in _toks(target)
+        if token not in generic_target_tokens
+    ]
+    if not identity_words:
+        identity_words = _toks(target)
+    identity_tokens = set(identity_words)
+    # Match the target's identity head, rather than any token in the target.
+    # For example, ``contract`` in ``contract duration`` must not satisfy the
+    # pending target ``contract price``.  A missing head fails open and leaves
+    # Gemini's original edge unchanged.
+    target_pattern = re.escape(identity_words[-1])
+    numeric_value = (
+        r"(?:about\s+|approximately\s+|roughly\s+)?(?:[$£€]?\s*"
+        r"-?\d+(?:\.\d+)?|zero|one|two|three|four|five|six|seven|"
+        r"eight|nine|ten|hundred|thousand)\b"
+    )
+
+    def result_right(text: str) -> int | None:
+        sentence_spans = _sentence_character_spans(text) or [(0, len(text))]
+        for left, right in sentence_spans:
+            sentence = text[left:right]
+            if not (identity_tokens & _content_tokens(sentence)):
+                continue
+            explicit_target_result = re.search(
+                rf"\b{target_pattern}\b[^.!?]{{0,45}}\b"
+                r"(?:equals?|has\s+to\s+be|must\s+be|comes?\s+to|"
+                r"works?\s+out\s+to)\b",
+                sentence,
+                re.IGNORECASE,
+            )
+            numeric_target_result = re.search(
+                rf"\b{target_pattern}\b[^.!?]{{0,30}}\b"
+                rf"(?:is|are|will\s+be)\s+{numeric_value}",
+                sentence,
+                re.IGNORECASE,
+            )
+            named_result = re.search(
+                rf"\b(?:answer|result|solution)\b[^.!?]{{0,45}}"
+                rf"\b{target_pattern}\b[^.!?]{{0,20}}\b(?:is|equals?)\b",
+                sentence,
+                re.IGNORECASE,
+            )
+            if explicit_target_result or numeric_target_result or named_result:
+                return right
+        return None
+
+    if result_right(selected[dependency.end():]) is not None:
+        return None, False
+
+    _floor, section_ceiling = _trusted_contiguous_section_bounds(
+        segments,
+        end_line,
+    )
+    parts: list[str] = []
+    line_ranges: list[tuple[int, int, int, int, int]] = []
+    cursor = 0
+    for line in range(end_line, section_ceiling + 1):
+        if line > end_line:
+            try:
+                gap = (
+                    float(segments[line].get("start", 0.0))
+                    - float(segments[line - 1].get("end", 0.0))
+                )
+            except (TypeError, ValueError, OverflowError):
+                break
+            if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+                break
+        source = str(segments[line].get("text") or "")
+        source_left = end_span[1] if line == end_line and end_span else 0
+        piece = source[source_left:]
+        if parts:
+            parts.append(" ")
+            cursor += 1
+        joined_left = cursor
+        parts.append(piece)
+        cursor += len(piece)
+        line_ranges.append((
+            line,
+            joined_left,
+            cursor,
+            source_left,
+            len(source),
+        ))
+    joined = "".join(parts)
+    if not _WORD_RE.search(joined):
+        return None, True
+    reset_positions = [
+        reset.start()
+        for pattern in (
+            _HARD_TOPIC_RESET_RE,
+            _TRUSTED_FORWARD_WORKED_HANDOFF_RE,
+            _TRUSTED_FRESH_EXAMPLE_RE,
+            _TRUSTED_STRONG_FRESH_WORKED_RESET_RE,
+        )
+        for reset in pattern.finditer(joined)
+    ]
+    completion_limit = min(reset_positions, default=len(joined))
+    result_end = result_right(joined[:completion_limit])
+    if result_end is None:
+        return None, True
+    mapped_result = next(
+        (
+            (line, source_left + result_end - joined_left)
+            for line, joined_left, joined_right, source_left, _source_right
+            in line_ranges
+            if joined_left < result_end <= joined_right
+        ),
+        None,
+    )
+    if mapped_result is None:
+        return None, True
+    result_line, result_source_right = mapped_result
+    last_line = result_line
+    last_source_right = result_source_right
+    for line, joined_left, joined_right, source_left, source_right in line_ranges:
+        if line < result_line or joined_left >= completion_limit:
+            continue
+        retained_joined_right = min(joined_right, completion_limit)
+        retained_source_right = source_left + retained_joined_right - joined_left
+        source = str(segments[line].get("text") or "")
+        piece = source[source_left:retained_source_right]
+        if line == result_line:
+            last_source_right = max(last_source_right, retained_source_right)
+            continue
+        previous = str(segments[line - 1].get("text") or "")
+        related = bool(
+            identity_tokens & _content_tokens(piece)
+            or _TRUSTED_WORKED_CLOSING_CONTEXT_RE.search(piece)
+            or _cue_has_weak_end(
+                previous,
+                source,
+                ignore_caption_case=True,
+            )
+        )
+        if not related:
+            break
+        last_line = line
+        last_source_right = retained_source_right
+
+    source = str(segments[last_line].get("text") or "")
+    retained_source = source[:last_source_right].rstrip()
+    complete = _last_safe_complete_prefix(retained_source)
+    if complete:
+        last_source_right = len(complete)
+        retained_source = complete
+    elif last_line == result_line:
+        last_source_right = result_source_right
+        retained_source = source[:last_source_right].rstrip()
+    words = list(_WORD_RE.finditer(retained_source))
+    if not words:
+        return None, True
+    quote_left = words[max(0, len(words) - 6)].start()
+    quote = retained_source[quote_left:]
+    if (last_line, last_source_right) <= (
+        end_line,
+        end_span[1] if end_span is not None else len(str(
+            segments[end_line].get("text") or ""
+        )),
+    ):
+        return None, True
+    return (last_line, (quote_left, last_source_right), quote), True
+
+
 def _trusted_relational_sentence_before_claim(
     segments: list[dict],
     *,
@@ -13107,6 +13455,9 @@ def _trusted_claim_sentence_start(
             or _WORD_RE.search(joined[sentence_span[0]:onset_left]) is not None
             or not (onset_right <= claim_start < claim_end <= sentence_span[1])
         ):
+            continue
+        claim_body = joined[frame.end():sentence_span[1]]
+        if _opening_has_unresolved_setup_reference(claim_body):
             continue
 
         onset_line = next(
@@ -15361,6 +15712,9 @@ def _trusted_universal_compact_plan_to_report(
                     ignore_caption_case=True,
                 )
             )
+            or _TRUSTED_BARE_DEMONSTRATIVE_PREDICATE_OPENING_RE.match(
+                clip_text
+            )
         )
         claim_location = (
             _unique_evidence_location(
@@ -15372,8 +15726,116 @@ def _trusted_universal_compact_plan_to_report(
             if raw_model_claim_quote
             else None
         )
-        named_handoff_applied = False
-        if current_start_is_clipped and claim_location is not None:
+        trusted_start_applied = False
+        if (
+            current_start_is_clipped
+            and start_span is not None
+            and _TRUSTED_BARE_DEMONSTRATIVE_PREDICATE_OPENING_RE.match(
+                clip_text
+            )
+            is None
+            and any(
+                handoff.group("teaching_setup") is not None
+                for handoff in _TRUSTED_CLAIM_SETUP_HANDOFF_RE.finditer(
+                    current_source,
+                    0,
+                    current_left,
+                )
+            )
+        ):
+            following_selected = ""
+            if a < b:
+                following_selected, _following_spans = _semantic_clip_slice(
+                    segments,
+                    a + 1,
+                    b,
+                    start_span=None,
+                    end_span=end_span,
+                )
+            recovered_quote = _recover_projected_start_within_cue(
+                current_source,
+                start_span,
+                evidence_quote=raw_model_claim_quote,
+                learning_objective=" ".join(str(value or "") for value in (
+                    proposal.title,
+                    proposal.learning_objective,
+                    proposal.facet,
+                    raw_model_claim_quote,
+                )),
+                following_text=following_selected,
+            )
+            recovered_span = (
+                _quote_character_span(current_source, recovered_quote)
+                if recovered_quote
+                else None
+            )
+            if (
+                recovered_span is not None
+                and recovered_span[0] < current_left
+            ):
+                candidate_text, candidate_spans = _semantic_clip_slice(
+                    segments,
+                    a,
+                    b,
+                    start_span=recovered_span,
+                    end_span=end_span,
+                )
+                if all(
+                    _contains_quote(candidate_text, quote)
+                    for quote in protected_quotes
+                ):
+                    start_span = recovered_span
+                    clip_text = candidate_text
+                    semantic_spans_by_cue = candidate_spans
+                    diagnostics.append(
+                        "recovered_projected_local_teaching_setup"
+                    )
+                    trusted_start_applied = True
+
+        if (
+            not trusted_start_applied
+            and current_start_is_clipped
+            and claim_location is not None
+            and _TRUSTED_BARE_DEMONSTRATIVE_PREDICATE_OPENING_RE.match(
+                clip_text
+            )
+        ):
+            claim_sentence_start = _trusted_claim_sentence_start(
+                segments,
+                selected_line=a,
+                claim_location=claim_location,
+                allowed_frame="note",
+            )
+            if (
+                claim_sentence_start is not None
+                and (claim_sentence_start[0], claim_sentence_start[1][0])
+                > (a, current_left)
+            ):
+                candidate_a, candidate_start_span = claim_sentence_start
+                candidate_text, candidate_spans = _semantic_clip_slice(
+                    segments,
+                    candidate_a,
+                    b,
+                    start_span=candidate_start_span,
+                    end_span=end_span,
+                )
+                if all(
+                    _contains_quote(candidate_text, quote)
+                    for quote in protected_quotes
+                ):
+                    a, start_span = candidate_a, candidate_start_span
+                    clip_text = candidate_text
+                    semantic_spans_by_cue = candidate_spans
+                    diagnostics.append(
+                        "advanced_anaphoric_start_to_claim_sentence"
+                    )
+                    trusted_start_applied = True
+
+        if (
+            not trusted_start_applied
+            and current_start_is_clipped
+            and claim_location is not None
+        ):
             named_handoff = _trusted_named_teaching_handoff_start(
                 segments,
                 search_start_line=a,
@@ -15390,10 +15852,6 @@ def _trusted_universal_compact_plan_to_report(
             )
             if (
                 named_handoff is not None
-                and not any(
-                    _opening_has_unresolved_setup_reference(quote)
-                    for quote in protected_quotes
-                )
                 and not _trusted_handoff_drops_protected_definition(
                     segments,
                     selected_line=a,
@@ -15428,9 +15886,9 @@ def _trusted_universal_compact_plan_to_report(
                     diagnostics.append(
                         "advanced_clipped_start_to_named_handoff"
                     )
-                    named_handoff_applied = True
+                    trusted_start_applied = True
 
-        if named_handoff_applied:
+        if trusted_start_applied:
             repaired_a, repaired_start_span, start_diagnostics = (
                 a,
                 start_span,
@@ -15496,6 +15954,70 @@ def _trusted_universal_compact_plan_to_report(
                 end_span=end_span,
             )
 
+        structural_end = _trusted_universal_structural_tail_end(
+            segments,
+            start_line=a,
+            start_span=start_span,
+            end_line=b,
+            end_span=end_span,
+            protected_quotes=protected_quotes,
+        )
+        if structural_end is not None:
+            candidate_b, candidate_end_span = structural_end
+            candidate_text, candidate_spans = _semantic_clip_slice(
+                segments,
+                a,
+                candidate_b,
+                start_span=start_span,
+                end_span=candidate_end_span,
+            )
+            if all(
+                _contains_quote(candidate_text, quote)
+                for quote in protected_quotes
+            ):
+                b, end_span = candidate_b, candidate_end_span
+                clip_text = candidate_text
+                semantic_spans_by_cue = candidate_spans
+                diagnostics.append(
+                    "trimmed_terminal_structural_navigation"
+                )
+
+        pending_end, pending_target = _trusted_pending_worked_target_end(
+            segments,
+            start_line=a,
+            start_span=start_span,
+            end_line=b,
+            end_span=end_span,
+            scope_text=" ".join(str(value or "") for value in (
+                proposal.title,
+                proposal.learning_objective,
+                proposal.facet,
+                raw_model_claim_quote,
+            )),
+        )
+        if pending_end is not None:
+            candidate_b, candidate_end_span, _candidate_quote = pending_end
+            candidate_text, candidate_spans = _semantic_clip_slice(
+                segments,
+                a,
+                candidate_b,
+                start_span=start_span,
+                end_span=candidate_end_span,
+            )
+            if all(
+                _contains_quote(candidate_text, quote)
+                for quote in protected_quotes
+            ):
+                b, end_span = candidate_b, candidate_end_span
+                clip_text = candidate_text
+                semantic_spans_by_cue = candidate_spans
+                diagnostics.append("completed_pending_worked_target")
+            else:
+                diagnostics.append("unresolved_pending_worked_target")
+        elif pending_target:
+            diagnostics.append("unresolved_pending_worked_target")
+
+        end_source = str(segments[b].get("text") or "")
         end_right = end_span[1] if end_span is not None else len(end_source)
         same_cue_following = end_source[end_right:]
         following_text = (
@@ -15609,7 +16131,7 @@ def _trusted_universal_compact_plan_to_report(
                 if complete_quote and starts_fresh_unit
                 else None
             )
-            if complete_anchor is not None:
+            if trimmed_end is None and complete_anchor is not None:
                 candidate_b = complete_anchor.last_line
                 candidate_end_span = complete_anchor.last_span
                 candidate_text, _candidate_spans = _semantic_clip_slice(

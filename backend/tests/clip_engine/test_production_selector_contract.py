@@ -1681,6 +1681,79 @@ def test_trusted_live_proportionality_predicate_expands_to_spoken_equation() -> 
     )
 
 
+def test_trusted_universal_start_advances_anaphor_to_grounded_claim_frame() -> None:
+    raw_cues = [
+        (33, 94.259, 96.93, "that must be applied in order for the"),
+        (34, 96.93, 100.17, "math to work out. This also means that"),
+        (35, 100.17, 102.99, "the second law can be rephrased to state"),
+        (36, 102.99, 104.88, "that the acceleration an object"),
+        (37, 104.88, 107.189, "experiences will be directly"),
+        (38, 107.189, 110.25, "proportional to the force applied and"),
+        (39, 110.25, 114.149, "inversely proportional to its mass. It is"),
+        (40, 114.149, 116.67, "important to note that the net force is"),
+        (41, 116.67, 119.28, "the sum of all the forces acting on an"),
+        (42, 119.28, 122.28, "object. If multiple forces are acting on"),
+        (43, 122.28, 124.68, "an object, which is often the case, we"),
+        (44, 124.68, 126.63, "will need to represent them all in a"),
+        (45, 126.63, 129.569, "free body diagram and then add up all"),
+        (46, 129.569, 132.81, "the vectors to find the net force, which"),
+        (47, 132.81, 133.49, "will tell us"),
+        (48, 133.49, 135.71, "the direction of the acceleration that"),
+        (49, 135.71, 138.23, "will occur in response to the net force."),
+    ]
+    segments = [
+        {
+            "cue_id": f"xzA6IBWUEDE:cue:{cue}",
+            "start": start,
+            "end": end,
+            "text": text,
+        }
+        for cue, start, end, text in raw_cues
+    ]
+    claim = "the net force is the sum of all the forces acting"
+    plan = _compact_custom_plan(
+        request="calculate net force using vector addition",
+        start_quote="This also means that",
+        end_quote="will occur in response to the net force",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": len(segments) - 1,
+            "title": "Understanding Net Force",
+            "learning_objective": (
+                "Explain how to calculate net force using vector addition."
+            ),
+            "facet": "net force vectors",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "xzA6IBWUEDE:cue:39"
+    assert clip["_clip_text"].startswith(
+        "It is important to note that the net force is"
+    )
+    assert "This also means that" not in clip["_clip_text"]
+    assert claim in clip["_clip_text"]
+    assert "advanced_anaphoric_start_to_claim_sentence" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
 def test_trusted_predicate_context_never_crosses_topic_reset_for_old_equation() -> None:
     segments = [
         {
@@ -7519,7 +7592,7 @@ def test_trusted_candidate_does_not_widen_clean_unit_to_prior_scenario() -> None
     assert "scenario A" not in clip["_clip_text"]
 
 
-def test_trusted_candidate_preserves_complete_model_end_even_when_broad() -> None:
+def test_trusted_universal_end_trims_complete_next_problem_tail() -> None:
     text = (
         "For part b, the acceleration is negative 0.75 meters per second squared. "
         "The tension is 452.5 newtons, so it is less than the weight force "
@@ -7539,16 +7612,402 @@ def test_trusted_candidate_preserves_complete_model_end_even_when_broad() -> Non
         plan,
         [{"cue_id": "cue-0", "start": 0.0, "end": 40.0, "text": text}],
         [],
-        {"_segment_trust_gemini_semantics": True},
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
         topic=plan.request_intent.exact_request,
     )
 
     assert report.accepted_count == report.proposed_count == 1
     assert report.rejected_reasons == []
     [clip] = report.clips
-    assert clip["_clip_text"].endswith("whatever you want to call it")
-    assert "work on this problem" in clip["_clip_text"]
-    assert "trimmed_trailing_edge_noise" not in (
+    assert clip["_clip_text"].endswith("during downward acceleration")
+    assert "work on this problem" not in clip["_clip_text"]
+    assert "trimmed_terminal_structural_navigation" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_end_never_trims_navigation_before_terminal_cue(
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 7.0,
+            "text": (
+                "The final acceleration is five meters per second squared. "
+                "Now let us work through this problem."
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 7.0,
+            "end": 15.0,
+            "text": (
+                "A car changes velocity by ten meters per second over two "
+                "seconds, so its acceleration is five meters per second squared."
+            ),
+        },
+    ]
+    claim = "The final acceleration is five meters per second squared"
+    plan = _compact_custom_plan(
+        request="acceleration result and worked example",
+        start_quote=claim,
+        end_quote="its acceleration is five meters per second squared",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "end_line": 1,
+            "title": "Acceleration result and worked example",
+            "learning_objective": (
+                "Explain the result and apply it in a worked example."
+            ),
+            "facet": "acceleration worked example",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-0", "cue-1"]
+    assert clip["_clip_text"].endswith(
+        "its acceleration is five meters per second squared"
+    )
+    assert "trimmed_terminal_structural_navigation" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_start_never_advances_to_unresolved_claim_reference(
+) -> None:
+    text = (
+        "This means the estimator is biased. It is important to note that "
+        "this result only holds for small samples."
+    )
+    claim = "this result only holds for small samples"
+    plan = _compact_custom_plan(
+        request="estimator bias caveat",
+        start_quote="This means the estimator is biased",
+        end_quote="only holds for small samples",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "title": "Estimator bias caveat",
+            "learning_objective": "Explain the estimator bias caveat.",
+            "facet": "estimator bias",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-1", "start": 4.0, "end": 12.0, "text": text}],
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith("This means the estimator is biased")
+    assert "advanced_anaphoric_start_to_claim_sentence" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_end_finishes_pending_worked_target() -> None:
+    segments = [
+        {
+            "cue_id": "pL2YfC-22Uc:cue:90",
+            "start": 3282.839,
+            "end": 3327.04,
+            "text": (
+                "Now, let's get back to tension. Suppose two blocks are "
+                "connected by a rope and a force of 60 newtons pulls right. "
+                "The masses are 10 and 20 kilograms. What is the tension force "
+                "in this rope? What is the"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:91",
+            "start": 3328.92,
+            "end": 3378.16,
+            "text": (
+                "answer? Now to find the tension force in a rope, we need to "
+                "find the net acceleration of the system. Treat the objects as "
+                "one mass of 30 kg. Using F equals m a, the net force is 60 "
+                "newtons and the net acceleration is 2 m/s squared."
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:92",
+            "start": 3373.96,
+            "end": 3398.72,
+            "text": (
+                "Because the blocks are attached by rope, both accelerate at "
+                "the same rate and move at the same speed along this horizontal "
+                "surface. Now let's focus on the 20 kilogram block. Let's isolate"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:93",
+            "start": 3402.2,
+            "end": 3451.76,
+            "text": (
+                "it. The 20 kilogram block feels 60 newtons to the right and a "
+                "tension force to the left. How can we write its net-force equation?"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:94",
+            "start": 3448.839,
+            "end": 3481.52,
+            "text": (
+                "The net force is the applied force minus the tension force. "
+                "Mass times acceleration is 20 times 2, or 40 newtons."
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:95",
+            "start": 3485.319,
+            "end": 3535.839,
+            "text": (
+                "So therefore the tension has to be 20 newtons. The same "
+                "tension pulls the 10 kilogram object to the right."
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:96",
+            "start": 3532.88,
+            "end": 3554.2,
+            "text": (
+                "Everything works out. The block feels 60 newtons right and "
+                "20 newtons of tension left, leaving 40 newtons net force."
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:97",
+            "start": 3562.079,
+            "end": 3567.04,
+            "text": "This time, let's say if there are three blocks.",
+        },
+    ]
+    claim = "the net acceleration is 2 m/s squared"
+    plan = _compact_custom_plan(
+        request="worked examples using force mass and acceleration",
+        start_quote="Suppose two blocks are connected by a rope",
+        end_quote="same speed along this horizontal surface",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 0,
+            "end_line": 2,
+            "title": "Finding Net Acceleration of a System",
+            "learning_objective": (
+                "Apply Newton's second law to find a system's acceleration."
+            ),
+            "facet": "net acceleration calculation",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["end_cue_id"] == "pL2YfC-22Uc:cue:96"
+    assert "the tension has to be 20 newtons" in clip["_clip_text"]
+    assert "20 newtons of tension left" in clip["_clip_text"]
+    assert "three blocks" not in clip["_clip_text"]
+    assert claim in clip["_clip_text"]
+    assert "completed_pending_worked_target" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_end_keeps_unresolved_pending_target() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "To determine the contract price, we first need to calculate "
+                "the hourly labor cost. The labor cost is 80 dollars."
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 8.0,
+            "end": 14.0,
+            "text": "Now let us discuss an unrelated warranty topic.",
+        },
+    ]
+    claim = "The labor cost is 80 dollars"
+    plan = _compact_custom_plan(
+        request="worked contract calculation",
+        start_quote="To determine the contract price",
+        end_quote="labor cost is 80 dollars",
+        claim_quote=claim,
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-0"]
+    assert "warranty" not in clip["_clip_text"]
+    assert "unresolved_pending_worked_target" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_end_does_not_confuse_target_modifier_with_head(
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "To determine the final contract price, we first need to "
+                "calculate the hourly labor cost. The labor cost is 80 dollars."
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 8.0,
+            "end": 12.0,
+            "text": "The contract duration is 10 years.",
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 12.0,
+            "end": 17.0,
+            "text": "Multiplying by the billed hours gives five hundred dollars.",
+        },
+    ]
+    claim = "The labor cost is 80 dollars"
+    plan = _compact_custom_plan(
+        request="worked contract price calculation",
+        start_quote="To determine the final contract price",
+        end_quote="labor cost is 80 dollars",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "title": "Worked contract price calculation",
+            "learning_objective": "Calculate the final contract price.",
+            "facet": "contract price calculation",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-0"]
+    assert "contract duration" not in clip["_clip_text"]
+    assert "completed_pending_worked_target" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+    assert "unresolved_pending_worked_target" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_end_does_not_extend_resolved_worked_target() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 10.0,
+            "text": (
+                "To determine the contract price, we first need to calculate "
+                "the hourly labor cost. The labor cost is 80 dollars, and the "
+                "contract price equals 500 dollars."
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 10.0,
+            "end": 15.0,
+            "text": "The warranty is an unrelated issue.",
+        },
+    ]
+    claim = "the contract price equals 500 dollars"
+    plan = _compact_custom_plan(
+        request="worked contract calculation",
+        start_quote="To determine the contract price",
+        end_quote="contract price equals 500 dollars",
+        claim_quote=claim,
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-0"]
+    assert "warranty" not in clip["_clip_text"]
+    assert "pending_worked_target" not in " ".join(
         clip["_boundary_fallback_reasons"]
     )
 
@@ -8053,6 +8512,274 @@ def test_trusted_universal_start_advances_to_named_teaching_handoff() -> None:
     assert "going to be relatively easy to move" not in clip["_clip_text"]
     assert "Force is equal to mass time acceleration" in clip["_clip_text"]
     assert "advanced_clipped_start_to_named_handoff" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_start_skips_a_complete_prior_sibling_law() -> None:
+    segments = [
+        {
+            "cue_id": "pL2YfC-22Uc:cue:1",
+            "start": 47.079,
+            "end": 85.32,
+            "text": (
+                "An object in space that is not acted on by any forces will "
+                "just keep on"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:2",
+            "start": 83.52,
+            "end": 95.52,
+            "text": (
+                "moving in a straight path. And so, that's the main idea behind "
+                "Newton's first law of motion. An object in motion will continue "
+                "in motion unless acted on by"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:3",
+            "start": 98.84,
+            "end": 149.84,
+            "text": (
+                "force. Newton's first law of motion is also known as the law of "
+                "inertia. Inertia is the tendency of an object to maintain its "
+                "state of rest or uniform motion. If we apply a force to the "
+                "smaller object, it's"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:4",
+            "start": 147.36,
+            "end": 181.04,
+            "text": (
+                "going to be relatively easy to move. The larger object is "
+                "harder to move because it has more inertia. And so that's the "
+                "main idea behind inertia."
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:5",
+            "start": 179.599,
+            "end": 186.08,
+            "text": (
+                "Now the next law that you need to be familiar with is "
+                "Newton's second"
+            ),
+        },
+        {
+            "cue_id": "pL2YfC-22Uc:cue:6",
+            "start": 188.519,
+            "end": 246.56,
+            "text": (
+                "law. Newton's second law is basically this equation. Force is "
+                "equal to mass time acceleration. And this of course is the net "
+                "force. A newton is equivalent to one kilogram times a meter "
+                "over second squ."
+            ),
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="Newton's second law F equals ma",
+        start_quote="moving in a straight path. And",
+        end_quote="times a meter over second squ",
+        claim_quote="Force is equal to mass time acceleration",
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 5,
+            "title": "Newton's Second Law and Force Units",
+            "learning_objective": (
+                "Explain Newton's second law, net force, mass, acceleration, "
+                "and force units."
+            ),
+            "facet": "Newton's second law definition and units",
+            "intent_evidence": [
+                gemini_segment._CompactIntentEvidence(
+                    id="subject",
+                    q="Force is equal to mass time acceleration",
+                ),
+                gemini_segment._CompactIntentEvidence(
+                    id="net_force",
+                    q="And this of course is the net force",
+                ),
+                gemini_segment._CompactIntentEvidence(
+                    id="units",
+                    q="A newton is equivalent to one kilogram times",
+                ),
+            ],
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "pL2YfC-22Uc:cue:5"
+    assert clip["_clip_text"].startswith(
+        "Now the next law that you need to be familiar with is Newton's second"
+    )
+    assert "Newton's first law" not in clip["_clip_text"]
+    assert "Force is equal to mass time acceleration" in clip["_clip_text"]
+    assert "advanced_clipped_start_to_named_handoff" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_start_recovers_local_teaching_setup() -> None:
+    segments = [
+        {
+            "cue_id": "Jyiw6KkedDY:cue:1",
+            "start": 31.08,
+            "end": 63.27,
+            "text": (
+                "Velocity is a lot like speed except for one important "
+                "difference: it has a direction attached to it."
+            ),
+        },
+        {
+            "cue_id": "Jyiw6KkedDY:cue:2",
+            "start": 60.48,
+            "end": 95.729,
+            "text": (
+                "so while your speed may have been 72 miles per hour your "
+                "velocity was 72 miles per hour east there just has to be some "
+                "direction attached to the speed to make it a velocity with "
+                "that knowledge in hand you're now ready to understand "
+                "acceleration which is simply the rate at which velocity changes "
+                "it's represented as distance per time squared"
+            ),
+        },
+        {
+            "cue_id": "Jyiw6KkedDY:cue:3",
+            "start": 92.75,
+            "end": 128.97,
+            "text": (
+                "anytime you change your velocity you are accelerating that can "
+                "be speeding up or slowing down or changing direction"
+            ),
+        },
+    ]
+    claim = "anytime you change your velocity you are accelerating"
+    plan = _compact_custom_plan(
+        request="acceleration intuition",
+        start_quote="acceleration which is simply the rate",
+        end_quote="slowing down or changing direction",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 2,
+            "title": "Intuition for Acceleration",
+            "learning_objective": (
+                "Explain acceleration as a change in velocity."
+            ),
+            "facet": "acceleration intuition",
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_cue_id"] == "Jyiw6KkedDY:cue:2"
+    assert clip["_clip_text"].startswith(
+        "you're now ready to understand acceleration"
+    )
+    assert "72 miles per hour" not in clip["_clip_text"]
+    assert claim in clip["_clip_text"]
+    assert "recovered_projected_local_teaching_setup" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_start_does_not_rewind_complete_definition() -> None:
+    text = (
+        "A cache stores reusable values. Memoization which caches a function "
+        "result can avoid repeated computation."
+    )
+    claim = "Memoization which caches a function result can avoid repeated computation"
+    plan = _compact_custom_plan(
+        request="memoization",
+        start_quote="Memoization which caches a function result",
+        end_quote="can avoid repeated computation",
+        claim_quote=claim,
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 9.0, "text": text}],
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith("Memoization which caches")
+    assert "A cache stores reusable values" not in clip["_clip_text"]
+
+
+def test_trusted_universal_start_recovers_cross_domain_teaching_setup() -> None:
+    text = (
+        "Offer and acceptance establish agreement with that knowledge in hand "
+        "you're now ready to understand consideration which is the bargained-for "
+        "exchange required for a contract. Consideration makes promises enforceable."
+    )
+    claim = "Consideration makes promises enforceable"
+    plan = _compact_custom_plan(
+        request="contract consideration",
+        start_quote="consideration which is the bargained-for exchange",
+        end_quote="Consideration makes promises enforceable",
+        claim_quote=claim,
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{"cue_id": "cue-0", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith(
+        "you're now ready to understand consideration"
+    )
+    assert "Offer and acceptance" not in clip["_clip_text"]
+    assert claim in clip["_clip_text"]
+    assert "recovered_projected_local_teaching_setup" in (
         clip["_boundary_fallback_reasons"]
     )
 
@@ -8840,6 +9567,230 @@ def test_trusted_universal_end_extends_protected_claim_to_completion() -> None:
     )
     assert plan.topics[0].claim_quote in clip["_clip_text"]
     assert "completed_unfinished_spoken_unit" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_end_trims_unpunctuated_navigation_before_dangling_tail(
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 244.56,
+            "end": 281.28,
+            "text": (
+                "so as the ball drops notice that the velocity is decreasing "
+                "by 9.8 every second so remember acceleration tells you how"
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 279.6,
+            "end": 316.8,
+            "text": (
+                "fast the velocity is changing every second now before we go "
+                "over a few free fall problems we need to talk about the "
+                "equations that you need to solve them so whenever an object "
+                "is moving with constant speed this is the equation that you "
+                "need to use d is equal to v t d can be used as distance or "
+                "displacement just remember distance is a scalar quantity "
+                "displacement is a vector so displacement can be positive or "
+                "negative but distance is always positive so anytime an object "
+                "is moving with"
+            ),
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 314.0,
+            "end": 353.919,
+            "text": (
+                "constant speed you can use this equation now when an object "
+                "is moving with constant acceleration you can use any one of "
+                "these four equations"
+            ),
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="acceleration due to gravity",
+        start_quote="so as the ball drops notice",
+        end_quote="anytime an object is moving with",
+        claim_quote="acceleration tells you how fast the velocity is changing",
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 0,
+            "end_line": 1,
+        })],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-0", "cue-1"]
+    assert clip["_clip_text"].endswith(
+        "fast the velocity is changing every second"
+    )
+    assert "before we go over" not in clip["_clip_text"]
+    assert "constant speed you can use this equation" not in clip["_clip_text"]
+    assert "trimmed_terminal_structural_navigation" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_end_keeps_navigation_containing_protected_evidence(
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "The warmup definition is complete. Now before we work through "
+                "examples we need to cover why net force equals mass times "
+                "acceleration and"
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 8.0,
+            "end": 13.0,
+            "text": "how this relation solves the requested problem.",
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="net force and acceleration",
+        start_quote="The warmup definition is complete",
+        end_quote="mass times acceleration and",
+        claim_quote="net force equals mass times acceleration",
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-0", "cue-1"]
+    assert clip["_clip_text"].endswith(
+        "how this relation solves the requested problem."
+    )
+    assert plan.topics[0].claim_quote in clip["_clip_text"]
+    assert "trimmed_terminal_structural_navigation" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_end_completes_same_unit_navigation() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "The acceleration calculation starts from zero net force now "
+                "before we work through this calculation we need to talk about "
+                "the next step because the result depends on"
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 8.0,
+            "end": 10.0,
+            "text": "net force.",
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="acceleration calculation",
+        start_quote="The acceleration calculation starts",
+        end_quote="because the result depends on",
+        claim_quote="acceleration calculation starts from zero net force",
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-0", "cue-1"]
+    assert clip["_clip_text"].endswith("the result depends on net force.")
+    assert "trimmed_terminal_structural_navigation" not in (
+        clip["_boundary_fallback_reasons"]
+    )
+    assert "completed_unfinished_spoken_unit" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
+def test_trusted_universal_end_never_trims_to_an_earlier_weak_edge() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 10.0,
+            "text": (
+                "Acceleration measures how velocity changes. The result depends "
+                "on the amount of now before we go over examples we need to talk "
+                "about equations so anytime an object is moving with"
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 10.0,
+            "end": 14.0,
+            "text": "constant speed you can use this equation.",
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="acceleration",
+        start_quote="Acceleration measures how velocity changes",
+        end_quote="anytime an object is moving with",
+        claim_quote="Acceleration measures how velocity changes",
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert not clip["_clip_text"].endswith("the amount of")
+    assert "trimmed_terminal_structural_navigation" not in (
         clip["_boundary_fallback_reasons"]
     )
 
@@ -9702,7 +10653,7 @@ def test_boundary_prompt_requires_cross_domain_subject_anchoring_and_context() -
     assert "the first word of sq and last word of eq are your proposed semantic edges" in normalized
     assert "one final transcript-only gemini audit" in normalized
     assert "do not rely on downstream code to fix an incomplete thought" in normalized
-    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v16"
+    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v17"
 
 
 @pytest.mark.parametrize(
