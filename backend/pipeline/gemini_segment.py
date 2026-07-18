@@ -31,6 +31,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     StringConstraints,
     ValidationError,
     field_validator,
@@ -1708,7 +1709,7 @@ _BOUNDARY_OUTPUT_TOKENS = 6_000
 _PRO_BOUNDARY_OUTPUT_TOKENS = 12_288
 # The final audit may return 40 decisions plus repaired edges, and high
 # thinking tokens count against the same provider output ceiling.
-_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS = 12_288
+_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS = 18_432
 # Calls cheap enough under a byte-per-token upper bound may use the local
 # estimate. Anything larger gets the provider's free exact count first, so two
 # Fast or three Slow selectors cannot collectively under-reserve past the job
@@ -1727,7 +1728,7 @@ _SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
 _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
-_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v4"
+_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v5"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
 
 _PRICING_VERSION = "gemini-standard-2026-07-11"
@@ -1956,6 +1957,9 @@ class _CompactBoundaryTopic(_StrictModel):
     """Token-efficient production schema; attributes retain canonical names."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    # Intentionally in-memory only: the final audit is converted immediately,
+    # before finalized clip dictionaries (not this model) enter the cache.
+    _pro_audit_start_authoritative: bool = PrivateAttr(default=False)
 
     candidate_id: _CompactCandidateId = Field(alias="id")
     start_line: int = Field(
@@ -2067,11 +2071,22 @@ class _ProAuditDecision(str, Enum):
     REJECT_FILLER_DOMINATED = "reject_filler_dominated"
 
 
+class _ProStartAction(str, Enum):
+    KEEP_CURRENT = "keep_current"
+    ADVANCE_PAST_PRIOR_UNIT = "advance_past_prior_unit"
+    EXPAND_FOR_CONTEXT = "expand_for_context"
+
+
 class _ProCandidateAuditItem(_StrictModel):
-    candidate_id: _NonBlank
+    candidate_id: _CompactCandidateId
     decision: _ProAuditDecision
-    actual_objective: _NonBlank
+    actual_objective: _CompactObjective
     evidence_quote: _CompactEvidenceQuote
+    opening_objective: _CompactObjective
+    opening_quote: _CompactBoundaryQuote
+    opening_matches_actual_objective: bool = Field(strict=True)
+    current_context_resolved: bool = Field(strict=True)
+    start_action: _ProStartAction
     start_line: int = Field(ge=0, strict=True)
     end_line: int = Field(ge=0, strict=True)
     start_quote: _CompactBoundaryQuote
@@ -3110,7 +3125,8 @@ def _pro_boundary_audit_prompts(
           "For every decision, actual_objective must context-completely name what the literal "
           "speech actually teaches—not a generic matching word. evidence_quote must be 5-16 "
           "exact consecutive words inside the candidate's ORIGINAL current sq-through-eq "
-          "semantic speech that prove that actual objective. For a rejection this quote must "
+          "semantic speech that prove that actual objective, and must occur exactly once "
+          "inside that original speech. For a rejection this quote must "
           "specifically ground the "
           "unrelated objective or filler dominance. The quote itself must identify the "
           "competing objective or unmistakable filler; if it is generic, depends on missing "
@@ -3152,6 +3168,36 @@ def _pro_boundary_audit_prompts(
           "Do not widen a complete opening merely for navigation such as 'Now here is another "
           "example.' Any repaired span must still contain the supplied cq claim and every "
           "non-scope ie intent quote from the original candidate.\n\n"
+          "REQUIRED START DIAGNOSTICS — output these fields for every candidate before "
+          "choosing returned edges:\n"
+          "1. actual_objective: name the context-complete objective of the best salvageable "
+          "unit grounded by the candidate's literal speech. Never redefine it to fit an "
+          "incorrect current opening.\n"
+          "2. opening_quote: copy 1-16 exact consecutive words beginning at the ORIGINAL "
+          "current sq first word. This diagnoses the current opening, not the repaired one.\n"
+          "3. opening_objective: context-completely name what the ORIGINAL opening discourse "
+          "actually teaches, finishes, or sets up. Base it on literal speech, not title, obj, "
+          "facet, cq, ie, or the eventual target.\n"
+          "4. opening_matches_actual_objective: true only when that opening is the actual "
+          "objective or indispensable setup for it. Shared terminology or useful background "
+          "is not a match. A completed prior law/example, the previous problem's answer, or "
+          "a disposable lead-in is false.\n"
+          "5. current_context_resolved: inspect the entire ORIGINAL current sq-through-eq "
+          "speech. Return true only when the opening is a complete sentence or independent "
+          "clause and every pronoun, demonstrative, ordinal, comparison baseline, named part, "
+          "scenario object, inherited given, and required prior result used by this unit is "
+          "defined inside that current span. A clipped predicate or sentence tail is false. "
+          "This field concerns missing spoken setup, not whether eq needs to be extended for "
+          "a conclusion.\n"
+          "6. start_action follows exactly: opening mismatch => advance_past_prior_unit; "
+          "opening match plus unresolved context => expand_for_context; opening match plus "
+          "resolved context => keep_current. advance_past_prior_unit must return a later sq at "
+          "the first complete target setup. expand_for_context must return an earlier sq at "
+          "the nearest necessary same-objective setup. keep_current must preserve the current "
+          "first semantic word. Repair eq independently.\n"
+          "For a rejected candidate, still diagnose the original opening literally, set "
+          "start_action=keep_current, and repeat its current boundaries exactly; rejection "
+          "does not grant boundary authority.\n\n"
           "MANDATORY WORD-EDGE CHECKLIST — apply every item to every KEEP candidate before "
           "returning it:\n"
           "1. Read current_selected_cues_focus literally from current sq through current eq. "
@@ -3160,10 +3206,10 @@ def _pro_boundary_audit_prompts(
           "completed earlier example, or mid-sentence fragment is never a valid cold start. "
           "If current sq has any of those forms, returning that same sq is invalid whenever "
           "the transcript contains a complete same-objective alternative.\n"
-          "3. Name internally (do not output) the objective completed by the opening speech "
-          "and the candidate's actual objective. If they differ, search forward for the first "
-          "explicit introduction/setup of the actual objective and move sq there while "
-          "preserving all protected cq/ie evidence. An explicit transition such as 'Now the "
+          "3. Use the required opening_objective comparison. If it differs from "
+          "actual_objective, search forward for the first explicit introduction/setup of the "
+          "actual objective and move sq there while preserving all protected cq/ie evidence. "
+          "An explicit transition such as 'Now the "
           "next law/rule/example is ...' is a hard semantic boundary: begin at that transition "
           "for the new objective, never at the completed prior law/rule/example merely because "
           "it shares variables or background.\n"
@@ -3184,16 +3230,23 @@ def _pro_boundary_audit_prompts(
           "Universal edge examples: If a coarse cue says 'the prior answer is forty two. "
           "Here is a new problem: a tank contains five liters ...', a candidate about the tank "
           "starts at 'Here is a new problem' (or its first necessary scenario word), not at "
-          "'the prior answer' or 'forty two'. If a candidate says 'these endpoints have the "
+          "'the prior answer' or 'forty two'; its diagnostic is "
+          "opening_matches_actual_objective=false and "
+          "start_action=advance_past_prior_unit. If a candidate says 'these endpoints have the "
           "largest response', it must include the nearest same-objective speech that defines "
-          "which endpoints; metadata cannot define them. Conversely, if a later case inherits "
+          "which endpoints; metadata cannot define them, so current_context_resolved=false "
+          "and start_action=expand_for_context. Conversely, if a later case inherits "
           "an object's givens from an immediately preceding case, retain that shared setup "
           "unless the later case restates it completely. If speech finishes Rule A and then "
           "says 'Now the next rule you need is Rule B,' a Rule-B candidate starts at 'Now the "
-          "next rule' even when Rule A shares terminology with Rule B. Conversely, a complete "
+          "next rule' even when Rule A shares terminology with Rule B; its diagnostic is "
+          "opening_matches_actual_objective=false and "
+          "start_action=advance_past_prior_unit. Conversely, a complete "
           "opening such as 'Acceleration is the rate at which velocity changes' does not need "
           "an earlier completed lesson defining velocity merely because velocity is a technical "
-          "term; that background can be its own candidate.\n\n"
+          "term; that background can be its own candidate, so "
+          "opening_matches_actual_objective=true, current_context_resolved=true, and "
+          "start_action=keep_current.\n\n"
           "Each candidate_id must equal its audit_id. start_line/end_line must be valid full-"
           "transcript IDs. start_quote/end_quote must each be the shortest unique 1-16 exact "
           "consecutive transcript words inside the returned inclusive range; their first/last "
@@ -16347,9 +16400,15 @@ def _trusted_universal_compact_plan_to_report(
             if raw_model_claim_quote
             else None
         )
-        trusted_start_applied = False
+        # A grounded final-Pro replacement already carries Gemini's explicit
+        # semantic comparison and start direction. Preserve that word edge;
+        # local context heuristics must not undo it by importing prior speech.
+        trusted_start_applied = proposal._pro_audit_start_authoritative
+        if trusted_start_applied:
+            diagnostics.append("preserved_pro_audited_start")
         if (
-            current_start_is_clipped
+            not trusted_start_applied
+            and current_start_is_clipped
             and start_span is not None
             and _TRUSTED_BARE_DEMONSTRATIVE_PREDICATE_OPENING_RE.match(
                 clip_text
@@ -16547,11 +16606,16 @@ def _trusted_universal_compact_plan_to_report(
             diagnostics.extend(start_diagnostics)
 
         structural_start_widened = False
-        for structural_start_repair in (
-            _trusted_universal_inherited_worked_start,
-            _trusted_universal_comparative_pair_start,
-            _trusted_universal_internal_reference_start,
-        ):
+        structural_start_repairs = (
+            ()
+            if proposal._pro_audit_start_authoritative
+            else (
+                _trusted_universal_inherited_worked_start,
+                _trusted_universal_comparative_pair_start,
+                _trusted_universal_internal_reference_start,
+            )
+        )
+        for structural_start_repair in structural_start_repairs:
             structural_start = structural_start_repair(
                 segments,
                 start_line=a,
@@ -16593,7 +16657,8 @@ def _trusted_universal_compact_plan_to_report(
         # present at Gemini's original edge. Re-run the same guarded advance
         # after widening so the repaired clip cannot open in the prior unit.
         if (
-            not structural_start_widened
+            not proposal._pro_audit_start_authoritative
+            and not structural_start_widened
             and claim_location is not None
             and _TRUSTED_BARE_DEMONSTRATIVE_PREDICATE_OPENING_RE.match(
                 clip_text
@@ -21217,6 +21282,8 @@ def _audit_pro_boundaries(
     rejected: dict[int, _ProAuditDecision] = {}
     returned_ids: set[str] = set()
     protected_boundary_failures = 0
+    start_diagnostic_failures = 0
+    audit_evidence_failures = 0
     for item in audit.items:
         audit_id = str(item.candidate_id)
         index = allowed.get(audit_id)
@@ -21287,6 +21354,36 @@ def _audit_pro_boundaries(
             # rejection is applied independently of the repeated edge fields.
             continue
 
+        audit_evidence_tokens = _toks(item.evidence_quote)
+        audit_evidence_anchor = (
+            _unique_boundary_anchor(
+                segments,
+                item.evidence_quote,
+                proposal.start_line,
+                proposal.end_line,
+                allow_timing_gaps=True,
+            )
+            if original_range_valid
+            and 5 <= len(audit_evidence_tokens) <= 16
+            else None
+        )
+        if not (
+            audit_evidence_anchor is not None
+            and (
+                not original_semantic_envelope_valid
+                or (
+                    original_start_anchor is not None
+                    and original_end_anchor is not None
+                    and original_start_anchor.first_word_position
+                    <= audit_evidence_anchor.first_word_position
+                    and audit_evidence_anchor.last_word_position
+                    <= original_end_anchor.last_word_position
+                )
+            )
+        ):
+            audit_evidence_failures += 1
+            continue
+
         if (
             item.start_line < 0
             or item.end_line >= len(segments)
@@ -21314,16 +21411,102 @@ def _audit_pro_boundaries(
         ):
             continue
 
-        protected_quotes = [str(proposal.claim_quote)]
+        # Gemini owns the semantic comparison. Locally enforce only that its
+        # explicit start diagnosis is grounded at the original opening and that
+        # its requested movement has the declared positional direction. Any
+        # inconsistency fails open to the untouched candidate.
+        # A malformed original envelope has no trustworthy position to compare;
+        # in that recovery case, accept any independently grounded returned
+        # edges below instead of blocking repair on an impossible diagnosis.
+        if original_semantic_envelope_valid:
+            opening_tokens = _toks(item.opening_quote)
+            opening_anchor = (
+                _unique_boundary_anchor(
+                    segments,
+                    item.opening_quote,
+                    proposal.start_line,
+                    proposal.end_line,
+                    allow_timing_gaps=True,
+                )
+                if 1 <= len(opening_tokens) <= 16
+                else None
+            )
+            expected_start_action = (
+                _ProStartAction.ADVANCE_PAST_PRIOR_UNIT
+                if not item.opening_matches_actual_objective
+                else (
+                    _ProStartAction.KEEP_CURRENT
+                    if item.current_context_resolved
+                    else _ProStartAction.EXPAND_FOR_CONTEXT
+                )
+            )
+            original_start_position = (
+                original_start_anchor.first_word_position
+                if original_start_anchor is not None
+                else None
+            )
+            action_position_valid = bool(
+                original_start_position is not None
+                and (
+                    (
+                        item.start_action is _ProStartAction.KEEP_CURRENT
+                        and start_anchor.first_word_position
+                        == original_start_position
+                    )
+                    or (
+                        item.start_action
+                        is _ProStartAction.ADVANCE_PAST_PRIOR_UNIT
+                        and start_anchor.first_word_position
+                        > original_start_position
+                    )
+                    or (
+                        item.start_action is _ProStartAction.EXPAND_FOR_CONTEXT
+                        and start_anchor.first_word_position
+                        < original_start_position
+                    )
+                )
+            )
+            if not (
+                opening_anchor is not None
+                and original_start_anchor is not None
+                and original_end_anchor is not None
+                and opening_anchor.first_word_position
+                == original_start_anchor.first_word_position
+                and opening_anchor.last_word_position
+                <= original_end_anchor.last_word_position
+                and item.start_action is expected_start_action
+                and action_position_valid
+            ):
+                start_diagnostic_failures += 1
+                continue
+
+        protected_quotes = [
+            str(proposal.claim_quote),
+            str(item.evidence_quote),
+        ]
         protected_quotes.extend(
             str(evidence.evidence_quote)
             for evidence in proposal.intent_evidence
             if constraint_kinds.get(str(evidence.constraint_id))
             is not _IntentConstraintKind.SCOPE
         )
+        protected_quotes = list(dict.fromkeys(protected_quotes))
+        returned_text, _returned_spans = _semantic_clip_slice(
+            segments,
+            start_anchor.first_line,
+            end_anchor.last_line,
+            start_span=start_anchor.first_span,
+            end_span=end_anchor.last_span,
+        )
+        if any(
+            not _contains_quote(returned_text, quote)
+            for quote in protected_quotes
+        ):
+            protected_boundary_failures += 1
+            continue
         protected_anchors = [
             anchor
-            for quote in dict.fromkeys(protected_quotes)
+            for quote in protected_quotes
             if original_semantic_envelope_valid
             and (
                 anchor := _unique_boundary_anchor(
@@ -21349,12 +21532,14 @@ def _audit_pro_boundaries(
             protected_boundary_failures += 1
             continue
 
-        replacements[index] = proposal.model_copy(update={
+        replacement = proposal.model_copy(update={
             "start_line": item.start_line,
             "end_line": item.end_line,
             "start_quote": item.start_quote,
             "end_quote": item.end_quote,
         })
+        replacement._pro_audit_start_authoritative = True
+        replacements[index] = replacement
 
     audited_topics = [
         replacements.get(index, topic_item)
@@ -21386,6 +21571,8 @@ def _audit_pro_boundaries(
             )
         ),
         protected_boundary_retained_count=protected_boundary_failures,
+        start_diagnostic_retained_count=start_diagnostic_failures,
+        audit_evidence_retained_count=audit_evidence_failures,
         rejected_count=len(rejected),
         rejected_unrelated_count=decision_counts[
             _ProAuditDecision.REJECT_UNRELATED.value

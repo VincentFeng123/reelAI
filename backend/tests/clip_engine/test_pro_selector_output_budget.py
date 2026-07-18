@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from types import SimpleNamespace
 
@@ -60,11 +61,32 @@ def _newton_audit_plan() -> gemini_segment._ProCandidateAuditPlan:
         "evidence_quote": (
             "net force on an object equals its mass times its acceleration"
         ),
+        "opening_objective": "Explain how net force, mass, and acceleration relate",
+        "opening_quote": "Newton's second law says that",
+        "opening_matches_actual_objective": True,
+        "current_context_resolved": True,
+        "start_action": "keep_current",
         "start_line": 0,
         "end_line": 0,
         "start_quote": "Newton's second law says that",
         "end_quote": "mass times its acceleration",
     }])
+
+
+def test_v5_audit_budget_fits_forty_items_plus_observed_high_thinking() -> None:
+    base = _newton_audit_plan().items[0]
+    audit = gemini_segment._ProCandidateAuditPlan(items=[
+        base.model_copy(update={"candidate_id": f"candidate-{index}"})
+        for index in range(1, 41)
+    ])
+    payload_bytes = len(audit.model_dump_json().encode("utf-8"))
+    conservative_candidate_tokens = math.ceil(payload_bytes / 2)
+
+    assert len(audit.items) == 40
+    assert (
+        conservative_candidate_tokens + _OBSERVED_PRO_THOUGHT_TOKENS
+        <= gemini_segment._PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS
+    )
 
 
 def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
@@ -188,7 +210,7 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     assert result.calls[0]["reserved_output_tokens"] == call["max_output_tokens"]
     assert audit_call["schema"] is gemini_segment._ProCandidateAuditPlan
     assert audit_call["operation"] == "pro_boundary_audit"
-    assert audit_call["prompt_version"] == "pro_candidate_audit_v4"
+    assert audit_call["prompt_version"] == "pro_candidate_audit_v5"
     assert audit_call["thinking_level"] == "high"
     assert audit_call["media_resolution"] is None
     assert gemini_segment._PRO_FINAL_AUDIT_RESERVED_S >= 60.0

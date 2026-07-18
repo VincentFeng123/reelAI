@@ -1897,7 +1897,7 @@ def test_trusted_live_net_force_complement_recovers_split_copula() -> None:
     )
 
 
-def test_pro_profile_rechecks_anaphor_exposed_by_context_repair(
+def test_pro_profile_preserves_audited_split_copula_repair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     segments = [
@@ -1947,9 +1947,14 @@ def test_pro_profile_rechecks_anaphor_exposed_by_context_repair(
         "decision": "keep",
         "actual_objective": "Define net force as the sum of forces",
         "evidence_quote": claim,
-        "start_line": 2,
+        "opening_objective": "Define net force as the sum of forces",
+        "opening_quote": "important to note that the net force",
+        "opening_matches_actual_objective": True,
+        "current_context_resolved": False,
+        "start_action": "expand_for_context",
+        "start_line": 1,
         "end_line": 3,
-        "start_quote": "important to note that the net force",
+        "start_quote": "It is",
         "end_quote": "all forces acting on an object",
     }])
     schemas: list[type] = []
@@ -12053,6 +12058,32 @@ def test_pro_schema_represents_sixteen_atomic_request_facets() -> None:
     assert "never bundle the members into one constraint" in user
 
 
+def _run_stubbed_pro_candidate_audit(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    plan: gemini_segment._CompactBoundaryPlan,
+    segments: list[dict],
+    item: dict,
+) -> tuple[gemini_segment._CompactBoundaryPlan, list[dict], list[str]]:
+    audit = gemini_segment._ProCandidateAuditPlan(items=[item])
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        lambda *_args, **_kwargs: (
+            audit,
+            {"model": "gemini-3.1-pro-preview", "operation": "pro_boundary_audit"},
+        ),
+    )
+    return gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        plan.request_intent.exact_request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+
 def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -12165,8 +12196,27 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
     )
     assert "never redefine the candidate's actual objective" in normalized
     assert "does not need an earlier completed lesson defining velocity" in normalized
+    assert "required start diagnostics" in normalized
+    assert "opening_quote: copy 1-16 exact consecutive words" in normalized
+    assert "beginning at the original current sq first word" in normalized
+    assert "opening_matches_actual_objective" in normalized
+    assert "current_context_resolved" in normalized
+    assert "opening mismatch => advance_past_prior_unit" in normalized
+    assert "opening match plus unresolved context => expand_for_context" in normalized
+    assert "opening match plus resolved context => keep_current" in normalized
+    audit_schema = gemini_segment._ProCandidateAuditPlan.model_json_schema()
+    audit_required = set(
+        audit_schema["$defs"]["_ProCandidateAuditItem"]["required"]
+    )
+    assert {
+        "opening_objective",
+        "opening_quote",
+        "opening_matches_actual_objective",
+        "current_context_resolved",
+        "start_action",
+    } <= audit_required
     assert gemini_segment._PRO_BOUNDARY_AUDIT_PROMPT_VERSION == (
-        "pro_candidate_audit_v4"
+        "pro_candidate_audit_v5"
     )
 
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
@@ -12174,6 +12224,11 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
         "decision": "keep",
         "actual_objective": "Explain why more mass means less acceleration for one force",
         "evidence_quote": "smaller person moves farther. And the larger person",
+        "opening_objective": "Compare two people's motion under the same force",
+        "opening_quote": "Both people experience the same force",
+        "opening_matches_actual_objective": True,
+        "current_context_resolved": True,
+        "start_action": "keep_current",
         "start_line": 0,
         "end_line": 1,
         "start_quote": "Both people experience the same force",
@@ -12220,6 +12275,493 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
     )
     assert retained == plan
     assert rejection_reasons == []
+
+
+def test_pro_candidate_audit_advances_past_completed_prior_lesson(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 83.52,
+            "end": 95.52,
+            "text": (
+                "moving in a straight path. And so, that's the main idea behind "
+                "Newton's first law of motion."
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 98.84,
+            "end": 149.84,
+            "text": (
+                "Newton's first law is also known as the law of inertia. Inertia is "
+                "the tendency of an object to maintain its state of motion."
+            ),
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 147.36,
+            "end": 181.04,
+            "text": "And so that's the main idea behind inertia.",
+        },
+        {
+            "cue_id": "cue-3",
+            "start": 179.599,
+            "end": 186.08,
+            "text": (
+                "Now the next law that you need to be familiar with is Newton's second"
+            ),
+        },
+        {
+            "cue_id": "cue-4",
+            "start": 188.519,
+            "end": 246.56,
+            "text": (
+                "law. Newton's second law is basically this equation. Force is equal "
+                "to mass time acceleration. And this of course is the net force."
+            ),
+        },
+    ]
+    claim = "Force is equal to mass time acceleration"
+    plan = _compact_custom_plan(
+        request="Newton's second law F equals ma",
+        start_quote="moving in a straight path. And",
+        end_quote="this of course is the net force",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 0,
+            "end_line": 4,
+            "title": "Newton's Second Law and Net Force",
+            "learning_objective": "Define Newton's second law and net force",
+            "facet": "Newton's second law",
+        })],
+    })
+
+    audited, _calls, rejections = _run_stubbed_pro_candidate_audit(
+        monkeypatch,
+        plan=plan,
+        segments=segments,
+        item={
+            "candidate_id": "candidate-1",
+            "decision": "keep",
+            "actual_objective": "Define Newton's second law and net force",
+            "evidence_quote": claim,
+            "opening_objective": "Finish Newton's first law and inertia lesson",
+            "opening_quote": "moving in a straight path. And",
+            "opening_matches_actual_objective": False,
+            "current_context_resolved": True,
+            "start_action": "advance_past_prior_unit",
+            "start_line": 3,
+            "end_line": 4,
+            "start_quote": "Now the next law that you need",
+            "end_quote": "this of course is the net force",
+        },
+    )
+
+    assert rejections == []
+    assert audited.topics[0].start_line == 3
+    assert audited.topics[0].start_quote == "Now the next law that you need"
+    report = gemini_segment._plan_to_report(
+        audited,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+    assert report.clips[0]["_clip_text"].startswith("Now the next law")
+    assert "Newton's first law" not in report.clips[0]["_clip_text"]
+
+
+def test_pro_candidate_audit_advances_past_prior_numeric_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 4405.88,
+            "end": 4447.719,
+            "text": (
+                "169.74 and you should get about 98 newtons. So that's how you can "
+                "calculate the tension forces for the previous block."
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 4446.159,
+            "end": 4503.679,
+            "text": (
+                "Here's a question for you. Let's say if you have two blocks, block A "
+                "and block B, with masses of 20 and 10 kilograms."
+            ),
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 4500.92,
+            "end": 4541.28,
+            "text": (
+                "The net force is equal to ma. The net force is 90 newtons and the "
+                "total mass is 30 kilograms."
+            ),
+        },
+        {
+            "cue_id": "cue-3",
+            "start": 4544.04,
+            "end": 4599.92,
+            "text": "So the acceleration of the system is 3 meters per second squared.",
+        },
+    ]
+    claim = "The net force is equal to ma"
+    plan = _compact_custom_plan(
+        request="Apply Newton's second law to a multi-block system",
+        start_quote="169.74 and you should get",
+        end_quote="system is 3 meters per second squared",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 0,
+            "end_line": 3,
+            "title": "Multi-block system",
+            "learning_objective": "Calculate a multi-block system's acceleration",
+            "facet": "net force and acceleration",
+        })],
+    })
+
+    audited, _calls, rejections = _run_stubbed_pro_candidate_audit(
+        monkeypatch,
+        plan=plan,
+        segments=segments,
+        item={
+            "candidate_id": "candidate-1",
+            "decision": "keep",
+            "actual_objective": "Calculate a multi-block system's acceleration",
+            "evidence_quote": claim,
+            "opening_objective": "Finish the previous rope-tension calculation",
+            "opening_quote": "169.74 and you should get",
+            "opening_matches_actual_objective": False,
+            "current_context_resolved": True,
+            "start_action": "advance_past_prior_unit",
+            "start_line": 1,
+            "end_line": 3,
+            "start_quote": "Here's a question for you",
+            "end_quote": "system is 3 meters per second squared",
+        },
+    )
+
+    assert rejections == []
+    assert audited.topics[0].start_line == 1
+    report = gemini_segment._plan_to_report(
+        audited,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+    assert report.clips[0]["_clip_text"].startswith("Here's a question for you")
+    assert "169.74" not in report.clips[0]["_clip_text"]
+    assert claim in report.clips[0]["_clip_text"]
+
+
+def test_pro_candidate_audit_expands_for_missing_referent_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "The oscillator's left and right turning points are its two endpoints."
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 8.0,
+            "end": 16.0,
+            "text": "The net force is equal to ma throughout this motion.",
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 16.0,
+            "end": 24.0,
+            "text": (
+                "At these endpoints the force and acceleration have their greatest magnitudes."
+            ),
+        },
+    ]
+    claim = "the force and acceleration have their greatest magnitudes"
+    plan = _compact_custom_plan(
+        request="Apply F equals ma to an oscillator's endpoints",
+        start_quote="The net force is equal to ma",
+        end_quote="acceleration have their greatest magnitudes",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 2,
+            "title": "Force at oscillator endpoints",
+            "learning_objective": "Relate force and acceleration at the endpoints",
+            "facet": "F equals ma application",
+        })],
+    })
+
+    audited, _calls, rejections = _run_stubbed_pro_candidate_audit(
+        monkeypatch,
+        plan=plan,
+        segments=segments,
+        item={
+            "candidate_id": "candidate-1",
+            "decision": "keep",
+            "actual_objective": "Relate force and acceleration at oscillator endpoints",
+            "evidence_quote": claim,
+            "opening_objective": "Relate net force and acceleration in the oscillator",
+            "opening_quote": "The net force is equal to ma",
+            "opening_matches_actual_objective": True,
+            "current_context_resolved": False,
+            "start_action": "expand_for_context",
+            "start_line": 0,
+            "end_line": 2,
+            "start_quote": "The oscillator's left and right turning points",
+            "end_quote": "acceleration have their greatest magnitudes",
+        },
+    )
+
+    assert rejections == []
+    assert audited.topics[0].start_line == 0
+    report = gemini_segment._plan_to_report(
+        audited,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+    assert report.clips[0]["_clip_text"].startswith("The oscillator's left")
+    assert "these endpoints" in report.clips[0]["_clip_text"]
+
+
+def test_pro_candidate_audit_keeps_clean_opening_without_prerequisite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": "Velocity describes speed together with a direction.",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 8.0,
+            "end": 16.0,
+            "text": (
+                "Acceleration is the rate at which velocity changes over time."
+            ),
+        },
+    ]
+    claim = "Acceleration is the rate at which velocity changes"
+    plan = _compact_custom_plan(
+        request="Explain acceleration",
+        start_quote="Acceleration is the rate at which velocity changes",
+        end_quote="velocity changes over time",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={
+            "start_line": 1,
+            "end_line": 1,
+            "title": "Acceleration",
+            "learning_objective": "Define acceleration",
+            "facet": "acceleration definition",
+        })],
+    })
+
+    audited, _calls, rejections = _run_stubbed_pro_candidate_audit(
+        monkeypatch,
+        plan=plan,
+        segments=segments,
+        item={
+            "candidate_id": "candidate-1",
+            "decision": "keep",
+            "actual_objective": "Define acceleration",
+            "evidence_quote": claim,
+            "opening_objective": "Define acceleration",
+            "opening_quote": "Acceleration is the rate at which velocity changes",
+            "opening_matches_actual_objective": True,
+            "current_context_resolved": True,
+            "start_action": "keep_current",
+            "start_line": 1,
+            "end_line": 1,
+            "start_quote": "Acceleration is the rate at which velocity changes",
+            "end_quote": "velocity changes over time",
+        },
+    )
+
+    assert rejections == []
+    assert audited.topics[0].start_line == plan.topics[0].start_line
+    assert audited.topics[0].start_quote == plan.topics[0].start_quote
+    for helper_name in (
+        "_trusted_universal_inherited_worked_start",
+        "_trusted_universal_comparative_pair_start",
+        "_trusted_universal_internal_reference_start",
+    ):
+        monkeypatch.setattr(
+            gemini_segment,
+            helper_name,
+            lambda *_args, _name=helper_name, **_kwargs: pytest.fail(
+                f"{_name} must not override a Pro-audited start"
+            ),
+        )
+    report = gemini_segment._plan_to_report(
+        audited,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+    assert report.clips[0]["cue_ids"] == ["cue-1"]
+
+
+@pytest.mark.parametrize(
+    ("opening_quote", "opening_matches", "context_resolved", "start_action"),
+    [
+        ("Newton's second law says", True, True, "keep_current"),
+        ("The prior lesson is complete", False, True, "keep_current"),
+        ("The prior lesson is complete", True, False, "advance_past_prior_unit"),
+    ],
+)
+def test_pro_candidate_audit_inconsistent_start_diagnostics_fail_open(
+    monkeypatch: pytest.MonkeyPatch,
+    opening_quote: str,
+    opening_matches: bool,
+    context_resolved: bool,
+    start_action: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": "The prior lesson is complete. Newton's second law says F equals ma.",
+        },
+    ]
+    claim = "Newton's second law says F equals ma"
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote="The prior lesson is complete",
+        end_quote="second law says F equals ma",
+        claim_quote=claim,
+    )
+
+    audited, _calls, rejections = _run_stubbed_pro_candidate_audit(
+        monkeypatch,
+        plan=plan,
+        segments=segments,
+        item={
+            "candidate_id": "candidate-1",
+            "decision": "keep",
+            "actual_objective": "Define Newton's second law",
+            "evidence_quote": claim,
+            "opening_objective": "Finish the prior lesson",
+            "opening_quote": opening_quote,
+            "opening_matches_actual_objective": opening_matches,
+            "current_context_resolved": context_resolved,
+            "start_action": start_action,
+            "start_line": 0,
+            "end_line": 0,
+            "start_quote": "Newton's second law says",
+            "end_quote": "second law says F equals ma",
+        },
+    )
+
+    assert audited == plan
+    assert rejections == []
+
+
+def test_pro_candidate_audit_grounding_failures_retain_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cases = [
+        {
+            "text": (
+                "Newton's second law says net force equals mass times acceleration."
+            ),
+            "claim": "second law says net force equals mass times acceleration",
+            "start_quote": "Newton's second law says",
+            "end_quote": "mass times acceleration",
+            "audit_evidence": "these hallucinated evidence words never appear here",
+            "opening_objective": "Define Newton's second law",
+            "opening_matches": True,
+            "start_action": "keep_current",
+            "returned_start": "Newton's second law says",
+        },
+        {
+            "text": (
+                "Opening required baseline defines the comparison. Required baseline "
+                "defines the comparison. The target equation explains the requested "
+                "relationship."
+            ),
+            "claim": "required baseline defines the comparison",
+            "start_quote": "Opening required baseline defines the comparison",
+            "end_quote": "explains the requested relationship",
+            "audit_evidence": "The target equation explains the requested relationship",
+            "opening_objective": "Finish a prior comparison baseline",
+            "opening_matches": False,
+            "start_action": "advance_past_prior_unit",
+            "returned_start": "The target equation explains",
+        },
+    ]
+    for case in cases:
+        segments = [{
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 12.0,
+            "text": case["text"],
+        }]
+        plan = _compact_custom_plan(
+            request="Explain the requested relationship",
+            start_quote=case["start_quote"],
+            end_quote=case["end_quote"],
+            claim_quote=case["claim"],
+        )
+        audited, _calls, rejections = _run_stubbed_pro_candidate_audit(
+            monkeypatch,
+            plan=plan,
+            segments=segments,
+            item={
+                "candidate_id": "candidate-1",
+                "decision": "keep",
+                "actual_objective": "Explain the requested relationship",
+                "evidence_quote": case["audit_evidence"],
+                "opening_objective": case["opening_objective"],
+                "opening_quote": case["start_quote"],
+                "opening_matches_actual_objective": case["opening_matches"],
+                "current_context_resolved": True,
+                "start_action": case["start_action"],
+                "start_line": 0,
+                "end_line": 0,
+                "start_quote": case["returned_start"],
+                "end_quote": case["end_quote"],
+            },
+        )
+
+        assert audited == plan
+        assert rejections == []
 
 
 def test_pro_boundary_audit_schema_failure_is_not_retried(
@@ -12308,6 +12850,11 @@ def test_pro_boundary_audit_can_repair_beyond_two_coarse_cues(
         "decision": "keep",
         "actual_objective": "Explain how evidence produces a Bayesian posterior",
         "evidence_quote": "Bayesian updating begins with a prior probability and then",
+        "opening_objective": "Explain how Bayesian updating begins from a prior",
+        "opening_quote": "Bayesian updating begins with a prior probability",
+        "opening_matches_actual_objective": True,
+        "current_context_resolved": True,
+        "start_action": "keep_current",
         "start_line": 0,
         "end_line": 5,
         "start_quote": "Bayesian updating begins with a prior probability",
@@ -12377,6 +12924,15 @@ def test_pro_candidate_audit_can_reject_only_grounded_unrelated_or_filler(
                 else "Ask viewers to subscribe to a channel"
             ),
             "evidence_quote": evidence,
+            "opening_objective": (
+                "Define momentum as mass times velocity"
+                if decision == "reject_unrelated"
+                else "Ask viewers to subscribe to a channel"
+            ),
+            "opening_quote": plan.topics[0].start_quote,
+            "opening_matches_actual_objective": True,
+            "current_context_resolved": True,
+            "start_action": "keep_current",
             "start_line": 0,
             "end_line": 0,
             "start_quote": plan.topics[0].start_quote,
@@ -12436,6 +12992,11 @@ def test_pro_candidate_audit_invalid_or_duplicate_rejection_retains_original(
         "decision": "reject_unrelated",
         "actual_objective": "Define momentum as mass times velocity",
         "evidence_quote": "Momentum equals mass times velocity in classical mechanics",
+        "opening_objective": "Define Newton's second law",
+        "opening_quote": plan.topics[0].start_quote,
+        "opening_matches_actual_objective": False,
+        "current_context_resolved": True,
+        "start_action": "keep_current",
         "start_line": 1,
         "end_line": 1,
         "start_quote": "Momentum equals mass times velocity",
@@ -12490,6 +13051,11 @@ def test_pro_candidate_audit_cannot_reject_from_unrelated_coarse_cue_tail(
         "decision": "reject_unrelated",
         "actual_objective": "Define momentum as mass times velocity",
         "evidence_quote": "momentum equals mass times velocity in classical mechanics",
+        "opening_objective": "Define Newton's second law",
+        "opening_quote": plan.topics[0].start_quote,
+        "opening_matches_actual_objective": False,
+        "current_context_resolved": True,
+        "start_action": "keep_current",
         "start_line": 0,
         "end_line": 0,
         "start_quote": plan.topics[0].start_quote,
@@ -12570,6 +13136,11 @@ def test_pro_candidate_audit_boundary_must_preserve_original_context_evidence(
         "decision": "keep",
         "actual_objective": "Explain how evidence updates a Bayesian posterior",
         "evidence_quote": "Posterior probability combines prior evidence with likelihood",
+        "opening_objective": "Establish Bayes theorem before calculation",
+        "opening_quote": "Necessary setup establishes Bayes theorem",
+        "opening_matches_actual_objective": False,
+        "current_context_resolved": True,
+        "start_action": "advance_past_prior_unit",
         "start_line": 0,
         "end_line": 0,
         "start_quote": "Posterior probability combines",
