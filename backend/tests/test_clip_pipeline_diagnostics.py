@@ -2959,8 +2959,8 @@ def test_live_acceleration_groq_places_repaired_gemini_start_on_exact_word(
     assert verified[0]["start"] == exact_start
     assert verified[0]["search_context"]["surface_eligible"] is True
     verify_audio.assert_called_once()
-    transcribe.assert_called_once()
-    request = transcribe.call_args.kwargs
+    assert transcribe.call_count == 3
+    request = transcribe.call_args_list[0].kwargs
     assert request["window_start_sec"] <= exact_start <= request["window_end_sec"]
     assert request["window_end_sec"] - request["window_start_sec"] == pytest.approx(
         pipeline_module.GROQ_BOUNDARY_WINDOW_SEC
@@ -2972,6 +2972,486 @@ def test_live_acceleration_groq_places_repaired_gemini_start_on_exact_word(
     assert projection["start"]["required_speech_sec"] == exact_start
     assert projection["start"]["timing_source"] == "groq_boundary_asr"
     assert projection["groq_boundary_asr"]["applied"] is True
+
+
+def test_direct_rolling_caption_conflict_runs_groq_and_keeps_exact_start(
+    monkeypatch,
+) -> None:
+    start_quote = "you're now ready to understand acceleration"
+    selected_text = (
+        "so while your speed may have been 72 miles per hour your velocity was "
+        "72 miles per hour east or 72 miles per hour towards the beach there "
+        "just has to be some direction attached to the speed to make it a "
+        "velocity with that knowledge in hand you're now ready to understand "
+        "acceleration which is simply the rate at which velocity changes it's "
+        "represented as distance per time per time or distance per time squared "
+        "for example meters per second squared are common units for acceleration"
+    )
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:rolling-acceleration-start",
+        "duration": 128.97,
+        "segments": [
+            {
+                "cue_id": "selected",
+                "start": 60.48,
+                "end": 95.729,
+                "text": selected_text,
+            },
+            {
+                "cue_id": "rolling-next",
+                "start": 92.75,
+                "end": 128.97,
+                "text": (
+                    "anytime you change your velocity you are accelerating that "
+                    "can be speeding up or slowing down"
+                ),
+            },
+        ],
+    }
+    clip = _quality_clip(
+        candidate_id="acceleration-definition",
+        cue_id="selected",
+        start=60.48,
+        end=95.729,
+        quote="meters per second squared are common units for acceleration",
+        selection_authority="gemini",
+        start_quote=start_quote,
+        end_quote="common units for acceleration",
+        edge_projection={
+            "start": {
+                "required": True,
+                "cue_id": "selected",
+                "quote": start_quote,
+            }
+        },
+    )
+    exact_start = 76.12
+    word = pipeline_module.clip_engine_silence.lexical_timing.LexicalWord
+    start_words = tuple(
+        word(text, onset)
+        for text, onset in (
+            ("hand", 75.86),
+            ("you're", exact_start),
+            ("now", 76.30),
+            ("ready", 76.52),
+            ("to", 76.68),
+            ("understand", 76.90),
+            ("acceleration", 77.28),
+            ("which", 77.52),
+        )
+    )
+    prepared = _ready_audio(duration_sec=128.97)
+    verify_audio = mock.Mock()
+    transcribe = mock.Mock(side_effect=[start_words, (), ()])
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify_audio,
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_groq_boundary_asr,
+        "transcribe_boundary_words",
+        transcribe,
+    )
+
+    verified = pipeline_module._verified_direct_adapter_clips(
+        source_url="https://www.youtube.com/watch?v=Jyiw6KkedDY",
+        engine_out={"clips": [clip], "transcript": transcript},
+        should_cancel=None,
+        prepared_audio=prepared,
+        require_acoustic_boundaries=True,
+        exact_topic="Newton's second law",
+    )
+
+    assert len(verified) == 1
+    assert verified[0]["selection_candidate_id"] == "acceleration-definition"
+    assert verified[0]["start"] == exact_start
+    assert verified[0]["end"] == 95.729
+    assert verified[0]["search_context"]["surface_eligible"] is True
+    projection = verified[0]["search_context"]["boundary_diagnostics"][
+        "lexical_projection"
+    ]
+    fallback = projection["context_fallback"]
+    assert fallback["reason"].startswith("partial_edge_fallback:")
+    assert fallback["retained_projected_edges"] == ["start"]
+    assert projection["start"]["timing_source"] == "groq_boundary_asr"
+    assert projection["groq_boundary_asr"]["applied"] is True
+    assert projection["groq_boundary_asr"]["edges"] == ["start"]
+    verify_audio.assert_not_called()
+    assert transcribe.call_count == 3
+
+
+def test_topic_ingestion_persists_projected_start_when_only_end_corridor_conflicts(
+    monkeypatch,
+) -> None:
+    start_quote = "you're now ready to understand acceleration"
+    selected_text = (
+        "so while your speed may have been 72 miles per hour your velocity was "
+        "72 miles per hour east or 72 miles per hour towards the beach there "
+        "just has to be some direction attached to the speed to make it a "
+        "velocity with that knowledge in hand you're now ready to understand "
+        "acceleration which is simply the rate at which velocity changes it's "
+        "represented as distance per time per time or distance per time squared "
+        "for example meters per second squared are common units for acceleration"
+    )
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:topic-rolling-acceleration",
+        "duration": 128.97,
+        "segments": [
+            {
+                "cue_id": "selected",
+                "start": 60.48,
+                "end": 95.729,
+                "text": selected_text,
+            },
+            {
+                "cue_id": "rolling-next",
+                "start": 92.75,
+                "end": 128.97,
+                "text": "The next acceleration example begins in this rolling caption.",
+            },
+        ],
+    }
+    clip = _quality_clip(
+        candidate_id="topic-acceleration-definition",
+        cue_id="selected",
+        start=60.48,
+        end=95.729,
+        quote="meters per second squared are common units for acceleration",
+        selection_authority="gemini",
+        start_quote=start_quote,
+        end_quote="common units for acceleration",
+        edge_projection={
+            "start": {
+                "required": True,
+                "cue_id": "selected",
+                "quote": start_quote,
+            }
+        },
+    )
+    exact_start = 76.12
+    word = pipeline_module.clip_engine_silence.lexical_timing.LexicalWord
+    start_words = tuple(
+        word(text, onset)
+        for text, onset in (
+            ("hand", 75.86),
+            ("you're", exact_start),
+            ("now", 76.30),
+            ("ready", 76.52),
+            ("to", 76.68),
+            ("understand", 76.90),
+            ("acceleration", 77.28),
+            ("which", 77.52),
+        )
+    )
+    prepared = _ready_audio(duration_sec=128.97)
+    verify_audio = mock.Mock()
+    transcribe = mock.Mock(side_effect=[start_words, (), ()])
+    groq_timeouts: list[float] = []
+    original_groq_refine = pipeline_module._groq_refine_without_silence
+
+    def track_groq_timeout(*args, **kwargs):
+        groq_timeouts.append(float(kwargs["timeout_sec"]))
+        return original_groq_refine(*args, **kwargs)
+
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "DEEP_PHASE_TIMEOUT_SEC",
+        0.25,
+    )
+    monkeypatch.setattr(pipeline_module, "GROQ_BOUNDARY_TIMEOUT_SEC", 1.0)
+    monkeypatch.setattr(
+        pipeline_module,
+        "_groq_refine_without_silence",
+        track_groq_timeout,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: _discovery(),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_clip",
+        lambda *_args, **_kwargs: {
+            "clips": [clip],
+            "transcript": transcript,
+            "notes": "",
+        },
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=prepared),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify_audio,
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_groq_boundary_asr,
+        "transcribe_boundary_words",
+        transcribe,
+    )
+    persisted: list[dict] = []
+    pipeline = _pipeline()
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        lambda *, clip, **_kwargs: (
+            persisted.append(clip) or "persisted-partial-start",
+            mock.sentinel.metadata,
+        ),
+    )
+    context = GenerationContext("fast", require_acoustic_boundaries=True)
+
+    reels, _ = pipeline.ingest_topic(
+        topic="acceleration",
+        material_id="material",
+        concept_id="concept",
+        generation_context=context,
+        retrieval_profile="deep",
+        max_videos=1,
+        max_reels=1,
+    )
+
+    assert reels == ["persisted-partial-start"]
+    assert len(persisted) == 1
+    assert persisted[0]["start"] == exact_start
+    assert persisted[0]["end"] == 95.729
+    boundary = persisted[0]["search_context"]
+    assert boundary["surface_eligible"] is True
+    projection = boundary["boundary_diagnostics"]["lexical_projection"]
+    fallback = projection["context_fallback"]
+    assert fallback["reason"].startswith("partial_edge_fallback:")
+    assert fallback["retained_projected_edges"] == ["start"]
+    assert projection["start"]["timing_source"] == "groq_boundary_asr"
+    assert projection["groq_boundary_asr"]["applied"] is True
+    assert projection["groq_boundary_asr"]["edges"] == ["start"]
+    verify_audio.assert_not_called()
+    assert transcribe.call_count == 3
+    assert len(groq_timeouts) == 1
+    assert 0.0 < groq_timeouts[0] <= 0.25
+    assert context.counters()["permanently_rejected_clips"] == 0
+
+
+def test_projected_end_survives_opposite_rolling_caption_conflict(
+    monkeypatch,
+) -> None:
+    selected_text = (
+        "Now solve the second law example carefully the final acceleration "
+        "equals force divided by mass and that closes the example"
+    )
+    end_quote = "the final acceleration equals force divided by mass"
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:rolling-acceleration-end",
+        "duration": 12.0,
+        "segments": [
+            {
+                "cue_id": "rolling-prior",
+                "start": 0.0,
+                "end": 4.25,
+                "text": "The prior rolling caption remains displayed briefly.",
+            },
+            {
+                "cue_id": "selected",
+                "start": 4.0,
+                "end": 12.0,
+                "text": selected_text,
+            },
+        ],
+    }
+    clip = _quality_clip(
+        candidate_id="acceleration-result",
+        cue_id="selected",
+        start=4.0,
+        end=12.0,
+        quote=end_quote,
+        selection_authority="gemini",
+        end_quote=end_quote,
+        edge_projection={
+            "end": {
+                "required": True,
+                "cue_id": "selected",
+                "quote": end_quote,
+            }
+        },
+    )
+    expected_end, _excluded = pipeline_module._interpolated_caption_edge_anchor(
+        cue_text=selected_text,
+        quote=end_quote,
+        edge="end",
+        cue_start_sec=4.0,
+        cue_end_sec=12.0,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_selected_speech_corridor",
+        mock.Mock(
+            return_value=(4.25, 12.0, "selected_cue_range_unavailable")
+        ),
+    )
+
+    verified = pipeline_module._verified_direct_adapter_clips(
+        source_url="https://www.youtube.com/watch?v=example-end",
+        engine_out={"clips": [clip], "transcript": transcript},
+        should_cancel=None,
+        exact_topic="Newton's second law",
+    )
+
+    assert len(verified) == 1
+    assert verified[0]["selection_candidate_id"] == "acceleration-result"
+    assert verified[0]["start"] == 4.0
+    assert verified[0]["end"] == pytest.approx(expected_end, abs=0.001)
+    assert verified[0]["search_context"]["surface_eligible"] is True
+    fallback = verified[0]["search_context"]["boundary_diagnostics"][
+        "lexical_projection"
+    ]["context_fallback"]
+    assert fallback["reason"].startswith("partial_edge_fallback:")
+    assert fallback["retained_projected_edges"] == ["end"]
+
+
+@pytest.mark.parametrize(
+    (
+        "complete_bounds",
+        "projected_bounds",
+        "projection",
+        "attempted_limits",
+        "expected_bounds",
+        "expected_edges",
+    ),
+    [
+        (
+            (60.48, 95.729),
+            (78.134, 95.729),
+            {
+                "start": {"required_speech_sec": 78.134},
+                "end": {"required_speech_sec": 95.729},
+            },
+            (0.0, 92.75),
+            (78.134, 95.729),
+            ("start",),
+        ),
+        (
+            (92.75, 128.97),
+            (92.75, 121.5),
+            {
+                "start": {"required_speech_sec": 92.75},
+                "end": {"required_speech_sec": 121.5},
+            },
+            (95.729, 128.97),
+            (92.75, 121.5),
+            ("end",),
+        ),
+    ],
+    ids=["keep-start-when-end-conflicts", "keep-end-when-start-conflicts"],
+)
+def test_independent_projected_edge_survives_opposite_corridor_conflict(
+    complete_bounds,
+    projected_bounds,
+    projection,
+    attempted_limits,
+    expected_bounds,
+    expected_edges,
+) -> None:
+    bounds, retained_edges = pipeline_module._retain_independently_projected_edges(
+        complete_cue_bounds=complete_bounds,
+        projected_speech_bounds=projected_bounds,
+        projection_diagnostics=projection,
+        attempted_search_limits=attempted_limits,
+    )
+
+    assert bounds == expected_bounds
+    assert retained_edges == expected_edges
+
+
+@pytest.mark.parametrize(
+    ("valid_edge", "valid_quote", "invalid_edge"),
+    [
+        ("start", "gamma delta", "end"),
+        ("end", "beta gamma", "start"),
+    ],
+)
+@pytest.mark.parametrize("with_lexical_words", [False, True])
+def test_projection_alignment_failure_preserves_grounded_opposite_edge(
+    valid_edge,
+    valid_quote,
+    invalid_edge,
+    with_lexical_words,
+) -> None:
+    transcript = {
+        "source": "supadata",
+        "duration": 10.0,
+        "segments": [
+            {
+                "cue_id": "selected",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "alpha beta gamma delta epsilon",
+            }
+        ],
+    }
+    clip = _quality_clip(
+        candidate_id=f"valid-{valid_edge}",
+        cue_id="selected",
+        start=0.0,
+        end=10.0,
+        quote="alpha beta gamma delta epsilon",
+        selection_authority="gemini",
+        edge_projection={
+            valid_edge: {"cue_id": "selected", "quote": valid_quote},
+            invalid_edge: {"cue_id": "selected", "quote": "words not present"},
+        },
+    )
+    diagnostics, complete_bounds = pipeline_module._transcript_boundary_seed(
+        transcript,
+        clip,
+    )
+    assert diagnostics is not None
+    lexical_word = pipeline_module.clip_engine_silence.lexical_timing.LexicalWord
+    lexical_words = (
+        tuple(
+            lexical_word(text, onset)
+            for text, onset in (
+                ("alpha", 0.5),
+                ("beta", 2.5),
+                ("gamma", 4.5),
+                ("delta", 6.5),
+                ("epsilon", 8.5),
+            )
+        )
+        if with_lexical_words
+        else ()
+    )
+
+    bounds, projection, error = pipeline_module._projected_speech_bounds(
+        transcript,
+        clip,
+        diagnostics,
+        _ready_audio(lexical_words=lexical_words, duration_sec=10.0),
+    )
+
+    assert error is None
+    assert valid_edge in projection
+    assert invalid_edge not in projection
+    assert projection["edge_projection_errors"][invalid_edge].endswith(
+        (
+            "_lexical_alignment_unavailable"
+            if with_lexical_words
+            else "_caption_interpolation_unavailable"
+        )
+    )
+    bound_index = 0 if valid_edge == "start" else 1
+    opposite_index = 1 - bound_index
+    assert bounds[bound_index] != complete_bounds[bound_index]
+    assert bounds[opposite_index] == complete_bounds[opposite_index]
 
 
 @pytest.mark.parametrize(
@@ -3345,7 +3825,7 @@ def test_groq_cache_dedupes_identical_near_media_edge_window(monkeypatch) -> Non
 
 
 @pytest.mark.parametrize("projected_edge", ["start", "end"])
-def test_groq_request_count_uses_only_explicit_projected_edges(
+def test_groq_request_count_uses_projection_and_raw_opposite_edge(
     projected_edge,
 ) -> None:
     raw_clip = {
@@ -3359,14 +3839,14 @@ def test_groq_request_count_uses_only_explicit_projected_edges(
         },
     }
 
-    assert pipeline_module._groq_boundary_request_count(raw_clip) == 1
+    assert pipeline_module._groq_boundary_request_count(raw_clip) == 2
 
 
 @pytest.mark.parametrize(
     ("projected_edge", "projected_target"),
     [("start", 4.0), ("end", 18.0)],
 )
-def test_groq_words_for_clip_uses_only_explicit_projected_edges(
+def test_groq_words_for_clip_uses_projection_and_raw_opposite_edge(
     projected_edge,
     projected_target,
 ) -> None:
@@ -3402,13 +3882,27 @@ def test_groq_words_for_clip_uses_only_explicit_projected_edges(
         )
 
     assert words == _groq_edge_words()
-    words_for_edge.assert_called_once()
-    call = words_for_edge.call_args.kwargs
-    assert call["cue_id"] == f"projected-{projected_edge}"
-    assert call["target_sec"] == projected_target
+    assert words_for_edge.call_count == 2
+    calls = [call.kwargs for call in words_for_edge.call_args_list]
+    assert [call["target_sec"] for call in calls] == [4.0, 18.0]
+    assert [call["cue_id"] for call in calls] == [
+        (
+            "projected-start"
+            if projected_edge == "start"
+            else "raw-start-cue"
+        ),
+        (
+            "projected-end"
+            if projected_edge == "end"
+            else "raw-end-cue"
+        ),
+    ]
+    assert calls[(0 if projected_edge == "start" else 1)][
+        "target_sec"
+    ] == projected_target
 
 
-def test_topic_generation_runs_bounded_groq_when_acoustic_worker_misses_deadline(
+def test_topic_generation_skips_groq_after_shared_boundary_deadline(
     monkeypatch,
 ) -> None:
     engine_out = _ambiguous_gemini_edge_engine_out()
@@ -3458,15 +3952,16 @@ def test_topic_generation_runs_bounded_groq_when_acoustic_worker_misses_deadline
         persist_clip,
     )
 
+    context = GenerationContext(
+        "slow",
+        require_acoustic_boundaries=True,
+    )
     try:
         reels, _ = pipeline.ingest_topic(
             topic="Intro to Python",
             material_id="material",
             concept_id="concept",
-            generation_context=GenerationContext(
-                "slow",
-                require_acoustic_boundaries=True,
-            ),
+            generation_context=context,
             max_videos=1,
             max_reels=1,
             retrieval_profile="deep",
@@ -3475,9 +3970,11 @@ def test_topic_generation_runs_bounded_groq_when_acoustic_worker_misses_deadline
         assert reels == ["stored-reel"]
         assert len(acoustic_timeouts) == 1
         assert 0.0 < acoustic_timeouts[0] < 0.5
-        groq_words.assert_called_once()
-        assert 0.0 < groq_words.call_args.kwargs["timeout_sec"] <= 0.1
-        assert persist_clip.call_args.kwargs["clip"]["start"] == 5.0
+        groq_words.assert_not_called()
+        stored_clip = persist_clip.call_args.kwargs["clip"]
+        assert 0.0 < stored_clip["start"] < stored_clip["end"] == 12.0
+        assert stored_clip["search_context"]["surface_eligible"] is True
+        assert context.counters()["permanently_rejected_clips"] == 0
     finally:
         release_acoustic.set()
         assert acoustic_returned.wait(timeout=1.0)

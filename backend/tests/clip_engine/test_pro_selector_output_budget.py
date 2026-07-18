@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from backend import gemini_client
+from backend.app.clip_engine import expand
 from backend.app.clip_engine.provider_runtime import GenerationContext
 from backend.pipeline import gemini_segment
 
@@ -187,8 +188,14 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     assert result.calls[0]["reserved_output_tokens"] == call["max_output_tokens"]
     assert audit_call["schema"] is gemini_segment._ProCandidateAuditPlan
     assert audit_call["operation"] == "pro_boundary_audit"
-    assert audit_call["thinking_level"] == "medium"
+    assert audit_call["prompt_version"] == "pro_candidate_audit_v4"
+    assert audit_call["thinking_level"] == "high"
     assert audit_call["media_resolution"] is None
+    assert gemini_segment._PRO_FINAL_AUDIT_RESERVED_S >= 60.0
+    assert (
+        gemini_segment._TOTAL_DEADLINE_S
+        == 2 * gemini_segment._PRO_FINAL_AUDIT_RESERVED_S
+    )
     assert (
         audit_call["deadline_monotonic"] - call["deadline_monotonic"]
         == pytest.approx(gemini_segment._PRO_FINAL_AUDIT_RESERVED_S)
@@ -392,7 +399,7 @@ def test_pro_selector_and_audit_headroom_fit_job_cost_ceiling(
         operation="expansion",
         model="gemini-3.1-flash-lite",
         estimated_input_tokens=1_000,
-        max_output_tokens=1_024,
+        max_output_tokens=expand.PRACTICE_FAST_EXPAND_OUTPUT_TOKENS,
     )
     selector_reservations = []
     audit_reservations = []

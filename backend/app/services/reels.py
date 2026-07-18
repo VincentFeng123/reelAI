@@ -1770,8 +1770,8 @@ class ReelService:
             ) or None
         concepts = self._order_concepts(conn, material_id, concepts, learner_id)
         if generation_context is not None and concepts:
-            # One concept/query family per durable acquisition pass keeps the
-            # fast (3-search) and slow (6-search) initial budgets truthful.
+            # Keep each durable acquisition pass on one concept/query family
+            # so its bounded provider reservations remain truthful.
             concept_index = max(0, int(acquisition_concept_offset)) % len(concepts)
             concepts = [concepts[concept_index]]
         safe_video_duration_pref = self._normalize_preferred_video_duration(preferred_video_duration)

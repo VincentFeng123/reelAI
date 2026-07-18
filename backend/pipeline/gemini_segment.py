@@ -1,7 +1,7 @@
 """Guarded Gemini educational clip segmentation.
 
 Production uses one medium-thinking Pro selection call followed by one
-medium-thinking Pro candidate-and-boundary audit over timestamped transcript
+high-thinking Pro candidate-and-boundary audit over timestamped transcript
 text. Deterministic code validates exact quotes and structure but makes no
 semantic admission decision. Video media is never attached.
 Legacy routing and enrichment helpers remain available only for isolated
@@ -1678,7 +1678,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v3"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v18"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v19"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -1698,7 +1698,7 @@ _FLASH_BOUNDARY_TIMEOUT_S = 45.0
 _FLASH_REPAIR_TIMEOUT_S = 20.0
 _FLASH_ENRICH_TIMEOUT_S = 25.0
 _PRO_TIMEOUT_S = 90.0
-_PRO_FINAL_AUDIT_RESERVED_S = 45.0
+_PRO_FINAL_AUDIT_RESERVED_S = 60.0
 _SELECTION_OUTPUT_TOKENS = 24_576
 # Six thousand compact-schema tokens cover the exhaustive candidate payload.
 _BOUNDARY_OUTPUT_TOKENS = 6_000
@@ -1706,7 +1706,7 @@ _BOUNDARY_OUTPUT_TOKENS = 6_000
 # separate allowance so medium reasoning cannot consume the structured payload;
 # provider runtime independently bounds the call count and total job exposure.
 _PRO_BOUNDARY_OUTPUT_TOKENS = 12_288
-# The final audit may return 40 decisions plus repaired edges, and medium
+# The final audit may return 40 decisions plus repaired edges, and high
 # thinking tokens count against the same provider output ceiling.
 _PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS = 12_288
 # Calls cheap enough under a byte-per-token upper bound may use the local
@@ -1727,7 +1727,7 @@ _SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
 _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
-_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v1"
+_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v4"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
 
 _PRICING_VERSION = "gemini-standard-2026-07-11"
@@ -1798,7 +1798,7 @@ class _IntentConstraint(_StrictModel):
 
 class _RequestIntent(_StrictModel):
     exact_request: _NonBlank
-    constraints: list[_IntentConstraint] = Field(min_length=1, max_length=8)
+    constraints: list[_IntentConstraint] = Field(min_length=1, max_length=16)
 
     @model_validator(mode="after")
     def _unique_constraint_ids(self):
@@ -1881,7 +1881,7 @@ class _BoundaryTopic(_StrictModel):
     # Compatibility defaults keep isolated conversion fixtures readable. The
     # live selector uses _IntentBoundaryTopic, where both fields are required.
     intent_role: _IntentRole | None = None
-    intent_evidence: list[_IntentEvidence] = Field(default_factory=list, max_length=8)
+    intent_evidence: list[_IntentEvidence] = Field(default_factory=list, max_length=16)
 
     @model_validator(mode="after")
     def _uncertainty_has_reason(self):
@@ -2025,7 +2025,7 @@ class _CompactBoundaryTopic(_StrictModel):
     intent_evidence: list[_CompactIntentEvidence] = Field(
         alias="ie",
         min_length=1,
-        max_length=8,
+        max_length=16,
         description=(
             "For a primary unit, one grounded item proving fulfillment of every required "
             "non-scope constraint. For a supporting unit, at least one item grounding its "
@@ -2041,7 +2041,7 @@ class _CompactBoundaryPlan(_StrictModel):
 
 class _IntentBoundaryTopic(_BoundaryTopic):
     intent_role: _IntentRole
-    intent_evidence: list[_IntentEvidence] = Field(min_length=1, max_length=8)
+    intent_evidence: list[_IntentEvidence] = Field(min_length=1, max_length=16)
 
 
 class _IntentBoundaryPlan(_StrictModel):
@@ -2728,12 +2728,19 @@ def _boundary_prompts(
         f"{learner_line}"
         "Task:\n"
         "1. Interpret the exact request before selecting anything. Return request_intent with "
-        "exact_request copied exactly from the Exact user request above and 1-8 atomic "
+        "exact_request copied exactly from the Exact user request above and 1-16 atomic "
         "constraints. Give every constraint a unique constraint_id, its kind, a concise "
         "requirement, and source_phrase copied as exact consecutive words from that request. "
         "Together the source phrases must cover every content-bearing request term. Preserve "
         "named subjects, requested operations or tasks, relationships, scope qualifiers, "
-        "formats, and outcomes. This verbatim exact_request is TOPIC for all selection and "
+        "formats, and outcomes. Give every separately named member of a list its own atomic "
+        "constraint, even when words such as including, through, each, or all introduce the "
+        "list. Keep the governing named concept as SUBJECT and label its named components or "
+        "facets as separate SCOPE constraints; never bundle the members into one constraint. "
+        "For 'Explain photosynthesis including chlorophyll, light reactions, the Calvin cycle, "
+        "and ATP,' use separate constraints for the governing photosynthesis subject, the "
+        "explanation task, and each of those four named facets. This verbatim exact_request is "
+        "TOPIC for all selection and "
         "relevance decisions. Do not substitute retrieval expansions or a broader topic. "
         "When a request contains a function, equation, expression, formula, identifier, or "
         "other structured object, keep the complete object in one atomic constraint; never "
@@ -3001,6 +3008,15 @@ def _pro_boundary_audit_prompts(
             f"intent {item.constraint_id}: {item.evidence_quote!r}"
             for item in candidate.intent_evidence
         )
+        current_cues = (
+            "\n".join(
+                f"[{line}] {_mmss(segments[line].get('start', 0.0))} "
+                f"{str(segments[line].get('text') or '').strip()}"
+                for line in range(candidate.start_line, candidate.end_line + 1)
+            )
+            if 0 <= candidate.start_line <= candidate.end_line < cue_count
+            else "(current cue range is invalid; recover from the full transcript)"
+        )
         blocks.append(
             f"<candidate audit_id={audit_id!r}>\n"
             "<current_boundary_reference>\n"
@@ -3017,6 +3033,9 @@ def _pro_boundary_audit_prompts(
             + "\n".join(evidence_lines)
             + "\n"
             "</untrusted_selector_hypotheses>\n"
+            "<current_selected_cues_focus>\n"
+            f"{current_cues}\n"
+            "</current_selected_cues_focus>\n"
             "</candidate>"
         )
 
@@ -3133,6 +3152,48 @@ def _pro_boundary_audit_prompts(
           "Do not widen a complete opening merely for navigation such as 'Now here is another "
           "example.' Any repaired span must still contain the supplied cq claim and every "
           "non-scope ie intent quote from the original candidate.\n\n"
+          "MANDATORY WORD-EDGE CHECKLIST — apply every item to every KEEP candidate before "
+          "returning it:\n"
+          "1. Read current_selected_cues_focus literally from current sq through current eq. "
+          "Treat its labels, title, objective, and scores as untrusted.\n"
+          "2. Test the first spoken words. A bare number/result, sentence tail, recap of a "
+          "completed earlier example, or mid-sentence fragment is never a valid cold start. "
+          "If current sq has any of those forms, returning that same sq is invalid whenever "
+          "the transcript contains a complete same-objective alternative.\n"
+          "3. Name internally (do not output) the objective completed by the opening speech "
+          "and the candidate's actual objective. If they differ, search forward for the first "
+          "explicit introduction/setup of the actual objective and move sq there while "
+          "preserving all protected cq/ie evidence. An explicit transition such as 'Now the "
+          "next law/rule/example is ...' is a hard semantic boundary: begin at that transition "
+          "for the new objective, never at the completed prior law/rule/example merely because "
+          "it shares variables or background.\n"
+          "4. Before moving sq backward, distinguish missing spoken referent/setup from a "
+          "merely useful prerequisite. If the current opening explicitly names or defines the "
+          "actual objective and has no unresolved deictic reference or scenario fact, do not "
+          "import an independently complete earlier lesson just to define one technical term. "
+          "Never redefine the candidate's actual objective to justify swallowing that earlier "
+          "lesson; cq and ie identify the core unit that the repaired span must isolate.\n"
+          "5. Scan the entire returned span for unresolved pronouns, demonstratives, ordinals, "
+          "comparatives, named parts, and scenario nouns. If speech says 'these endpoints', "
+          "'that value', 'the smaller one', 'Part B', or equivalent without defining it, move "
+          "sq backward to the nearest contiguous same-objective definition/setup.\n"
+          "6. Test the final words for a complete answer, unit, qualification, and conclusion, "
+          "then stop before navigation or the next objective.\n"
+          "7. Copy fresh exact sq/eq anchors for those corrected first/last words. Do not merely "
+          "repeat the current boundary because its enclosing cue IDs are valid.\n\n"
+          "Universal edge examples: If a coarse cue says 'the prior answer is forty two. "
+          "Here is a new problem: a tank contains five liters ...', a candidate about the tank "
+          "starts at 'Here is a new problem' (or its first necessary scenario word), not at "
+          "'the prior answer' or 'forty two'. If a candidate says 'these endpoints have the "
+          "largest response', it must include the nearest same-objective speech that defines "
+          "which endpoints; metadata cannot define them. Conversely, if a later case inherits "
+          "an object's givens from an immediately preceding case, retain that shared setup "
+          "unless the later case restates it completely. If speech finishes Rule A and then "
+          "says 'Now the next rule you need is Rule B,' a Rule-B candidate starts at 'Now the "
+          "next rule' even when Rule A shares terminology with Rule B. Conversely, a complete "
+          "opening such as 'Acceleration is the rate at which velocity changes' does not need "
+          "an earlier completed lesson defining velocity merely because velocity is a technical "
+          "term; that background can be its own candidate.\n\n"
           "Each candidate_id must equal its audit_id. start_line/end_line must be valid full-"
           "transcript IDs. start_quote/end_quote must each be the shortest unique 1-16 exact "
           "consecutive transcript words inside the returned inclusive range; their first/last "
@@ -21112,7 +21173,7 @@ def _audit_pro_boundaries(
             user,
             _ProCandidateAuditPlan,
             model=config.SEGMENT_PRO_MODEL,
-            thinking_level="medium",
+            thinking_level="high",
             max_output_tokens=_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS,
             timeout_s=_PRO_TIMEOUT_S,
             deadline_monotonic=deadline,

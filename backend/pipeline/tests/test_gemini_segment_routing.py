@@ -362,6 +362,26 @@ def test_production_route_caps_and_respects_the_shared_deadline(
     assert captured["deadline_monotonic"] == expected_deadline
 
 
+def test_pro_only_route_uses_shared_two_pass_deadline(monkeypatch):
+    captured = {}
+
+    def fake_run(transcript, settings, profile, **kwargs):
+        captured.update(kwargs)
+        return _result(profile, "green", title="pro")
+
+    monkeypatch.setattr(G.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(G, "run_segment_profile", fake_run)
+
+    G.segment_clips_detailed(
+        _transcript(),
+        {},
+        video_id="video",
+        routing_mode="pro_only",
+    )
+
+    assert captured["deadline_monotonic"] == 220.0
+
+
 def test_green_hybrid_flash_never_calls_pro(monkeypatch):
     seen = []
     monkeypatch.setattr(G.config, "SEGMENT_HYBRID_PERCENT", 100.0)

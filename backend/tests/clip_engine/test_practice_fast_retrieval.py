@@ -42,6 +42,7 @@ def _intent_expansion_json(
         "corrected": corrected,
         "intent_constraints": [{
             "constraint_id": "subject",
+            "kind": "subject",
             "source_phrase": source_phrase,
             "requirement": f"Teach {corrected}",
         }],
@@ -90,12 +91,22 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
 def test_practice_fast_expansion_requests_focused_sources() -> None:
     prompt = " ".join(expand._PRACTICE_FAST_SYSTEM.casefold().split())
 
+    assert expand.PRACTICE_FAST_EXPAND_CACHE_VERSION == 7
+    assert expand.PRACTICE_FAST_EXPAND_OUTPUT_TOKENS == 2_048
     assert "prefer focused teaching videos" in prompt
     assert "never query for a full course" in prompt
     assert "unless the user explicitly requests that format" in prompt
+    assert "the first broad query must preserve every constraint" in prompt
+    assert "every subject constraint plus one or more distinct" in prompt
+    assert "collectively target every named facet or list member" in prompt
+    assert "subject means the governing named topic, law, concept, or object" in prompt
+    assert "components and named list members under that governing topic are scope" in (
+        prompt
+    )
+    assert "net force, mass, acceleration, and units are four separate scope" in prompt
 
 
-def test_practice_fast_expansion_keeps_only_queries_preserving_every_intent_constraint(
+def test_practice_fast_expansion_keeps_broad_query_then_subject_grounded_focus(
     monkeypatch,
 ):
     payload = {
@@ -103,23 +114,35 @@ def test_practice_fast_expansion_keeps_only_queries_preserving_every_intent_cons
         "intent_constraints": [
             {
                 "constraint_id": "subject",
+                "kind": "subject",
                 "source_phrase": "chain rule",
                 "requirement": "Teach the chain rule",
             },
             {
                 "constraint_id": "task",
-                "source_phrase": "worked example",
-                "requirement": "Work through a concrete example to its answer",
+                "kind": "task",
+                "source_phrase": "worked",
+                "requirement": "Work through the process",
+            },
+            {
+                "constraint_id": "outcome",
+                "kind": "outcome",
+                "source_phrase": "example",
+                "requirement": "Reach a concrete example answer",
             },
         ],
         "queries": [
             {
-                "text": "chain rule definition lecture",
-                "preserved_constraint_ids": ["subject"],
+                "text": "worked derivative walkthrough",
+                "preserved_constraint_ids": ["task"],
+            },
+            {
+                "text": "chain rule worked example",
+                "preserved_constraint_ids": ["subject", "task", "outcome"],
             },
             {
                 "text": "chain rule solved derivative walkthrough",
-                "preserved_constraint_ids": ["subject", "task"],
+                "preserved_constraint_ids": ["subject", "task", "outcome"],
             },
         ],
     }
@@ -133,9 +156,415 @@ def test_practice_fast_expansion_keeps_only_queries_preserving_every_intent_cons
 
     assert result == {
         "corrected": "chain rule worked example",
-        "queries": ["chain rule solved derivative walkthrough"],
+        "queries": [
+            "chain rule worked example",
+            "chain rule solved derivative walkthrough",
+        ],
         "provider_used": "gemini",
     }
+
+
+def test_practice_fast_expansion_collectively_targets_named_request_facets(monkeypatch):
+    topic = (
+        "Explain Newton's second law F=ma from intuition through worked examples, "
+        "including net force, mass, acceleration, units, and solving for each variable"
+    )
+    constraints = [
+        ("task", "task", "Explain"),
+        ("subject", "subject", "Newton's second law F=ma"),
+        ("intuition", "format", "from intuition through"),
+        ("worked_examples", "format", "through worked examples, including"),
+        ("net_force", "scope", "net force"),
+        ("mass", "scope", "mass"),
+        ("acceleration", "scope", "acceleration"),
+        ("units", "scope", "units"),
+        ("solve_each", "outcome", "solving for each variable"),
+    ]
+    all_ids = [constraint_id for constraint_id, _kind, _phrase in constraints]
+    payload = {
+        "corrected": topic,
+        "intent_constraints": [
+            {
+                "constraint_id": constraint_id,
+                "kind": kind,
+                "source_phrase": source_phrase,
+                "requirement": f"Preserve {source_phrase}",
+            }
+            for constraint_id, kind, source_phrase in constraints
+        ],
+        "queries": [
+            {
+                "text": "Newton second law net force and mass worked explanation",
+                "preserved_constraint_ids": [
+                    "subject", "task", "intuition", "net_force", "mass",
+                ],
+            },
+            {
+                "text": (
+                    "Newton second law F=ma complete worked examples for every variable"
+                ),
+                "preserved_constraint_ids": all_ids,
+            },
+            {
+                "text": "Newton second law acceleration units solve each variable",
+                "preserved_constraint_ids": [
+                    "subject",
+                    "worked_examples",
+                    "acceleration",
+                    "units",
+                    "solve_each",
+                ],
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    result = expand.expand_query_practice_fast(topic, 3)
+
+    assert result == {
+        "corrected": topic,
+        "queries": [
+            "Newton second law F=ma complete worked examples for every variable",
+            "Newton second law net force and mass worked explanation",
+            "Newton second law acceleration units solve each variable",
+        ],
+        "provider_used": "gemini",
+    }
+
+
+def test_practice_fast_expansion_repairs_missing_model_broad_query_safely(monkeypatch):
+    topic = (
+        "Explain Newton's second law F=ma from intuition through worked examples, "
+        "including net force, mass, acceleration, units, and solving for each variable"
+    )
+    payload = {
+        "corrected": topic,
+        "intent_constraints": [
+            {
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": "Newton's second law F=ma",
+                "requirement": "Teach the governing law",
+            },
+            {
+                "constraint_id": "task",
+                "kind": "task",
+                "source_phrase": "Explain",
+                "requirement": "Explain clearly",
+            },
+            {
+                "constraint_id": "intuition",
+                "kind": "scope",
+                "source_phrase": "intuition",
+                "requirement": "Cover intuition",
+            },
+            {
+                "constraint_id": "components",
+                "kind": "scope",
+                "source_phrase": "net force, mass, acceleration, units",
+                "requirement": "Cover the named components",
+            },
+            {
+                "constraint_id": "worked",
+                "kind": "outcome",
+                "source_phrase": "worked examples, and solving for each variable",
+                "requirement": "Solve each variable in worked examples",
+            },
+        ],
+        "queries": [
+            {
+                "text": "Newton second law intuitive explanation and units",
+                "preserved_constraint_ids": [
+                    "subject", "task", "intuition", "components",
+                ],
+            },
+            {
+                "text": "Newton second law worked examples solve F m and a",
+                "preserved_constraint_ids": ["subject", "worked"],
+            },
+            {
+                "text": "Newton second law net force mass acceleration practice",
+                "preserved_constraint_ids": ["subject", "components", "worked"],
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    result = expand.expand_query_practice_fast(topic, 3)
+
+    assert result == {
+        "corrected": topic,
+        "queries": [
+            topic,
+            "Newton second law intuitive explanation and units",
+            "Newton second law worked examples solve F m and a",
+        ],
+        "provider_used": "gemini",
+    }
+
+
+def test_practice_fast_expansion_prioritizes_distinct_facet_coverage(monkeypatch):
+    topic = "physics force mass acceleration units"
+    constraints = [
+        ("subject", "subject", "physics"),
+        ("force", "scope", "force"),
+        ("mass", "scope", "mass"),
+        ("acceleration", "scope", "acceleration"),
+        ("units", "scope", "units"),
+    ]
+    all_ids = [constraint_id for constraint_id, _kind, _phrase in constraints]
+    payload = {
+        "corrected": topic,
+        "intent_constraints": [
+            {
+                "constraint_id": constraint_id,
+                "kind": kind,
+                "source_phrase": source_phrase,
+                "requirement": f"Preserve {source_phrase}",
+            }
+            for constraint_id, kind, source_phrase in constraints
+        ],
+        "queries": [
+            {
+                "text": "physics force mass acceleration units overview",
+                "preserved_constraint_ids": all_ids,
+            },
+            {
+                "text": "physics force and mass",
+                "preserved_constraint_ids": ["subject", "force", "mass"],
+            },
+            {
+                "text": "physics force and acceleration",
+                "preserved_constraint_ids": ["subject", "force", "acceleration"],
+            },
+            {
+                "text": "physics acceleration and units",
+                "preserved_constraint_ids": ["subject", "acceleration", "units"],
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    result = expand.expand_query_practice_fast(topic, 3)
+
+    assert result["queries"] == [
+        "physics force mass acceleration units overview",
+        "physics force and mass",
+        "physics acceleration and units",
+    ]
+
+
+def test_practice_fast_expansion_finds_non_greedy_complete_facet_cover(monkeypatch):
+    topic = "physics force mass acceleration units energy momentum"
+    all_ids = [
+        "subject",
+        "force",
+        "mass",
+        "acceleration",
+        "units",
+        "energy",
+        "momentum",
+    ]
+    payload = {
+        "corrected": topic,
+        "intent_constraints": [
+            {
+                "constraint_id": constraint_id,
+                "kind": "subject" if constraint_id == "subject" else "scope",
+                "source_phrase": (
+                    "physics" if constraint_id == "subject" else constraint_id
+                ),
+                "requirement": f"Preserve {constraint_id}",
+            }
+            for constraint_id in all_ids
+        ],
+        "queries": [
+            {
+                "text": "physics force mass acceleration and units",
+                "preserved_constraint_ids": [
+                    "subject",
+                    "force",
+                    "mass",
+                    "acceleration",
+                    "units",
+                ],
+            },
+            {
+                "text": "physics force mass and energy",
+                "preserved_constraint_ids": [
+                    "subject",
+                    "force",
+                    "mass",
+                    "energy",
+                ],
+            },
+            {
+                "text": "physics acceleration units and momentum",
+                "preserved_constraint_ids": [
+                    "subject",
+                    "acceleration",
+                    "units",
+                    "momentum",
+                ],
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    result = expand.expand_query_practice_fast(topic, 3)
+
+    assert result == {
+        "corrected": topic,
+        "queries": [
+            topic,
+            "physics force mass and energy",
+            "physics acceleration units and momentum",
+        ],
+        "provider_used": "gemini",
+    }
+
+
+def test_practice_fast_expansion_rejects_partial_focused_facet_coverage(monkeypatch):
+    topic = "physics force mass acceleration units"
+    all_ids = ["subject", "force", "mass", "acceleration", "units"]
+    payload = {
+        "corrected": topic,
+        "intent_constraints": [
+            {
+                "constraint_id": constraint_id,
+                "kind": "subject" if constraint_id == "subject" else "scope",
+                "source_phrase": (
+                    "physics" if constraint_id == "subject" else constraint_id
+                ),
+                "requirement": f"Preserve {constraint_id}",
+            }
+            for constraint_id in all_ids
+        ],
+        "queries": [
+            {
+                "text": "physics force mass acceleration units overview",
+                "preserved_constraint_ids": all_ids,
+            },
+            {
+                "text": "physics force lesson",
+                "preserved_constraint_ids": ["subject", "force"],
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    result = expand.expand_query_practice_fast(topic, 3)
+
+    assert result == {
+        "corrected": topic,
+        "queries": [topic],
+        "provider_used": "literal_fallback",
+    }
+
+
+@pytest.mark.parametrize(
+    "intent_constraints, queries, expected",
+    [
+        (
+            [{
+                "constraint_id": "request",
+                "kind": "task",
+                "source_phrase": "chain rule worked example",
+                "requirement": "Teach a chain rule worked example",
+            }],
+            [{
+                "text": "chain rule worked example",
+                "preserved_constraint_ids": ["request"],
+            }],
+            {
+                "corrected": "chain rule worked example",
+                "queries": ["chain rule worked example"],
+                "provider_used": "literal_fallback",
+            },
+        ),
+        (
+            [
+                {
+                    "constraint_id": "subject",
+                    "kind": "subject",
+                    "source_phrase": "chain rule",
+                    "requirement": "Teach the chain rule",
+                },
+                {
+                    "constraint_id": "task",
+                    "kind": "task",
+                    "source_phrase": "worked",
+                    "requirement": "Work through the process",
+                },
+                {
+                    "constraint_id": "outcome",
+                    "kind": "outcome",
+                    "source_phrase": "example",
+                    "requirement": "Reach a concrete example answer",
+                },
+            ],
+            [
+                {
+                    "text": "chain rule worked walkthrough",
+                    "preserved_constraint_ids": ["subject", "task"],
+                },
+                {
+                    "text": "chain rule example answer",
+                    "preserved_constraint_ids": ["subject", "outcome"],
+                },
+            ],
+            {
+                "corrected": "chain rule worked example",
+                "queries": [
+                    "chain rule worked example",
+                    "chain rule worked walkthrough",
+                    "chain rule example answer",
+                ],
+                "provider_used": "gemini",
+            },
+        ),
+    ],
+)
+def test_practice_fast_expansion_requires_subject_and_repairs_missing_broad_query(
+    monkeypatch,
+    intent_constraints,
+    queries,
+    expected,
+):
+    payload = {
+        "corrected": "chain rule worked example",
+        "intent_constraints": intent_constraints,
+        "queries": queries,
+    }
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    result = expand.expand_query_practice_fast("chain rule worked example", 3)
+
+    assert result == expected
 
 
 def test_practice_fast_expansion_falls_back_to_exact_request_when_contract_drops_qualifier(
@@ -146,6 +575,7 @@ def test_practice_fast_expansion_falls_back_to_exact_request_when_contract_drops
         "intent_constraints": [
             {
                 "constraint_id": "subject",
+                "kind": "subject",
                 "source_phrase": "chain rule",
                 "requirement": "Teach the chain rule",
             },
@@ -242,7 +672,7 @@ def test_successful_expansion_dispatch_is_not_double_recorded(monkeypatch):
     config = seen["config"]
     assert str(config.thinking_config.thinking_level).casefold().endswith("low")
     assert config.temperature is None
-    assert config.max_output_tokens == 1_024
+    assert config.max_output_tokens == 2_048
 
 
 def test_practice_fast_expansion_never_falls_back_to_pro(monkeypatch):
@@ -1422,7 +1852,7 @@ def test_literal_sufficient_retrieval_still_uses_bounded_ai_diversity(
 @pytest.mark.parametrize(
     ("mode", "source_budget", "expected_follow_up"),
     [
-        ("fast", 2, ["physics mechanics"]),
+        ("fast", 2, ["physics mechanics", "physics waves"]),
         ("slow", 3, ["physics mechanics", "physics waves"]),
     ],
 )

@@ -11933,7 +11933,7 @@ def test_boundary_prompt_requires_cross_domain_subject_anchoring_and_context() -
     assert "part b is not whole merely because its local arithmetic reaches an answer" in (
         normalized
     )
-    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v18"
+    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v19"
 
 
 @pytest.mark.parametrize(
@@ -12018,6 +12018,41 @@ def test_compact_schema_and_final_audit_require_context_complete_evidence_and_ed
     assert "never omit it solely for boundary uncertainty" in normalized
 
 
+def test_pro_schema_represents_sixteen_atomic_request_facets() -> None:
+    compact_schema = gemini_segment._CompactBoundaryPlan.model_json_schema()
+    compact_definitions = compact_schema["$defs"]
+    assert (
+        compact_definitions["_RequestIntent"]["properties"]["constraints"][
+            "maxItems"
+        ]
+        == 16
+    )
+    assert (
+        compact_definitions["_CompactBoundaryTopic"]["properties"]["ie"][
+            "maxItems"
+        ]
+        == 16
+    )
+
+    intent_schema = gemini_segment._IntentBoundaryPlan.model_json_schema()
+    intent_definitions = intent_schema["$defs"]
+    assert (
+        intent_definitions["_IntentBoundaryTopic"]["properties"][
+            "intent_evidence"
+        ]["maxItems"]
+        == 16
+    )
+
+    _system, user = gemini_segment._boundary_prompts(
+        "[0] 00:00 A complete teaching unit.",
+        1,
+        "Explain one subject through all of its named facets",
+    )
+    assert "1-16 atomic constraints" in user
+    assert "every separately named member of a list its own atomic constraint" in user
+    assert "never bundle the members into one constraint" in user
+
+
 def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -12097,6 +12132,42 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
     assert "not at the method-a recap" in normalized
     assert "advanced but related material stays" in normalized
     assert "current_boundary_reference" in normalized
+    assert "<current_selected_cues_focus>" in user
+    assert "</current_selected_cues_focus>" in user
+    selected_focus = user.split(
+        "<current_selected_cues_focus>\n", 1,
+    )[1].split("\n</current_selected_cues_focus>", 1)[0]
+    assert "Both people experience the same force" in selected_focus
+    assert "And the larger person" in selected_focus
+    assert "he is not going to move back very much" not in selected_focus
+    assert "mandatory word-edge checklist" in normalized
+    assert "read current_selected_cues_focus literally" in normalized
+    assert (
+        "a bare number/result, sentence tail, recap of a completed earlier example"
+        in normalized
+    )
+    assert "or mid-sentence fragment is never a valid cold start" in normalized
+    assert "search forward for the first explicit introduction/setup" in normalized
+    assert "these endpoints" in normalized
+    assert "metadata cannot define them" in normalized
+    assert "the prior answer is forty two" in normalized
+    assert "here is a new problem" in normalized
+    assert "if a later case inherits an object's givens" in normalized
+    assert "returning that same sq is invalid" in normalized
+    assert (
+        "an explicit transition such as 'now the next law/rule/example is ...'"
+        in normalized
+    )
+    assert "is a hard semantic boundary" in normalized
+    assert "if speech finishes rule a" in normalized
+    assert "distinguish missing spoken referent/setup from a merely useful prerequisite" in (
+        normalized
+    )
+    assert "never redefine the candidate's actual objective" in normalized
+    assert "does not need an earlier completed lesson defining velocity" in normalized
+    assert gemini_segment._PRO_BOUNDARY_AUDIT_PROMPT_VERSION == (
+        "pro_candidate_audit_v4"
+    )
 
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
         "candidate_id": "candidate-1",

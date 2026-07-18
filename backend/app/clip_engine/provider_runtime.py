@@ -123,7 +123,10 @@ class GenerationBudget:
 
     _LIMITS: dict[GenerationMode, dict[BudgetedProviderOperation, int]] = {
         # Reservations count provider attempts, including retries.
-        "fast": {"search": 3, "transcript": 2, "segmentation": 2},
+        # Three complementary initial queries can cover a broad request plus
+        # distinct named facets. Keep one additional reservation so a single
+        # transient Supadata failure can still use the bounded retry path.
+        "fast": {"search": 4, "transcript": 2, "segmentation": 2},
         "slow": {"search": 4, "transcript": 3, "segmentation": 3},
     }
     _PASS_LIMITS: dict[GenerationMode, tuple[int, int]] = {
@@ -136,7 +139,7 @@ class GenerationBudget:
         # for each source. These are ceilings, not expected spend; billed usage
         # comes from provider telemetry and is normally much lower.
         # Each source may use one medium-thinking Pro selector plus one
-        # medium-thinking transcript-only final audit. Keep enough headroom for
+        # high-thinking transcript-only final audit. Keep enough headroom for
         # both bounded calls without allowing an audit to disappear at release.
         "fast": 1.00,
         "slow": 1.50,

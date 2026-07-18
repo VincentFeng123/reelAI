@@ -5,6 +5,7 @@ import time
 import pytest
 
 from backend import config as backend_config
+from backend.app.clip_engine import expand
 from backend.app.clip_engine import config as clip_engine_config
 from backend.app.clip_engine.errors import ProviderBudgetExceededError
 from backend.app.clip_engine.provider_cache import (
@@ -64,11 +65,15 @@ def test_transcript_cache_version_invalidates_coarser_cue_artifacts() -> None:
 def test_generation_budgets_match_fast_and_slow_contracts() -> None:
     fast = GenerationBudget.for_mode("fast")
     slow = GenerationBudget.for_mode("slow")
-    assert fast.snapshot()["limits"] == {"search": 3, "transcript": 2, "segmentation": 2}
+    assert fast.snapshot()["limits"] == {
+        "search": 4,
+        "transcript": 2,
+        "segmentation": 2,
+    }
     assert (fast.max_passes, fast.max_no_growth_passes) == (1, 0)
     assert slow.snapshot()["limits"] == {"search": 4, "transcript": 3, "segmentation": 3}
     assert (slow.max_passes, slow.max_no_growth_passes) == (1, 0)
-    for _ in range(3):
+    for _ in range(4):
         fast.reserve("search")
     with pytest.raises(ProviderBudgetExceededError):
         fast.reserve("search")
@@ -218,7 +223,7 @@ def test_job_cost_budget_fits_expansion_and_typical_whole_transcript_selectors(
         operation="expansion",
         model="gemini-3.1-flash-lite",
         estimated_input_tokens=1_000,
-        max_output_tokens=1_024,
+        max_output_tokens=expand.PRACTICE_FAST_EXPAND_OUTPUT_TOKENS,
     )
     for _ in range(selector_count):
         context.reserve_gemini_call(
@@ -234,7 +239,7 @@ def test_job_cost_budget_fits_expansion_and_typical_whole_transcript_selectors(
     budget = context.budget.snapshot()["gemini"]
     expected_reserved_cost = (
         1_000 * 0.25
-        + 1_024 * 1.5
+        + expand.PRACTICE_FAST_EXPAND_OUTPUT_TOKENS * 1.5
         + selector_count * (
             (
                 10_500

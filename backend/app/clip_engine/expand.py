@@ -15,7 +15,7 @@ import unicodedata
 from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -35,15 +35,15 @@ _INTENT_TOKEN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
 _INTENT_STOPWORDS = frozenset({
     "a", "an", "and", "are", "as", "at", "be", "by", "do", "does", "for",
     "from", "how", "i", "in", "is", "it", "me", "my", "of", "on", "or",
-    "please", "the", "to", "what", "when", "where", "which", "who", "why",
-    "with", "would", "you",
+    "including", "please", "the", "through", "to", "what", "when", "where",
+    "which", "who", "why", "with", "would", "you",
 })
 
 PRACTICE_FAST_EXPAND_MODEL = "gemini-3.1-flash-lite"
 # Gemini rejects manually configured deadlines below ten seconds.
 PRACTICE_FAST_EXPAND_TIMEOUT_MS = 10_000
-PRACTICE_FAST_EXPAND_OUTPUT_TOKENS = 1_024
-PRACTICE_FAST_EXPAND_CACHE_VERSION = 6
+PRACTICE_FAST_EXPAND_OUTPUT_TOKENS = 2_048
+PRACTICE_FAST_EXPAND_CACHE_VERSION = 7
 # An expansion can be nearly one segment-cache lifetime old when it discovers a
 # newly analyzed source. Keeping it for two lifetimes guarantees that source's
 # subsequent valid segment-cache lifetime never triggers another expansion call.
@@ -54,6 +54,14 @@ class _PracticeFastIntentConstraint(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     constraint_id: str = Field(min_length=1, max_length=32)
+    kind: Literal[
+        "subject",
+        "task",
+        "relationship",
+        "scope",
+        "format",
+        "outcome",
+    ]
     source_phrase: str = Field(min_length=1, max_length=160)
     requirement: str = Field(min_length=1, max_length=240)
 
@@ -62,7 +70,7 @@ class _PracticeFastQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     text: str = Field(min_length=1, max_length=240)
-    preserved_constraint_ids: list[str] = Field(min_length=1, max_length=8)
+    preserved_constraint_ids: list[str] = Field(min_length=1, max_length=16)
 
 
 class _PracticeFastExpansion(BaseModel):
@@ -71,7 +79,7 @@ class _PracticeFastExpansion(BaseModel):
     corrected: str
     intent_constraints: list[_PracticeFastIntentConstraint] = Field(
         min_length=1,
-        max_length=8,
+        max_length=16,
     )
     queries: list[_PracticeFastQuery]
 
@@ -90,9 +98,9 @@ Do this:
 1. Spellcheck and correct the user's input.
 2. Infer the most likely intent or sense.
 3. Produce up to N concise queries that a person would actually search on YouTube.
-4. Preserve the user's named subject, task, and requested relationship. Cover close synonyms,
-   genuinely related informational facets, useful prerequisites, and educational sources, but
-   never redirect the search into a merely adjacent field.
+4. Preserve the user's named subject in every query. Cover close synonyms, genuinely related
+   informational facets, useful prerequisites, and educational sources, but never redirect the
+   search into a merely adjacent field.
 5. In the optimized query list, prioritize substantive spoken lessons, lectures, or worked
    explanations with natural pauses and little or no background music. Avoid Shorts, reaction
    videos, compilations, montages, and explanations that only work when unseen visuals are shown.
@@ -100,12 +108,22 @@ Do this:
    playlist, or lecture series unless the user explicitly requests that format.
 6. Before writing queries, decompose the exact request into atomic mandatory intent constraints.
    Give every named subject, requested operation or task, requested relationship, scope qualifier,
-   and requested outcome its own constraint. Copy the exact words that introduced each constraint
-   into source_phrase. Do not collapse a requested task into a generic subject constraint.
-7. For every query, return the IDs of all constraints it preserves. A query is usable only if it
-   preserves every constraint. Synonyms and natural YouTube wording are welcome, but no query may
-   drop a comparison, causal relationship, misconception-correction task, identification task,
-   derivation/application task, example request, or other qualifier from the exact request.
+   requested format, and requested outcome its own constraint and label its kind. Give every named
+   member of a list its own separate constraint; the schema supports sixteen. Copy the exact words
+   that introduced each constraint into source_phrase. Do not collapse a requested task or facet
+   into the subject. SUBJECT means the governing named topic, law, concept, or object; components
+   and named list members under that governing topic are SCOPE constraints. For
+   "Explain Newton's second law F=ma with net force, mass, acceleration, units, and solving for
+   each variable," Newton's second law F=ma is SUBJECT,
+   Explain is TASK, net force, mass, acceleration, and units are four separate SCOPE constraints,
+   and solving for each variable is OUTCOME.
+7. The first broad query must preserve every constraint. Every later focused query must preserve
+   every subject constraint plus one or more distinct task, relationship, scope, format, or outcome
+   constraints. Collectively target every named facet or list member; when the request says each,
+   every, or all, give distinct members focused coverage where N permits.
+8. For every query, return exactly the IDs of the constraints it preserves. Synonyms and natural
+   YouTube wording are welcome, but focused queries must not lose the governing subject or drift
+   into an adjacent field.
 
 Return only the requested JSON object with corrected, intent_constraints, and queries. Keep
 corrected separate from queries. Return N optimized search queries; do not automatically spend
@@ -248,18 +266,75 @@ def _contains_token_phrase(text: object, phrase: object) -> bool:
     )
 
 
+def _contains_ordered_topic_terms(text: object, phrase: object) -> bool:
+    """Accept exact spans or grounded in-order terms without stitched invention."""
+
+    if _contains_token_phrase(text, phrase):
+        return True
+    source = [
+        token for token in _intent_tokens(text) if token not in _INTENT_STOPWORDS
+    ]
+    target = [
+        token for token in _intent_tokens(phrase) if token not in _INTENT_STOPWORDS
+    ]
+    if not source or not target:
+        return False
+    cursor = 0
+    for token in source:
+        if token == target[cursor]:
+            cursor += 1
+            if cursor == len(target):
+                return True
+    return False
+
+
+def _covering_focus_indices(
+    focused: list[tuple[str, frozenset[str]]],
+    required_ids: set[str],
+    limit: int,
+) -> tuple[int, ...] | None:
+    """Find the earliest smallest bounded query set with complete facet coverage."""
+
+    target = frozenset(required_ids)
+    if not target:
+        return ()
+    states: dict[frozenset[str], tuple[int, ...]] = {frozenset(): ()}
+    for index, (_query, signature) in enumerate(focused):
+        updates: dict[frozenset[str], tuple[int, ...]] = {}
+        for covered, selected in tuple(states.items()):
+            if len(selected) >= limit:
+                continue
+            combined = covered | signature
+            candidate = (*selected, index)
+            previous = updates.get(combined, states.get(combined))
+            if previous is None or (len(candidate), candidate) < (
+                len(previous),
+                previous,
+            ):
+                updates[combined] = candidate
+        states.update(updates)
+    return states.get(target)
+
+
 def _validated_ai_queries(
     topic: str,
     parsed: _PracticeFastExpansion,
     count: int,
 ) -> list[str]:
-    """Keep only AI queries whose same-call contract preserves exact intent."""
+    """Keep one exact-request query plus subject-grounded facet queries."""
     constraints = list(parsed.intent_constraints)
     constraint_ids = {constraint.constraint_id for constraint in constraints}
     if not constraint_ids:
         return []
+    subject_ids = {
+        constraint.constraint_id
+        for constraint in constraints
+        if constraint.kind == "subject"
+    }
+    if not subject_ids:
+        return []
     if any(
-        not _contains_token_phrase(topic, constraint.source_phrase)
+        not _contains_ordered_topic_terms(topic, constraint.source_phrase)
         for constraint in constraints
     ):
         return []
@@ -275,17 +350,84 @@ def _validated_ai_queries(
     if required_topic_tokens and not required_topic_tokens.issubset(covered_topic_tokens):
         return []
 
-    valid: list[str] = []
+    broad: list[str] = []
+    focused: list[tuple[str, frozenset[str]]] = []
+    focused_signatures: set[frozenset[str]] = set()
+    non_subject_ids = constraint_ids - subject_ids
     for query in parsed.queries:
         preserved = {
             " ".join(str(value or "").split())
             for value in query.preserved_constraint_ids
             if " ".join(str(value or "").split())
         }
-        if preserved != constraint_ids:
+        if (
+            not preserved
+            or not preserved.issubset(constraint_ids)
+            or not subject_ids.issubset(preserved)
+        ):
             continue
-        valid.append(query.text)
-    return _normalize(valid, count)
+        if preserved == constraint_ids:
+            broad.append(query.text)
+            continue
+        signature = frozenset(preserved & non_subject_ids)
+        if not signature or signature in focused_signatures:
+            continue
+        focused_signatures.add(signature)
+        focused.append((query.text, signature))
+
+    normalized_model_broad = _normalize(broad, len(broad))
+    primary_broad = normalized_model_broad[0] if normalized_model_broad else topic
+    broad_keys = {
+        _key(query) for query in [topic, *normalized_model_broad]
+    }
+    normalized_focused: list[tuple[str, frozenset[str]]] = []
+    focused_keys: set[str] = set()
+    for query, signature in focused:
+        text = " ".join(str(query or "").split())
+        key = _key(text)
+        if not text or not key or key in broad_keys or key in focused_keys:
+            continue
+        focused_keys.add(key)
+        normalized_focused.append((text, signature))
+    if not non_subject_ids:
+        return _normalize(
+            [primary_broad, *normalized_model_broad[1:]],
+            count,
+        )
+    if len(non_subject_ids) <= 2:
+        normalized_focused.extend(
+            (query, frozenset(non_subject_ids))
+            for query in normalized_model_broad[1:]
+        )
+    if count <= 1:
+        return _normalize([primary_broad], count)
+    if count > 1 and non_subject_ids and not normalized_focused:
+        return []
+
+    focused_limit = max(0, count - 1)
+    selected_indices = _covering_focus_indices(
+        normalized_focused,
+        non_subject_ids,
+        focused_limit,
+    )
+    if selected_indices is None:
+        return []
+    selected_index_set = set(selected_indices)
+    for index in range(len(normalized_focused)):
+        if len(selected_index_set) >= focused_limit:
+            break
+        selected_index_set.add(index)
+    selected_focused = [
+        normalized_focused[index]
+        for index in sorted(selected_index_set)
+    ]
+    return _normalize(
+        [
+            primary_broad,
+            *(query for query, _signature in selected_focused),
+        ],
+        count,
+    )
 
 
 def deterministic_expand(topic: str, n: int, *, level: str | None = None) -> dict:

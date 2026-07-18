@@ -699,10 +699,6 @@ def discover_practice_fast(
     expansion_count = min(3, max(1, requested))
     query_count = max(1, min(12, requested))
     if context is not None:
-        if context.budget.mode == "fast":
-            # Leave one of Fast's three search reservations available for a
-            # transient retry instead of spending the whole budget at once.
-            query_count = min(query_count, 2)
         query_count = min(query_count, context.budget.remaining("search"))
     if not bootstrap:
         query_count = min(query_count, 3)
@@ -727,8 +723,8 @@ def discover_practice_fast(
     else:
         expansion = expand.expand_query_practice_fast(
             literal_query,
-            # Both modes share one cached plan. Their bounded search budgets
-            # decide whether one or two AI queries are used.
+            # Both modes share one cached three-query plan. Their bounded
+            # provider budgets decide how much of that plan can be used.
             expansion_count,
             level=None,
             should_cancel=should_cancel,
