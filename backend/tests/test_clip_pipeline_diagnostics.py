@@ -2615,6 +2615,14 @@ def test_explicit_edges_use_caption_tokens_when_native_words_do_not_align() -> N
     assert "lexical_boundary_verified" not in projection
 
 
+def test_deep_boundary_deadline_reserves_silence_and_two_groq_edges() -> None:
+    assert pipeline_module.GROQ_BOUNDARY_TIMEOUT_SEC >= 15.0
+    assert pipeline_module.clip_engine_silence.DEEP_PHASE_TIMEOUT_SEC >= (
+        pipeline_module.clip_engine_silence.DEFAULT_TIMEOUT_SEC
+        + 2 * pipeline_module.GROQ_BOUNDARY_TIMEOUT_SEC
+    )
+
+
 def test_direct_adapter_uses_groq_words_after_ambiguous_edge_silence_fails(
     monkeypatch,
 ) -> None:

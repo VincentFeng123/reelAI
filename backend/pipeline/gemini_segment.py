@@ -49,6 +49,7 @@ _SELECTOR_OPERATIONS = frozenset({
     "flash_boundary_selector",
     "flash_single_candidate",
     "pro_authoritative",
+    "pro_boundary_audit",
     "pro_fallback",
 })
 _selector_call_slots = BoundedSemaphore(_SELECTOR_CALL_LIMIT)
@@ -1672,7 +1673,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v3"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v12"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v13"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -1700,6 +1701,7 @@ _BOUNDARY_OUTPUT_TOKENS = 6_000
 # payload budget; two Fast or three Slow 30k-token text-only selectors still fit
 # their existing hard job-cost ceilings.
 _PRO_BOUNDARY_OUTPUT_TOKENS = 12_288
+_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS = 6_144
 # Calls cheap enough under a byte-per-token upper bound may use the local
 # estimate. Anything larger gets the provider's free exact count first, so two
 # Fast or three Slow selectors cannot collectively under-reserve past the job
@@ -1718,6 +1720,7 @@ _SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
 _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
+_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_boundary_audit_v2"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
 
 _PRICING_VERSION = "gemini-standard-2026-07-11"
@@ -1775,7 +1778,13 @@ class _IntentConstraint(_StrictModel):
             "this atomic constraint."
         )
     )
-    requirement: _NonBlank
+    requirement: _NonBlank = Field(
+        description=(
+            "A context-complete statement of the requested requirement. A nested term such "
+            "as a component, variable, unit, or step must retain its governing named object "
+            "or relationship; never turn one shared word into an independent topical anchor."
+        )
+    )
 
 
 class _RequestIntent(_StrictModel):
@@ -1926,7 +1935,10 @@ class _CompactIntentEvidence(_StrictModel):
             "unit fulfills the named constraint or ground a supporting unit's substantive "
             "educational connection to that constraint. The quote must belong to the same "
             "atomic teaching objective as sq, eq, cq, title, obj, and facet; never cite an "
-            "earlier completed prerequisite or a later adjacent lesson."
+            "earlier completed prerequisite or a later adjacent lesson. The proposition "
+            "containing the quote must actually teach the context-complete requirement; "
+            "using one requested word as an operand, symbol, unit, or example label does "
+            "not ground it."
         ),
     )
 
@@ -1955,7 +1967,8 @@ class _CompactBoundaryTopic(_StrictModel):
             "independently understandable spoken sentence or independent clause. Never "
             "begin at a prior sentence's trailing clause, complement, list item, or clipped "
             "completion. 'Shortest' controls only this matching quote's word count, never "
-            "the semantic span or clip duration. It must occur uniquely inside the s:e "
+            "the semantic span or clip duration. Its first token must be a complete spoken "
+            "word, never a caption-window fragment. It must occur uniquely inside the s:e "
             "range and may continue across adjacent caption lines; ignore acoustic silence "
             "and never include earlier speech for a pause."
         ),
@@ -1970,9 +1983,12 @@ class _CompactBoundaryTopic(_StrictModel):
             "last word must finish a complete concluding sentence or independent clause, "
             "never stop at a leading clause, sentence prefix, or unfilled predicate. "
             "'Shortest' controls only this matching quote's word count, never the semantic "
-            "span or clip duration. It must occur uniquely inside the s:e range and may "
-            "begin across adjacent caption lines; ignore acoustic silence and never include "
-            "later speech for a pause."
+            "span or clip duration. Its final token must be a complete spoken word, never a "
+            "caption-window fragment. If the word, sentence, answer, or same-objective "
+            "reasoning continues in a later cue, increase e and continue to the complete "
+            "conclusion. It must occur uniquely inside the s:e range and may begin across "
+            "adjacent caption lines; ignore acoustic silence and never include later speech "
+            "for a pause."
         ),
     )
     claim_quote: _CompactEvidenceQuote = Field(
@@ -2182,9 +2198,10 @@ _POLICY_AND_EXAMPLES = """Policy:
   not enough: "force" does not ground "net force", and "units" does not ground the units of a
   named law. A different governing law, equation, theory, system, or domain is not supporting
   material merely because it uses the same algebra, variables, units, or vocabulary.
-- Return a candidate only when informativeness, topic_relevance, and educational_importance
-  are each at least 0.75 and the spoken unit satisfies every substantive, grounding,
-  context, and filler rule.
+- Score informativeness, topic_relevance, and educational_importance honestly as metadata,
+  never as numeric eligibility gates. Return every related, coherent, substantive teaching
+  unit that satisfies the grounding, context, and filler rules above; omit it only under those
+  spoken-content rules, not because a subjective score falls below a fixed threshold.
 - Copy exact transcript line IDs and exact opening/closing quotes. start_quote must be the
   first words a cold viewer needs to hear for this one teaching objective, after every
   atmospheric hook, scene-setting flourish, or opening joke. end_quote must be the last
@@ -2243,33 +2260,34 @@ def _topic_rule(topic: str) -> str:
         compound_rule = (
             "For an explicit comparison request, a primary unit must teach every named side "
             "and the requested relationship in one self-contained span. Also return complete "
-            "supporting units that substantively teach a named side or comparison mechanism. "
+            "supporting units that substantively teach a named side as their own objective in "
+            "the requested comparison, or teach its explicitly requested comparison mechanism. "
         )
     elif "," in topic or ";" in topic:
         compound_rule = (
             "When the request lists multiple required ideas, a primary unit must fulfill all "
-            "of them unless the wording presents alternatives. Also return complete supporting "
-            "units that substantively teach any listed idea. Require the relationship between "
-            "components only for primary comparison, connection, or joint-application units. "
+            "of them unless the wording presents alternatives. The list does not turn a "
+            "component word into an independent topical anchor for supporting material. "
         )
     elif _EXPLICIT_TRANSITION_REQUEST_RE.search(topic):
         compound_rule = (
             "For an explicit transition request, a primary unit must name both endpoints and "
-            "teach the transition between them. Also return substantive supporting units about "
-            "either named endpoint or a mechanism used in that transition. "
+            "teach the transition between them. A supporting unit's own objective must teach "
+            "a named endpoint's role in that transition or a requested transition mechanism. "
         )
     elif _EXPLICIT_CONJUNCTIVE_REQUEST_RE.search(topic):
         compound_rule = (
             "For an explicit conjunctive request, a primary unit fulfills every named "
-            "component and constraint. Also return complete supporting units that substantively "
-            "teach one or more named components. "
+            "component and constraint. A supporting unit's own objective must substantively "
+            "teach a named component's meaning or role in the governing request. "
         )
     else:
         compound_rule = (
             "When the request names multiple linked ideas, tasks, objects, formats, or "
             "outcomes, a primary candidate fulfills every required part. Supporting candidates "
-            "may substantively teach one required part or a directly connected example, "
-            "mechanism, prerequisite, verification, or application. "
+            "must make one required part or its role in the governing request their own "
+            "substantive teaching objective; a directly connected example qualifies when its "
+            "own objective applies the exact requested method or relationship. "
         )
     return (
         f"The TOPIC is the user's original prompt, exactly {topic!r}. Never substitute a "
@@ -2283,6 +2301,13 @@ def _topic_rule(topic: str) -> str:
         "merely names the subject, course, institution, or speaker, or belongs to an adjacent "
         "field without a useful connection to the request. "
         f"{compound_rule}"
+        "A listed component may be SUPPORTING only when the candidate's own atomic objective "
+        "teaches that component's meaning or role in the exact request, explicitly connects "
+        "it to the request's governing subject or relationship, or applies the exact requested "
+        "technical method. Merely mentioning or using the component inside another objective, "
+        "law, equation, theory, system, or domain is not support. A component that is the "
+        "explicit subject of its own requested definition or explanation may qualify; a "
+        "component merely used while teaching a different subject may not. "
         "When the topic requests "
         "identification, recognition, diagnosis, derivation, comparison, or application, "
         "a primary unit must actually perform that task for the named object and reach any "
@@ -2775,10 +2800,11 @@ def _boundary_prompts(
         "coherent teaching unit, such as material dominated by filler or transcript noise. "
         f"{visual_rule}"
         "4. Score topic relevance, information density, educational value, and difficulty "
-        "honestly. Return a unit only when topic_relevance, informativeness, and "
-        "educational_importance are each at least 0.75. Difficulty records prior knowledge "
-        "only: 0.00-0.33 means beginner, 0.34-0.66 means intermediate, and 0.67-1.00 means "
-        "advanced. Difficulty is always metadata, never an eligibility filter. Qualifying "
+        "honestly. These scores are metadata, never numeric eligibility gates. Return every "
+        "related, coherent, substantive teaching unit admitted by the spoken-content rules "
+        "above. Difficulty records prior knowledge only: 0.00-0.33 means beginner, "
+        "0.34-0.66 means intermediate, and 0.67-1.00 means advanced. Difficulty is always "
+        "metadata, never an eligibility filter. Qualifying "
         "units may span the entire scale; the backend stores and defers units outside the "
         "current learner's fit.\n"
         "5. Return every distinct qualifying unit. Set substantive and factually_grounded true "
@@ -2789,6 +2815,30 @@ def _boundary_prompts(
         "candidate_id, include the best available setup inside its span, and set self and "
         "stand honestly. A false self or stand value alone is not an omission reason.\n"
         f"{_compact_output_guide()}\n"
+        "MANDATORY FINAL ADMISSION AUDIT (silent): For each proposed topic, answer from its "
+        "obj, cq, and ie: 'What concrete new ability or understanding for the exact request "
+        "does this clip teach?' Keep the topic only when the answer names a requested subject, "
+        "role, relationship, technical method, step, or application and the cited speech "
+        "actually teaches it. Omit the topic when the only honest connection is a shared noun, "
+        "variable, symbol, unit, broad field, generic task or format, or use of a requested "
+        "component inside a different governing law, equation, theory, system, or domain. A "
+        "nested component qualifies only when this candidate's own atomic objective and cq "
+        "teach its meaning or role in the requested governing topic, explicitly connect it to "
+        "that topic, or apply the exact requested technical method. Score rel from that actual "
+        "objective and teaching claim, never from an isolated matching word in ie. Prefer no "
+        "topic from a loosely related source over a broad-field match. Do not output this audit.\n"
+        "MANDATORY FINAL EDGE AUDIT (silent): Read the literal sq-through-eq span as a cold "
+        "listener and inspect its neighboring cues. sq's first token and eq's last token must "
+        "be complete spoken words, not cue or window fragments. Caption boundaries are never "
+        "semantic boundaries. If a word, sentence, reasoning chain, answer, qualification, or "
+        "same-objective explanation continues into a later cue, increase e and continue to the "
+        "first complete same-objective conclusion. If the tail starts a new subject with a "
+        "coordinator or transition but does not complete its predicate—for example, 'And the "
+        "comparison subject...' or 'But the second case...'—either extend through that required "
+        "complete thought when it belongs to the same objective or move eq back before that "
+        "tail. If the supplied transcript itself ends before completion, keep the otherwise "
+        "good candidate at the widest grounded cue range, set self and stand honestly, and "
+        "never omit it solely for boundary uncertainty. Do not output this audit.\n"
         f"Return only the object {{request_intent, topics}}. Every topic must contain "
         f"{_selection_fields(enriched=False, compact=True)}. The ie list must be nonempty and "
         "use {id, q} items where id is the constraint_id and q is an exact consecutive 5-16 "
@@ -2860,6 +2910,88 @@ def _boundary_repair_prompts(
         + "\n\nRepair only the preceding candidates. For each safe repair return "
           "candidate_id, start_line, end_line, start_quote, and end_quote. Each line ID "
           "must come from that candidate's corresponding allowed list."
+    )
+    return system, user, allowed
+
+
+def _pro_boundary_audit_prompts(
+    plan: _CompactBoundaryPlan,
+    segments: list[dict],
+    topic: str,
+) -> tuple[
+    str,
+    str,
+    dict[str, tuple[int, set[int], set[int]]],
+]:
+    """Render one text-only, non-dropping audit of Gemini's own word edges."""
+    allowed: dict[str, tuple[int, set[int], set[int]]] = {}
+    blocks: list[str] = []
+    cue_count = len(segments)
+    transcript_lines = set(range(cue_count))
+    for index, candidate in enumerate(plan.topics):
+        audit_id = f"candidate-{index + 1}"
+        start_lines = set(transcript_lines)
+        end_lines = set(transcript_lines)
+        allowed[audit_id] = (index, start_lines, end_lines)
+        blocks.append(
+            f"<candidate audit_id={audit_id!r}>\n"
+            f"original id: {candidate.candidate_id}\n"
+            f"title: {candidate.title}\n"
+            f"learning objective: {candidate.learning_objective}\n"
+            f"facet: {candidate.facet}\n"
+            f"current s/e: {candidate.start_line}/{candidate.end_line}\n"
+            f"current sq: {candidate.start_quote!r}\n"
+            f"current eq: {candidate.end_quote!r}\n"
+            f"allowed start/end line ID range: 0-{cue_count - 1}\n"
+            "</candidate>"
+        )
+
+    rendered_cues = "\n".join(
+        f"[{index}] {_mmss(segments[index].get('start', 0.0))} "
+        f"{str(segments[index].get('text') or '').strip()}"
+        for index in range(cue_count)
+    )
+    system = (
+        "You are the final boundary auditor for educational clips already selected by "
+        "Gemini. You receive transcript text only; no video, image, audio, URL, frame, or "
+        "visual metadata is attached. Preserve every candidate and its semantic objective. "
+        "You may correct only start_line, end_line, start_quote, and end_quote. Never add, "
+        "remove, reject, merge, split, rank, or semantically reclassify a candidate. Return "
+        "exactly one item for every audit_id, even when the best answer is to repeat its "
+        "current boundaries. Do not provide reasoning."
+    )
+    user = (
+        f"Exact user request: {topic.strip() or '(all educational topics)'}\n\n"
+        "<full_transcript_cues>\n"
+        f"{rendered_cues}\n"
+        "</full_transcript_cues>\n\n"
+        + "\n\n".join(blocks)
+        + "\n\nFor every candidate, reread its literal sq-through-eq speech as a cold "
+          "listener. Its first and final tokens must be complete spoken words. The opening "
+          "must include the candidate's own necessary setup and resolved referents. The ending "
+          "must finish its same-objective sentence, reasoning, answer, qualification, and "
+          "conclusion. Caption punctuation, cue edges, and silence are not semantic endings. "
+          "If a word or thought continues into a later cue, increase end_line and end only at "
+          "the first complete same-objective conclusion. If the current tail begins a new "
+          "clause or subject but leaves its predicate unfinished, either include that whole "
+          "same-objective thought or move end_quote back before the incomplete tail. Never "
+          "stop after a coordinator plus a newly introduced subject, such as 'And the second "
+          "subject'; continue through its predicate, or stop before the coordinator. If the "
+          "transcript corrupts a final word and then "
+          "starts a different objective, do not invent the missing letters and do not append "
+          "the different objective; move end_quote back to the last complete conclusion for "
+          "this candidate. Context and wholeness outrank brevity, and there is no duration "
+          "target. Boundary uncertainty is never a reason to omit a candidate.\n\n"
+          "Do not widen an already complete opening merely to include navigation or generic "
+          "framing such as 'Now the next law you need to know' or 'Now here is another "
+          "example.' When the following speech itself names the law, object, or scenario, "
+          "begin at that complete teaching setup and leave the navigation outside.\n\n"
+          "Each returned candidate_id must be the audit_id exactly. start_line and end_line "
+          "must be valid IDs from the supplied full transcript. "
+          "start_quote and end_quote must each be the shortest unique 1-16 exact consecutive "
+          "transcript words inside the returned inclusive line range. Their first/last words "
+          "are the semantic edges. Quotes may cross adjacent cues but may not skip, stitch, "
+          "reorder, paraphrase, or correct transcript text. Return only {items}."
     )
     return system, user, allowed
 
@@ -18610,6 +18742,114 @@ def _boundary_selector_content(
     return transcript_prompt, None, False
 
 
+def _audit_pro_boundaries(
+    plan: _CompactBoundaryPlan,
+    segments: list[dict],
+    topic: str,
+    settings: dict,
+    *,
+    deadline: float,
+    cancelled: CancelledCb,
+) -> tuple[_CompactBoundaryPlan, list[dict]]:
+    """Let Pro correct its word edges without ever dropping a selected topic."""
+    if not plan.topics:
+        return plan, []
+    system, user, allowed = _pro_boundary_audit_prompts(plan, segments, topic)
+    sink = settings.get("_segment_telemetry")
+    try:
+        audit, call = _call_model(
+            system,
+            user,
+            _BoundaryRepairPlan,
+            model=config.SEGMENT_PRO_MODEL,
+            thinking_level="low",
+            max_output_tokens=_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS,
+            timeout_s=_PRO_TIMEOUT_S,
+            deadline_monotonic=deadline,
+            operation="pro_boundary_audit",
+            prompt_version=_PRO_BOUNDARY_AUDIT_PROMPT_VERSION,
+            cancelled=cancelled,
+            budget_reserve=settings.get("_segment_budget_reserve"),
+            budget_reconcile=settings.get("_segment_budget_reconcile"),
+            max_retries=0,
+        )
+        call["video_grounded"] = False
+        calls = [call]
+    except Exception as exc:
+        telemetry = _exception_telemetry(exc)
+        if telemetry:
+            telemetry.setdefault("error_type", type(exc).__name__)
+            telemetry["video_grounded"] = False
+        calls = [telemetry] if telemetry else []
+        _emit(
+            sink,
+            "boundary_audit",
+            attempted_count=len(plan.topics),
+            applied_count=0,
+            reason=f"request_failure:{type(exc).__name__}",
+        )
+        return plan, calls
+
+    if not isinstance(audit, _BoundaryRepairPlan):
+        return plan, calls
+
+    replacements: dict[int, _CompactBoundaryTopic] = {}
+    seen: set[str] = set()
+    for item in audit.items:
+        audit_id = str(item.candidate_id)
+        permitted = allowed.get(audit_id)
+        if permitted is None or audit_id in seen:
+            continue
+        seen.add(audit_id)
+        index, start_lines, end_lines = permitted
+        if (
+            item.start_line not in start_lines
+            or item.end_line not in end_lines
+            or item.end_line < item.start_line
+            or not 1 <= len(_toks(item.start_quote)) <= 16
+            or not 1 <= len(_toks(item.end_quote)) <= 16
+        ):
+            continue
+        start_anchor = _unique_boundary_anchor(
+            segments,
+            item.start_quote,
+            item.start_line,
+            item.end_line,
+        )
+        end_anchor = _unique_boundary_anchor(
+            segments,
+            item.end_quote,
+            item.start_line,
+            item.end_line,
+        )
+        if (
+            start_anchor is None
+            or end_anchor is None
+            or start_anchor.first_word_position > end_anchor.last_word_position
+        ):
+            continue
+        replacements[index] = plan.topics[index].model_copy(update={
+            "start_line": item.start_line,
+            "end_line": item.end_line,
+            "start_quote": item.start_quote,
+            "end_quote": item.end_quote,
+        })
+
+    audited_topics = [
+        replacements.get(index, topic_item)
+        for index, topic_item in enumerate(plan.topics)
+    ]
+    _emit(
+        sink,
+        "boundary_audit",
+        attempted_count=len(plan.topics),
+        returned_count=len(seen),
+        applied_count=len(replacements),
+        retained_count=len(plan.topics) - len(replacements),
+    )
+    return plan.model_copy(update={"topics": audited_topics}), calls
+
+
 def _run_selection_profile(
     profile: str,
     transcript: dict,
@@ -18725,40 +18965,93 @@ def _run_selection_profile(
     )
     retry_capacity_once = retry_flash_capacity_once or retry_pro_capacity_once
     operation = str(settings.get("_segment_operation") or operation)
-    parsed, call = _call_model(
-        system,
-        selector_user,
-        schema,
-        model=model,
-        thinking_level=level,
-        max_output_tokens=cap,
-        timeout_s=timeout,
-        deadline_monotonic=deadline,
-        operation=operation,
-        prompt_version=profile,
-        cancelled=cancelled,
-        budget_reserve=settings.get("_segment_budget_reserve"),
-        budget_reconcile=settings.get("_segment_budget_reconcile"),
-        # A confirmed 503 may receive one bounded retry on the same model. This
-        # follows Gemini's transient-capacity guidance without adding another
-        # billable selection, changing model tiers, or allowing an open-ended wait.
-        max_retries=1 if retry_capacity_once else 0,
-        retry_status_codes=(
-            frozenset({503}) if retry_capacity_once else None
-        ),
-        failover_model=(
-            config.SEGMENT_FLASH_FALLBACK_MODEL
-            if (
-                profile == FLASH_SPLIT_PROFILE
-                and not video_grounded
-                and settings.get("_segment_allow_flash_lite_failover") is True
-            )
-            else None
-        ),
-        media_resolution=media_resolution,
-        estimated_media_tokens=estimated_media_tokens,
-    )
+    def invoke_selector() -> tuple[BaseModel, dict]:
+        return _call_model(
+            system,
+            selector_user,
+            schema,
+            model=model,
+            thinking_level=level,
+            max_output_tokens=cap,
+            timeout_s=timeout,
+            deadline_monotonic=deadline,
+            operation=operation,
+            prompt_version=profile,
+            cancelled=cancelled,
+            budget_reserve=settings.get("_segment_budget_reserve"),
+            budget_reconcile=settings.get("_segment_budget_reconcile"),
+            # A confirmed 503 may receive one bounded retry on the same model.
+            # This follows Gemini's transient-capacity guidance without changing
+            # model tiers or allowing an open-ended wait.
+            max_retries=1 if retry_capacity_once else 0,
+            retry_status_codes=(
+                frozenset({503}) if retry_capacity_once else None
+            ),
+            failover_model=(
+                config.SEGMENT_FLASH_FALLBACK_MODEL
+                if (
+                    profile == FLASH_SPLIT_PROFILE
+                    and not video_grounded
+                    and settings.get("_segment_allow_flash_lite_failover") is True
+                )
+                else None
+            ),
+            media_resolution=media_resolution,
+            estimated_media_tokens=estimated_media_tokens,
+        )
+
+    calls: list[dict] = []
+    try:
+        parsed, call = invoke_selector()
+    except _SchemaResponseError as first_exc:
+        # A provider-successful response can occasionally be malformed JSON. Give
+        # only the authoritative text-only Pro selector one separately budgeted
+        # retry with the identical transcript prompt; semantic results are never
+        # retried merely because they contain few or unexpected clips.
+        first_call = _exception_telemetry(first_exc)
+        first_call.update({
+            "error_type": type(first_exc).__name__,
+            "video_grounded": video_grounded,
+        })
+        first_exc.telemetry = first_call
+        if profile != PRO_BOUNDARY_PROFILE:
+            raise
+        first_call.update({
+            "schema_retry_attempt": 1,
+            "schema_retry_reason": "invalid_structured_response",
+        })
+        if _cancel_requested(cancelled) or deadline <= time.monotonic():
+            raise
+        calls.append(first_call)
+        try:
+            parsed, call = invoke_selector()
+        except Exception as retry_exc:
+            retry_call = _exception_telemetry(retry_exc)
+            retry_call.setdefault("error_type", type(retry_exc).__name__)
+            retry_call.update({
+                "video_grounded": video_grounded,
+                "schema_retry_attempt": 2,
+                "schema_retry_exhausted": True,
+            })
+            # Preserve both billable attempts if the bounded retry also fails.
+            retry_exc.selection_attempt_calls = [first_call, retry_call]
+            raise
+        call.update({
+            "schema_retry_attempt": 2,
+            "schema_retry_recovered": True,
+        })
     call["video_grounded"] = video_grounded
+    calls.append(call)
+    if profile == PRO_BOUNDARY_PROFILE and isinstance(parsed, _CompactBoundaryPlan):
+        parsed, boundary_audit_calls = _audit_pro_boundaries(
+            parsed,
+            segments,
+            topic,
+            settings,
+            deadline=deadline,
+            cancelled=cancelled,
+        )
+        calls.extend(boundary_audit_calls)
     require_enrichment = profile in {CORRECTED_PRO_PROFILE, FLASH_SINGLE_PROFILE}
     conversion_settings = dict(settings)
     conversion_settings["_segment_video_grounded"] = video_grounded
@@ -18792,7 +19085,6 @@ def _run_selection_profile(
         ]
         report.proposed_count += len(clean_rejections)
         report.rejected_reasons = clean_rejections + report.rejected_reasons
-    calls = [call]
     if (
         profile in {FLASH_SPLIT_PROFILE, PRO_BOUNDARY_PROFILE}
         and not conversion_settings.get("_segment_trust_gemini_semantics")
@@ -19002,8 +19294,13 @@ def run_segment_profile(
     except Exception as exc:  # callers decide whether an invalid profile should fall back
         if _cancel_requested(cancelled):
             raise
-        call = _exception_telemetry(exc)
-        calls = [call] if call else []
+        attempt_calls = getattr(exc, "selection_attempt_calls", None)
+        if isinstance(attempt_calls, list):
+            calls = [dict(item) for item in attempt_calls if isinstance(item, dict)]
+            call = calls[-1] if calls else {}
+        else:
+            call = _exception_telemetry(exc)
+            calls = [call] if call else []
         error_type = str(call.get("error_type") or type(exc).__name__)
         failure_reason = f"request_failure:{error_type}"
         status_code = call.get("provider_status_code")
@@ -19071,7 +19368,8 @@ def _authoritative_pro(transcript: dict, settings: dict, topic: str, deadline: f
         deadline_monotonic=deadline, cancelled=cancelled,
     )
     for call in result.calls:
-        call["operation"] = operation
+        if str(call.get("operation") or "") != "pro_boundary_audit":
+            call["operation"] = operation
     return result
 
 

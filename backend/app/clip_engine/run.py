@@ -69,7 +69,7 @@ def is_valid_timestamped_supadata_transcript(transcript: dict) -> bool:
 
 def _segment_usage_stage(operation: object) -> str:
     normalized = str(operation or "").casefold()
-    if normalized == "flash_boundary_repair":
+    if normalized in {"flash_boundary_repair", "pro_boundary_audit"}:
         return "repair"
     if "enrichment" in normalized:
         return "enrichment"

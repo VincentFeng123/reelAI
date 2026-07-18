@@ -133,7 +133,10 @@ GROQ_BOUNDARY_END_POSTROLL_SEC = 0.12
 GROQ_BOUNDARY_NEIGHBOR_GUARD_SEC = 0.01
 GROQ_BOUNDARY_WINDOW_SEC = 12.0
 GROQ_BOUNDARY_WINDOW_MARGIN_SEC = 2.0
-GROQ_BOUNDARY_TIMEOUT_SEC = 8.0
+# Live boundary windows regularly need 9-12 seconds including local WAV decode
+# and the provider round trip. Keep the request bounded while leaving enough
+# headroom for a healthy short-window transcription to finish.
+GROQ_BOUNDARY_TIMEOUT_SEC = 15.0
 _QUOTE_WORD_RE = re.compile(
     r"[\w+#]+(?:['\u2018\u2019\u02bc-][\w+#]+)*",
     re.UNICODE,

@@ -60,6 +60,8 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     calls: list[dict] = []
     candidate_tokens = 500
     prompt_tokens = 10_006
+    audit_prompt_tokens = 1_000
+    audit_candidate_tokens = 100
 
     monkeypatch.setattr(
         gemini_client,
@@ -68,7 +70,28 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     )
 
     def generate(_system, user, _schema, **kwargs):
-        calls.append({"user": user, **kwargs})
+        calls.append({"user": user, "schema": _schema, **kwargs})
+        if _schema is gemini_segment._BoundaryRepairPlan:
+            return SimpleNamespace(
+                text=gemini_segment._BoundaryRepairPlan(items=[{
+                    "candidate_id": "candidate-1",
+                    "start_line": 0,
+                    "end_line": 0,
+                    "start_quote": "Newton's second law says that",
+                    "end_quote": "mass times its acceleration",
+                }]).model_dump_json(),
+                telemetry={
+                    "model": kwargs["model"],
+                    "operation": kwargs["operation"],
+                    "prompt_version": kwargs["prompt_version"],
+                    "thinking_level": kwargs["thinking_level"],
+                    "finish_reason": "STOP",
+                    "prompt_tokens": audit_prompt_tokens,
+                    "candidate_tokens": audit_candidate_tokens,
+                    "thought_tokens": 0,
+                    "total_tokens": audit_prompt_tokens + audit_candidate_tokens,
+                },
+            )
         if (
             kwargs["max_output_tokens"]
             < _OBSERVED_PRO_THOUGHT_TOKENS
@@ -139,8 +162,8 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     assert result.error is None
     assert result.accepted_count == 1
     assert result.clips[0]["selection_candidate_id"] == "newton-second-law"
-    assert len(calls) == 1
-    [call] = calls
+    assert len(calls) == 2
+    call, audit_call = calls
     assert isinstance(call["user"], str)
     assert call["media_resolution"] is None
     assert call["model"] == "gemini-3.1-pro-preview"
@@ -153,14 +176,198 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     )
     assert result.calls[0]["video_grounded"] is False
     assert result.calls[0]["reserved_output_tokens"] == call["max_output_tokens"]
+    assert audit_call["schema"] is gemini_segment._BoundaryRepairPlan
+    assert audit_call["operation"] == "pro_boundary_audit"
+    assert audit_call["thinking_level"] == "low"
+    assert audit_call["media_resolution"] is None
+    assert result.calls[1]["video_grounded"] is False
 
     budget = context.budget.snapshot()["gemini"]
     expected_actual_cost = (
         prompt_tokens * 2.0
         + (candidate_tokens + _OBSERVED_PRO_THOUGHT_TOKENS) * 12.0
+        + audit_prompt_tokens * 2.0
+        + audit_candidate_tokens * 12.0
     ) / 1_000_000.0
     assert budget["selector_calls"] == 1
+    assert budget["boundary_audit_calls"] == 1
     assert budget["committed_cost_usd"] == pytest.approx(expected_actual_cost)
+    assert budget["inflight_reserved_cost_usd"] == 0.0
+
+
+def test_text_only_pro_retries_one_malformed_structured_response(
+    monkeypatch,
+) -> None:
+    """A billable malformed Pro response gets one identical text-only retry."""
+    plan = _newton_plan()
+    context = GenerationContext("fast", generation_id="pro-schema-retry")
+    generated: list[dict] = []
+
+    monkeypatch.setattr(
+        gemini_client,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 10_000,
+    )
+
+    def generate(_system, user, schema, **kwargs):
+        generated.append({"user": user, "schema": schema, **kwargs})
+        prompt_tokens = (
+            10_000 if schema is gemini_segment._CompactBoundaryPlan else 500
+        )
+        candidate_tokens = 100
+        thought_tokens = 25
+        telemetry = {
+            "model": kwargs["model"],
+            "operation": kwargs["operation"],
+            "prompt_version": kwargs["prompt_version"],
+            "thinking_level": kwargs["thinking_level"],
+            "finish_reason": "STOP",
+            "prompt_tokens": prompt_tokens,
+            "candidate_tokens": candidate_tokens,
+            "thought_tokens": thought_tokens,
+            "total_tokens": prompt_tokens + candidate_tokens + thought_tokens,
+        }
+        if schema is gemini_segment._CompactBoundaryPlan and sum(
+            call["schema"] is gemini_segment._CompactBoundaryPlan
+            for call in generated
+        ) == 1:
+            return SimpleNamespace(text="{malformed", telemetry=telemetry)
+        if schema is gemini_segment._BoundaryRepairPlan:
+            text = gemini_segment._BoundaryRepairPlan(items=[{
+                "candidate_id": "candidate-1",
+                "start_line": 0,
+                "end_line": 0,
+                "start_quote": "Newton's second law says that",
+                "end_quote": "mass times its acceleration",
+            }]).model_dump_json()
+        else:
+            text = plan.model_dump_json(by_alias=True)
+        return SimpleNamespace(text=text, telemetry=telemetry)
+
+    monkeypatch.setattr(gemini_client, "generate_json_v3", generate)
+
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "supadata-cue-0",
+                "start": 0.0,
+                "end": 8.0,
+                "text": (
+                    "Newton's second law says that the net force on an object "
+                    "equals its mass times its acceleration."
+                ),
+            }],
+            "words": [],
+            "source": "supadata",
+        },
+        {
+            "_segment_operation": "pro_authoritative",
+            "_segment_budget_reserve": context.reserve_gemini_call,
+            "_segment_budget_reconcile": context.reconcile_gemini_call,
+        },
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic="Newton's second law F=ma",
+        deadline_monotonic=time.monotonic() + 90.0,
+    )
+
+    assert result.error is None
+    assert result.accepted_count == 1
+    assert [call["schema"] for call in generated] == [
+        gemini_segment._CompactBoundaryPlan,
+        gemini_segment._CompactBoundaryPlan,
+        gemini_segment._BoundaryRepairPlan,
+    ]
+    assert generated[0]["user"] == generated[1]["user"]
+    assert isinstance(generated[0]["user"], str)
+    assert generated[0]["media_resolution"] is None
+    assert generated[1]["media_resolution"] is None
+    assert generated[0]["max_retries"] == 0
+    assert generated[1]["max_retries"] == 0
+    assert result.calls[0]["error_type"] == "_SchemaResponseError"
+    assert result.calls[0]["schema_retry_attempt"] == 1
+    assert result.calls[0]["video_grounded"] is False
+    assert result.calls[1]["schema_retry_attempt"] == 2
+    assert result.calls[1]["schema_retry_recovered"] is True
+    assert result.calls[1]["video_grounded"] is False
+    assert result.calls[2]["operation"] == "pro_boundary_audit"
+
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["selector_calls"] == 2
+    assert budget["boundary_audit_calls"] == 1
+    assert budget["committed_cost_usd"] == pytest.approx(0.0455)
+    assert budget["inflight_reserved_cost_usd"] == 0.0
+
+
+def test_text_only_pro_stops_after_two_malformed_structured_responses(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("fast", generation_id="pro-schema-retry-exhausted")
+    generated: list[dict] = []
+
+    monkeypatch.setattr(
+        gemini_client,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 10_000,
+    )
+
+    def generate(_system, user, schema, **kwargs):
+        generated.append({"user": user, "schema": schema, **kwargs})
+        assert schema is gemini_segment._CompactBoundaryPlan
+        return SimpleNamespace(
+            text="{malformed",
+            telemetry={
+                "model": kwargs["model"],
+                "operation": kwargs["operation"],
+                "prompt_version": kwargs["prompt_version"],
+                "thinking_level": kwargs["thinking_level"],
+                "finish_reason": "STOP",
+                "prompt_tokens": 10_000,
+                "candidate_tokens": 100,
+                "thought_tokens": 25,
+                "total_tokens": 10_125,
+            },
+        )
+
+    monkeypatch.setattr(gemini_client, "generate_json_v3", generate)
+
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "supadata-cue-0",
+                "start": 0.0,
+                "end": 8.0,
+                "text": (
+                    "Newton's second law says that the net force on an object "
+                    "equals its mass times its acceleration."
+                ),
+            }],
+            "words": [],
+            "source": "supadata",
+        },
+        {
+            "_segment_operation": "pro_authoritative",
+            "_segment_budget_reserve": context.reserve_gemini_call,
+            "_segment_budget_reconcile": context.reconcile_gemini_call,
+        },
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic="Newton's second law F=ma",
+        deadline_monotonic=time.monotonic() + 90.0,
+    )
+
+    assert result.error is not None
+    assert len(generated) == 2
+    assert all(isinstance(call["user"], str) for call in generated)
+    assert all(call["media_resolution"] is None for call in generated)
+    assert len(result.calls) == 2
+    assert result.calls[0]["schema_retry_attempt"] == 1
+    assert result.calls[1]["schema_retry_attempt"] == 2
+    assert result.calls[1]["schema_retry_exhausted"] is True
+    assert all(call["video_grounded"] is False for call in result.calls)
+
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["selector_calls"] == 2
+    assert budget["boundary_audit_calls"] == 0
+    assert budget["committed_cost_usd"] == pytest.approx(0.043)
     assert budget["inflight_reserved_cost_usd"] == 0.0
 
 

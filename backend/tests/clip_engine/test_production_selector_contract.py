@@ -8244,7 +8244,318 @@ def test_boundary_prompt_requires_cross_domain_subject_anchoring_and_context() -
     assert "end eq after the unit" in normalized
     assert "the first word of sq and last word of eq are final semantic edges" in normalized
     assert "do not rely on downstream code to fix an incomplete thought" in normalized
-    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v12"
+    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v13"
+
+
+@pytest.mark.parametrize(
+    "topic",
+    [
+        "Explain Bayes' theorem, including priors, likelihoods, and posteriors",
+        "Compare negligence and strict liability, including duty and causation",
+        "Explain quicksort pivot selection, partitioning, and complexity",
+        "Explain photosynthesis and how light energy becomes stored chemical energy",
+    ],
+)
+def test_boundary_prompt_requires_each_supporting_objective_to_advance_governing_topic(
+    topic: str,
+) -> None:
+    system, user = gemini_segment._boundary_prompts(
+        "[0] 00:00 A neighboring concept happens to reuse one requested word.",
+        1,
+        topic,
+    )
+    normalized = " ".join(f"{system}\n{user}".split()).casefold()
+
+    assert "any listed idea" not in normalized
+    assert "mandatory final admission audit (silent)" in normalized
+    assert (
+        "what concrete new ability or understanding for the exact request does this clip teach"
+        in normalized
+    )
+    assert (
+        "the candidate's own atomic objective teaches that component's meaning or role"
+        in normalized
+    )
+    assert (
+        "merely mentioning or using the component inside another objective, law, equation, "
+        "theory, system, or domain is not support"
+    ) in normalized
+    assert (
+        "shared noun, variable, symbol, unit, broad field, generic task or format"
+        in normalized
+    )
+    assert "do not output this audit" in normalized
+
+
+def test_compact_schema_and_final_audit_require_context_complete_evidence_and_edges() -> None:
+    schema = gemini_segment._CompactBoundaryPlan.model_json_schema()
+    definitions = schema["$defs"]
+    constraint_description = definitions["_IntentConstraint"]["properties"][
+        "requirement"
+    ]["description"]
+    evidence_description = definitions["_CompactIntentEvidence"]["properties"][
+        "q"
+    ]["description"]
+    start_description = definitions["_CompactBoundaryTopic"]["properties"][
+        "sq"
+    ]["description"]
+    end_description = definitions["_CompactBoundaryTopic"]["properties"][
+        "eq"
+    ]["description"]
+
+    assert "context-complete" in constraint_description
+    assert "governing named object or relationship" in constraint_description
+    assert "actually teach" in evidence_description
+    assert "operand, symbol, unit, or example label" in evidence_description
+    assert "complete spoken word" in start_description
+    assert "complete spoken word" in end_description
+    assert "later cue" in end_description
+
+    system, user = gemini_segment._boundary_prompts(
+        "\n".join([
+            "[0] 00:00 The first case reaches a complete result. And the comparison subject",
+            "[1] 00:08 changes less because the same input acts on a larger quantity.",
+        ]),
+        2,
+        "Explain how one quantity changes a system's response to the same input",
+    )
+    normalized = " ".join(f"{system}\n{user}".split()).casefold()
+    assert "mandatory final edge audit (silent)" in normalized
+    assert "caption boundaries are never semantic boundaries" in normalized
+    assert "increase e and continue to the first complete same-objective conclusion" in normalized
+    assert "and the comparison subject" in normalized
+    assert "move eq back before that tail" in normalized
+    assert "never omit it solely for boundary uncertainty" in normalized
+
+
+def test_pro_boundary_audit_repairs_words_but_can_never_drop_a_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain how mass changes acceleration under the same net force"
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "Both people experience the same force, but the smaller person moves "
+                "farther. And the larger person"
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 7.8,
+            "end": 14.0,
+            "text": (
+                "he is not going to move back very much since he experiences a smaller "
+                "acceleration. Another law begins here."
+            ),
+        },
+    ]
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": [{
+                "constraint_id": "relationship",
+                "kind": "relationship",
+                "source_phrase": "mass changes acceleration",
+                "requirement": "Explain how mass changes acceleration under the same force",
+            }],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="same-force-different-mass",
+            start_line=0,
+            end_line=0,
+            start_quote="Both people experience the same force",
+            end_quote="And the larger person",
+            claim_quote="the smaller person moves farther. And the larger person",
+            title="Same Force, Different Acceleration",
+            learning_objective="Explain why more mass yields less acceleration for one force",
+            facet="mass and acceleration",
+            informativeness=0.95,
+            topic_relevance=0.98,
+            educational_importance=0.95,
+            difficulty=0.2,
+            directly_teaches_topic=False,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[{
+                "id": "relationship",
+                "q": "smaller person moves farther. And the larger person",
+            }],
+        )],
+    )
+    system, user, _allowed = gemini_segment._pro_boundary_audit_prompts(
+        plan, segments, request,
+    )
+    normalized = " ".join(f"{system}\n{user}".split()).casefold()
+    assert "preserve every candidate" in normalized
+    assert "never add, remove, reject, merge, split" in normalized
+    assert "no video, image, audio, url, frame" in normalized
+    assert "coordinator plus a newly introduced subject" in normalized
+    assert "<full_transcript_cues>" in user
+    assert "do not widen an already complete opening merely to include navigation" in normalized
+
+    audit = gemini_segment._BoundaryRepairPlan(items=[{
+        "candidate_id": "candidate-1",
+        "start_line": 0,
+        "end_line": 1,
+        "start_quote": "Both people experience the same force",
+        "end_quote": "since he experiences a smaller acceleration",
+    }])
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        lambda *_args, **_kwargs: (
+            audit,
+            {"model": "gemini-3.1-pro-preview", "operation": "pro_boundary_audit"},
+        ),
+    )
+    repaired, calls = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert len(repaired.topics) == len(plan.topics) == 1
+    assert repaired.topics[0].end_line == 1
+    assert repaired.topics[0].end_quote == "since he experiences a smaller acceleration"
+    assert calls[0]["video_grounded"] is False
+
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        lambda *_args, **_kwargs: (
+            gemini_segment._BoundaryRepairPlan(items=[]),
+            {"model": "gemini-3.1-pro-preview", "operation": "pro_boundary_audit"},
+        ),
+    )
+    retained, _calls = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+    assert retained == plan
+
+
+def test_pro_boundary_audit_schema_failure_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _compact_custom_plan(
+        request="Bayes' theorem",
+        start_quote="Bayes' theorem updates a prior probability",
+        end_quote="using the likelihood of the observed evidence",
+        claim_quote=(
+            "Bayes' theorem updates a prior probability using the likelihood of "
+            "the observed evidence"
+        ),
+    )
+    segments = [{
+        "cue_id": "cue-0",
+        "start": 0.0,
+        "end": 8.0,
+        "text": (
+            "Bayes' theorem updates a prior probability using the likelihood of "
+            "the observed evidence."
+        ),
+    }]
+    attempted = 0
+
+    def fail_audit(*_args, **kwargs):
+        nonlocal attempted
+        attempted += 1
+        assert kwargs["operation"] == "pro_boundary_audit"
+        raise gemini_segment._SchemaResponseError(
+            "invalid boundary audit response",
+            {
+                "model": "gemini-3.1-pro-preview",
+                "operation": "pro_boundary_audit",
+                "prompt_tokens": 500,
+            },
+        )
+
+    monkeypatch.setattr(gemini_segment, "_call_model", fail_audit)
+    retained, calls = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        "Bayes' theorem",
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert attempted == 1
+    assert retained == plan
+    assert len(calls) == 1
+    assert calls[0]["operation"] == "pro_boundary_audit"
+    assert calls[0]["error_type"] == "_SchemaResponseError"
+    assert calls[0]["video_grounded"] is False
+
+
+def test_pro_boundary_audit_can_repair_beyond_two_coarse_cues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain how evidence changes a Bayesian posterior"
+    segments = [
+        {
+            "cue_id": f"cue-{index}",
+            "start": float(index * 8),
+            "end": float((index + 1) * 8),
+            "text": text,
+        }
+        for index, text in enumerate([
+            "Bayesian updating begins with a prior probability and then",
+            "compares how likely the observed evidence would be under each hypothesis.",
+            "The likelihood weights hypotheses that better predict that evidence,",
+            "while the prior keeps earlier knowledge represented in the calculation.",
+            "After normalizing those weighted values, the result is",
+            "the posterior probability after observing the evidence.",
+        ])
+    ]
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="Bayesian updating begins with a prior probability",
+        end_quote="and then",
+        claim_quote="Bayesian updating begins with a prior probability and then",
+    )
+    audit = gemini_segment._BoundaryRepairPlan(items=[{
+        "candidate_id": "candidate-1",
+        "start_line": 0,
+        "end_line": 5,
+        "start_quote": "Bayesian updating begins with a prior probability",
+        "end_quote": "the posterior probability after observing the evidence",
+    }])
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        lambda *_args, **_kwargs: (
+            audit,
+            {"model": "gemini-3.1-pro-preview", "operation": "pro_boundary_audit"},
+        ),
+    )
+
+    repaired, _calls = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert repaired.topics[0].start_line == 0
+    assert repaired.topics[0].end_line == 5
+    assert repaired.topics[0].end_quote == (
+        "the posterior probability after observing the evidence"
+    )
 
 
 def test_boundary_prompt_stays_transcript_only_when_video_is_requested() -> None:
@@ -11891,10 +12202,10 @@ def test_selector_prompt_is_exhaustive_for_primary_and_supporting_units() -> Non
     assert "keep the complete object in one atomic constraint" in user
     assert "every distinct educational unit" in user
     assert "whole transcript" in (_system + user).lower()
-    assert (
-        "informativeness, topic_relevance, and educational_importance\n"
-        "  are each at least 0.75"
-    ) in (_system + user)
+    assert "scores are metadata, never numeric eligibility gates" in (
+        _system + user
+    ).lower()
+    assert "each at least 0.75" not in (_system + user)
     assert "current-fit difficulty band is 0.00-0.40" in user
     assert "level is metadata, never selection eligibility" in user.lower()
     assert "defers or reuses out-of-level units" in user.lower()

@@ -37,7 +37,7 @@ VerificationStatus = Literal["verified", "context_aligned", "unavailable"]
 PreparationStatus = Literal["ready", "unavailable"]
 
 DEFAULT_TIMEOUT_SEC = 20.0
-DEEP_PHASE_TIMEOUT_SEC = 24.0
+DEEP_PHASE_TIMEOUT_SEC = 50.0
 DEFAULT_PREPARE_TIMEOUT_SEC = 24.0
 EDGE_WINDOW_SEC = 6.0
 QUIET_THRESHOLD_DBFS = -38.0

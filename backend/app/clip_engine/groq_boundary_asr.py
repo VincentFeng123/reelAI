@@ -24,6 +24,7 @@ MAX_BOUNDARY_WINDOW_SEC = 20.0
 MAX_BOUNDARY_WAV_BYTES = 2 * 1024 * 1024
 EXPECTED_SAMPLE_RATE = 16_000
 MIN_EXACT_EDGE_FRAGMENT_TOKENS = 4
+MAX_WORD_TIMESTAMP_OVERLAP_SEC = 0.25
 _LANGUAGE_RE = re.compile(r"^[a-z]{2}$")
 
 
@@ -111,17 +112,6 @@ def _absolute_words(
         text = _field(raw_word, "word")
         local_start = _finite_number(_field(raw_word, "start"))
         local_end = _finite_number(_field(raw_word, "end"))
-        trailing_partial = bool(
-            index == len(raw_words) - 1
-            and isinstance(text, str)
-            and text.strip()
-            and local_start is not None
-            and local_end is not None
-            and 0 <= local_start < decoded_duration_sec < local_end
-            and local_start >= previous_end
-        )
-        if trailing_partial:
-            break
         if (
             not isinstance(text, str)
             or not text.strip()
@@ -129,8 +119,26 @@ def _absolute_words(
             or local_end is None
             or local_start < 0
             or local_end <= local_start
-            or local_start < previous_end
-            or local_end > decoded_duration_sec
+        ):
+            return ()
+        if local_start < previous_end:
+            if (
+                previous_end - local_start > MAX_WORD_TIMESTAMP_OVERLAP_SEC
+                or local_end <= previous_end
+            ):
+                return ()
+            # Whisper occasionally reports a small overlap between consecutive
+            # words. Preserve the word sequence while assigning the shared
+            # acoustic interval to the preceding word.
+            local_start = previous_end
+        trailing_partial = bool(
+            index == len(raw_words) - 1
+            and 0 <= local_start < decoded_duration_sec < local_end
+        )
+        if trailing_partial:
+            break
+        if (
+            local_end > decoded_duration_sec
         ):
             return ()
         absolute_start = window_start_sec + local_start

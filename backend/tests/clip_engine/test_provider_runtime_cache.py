@@ -738,6 +738,34 @@ def test_authoritative_pro_uses_shared_bounded_selector_budget(
     assert budget["pro_call_limit"] == 0
 
 
+@pytest.mark.parametrize(("mode", "audit_limit"), [("fast", 2), ("slow", 3)])
+def test_pro_boundary_audit_has_a_separate_bounded_budget(
+    mode: str,
+    audit_limit: int,
+) -> None:
+    context = GenerationContext(mode, generation_id=f"job-boundary-audit-{mode}")
+
+    for _ in range(audit_limit):
+        context.reserve_gemini_call(
+            operation="pro_boundary_audit",
+            model="gemini-3.1-pro-preview",
+            prompt_text="candidate neighboring cues",
+            max_output_tokens=1024,
+        )
+    with pytest.raises(ProviderBudgetExceededError, match="boundary-audit budget"):
+        context.reserve_gemini_call(
+            operation="pro_boundary_audit",
+            model="gemini-3.1-pro-preview",
+            prompt_text="one more candidate window",
+            max_output_tokens=1024,
+        )
+
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["selector_calls"] == 0
+    assert budget["boundary_audit_calls"] == audit_limit
+    assert budget["boundary_audit_limit"] == audit_limit
+
+
 def test_generation_usage_payload_aggregates_stage_tokens_cost_and_fallbacks() -> None:
     context = GenerationContext("fast", generation_id="job-summary")
     context.record_gemini(

@@ -430,7 +430,7 @@ def test_groq_edge_fragment_requires_real_excluded_timed_neighbor() -> None:
         [{"word": "bad", "start": 1.8, "end": 2.1}],
         [
             {"word": "first", "start": 0.2, "end": 0.8},
-            {"word": "overlap", "start": 0.7, "end": 1.0},
+            {"word": "overlap", "start": 0.4, "end": 1.0},
         ],
         [
             {"word": "first", "start": 0.2, "end": 0.8},
@@ -439,7 +439,7 @@ def test_groq_edge_fragment_requires_real_excluded_timed_neighbor() -> None:
         ],
         [
             {"word": "first", "start": 0.2, "end": 1.85},
-            {"word": "overlap", "start": 1.8, "end": 2.1},
+            {"word": "overlap", "start": 1.5, "end": 2.1},
         ],
         [{"word": " ", "start": 0.1, "end": 0.2}],
     ],
@@ -462,6 +462,37 @@ def test_rejects_entire_response_for_invalid_or_unordered_word_timestamps(
         window_end_sec=12.0,
         timeout_sec=5.0,
     ) == ()
+
+
+def test_clamps_small_provider_timestamp_overlap_without_discarding_words(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    wav_path = tmp_path / "short.wav"
+    _write_wav(wav_path)
+    _install_decode(monkeypatch, wav_path)
+    client = _Client({
+        "words": [
+            {"word": "the", "start": 0.24, "end": 0.42},
+            {"word": "larger", "start": 0.24, "end": 0.66},
+            {"word": "person", "start": 0.66, "end": 1.1},
+        ]
+    })
+    monkeypatch.setenv("GROQ_API_KEY", "unit-test-key")
+    monkeypatch.setattr(groq_boundary_asr, "_create_client", lambda **_kwargs: client)
+
+    words = groq_boundary_asr.transcribe_boundary_words(
+        _prepared(),
+        window_start_sec=10.0,
+        window_end_sec=12.0,
+        timeout_sec=5.0,
+    )
+
+    assert [(word.text, word.onset_sec, word.end_sec) for word in words] == [
+        ("the", 10.24, 10.42),
+        ("larger", 10.42, 10.66),
+        ("person", 10.66, 11.1),
+    ]
 
 
 class _ProviderFailure(RuntimeError):

@@ -142,6 +142,7 @@ class GenerationBudget:
         "fast": 2,
         "slow": 3,
     }
+    _BOUNDARY_AUDIT_CALL_LIMIT = _SELECTOR_CALL_LIMIT
     # Compatibility alias for older diagnostics/tests.  The active production
     # selector may now be Flash or Pro, but the bounded per-source call count is
     # shared so upgrading the model cannot multiply provider spend.
@@ -168,6 +169,7 @@ class GenerationBudget:
         self._selector_calls = 0
         self._flash_selector_calls = 0
         self._pro_selector_calls = 0
+        self._boundary_audit_calls = 0
         self._pro_fallback_calls = 0
         self._lock = threading.Lock()
         self._gemini_condition = threading.Condition(self._lock)
@@ -226,6 +228,9 @@ class GenerationBudget:
         normalized_operation = str(operation or "").casefold()
         is_pro = "pro" in normalized_model or normalized_operation.startswith("pro_")
         is_pro_fallback = normalized_operation == "pro_fallback"
+        is_pro_boundary_audit = (
+            is_pro and normalized_operation == "pro_boundary_audit"
+        )
         is_pro_selector = is_pro and normalized_operation == "pro_authoritative"
         is_flash_selector = (
             not is_pro
@@ -237,6 +242,9 @@ class GenerationBudget:
             }
         )
         is_selector = is_flash_selector or is_pro_selector
+        is_allowed_pro_operation = (
+            is_pro_selector or is_pro_boundary_audit or is_pro_fallback
+        )
         reservation = max(0.0, float(estimated_cost_usd))
         cost_limit = self._GEMINI_COST_LIMIT_USD[self.mode]
 
@@ -268,7 +276,7 @@ class GenerationBudget:
                 )
 
             with self._gemini_condition:
-                if is_pro and not (is_pro_selector or is_pro_fallback):
+                if is_pro and not is_allowed_pro_operation:
                     raise ProviderBudgetExceededError(
                         "This Gemini Pro operation is disabled for generation.",
                         provider="gemini",
@@ -294,6 +302,17 @@ class GenerationBudget:
                         provider="gemini",
                         operation=operation,
                     )
+                if (
+                    is_pro_boundary_audit
+                    and self._boundary_audit_calls
+                    >= self._BOUNDARY_AUDIT_CALL_LIMIT[self.mode]
+                ):
+                    raise ProviderBudgetExceededError(
+                        "Gemini Pro boundary-audit budget exhausted "
+                        f"({self._BOUNDARY_AUDIT_CALL_LIMIT[self.mode]} maximum).",
+                        provider="gemini",
+                        operation=operation,
+                    )
                 inflight_cost = sum(self._gemini_inflight.values())
                 exposure = self._gemini_committed_cost_usd + inflight_cost
                 if exposure + reservation <= cost_limit + 1e-9:
@@ -309,6 +328,8 @@ class GenerationBudget:
                         self._flash_selector_calls += 1
                     if is_pro_selector:
                         self._pro_selector_calls += 1
+                    if is_pro_boundary_audit:
+                        self._boundary_audit_calls += 1
                     return reservation_id
 
                 # Settling in-flight work cannot reduce already committed
@@ -411,6 +432,8 @@ class GenerationBudget:
                     "flash_selector_limit": self._SELECTOR_CALL_LIMIT[self.mode],
                     "pro_selector_calls": self._pro_selector_calls,
                     "pro_selector_limit": self._SELECTOR_CALL_LIMIT[self.mode],
+                    "boundary_audit_calls": self._boundary_audit_calls,
+                    "boundary_audit_limit": self._BOUNDARY_AUDIT_CALL_LIMIT[self.mode],
                     # Keep the older names as compatibility aliases. These
                     # counters have always represented the fallback allowance,
                     # not ordinary authoritative Pro selectors.
