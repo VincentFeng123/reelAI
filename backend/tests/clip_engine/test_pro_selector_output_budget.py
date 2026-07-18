@@ -61,11 +61,9 @@ def _newton_audit_plan() -> gemini_segment._ProCandidateAuditPlan:
         "evidence_quote": (
             "net force on an object equals its mass times its acceleration"
         ),
-        "opening_objective": "Explain how net force, mass, and acceleration relate",
-        "opening_quote": "Newton's second law says that",
-        "opening_matches_actual_objective": True,
-        "current_context_resolved": True,
-        "start_action": "keep_current",
+        "direct_start_line": 0,
+        "direct_start_quote": "Newton's second law says that",
+        "direct_start_context_resolved": True,
         "start_line": 0,
         "end_line": 0,
         "start_quote": "Newton's second law says that",
@@ -73,13 +71,21 @@ def _newton_audit_plan() -> gemini_segment._ProCandidateAuditPlan:
     }])
 
 
-def test_v5_audit_budget_fits_forty_items_plus_observed_high_thinking() -> None:
-    base = _newton_audit_plan().items[0]
-    audit = gemini_segment._ProCandidateAuditPlan(items=[
-        base.model_copy(update={"candidate_id": f"candidate-{index}"})
-        for index in range(1, 41)
-    ])
-    payload_bytes = len(audit.model_dump_json().encode("utf-8"))
+def test_v6_audit_budget_fits_forty_items_plus_observed_high_thinking() -> None:
+    audit = gemini_segment._ProCandidateAuditPlan(items=[{
+        "id": f"candidate-{index}",
+        "d": "reject_filler_dominated",
+        "obj": "o" * 120,
+        "ev": "e" * 112,
+        "ds": 999,
+        "dq": "d" * 84,
+        "dc": True,
+        "s": 999,
+        "e": 999,
+        "sq": "s" * 84,
+        "eq": "q" * 84,
+    } for index in range(1, 41)])
+    payload_bytes = len(audit.model_dump_json(by_alias=True).encode("utf-8"))
     conservative_candidate_tokens = math.ceil(payload_bytes / 2)
 
     assert len(audit.items) == 40
@@ -210,7 +216,7 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     assert result.calls[0]["reserved_output_tokens"] == call["max_output_tokens"]
     assert audit_call["schema"] is gemini_segment._ProCandidateAuditPlan
     assert audit_call["operation"] == "pro_boundary_audit"
-    assert audit_call["prompt_version"] == "pro_candidate_audit_v5"
+    assert audit_call["prompt_version"] == "pro_candidate_audit_v6"
     assert audit_call["thinking_level"] == "high"
     assert audit_call["media_resolution"] is None
     assert gemini_segment._PRO_FINAL_AUDIT_RESERVED_S >= 60.0

@@ -2907,18 +2907,19 @@ def test_live_acceleration_groq_places_repaired_gemini_start_on_exact_word(
     )
     prepared = _ready_audio(duration_sec=128.97)
     exact_start = 76.12
+    guarded_start = exact_start - 0.10
     word = pipeline_module.clip_engine_silence.lexical_timing.LexicalWord
     groq_words = tuple(
-        word(text, onset)
-        for text, onset in (
-            ("hand", 75.86),
-            ("you're", exact_start),
-            ("now", 76.30),
-            ("ready", 76.52),
-            ("to", 76.68),
-            ("understand", 76.90),
-            ("acceleration", 77.28),
-            ("which", 77.52),
+        word(text, onset, end)
+        for text, onset, end in (
+            ("hand", 75.86, guarded_start),
+            ("you're", exact_start, 76.28),
+            ("now", 76.30, 76.50),
+            ("ready", 76.52, 76.66),
+            ("to", 76.68, 76.86),
+            ("understand", 76.90, 77.26),
+            ("acceleration", 77.28, 77.50),
+            ("which", 77.52, 77.70),
         )
     )
     verify_audio = mock.Mock(
@@ -2956,7 +2957,7 @@ def test_live_acceleration_groq_places_repaired_gemini_start_on_exact_word(
 
     assert len(verified) == 1
     assert verified[0]["selection_candidate_id"] == "acceleration-definition-units"
-    assert verified[0]["start"] == exact_start
+    assert verified[0]["start"] == pytest.approx(guarded_start)
     assert verified[0]["search_context"]["surface_eligible"] is True
     verify_audio.assert_called_once()
     assert transcribe.call_count == 3
@@ -2969,7 +2970,7 @@ def test_live_acceleration_groq_places_repaired_gemini_start_on_exact_word(
         "lexical_projection"
     ]
     assert projection["start"]["quote"] == start_quote
-    assert projection["start"]["required_speech_sec"] == exact_start
+    assert projection["start"]["required_speech_sec"] == pytest.approx(guarded_start)
     assert projection["start"]["timing_source"] == "groq_boundary_asr"
     assert projection["groq_boundary_asr"]["applied"] is True
 
@@ -3028,18 +3029,19 @@ def test_direct_rolling_caption_conflict_runs_groq_and_keeps_exact_start(
         },
     )
     exact_start = 76.12
+    guarded_start = exact_start - 0.10
     word = pipeline_module.clip_engine_silence.lexical_timing.LexicalWord
     start_words = tuple(
-        word(text, onset)
-        for text, onset in (
-            ("hand", 75.86),
-            ("you're", exact_start),
-            ("now", 76.30),
-            ("ready", 76.52),
-            ("to", 76.68),
-            ("understand", 76.90),
-            ("acceleration", 77.28),
-            ("which", 77.52),
+        word(text, onset, end)
+        for text, onset, end in (
+            ("hand", 75.86, guarded_start),
+            ("you're", exact_start, 76.28),
+            ("now", 76.30, 76.50),
+            ("ready", 76.52, 76.66),
+            ("to", 76.68, 76.86),
+            ("understand", 76.90, 77.26),
+            ("acceleration", 77.28, 77.50),
+            ("which", 77.52, 77.70),
         )
     )
     prepared = _ready_audio(duration_sec=128.97)
@@ -3067,7 +3069,7 @@ def test_direct_rolling_caption_conflict_runs_groq_and_keeps_exact_start(
 
     assert len(verified) == 1
     assert verified[0]["selection_candidate_id"] == "acceleration-definition"
-    assert verified[0]["start"] == exact_start
+    assert verified[0]["start"] == pytest.approx(guarded_start)
     assert verified[0]["end"] == 95.729
     assert verified[0]["search_context"]["surface_eligible"] is True
     projection = verified[0]["search_context"]["boundary_diagnostics"][
@@ -3134,18 +3136,19 @@ def test_topic_ingestion_persists_projected_start_when_only_end_corridor_conflic
         },
     )
     exact_start = 76.12
+    guarded_start = exact_start - 0.10
     word = pipeline_module.clip_engine_silence.lexical_timing.LexicalWord
     start_words = tuple(
-        word(text, onset)
-        for text, onset in (
-            ("hand", 75.86),
-            ("you're", exact_start),
-            ("now", 76.30),
-            ("ready", 76.52),
-            ("to", 76.68),
-            ("understand", 76.90),
-            ("acceleration", 77.28),
-            ("which", 77.52),
+        word(text, onset, end)
+        for text, onset, end in (
+            ("hand", 75.86, guarded_start),
+            ("you're", exact_start, 76.28),
+            ("now", 76.30, 76.50),
+            ("ready", 76.52, 76.66),
+            ("to", 76.68, 76.86),
+            ("understand", 76.90, 77.26),
+            ("acceleration", 77.28, 77.50),
+            ("which", 77.52, 77.70),
         )
     )
     prepared = _ready_audio(duration_sec=128.97)
@@ -3222,7 +3225,7 @@ def test_topic_ingestion_persists_projected_start_when_only_end_corridor_conflic
 
     assert reels == ["persisted-partial-start"]
     assert len(persisted) == 1
-    assert persisted[0]["start"] == exact_start
+    assert persisted[0]["start"] == pytest.approx(guarded_start)
     assert persisted[0]["end"] == 95.729
     boundary = persisted[0]["search_context"]
     assert boundary["surface_eligible"] is True
@@ -4511,13 +4514,74 @@ def test_groq_word_spans_add_safe_cushions_without_reaching_neighbor() -> None:
     )
 
     assert error is None
-    assert bounds == pytest.approx((0.9, 2.52))
+    assert bounds == pytest.approx((0.9, 2.42))
     assert projection["end"]["quote_last_end_sec"] == 2.4
     assert search_limits == pytest.approx((0.5, 2.6))
     assert aligned.status == "context_aligned"
     assert aligned.start_sec == pytest.approx(0.9)
-    assert aligned.end_sec == pytest.approx(2.52)
+    assert aligned.end_sec == pytest.approx(2.42)
+    assert aligned.end_sec == pytest.approx(
+        projection["end"]["quote_last_end_sec"] + 0.02
+    )
+    assert aligned.end_sec >= projection["end"]["quote_last_end_sec"]
     assert aligned.end_sec < projection["end"]["excluded_neighbor_onset_sec"]
+
+
+def test_groq_word_span_cushions_clamp_at_tight_neighbor_speech() -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:groq-tight-neighbors",
+        "duration": 4.0,
+        "segments": [
+            {
+                "cue_id": "unit",
+                "start": 0.0,
+                "end": 4.0,
+                "text": "before alpha beta finish next",
+            }
+        ],
+    }
+    clip = _quality_clip(
+        cue_id="unit",
+        start=0.0,
+        end=4.0,
+        quote="alpha beta finish",
+        edge_projection={
+            "start": {"cue_id": "unit", "quote": "alpha beta"},
+            "end": {"cue_id": "unit", "quote": "finish"},
+        },
+    )
+    caption = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert caption is not None
+    word = pipeline_module.clip_engine_silence.lexical_timing.LexicalWord
+    groq_words = tuple(
+        word(value, onset, end)
+        for value, onset, end in (
+            ("before", 0.60, 0.97),
+            ("alpha", 1.00, 1.18),
+            ("beta", 1.20, 1.45),
+            ("finish", 2.00, 2.40),
+            ("next", 2.405, 2.70),
+        )
+    )
+
+    bounds, projection, error = pipeline_module._projected_speech_bounds(
+        transcript,
+        clip,
+        caption,
+        None,
+        lexical_words=groq_words,
+        lexical_timing_source="groq_boundary_asr",
+    )
+
+    assert error is None
+    # The intended 100 ms lead-in is shortened when the previous word is close.
+    assert bounds[0] == pytest.approx(0.97)
+    # Never trim into the final word merely to create an end contraction.
+    assert bounds[1] == pytest.approx(2.40)
+    assert bounds[1] >= projection["end"]["quote_last_end_sec"]
+    assert bounds[1] < projection["end"]["excluded_neighbor_onset_sec"]
 
 
 def test_first_occurrence_projection_handles_a_repeated_formula_operand() -> None:
