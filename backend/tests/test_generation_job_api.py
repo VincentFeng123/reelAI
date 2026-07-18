@@ -4478,8 +4478,19 @@ def test_feed_returns_ranked_reels_when_autofill_is_throttled(
         conn.close()
 
 
-def test_feed_slow_reservoir_immediately_satisfies_fast_without_queuing(
+@pytest.mark.parametrize(
+    ("prior_mode", "prior_relevance", "current_mode", "current_relevance"),
+    [
+        ("slow", None, "fast", None),
+        ("fast", 0.3, "fast", 0.0),
+    ],
+)
+def test_feed_verified_reservoir_satisfies_compatible_request_without_queuing(
     monkeypatch,
+    prior_mode: str,
+    prior_relevance: float | None,
+    current_mode: str,
+    current_relevance: float | None,
 ) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
@@ -4489,7 +4500,7 @@ def test_feed_slow_reservoir_immediately_satisfies_fast_without_queuing(
         material_id="m1",
         concept_id=None,
         request_key="prior-level-request",
-        generation_mode="slow",
+        generation_mode=prior_mode,
         retrieval_profile="unified",
     )
     for index in range(3):
@@ -4510,20 +4521,22 @@ def test_feed_slow_reservoir_immediately_satisfies_fast_without_queuing(
             conn, "m1", None
         ),
         request_params={
-            "generation_mode": "slow",
+            "generation_mode": prior_mode,
             "num_reels": 12,
             "exclude_video_ids": [],
             "creative_commons_only": False,
-            "min_relevance": None,
+            "min_relevance": prior_relevance,
             "preferred_video_duration": "any",
             "knowledge_level": "beginner",
             "language": "en",
         },
     )
     ranked_generation_ids: list[str | None] = []
+    ranked_relevance_thresholds: list[float | None] = []
 
     def ranked(*_args, **kwargs):
         ranked_generation_ids.append(kwargs.get("generation_id"))
+        ranked_relevance_thresholds.append(kwargs.get("min_relevance"))
         return [
             {
                 "reel_id": f"verified-prior-reel-{index}",
@@ -4538,17 +4551,73 @@ def test_feed_slow_reservoir_immediately_satisfies_fast_without_queuing(
             object(),
             material_id="m1",
             autofill=True,
-            generation_mode="fast",
+            generation_mode=current_mode,
+            min_relevance=current_relevance,
         )
 
         assert response["generation_id"] == source_generation_id
         assert len(response["reels"]) == 5
         assert ranked_generation_ids == [source_generation_id]
+        assert ranked_relevance_thresholds == [current_relevance]
         queued = conn.execute(
             "SELECT * FROM reel_generation_jobs WHERE status = 'queued' "
             "ORDER BY created_at DESC, id DESC LIMIT 1"
         ).fetchone()
         assert queued is None
+    finally:
+        conn.close()
+
+
+def test_cross_request_reuse_prefers_exact_relevance_before_fallback() -> None:
+    conn = _conn()
+    completed_at = datetime.now(timezone.utc)
+    base_params = {
+        "generation_mode": "fast",
+        "num_reels": 9,
+        "exclude_video_ids": [],
+        "creative_commons_only": False,
+        "preferred_video_duration": "any",
+        "knowledge_level": "beginner",
+        "language": "en",
+    }
+    generation_ids: dict[float, str] = {}
+    for index, relevance in enumerate((0.0, 0.9)):
+        generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=f"relevance-{relevance}",
+            generation_mode="fast",
+            retrieval_profile="unified",
+        )
+        generation_ids[relevance] = generation_id
+        timestamp = (completed_at + timedelta(seconds=index)).isoformat()
+        _insert_generation_reel(
+            conn,
+            generation_id=generation_id,
+            reel_id=f"relevance-{relevance}-reel",
+            video_id=f"relevance-{relevance}-video",
+            created_at=timestamp,
+        )
+        _terminal_job_for_generation(
+            conn,
+            request_key=f"relevance-{relevance}",
+            generation_id=generation_id,
+            completed_at=timestamp,
+            content_fingerprint="same-fingerprint",
+            request_params={**base_params, "min_relevance": relevance},
+        )
+    try:
+        result = main._verified_cross_request_source_generation(
+            conn,
+            material_id="m1",
+            learner_id="learner-1",
+            request_key="new-request",
+            concept_id="c1",
+            content_fingerprint="same-fingerprint",
+            request_params={**base_params, "min_relevance": 0.0},
+        )
+        assert result == generation_ids[0.0]
     finally:
         conn.close()
 
@@ -4798,7 +4867,9 @@ def test_cross_request_source_query_avoids_untyped_null_parameters(
         ("same-fingerprint", {"knowledge_level": "advanced"}, True),
         ("same-fingerprint", {"language": "fr"}, False),
         ("same-fingerprint", {"exclude_video_ids": ["prior-video"]}, False),
-        ("same-fingerprint", {"min_relevance": 0.9}, False),
+        # Relevance is reapplied while ranking the reused chain. It must not
+        # force duplicate provider work or duplicate persistence by itself.
+        ("same-fingerprint", {"min_relevance": 0.9}, True),
     ],
 )
 def test_cross_request_reuse_checks_source_constraints_but_reuses_all_difficulties(

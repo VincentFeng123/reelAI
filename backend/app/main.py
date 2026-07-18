@@ -3533,6 +3533,7 @@ def _verified_cross_request_source_generation(
     expected_relevance = _normalize_min_relevance(
         request_params.get("min_relevance")
     )
+    cross_relevance_fallback: str | None = None
     for row in candidates:
         try:
             prior_params = json.loads(str(row.get("request_params_json") or "{}"))
@@ -3555,8 +3556,6 @@ def _verified_cross_request_source_generation(
                 prior_params.get("exclude_video_ids") or []
             ))
             != expected_exclusions
-            or _normalize_min_relevance(prior_params.get("min_relevance"))
-            != expected_relevance
         ):
             continue
         generation_id = str(row.get("result_generation_id") or "").strip()
@@ -3567,8 +3566,14 @@ def _verified_cross_request_source_generation(
             generation_id=generation_id,
             material_id=material_id,
         ):
-            return generation_id
-    return None
+            if (
+                _normalize_min_relevance(prior_params.get("min_relevance"))
+                == expected_relevance
+            ):
+                return generation_id
+            if cross_relevance_fallback is None:
+                cross_relevance_fallback = generation_id
+    return cross_relevance_fallback
 
 
 def _finalize_request_reel_order(
