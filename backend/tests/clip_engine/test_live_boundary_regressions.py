@@ -405,6 +405,97 @@ def test_dangling_article_and_same_sentence_preposition_are_incomplete_edges() -
     assert G._projected_end_continues_same_sentence(text, span)
 
 
+def test_live_newton_unit_derivation_requires_the_grounded_result() -> None:
+    request = "how force, mass, and acceleration are related by Newton's second law"
+    objective = "Explain how the Newton is derived as the SI unit of force"
+    incomplete_segments = [
+        _cue(
+            "newton-unit",
+            0,
+            0.0,
+            1.0,
+            "equation, F = ma. What it means is that we can do",
+        ),
+        _cue(
+            "newton-unit",
+            1,
+            1.0,
+            14.0,
+            "quantitative calculations relating the magnitude of a force applied "
+            "to an object, the mass of the object, and the magnitude of the "
+            "acceleration that object will experience,",
+        ),
+        _cue(
+            "newton-unit",
+            2,
+            14.0,
+            23.0,
+            "and it shows the derivation of the Newton as the SI unit of force "
+            "when we plug in 1 kilogram and one meter per second squared for mass "
+            "and acceleration.",
+        ),
+    ]
+    plan = _plan(
+        request=request,
+        start_line=0,
+        end_line=2,
+        start_quote="we can do quantitative calculations",
+        end_quote="for mass and acceleration",
+        claim_quote="shows the derivation of the Newton as the SI unit of force",
+        objective=objective,
+    )
+
+    incomplete = G._plan_to_report(
+        plan,
+        incomplete_segments,
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_trust_gemini_semantics": True,
+        },
+        topic=request,
+    )
+
+    assert incomplete.clips == []
+    assert "proposal_0:claimed_worked_result_missing" in incomplete.rejected_reasons
+
+    complete_segments = [
+        *incomplete_segments,
+        _cue(
+            "newton-unit",
+            3,
+            23.0,
+            27.0,
+            "That gives one Newton, equal to one kilogram meter per second squared.",
+        ),
+    ]
+    complete_plan = plan.model_copy(update={
+        "topics": [
+            plan.topics[0].model_copy(update={
+                "end_line": 3,
+                "end_quote": "one kilogram meter per second squared",
+            })
+        ],
+    })
+
+    complete = G._plan_to_report(
+        complete_plan,
+        complete_segments,
+        [],
+        {
+            "_segment_ignore_caption_case": True,
+            "_segment_trust_gemini_semantics": True,
+        },
+        topic=request,
+    )
+
+    assert complete.rejected_reasons == []
+    [clip] = complete.clips
+    assert clip["_clip_text"].endswith(
+        "That gives one Newton, equal to one kilogram meter per second squared"
+    )
+
+
 def test_split_condition_is_included_before_the_next_independent_topic() -> None:
     segments = [
         _cue("condition", 0, 0.0, 2.0, "The probability measures the observed result"),

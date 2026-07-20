@@ -494,7 +494,7 @@ test("generation finals cannot reconcile after their search scope is invalidated
     if (
       ts.isCallExpression(node)
       && node.expression.getText(sourceFile) === "reconcileGeneratedReels"
-      && node.arguments[2]?.getText(sourceFile) === "{ preserveUnmatchedUnseen: true }"
+      && node.arguments[2]?.getText(sourceFile) === "{ preserveUnmatchedUnseen: true, preserveUnmatchedLockedPrefix: true }"
     ) {
       let statement = node;
       while (statement.parent && !ts.isBlock(statement.parent)) {
@@ -511,7 +511,7 @@ test("generation finals cannot reconcile after their search scope is invalidated
     const reconciliationCall = reconciliation.call;
     assert.equal(
       reconciliationCall.arguments[2]?.getText(sourceFile),
-      "{ preserveUnmatchedUnseen: true }",
+      "{ preserveUnmatchedUnseen: true, preserveUnmatchedLockedPrefix: true }",
       "stream settlement must explicitly retain unmatched provisional rows",
     );
     const block = reconciliation.statement.parent;
@@ -747,7 +747,10 @@ test("feed-owned final inventory reconciles when no candidate event arrived", as
   assert.equal(reconciled.length, 1);
   assert.deepEqual(reconciled[0][0], []);
   assert.deepEqual(reconciled[0][1].map((reel) => reel.reel_id), ["final-a", "final-b"]);
-  assert.deepEqual(reconciled[0][2], { preserveUnmatchedUnseen: true });
+  assert.deepEqual(reconciled[0][2], {
+    preserveUnmatchedUnseen: true,
+    preserveUnmatchedLockedPrefix: true,
+  });
   assert.equal(isGeneratingRef.current, false);
 });
 
@@ -1208,19 +1211,25 @@ test("the Reel contract explicitly retains v4 selection metadata", () => {
 
 test("restored reconciliation removes cached unseen rows and stream settlement drops rejected provisionals", () => {
   const currentRows = [
-    { reel_id: "watched", video_url: "watched", video_title: "Watched" },
-    { reel_id: "current", video_url: "current", video_title: "Cached current" },
+    { reel_id: "confirmed-watched", video_url: "confirmed-watched", video_title: "Cached watched" },
+    { reel_id: "vanished-watched", video_url: "vanished-watched", video_title: "Vanished watched" },
+    { reel_id: "cached-current", video_url: "current", video_title: "Cached current" },
     { reel_id: "prior-unseen", video_url: "prior-unseen", video_title: "Prior unseen" },
     { reel_id: "rejected-provisional", video_url: "rejected-provisional", video_title: "Rejected provisional" },
   ];
   const reelsRef = { current: currentRows };
-  const activeIndexRef = { current: 1 };
-  const watchedFrontierIndexRef = { current: 1 };
+  const activeIndexRef = { current: 2 };
+  const watchedFrontierIndexRef = { current: 2 };
+  const pendingResumeRef = {
+    current: { index: 2, reelId: "cached-current", updatedAt: 123 },
+  };
   let renderedRows = currentRows;
+  let renderedActiveIndex = activeIndexRef.current;
   const callback = compileUseCallback("reconcileGeneratedReels", {
     reelsRef,
     activeIndexRef,
     watchedFrontierIndexRef,
+    pendingResumeRef,
     reelClipKey: (reel) => reel.video_url,
     dedupeByIdentity: (rows) => {
       const seen = new Set();
@@ -1230,6 +1239,9 @@ test("restored reconciliation removes cached unseen rows and stream settlement d
       reelsRef.current = rows;
       renderedRows = rows;
     },
+    setActiveIndex: (index) => {
+      renderedActiveIndex = index;
+    },
     setTotal: () => {},
   });
 
@@ -1237,7 +1249,12 @@ test("restored reconciliation removes cached unseen rows and stream settlement d
     [],
     [
       {
-        reel_id: "current",
+        reel_id: "confirmed-watched",
+        video_url: "confirmed-watched",
+        video_title: "Authoritative watched",
+      },
+      {
+        reel_id: "authoritative-current",
         video_url: "current",
         video_title: "",
         captions: [],
@@ -1246,26 +1263,45 @@ test("restored reconciliation removes cached unseen rows and stream settlement d
       },
       { reel_id: "new-unseen", video_url: "new-unseen", video_title: "New unseen" },
     ],
-    { preserveUnmatchedUnseen: false },
+    {
+      preserveUnmatchedUnseen: false,
+      preserveUnmatchedLockedPrefix: false,
+    },
   );
-  assert.deepEqual(renderedRows.map((row) => row.reel_id), ["watched", "current", "new-unseen"]);
+  assert.deepEqual(
+    renderedRows.map((row) => row.reel_id),
+    ["confirmed-watched", "authoritative-current", "new-unseen"],
+    "a vanished cached row must not remain feedback-eligible after page-one reconciliation",
+  );
+  assert.equal(renderedRows[0].video_title, "Authoritative watched");
   assert.equal(renderedRows[1].video_title, "");
   assert.deepEqual(renderedRows[1].captions, []);
   assert.equal(renderedRows[1].t_start, 10.125);
   assert.equal(renderedRows[1].t_end, 30.875);
+  assert.equal(activeIndexRef.current, 1, "the visible reel must follow its canonical clip identity");
+  assert.equal(renderedActiveIndex, 1);
+  assert.deepEqual(
+    pendingResumeRef.current,
+    { index: 1, reelId: "authoritative-current", updatedAt: 123 },
+    "deferred resume must not reapply the stale numeric index after reconciliation",
+  );
 
   reelsRef.current = currentRows;
   callback(
     [{ reel_id: "rejected-provisional", video_url: "rejected-provisional" }],
     [
-      { reel_id: "current", video_url: "current", video_title: "Authoritative current" },
+      { reel_id: "confirmed-watched", video_url: "confirmed-watched", video_title: "Authoritative watched" },
+      { reel_id: "authoritative-current", video_url: "current", video_title: "Authoritative current" },
       { reel_id: "new-unseen", video_url: "new-unseen", video_title: "New unseen" },
     ],
-    { preserveUnmatchedUnseen: true },
+    {
+      preserveUnmatchedUnseen: true,
+      preserveUnmatchedLockedPrefix: true,
+    },
   );
   assert.deepEqual(
     renderedRows.map((row) => row.reel_id),
-    ["watched", "current", "new-unseen", "prior-unseen"],
+    ["confirmed-watched", "vanished-watched", "authoritative-current", "new-unseen", "prior-unseen"],
   );
 });
 
@@ -1305,7 +1341,10 @@ test("generation settlement freezes the watched frontier and preserves authorita
       { reel_id: "easy", video_url: "easy", difficulty: -2 },
       { reel_id: "tie-second", video_url: "tie-second", difficulty: 0.5 },
     ],
-    { preserveUnmatchedUnseen: true },
+    {
+      preserveUnmatchedUnseen: true,
+      preserveUnmatchedLockedPrefix: true,
+    },
   );
 
   assert.deepEqual(renderedRows.map((row) => row.reel_id), [
@@ -1356,7 +1395,7 @@ test("a restored feed reconciles durable inventory with its restored mode and a 
   assert.match(loadPageText, /autofill: allowServerAutofill/);
   assert.match(
     loadPageText,
-    /reconcileGeneratedReels\(\[\], fetchedReels, \{ preserveUnmatchedUnseen: false \}\)/,
+    /reconcileGeneratedReels\(\[\], fetchedReels, \{[\s\S]*preserveUnmatchedUnseen: false,[\s\S]*preserveUnmatchedLockedPrefix: false,[\s\S]*\}\)/,
   );
 
   const hydrationStart = source.indexOf("let restoredSession: FeedSessionSnapshot | null = null;");
@@ -1891,9 +1930,135 @@ test("missing-material history reopening stays free and surfaces an unavailable-
     /SAVED_SESSION_UNAVAILABLE_MESSAGE = "This saved session is no longer available\. Start a new search to continue\."/,
   );
   assert.match(callbackText, /setVisibleFeedError\(SAVED_SESSION_UNAVAILABLE_MESSAGE\)/);
-  assert.match(source, /material_id not found[\s\S]*showSavedSessionUnavailable\(\)/);
+  assert.match(source, /material_id not found[\s\S]*showSavedSessionUnavailable\(missingMaterialId\)/);
   assert.match(source, /error === SAVED_SESSION_UNAVAILABLE_MESSAGE[\s\S]*Saved session unavailable/);
   assert.match(source, /onClick=\{navigateBackToPreviousPage\}[\s\S]*Start a new search/);
+});
+
+test("missing material expiry removes only that stored session and progress", () => {
+  const values = new Map([
+    ["history", JSON.stringify([
+      { materialId: "expired", title: "Expired" },
+      { materialId: "keep", title: "Keep" },
+    ])],
+    ["sessions", JSON.stringify({
+      expired: { reels: ["stale"] },
+      keep: { reels: ["current"] },
+      legacy: { untouched: true },
+    })],
+    ["progress", JSON.stringify({
+      expired: { index: 3 },
+      keep: { index: 1 },
+    })],
+  ]);
+  const window = {
+    localStorage: {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => values.set(key, value),
+    },
+  };
+  const safeLocalStorageSetItem = (key, value) => {
+    window.localStorage.setItem(key, value);
+    return true;
+  };
+  const removeStoredMaterialMapEntry = compileFunctionDeclaration("removeStoredMaterialMapEntry", {
+    window,
+    safeLocalStorageSetItem,
+  });
+  let writtenAccountId = null;
+  const dropStoredMaterialSession = compileFunctionDeclaration("dropStoredMaterialSession", {
+    window,
+    readScopedHistorySnapshot: () => values.get("history"),
+    normalizeHistoryStorageItems: (rows) => rows,
+    writeScopedHistorySnapshot: (accountId, raw) => {
+      writtenAccountId = accountId;
+      values.set("history", raw);
+    },
+    removeStoredMaterialMapEntry,
+    FEED_SESSION_STORAGE_KEY: "sessions",
+    FEED_PROGRESS_STORAGE_KEY: "progress",
+  });
+
+  const nextHistory = dropStoredMaterialSession("expired", "account-a");
+
+  assert.equal(writtenAccountId, "account-a");
+  assert.deepEqual(nextHistory.map((item) => item.materialId), ["keep"]);
+  assert.deepEqual(Object.keys(JSON.parse(values.get("sessions"))), ["keep", "legacy"]);
+  assert.deepEqual(Object.keys(JSON.parse(values.get("progress"))), ["keep"]);
+});
+
+test("missing material expiry stops generation and assessment before showing the empty state", async () => {
+  const unavailableMaterialIdRef = { current: null };
+  const materialIdsForFeedRef = { current: ["expired"] };
+  const adaptiveExcludeReelIdsRef = { current: ["old-reel"] };
+  const pendingResumeRef = { current: { index: 2 } };
+  const resumeAppliedRef = { current: false };
+  const resumeLoadingRef = { current: true };
+  const bootstrapAttemptedRef = { current: false };
+  const assessmentStartRequestRef = { current: { promise: null } };
+  const pendingHistorySyncRef = { current: { items: [{ materialId: "expired" }] } };
+  const calls = [];
+  const callback = compileUseCallback("showSavedSessionUnavailable", {
+    materialId: "expired",
+    unavailableMaterialIdRef,
+    renewActiveSearchScope: () => calls.push("abort"),
+    clearGenerationTracking: () => calls.push("clear-generation"),
+    clearHistorySyncTimer: () => calls.push("clear-history-sync"),
+    pendingHistorySyncRef,
+    authAccountId: "account-a",
+    readCommunityAuthSession: () => null,
+    dropStoredMaterialSession: () => [{ materialId: "keep" }],
+    captureCommunitySessionContext: () => ({ accountId: "account-a", sessionToken: "token" }),
+    queueCommunityHistorySync: async (items) => { calls.push(["sync", items]); },
+    materialIdsForFeedRef,
+    adaptiveExcludeReelIdsRef,
+    pendingResumeRef,
+    resumeAppliedRef,
+    resumeLoadingRef,
+    bootstrapAttemptedRef,
+    assessmentStartRequestRef,
+    updateSessionReels: (rows) => calls.push(["reels", rows]),
+    setPage: () => {},
+    setTotal: () => {},
+    setActiveIndex: () => {},
+    activeIndexRef: { current: 2 },
+    watchedFrontierIndexRef: { current: 2 },
+    setFeedbackByReel: () => {},
+    setCanRequestMore: (value) => calls.push(["can-request", value]),
+    setFeedPagesExhausted: () => {},
+    setLoading: () => {},
+    setBootstrappingFirstReels: () => {},
+    setAssessmentSession: (value) => calls.push(["assessment", value]),
+    setAssessmentSlideActive: () => {},
+    setAssessmentGatePending: () => {},
+    setAssessmentBootstrapPending: (value) => calls.push(["assessment-bootstrap", value]),
+    setVisibleFeedError: (message) => calls.push(["error", message]),
+    SAVED_SESSION_UNAVAILABLE_MESSAGE: "unavailable",
+  });
+
+  callback("expired");
+  callback("expired");
+  await Promise.resolve();
+
+  assert.equal(unavailableMaterialIdRef.current, "expired");
+  assert.deepEqual(materialIdsForFeedRef.current, []);
+  assert.deepEqual(adaptiveExcludeReelIdsRef.current, []);
+  assert.equal(pendingResumeRef.current, null);
+  assert.equal(bootstrapAttemptedRef.current, true);
+  assert.equal(assessmentStartRequestRef.current, null);
+  assert.equal(pendingHistorySyncRef.current, null);
+  assert.equal(calls.filter((call) => call === "abort").length, 1, "expiry must be idempotent");
+  assert.ok(calls.some((call) => Array.isArray(call) && call[0] === "can-request" && call[1] === false));
+  assert.ok(calls.some((call) => Array.isArray(call) && call[0] === "assessment-bootstrap" && call[1] === false));
+  assert.ok(calls.some((call) => Array.isArray(call) && call[0] === "reels" && call[1].length === 0));
+  assert.ok(calls.some((call) => Array.isArray(call) && call[0] === "error" && call[1] === "unavailable"));
+
+  const assessmentBootstrapStart = source.indexOf("const response = await fetchPendingAssessment");
+  const assessmentBootstrapPrefix = source.slice(assessmentBootstrapStart - 900, assessmentBootstrapStart);
+  assert.match(assessmentBootstrapPrefix, /unavailableMaterialIdRef\.current === materialId/);
+  const sessionPersistenceStart = source.lastIndexOf("persistFeedSessionSnapshot(materialId");
+  const sessionPersistencePrefix = source.slice(sessionPersistenceStart - 900, sessionPersistenceStart);
+  assert.match(sessionPersistencePrefix, /unavailableMaterialIdRef\.current === materialId/);
 });
 
 test("feed billing failures block automatic provider retries until billing becomes available", () => {

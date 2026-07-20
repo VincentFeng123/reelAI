@@ -228,6 +228,12 @@ class FeedbackRequest(BaseModel):
     rating: int | None = Field(default=None, ge=1, le=5)
     saved: bool = False
 
+    @model_validator(mode="after")
+    def validate_learning_signal(self) -> "FeedbackRequest":
+        if self.helpful and self.confusing:
+            raise ValueError("Feedback cannot be both helpful and confusing.")
+        return self
+
 
 class FeedbackResponse(BaseModel):
     status: str

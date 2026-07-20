@@ -2393,11 +2393,17 @@ class ReelService:
         t_end = float(getattr(reel_obj, "t_end", 0.0) or 0.0)
         raw_informativeness = getattr(reel_obj, "informativeness", None)
         raw_difficulty = getattr(reel_obj, "difficulty", None)
+        persisted_concept_id = str(
+            getattr(reel_obj, "concept_id", "") or concept["id"]
+        )
+        persisted_concept_title = str(
+            getattr(reel_obj, "concept_title", "") or concept["title"]
+        )
         return {
             "reel_id": reel_obj.reel_id,
             "material_id": reel_obj.material_id,
-            "concept_id": concept["id"],
-            "concept_title": concept["title"],
+            "concept_id": persisted_concept_id,
+            "concept_title": persisted_concept_title,
             "video_id": video_id,
             "video_title": getattr(reel_obj, "video_title", "") or "",
             "video_description": getattr(reel_obj, "video_description", "") or "",
@@ -4543,7 +4549,30 @@ class ReelService:
                 should_cancel=should_cancel,
             )
         )
-        return [root_concept]
+        clip_concept_ids: set[str] = set()
+        for row in fetch_all(
+            conn,
+            "SELECT concept_id, search_context_json FROM reels WHERE material_id = ?",
+            (material_id,),
+        ):
+            try:
+                context = json.loads(str(row.get("search_context_json") or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            concept_row_id = str(row.get("concept_id") or "")
+            if (
+                isinstance(context, dict)
+                and concept_row_id
+                and str(context.get("clip_concept_id") or "") == concept_row_id
+            ):
+                clip_concept_ids.add(concept_row_id)
+        clip_concepts = [
+            dict(concept)
+            for concept in concepts
+            if str(concept.get("id") or "") in clip_concept_ids
+            and str(concept.get("id") or "") != str(root_concept.get("id") or "")
+        ]
+        return [root_concept, *clip_concepts]
 
     def _bootstrap_topic_keywords(
         self,
@@ -5330,6 +5359,24 @@ class ReelService:
                 (str(learner_id or LEGACY_LEARNER_ID), material_id),
             )
         }
+        try:
+            assessment_adjustments = {
+                str(row["concept_id"]): float(row["adjustment"] or 0.0)
+                for row in fetch_all(
+                    conn,
+                    """
+                    SELECT concept_id, COALESCE(SUM(adjustment), 0.0) AS adjustment
+                    FROM assessment_concept_outcomes
+                    WHERE learner_id = ? AND material_id = ?
+                    GROUP BY concept_id
+                    """,
+                    (str(learner_id or LEGACY_LEARNER_ID), material_id),
+                )
+            }
+        except sqlite3.OperationalError as exc:
+            if "no such table: assessment_concept_outcomes" not in str(exc):
+                raise
+            assessment_adjustments = {}
 
         def concept_key(concept: dict[str, Any]) -> tuple[float, int, str]:
             feedback = concept_feedback.get(concept["id"], {"helpful": 0.0, "confusing": 0.0, "avg_rating": 3.0})
@@ -5337,7 +5384,7 @@ class ReelService:
                 helpful=feedback["helpful"],
                 confusing=feedback["confusing"],
                 avg_rating=feedback["avg_rating"],
-            )
+            ) + assessment_adjustments.get(str(concept["id"]), 0.0)
             reel_count = concept_counts.get(concept["id"], 0)
             created = concept.get("created_at") or ""
             return (mastery, reel_count, created)
@@ -5974,7 +6021,9 @@ class ReelService:
         items: list[dict[str, Any]],
         *,
         level_target: float,
+        concept_coverage: dict[str, dict[str, float]],
         concept_adjustments: dict[str, float],
+        latest_feedback: dict[str, Any] | None,
         previous_video_id: str,
     ) -> list[dict[str, Any]]:
         """Priority topological sort for confidence-gated selection rows."""
@@ -6027,9 +6076,69 @@ class ReelService:
         satisfied: set[str] = set()
         ordered: list[dict[str, Any]] = []
         last_video = str(previous_video_id or "")
-        target_stage = self._selection_difficulty_stage(
-            {"difficulty": level_target}
+        remediation_signals = list(
+            (latest_feedback or {}).get("assessment_remediations") or []
         )
+        if (
+            not remediation_signals
+            and latest_feedback
+            and int(latest_feedback.get("confusing") or 0) > 0
+        ):
+            remediation_signals = [latest_feedback]
+        remediation_by_concept = {
+            str(signal.get("concept_id") or ""): signal
+            for signal in remediation_signals
+            if str(signal.get("concept_id") or "")
+        }
+
+        def adaptive_priority(node_id: str) -> tuple[Any, ...]:
+            item = nodes[node_id]
+            concept_id = str(item.get("concept_id") or "")
+            coverage = concept_coverage.get(concept_id, {})
+            adjustment = float(concept_adjustments.get(concept_id, 0.0))
+            exposure_priority = (
+                float(coverage.get("helpful") or 0.0)
+                - float(coverage.get("confusing") or 0.0)
+                + 4.0 * adjustment
+            )
+            remediation = remediation_by_concept.get(concept_id)
+            if remediation is None:
+                remediation_priority = 4
+            else:
+                easier = self._difficulty(item) < self._difficulty(remediation)
+                alternate_source = str(item.get("video_id") or "") != str(
+                    remediation.get("video_id") or ""
+                )
+                avoids_current_source = (
+                    not last_video
+                    or str(item.get("video_id") or "") != last_video
+                )
+                remediation_priority = (
+                    0
+                    if easier and alternate_source and avoids_current_source
+                    else 1
+                    if easier and avoids_current_source
+                    else 2
+                    if easier
+                    else 3
+                )
+            concept_target = max(
+                0.0,
+                min(1.0, level_target + adjustment),
+            )
+            target_stage = self._selection_difficulty_stage(
+                {"difficulty": concept_target}
+            )
+            return (
+                remediation_priority,
+                exposure_priority,
+                *self._selection_contract_sort_key(
+                    item,
+                    input_order=int(item.get("_selection_input_order") or 0),
+                    target_stage=target_stage,
+                ),
+            )
+
         while remaining:
             eligible = [
                 node_id
@@ -6060,13 +6169,7 @@ class ReelService:
 
             chosen_id = min(
                 eligible,
-                key=lambda node_id: self._selection_contract_sort_key(
-                    nodes[node_id],
-                    input_order=int(
-                        nodes[node_id].get("_selection_input_order") or 0
-                    ),
-                    target_stage=target_stage,
-                ),
+                key=adaptive_priority,
             )
             chosen = nodes[chosen_id]
             ordered.append(chosen)
@@ -6122,7 +6225,9 @@ class ReelService:
             return self._selection_contract_order(
                 versioned_items,
                 level_target=level_target,
+                concept_coverage=coverage,
                 concept_adjustments=adjustments,
+                latest_feedback=latest,
                 previous_video_id=previous_video_id,
             )
         queues: dict[str, list[dict[str, Any]]] = defaultdict(list)

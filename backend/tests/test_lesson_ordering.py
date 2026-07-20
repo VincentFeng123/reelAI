@@ -113,6 +113,122 @@ def test_orders_every_clip_and_returns_organizer_checkpoints(monkeypatch) -> Non
     assert "assessment_checkpoint_reel_ids" in captured["user"]
 
 
+def test_organizer_may_omit_a_mastered_concept(monkeypatch) -> None:
+    reels = [
+        _reel(
+            "mastered-repeat",
+            video_id="a",
+            start=0,
+            concept="force definition",
+            concept_id="force",
+        ),
+        _reel(
+            "net-force",
+            video_id="b",
+            start=0,
+            concept="net force",
+            concept_id="net-force",
+        ),
+        _reel(
+            "worked",
+            video_id="c",
+            start=0,
+            concept="worked example",
+            concept_id="worked-example",
+        ),
+    ]
+    captured: dict[str, str] = {}
+
+    def fake_generate(system_prompt, user_prompt, **_kwargs):
+        captured["system"] = system_prompt
+        captured["user"] = user_prompt
+        return _generation_result(["net-force", "worked"], ["worked"])
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="Newton's second law",
+        concept_signals={
+            "force": {
+                "helpful": 2,
+                "confusing": 0,
+                "adjustment": 0.08,
+            }
+        },
+    )
+
+    assert result.ordered_reel_ids == ["net-force", "worked"]
+    assert result.reels == [reels[1], reels[2]]
+    assert result.degraded is False
+    assert "may omit" in captured["system"]
+    assert '"concept_id":"force"' in captured["user"]
+    assert '"helpful":2.0' in captured["user"]
+    assert '"adjustment":0.08' in captured["user"]
+
+
+def test_organizer_subset_cannot_orphan_a_declared_prerequisite(monkeypatch) -> None:
+    reels = [
+        _reel(
+            "definition",
+            video_id="a",
+            start=0,
+            concept="definition",
+            selection_candidate_id="candidate-definition",
+        ),
+        _reel(
+            "example",
+            video_id="b",
+            start=0,
+            concept="example",
+            prerequisite_ids=["candidate-definition"],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *args, **kwargs: _generation_result(["example"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(reels, topic="topic")
+
+    assert result.reels == reels
+    assert result.degraded is True
+    assert result.fallback_reason == "invalid_model_order"
+
+
+def test_organizer_subset_cannot_skip_an_earlier_chain_member(monkeypatch) -> None:
+    reels = [
+        _reel(
+            "chain-one",
+            video_id="a",
+            start=0,
+            concept="setup",
+            chain_id="derivation",
+            chain_position=1,
+        ),
+        _reel(
+            "chain-two",
+            video_id="a",
+            start=20,
+            concept="result",
+            chain_id="derivation",
+            chain_position=2,
+        ),
+        _reel("independent", video_id="b", start=0, concept="recap"),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *args, **kwargs: _generation_result(["chain-two", "independent"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(reels, topic="topic")
+
+    assert result.reels == reels
+    assert result.degraded is True
+
+
 def test_explicit_empty_checkpoint_list_is_authoritative(monkeypatch) -> None:
     reels = [
         _reel("intro", video_id="a", start=0, concept="intro"),

@@ -249,8 +249,14 @@ class KnowledgeLevelApiTests(unittest.TestCase):
             json={"reel_id": reel_id, "helpful": False, "confusing": True, "rating": 2, "saved": False},
             headers=owner_b,
         )
+        contradictory = self.client.post(
+            "/api/reels/feedback",
+            json={"reel_id": reel_id, "helpful": True, "confusing": True},
+            headers=owner_a,
+        )
         self.assertEqual(got_it.status_code, 200, got_it.text)
         self.assertEqual(need_help.status_code, 200, need_help.text)
+        self.assertEqual(contradictory.status_code, 422, contradictory.text)
         with db_module.get_conn() as conn:
             rows = db_module.fetch_all(
                 conn,

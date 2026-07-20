@@ -588,6 +588,27 @@ _TERMINAL_EDGE_DISFLUENCY_RE = re.compile(
     r"(?:er+|hmm+|uh+|um+))\s*[.!?]?[\"')\]]*$",
     re.IGNORECASE,
 )
+_CLAIMED_WORKED_RESULT_SCOPE_RE = re.compile(
+    r"\b(?:calculat(?:e|ed|es|ing|ion)|comput(?:e|ed|es|ing|ation)|"
+    r"deriv(?:e|ed|es|ing|ation)|evaluat(?:e|ed|es|ing|ion)|"
+    r"prov(?:e|ed|es|ing)|solv(?:e|ed|es|ing)|solution)\b",
+    re.IGNORECASE,
+)
+_SUBSTITUTION_SETUP_RE = re.compile(
+    r"\b(?:(?:when|if|after)\s+(?:i|we|you)\s+"
+    r"(?:plug(?:ged|ging)?(?:\s+in)?|substitut(?:e|ed|ing)|insert(?:ed|ing)?)\b|"
+    r"(?:by|after)\s+(?:plugging(?:\s+in)?|substituting|inserting)\b)",
+    re.IGNORECASE,
+)
+_GROUNDED_WORKED_RESULT_RE = re.compile(
+    r"(?:=|\u2192|\u21d2)|"
+    r"\b(?:the\s+)?(?:answer|result|solution)\s+(?:is|equals?)\b|"
+    r"\b(?:equals?|is\s+equal\s+to|gives?|yields?|produces?|becomes?|"
+    r"comes?\s+(?:out\s+)?to|works?\s+out\s+to)\b|"
+    r"\b(?:i|we|you)\s+(?:arrive\s+at|get|obtain|find)\b|"
+    r"\b(?:therefore|thus|hence)\b",
+    re.IGNORECASE,
+)
 _TRAILING_FORWARD_SETUP_RE = re.compile(
     r"(?:^|[.!?]\s+)(?:but\s+)?what happens if\b.*?\?\s*"
     r"(?:now\s*[,]?\s*)?we\s+can(?:not|['’]t)\b[^.!?]*[.!?]?\s*$",
@@ -4355,6 +4376,32 @@ def _terminal_content_is_explicitly_incomplete(text: str) -> bool:
         or _TERMINAL_DANGLING_TRANSITIVE_RE.search(raw_text)
         or _TERMINAL_AUXILIARY_TRANSITIVE_RE.search(raw_text)
     )
+
+
+def _claimed_worked_result_is_missing(
+    text: str,
+    *,
+    scope_text: str,
+) -> bool:
+    """Reject a substitution setup that metadata overstates as completed work.
+
+    A substitution clause can be a grammatically complete sentence while still
+    stopping before the value or relation it promises to derive.  This guard is
+    intentionally narrow: it applies only when the clip metadata claims a
+    calculation/derivation and the selected speech itself contains a
+    substitution setup.  A result counts only when it is spoken after that
+    setup, so an earlier premise equation cannot masquerade as the conclusion.
+    """
+    raw_text = str(text or "").strip()
+    if (
+        _CLAIMED_WORKED_RESULT_SCOPE_RE.search(str(scope_text or "")) is None
+        or not raw_text
+    ):
+        return False
+    setups = list(_SUBSTITUTION_SETUP_RE.finditer(raw_text))
+    if not setups:
+        return False
+    return _GROUNDED_WORKED_RESULT_RE.search(raw_text[setups[-1].end():]) is None
 
 
 def _complete_prefix_end_quote(text: str) -> str:
@@ -17052,6 +17099,18 @@ def _trusted_universal_compact_plan_to_report(
             )
             else "supporting"
         )
+        if _claimed_worked_result_is_missing(
+            clip_text,
+            scope_text=" ".join(str(value or "") for value in (
+                proposal.title,
+                proposal.learning_objective,
+                proposal.facet,
+            )),
+        ):
+            report.rejected_reasons.append(
+                f"proposal_{index}:claimed_worked_result_missing"
+            )
+            continue
 
         base_id = str(proposal.candidate_id or f"candidate-{index + 1}")
         candidate_id = base_id
@@ -18230,6 +18289,18 @@ def _trusted_compact_plan_to_report(
         )
         if topic_evidence_quote != raw_model_claim_quote:
             diagnostics.append("claim_quote_reanchored")
+        if _claimed_worked_result_is_missing(
+            clip_text,
+            scope_text=" ".join(str(value or "") for value in (
+                proposal.title,
+                proposal.learning_objective,
+                proposal.facet,
+            )),
+        ):
+            report.rejected_reasons.append(
+                f"proposal_{index}:claimed_worked_result_missing"
+            )
+            continue
 
         base_id = str(proposal.candidate_id or f"candidate-{index + 1}")
         candidate_id = base_id
@@ -20338,6 +20409,19 @@ def _plan_to_report(
                 evidence_quote=topic_evidence_quote,
                 require_grounding=require_grounding,
             )
+        if _claimed_worked_result_is_missing(
+            clip_text,
+            scope_text=" ".join((
+                clip_title,
+                learning_objective,
+                clip_facet,
+                clip_reason,
+            )),
+        ):
+            report.rejected_reasons.append(
+                f"{prefix}:claimed_worked_result_missing"
+            )
+            continue
         cue_ids = [
             str(segments[line].get("cue_id") or f"cue-{line}")
             for line in range(a, b + 1)
@@ -20475,8 +20559,18 @@ def _plan_to_report(
 
 
 def _public_clips(clips: list[dict]) -> list[dict]:
-    return [{key: value for key, value in clip.items() if not key.startswith("_")}
-            for clip in clips]
+    public: list[dict] = []
+    for clip in clips:
+        item = {
+            key: value for key, value in clip.items() if not key.startswith("_")
+        }
+        concept = " ".join(
+            unicodedata.normalize("NFKC", str(item.get("facet") or "")).split()
+        ).strip()
+        if concept:
+            item["concept"] = concept
+        public.append(item)
+    return public
 
 
 def _plan_to_clips(plan: _Plan | _BoundaryPlan | _IntentBoundaryPlan | _LegacyPlan | _ProductionPlan,

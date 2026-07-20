@@ -43,7 +43,7 @@ DEFAULT_LEASE_SECONDS = 90
 DEFAULT_DEADLINE_SECONDS = 60 * 60
 DEFAULT_QUEUE_TTL_SECONDS = 8 * 60
 # Request-key version doubles as a production inventory compatibility gate.
-REQUEST_SCHEMA_VERSION = "quality_silence_v38"
+REQUEST_SCHEMA_VERSION = "adaptive_clip_concepts_v1"
 GENERATION_SUBMIT_ADVISORY_LOCK_ID = 0x5354554459524545
 
 
@@ -202,6 +202,7 @@ def build_request_key(
     min_relevance: float | None = None,
     exclude_video_ids: list[str] | tuple[str, ...] | set[str] | None = None,
     continuation_token: str | None = None,
+    adaptation_fingerprint: str = "",
 ) -> str:
     """Build the normalized request key; deprecated clip-duration fields are inert."""
     payload = {
@@ -226,6 +227,7 @@ def build_request_key(
             }
         ),
         "continuation_token": _normalize_text(continuation_token),
+        "adaptation_fingerprint": _normalize_text(adaptation_fingerprint),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

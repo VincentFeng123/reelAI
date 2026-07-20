@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 import threading
@@ -30,6 +31,9 @@ from backend.app.services import generation_jobs
 from backend.app.services.reels import ReelService
 
 
+EMPTY_ADAPTATION_FINGERPRINT = hashlib.sha256(b"{}").hexdigest()
+
+
 def test_generate_request_supports_full_material_inventory() -> None:
     assert ReelsGenerateRequest(material_id="m1").num_reels == 20
     assert ReelsGenerateRequest(material_id="m1", num_reels=300).num_reels == 300
@@ -40,9 +44,9 @@ def test_generate_request_supports_full_material_inventory() -> None:
 def test_fresh_inventory_and_selector_cache_share_current_contract() -> None:
     assert {
         main.SELECTION_CONTRACT_VERSION,
-        generation_jobs.REQUEST_SCHEMA_VERSION,
         ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
     } == {"quality_silence_v38"}
+    assert generation_jobs.REQUEST_SCHEMA_VERSION == "adaptive_clip_concepts_v1"
     assert segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v38"
     assert "quality_silence_v18" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v19" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
@@ -132,7 +136,7 @@ def _conn() -> sqlite3.Connection:
     return conn
 
 
-def test_persisted_lesson_order_reorders_only_an_exact_valid_reel_set() -> None:
+def test_persisted_lesson_order_reapplies_a_valid_selected_subset() -> None:
     conn = _conn()
     try:
         generation_id = main._create_generation_row(
@@ -157,6 +161,24 @@ def test_persisted_lesson_order_reorders_only_an_exact_valid_reel_set() -> None:
             conn,
             generation_id=generation_id,
             metadata={"version": 2, "ordered_reel_ids": ["a"]},
+        )
+        assert main._apply_generation_lesson_order(
+            conn, generation_id=generation_id, reels=reels
+        ) == [reels[0]]
+
+        main._persist_generation_lesson_order(
+            conn,
+            generation_id=generation_id,
+            metadata={"version": 2, "ordered_reel_ids": ["unknown"]},
+        )
+        assert main._apply_generation_lesson_order(
+            conn, generation_id=generation_id, reels=reels
+        ) == reels
+
+        main._persist_generation_lesson_order(
+            conn,
+            generation_id=generation_id,
+            metadata={"version": 2, "ordered_reel_ids": []},
         )
         assert main._apply_generation_lesson_order(
             conn, generation_id=generation_id, reels=reels
@@ -212,6 +234,7 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
     generated: list[dict] = []
 
     def generate_stage(worker_conn, **kwargs) -> None:
+        mastery_at = (now + timedelta(seconds=5)).isoformat()
         for index in range(3):
             generated.append(
                 _insert_generation_reel(
@@ -222,9 +245,20 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
                     created_at=(now + timedelta(seconds=index)).isoformat(),
                 )
             )
+        worker_conn.execute(
+            "INSERT INTO reel_feedback "
+            "(id, learner_id, reel_id, helpful, confusing, rating, saved, "
+            "mastery_updated_at, updated_at, created_at) "
+            "VALUES ('lesson-feedback', 'learner-1', 'release-reel-0', "
+            "1, 0, 5, 0, ?, ?, ?)",
+            (mastery_at, mastery_at, mastery_at),
+        )
 
     def order_batch(reels, **kwargs):
         assert kwargs["topic"] == "Cell biology"
+        assert kwargs["concept_signals"] == {
+            "c1": {"helpful": 1.0, "confusing": 0.0, "adjustment": 0.04}
+        }
         ordered = list(reversed(reels))
         return mock.Mock(
             reels=ordered,
@@ -511,6 +545,64 @@ def _terminal_job_for_generation(
     return {**job, "status": status, "result_generation_id": generation_id}
 
 
+def test_latest_compatible_job_requires_current_adaptation_fingerprint() -> None:
+    conn = _conn()
+    params = {
+        "request_schema_version": main.GENERATION_REQUEST_SCHEMA_VERSION,
+        "generation_mode": "slow",
+        "creative_commons_only": False,
+        "preferred_video_duration": "any",
+        "knowledge_level": "beginner",
+        "language": "en",
+        "exclude_video_ids": [],
+        "min_relevance": None,
+        "adaptation_fingerprint": "before-feedback",
+    }
+    generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id=None,
+        request_key="before-feedback",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    content_fingerprint = generation_jobs.material_content_fingerprint(
+        conn, "m1", None
+    )
+    prior = _terminal_job_for_generation(
+        conn,
+        request_key="before-feedback",
+        generation_id=generation_id,
+        completed_at="2026-07-12T00:00:00+00:00",
+        concept_id=None,
+        content_fingerprint=content_fingerprint,
+        request_params=params,
+    )
+    try:
+        matching = main._latest_compatible_generation_job(
+            conn,
+            material_id="m1",
+            learner_id="learner-1",
+            concept_id=None,
+            content_fingerprint=content_fingerprint,
+            request_params=params,
+        )
+        changed = main._latest_compatible_generation_job(
+            conn,
+            material_id="m1",
+            learner_id="learner-1",
+            concept_id=None,
+            content_fingerprint=content_fingerprint,
+            request_params={**params, "adaptation_fingerprint": "after-feedback"},
+        )
+
+        assert matching is not None
+        assert matching["id"] == prior["id"]
+        assert changed is None
+    finally:
+        conn.close()
+
+
 def _append_authoritative_release(
     conn: sqlite3.Connection,
     *,
@@ -659,6 +751,30 @@ def test_released_feed_reconstructs_exact_batch_order_and_hides_raw_reservoir(
         conn.close()
 
 
+def test_released_feed_uses_release_as_allow_list_not_frozen_display_order(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [(["released-first", "released-second"], [
+            "released-second",
+            "raw-private",
+            "released-first",
+        ])],
+    )
+    _patch_released_ranked_feed(monkeypatch, rows)
+    try:
+        ranked = _rank_released_feed(conn, generation_id=generation_id)
+
+        assert [reel["reel_id"] for reel in ranked] == [
+            "released-second",
+            "released-first",
+        ]
+    finally:
+        conn.close()
+
+
 def test_released_feed_treats_authoritative_empty_as_empty(monkeypatch) -> None:
     conn = _conn()
     generation_id, rows, _jobs = _released_generation_chain(
@@ -716,7 +832,7 @@ def test_released_feed_stably_deduplicates_and_preserves_exclusion_order(
         conn.close()
 
 
-def test_terminal_status_and_replay_use_only_current_released_batch(
+def test_terminal_status_and_replay_use_current_ranking_within_released_batch(
     monkeypatch,
 ) -> None:
     conn = _conn()
@@ -738,10 +854,10 @@ def test_terminal_status_and_replay_use_only_current_released_batch(
             generation_jobs.replay_events(conn, job_id=str(terminal["id"])),
         )
 
-        assert [reel["reel_id"] for reel in status["reels"]] == ["r4", "r3"]
+        assert [reel["reel_id"] for reel in status["reels"]] == ["r3", "r4"]
         final = next(event for event in replay if event["type"] == "final")
         assert [reel["reel_id"] for reel in final["payload"]["reels"]] == [
-            "r4", "r3",
+            "r3", "r4",
         ]
     finally:
         conn.close()
@@ -2061,6 +2177,7 @@ def test_deferred_only_slow_reservoir_queues_current_batch_after_level_change(
             "min_relevance": None,
             "preferred_video_duration": "any",
             "knowledge_level": "beginner",
+            "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
             "language": "en",
         },
     )
@@ -4538,6 +4655,7 @@ def test_feed_verified_reservoir_satisfies_compatible_request_without_queuing(
             "min_relevance": prior_relevance,
             "preferred_video_duration": "any",
             "knowledge_level": "beginner",
+            "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
             "language": "en",
         },
     )
@@ -4632,6 +4750,88 @@ def test_cross_request_reuse_prefers_exact_relevance_before_fallback() -> None:
         conn.close()
 
 
+def test_cross_request_reuse_requires_current_schema_and_adaptation() -> None:
+    conn = _conn()
+    params = {
+        "generation_mode": "fast",
+        "num_reels": 9,
+        "exclude_video_ids": [],
+        "creative_commons_only": False,
+        "preferred_video_duration": "any",
+        "knowledge_level": "beginner",
+        "language": "en",
+        "min_relevance": 0.0,
+    }
+    generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="legacy-conceptless-request",
+        generation_mode="fast",
+        retrieval_profile="unified",
+    )
+    _insert_generation_reel(
+        conn,
+        generation_id=generation_id,
+        reel_id="legacy-conceptless-reel",
+        video_id="legacy-conceptless-video",
+        created_at="2026-07-12T00:00:00+00:00",
+    )
+    job = _terminal_job_for_generation(
+        conn,
+        request_key="legacy-conceptless-request",
+        generation_id=generation_id,
+        completed_at="2026-07-12T00:00:00+00:00",
+        content_fingerprint="same-fingerprint",
+        request_params=params,
+    )
+    stored = main._job_request_params(job)
+    stored["request_schema_version"] = "quality_silence_v38"
+    conn.execute(
+        "UPDATE reel_generation_jobs SET request_params_json = ? WHERE id = ?",
+        (json.dumps(stored), job["id"]),
+    )
+    try:
+        assert main._verified_cross_request_source_generation(
+            conn,
+            material_id="m1",
+            learner_id="learner-1",
+            request_key="current-request",
+            concept_id="c1",
+            content_fingerprint="same-fingerprint",
+            request_params=params,
+        ) is None
+
+        stored.update({
+            "request_schema_version": main.GENERATION_REQUEST_SCHEMA_VERSION,
+            "adaptation_fingerprint": "before-feedback",
+        })
+        conn.execute(
+            "UPDATE reel_generation_jobs SET request_params_json = ? WHERE id = ?",
+            (json.dumps(stored), job["id"]),
+        )
+        assert main._verified_cross_request_source_generation(
+            conn,
+            material_id="m1",
+            learner_id="learner-1",
+            request_key="after-feedback-request",
+            concept_id="c1",
+            content_fingerprint="same-fingerprint",
+            request_params={**params, "adaptation_fingerprint": "after-feedback"},
+        ) is None
+        assert main._verified_cross_request_source_generation(
+            conn,
+            material_id="m1",
+            learner_id="learner-1",
+            request_key="matching-feedback-request",
+            concept_id="c1",
+            content_fingerprint="same-fingerprint",
+            request_params={**params, "adaptation_fingerprint": "before-feedback"},
+        ) == generation_id
+    finally:
+        conn.close()
+
+
 def test_feed_partial_cross_request_reservoir_queues_fresh_startup_budget(
     monkeypatch,
 ) -> None:
@@ -4671,6 +4871,7 @@ def test_feed_partial_cross_request_reservoir_queues_fresh_startup_budget(
             "min_relevance": None,
             "preferred_video_duration": "any",
             "knowledge_level": "beginner",
+            "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
             "language": "en",
         },
     )
@@ -4751,6 +4952,7 @@ def test_feed_fast_reservoir_queues_slow_top_up_despite_full_ranked_page(
             "min_relevance": None,
             "preferred_video_duration": "any",
             "knowledge_level": "beginner",
+            "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
             "language": "en",
         },
     )
@@ -5396,6 +5598,7 @@ def test_generate_cross_request_reservoir_is_owned_by_current_batch(
             "min_relevance": None,
             "preferred_video_duration": "any",
             "knowledge_level": "beginner",
+            "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
             "language": "en",
         },
     )
@@ -5509,6 +5712,7 @@ def test_generate_fast_reservoir_queues_slow_top_up(
             "min_relevance": None,
             "preferred_video_duration": "any",
             "knowledge_level": "beginner",
+            "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
             "language": "en",
         },
     )

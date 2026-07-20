@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backend.app.db import SCHEMA
+from backend.app.db import SCHEMA, _migrate_reel_feedback_uniqueness_sqlite
 from backend.app.clip_engine.provider_cache import (
     TRANSCRIPT_SCHEMA_VERSION,
     transcript_artifact_key,
@@ -28,6 +28,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         self.conn = sqlite3.connect(":memory:")
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        _migrate_reel_feedback_uniqueness_sqlite(self.conn)
         self.conn.execute(
             "INSERT INTO materials "
             "(id, subject_tag, raw_text, source_type, source_path, knowledge_level, created_at) "
@@ -40,6 +41,13 @@ class SelectionContractOrderingTests(unittest.TestCase):
             "(id, material_id, title, keywords_json, summary, embedding_json, created_at) "
             "VALUES ('c1', ?, 'Chemical bonding', '[\"chemical bonding\"]', "
             "'How atoms form chemical bonds.', NULL, '2026-07-12T00:00:00+00:00')",
+            (self.MATERIAL,),
+        )
+        self.conn.execute(
+            "INSERT INTO concepts "
+            "(id, material_id, title, keywords_json, summary, embedding_json, created_at) "
+            "VALUES ('c2', ?, 'Bond polarity', '[\"bond polarity\"]', "
+            "'How electronegativity creates bond polarity.', NULL, '2026-07-12T00:00:01+00:00')",
             (self.MATERIAL,),
         )
         for video_id in ("video-a", "video-b", "video-c"):
@@ -75,10 +83,11 @@ class SelectionContractOrderingTests(unittest.TestCase):
         prerequisite_ids: list[str] | None = None,
         intent_role: str = "primary",
         intent_coverage: float = 1.0,
+        concept_id: str = "c1",
     ) -> dict:
         item = {
             "reel_id": reel_id,
-            "concept_id": "c1",
+            "concept_id": concept_id,
             "video_id": video_id,
             "t_start": start,
             "t_end": start + 20,
@@ -101,6 +110,224 @@ class SelectionContractOrderingTests(unittest.TestCase):
         if educational_importance is not None:
             item["_selection_educational_importance"] = educational_importance
         return item
+
+    def _insert_mastery_reel(
+        self,
+        reel_id: str,
+        *,
+        concept_id: str,
+        video_id: str,
+        difficulty: float,
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO reels "
+            "(id, material_id, concept_id, video_id, video_url, t_start, t_end, "
+            "transcript_snippet, takeaways_json, base_score, difficulty, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 1, 21, 'lesson', '[]', 1.0, ?, "
+            "'2026-07-12T00:01:00+00:00')",
+            (
+                reel_id,
+                self.MATERIAL,
+                concept_id,
+                video_id,
+                f"https://youtube.test/{video_id}",
+                difficulty,
+            ),
+        )
+
+    def _insert_assessment_outcome(
+        self,
+        session_id: str,
+        *,
+        concept_id: str,
+        adjustment: float,
+        video_id: str,
+        difficulty: float,
+    ) -> None:
+        timestamp = "2026-07-12T00:02:00+00:00"
+        self.conn.execute(
+            "INSERT INTO assessment_sessions "
+            "(id, learner_id, material_id, status, current_index, question_count, "
+            "correct_count, information_units, readiness_threshold, created_at, "
+            "updated_at, completed_at) "
+            "VALUES (?, ?, ?, 'completed', 1, 1, ?, 3.5, 3.5, ?, ?, ?)",
+            (
+                session_id,
+                self.LEARNER,
+                self.MATERIAL,
+                1 if adjustment > 0 else 0,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        self.conn.execute(
+            "INSERT INTO assessment_concept_outcomes "
+            "(learner_id, session_id, material_id, concept_id, question_count, "
+            "correct_count, accuracy, adjustment, source_reel_id, source_video_id, "
+            "source_difficulty, created_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?, NULL, ?, ?, ?)",
+            (
+                self.LEARNER,
+                session_id,
+                self.MATERIAL,
+                concept_id,
+                1 if adjustment > 0 else 0,
+                1.0 if adjustment > 0 else 0.0,
+                adjustment,
+                video_id,
+                difficulty,
+                timestamp,
+            ),
+        )
+
+    def test_helpful_concept_moves_behind_an_unseen_concept(self) -> None:
+        self._insert_mastery_reel(
+            "watched-helpful",
+            concept_id="c1",
+            video_id="video-a",
+            difficulty=0.3,
+        )
+        self.service.record_feedback(
+            self.conn,
+            "watched-helpful",
+            helpful=True,
+            confusing=False,
+            rating=5,
+            saved=False,
+            learner_id=self.LEARNER,
+        )
+        items = [
+            self._selection_item(
+                "mastered-best",
+                video_id="video-a",
+                start=30,
+                content_score=0.99,
+                concept_id="c1",
+            ),
+            self._selection_item(
+                "unseen-weaker",
+                video_id="video-b",
+                start=20,
+                content_score=0.80,
+                concept_id="c2",
+            ),
+            self._selection_item(
+                "mastered-weaker",
+                video_id="video-c",
+                start=40,
+                content_score=0.85,
+                concept_id="c1",
+            ),
+        ]
+
+        ordered = self.service.adaptive_curriculum_order(
+            self.conn, self.MATERIAL, self.LEARNER, items,
+        )
+
+        self.assertEqual(
+            [item["reel_id"] for item in ordered],
+            ["unseen-weaker", "mastered-best", "mastered-weaker"],
+        )
+
+    def test_confusing_concept_starts_with_easier_alternate_source(self) -> None:
+        self._insert_mastery_reel(
+            "watched-confusing",
+            concept_id="c1",
+            video_id="video-a",
+            difficulty=0.8,
+        )
+        self.service.record_feedback(
+            self.conn,
+            "watched-confusing",
+            helpful=False,
+            confusing=True,
+            rating=2,
+            saved=False,
+            learner_id=self.LEARNER,
+        )
+        items = [
+            self._selection_item(
+                "same-source",
+                video_id="video-a",
+                start=30,
+                content_score=0.99,
+                difficulty=0.1,
+                concept_id="c1",
+            ),
+            self._selection_item(
+                "alternate-source",
+                video_id="video-b",
+                start=20,
+                content_score=0.80,
+                difficulty=0.3,
+                concept_id="c1",
+            ),
+            self._selection_item(
+                "other-concept",
+                video_id="video-c",
+                start=10,
+                content_score=1.0,
+                difficulty=0.1,
+                concept_id="c2",
+            ),
+        ]
+
+        ordered = self.service.adaptive_curriculum_order(
+            self.conn, self.MATERIAL, self.LEARNER, items,
+        )
+
+        self.assertEqual(ordered[0]["reel_id"], "alternate-source")
+
+    def test_quiz_outcomes_prioritize_wrong_and_deprioritize_right_concepts(
+        self,
+    ) -> None:
+        self.conn.execute(
+            "UPDATE learner_material_progress SET difficulty_reset_at = '' "
+            "WHERE learner_id = ? AND material_id = ?",
+            (self.LEARNER, self.MATERIAL),
+        )
+        self._insert_assessment_outcome(
+            "quiz-right",
+            concept_id="c1",
+            adjustment=0.08,
+            video_id="video-a",
+            difficulty=0.5,
+        )
+        self._insert_assessment_outcome(
+            "quiz-wrong",
+            concept_id="c2",
+            adjustment=-0.12,
+            video_id="video-b",
+            difficulty=0.7,
+        )
+        items = [
+            self._selection_item(
+                "right-high-quality",
+                video_id="video-a",
+                start=10,
+                content_score=0.99,
+                difficulty=0.3,
+                concept_id="c1",
+            ),
+            self._selection_item(
+                "wrong-remediation",
+                video_id="video-c",
+                start=20,
+                content_score=0.80,
+                difficulty=0.3,
+                concept_id="c2",
+            ),
+        ]
+
+        ordered = self.service.adaptive_curriculum_order(
+            self.conn, self.MATERIAL, self.LEARNER, items,
+        )
+
+        self.assertEqual(
+            [item["reel_id"] for item in ordered],
+            ["wrong-remediation", "right-high-quality"],
+        )
 
     def test_easier_independent_clip_precedes_higher_quality_advanced_clip(self) -> None:
         items = [

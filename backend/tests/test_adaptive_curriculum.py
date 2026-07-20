@@ -362,6 +362,36 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         )[1]
         self.assertEqual(bounded["c1"], 0.25)
 
+    def test_acquisition_orders_wrong_quiz_concept_before_right_quiz_concept(
+        self,
+    ) -> None:
+        self._insert_assessment_outcome(
+            session_id="acquisition-right",
+            concept_id="c1",
+            adjustment=0.08,
+        )
+        self._insert_assessment_outcome(
+            session_id="acquisition-wrong",
+            concept_id="c2",
+            adjustment=-0.12,
+        )
+        concepts = [
+            dict(row)
+            for row in self.conn.execute(
+                "SELECT * FROM concepts WHERE material_id = ? ORDER BY id",
+                (self.MATERIAL,),
+            ).fetchall()
+        ]
+
+        ordered = self.svc._order_concepts(
+            self.conn,
+            self.MATERIAL,
+            concepts,
+            self.LEARNER,
+        )
+
+        self.assertEqual([row["id"] for row in ordered], ["c2", "c1"])
+
     def test_incorrect_assessment_prefers_easier_alternative_source(self) -> None:
         self.conn.execute(
             "UPDATE learner_material_progress SET difficulty_reset_at = '' "

@@ -25,7 +25,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
+import unicodedata
 import uuid
 from typing import Any
 
@@ -50,6 +52,13 @@ from .models import IngestMetadata
 logger: logging.Logger = get_ingest_logger(__name__)
 
 _INGEST_META_PREFIX = "ingest_meta:"
+_CLIP_CONCEPT_TOKEN_RE = re.compile(
+    r"[^\W_]+(?:['\u2018\u2019\u02bc][^\W_]+)*",
+    re.UNICODE,
+)
+_CLIP_CONCEPT_APOSTROPHES = str.maketrans(
+    {"\u2018": "'", "\u2019": "'", "\u02bc": "'"}
+)
 
 
 # --------------------------------------------------------------------- #
@@ -187,6 +196,87 @@ def resolve_material_concept(
         return material_id, str(concept["id"])
 
     return material_id, ensure_sentinel_concept(conn, material_id)
+
+
+def normalize_clip_concept(value: object) -> tuple[str, str]:
+    """Return a readable label and stable identity key for one Gemini facet."""
+    title = " ".join(unicodedata.normalize("NFKC", str(value or "")).split()).strip()
+    title = title[:240]
+    normalized = title.casefold().translate(_CLIP_CONCEPT_APOSTROPHES)
+    key = " ".join(match.group(0) for match in _CLIP_CONCEPT_TOKEN_RE.finditer(normalized))
+    return title, key
+
+
+def ensure_clip_concept(
+    conn: Any,
+    *,
+    material_id: str,
+    title: str,
+) -> tuple[str, str, str]:
+    """Reuse or deterministically create a material-scoped clip concept."""
+    clean_title, concept_key = normalize_clip_concept(title)
+    if not clean_title or not concept_key:
+        raise InvalidReferenceError("The clip concept is empty after normalization.")
+
+    material = fetch_one(conn, "SELECT id FROM materials WHERE id = ?", (material_id,))
+    if not material:
+        raise InvalidReferenceError("The supplied material does not exist.")
+
+    existing_rows = fetch_all(
+        conn,
+        "SELECT id, title FROM concepts WHERE material_id = ? ORDER BY created_at, id",
+        (material_id,),
+    )
+    for row in existing_rows:
+        _existing_title, existing_key = normalize_clip_concept(row.get("title"))
+        if existing_key == concept_key:
+            return str(row["id"]), str(row["title"]), concept_key
+
+    concept_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"reelai:clip-concept:{material_id}:{concept_key}",
+        )
+    )
+    existing_id = fetch_one(
+        conn,
+        "SELECT id, material_id, title FROM concepts WHERE id = ?",
+        (concept_id,),
+    )
+    if existing_id:
+        _existing_title, existing_key = normalize_clip_concept(existing_id.get("title"))
+        if existing_id.get("material_id") == material_id and existing_key == concept_key:
+            return concept_id, str(existing_id["title"]), concept_key
+        raise DatabaseIntegrityError("Deterministic clip concept ID is already in use.")
+
+    try:
+        insert(
+            conn,
+            "concepts",
+            {
+                "id": concept_id,
+                "material_id": material_id,
+                "title": clean_title,
+                "keywords_json": dumps_json(concept_key.split()[:12]),
+                "summary": "",
+                "embedding_json": None,
+                "created_at": now_iso(),
+            },
+        )
+    except DatabaseIntegrityError:
+        # Concurrent workers derive the same primary key for the same normalized facet.
+        existing_id = fetch_one(
+            conn,
+            "SELECT id, material_id, title FROM concepts WHERE id = ?",
+            (concept_id,),
+        )
+        if not existing_id or existing_id.get("material_id") != material_id:
+            raise
+        _existing_title, existing_key = normalize_clip_concept(existing_id.get("title"))
+        if existing_key != concept_key:
+            raise
+        return concept_id, str(existing_id["title"]), concept_key
+    return concept_id, clean_title, concept_key
 
 
 # --------------------------------------------------------------------- #
@@ -770,8 +860,10 @@ if __name__ == "__main__":
 
 __all__ = [
     "build_video_id",
+    "ensure_clip_concept",
     "ensure_sentinel_material",
     "ensure_sentinel_concept",
+    "normalize_clip_concept",
     "resolve_material_concept",
     "upsert_video",
     "upsert_reel_row",

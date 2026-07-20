@@ -2985,7 +2985,7 @@ def _apply_generation_lesson_order(
     generation_id: str | None,
     reels: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Apply persisted order only when it exactly matches valid inventory."""
+    """Apply a persisted non-empty selection when every selected reel exists."""
     ordered_ids = _stored_generation_lesson_order_ids(conn, generation_id)
     if ordered_ids is None:
         return reels
@@ -2995,13 +2995,13 @@ def _apply_generation_lesson_order(
         for value in [reel.get("reel_id")]
     ]
     if (
-        any(not reel_id for reel_id in reel_ids)
+        not ordered_ids
+        or any(not reel_id for reel_id in reel_ids)
         or len(set(reel_ids)) != len(reel_ids)
-        or len(ordered_ids) != len(reel_ids)
-        or set(ordered_ids) != set(reel_ids)
+        or not set(ordered_ids).issubset(reel_ids)
     ):
         logger.warning(
-            "Ignoring stale lesson order generation_id=%s stored=%d valid=%d",
+            "Ignoring invalid lesson selection generation_id=%s stored=%d valid=%d",
             generation_id,
             len(ordered_ids),
             len(reel_ids),
@@ -3681,6 +3681,8 @@ def _latest_compatible_generation_job(
             )
             or str(prior_params.get("language") or "en").strip().lower()
             != str(request_params.get("language") or "en").strip().lower()
+            or str(prior_params.get("adaptation_fingerprint") or "")
+            != str(request_params.get("adaptation_fingerprint") or "")
             or sorted(_normalize_excluded_video_ids(
                 prior_params.get("exclude_video_ids") or []
             )) != expected_exclusions
@@ -3746,7 +3748,11 @@ def _verified_cross_request_source_generation(
         if not isinstance(prior_params, dict):
             continue
         if (
-            bool(prior_params.get("creative_commons_only"))
+            str(prior_params.get("request_schema_version") or "")
+            != GENERATION_REQUEST_SCHEMA_VERSION
+            or str(prior_params.get("adaptation_fingerprint") or "")
+            != str(request_params.get("adaptation_fingerprint") or "")
+            or bool(prior_params.get("creative_commons_only"))
             != bool(request_params.get("creative_commons_only"))
             or _normalize_preferred_video_duration(
                 str(prior_params.get("preferred_video_duration") or "any")
@@ -4016,17 +4022,11 @@ def _ranked_request_reels(
             str(difficulty_progress.get("selected_level") or "beginner"),
         )
     if authoritative_release_ids is not None:
-        by_id: dict[str, dict[str, Any]] = {}
-        for reel in ranked:
-            reel_id = str(reel.get("reel_id") or "").strip()
-            if reel_id and reel_id not in by_id:
-                ordered_reel = dict(reel)
-                ordered_reel["_selection_ordered"] = True
-                by_id[reel_id] = ordered_reel
         ranked = [
-            by_id[reel_id]
-            for reel_id in authoritative_release_ids
-            if reel_id in by_id
+            reel
+            for reel in ranked
+            if str(reel.get("reel_id") or "").strip()
+            in authoritative_release_id_set
         ]
     seen_reel_ids = _learner_seen_reel_ids(
         conn,
@@ -4577,6 +4577,31 @@ def _generation_exhaustion_message(counters: dict[str, int]) -> str:
     return "No discovered YouTube videos produced valid clips."
 
 
+def _learner_concept_signals(
+    conn,
+    *,
+    material_id: str,
+    learner_id: str,
+) -> dict[str, dict[str, float]]:
+    coverage, adjustments, _, _ = reel_service._learner_adaptation_context(
+        conn,
+        material_id,
+        learner_id,
+    )
+    return {
+        concept_key: {
+            "helpful": float(
+                coverage.get(concept_key, {}).get("helpful", 0.0)
+            ),
+            "confusing": float(
+                coverage.get(concept_key, {}).get("confusing", 0.0)
+            ),
+            "adjustment": float(adjustments.get(concept_key, 0.0)),
+        }
+        for concept_key in (set(coverage) | set(adjustments))
+    }
+
+
 def _run_leased_generation_job(
     job_row: dict[str, Any],
     worker_stop: threading.Event | None = None,
@@ -4884,6 +4909,11 @@ def _run_leased_generation_job(
                     generation_id,
                 )
                 if stored_order_ids is None:
+                    concept_signals = _learner_concept_signals(
+                        conn,
+                        material_id=material_id,
+                        learner_id=learner_id,
+                    )
                     ordering = order_lesson_batch(
                         final_reels,
                         topic=_lesson_order_topic(
@@ -4892,6 +4922,7 @@ def _run_leased_generation_job(
                             reels=final_reels,
                         ),
                         learner_level=str(params.get("knowledge_level") or "beginner"),
+                        concept_signals=concept_signals,
                         should_cancel=should_cancel,
                         generation_context=context,
                     )
@@ -6644,6 +6675,18 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
         learner_id = _resolve_learner_identity(conn, request)
         learner_progress = reel_service.learner_progress(conn, payload.material_id, learner_id)
         learner_knowledge_level = str(learner_progress.get("selected_level") or "beginner")
+        concept_signals = _learner_concept_signals(
+            conn,
+            material_id=payload.material_id,
+            learner_id=learner_id,
+        )
+        adaptation_fingerprint = hashlib.sha256(
+            json.dumps(
+                concept_signals,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         content_fingerprint = material_content_fingerprint(
             conn,
             payload.material_id,
@@ -6664,6 +6707,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             min_relevance=min_relevance,
             exclude_video_ids=excluded_video_ids,
             continuation_token=continuation_token,
+            adaptation_fingerprint=adaptation_fingerprint,
         )
         request_params = {
             "material_id": payload.material_id,
@@ -6676,6 +6720,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             "min_relevance": min_relevance,
             "preferred_video_duration": safe_video_duration_pref,
             "knowledge_level": learner_knowledge_level,
+            "adaptation_fingerprint": adaptation_fingerprint,
             "language": "en",
         }
         source_generation_id: str | None = None
@@ -7645,6 +7690,18 @@ def feed(
         learner_id = _resolve_learner_identity(conn, request)
         progress = reel_service.learner_progress(conn, material_id, learner_id)
         knowledge_level = str(progress.get("selected_level") or "beginner")
+        concept_signals = _learner_concept_signals(
+            conn,
+            material_id=material_id,
+            learner_id=learner_id,
+        )
+        adaptation_fingerprint = hashlib.sha256(
+            json.dumps(
+                concept_signals,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         try:
             effective_level = _effective_level_target(
                 knowledge_level,
@@ -7668,6 +7725,7 @@ def feed(
             target_clip_duration_max_sec=safe_clip_max,
             min_relevance=safe_relevance,
             exclude_video_ids=excluded_videos,
+            adaptation_fingerprint=adaptation_fingerprint,
         )
         request_params = {
             "material_id": material_id,
@@ -7679,6 +7737,7 @@ def feed(
             "min_relevance": safe_relevance,
             "preferred_video_duration": safe_duration,
             "knowledge_level": knowledge_level,
+            "adaptation_fingerprint": adaptation_fingerprint,
             "language": "en",
         }
         completed_job = find_completed_generation_job(conn, request_key)

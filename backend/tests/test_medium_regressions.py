@@ -924,6 +924,75 @@ class MediumRegressionTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_topic_bootstrap_reuses_persisted_clip_concepts_for_adaptive_acquisition(
+        self,
+    ) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA)
+        conn.execute(
+            "INSERT INTO materials "
+            "(id, subject_tag, raw_text, source_type, created_at) "
+            "VALUES ('material-adaptive-topic', 'melittology', "
+            "'Topic: melittology', 'topic', '2026-07-20T00:00:00+00:00')"
+        )
+        conn.executemany(
+            "INSERT INTO concepts "
+            "(id, material_id, title, keywords_json, summary, created_at) "
+            "VALUES (?, 'material-adaptive-topic', ?, '[]', '', "
+            "'2026-07-20T00:00:00+00:00')",
+            [
+                ("concept-root", "Melittology"),
+                ("concept-clip", "Bee classification"),
+                ("concept-unrelated", "Stale expansion"),
+            ],
+        )
+        conn.execute(
+            "INSERT INTO videos "
+            "(id, title, channel_title, created_at) "
+            "VALUES ('video-clip', 'Bee lesson', 'Teacher', "
+            "'2026-07-20T00:00:00+00:00')"
+        )
+        conn.execute(
+            "INSERT INTO reels "
+            "(id, material_id, concept_id, video_id, video_url, t_start, t_end, "
+            "transcript_snippet, takeaways_json, base_score, search_context_json, "
+            "created_at) VALUES ('reel-clip', 'material-adaptive-topic', "
+            "'concept-clip', 'video-clip', 'https://youtube.test/video-clip', "
+            "0, 20, 'Bee classification.', '[]', 1.0, "
+            "'{\"clip_concept_id\":\"concept-clip\"}', "
+            "'2026-07-20T00:00:00+00:00')"
+        )
+        service = ReelService(embedding_service=mock.Mock(), youtube_service=mock.Mock())
+        try:
+            concepts = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM concepts WHERE material_id = ? ORDER BY id",
+                    ("material-adaptive-topic",),
+                )
+            ]
+
+            working = service._bootstrap_topic_retrieval_concepts(
+                conn=conn,
+                concepts=concepts,
+                subject_tag="melittology",
+                material_id="material-adaptive-topic",
+                expansion={
+                    "canonical_topic": "melittology",
+                    "aliases": [],
+                    "subtopics": [],
+                    "related_terms": [],
+                },
+            )
+
+            self.assertEqual(
+                [concept["id"] for concept in working],
+                ["concept-root", "concept-clip"],
+            )
+        finally:
+            conn.close()
+
     def test_strict_topic_selection_guard_rejects_low_alignment(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
         allowed = service._passes_selection_topic_guard(

@@ -36,6 +36,7 @@ import { applySearchFeedSettingsToParams, mergeSearchFeedQuerySettings, readSear
 import {
   HISTORY_STORAGE_KEY,
   normalizeStoredHistoryItems as normalizeHistoryStorageItems,
+  readScopedHistorySnapshot,
   type StoredRecallSummary,
   type StoredHistoryItem,
   writeScopedHistorySnapshot,
@@ -638,6 +639,52 @@ function safeLocalStorageSetItem(key: string, value: string): boolean {
   }
 }
 
+function removeStoredMaterialMapEntry(storageKey: string, materialId: string): void {
+  if (typeof window === "undefined" || !materialId) {
+    return;
+  }
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw) {
+      return;
+    }
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !(materialId in parsed)) {
+      return;
+    }
+    delete parsed[materialId];
+    safeLocalStorageSetItem(storageKey, JSON.stringify(parsed));
+  } catch {
+    // Keep expiry best-effort if one browser storage entry is malformed.
+  }
+}
+
+function dropStoredMaterialSession(
+  materialId: string,
+  accountId: string | null,
+): StoredHistoryItem[] | null {
+  const normalizedMaterialId = materialId.trim();
+  if (typeof window === "undefined" || !normalizedMaterialId) {
+    return null;
+  }
+
+  let nextHistory: StoredHistoryItem[] | null = null;
+  try {
+    const rawHistory = readScopedHistorySnapshot(accountId);
+    if (rawHistory !== null) {
+      const historyItems = normalizeHistoryStorageItems(JSON.parse(rawHistory));
+      nextHistory = historyItems.filter((item) => item.materialId !== normalizedMaterialId);
+      writeScopedHistorySnapshot(accountId, JSON.stringify(nextHistory));
+    }
+  } catch {
+    // Do not replace unrelated history when its stored payload is malformed.
+  }
+
+  removeStoredMaterialMapEntry(FEED_SESSION_STORAGE_KEY, normalizedMaterialId);
+  removeStoredMaterialMapEntry(FEED_PROGRESS_STORAGE_KEY, normalizedMaterialId);
+  return nextHistory;
+}
+
 function trimStoredText(value: string | undefined, maxChars: number): string | undefined {
   const normalized = String(value || "").trim();
   if (!normalized) {
@@ -1187,6 +1234,7 @@ function FeedPageInner() {
   const assessmentProgressMaxRef = useRef<Map<string, number>>(new Map());
   const reportedForwardScrollKeysRef = useRef<Set<string>>(new Set());
   const assessmentStartRequestRef = useRef<AssessmentGateRequest | null>(null);
+  const unavailableMaterialIdRef = useRef<string | null>(null);
   const activeSearchScopeRef = useRef<FeedSearchScope>({
     key: "",
     seq: 0,
@@ -1854,7 +1902,11 @@ function FeedPageInner() {
     activeIndex?: number;
     recall?: StoredRecallSummary;
   }) => {
-    if (typeof window === "undefined" || !materialId) {
+    if (
+      typeof window === "undefined"
+      || !materialId
+      || unavailableMaterialIdRef.current === materialId
+    ) {
       return;
     }
     try {
@@ -1939,9 +1991,56 @@ function FeedPageInner() {
     [generationMode, materialId, mergeFeedSettingsSnapshot, params, router],
   );
 
-  const showSavedSessionUnavailable = useCallback(() => {
+  const showSavedSessionUnavailable = useCallback((missingMaterialId = materialId) => {
+    const expiredMaterialId = String(missingMaterialId || "").trim();
+    if (!expiredMaterialId || unavailableMaterialIdRef.current === expiredMaterialId) {
+      return;
+    }
+    unavailableMaterialIdRef.current = expiredMaterialId;
+    renewActiveSearchScope();
+    clearGenerationTracking();
+    clearHistorySyncTimer();
+    pendingHistorySyncRef.current = null;
+    const accountId = authAccountId || readCommunityAuthSession()?.account?.id?.trim() || null;
+    const nextHistory = dropStoredMaterialSession(expiredMaterialId, accountId);
+    const sessionContext = captureCommunitySessionContext();
+    if (nextHistory && sessionContext) {
+      void queueCommunityHistorySync(nextHistory, sessionContext).catch(() => {
+        // The local expiry remains authoritative for this browser if sync fails.
+      });
+    }
+    materialIdsForFeedRef.current = [];
+    adaptiveExcludeReelIdsRef.current = [];
+    pendingResumeRef.current = null;
+    resumeAppliedRef.current = true;
+    resumeLoadingRef.current = false;
+    bootstrapAttemptedRef.current = true;
+    assessmentStartRequestRef.current = null;
+    updateSessionReels([]);
+    setPage(1);
+    setTotal(0);
+    setActiveIndex(0);
+    activeIndexRef.current = 0;
+    watchedFrontierIndexRef.current = 0;
+    setFeedbackByReel({});
+    setCanRequestMore(false);
+    setFeedPagesExhausted(true);
+    setLoading(false);
+    setBootstrappingFirstReels(false);
+    setAssessmentSession(null);
+    setAssessmentSlideActive(false);
+    setAssessmentGatePending(false);
+    setAssessmentBootstrapPending(false);
     setVisibleFeedError(SAVED_SESSION_UNAVAILABLE_MESSAGE);
-  }, [setVisibleFeedError]);
+  }, [
+    authAccountId,
+    clearGenerationTracking,
+    clearHistorySyncTimer,
+    materialId,
+    renewActiveSearchScope,
+    setVisibleFeedError,
+    updateSessionReels,
+  ]);
 
   const feedNeedsBootstrapTopUp = useCallback((): boolean => {
     const feedMaterialIds = getFeedMaterialIds();
@@ -1976,9 +2075,17 @@ function FeedPageInner() {
     (
       _provisional: Reel[],
       finalInventory: Reel[],
-      options: { preserveUnmatchedUnseen: boolean },
+      options: {
+        preserveUnmatchedUnseen: boolean;
+        preserveUnmatchedLockedPrefix: boolean;
+      },
     ): SessionMergeResult => {
       const currentRows = reelsRef.current;
+      const previousActiveIndex = currentRows.length > 0
+        ? Math.min(Math.max(0, activeIndexRef.current), currentRows.length - 1)
+        : 0;
+      const previousActiveReel = currentRows[previousActiveIndex];
+      const previousActiveReelId = String(previousActiveReel?.reel_id || "").trim();
       const lockedPrefixLength = Math.min(
         currentRows.length,
         Math.max(activeIndexRef.current, watchedFrontierIndexRef.current) + 1,
@@ -1989,16 +2096,20 @@ function FeedPageInner() {
           .filter(([reelId]) => Boolean(reelId)),
       );
       const authoritativeByClip = new Map(finalInventory.map((reel) => [reelClipKey(reel), reel] as const));
+      const authoritativeActiveReel = previousActiveReel
+        ? (previousActiveReelId ? authoritativeById.get(previousActiveReelId) : undefined)
+          ?? authoritativeByClip.get(reelClipKey(previousActiveReel))
+        : undefined;
       const consumedAuthoritative = new Set<Reel>();
-      const lockedPrefix = currentRows.slice(0, lockedPrefixLength).map((reel) => {
+      const lockedPrefix = currentRows.slice(0, lockedPrefixLength).flatMap((reel) => {
         const reelId = String(reel.reel_id || "").trim();
         const authoritative = (reelId ? authoritativeById.get(reelId) : undefined)
           ?? authoritativeByClip.get(reelClipKey(reel));
         if (!authoritative) {
-          return reel;
+          return options.preserveUnmatchedLockedPrefix ? [reel] : [];
         }
         consumedAuthoritative.add(authoritative);
-        return authoritative;
+        return [authoritative];
       });
       const stableUnseenRows = currentRows.slice(lockedPrefixLength);
       const provisionalReelIds = new Set(
@@ -2042,6 +2153,30 @@ function FeedPageInner() {
         }));
       }
       const reordered = dedupeByIdentity([...lockedPrefix, ...authoritativeTail]);
+      if (!options.preserveUnmatchedLockedPrefix && authoritativeActiveReel) {
+        const nextActiveIndex = reordered.indexOf(authoritativeActiveReel);
+        if (nextActiveIndex >= 0) {
+          const pendingResume = pendingResumeRef.current;
+          const pendingResumeReelId = String(pendingResume?.reelId || "").trim();
+          if (
+            pendingResume
+            && (
+              (pendingResumeReelId && pendingResumeReelId === previousActiveReelId)
+              || (!pendingResumeReelId && Math.floor(pendingResume.index || 0) === previousActiveIndex)
+            )
+          ) {
+            pendingResumeRef.current = {
+              ...pendingResume,
+              index: nextActiveIndex,
+              reelId: String(authoritativeActiveReel.reel_id || "").trim() || pendingResume.reelId,
+            };
+          }
+          if (nextActiveIndex !== activeIndexRef.current) {
+            activeIndexRef.current = nextActiveIndex;
+            setActiveIndex(nextActiveIndex);
+          }
+        }
+      }
       const previousIdentity = new Set(currentRows.map((reel) => `${String(reel.reel_id || "").trim()}|${reelClipKey(reel)}`));
       const addedReels = reordered.filter(
         (reel) => !previousIdentity.has(`${String(reel.reel_id || "").trim()}|${reelClipKey(reel)}`),
@@ -2109,7 +2244,7 @@ function FeedPageInner() {
         const reconciled = reconcileGeneratedReels(
           streamedReels,
           data.reels,
-          { preserveUnmatchedUnseen: true },
+          { preserveUnmatchedUnseen: true, preserveUnmatchedLockedPrefix: true },
         );
         settleGenerationContinuation(materialIdValue, data);
         madeProgress = madeProgress || reconciled.addedCount > 0;
@@ -2223,7 +2358,7 @@ function FeedPageInner() {
               /material_id not found/i.test(message) &&
               missingMaterialId
             ) {
-              showSavedSessionUnavailable();
+              showSavedSessionUnavailable(missingMaterialId);
               setRecoveryPhase("idle");
               return { addedCount: 0, exhausted: feedPagesExhausted };
             }
@@ -2244,7 +2379,10 @@ function FeedPageInner() {
         const fetchedTotal = successful.reduce((sum, row) => sum + Math.max(0, Number(row.data!.total) || 0), 0);
         const merged = targetPage === 1
           ? options?.preserveSession
-            ? reconcileGeneratedReels([], fetchedReels, { preserveUnmatchedUnseen: false })
+            ? reconcileGeneratedReels([], fetchedReels, {
+                preserveUnmatchedUnseen: false,
+                preserveUnmatchedLockedPrefix: false,
+              })
             : mergeSessionReels(fetchedReels)
           : mergeSessionReels(fetchedReels, reelsRef.current);
         addedDuringFetch = merged.addedCount > 0;
@@ -2486,7 +2624,7 @@ function FeedPageInner() {
             const reconciled = reconcileGeneratedReels(
               streamedReels,
               data.reels,
-              { preserveUnmatchedUnseen: true },
+              { preserveUnmatchedUnseen: true, preserveUnmatchedLockedPrefix: true },
             );
             settleGenerationContinuation(id, data);
             const batchAddedReels = dedupeByIdentity([...streamedReels, ...reconciled.addedReels]);
@@ -2531,7 +2669,7 @@ function FeedPageInner() {
         /material_id not found/i.test(firstFailureMessage) &&
         missingMaterialId
       ) {
-        showSavedSessionUnavailable();
+        showSavedSessionUnavailable(missingMaterialId);
         clearPendingTailAdvance();
         return [];
       }
@@ -2992,6 +3130,10 @@ function FeedPageInner() {
       setAssessmentBootstrapPending(false);
       return;
     }
+    if (unavailableMaterialIdRef.current === materialId) {
+      setAssessmentBootstrapPending(false);
+      return;
+    }
     if (!settingsScopeReady || !sessionHydrated) {
       return;
     }
@@ -3054,7 +3196,12 @@ function FeedPageInner() {
 
   const refreshFeedInventory = useCallback(async () => {
     const feedMaterialIds = getFeedMaterialIds();
-    if (!settingsScopeReady || feedMaterialIds.length === 0 || isRefreshingFeedRef.current) {
+    if (
+      unavailableMaterialIdRef.current === materialId
+      || !settingsScopeReady
+      || feedMaterialIds.length === 0
+      || isRefreshingFeedRef.current
+    ) {
       return;
     }
     if (adaptiveExcludeReelIdsRef.current.length > 0) {
@@ -3184,6 +3331,7 @@ function FeedPageInner() {
     mergeReelBatchesInServerOrder,
     isSearchScopeActive,
     markRecoveryProgress,
+    materialId,
     mergeSessionReels,
     noteFeedTransportFailure,
     rememberFeedContinuationToken,
@@ -3632,7 +3780,12 @@ function FeedPageInner() {
   }, [abortActiveChat, desktopPanel]);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !materialId || !sessionHydrated) {
+    if (
+      typeof window === "undefined"
+      || !materialId
+      || unavailableMaterialIdRef.current === materialId
+      || !sessionHydrated
+    ) {
       return;
     }
     const allowedMaterialIds = new Set(getFeedMaterialIds().map((id) => String(id || "").trim()).filter(Boolean));

@@ -405,6 +405,33 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertTrue(str(first.get("ai_summary") or "").strip())
         self.assertTrue(str(first.get("match_reason") or "").strip())
 
+    def test_generate_reels_returns_persisted_clip_concept_not_acquisition_parent(
+        self,
+    ) -> None:
+        engine_out = _multi_clip_engine_out()
+        engine_out["clips"] = [{
+            **engine_out["clips"][0],
+            "concept": "Mitochondrial energy release",
+        }]
+        self._patched_engine(engine_out)
+
+        with db_module.get_conn() as conn:
+            generated = main_module.reel_service.generate_reels(
+                conn,
+                material_id=MATERIAL_ID,
+                concept_id=CONCEPT_ID,
+                num_reels=1,
+                creative_commons_only=False,
+                generation_id="gen-clip-concept-attribution",
+            )
+
+        self.assertEqual(len(generated), 1)
+        self.assertNotEqual(generated[0]["concept_id"], CONCEPT_ID)
+        self.assertEqual(
+            generated[0]["concept_title"],
+            "Mitochondrial energy release",
+        )
+
     def test_below_threshold_quality_is_rejected(self) -> None:
         engine_out = _multi_clip_engine_out()
         engine_out["clips"] = [{

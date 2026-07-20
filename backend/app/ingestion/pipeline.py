@@ -75,8 +75,10 @@ from .models import (
     YouTubeSourceRef,
 )
 from .persistence import (
+    ensure_clip_concept,
     load_existing_reel,
     load_reel_by_selection_candidate,
+    normalize_clip_concept,
     resolve_material_concept,
     store_ingest_metadata_blob,
     update_reel_boundary_state,
@@ -6772,15 +6774,48 @@ class IngestionPipeline:
             informativeness = 0.6
         informativeness = max(0.0, min(1.0, informativeness))
         assessment = details.get("assessment")
+        clip_concept_raw, clip_concept_key = normalize_clip_concept(
+            details.get("concept")
+        )
         raise_if_cancelled(should_cancel)
 
         with get_conn(transactional=True) as conn:
             raise_if_cancelled(should_cancel)
-            effective_material_id, effective_concept_id = resolve_material_concept(
+            effective_material_id, acquisition_concept_id = resolve_material_concept(
                 conn,
                 material_id=material_id,
                 concept_id=concept_id,
             )
+            acquisition_concept = fetch_one(
+                conn,
+                "SELECT title FROM concepts WHERE id = ?",
+                (acquisition_concept_id,),
+            )
+            acquisition_concept_title = str(
+                (acquisition_concept or {}).get("title") or ""
+            )
+            effective_concept_id = acquisition_concept_id
+            effective_concept_title = acquisition_concept_title
+            if clip_concept_raw and clip_concept_key:
+                (
+                    effective_concept_id,
+                    effective_concept_title,
+                    clip_concept_key,
+                ) = ensure_clip_concept(
+                    conn,
+                    material_id=effective_material_id,
+                    title=clip_concept_raw,
+                )
+                selection_context.update(
+                    {
+                        "acquisition_concept_id": acquisition_concept_id,
+                        "acquisition_concept_title": acquisition_concept_title,
+                        "clip_concept_raw": clip_concept_raw,
+                        "clip_concept_key": clip_concept_key,
+                        "clip_concept_id": effective_concept_id,
+                        "clip_concept_title": effective_concept_title,
+                    }
+                )
 
             tombstone = None
             try:
@@ -7007,7 +7042,7 @@ class IngestionPipeline:
             reel_id=reel_id,
             material_id=effective_material_id,
             concept_id=effective_concept_id,
-            concept_title=clip_title or metadata.title or "",
+            concept_title=effective_concept_title,
             video_title=metadata.title or "",
             channel_name=metadata.author_name or "",
             video_description=metadata.description,

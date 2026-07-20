@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -28,6 +29,7 @@ from backend.app.ingestion.models import (  # noqa: E402
     IngestTranscriptCue,
     YouTubeSourceRef,
 )
+from backend.pipeline import gemini_segment  # noqa: E402
 
 
 def _strict_boundary_context(
@@ -226,6 +228,139 @@ class PersistenceIntegrityTests(unittest.TestCase):
         stored = json.loads(row["search_context_json"])
         self.assertEqual(stored["intent_role"], "supporting")
         self.assertEqual(stored["intent_coverage"], 0.5)
+
+    def test_gemini_clip_concept_is_normalized_reused_and_persisted(self) -> None:
+        pipeline, adapter, metadata = self._boundary_persistence_fixture()
+        first_clip = gemini_segment._public_clips(
+            [{"facet": "  Net   Force—Acceleration  ", "_private": "discard"}]
+        )[0]
+        second_clip = gemini_segment._public_clips(
+            [{"facet": "net-force / acceleration", "_private": "discard"}]
+        )[0]
+
+        first_context = _strict_boundary_context(
+            "video-a::net-force-1",
+            start=2.0,
+            end=8.0,
+            surface=True,
+        )
+        first = pipeline._persist_ingest(
+            adapter_result=adapter,
+            metadata=metadata,
+            cues=[
+                IngestTranscriptCue(
+                    cue_id="cue-1",
+                    start=2.0,
+                    end=8.0,
+                    text="Net force produces acceleration.",
+                )
+            ],
+            chosen=IngestSegment(
+                t_start=2.0,
+                t_end=8.0,
+                text="Net force produces acceleration.",
+            ),
+            snippet="Net force produces acceleration.",
+            material_id="material-a",
+            concept_id="concept-a",
+            clip_window=(2.0, 8.0),
+            target_max=0,
+            generation_id="generation-a",
+            clip_title="Net force and acceleration",
+            clip_details={
+                **first_clip,
+                "cue_ids": ["cue-1"],
+                "search_context": first_context,
+            },
+        )
+
+        second_context = _strict_boundary_context(
+            "video-a::net-force-2",
+            start=10.0,
+            end=16.0,
+            surface=True,
+        )
+        second = pipeline._persist_ingest(
+            adapter_result=adapter,
+            metadata=metadata,
+            cues=[
+                IngestTranscriptCue(
+                    cue_id="cue-2",
+                    start=10.0,
+                    end=16.0,
+                    text="Acceleration follows the net force.",
+                )
+            ],
+            chosen=IngestSegment(
+                t_start=10.0,
+                t_end=16.0,
+                text="Acceleration follows the net force.",
+            ),
+            snippet="Acceleration follows the net force.",
+            material_id="material-a",
+            concept_id="concept-a",
+            clip_window=(10.0, 16.0),
+            target_max=0,
+            generation_id="generation-a",
+            clip_title="Acceleration from net force",
+            clip_details={
+                **second_clip,
+                "cue_ids": ["cue-2"],
+                "search_context": second_context,
+            },
+        )
+
+        self.assertEqual(first_clip["concept"], "Net Force—Acceleration")
+        self.assertEqual(second_clip["concept"], "net-force / acceleration")
+        self.assertEqual(first.concept_id, second.concept_id)
+        self.assertNotEqual(first.concept_id, "concept-a")
+        self.assertEqual(
+            first.concept_id,
+            str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    "reelai:clip-concept:material-a:net force acceleration",
+                )
+            ),
+        )
+        self.assertEqual(first.concept_title, "Net Force—Acceleration")
+        self.assertEqual(second.concept_title, "Net Force—Acceleration")
+
+        with db_module.get_conn() as conn:
+            concept_rows = db_module.fetch_all(
+                conn,
+                "SELECT id, title FROM concepts WHERE material_id = ? ORDER BY id",
+                ("material-a",),
+            )
+            reel_rows = db_module.fetch_all(
+                conn,
+                "SELECT concept_id, search_context_json FROM reels "
+                "WHERE id IN (?, ?) ORDER BY t_start",
+                (first.reel_id, second.reel_id),
+            )
+
+        self.assertCountEqual(
+            [row["title"] for row in concept_rows],
+            ["Net Force—Acceleration", "Test concept"],
+        )
+        self.assertEqual(
+            [row["concept_id"] for row in reel_rows],
+            [first.concept_id, first.concept_id],
+        )
+        first_provenance = json.loads(reel_rows[0]["search_context_json"])
+        second_provenance = json.loads(reel_rows[1]["search_context_json"])
+        for provenance, raw_concept in (
+            (first_provenance, "Net Force—Acceleration"),
+            (second_provenance, "net-force / acceleration"),
+        ):
+            self.assertEqual(provenance["acquisition_concept_id"], "concept-a")
+            self.assertEqual(provenance["acquisition_concept_title"], "Test concept")
+            self.assertEqual(provenance["clip_concept_raw"], raw_concept)
+            self.assertEqual(provenance["clip_concept_key"], "net force acceleration")
+            self.assertEqual(provenance["clip_concept_id"], first.concept_id)
+            self.assertEqual(
+                provenance["clip_concept_title"], "Net Force—Acceleration"
+            )
 
     def test_scratch_concepts_are_scoped_to_their_material(self) -> None:
         with db_module.get_conn(transactional=True) as conn:
