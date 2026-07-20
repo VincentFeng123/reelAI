@@ -86,7 +86,7 @@ test("similarity copy uses the dial height for deliberate vertical alignment", (
 });
 
 test("plan, data, and account actions use existing application services", () => {
-  assert.match(source, /<BillingActions status=\{billingStatus\} plans=\{billingPlans\}[\s\S]*demoMode=\{demoMode\}/);
+  assert.match(source, /<BillingActions[\s\S]*status=\{billingStatus\}[\s\S]*plans=\{billingPlans\}[\s\S]*demoMode=\{demoMode\}/);
   assert.match(source, /onClearSearchData\(\)/);
   assert.match(source, /clearSetCache/);
   assert.match(source, /resetDefaults/);

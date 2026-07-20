@@ -6,6 +6,7 @@ const test = require("node:test");
 const uploadSource = fs.readFileSync(path.join(__dirname, "UploadPanel.tsx"), "utf8");
 const accountSource = fs.readFileSync(path.join(__dirname, "CommunityAccountScreen.tsx"), "utf8");
 const actionsSource = fs.readFileSync(path.join(__dirname, "BillingActions.tsx"), "utf8");
+const settingsSource = fs.readFileSync(path.join(__dirname, "SettingsPanel.tsx"), "utf8");
 const gateSource = fs.readFileSync(path.join(__dirname, "BillingGateDialog.tsx"), "utf8");
 const cardSource = fs.readFileSync(path.join(__dirname, "BillingPlanUsageCard.tsx"), "utf8");
 const feedSource = fs.readFileSync(path.join(__dirname, "../app/feed/page.tsx"), "utf8");
@@ -37,6 +38,21 @@ test("account exposes custom plan usage and Stripe-only management", () => {
   assert.doesNotMatch(cardSource, /apple|App Store|StoreKit/i);
   assert.match(apiSource, /JSON\.stringify\(\{ plan \}\)/);
   assert.match(actionsSource, /if \(demoMode\) \{[\s\S]*Billing actions are disabled for the local demo account/);
+});
+
+test("settings places a two-column Plus and Pro pricing comparison below the current plan", () => {
+  assert.match(
+    settingsSource,
+    /data-current-plan-card[\s\S]*<BillingActions[\s\S]*presentation="pricing"/,
+  );
+  assert.match(actionsSource, /presentation\?: "compact" \| "pricing"/);
+  assert.match(actionsSource, /data-billing-pricing-grid className="grid grid-cols-1 gap-3 sm:grid-cols-2"/);
+  assert.match(actionsSource, /plans\.filter\(\(plan\)[\s\S]*plan\.code !== "free"/);
+  assert.match(actionsSource, /formatPlanMonthlyAmount\(plan\)/);
+  assert.match(actionsSource, /planBenefits\(plan\)\.map/);
+  assert.match(actionsSource, /`Purchase \$\{plan\.name\}`/);
+  assert.match(actionsSource, /data-stripe-plan-button=\{plan\.code\}/);
+  assert.match(actionsSource, /if \(activeSubscription\)[\s\S]*openPortal\(\)[\s\S]*openCheckout\(plan\.code\)/);
 });
 
 test("legacy billing and signed-in account routes open the settings modal", () => {

@@ -225,6 +225,46 @@ body > * {
   z-index: 1;
 }
 
+.reelai-loading-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: grid;
+  min-height: 100dvh;
+  place-items: center;
+  overflow: hidden;
+  color: #fff;
+  background: #080808;
+}
+
+.reelai-loading-wordmark {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 24px;
+  font-weight: 400;
+  line-height: 1;
+}
+
+.reelai-loading-letter {
+  display: block;
+  filter: blur(0);
+  animation: reelai-loading-letter-blur 1.5s linear infinite alternate;
+}
+
+@keyframes reelai-loading-letter-blur {
+  to {
+    filter: blur(4px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reelai-loading-letter {
+    filter: none;
+    animation: none;
+  }
+}
+
 input,
 textarea,
 button {

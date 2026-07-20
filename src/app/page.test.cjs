@@ -57,6 +57,8 @@ test("sidebar exposes only supported primary destinations", () => {
   assert.match(primaryActions, /label: "New search"/);
   assert.match(primaryActions, /label: "Community Reels"/);
   assert.match(primaryActions, /label: "Your Sets"/);
+  assert.match(primaryActions, /label: "Community Reels"[\s\S]{0,260}?data-sidebar-icon="community-sets"[\s\S]{0,180}?fa-solid fa-users/);
+  assert.match(primaryActions, /label: "Your Sets"[\s\S]{0,260}?data-sidebar-icon="your-sets"[\s\S]{0,180}?fa-solid fa-folder/);
   assert.match(primaryActions, /\.\.\.\(shellAccount \? \[\{/);
   assert.doesNotMatch(primaryActions, /Search History|label: "Settings"/);
   assert.match(source, /data-mobile-drawer="true"[\s\S]*bg-black text-white/);
@@ -106,7 +108,9 @@ test("shell icons are thin and large centered overlays share one compact frame",
   assert.match(source, /strokeWidth="1\.5"/);
   assert.match(source, /<ShellIcon name="search"/);
   assert.match(source, /<ShellIcon name="panel"/);
-  assert.doesNotMatch(source, /fa-(solid|regular|brands)|fa-magnifying-glass|fa-table-columns|fa-bars/);
+  assert.equal((source.match(/\{action\.icon\}/g) || []).length, 2);
+  assert.doesNotMatch(source, /case "community"|case "sets"/);
+  assert.doesNotMatch(source, /fa-magnifying-glass|fa-table-columns|fa-bars/);
   assert.match(source, /const LARGE_CENTERED_MODAL_PANEL_CLASS = "[^"]*sm:h-\[min\(600px,calc\(100dvh-64px\)\)\][^"]*sm:max-w-\[820px\]"/);
   assert.equal((source.match(/panelClassName=\{LARGE_CENTERED_MODAL_PANEL_CLASS\}/g) || []).length, 2);
   assert.doesNotMatch(source, /AUTH_MODAL_PANEL_CLASS/);

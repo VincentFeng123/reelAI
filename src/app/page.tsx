@@ -97,8 +97,6 @@ type ShellIconName =
   | "search"
   | "panel"
   | "compose"
-  | "community"
-  | "sets"
   | "close"
   | "menu"
   | "chevron"
@@ -143,23 +141,6 @@ function ShellIcon({
         <>
           <path d="M12 5H7a3 3 0 0 0-3 3v9a3 3 0 0 0 3 3h9a3 3 0 0 0 3-3v-5" />
           <path d="m9.5 14.5.8-3 6.8-6.8a1.4 1.4 0 0 1 2 2l-6.8 6.8-2.8 1Z" />
-        </>
-      );
-      break;
-    case "community":
-      content = (
-        <>
-          <circle cx="9" cy="9" r="3" />
-          <circle cx="17" cy="10" r="2.25" />
-          <path d="M3.8 19c.5-3 2.3-4.5 5.2-4.5s4.7 1.5 5.2 4.5M15 14.7c2.8-.5 4.6.8 5.2 3.3" />
-        </>
-      );
-      break;
-    case "sets":
-      content = (
-        <>
-          <path d="M3.5 7.5h6l1.8 2h9.2v7.25A2.75 2.75 0 0 1 17.75 19.5H6.25a2.75 2.75 0 0 1-2.75-2.75V7.5Z" />
-          <path d="M3.5 7.5V6.75A2.25 2.25 0 0 1 5.75 4.5h3.4l1.7 2" />
         </>
       );
       break;
@@ -1563,28 +1544,40 @@ function HomePageContent() {
     {
       key: "search",
       label: "New search",
-      icon: "compose",
+      icon: <ShellIcon name="compose" className="h-[18px] w-[18px]" />,
       isActive: visibleSidebarTab === "search",
       onClick: startNewSearch,
     },
     {
       key: "community",
       label: "Community Reels",
-      icon: "community",
+      icon: (
+        <i
+          data-sidebar-icon="community-sets"
+          className="fa-solid fa-users h-[18px] w-[18px] shrink-0 text-center text-[15px] leading-[18px]"
+          aria-hidden="true"
+        />
+      ),
       isActive: visibleSidebarTab === "community",
       onClick: () => switchSidebarTab("community", { resetCommunityView: true }),
     },
     ...(shellAccount ? [{
       key: "edit",
       label: "Your Sets",
-      icon: "sets" as const,
+      icon: (
+        <i
+          data-sidebar-icon="your-sets"
+          className="fa-solid fa-folder h-[18px] w-[18px] shrink-0 text-center text-[15px] leading-[18px]"
+          aria-hidden="true"
+        />
+      ),
       isActive: visibleSidebarTab === "edit" || visibleSidebarTab === "create",
       onClick: () => switchSidebarTab("edit"),
     }] : []),
   ] satisfies ReadonlyArray<{
     key: string;
     label: string;
-    icon: ShellIconName;
+    icon: ReactNode;
     isActive: boolean;
     onClick: () => void;
   }>;
@@ -1967,7 +1960,7 @@ function HomePageContent() {
               action.isActive ? "bg-[#2a2a2a] text-white" : "text-zinc-200 hover:bg-white/[0.07]"
             }`}
           >
-            <ShellIcon name={action.icon} className="h-[18px] w-[18px]" />
+            {action.icon}
             <span className="truncate">{action.label}</span>
           </button>
         ))}
@@ -2085,7 +2078,7 @@ function HomePageContent() {
       <div className="mt-2 flex flex-col gap-1">
         {sidebarPrimaryActions.map((action) => (
           <button key={action.key} type="button" onClick={action.onClick} aria-label={action.label} title={action.label} className={`grid h-10 w-10 place-items-center rounded-xl transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-white ${action.isActive ? "bg-[#2a2a2a] text-white" : "text-zinc-300 hover:bg-white/[0.07] hover:text-white"}`}>
-            <ShellIcon name={action.icon} />
+            {action.icon}
           </button>
         ))}
       </div>

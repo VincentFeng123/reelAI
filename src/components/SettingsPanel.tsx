@@ -1055,7 +1055,8 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
                     </button>
                   </div>
                 ) : billingStatus ? (
-                  <div className="rounded-2xl bg-white/[0.045] p-4">
+                  <div>
+                  <div data-current-plan-card className="rounded-2xl bg-white/[0.045] p-4">
                     <div className="flex items-start justify-between gap-4">
                       <div>
                         <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-white/45">Current plan</p>
@@ -1093,9 +1094,16 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
                         ) : null}
                       </div>
                     ) : null}
-                    <div className="mt-6">
-                      <BillingActions status={billingStatus} plans={billingPlans} onError={setBillingActionError} demoMode={demoMode} />
-                    </div>
+                  </div>
+                  <div className="mt-5">
+                    <BillingActions
+                      status={billingStatus}
+                      plans={billingPlans}
+                      onError={setBillingActionError}
+                      demoMode={demoMode}
+                      presentation="pricing"
+                    />
+                  </div>
                   </div>
                 ) : (
                   <div className="rounded-2xl bg-white/[0.045] p-4" aria-live="polite">

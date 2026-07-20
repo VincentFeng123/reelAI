@@ -1,16 +1,27 @@
+const LOADING_LETTERS = ["R", "E", "E", "L", "A", "I"] as const;
+
 export function FullscreenLoadingScreen() {
   return (
     <div
-      className="fixed inset-0 grid min-h-[100dvh] place-items-center bg-black text-white"
+      className="reelai-loading-screen"
       aria-busy="true"
     >
       <div
-        className="text-lg font-semibold tracking-[-0.02em]"
+        className="reelai-loading-wordmark"
         role="status"
         aria-live="polite"
         aria-label="Loading ReelAI"
       >
-        ReelAI
+        {LOADING_LETTERS.map((letter, index) => (
+          <span
+            key={`${letter}-${index}`}
+            className="reelai-loading-letter"
+            style={{ animationDelay: `${index * 0.2}s` }}
+            aria-hidden="true"
+          >
+            {letter}
+          </span>
+        ))}
       </div>
     </div>
   );
