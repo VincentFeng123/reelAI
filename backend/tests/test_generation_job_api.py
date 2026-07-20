@@ -26,7 +26,13 @@ from backend.app.ingestion.models import (
     IngestTranscriptCue,
     YouTubeSourceRef,
 )
-from backend.app.models import ReelOut, ReelsGenerateRequest
+from backend.app.models import (
+    AssessmentAnswerRequest,
+    FeedbackRequest,
+    MaterialLevelUpdateRequest,
+    ReelOut,
+    ReelsGenerateRequest,
+)
 from backend.app.services import generation_jobs
 from backend.app.services.reels import ReelService
 
@@ -210,6 +216,12 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
         if preparation_complete
         else "incomplete"
     )
+    concept_signals = {
+        "c1": {"helpful": 1.0, "confusing": 0.0, "adjustment": 0.04}
+    }
+    adaptation_fingerprint = hashlib.sha256(
+        json.dumps(concept_signals, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     job, _ = generation_jobs.submit_or_get_active(
         conn,
         material_id="m1",
@@ -221,6 +233,7 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
             "generation_mode": "fast",
             "num_reels": 3,
             "knowledge_level": "beginner",
+            "adaptation_fingerprint": adaptation_fingerprint,
         },
         now=now,
     )
@@ -234,7 +247,6 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
     generated: list[dict] = []
 
     def generate_stage(worker_conn, **kwargs) -> None:
-        mastery_at = (now + timedelta(seconds=5)).isoformat()
         for index in range(3):
             generated.append(
                 _insert_generation_reel(
@@ -245,14 +257,6 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
                     created_at=(now + timedelta(seconds=index)).isoformat(),
                 )
             )
-        worker_conn.execute(
-            "INSERT INTO reel_feedback "
-            "(id, learner_id, reel_id, helpful, confusing, rating, saved, "
-            "mastery_updated_at, updated_at, created_at) "
-            "VALUES ('lesson-feedback', 'learner-1', 'release-reel-0', "
-            "1, 0, 5, 0, ?, ?, ?)",
-            (mastery_at, mastery_at, mastery_at),
-        )
 
     def order_batch(reels, **kwargs):
         assert kwargs["topic"] == "Cell biology"
@@ -295,6 +299,11 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
         return original_append(worker_conn, **kwargs)
 
     monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_learner_concept_signals",
+        lambda *_args, **_kwargs: concept_signals,
+    )
     monkeypatch.setattr(
         main,
         "_ranked_request_reels",
@@ -853,12 +862,29 @@ def test_terminal_status_and_replay_use_current_ranking_within_released_batch(
             terminal,
             generation_jobs.replay_events(conn, job_id=str(terminal["id"])),
         )
+        running_replay = main._sanitize_generation_replay_events(
+            conn,
+            {**terminal, "status": "running"},
+            generation_jobs.replay_events(conn, job_id=str(terminal["id"])),
+        )
+        cancelled_replay = main._sanitize_generation_replay_events(
+            conn,
+            {**terminal, "status": "cancelled"},
+            generation_jobs.replay_events(conn, job_id=str(terminal["id"])),
+        )
 
         assert [reel["reel_id"] for reel in status["reels"]] == ["r3", "r4"]
         final = next(event for event in replay if event["type"] == "final")
         assert [reel["reel_id"] for reel in final["payload"]["reels"]] == [
             "r3", "r4",
         ]
+        running_final = next(event for event in running_replay if event["type"] == "final")
+        assert [reel["reel_id"] for reel in running_final["payload"]["reels"]] == [
+            "r3", "r4",
+        ]
+        cancelled_final = next(event for event in cancelled_replay if event["type"] == "final")
+        assert cancelled_final["payload"]["reels"] == []
+        assert cancelled_final["payload"]["generation_id"] is None
     finally:
         conn.close()
 
@@ -1657,6 +1683,230 @@ def test_generation_worker_db_probe_stops_for_every_invalid_lease_state(
             ),
         )
         assert main._generation_job_db_should_stop(job["id"], "worker-a", now=checked_at)
+    finally:
+        conn.close()
+
+
+def test_generation_worker_cancels_inventory_acquired_under_stale_adaptation(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="stale-adaptation-release",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={
+            "generation_mode": "fast",
+            "num_reels": 1,
+            "knowledge_level": "beginner",
+            "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
+        },
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="stale-adaptation-worker",
+        now=now,
+    )
+    assert leased
+    concept_signals: dict[str, dict[str, float]] = {}
+    ordering_calls = 0
+
+    def generate_then_receive_feedback(worker_conn, **kwargs) -> None:
+        nonlocal concept_signals
+        _insert_generation_reel(
+            worker_conn,
+            generation_id=str(kwargs["generation_id"]),
+            reel_id="pre-feedback-reel",
+            video_id="pre-feedback-video",
+            created_at=now.isoformat(),
+        )
+        concept_signals = {
+            "c1": {"helpful": 0.0, "confusing": 1.0, "adjustment": -0.35}
+        }
+
+    def order_batch(reels, **_kwargs):
+        nonlocal ordering_calls
+        ordering_calls += 1
+        return mock.Mock(
+            reels=reels,
+            ordered_reel_ids=[reel["reel_id"] for reel in reels],
+            assessment_checkpoint_reel_ids=[],
+            model_used="gemini-test",
+            degraded=False,
+            fallback_reason=None,
+            provider_called=True,
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_then_receive_feedback)
+    monkeypatch.setattr(
+        main,
+        "_learner_concept_signals",
+        lambda *_args, **_kwargs: concept_signals,
+    )
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        cancelled = generation_jobs.get_job(conn, job["id"])
+        assert cancelled is not None
+        assert cancelled["status"] == "cancelled"
+        assert cancelled["terminal_error_code"] == "cancelled"
+        assert ordering_calls == 0
+        assert not any(
+            event["type"] == "final"
+            for event in generation_jobs.replay_events(conn, job_id=job["id"])
+        )
+        assert main._generation_job_status_payload(conn, cancelled)["reels"] == []
+        assert conn.execute("SELECT COUNT(*) FROM reel_generation_heads").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("stale_dimension", ["concept", "knowledge_level"])
+def test_generation_worker_rejects_stale_lease_before_provider_work(
+    monkeypatch,
+    stale_dimension: str,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="stale-adaptation-preflight",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={
+            "generation_mode": "fast",
+            "num_reels": 1,
+            "knowledge_level": "beginner",
+            "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
+        },
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="stale-preflight-worker",
+        now=now,
+    )
+    assert leased
+    provider = mock.Mock()
+    monkeypatch.setattr(main.reel_service, "generate_reels", provider)
+    if stale_dimension == "concept":
+        monkeypatch.setattr(
+            main,
+            "_learner_concept_signals",
+            lambda *_args, **_kwargs: {
+                "c1": {"helpful": 0.0, "confusing": 1.0, "adjustment": -0.35}
+            },
+        )
+    else:
+        monkeypatch.setattr(
+            main.reel_service,
+            "learner_progress",
+            lambda *_args, **_kwargs: {
+                "selected_level": "advanced",
+                "global_adjustment": 0.0,
+            },
+        )
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        cancelled = generation_jobs.get_job(conn, job["id"])
+        assert cancelled is not None
+        assert cancelled["status"] == "cancelled"
+        provider.assert_not_called()
+        assert conn.execute("SELECT COUNT(*) FROM reel_generations").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_generation_worker_rechecks_adaptation_at_atomic_release(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="stale-adaptation-final-release",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={
+            "generation_mode": "fast",
+            "num_reels": 1,
+            "knowledge_level": "beginner",
+            "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
+        },
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="stale-release-worker",
+        now=now,
+    )
+    assert leased
+    concept_signals: dict[str, dict[str, float]] = {}
+    original_lock = main._lock_learner_adaptation
+
+    def generate_stage(worker_conn, **kwargs) -> None:
+        _insert_generation_reel(
+            worker_conn,
+            generation_id=str(kwargs["generation_id"]),
+            reel_id="pre-release-feedback-reel",
+            video_id="pre-release-feedback-video",
+            created_at=now.isoformat(),
+        )
+
+    def order_batch(reels, **_kwargs):
+        return mock.Mock(
+            reels=reels,
+            ordered_reel_ids=[reel["reel_id"] for reel in reels],
+            assessment_checkpoint_reel_ids=[],
+            model_used="gemini-test",
+            degraded=False,
+            fallback_reason=None,
+            provider_called=True,
+        )
+
+    def lock_after_feedback(worker_conn, **kwargs) -> None:
+        nonlocal concept_signals
+        original_lock(worker_conn, **kwargs)
+        concept_signals = {
+            "c1": {"helpful": 1.0, "confusing": 0.0, "adjustment": 0.2}
+        }
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
+    monkeypatch.setattr(main, "_lock_learner_adaptation", lock_after_feedback)
+    monkeypatch.setattr(
+        main,
+        "_learner_concept_signals",
+        lambda *_args, **_kwargs: concept_signals,
+    )
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        cancelled = generation_jobs.get_job(conn, job["id"])
+        assert cancelled is not None
+        assert cancelled["status"] == "cancelled"
+        assert not any(
+            event["type"] == "final"
+            for event in generation_jobs.replay_events(conn, job_id=job["id"])
+        )
+        assert conn.execute("SELECT COUNT(*) FROM reel_generation_heads").fetchone()[0] == 0
     finally:
         conn.close()
 
@@ -3414,6 +3664,298 @@ def test_generate_continuation_queues_one_new_batch_from_the_previous_job(monkey
         conn.close()
 
 
+@pytest.mark.parametrize("stale_dimension", ["adaptation", "request_schema"])
+def test_generate_rejects_a_stale_continuation(monkeypatch, stale_dimension: str) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    root_payload = ReelsGenerateRequest(material_id="m1", concept_id="c1", num_reels=3)
+    try:
+        root_response = asyncio.run(main.generate_reels(object(), root_payload))
+        root_job_id = json.loads(root_response.body)["job_id"]
+        root_job = generation_jobs.get_job(conn, root_job_id)
+        assert root_job
+        root_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=str(root_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        completed_at = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE reel_generation_jobs SET status = 'completed', phase = 'terminal', "
+            "progress = 1.0, result_generation_id = ?, completed_at = ?, updated_at = ? "
+            "WHERE id = ?",
+            (root_generation_id, completed_at, completed_at, root_job_id),
+        )
+
+        if stale_dimension == "adaptation":
+            monkeypatch.setattr(
+                main,
+                "_learner_concept_signals",
+                lambda *_args, **_kwargs: {
+                    "mitochondria": {
+                        "helpful": 0.0,
+                        "confusing": 1.0,
+                        "adjustment": -0.35,
+                    }
+                },
+            )
+        else:
+            stored_params = main._job_request_params(root_job)
+            stored_params["request_schema_version"] = "quality_silence_v38"
+            conn.execute(
+                "UPDATE reel_generation_jobs SET request_params_json = ? WHERE id = ?",
+                (json.dumps(stored_params), root_job_id),
+            )
+
+        with pytest.raises(main.HTTPException) as exc_info:
+            asyncio.run(main.generate_reels(
+                object(),
+                ReelsGenerateRequest(
+                    material_id="m1",
+                    concept_id="c1",
+                    num_reels=3,
+                    continuation_token=root_job_id,
+                ),
+            ))
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail["code"] == "invalid_continuation_token"
+        assert conn.execute("SELECT COUNT(*) FROM reel_generation_jobs").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_generate_cancels_a_stale_active_job_before_queueing_its_replacement(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    payload = ReelsGenerateRequest(material_id="m1", concept_id="c1", num_reels=3)
+    try:
+        first = asyncio.run(main.generate_reels(object(), payload))
+        first_job_id = json.loads(first.body)["job_id"]
+        monkeypatch.setattr(
+            main,
+            "_learner_concept_signals",
+            lambda *_args, **_kwargs: {
+                "mitochondria": {
+                    "helpful": 0.0,
+                    "confusing": 1.0,
+                    "adjustment": -0.35,
+                }
+            },
+        )
+
+        replacement = asyncio.run(main.generate_reels(object(), payload))
+        replacement_job_id = json.loads(replacement.body)["job_id"]
+
+        assert replacement.status_code == 202
+        assert replacement_job_id != first_job_id
+        assert generation_jobs.get_job(conn, first_job_id)["status"] == "cancelled"
+        assert generation_jobs.get_job(conn, replacement_job_id)["status"] == "queued"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs "
+            "WHERE status IN ('queued', 'running')"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_feedback_cancels_the_previous_adaptation_inside_its_write(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="feedback-signal-generation",
+        generation_mode="fast",
+        retrieval_profile="unified",
+    )
+    _insert_generation_reel(
+        conn,
+        generation_id=generation_id,
+        reel_id="feedback-signal-reel",
+        video_id="feedback-signal-video",
+        created_at=now.isoformat(),
+    )
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="feedback-signal-job",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="feedback-signal-worker",
+        now=now,
+    )
+    assert leased
+    signal_written = False
+
+    def record_feedback(*_args, **_kwargs) -> int:
+        nonlocal signal_written
+        signal_written = True
+        return 1
+
+    def current_fingerprint(*_args, **_kwargs) -> str:
+        assert signal_written
+        return "after-feedback"
+
+    monkeypatch.setattr(main.reel_service, "record_feedback", record_feedback)
+    monkeypatch.setattr(
+        main,
+        "_learner_adaptation_fingerprint",
+        current_fingerprint,
+    )
+    try:
+        response = main.feedback(
+            object(),
+            FeedbackRequest(
+                reel_id="feedback-signal-reel",
+                helpful=True,
+                confusing=False,
+            ),
+        )
+
+        assert response["status"] == "ok"
+        assert generation_jobs.get_job(conn, job["id"])["status"] == "cancelled"
+    finally:
+        conn.close()
+
+
+def test_completed_assessment_cancels_the_previous_adaptation_inside_its_write(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        "INSERT INTO assessment_sessions "
+        "(id, learner_id, material_id, status, created_at, updated_at) "
+        "VALUES ('assessment-session', 'learner-1', 'm1', 'completed', ?, ?)",
+        (now.isoformat(), now.isoformat()),
+    )
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="assessment-signal-job",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="assessment-signal-worker",
+        now=now,
+    )
+    assert leased
+    adaptation_locked = False
+    signal_written = False
+    original_lock = main._lock_learner_adaptation
+
+    def lock_adaptation(worker_conn, **kwargs) -> None:
+        nonlocal adaptation_locked
+        original_lock(worker_conn, **kwargs)
+        adaptation_locked = True
+
+    def answer(*_args, **_kwargs):
+        nonlocal signal_written
+        assert adaptation_locked
+        signal_written = True
+        return {
+            "correct": False,
+            "correct_index": 0,
+            "explanation": "Review the concept.",
+            "session": {"status": "completed", "material_id": "m1"},
+        }
+
+    def current_fingerprint(*_args, **_kwargs) -> str:
+        assert signal_written
+        return "after-assessment"
+
+    monkeypatch.setattr(main, "_lock_learner_adaptation", lock_adaptation)
+    monkeypatch.setattr(main.assessment_service, "answer", answer)
+    monkeypatch.setattr(main.reel_service, "update_level_adjustment", mock.Mock())
+    monkeypatch.setattr(
+        main,
+        "_learner_adaptation_fingerprint",
+        current_fingerprint,
+    )
+    try:
+        response = main.answer_assessment(
+            object(),
+            "assessment-session",
+            AssessmentAnswerRequest(question_id="assessment-question", choice_index=1),
+        )
+
+        assert response["session"]["status"] == "completed"
+        assert generation_jobs.get_job(conn, job["id"])["status"] == "cancelled"
+    finally:
+        conn.close()
+
+
+def test_level_change_cancels_an_active_job_from_the_previous_difficulty(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+
+    @contextmanager
+    def connection(**_kwargs):
+        yield conn
+
+    monkeypatch.setattr(main, "get_conn", connection)
+    monkeypatch.setattr(
+        main,
+        "_resolve_learner_identity",
+        lambda *_args, **_kwargs: "learner-1",
+    )
+    main.reel_service.learner_progress(conn, "m1", "learner-1")
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="previous-level-job",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={
+            "knowledge_level": "beginner",
+            "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
+        },
+        now=now,
+    )
+    try:
+        response = main.update_material_level(
+            "m1",
+            object(),
+            MaterialLevelUpdateRequest(knowledge_level="advanced"),
+        )
+
+        assert response["knowledge_level"] == "advanced"
+        assert generation_jobs.get_job(conn, job["id"])["status"] == "cancelled"
+        progress = main.reel_service.learner_progress(conn, "m1", "learner-1")
+        assert progress["selected_level"] == "advanced"
+    finally:
+        conn.close()
+
+
 def test_generate_cost_guard_preserves_active_and_completed_reuse(monkeypatch) -> None:
     assert main.REELS_GENERATE_RATE_LIMIT_PER_WINDOW == 6
     assert main.GENERATION_GLOBAL_ACTIVE_LIMIT == 4
@@ -4177,6 +4719,41 @@ def test_feed_autofill_false_never_submits_and_true_submits_before_return(monkey
             ("feed", 36),
             ("generation-submit", 6),
         ]
+    finally:
+        conn.close()
+
+
+def test_feed_cancels_a_stale_active_job_before_queueing_its_replacement(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    concept_signals: dict[str, dict[str, float]] = {}
+    monkeypatch.setattr(
+        main,
+        "_learner_concept_signals",
+        lambda *_args, **_kwargs: concept_signals,
+    )
+    try:
+        first = main.feed(object(), material_id="m1", autofill=True)
+        first_job_id = first["generation_job_id"]
+        assert first_job_id
+
+        concept_signals = {
+            "c1": {"helpful": 0.0, "confusing": 1.0, "adjustment": -0.35}
+        }
+        replacement = main.feed(object(), material_id="m1", autofill=True)
+        replacement_job_id = replacement["generation_job_id"]
+
+        assert replacement_job_id
+        assert replacement_job_id != first_job_id
+        assert generation_jobs.get_job(conn, first_job_id)["status"] == "cancelled"
+        assert generation_jobs.get_job(conn, replacement_job_id)["status"] == "queued"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs "
+            "WHERE status IN ('queued', 'running')"
+        ).fetchone()[0] == 1
     finally:
         conn.close()
 

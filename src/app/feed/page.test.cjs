@@ -313,6 +313,7 @@ function compileUseCallback(name, bindings) {
     isDailySearchLimitError: () => false,
     isVerifiedAccountRequiredError: () => false,
     isTransportError: () => false,
+    getAdaptiveExcludeVideoIds: () => [],
     ...bindings,
   };
   const names = Object.keys(effectiveBindings);
@@ -553,7 +554,7 @@ test("feed starts with three three-clip batches and resumes durable jobs", () =>
   const requestMoreStart = source.indexOf("const requestMore = useCallback(");
   const requestMoreEnd = source.indexOf("\n\n  useEffect(() => {", requestMoreStart);
   const requestMoreText = source.slice(requestMoreStart, requestMoreEnd);
-  assert.doesNotMatch(requestMoreText, /excludeVideoIds/);
+  assert.match(requestMoreText, /adaptiveExcludeVideoIds\.length > 0/);
   assert.doesNotMatch(requestMoreText, /markGenerationFinished/);
 });
 
@@ -1177,13 +1178,14 @@ test("terminal copy is hidden until the viewer reaches the last visible reel", (
   );
 });
 
-test("generation continuation is server-owned and does not exclude whole source videos", () => {
+test("generation continuation stays server-owned while adaptive requests exclude watched sources", () => {
   const requestMoreStart = source.indexOf("const requestMore = useCallback(");
   const requestMoreEnd = source.indexOf("\n\n  useEffect(() => {", requestMoreStart);
   const callbackText = source.slice(requestMoreStart, requestMoreEnd);
   assert.match(callbackText, /const continuationToken = continuationTokenByMaterialRef\.current\.get\(id\)/);
   assert.match(callbackText, /continuationToken,/);
-  assert.doesNotMatch(callbackText, /excludeVideoIds/);
+  assert.match(callbackText, /getAdaptiveExcludeVideoIds\(\)/);
+  assert.match(callbackText, /excludeVideoIds: adaptiveExcludeVideoIds/);
 });
 
 test("a restored feed response seeds the next continuation token", () => {
@@ -2267,7 +2269,7 @@ test("every forward transition waits for backend assessment readiness", () => {
   const jumpText = source.slice(jumpStart, jumpEnd);
   assert.match(
     jumpText,
-    /if \(nextIndex <= currentIndex\) \{\s+reportForwardScrollForReel\(outgoingReel\);\s+maybeLoadMore\(\)/,
+    /if \(nextIndex <= currentIndex\)[\s\S]*?gateRequest\.advanceRequested = true;[\s\S]*?maybeLoadMore\(\)/,
   );
   assert.match(
     jumpText,
@@ -2284,6 +2286,52 @@ test("every forward transition waits for backend assessment readiness", () => {
     source.slice(playbackStart, playbackEnd),
     /naturalEnd[\s\S]*?activeIndexRef\.current >= reelsRef\.current\.length - 1[\s\S]*?reportForwardScrollForReel\(activeReel\)/,
   );
+});
+
+test("keyboard-style tail jumps preserve the recall move while inventory is queued", () => {
+  const gateRequest = { advanceRequested: false };
+  let loadAttempts = 0;
+  const jumpAtTail = compileUseCallback("jumpOneReel", {
+    assessmentBootstrapPending: false,
+    assessmentGatePending: false,
+    assessmentSession: null,
+    assessmentSlideActive: false,
+    activeIndexRef: { current: 0 },
+    reelsRef: { current: [{ reel_id: "tail" }] },
+    maybeLoadMore: () => { loadAttempts += 1; },
+    reportForwardScrollForReel: () => gateRequest,
+    commitOneReelMove: () => {},
+    beginSnapTransitionLock: () => {},
+    setAssessmentAdvanceAfterClose: () => {},
+    hasMore: false,
+    canRequestMore: true,
+    isGeneratingRef: { current: true },
+    isFetchingRef: { current: false },
+  });
+
+  jumpAtTail(1);
+  assert.equal(gateRequest.advanceRequested, true);
+  assert.equal(loadAttempts, 1);
+
+  const closeDebt = [];
+  const openPendingRecall = compileUseCallback("jumpOneReel", {
+    assessmentBootstrapPending: false,
+    assessmentGatePending: false,
+    assessmentSession: { id: "pending-recall" },
+    assessmentSlideActive: false,
+    activeIndexRef: { current: 0 },
+    reelsRef: { current: [{ reel_id: "tail" }] },
+    beginSnapTransitionLock: () => {},
+    setAssessmentAdvanceAfterClose: (value) => closeDebt.push(value),
+    setAssessmentSlideActive: () => {},
+    hasMore: false,
+    canRequestMore: true,
+    isGeneratingRef: { current: true },
+    isFetchingRef: { current: false },
+  });
+
+  openPendingRecall(1);
+  assert.deepEqual(closeDebt, [true]);
 });
 
 test("a checkpoint scroll gate serializes rapid swipes before opening recall", async () => {
@@ -2411,12 +2459,66 @@ test("a checkpoint scroll gate serializes rapid swipes before opening recall", a
     setAssessmentGatePending: () => {},
     setAssessmentAdvanceAfterClose: () => {},
     commitOneReelMove,
+    activeIndexRef,
+    reelsRef,
+    hasMore: false,
+    canRequestMore: false,
+    isGeneratingRef: { current: false },
+    isFetchingRef: { current: false },
+    pendingAutoplayAdvanceRef: { current: false },
+    setPendingTailAdvance: () => {},
+    maybeLoadMore: () => {},
   });
   closeAssessmentAndContinue();
   assert.equal(activeIndexRef.current, 3);
   assert.equal(commits, 1);
   assert.deepEqual(slideStates, [true, false]);
   assert.equal(assessmentStartRequestRef.current, null);
+});
+
+test("closing recall at a queued adaptive tail retains exactly one owed move", () => {
+  const activeIndexRef = { current: 0 };
+  const reelsRef = { current: [{ reel_id: "watched" }] };
+  const pendingAutoplayAdvanceRef = { current: false };
+  const pendingStates = [];
+  let loadAttempts = 0;
+  let commits = 0;
+  const closeAssessmentAndContinue = compileUseCallback("closeAssessmentAndContinue", {
+    assessmentAdvanceAfterClose: true,
+    assessmentStartRequestRef: { current: { id: "assessment" } },
+    setAssessmentSlideActive: () => {},
+    setAssessmentSession: () => {},
+    setAssessmentQuestionIndex: () => {},
+    setAssessmentAnswerReveal: () => {},
+    setAssessmentAnswering: () => {},
+    setAssessmentResultsVisible: () => {},
+    setAssessmentPreparingFeed: () => {},
+    setAssessmentSnoozing: () => {},
+    setAssessmentError: () => {},
+    setAssessmentGatePending: () => {},
+    setAssessmentAdvanceAfterClose: () => {},
+    activeIndexRef,
+    reelsRef,
+    hasMore: false,
+    canRequestMore: true,
+    isGeneratingRef: { current: true },
+    isFetchingRef: { current: false },
+    pendingAutoplayAdvanceRef,
+    setPendingTailAdvance: (value) => pendingStates.push(value),
+    maybeLoadMore: () => { loadAttempts += 1; },
+    commitOneReelMove: () => { commits += 1; },
+  });
+
+  closeAssessmentAndContinue();
+
+  assert.equal(commits, 0);
+  assert.equal(loadAttempts, 1);
+  assert.equal(pendingAutoplayAdvanceRef.current, true);
+  assert.deepEqual(pendingStates, [true]);
+  assert.match(
+    source,
+    /if \(!pendingAutoplayAdvanceRef\.current\)[\s\S]*?activeIndex >= reels\.length - 1[\s\S]*?jumpOneReel\(1\)/,
+  );
 });
 
 test("a failed checkpoint request fails open and releases the next reel for retry", async () => {
@@ -2710,22 +2812,139 @@ test("initial feed loads retain a level baseline for every grouped material", ()
   assert.match(callbackText, /knowledgeLevelByMaterialRef\.current\.get\(feedMaterialIds\[0\]\)/);
 });
 
-test("restored and grouped level changes invalidate old generation before changing inventory", () => {
+test("every adaptive rerank invalidates old generation before changing inventory", async () => {
   const rerankStart = source.indexOf("const rerankUnseenTail = useCallback(async () => {");
   const rerankEnd = source.indexOf("const reportActiveReelProgress", rerankStart);
   assert.ok(rerankStart >= 0 && rerankEnd > rerankStart);
   const callbackText = source.slice(rerankStart, rerankEnd);
   const groupedLevelIndex = callbackText.indexOf("nextLevelsByMaterial.set(feedMaterialIds[index], nextLevel)");
-  const restoredSessionGuard = callbackText.indexOf("previousLevel === undefined || previousLevel !== nextLevel");
-  const clearIndex = callbackText.indexOf("clearGenerationTracking();", restoredSessionGuard);
-  const renewIndex = callbackText.indexOf("renewActiveSearchScope();", restoredSessionGuard);
+  const storedLevelIndex = callbackText.indexOf("knowledgeLevelByMaterialRef.current.set(id, nextLevel)");
+  const clearIndex = callbackText.indexOf("clearGenerationTracking();");
+  const renewIndex = callbackText.indexOf("renewActiveSearchScope();", clearIndex);
+  const fetchIndex = callbackText.indexOf("const responses = await Promise.all", renewIndex);
   const inventoryIndex = callbackText.indexOf("updateSessionReels(nextReels);", renewIndex);
+  const consumeIndex = callbackText.indexOf("consumeFeedGenerationJob(", inventoryIndex);
   assert.ok(groupedLevelIndex >= 0, "every grouped material must be checked independently");
-  assert.ok(restoredSessionGuard > groupedLevelIndex, "an absent restored-session baseline must count as stale");
-  assert.ok(clearIndex > restoredSessionGuard, "old durable-job tracking must be cleared");
+  assert.ok(storedLevelIndex > groupedLevelIndex, "every grouped material level must be retained");
   assert.ok(renewIndex > clearIndex, "the old search scope must be invalidated");
+  assert.ok(fetchIndex > renewIndex, "old generation must be invalidated even when the adaptive inventory read fails");
   assert.ok(inventoryIndex > renewIndex, "the new inventory must only be applied after stale generation is aborted");
+  assert.ok(consumeIndex > inventoryIndex, "a current adaptive job must attach after its inventory is applied");
   assert.doesNotMatch(callbackText, /knowledgeLevel && nextLevel !== knowledgeLevel/);
   assert.doesNotMatch(source, /Change knowledge level/);
   assert.doesNotMatch(source, /auto-adjusting/);
+
+  const events = [];
+  const currentReels = [
+    { reel_id: "watched", material_id: "material-a" },
+    { reel_id: "old-unseen", material_id: "material-a" },
+  ];
+  const dedupeByIdentity = (rows, existing = []) => {
+    const byId = new Map(existing.map((reel) => [reel.reel_id, reel]));
+    for (const reel of rows) {
+      if (!byId.has(reel.reel_id)) byId.set(reel.reel_id, reel);
+    }
+    return [...byId.values()];
+  };
+  const oldScope = { key: "material-a", seq: 1, controller: new AbortController() };
+  const activeSearchScopeRef = { current: oldScope };
+  const rerank = compileUseCallback("rerankUnseenTail", {
+    getFeedMaterialIds: () => ["material-a"],
+    reelsRef: { current: currentReels },
+    settingsScopeReady: true,
+    activeSearchScopeRef,
+    activeIndexRef: { current: 0 },
+    watchedFrontierIndexRef: { current: 0 },
+    clamp: (value, min, max) => Math.max(min, Math.min(max, value)),
+    MAX_REELS_PER_FEED_SESSION: 50,
+    getFeedTuningSettings: () => ({
+      minRelevance: 0.75,
+      creativeCommonsOnly: false,
+      preferredVideoDuration: "any",
+    }),
+    fetchFeed: async ({ signal, excludeVideoIds }) => {
+      assert.equal(signal, activeSearchScopeRef.current.controller.signal);
+      assert.deepEqual(excludeVideoIds, ["dQw4w9WgXcQ"]);
+      events.push(`fetch:${activeSearchScopeRef.current.seq}`);
+      return {
+        reels: [],
+        total: 0,
+        knowledge_level: "beginner",
+        generation_job_id: "adaptive-job",
+        generation_job_status: "queued",
+      };
+    },
+    generationMode: "slow",
+    isSearchScopeActive: (scope) => scope === activeSearchScopeRef.current && !scope.controller.signal.aborted,
+    knowledgeLevelByMaterialRef: { current: new Map([["material-a", "beginner"]]) },
+    clearGenerationTracking: () => events.push("clear"),
+    setAssessmentPreparingFeed: () => {},
+    renewActiveSearchScope: () => {
+      activeSearchScopeRef.current.controller.abort();
+      activeSearchScopeRef.current = {
+        key: "material-a",
+        seq: activeSearchScopeRef.current.seq + 1,
+        controller: new AbortController(),
+      };
+      events.push("renew");
+    },
+    rememberFeedContinuationToken: () => {},
+    rememberFeedGenerationJob: (_materialId, response) => events.push(`remember:${response.generation_job_id}`),
+    consumeFeedGenerationJob: (_materialId, response, scope) => {
+      events.push(`consume:${response.generation_job_id}:${scope.seq}`);
+      return null;
+    },
+    getAdaptiveExcludeVideoIds: () => ["dQw4w9WgXcQ"],
+    dedupeByIdentity,
+    mergeReelBatchesInServerOrder: (batches) => batches.flat(),
+    adaptiveExcludeReelIdsRef: { current: [] },
+    updateSessionReels: (reels) => events.push(`inventory:${reels.map((reel) => reel.reel_id).join(",")}`),
+    setActiveIndex: () => {},
+    setTotal: () => {},
+    setPage: () => {},
+    setCanRequestMore: (value) => events.push(`can-request:${value}`),
+    setFeedPagesExhausted: () => {},
+    setKnowledgeLevel: () => {},
+  });
+
+  await rerank();
+  assert.equal(oldScope.controller.signal.aborted, true);
+  assert.deepEqual(events, [
+    "clear",
+    "renew",
+    "can-request:true",
+    "fetch:2",
+    "inventory:watched",
+    "remember:adaptive-job",
+    "consume:adaptive-job:2",
+  ]);
+});
+
+test("adaptive generation excludes source videos from the watched prefix", () => {
+  const getAdaptiveExcludeVideoIds = compileUseCallback("getAdaptiveExcludeVideoIds", {
+    adaptiveExcludeReelIdsRef: { current: ["watched", "missing"] },
+    reelsRef: {
+      current: [
+        {
+          reel_id: "watched",
+          video_id: "yt:dQw4w9WgXcQ",
+          video_url: "https://youtube.com/embed/dQw4w9WgXcQ?start=10&end=20",
+        },
+        {
+          reel_id: "unseen",
+          video_id: "source-b",
+          video_url: "https://youtube.com/watch?v=source-b",
+        },
+      ],
+    },
+    sourceVideoKeyFromUrl: () => "dQw4w9WgXcQ",
+  });
+
+  assert.deepEqual(getAdaptiveExcludeVideoIds(), ["dQw4w9WgXcQ"]);
+  const requestStart = source.indexOf("const requestMore = useCallback(async");
+  const requestEnd = source.indexOf("const requestReadyBatch", requestStart);
+  assert.match(
+    source.slice(requestStart, requestEnd),
+    /generateReelsStream\(\{[\s\S]*?excludeVideoIds: adaptiveExcludeVideoIds/,
+  );
 });

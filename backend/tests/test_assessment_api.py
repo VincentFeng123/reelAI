@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
+import threading
+from unittest import mock
 
 from fastapi.testclient import TestClient
+import pytest
 
 from backend.app import db as db_module
 from backend.app.config import get_settings
@@ -220,6 +224,137 @@ class TestAssessmentApi:
             },
         )
         assert forbidden.status_code == 404
+
+    def test_final_answer_rolls_back_all_quiz_adaptation_on_later_failure(
+        self,
+    ) -> None:
+        ready = False
+        for index in range(5):
+            response = self.client.post(
+                f"/api/reels/api-reel-{index}/scroll",
+                headers=self.headers_a,
+            )
+            assert response.status_code == 200
+            ready = bool(response.json()["assessment_ready"])
+            if ready:
+                break
+        assert ready
+        session = self.client.post(
+            "/api/assessments/next",
+            headers=self.headers_a,
+            json={"material_id": MATERIAL},
+        ).json()["session"]
+        for question in session["questions"][:2]:
+            response = self.client.post(
+                f"/api/assessments/{session['id']}/answer",
+                headers=self.headers_a,
+                json={"question_id": question["id"], "choice_index": 0},
+            )
+            assert response.status_code == 200
+
+        final_question = session["questions"][2]
+        with (
+            mock.patch.object(
+                main_module.reel_service,
+                "update_level_adjustment",
+                side_effect=RuntimeError("post-assessment failure"),
+            ),
+            pytest.raises(RuntimeError, match="post-assessment failure"),
+        ):
+            self.client.post(
+                f"/api/assessments/{session['id']}/answer",
+                headers=self.headers_a,
+                json={"question_id": final_question["id"], "choice_index": 0},
+            )
+
+        with db_module.get_conn() as conn:
+            stored = db_module.fetch_one(
+                conn,
+                "SELECT status, current_index FROM assessment_sessions WHERE id = ?",
+                (session["id"],),
+            )
+            attempts = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS count FROM assessment_attempts WHERE session_id = ?",
+                (session["id"],),
+            )
+            outcomes = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS count FROM assessment_concept_outcomes "
+                "WHERE session_id = ?",
+                (session["id"],),
+            )
+        assert stored == {"status": "pending", "current_index": 2}
+        assert attempts == {"count": 2}
+        assert outcomes == {"count": 0}
+
+    def test_adaptation_lock_serializes_real_sqlite_connections(self) -> None:
+        learner_id = "owner:" + hashlib.sha256(OWNER_A.encode("utf-8")).hexdigest()
+        first_locked = threading.Event()
+        release_first = threading.Event()
+        second_locked = threading.Event()
+        errors: list[BaseException] = []
+
+        def hold_first_lock() -> None:
+            try:
+                with db_module.get_conn(transactional=True) as conn:
+                    main_module._lock_learner_adaptation(
+                        conn,
+                        material_id=MATERIAL,
+                        learner_id=learner_id,
+                    )
+                    conn.execute(
+                        "UPDATE learner_material_progress "
+                        "SET selected_level = 'advanced', global_adjustment = 0.2, "
+                        "feedback_revision = 7 "
+                        "WHERE learner_id = ? AND material_id = ?",
+                        (learner_id, MATERIAL),
+                    )
+                    first_locked.set()
+                    assert release_first.wait(3)
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        def wait_for_same_lock() -> None:
+            try:
+                assert first_locked.wait(3)
+                with db_module.get_conn(transactional=True) as conn:
+                    main_module._lock_learner_adaptation(
+                        conn,
+                        material_id=MATERIAL,
+                        learner_id=learner_id,
+                    )
+                    second_locked.set()
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        first = threading.Thread(target=hold_first_lock)
+        second = threading.Thread(target=wait_for_same_lock)
+        first.start()
+        assert first_locked.wait(3)
+        second.start()
+        assert not second_locked.wait(0.2)
+        release_first.set()
+        first.join(timeout=3)
+        second.join(timeout=3)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        assert second_locked.is_set()
+        with db_module.get_conn() as conn:
+            progress = db_module.fetch_one(
+                conn,
+                "SELECT selected_level, global_adjustment, feedback_revision "
+                "FROM learner_material_progress "
+                "WHERE learner_id = ? AND material_id = ?",
+                (learner_id, MATERIAL),
+            )
+        assert progress == {
+            "selected_level": "advanced",
+            "global_adjustment": 0.2,
+            "feedback_revision": 7,
+        }
 
     def test_progress_requires_a_real_study_reel(self) -> None:
         response = self.client.post(

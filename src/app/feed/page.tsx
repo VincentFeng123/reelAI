@@ -2051,6 +2051,25 @@ function FeedPageInner() {
     return shouldRefillReadyBuffer(currentReels.length, activeIndexRef.current);
   }, [getFeedMaterialIds]);
 
+  const getAdaptiveExcludeVideoIds = useCallback((): string[] => {
+    const excludedReelIds = new Set(adaptiveExcludeReelIdsRef.current);
+    if (excludedReelIds.size === 0) {
+      return [];
+    }
+    return Array.from(new Set(
+      reelsRef.current
+        .filter((reel) => excludedReelIds.has(String(reel.reel_id || "").trim()))
+        .map((reel) => {
+          const urlVideoId = sourceVideoKeyFromUrl(reel.video_url);
+          if (/^[A-Za-z0-9_-]{11}$/.test(urlVideoId)) {
+            return urlVideoId;
+          }
+          return String(reel.video_id || "").trim().replace(/^yt:/, "");
+        })
+        .filter(Boolean),
+    ));
+  }, []);
+
   const appendGeneratedReels = useCallback(
     (generated: Reel[]): SessionMergeResult => {
       if (!generated.length) {
@@ -2297,6 +2316,7 @@ function FeedPageInner() {
         const tuning = getFeedTuningSettings();
         const requestGenerationMode = options?.generationMode ?? generationMode;
         const requestLimit = adaptiveExcludeReelIdsRef.current.length > 0 ? 25 : PAGE_SIZE;
+        const adaptiveExcludeVideoIds = getAdaptiveExcludeVideoIds();
         const allowServerAutofill = (
           (options?.autofill ?? true)
           && feedMaterialIds.length === 1
@@ -2310,6 +2330,9 @@ function FeedPageInner() {
                 page: targetPage,
                 limit: requestLimit,
                 excludeReelIds: adaptiveExcludeReelIdsRef.current,
+                ...(adaptiveExcludeVideoIds.length > 0
+                  ? { excludeVideoIds: adaptiveExcludeVideoIds }
+                  : {}),
                 autofill: allowServerAutofill,
                 prefetch: readyReservoirTarget(requestGenerationMode),
                 generationMode: requestGenerationMode,
@@ -2488,6 +2511,7 @@ function FeedPageInner() {
       generationMode,
       getFeedMaterialIds,
       getFeedTuningSettings,
+      getAdaptiveExcludeVideoIds,
       mergeReelBatchesInServerOrder,
       isSearchScopeActive,
       markRecoveryProgress,
@@ -2536,6 +2560,7 @@ function FeedPageInner() {
     }
     const searchScope = activeSearchScopeRef.current;
     const tuning = getFeedTuningSettings();
+    const adaptiveExcludeVideoIds = getAdaptiveExcludeVideoIds();
     const requestedReadyCount = Math.max(1, Math.floor(
       options?.requestedCount
         ?? (options?.initialFill ? readyReservoirTarget(generationMode) : REEL_BATCH_SIZE),
@@ -2582,6 +2607,9 @@ function FeedPageInner() {
                 : Math.min(INITIAL_READY_REEL_TARGET, existingMaterialReels + batchSize),
               generationJobId: activeGenerationJob?.jobId,
               continuationToken,
+              ...(adaptiveExcludeVideoIds.length > 0
+                ? { excludeVideoIds: adaptiveExcludeVideoIds }
+                : {}),
               generationMode,
               minRelevance: tuning.minRelevance,
               creativeCommonsOnly: tuning.creativeCommonsOnly,
@@ -2776,6 +2804,7 @@ function FeedPageInner() {
     generationMode,
     getFeedMaterialIds,
     getFeedTuningSettings,
+    getAdaptiveExcludeVideoIds,
     mergeReelBatchesInServerOrder,
     isIngestMaterial,
     isGenerationFinished,
@@ -3950,7 +3979,13 @@ function FeedPageInner() {
       if (assessmentSession) {
         if (direction > 0 && !assessmentSlideActive) {
           beginSnapTransitionLock();
-          setAssessmentAdvanceAfterClose(activeIndexRef.current < reelsRef.current.length - 1);
+          setAssessmentAdvanceAfterClose(
+            activeIndexRef.current < reelsRef.current.length - 1
+            || hasMore
+            || canRequestMore
+            || isGeneratingRef.current
+            || isFetchingRef.current,
+          );
           setAssessmentSlideActive(true);
         } else if (direction < 0 && assessmentSlideActive) {
           beginSnapTransitionLock();
@@ -3975,7 +4010,10 @@ function FeedPageInner() {
       const outgoingReel = currentReels[currentIndex];
       const nextIndex = Math.min(currentReels.length - 1, currentIndex + 1);
       if (nextIndex <= currentIndex) {
-        reportForwardScrollForReel(outgoingReel);
+        const gateRequest = reportForwardScrollForReel(outgoingReel);
+        if (gateRequest) {
+          gateRequest.advanceRequested = true;
+        }
         maybeLoadMore();
         return;
       }
@@ -4009,7 +4047,9 @@ function FeedPageInner() {
       assessmentSession,
       assessmentSlideActive,
       beginSnapTransitionLock,
+      canRequestMore,
       commitOneReelMove,
+      hasMore,
       isSearchScopeActive,
       maybeLoadMore,
       reportForwardScrollForReel,
@@ -4406,8 +4446,6 @@ function FeedPageInner() {
     if (!settingsScopeReady || feedMaterialIds.length === 0 || currentReels.length === 0) {
       return;
     }
-    const searchScope = activeSearchScopeRef.current;
-
     const currentIndex = clamp(activeIndexRef.current, 0, currentReels.length - 1);
     const preservedThroughIndex = clamp(
       Math.max(currentIndex, watchedFrontierIndexRef.current),
@@ -4418,8 +4456,17 @@ function FeedPageInner() {
     const watchedPrefix = currentReels.slice(0, preservedThroughIndex + 1);
     const excludeReelIds = watchedPrefix.map((reel) => String(reel.reel_id || "").trim()).filter(Boolean);
     const tailCapacity = Math.max(0, MAX_REELS_PER_FEED_SESSION - watchedPrefix.length);
+    adaptiveExcludeReelIdsRef.current = excludeReelIds.slice(-200);
+    const excludeVideoIds = getAdaptiveExcludeVideoIds();
+    // Feedback and assessment outcomes change the durable generation key even
+    // when the coarse knowledge level stays the same. Stop every old-signal
+    // stream before reading or applying the newly ranked inventory.
+    clearGenerationTracking();
+    renewActiveSearchScope();
+    setCanRequestMore(true);
+    const searchScope = activeSearchScopeRef.current;
     if (tailCapacity === 0) {
-      adaptiveExcludeReelIdsRef.current = excludeReelIds.slice(-200);
+      setAssessmentPreparingFeed(false);
       return;
     }
     const unseenCount = Math.max(0, currentReels.length - watchedPrefix.length);
@@ -4438,6 +4485,7 @@ function FeedPageInner() {
               page: pageNumber,
               limit: 25,
               excludeReelIds,
+              excludeVideoIds,
               autofill: false,
               prefetch: 0,
               generationMode,
@@ -4454,6 +4502,9 @@ function FeedPageInner() {
       }),
     );
     if (!isSearchScopeActive(searchScope) || responses.some((response) => response === null)) {
+      if (isSearchScopeActive(searchScope)) {
+        setAssessmentPreparingFeed(false);
+      }
       return;
     }
     const successful = responses as Array<Array<Awaited<ReturnType<typeof fetchFeed>>>>;
@@ -4464,34 +4515,13 @@ function FeedPageInner() {
         nextLevelsByMaterial.set(feedMaterialIds[index], nextLevel);
       }
     }
-    const levelChanged = Array.from(nextLevelsByMaterial).some(([id, nextLevel]) => {
-      const previousLevel = knowledgeLevelByMaterialRef.current.get(id);
-      return previousLevel === undefined || previousLevel !== nextLevel;
-    });
     for (const [id, nextLevel] of nextLevelsByMaterial) {
       knowledgeLevelByMaterialRef.current.set(id, nextLevel);
     }
-    if (levelChanged) {
-      // A restored session has no trustworthy level baseline, and any member of
-      // a grouped feed can advance independently. Stop every old-level stream
-      // before applying the newly ranked inventory.
-      clearGenerationTracking();
-      setAssessmentPreparingFeed(false);
-      renewActiveSearchScope();
-    }
-    for (let index = 0; index < successful.length; index += 1) {
-      const pages = successful[index];
-      const lastResponse = pages[pages.length - 1];
-      if (lastResponse) {
-        rememberFeedContinuationToken(feedMaterialIds[index], lastResponse);
-      }
-    }
-
     const serverOrderedTail = dedupeByIdentity(mergeReelBatchesInServerOrder(
       successful.map((pages) => dedupeByIdentity(pages.flatMap((response) => response.reels))),
     ));
     const nextReels = dedupeByIdentity(serverOrderedTail, watchedPrefix).slice(0, MAX_REELS_PER_FEED_SESSION);
-    adaptiveExcludeReelIdsRef.current = excludeReelIds.slice(-200);
     updateSessionReels(nextReels);
     const nextActiveIndex = currentActiveReelId
       ? nextReels.findIndex((reel) => reel.reel_id === currentActiveReelId)
@@ -4506,24 +4536,35 @@ function FeedPageInner() {
       }, 0),
     ));
     setPage(pagesToFetch);
-    if (levelChanged) {
-      setCanRequestMore(true);
-    }
     setFeedPagesExhausted(false);
     const primaryLevel = nextLevelsByMaterial.get(feedMaterialIds[0]);
     if (primaryLevel) {
       setKnowledgeLevel(primaryLevel);
     }
+    for (let index = 0; index < successful.length; index += 1) {
+      const pages = successful[index];
+      const lastResponse = pages[pages.length - 1];
+      if (!lastResponse) {
+        continue;
+      }
+      rememberFeedContinuationToken(feedMaterialIds[index], lastResponse);
+      rememberFeedGenerationJob(feedMaterialIds[index], lastResponse);
+      void consumeFeedGenerationJob(feedMaterialIds[index], lastResponse, searchScope);
+    }
+    setAssessmentPreparingFeed(false);
   }, [
     clearGenerationTracking,
+    consumeFeedGenerationJob,
     dedupeByIdentity,
     generationMode,
     getFeedMaterialIds,
     getFeedTuningSettings,
+    getAdaptiveExcludeVideoIds,
     mergeReelBatchesInServerOrder,
     isSearchScopeActive,
     renewActiveSearchScope,
     rememberFeedContinuationToken,
+    rememberFeedGenerationJob,
     settingsScopeReady,
     updateSessionReels,
   ]);
@@ -4705,9 +4746,20 @@ function FeedPageInner() {
     setAssessmentGatePending(false);
     setAssessmentAdvanceAfterClose(false);
     if (shouldAdvance) {
-      commitOneReelMove(1);
+      if (activeIndexRef.current < reelsRef.current.length - 1) {
+        commitOneReelMove(1);
+      } else if (
+        hasMore
+        || canRequestMore
+        || isGeneratingRef.current
+        || isFetchingRef.current
+      ) {
+        pendingAutoplayAdvanceRef.current = true;
+        setPendingTailAdvance(true);
+        maybeLoadMore();
+      }
     }
-  }, [assessmentAdvanceAfterClose, commitOneReelMove]);
+  }, [assessmentAdvanceAfterClose, canRequestMore, commitOneReelMove, hasMore, maybeLoadMore]);
 
   const snoozeActiveAssessment = useCallback(async () => {
     if (!assessmentSession || assessmentSnoozing) {

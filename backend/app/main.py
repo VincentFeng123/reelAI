@@ -192,6 +192,7 @@ from .ingestion.pipeline import IngestionPipeline
 from .services.generation_jobs import (
     DEFAULT_HEARTBEAT_SECONDS,
     DEFAULT_LEASE_SECONDS,
+    EMPTY_ADAPTATION_FINGERPRINT as GENERATION_EMPTY_ADAPTATION_FINGERPRINT,
     REQUEST_SCHEMA_VERSION as GENERATION_REQUEST_SCHEMA_VERSION,
     GenerationQueueFullError,
     JobLeaseLostError,
@@ -3663,6 +3664,10 @@ def _latest_compatible_generation_job(
         request_params.get("exclude_video_ids") or []
     ))
     expected_relevance = _normalize_min_relevance(request_params.get("min_relevance"))
+    expected_adaptation_fingerprint = str(
+        request_params.get("adaptation_fingerprint")
+        or GENERATION_EMPTY_ADAPTATION_FINGERPRINT
+    )
     for row in rows:
         prior_params = _job_request_params(row)
         if (
@@ -3682,7 +3687,7 @@ def _latest_compatible_generation_job(
             or str(prior_params.get("language") or "en").strip().lower()
             != str(request_params.get("language") or "en").strip().lower()
             or str(prior_params.get("adaptation_fingerprint") or "")
-            != str(request_params.get("adaptation_fingerprint") or "")
+            != expected_adaptation_fingerprint
             or sorted(_normalize_excluded_video_ids(
                 prior_params.get("exclude_video_ids") or []
             )) != expected_exclusions
@@ -3739,6 +3744,10 @@ def _verified_cross_request_source_generation(
     expected_relevance = _normalize_min_relevance(
         request_params.get("min_relevance")
     )
+    expected_adaptation_fingerprint = str(
+        request_params.get("adaptation_fingerprint")
+        or GENERATION_EMPTY_ADAPTATION_FINGERPRINT
+    )
     cross_relevance_fallback: str | None = None
     for row in candidates:
         try:
@@ -3751,7 +3760,7 @@ def _verified_cross_request_source_generation(
             str(prior_params.get("request_schema_version") or "")
             != GENERATION_REQUEST_SCHEMA_VERSION
             or str(prior_params.get("adaptation_fingerprint") or "")
-            != str(request_params.get("adaptation_fingerprint") or "")
+            != expected_adaptation_fingerprint
             or bool(prior_params.get("creative_commons_only"))
             != bool(request_params.get("creative_commons_only"))
             or _normalize_preferred_video_duration(
@@ -3784,6 +3793,40 @@ def _verified_cross_request_source_generation(
             if cross_relevance_fallback is None:
                 cross_relevance_fallback = generation_id
     return cross_relevance_fallback
+
+
+def _cancel_stale_active_adaptation_jobs(
+    conn,
+    *,
+    material_id: str,
+    learner_id: str,
+    adaptation_fingerprint: str,
+) -> None:
+    current_knowledge_level = str(
+        reel_service.learner_progress(conn, material_id, learner_id).get(
+            "selected_level"
+        )
+        or "beginner"
+    )
+    rows = fetch_all(
+        conn,
+        "SELECT * FROM reel_generation_jobs "
+        "WHERE material_id = ? AND learner_id = ? "
+        "AND status IN ('queued', 'running')",
+        (material_id, learner_id),
+    )
+    for row in rows:
+        params = _job_request_params(row)
+        if (
+            str(params.get("request_schema_version") or "")
+            == GENERATION_REQUEST_SCHEMA_VERSION
+            and str(params.get("adaptation_fingerprint") or "")
+            == adaptation_fingerprint
+            and str(params.get("knowledge_level") or "beginner")
+            == current_knowledge_level
+        ):
+            continue
+        request_generation_cancellation(conn, job_id=str(row.get("id") or ""))
 
 
 def _finalize_request_reel_order(
@@ -4422,10 +4465,11 @@ def _generation_job_status_payload(conn, job_row: dict[str, Any]) -> dict[str, A
             detail = None
         if detail is not None:
             error["detail"] = detail
-    terminal = str(job_row.get("status") or "") in GENERATION_TERMINAL_STATUSES
+    status = str(job_row.get("status") or "")
+    surfaceable_terminal = status in {"completed", "partial", "exhausted"}
     return {
         "job_id": str(job_row.get("id") or ""),
-        "status": str(job_row.get("status") or "queued"),
+        "status": status or "queued",
         "phase": str(job_row.get("phase") or ""),
         "progress": float(job_row.get("progress") or 0.0),
         "attempt_count": int(job_row.get("attempt_count") or 0),
@@ -4440,7 +4484,7 @@ def _generation_job_status_payload(conn, job_row: dict[str, Any]) -> dict[str, A
         "quality_degraded": bool(job_row.get("quality_degraded")),
         "usage": usage if isinstance(usage, dict) else {},
         "error": error,
-        "reels": _generation_job_reels(conn, job_row) if terminal else [],
+        "reels": _generation_job_reels(conn, job_row) if surfaceable_terminal else [],
         "created_at": _normalize_datetime_for_api(job_row.get("created_at")),
         "started_at": _normalize_datetime_for_api(job_row.get("started_at")),
         "completed_at": _normalize_datetime_for_api(job_row.get("completed_at")),
@@ -4454,9 +4498,15 @@ def _sanitize_generation_replay_events(
 ) -> list[dict[str, Any]]:
     sanitized: list[dict[str, Any]] = []
     authoritative_reels: list[dict[str, Any]] | None = None
+    job_status = str((job_row or {}).get("status") or "")
+    surfaceable_terminal = bool(
+        job_row
+        and job_status in {"completed", "partial", "exhausted"}
+    )
+    suppress_inventory = job_status in {"failed", "cancelled"}
     terminal_inventory = bool(
         job_row
-        and str(job_row.get("status") or "") in GENERATION_TERMINAL_STATUSES
+        and surfaceable_terminal
         and str(job_row.get("result_generation_id") or "").strip()
     )
     if terminal_inventory and job_row is not None:
@@ -4468,9 +4518,16 @@ def _sanitize_generation_replay_events(
         if event_type == "candidate":
             continue
         if event_type == "final" and job_row is not None:
-            if authoritative_reels is None:
-                authoritative_reels = _generation_job_reels(conn, job_row)
+            if suppress_inventory:
+                authoritative_reels = []
+            elif authoritative_reels is None:
+                authoritative_reels = _generation_job_reels(
+                    conn,
+                    job_row if surfaceable_terminal else {**job_row, "status": "completed"},
+                )
             payload["reels"] = authoritative_reels
+            if suppress_inventory:
+                payload["generation_id"] = None
             payload["authoritative"] = True
             event["payload"] = payload
         sanitized.append(event)
@@ -4602,6 +4659,64 @@ def _learner_concept_signals(
     }
 
 
+def _learner_adaptation_fingerprint(
+    conn,
+    *,
+    material_id: str,
+    learner_id: str,
+) -> str:
+    concept_signals = _learner_concept_signals(
+        conn,
+        material_id=material_id,
+        learner_id=learner_id,
+    )
+    return hashlib.sha256(
+        json.dumps(
+            concept_signals,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _lock_learner_adaptation(
+    conn,
+    *,
+    material_id: str,
+    learner_id: str,
+) -> None:
+    """Serialize final release with feedback and completed assessments."""
+    material = fetch_one(
+        conn,
+        "SELECT knowledge_level FROM materials WHERE id = ?",
+        (material_id,),
+    )
+    if not material:
+        raise ValueError(f"unknown material_id: {material_id}")
+    timestamp = now_iso()
+    execute_modify(
+        conn,
+        "INSERT INTO learner_material_progress "
+        "(learner_id, material_id, selected_level, global_adjustment, "
+        "difficulty_reset_at, feedback_revision, updated_at) "
+        "VALUES (?, ?, ?, 0.0, ?, 0, ?) "
+        "ON CONFLICT(learner_id, material_id) DO NOTHING",
+        (
+            learner_id,
+            material_id,
+            str(material.get("knowledge_level") or "beginner"),
+            "" if learner_id == LEGACY_LEARNER_ID else timestamp,
+            timestamp,
+        ),
+    )
+    execute_modify(
+        conn,
+        "UPDATE learner_material_progress SET updated_at = updated_at "
+        "WHERE learner_id = ? AND material_id = ?",
+        (learner_id, material_id),
+    )
+
+
 def _run_leased_generation_job(
     job_row: dict[str, Any],
     worker_stop: threading.Event | None = None,
@@ -4684,6 +4799,40 @@ def _run_leased_generation_job(
         )
         return payload
 
+    def cancel_if_adaptation_stale(conn) -> bool:
+        stored_schema = str(params.get("request_schema_version") or "")
+        stored_fingerprint = str(params.get("adaptation_fingerprint") or "")
+        stored_knowledge_level = str(
+            params.get("knowledge_level") or "beginner"
+        )
+        current_knowledge_level = str(
+            reel_service.learner_progress(conn, material_id, learner_id).get(
+                "selected_level"
+            )
+            or "beginner"
+        )
+        is_current = (
+            stored_schema == GENERATION_REQUEST_SCHEMA_VERSION
+            and stored_knowledge_level == current_knowledge_level
+            and stored_fingerprint == _learner_adaptation_fingerprint(
+                conn,
+                material_id=material_id,
+                learner_id=learner_id,
+            )
+        )
+        if is_current:
+            return False
+        transition_generation_terminal(
+            conn,
+            job_id=job_id,
+            status="cancelled",
+            result_generation_id=generation_id or None,
+            lease_owner=lease_owner,
+            usage=generation_usage_payload(),
+        )
+        logger.info("cancelled stale adaptive generation job_id=%s", job_id)
+        return True
+
     try:
         with get_conn(transactional=True) as setup_conn:
             if not update_generation_progress(
@@ -4696,6 +4845,8 @@ def _run_leased_generation_job(
                 raise JobLeaseLostError(
                     f"generation job lease is no longer active: {job_id}"
                 )
+            if cancel_if_adaptation_stale(setup_conn):
+                return
             generation_id = str(job_row.get("result_generation_id") or "").strip()
             if not _fetch_generation_row(setup_conn, generation_id):
                 source_generation_id = (
@@ -4868,6 +5019,8 @@ def _run_leased_generation_job(
                 source_reel_count
                 + _count_generation_surfaceable_reels(conn, generation_id)
             )
+            if cancel_if_adaptation_stale(conn):
+                return
             has_verified_reservoir = (
                 False
                 if is_continuation
@@ -4898,6 +5051,7 @@ def _run_leased_generation_job(
             ) > 0
             ordering_degraded = False
             recall_preparation: dict[str, int] | None = None
+            activate_generation = False
             if cumulative_count or has_verified_reservoir or rankable_fallback:
                 final_reels = rankable_fallback or _generation_job_reels(
                     conn,
@@ -5030,13 +5184,7 @@ def _run_leased_generation_job(
                             len(checkpoint_reel_ids),
                             int((recall_preparation or {}).get("prepared") or 0),
                         )
-                _activate_generation(
-                    conn,
-                    material_id=material_id,
-                    request_key=str(job_row.get("request_key") or ""),
-                    generation_id=generation_id,
-                    retrieval_profile="unified",
-                )
+                activate_generation = True
             elif provider_cursor_open:
                 _complete_generation(
                     conn,
@@ -5070,17 +5218,6 @@ def _run_leased_generation_job(
             quality_degraded = ordering_degraded or any(
                 bool(row.get("quality_degraded")) for row in model_records
             )
-            append_generation_event(
-                conn,
-                job_id=job_id,
-                event_type="final",
-                payload={
-                    "reels": final_reels,
-                    "generation_id": generation_id if has_terminal_result else None,
-                    "authoritative": True,
-                },
-                lease_owner=lease_owner,
-            )
             terminal_status = (
                 "completed"
                 if len(final_reels) >= requested_count
@@ -5088,27 +5225,60 @@ def _run_leased_generation_job(
                 if has_terminal_result
                 else "exhausted"
             )
-            transition_generation_terminal(
-                conn,
-                job_id=job_id,
-                status=terminal_status,
-                result_generation_id=generation_id if has_terminal_result else None,
-                lease_owner=lease_owner,
-                model_used=model_used,
-                quality_degraded=quality_degraded,
-                usage=usage_payload,
-                error_code="inventory_exhausted" if terminal_status == "exhausted" else None,
-                error_message=(
-                    _generation_exhaustion_message(stage_counters)
-                    if terminal_status == "exhausted"
-                    else None
-                ),
-                error_detail=(
-                    {"counters": stage_counters}
-                    if terminal_status == "exhausted"
-                    else None
-                ),
-            )
+            with get_conn(transactional=True) as release_conn:
+                _lock_learner_adaptation(
+                    release_conn,
+                    material_id=material_id,
+                    learner_id=learner_id,
+                )
+                if cancel_if_adaptation_stale(release_conn):
+                    return
+                if activate_generation:
+                    _activate_generation(
+                        release_conn,
+                        material_id=material_id,
+                        request_key=str(job_row.get("request_key") or ""),
+                        generation_id=generation_id,
+                        retrieval_profile="unified",
+                    )
+                append_generation_event(
+                    release_conn,
+                    job_id=job_id,
+                    event_type="final",
+                    payload={
+                        "reels": final_reels,
+                        "generation_id": generation_id if has_terminal_result else None,
+                        "authoritative": True,
+                    },
+                    lease_owner=lease_owner,
+                )
+                transition_generation_terminal(
+                    release_conn,
+                    job_id=job_id,
+                    status=terminal_status,
+                    result_generation_id=(
+                        generation_id if has_terminal_result else None
+                    ),
+                    lease_owner=lease_owner,
+                    model_used=model_used,
+                    quality_degraded=quality_degraded,
+                    usage=usage_payload,
+                    error_code=(
+                        "inventory_exhausted"
+                        if terminal_status == "exhausted"
+                        else None
+                    ),
+                    error_message=(
+                        _generation_exhaustion_message(stage_counters)
+                        if terminal_status == "exhausted"
+                        else None
+                    ),
+                    error_detail=(
+                        {"counters": stage_counters}
+                        if terminal_status == "exhausted"
+                        else None
+                    ),
+                )
             if recall_preparation is not None:
                 logger.info(
                     "recall preparation job_id=%s requested=%d prepared=%d fallback=%d",
@@ -6630,7 +6800,22 @@ def update_material_level(material_id: str, request: Request, payload: MaterialL
             raise HTTPException(status_code=404, detail="material not found")
         learner_id = _resolve_learner_identity(conn, request, required=False)
         if learner_id:
+            _lock_learner_adaptation(
+                conn,
+                material_id=material_id,
+                learner_id=learner_id,
+            )
             reel_service.set_learner_level(conn, material_id, learner_id, payload.knowledge_level)
+            _cancel_stale_active_adaptation_jobs(
+                conn,
+                material_id=material_id,
+                learner_id=learner_id,
+                adaptation_fingerprint=_learner_adaptation_fingerprint(
+                    conn,
+                    material_id=material_id,
+                    learner_id=learner_id,
+                ),
+            )
         else:
             # Compatibility for pre-personalization clients: their PATCH request
             # carried no identity, so retain the old material-default behavior.
@@ -6673,20 +6858,18 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
         if not material:
             raise HTTPException(status_code=404, detail="material_id not found")
         learner_id = _resolve_learner_identity(conn, request)
-        learner_progress = reel_service.learner_progress(conn, payload.material_id, learner_id)
-        learner_knowledge_level = str(learner_progress.get("selected_level") or "beginner")
-        concept_signals = _learner_concept_signals(
+        _lock_learner_adaptation(
             conn,
             material_id=payload.material_id,
             learner_id=learner_id,
         )
-        adaptation_fingerprint = hashlib.sha256(
-            json.dumps(
-                concept_signals,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        learner_progress = reel_service.learner_progress(conn, payload.material_id, learner_id)
+        learner_knowledge_level = str(learner_progress.get("selected_level") or "beginner")
+        adaptation_fingerprint = _learner_adaptation_fingerprint(
+            conn,
+            material_id=payload.material_id,
+            learner_id=learner_id,
+        )
         content_fingerprint = material_content_fingerprint(
             conn,
             payload.material_id,
@@ -6723,6 +6906,12 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             "adaptation_fingerprint": adaptation_fingerprint,
             "language": "en",
         }
+        _cancel_stale_active_adaptation_jobs(
+            conn,
+            material_id=payload.material_id,
+            learner_id=learner_id,
+            adaptation_fingerprint=adaptation_fingerprint,
+        )
         source_generation_id: str | None = None
         continuation_job: dict[str, Any] | None = None
         if continuation_token:
@@ -6749,6 +6938,10 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 and sorted(_normalize_excluded_video_ids(
                     continuation_params.get("exclude_video_ids") or []
                 )) == sorted(excluded_video_ids)
+                and str(continuation_params.get("request_schema_version") or "")
+                == GENERATION_REQUEST_SCHEMA_VERSION
+                and str(continuation_params.get("adaptation_fingerprint") or "")
+                == adaptation_fingerprint
             )
             if not continuation_matches or continuation_status not in {
                 "completed", "partial", "exhausted"
@@ -7688,20 +7881,18 @@ def feed(
         if not material:
             raise HTTPException(status_code=404, detail="material_id not found")
         learner_id = _resolve_learner_identity(conn, request)
-        progress = reel_service.learner_progress(conn, material_id, learner_id)
-        knowledge_level = str(progress.get("selected_level") or "beginner")
-        concept_signals = _learner_concept_signals(
+        _lock_learner_adaptation(
             conn,
             material_id=material_id,
             learner_id=learner_id,
         )
-        adaptation_fingerprint = hashlib.sha256(
-            json.dumps(
-                concept_signals,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        progress = reel_service.learner_progress(conn, material_id, learner_id)
+        knowledge_level = str(progress.get("selected_level") or "beginner")
+        adaptation_fingerprint = _learner_adaptation_fingerprint(
+            conn,
+            material_id=material_id,
+            learner_id=learner_id,
+        )
         try:
             effective_level = _effective_level_target(
                 knowledge_level,
@@ -7740,6 +7931,12 @@ def feed(
             "adaptation_fingerprint": adaptation_fingerprint,
             "language": "en",
         }
+        _cancel_stale_active_adaptation_jobs(
+            conn,
+            material_id=material_id,
+            learner_id=learner_id,
+            adaptation_fingerprint=adaptation_fingerprint,
+        )
         completed_job = find_completed_generation_job(conn, request_key)
         active_job = find_active_generation_job(conn, request_key)
         latest_compatible_job = _latest_compatible_generation_job(
@@ -7971,12 +8168,17 @@ def feedback(request: Request, payload: FeedbackRequest):
         # delete of the reel can't race us into writing an orphan feedback row.
         exists = fetch_one(
             conn,
-            "SELECT id FROM reels WHERE id = ? LIMIT 1",
+            "SELECT id, material_id FROM reels WHERE id = ? LIMIT 1",
             (clean_reel_id,),
         )
         if not exists:
             raise HTTPException(status_code=404, detail="reel_id not found")
 
+        _lock_learner_adaptation(
+            conn,
+            material_id=str(exists["material_id"]),
+            learner_id=learner_id,
+        )
         reel_service.record_feedback(
             conn,
             reel_id=clean_reel_id,
@@ -7985,6 +8187,16 @@ def feedback(request: Request, payload: FeedbackRequest):
             rating=payload.rating,
             saved=payload.saved,
             learner_id=learner_id,
+        )
+        _cancel_stale_active_adaptation_jobs(
+            conn,
+            material_id=str(exists["material_id"]),
+            learner_id=learner_id,
+            adaptation_fingerprint=_learner_adaptation_fingerprint(
+                conn,
+                material_id=str(exists["material_id"]),
+                learner_id=learner_id,
+            ),
         )
 
     return {"status": "ok", "reel_id": clean_reel_id}
@@ -8099,17 +8311,41 @@ def answer_assessment(
     try:
         with get_conn(transactional=True) as conn:
             learner_id = _resolve_learner_identity(conn, request)
+            clean_session_id = str(session_id or "").strip()
+            session_scope = fetch_one(
+                conn,
+                "SELECT material_id FROM assessment_sessions "
+                "WHERE id = ? AND learner_id = ?",
+                (clean_session_id, learner_id),
+            )
+            if session_scope:
+                _lock_learner_adaptation(
+                    conn,
+                    material_id=str(session_scope["material_id"]),
+                    learner_id=learner_id,
+                )
             result = assessment_service.answer(
                 conn,
                 learner_id=learner_id,
-                session_id=str(session_id or "").strip(),
+                session_id=clean_session_id,
                 question_id=payload.question_id,
                 choice_index=payload.choice_index,
             )
             session = result.get("session") or {}
             if session.get("status") == "completed":
+                material_id = str(session.get("material_id") or "")
                 reel_service.update_level_adjustment(
-                    conn, str(session.get("material_id") or ""), learner_id
+                    conn, material_id, learner_id
+                )
+                _cancel_stale_active_adaptation_jobs(
+                    conn,
+                    material_id=material_id,
+                    learner_id=learner_id,
+                    adaptation_fingerprint=_learner_adaptation_fingerprint(
+                        conn,
+                        material_id=material_id,
+                        learner_id=learner_id,
+                    ),
                 )
             return result
     except ValueError as exc:

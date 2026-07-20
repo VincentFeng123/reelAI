@@ -1151,6 +1151,7 @@ type GenerateReelsParams = {
   numReels?: number;
   conceptId?: string;
   continuationToken?: string;
+  excludeVideoIds?: string[];
   generationMode?: "slow" | "fast";
   minRelevance?: number;
   creativeCommonsOnly?: boolean;
@@ -1227,11 +1228,13 @@ function requestedReelCount(params: Pick<GenerateReelsParams, "generationMode" |
 }
 
 function buildGenerateReelsRequestBody(params: GenerateReelsParams): Record<string, unknown> {
+  const excludeVideoIds = normalizeVideoIdList(params.excludeVideoIds);
   return {
     material_id: params.materialId,
     concept_id: params.conceptId,
     num_reels: requestedReelCount(params),
     continuation_token: String(params.continuationToken || "").trim() || undefined,
+    ...(excludeVideoIds.length > 0 ? { exclude_video_ids: excludeVideoIds } : {}),
     creative_commons_only: params.creativeCommonsOnly === true,
     generation_mode: params.generationMode ?? "slow",
     min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,

@@ -193,6 +193,130 @@
 - Regression test: The persisted-order regression covers the empty sentinel alongside valid full/subset selections and unknown-ID fallback. Passed locally.
 - Exact retest: Pending.
 
+### AF-012 — Feedback and quiz reranks leave the pre-signal generation stream active
+
+- Status: Fixed locally; production retest pending
+- Severity: High — clips selected under stale concept signals can re-enter the personalized unseen tail
+- Evidence:
+  - Both successful thumb submission and completed assessment call `rerankUnseenTail()`.
+  - That callback fetches inventory under the new backend adaptation fingerprint, but calls `clearGenerationTracking()` and `renewActiveSearchScope()` only when the coarse `knowledge_level` changes.
+  - A feedback or per-concept quiz outcome normally changes concept signals without changing `knowledge_level`, so an already-running old-fingerprint stream remains subscribed and its `onCandidate` callback can append stale candidates after the new tail is applied.
+  - The same conditional controls `setCanRequestMore(true)`. If the old request was already exhausted, a same-level signal change removes its unseen tail but cannot request the replacement adaptive batch.
+  - Unlike the normal page loader, the rerank path records only continuation tokens. If its current-fingerprint response reports a job already queued by another request, it neither records nor consumes that job.
+- Expected: Every successful adaptive rerank invalidates local job/continuation state and aborts streams started under the previous concept-signal fingerprint before applying the new unseen tail.
+- Root cause: Generation invalidation was coupled to level changes even though concept-signal changes independently define a new durable generation request.
+- Fix: Every adaptive rerank now aborts the old search scope, clears old job/continuation tracking, reopens generation, preserves only the watched prefix, applies the current-fingerprint inventory, and attaches/consumes the current job even when that inventory is temporarily empty.
+- Regression test: The compiled rerank callback proves the old scope is aborted, an empty queued response preserves the watched prefix, and the current job is remembered and consumed on the renewed scope. Full frontend suite passed locally.
+- Exact retest: Pending.
+
+### AF-013 — The server can release or continue a job after its adaptation fingerprint becomes stale
+
+- Status: Fixed locally; production retest pending
+- Severity: High — pre-feedback topic acquisition can survive a thumb or quiz update
+- Evidence:
+  - Adaptation fingerprints prevent lookup/reuse of an old completed or active job, but a worker already holding that job does not revalidate the fingerprint before authoritative release.
+  - The organizer rereads current signals, so it may reorder or omit old inventory, but it cannot add a remediation concept that the pre-signal acquisition pass never retrieved.
+  - Explicit continuation validation compares material, learner, content, level, mode, licensing, duration, relevance, and exclusions, but not `adaptation_fingerprint` or the current generation request schema.
+  - For an accepted continuation with unseen source-chain reels, the worker intentionally sets the fresh provider budget to zero and drains that old inventory first.
+  - The stale queued/running job still counts against the one-active-job-per-learner limit, so the first current-fingerprint replacement request can fail as “generation busy” before the worker reaches its release-time guard.
+  - Worker setup attaches a private `result_generation_id` before retrieval. The status/replay serializers treated every terminal state as surfaceable, so a stale job cancelled before activation could expose that private inventory through generation status.
+  - A final fingerprint check followed by separate activation/event/terminal commits still has a time-of-check/time-of-use window. Feedback or assessment can commit after the check and before the final event.
+  - A request can compute an old fingerprint before feedback commits and insert its old-signal job afterward unless request snapshot/submission shares the same serialization point as signal writes.
+- Expected: A worker must not release a batch when its learner concept-signal fingerprint has changed, and a continuation token is valid only under the same fingerprint that created it.
+- Root cause: Fingerprint compatibility was enforced at job lookup/reuse boundaries but omitted from leased-worker release and explicit continuation validation.
+- Fix: Feed/generate snapshot and submission, feedback, assessment completion, level changes, and final release now serialize on the learner-material progress row. The worker checks schema, concept fingerprint, and selected level before provider work, after acquisition, and inside the atomic activation/final/terminal transaction. Stale same-material jobs are cancelled before replacement capacity checks; stale continuations are rejected; failed/cancelled status and replay never expose private inventory.
+- Regression test: Focused tests cover stale schema/fingerprint continuation rejection, pre-provider and post-acquisition cancellation, a signal change at the atomic release boundary, stale active replacement through both generate and feed, selected-level invalidation, cancelled-after-final replay sanitization, and current ranking of the released allow-list. The affected generation/job/billing/feedback/assessment suite passed locally.
+- Exact retest: Pending.
+
+### AF-014 — Fresh adaptive generation does not exclude content already watched in the session
+
+- Status: Fixed locally; production retest pending
+- Severity: Medium — an exact or near-duplicate can consume the personalized replacement slot and produce zero visible growth
+- Evidence:
+  - `adaptiveExcludeReelIdsRef` is sent to `/api/feed`, but the direct `/api/reels/generate` path does not send any watched reel, clip, or video exclusion.
+  - Reel IDs are generation-scoped, so rediscovering the same source span can create a different UUID.
+  - Frontend clip-key deduplication then discards that result only after provider work and batch selection have already spent the slot.
+- Expected: A fresh post-feedback/post-quiz acquisition excludes sources already watched in that feed session so it cannot return the same or a near-identical clip as the adaptive replacement.
+- Root cause: Adaptive session exclusions were implemented only for ranked-feed reads and were not translated into the generate endpoint's existing `exclude_video_ids` contract.
+- Fix: Adaptive rerank derives canonical bare YouTube IDs from the watched prefix (including persisted `yt:` IDs and embed URLs), stores them with adaptive reel exclusions, and sends them through both feed reads and direct generation requests.
+- Regression test: API tests prove normalized/deduplicated `exclude_video_ids`; feed tests prove watched source IDs are derived and included in post-signal generation.
+- Exact retest: Pending.
+
+### AF-015 — Recall “Continue learning” loses its owed move while the adaptive reel is queued
+
+- Status: Fixed locally; production retest pending
+- Severity: Medium — quiz adaptation appears not to take effect because the learner remains on the same reel
+- Reproduction:
+  1. Open recall from a forward swipe at the current tail.
+  2. Complete the assessment so rerank retains only the watched prefix and attaches a queued current-fingerprint job.
+  3. Select `Continue learning` before the first candidate arrives.
+- Evidence:
+  - `closeAssessmentAndContinue()` calls `commitOneReelMove(1)` when the assessment owes a forward advance.
+  - At the temporary tail, `commitOneReelMove()` clears `pendingAutoplayAdvanceRef`, calls `maybeLoadMore()`, and returns.
+  - The adopted job already holds the generation lock, so `maybeLoadMore()` does nothing; when the candidate arrives, no pending move remains for the existing append effect to consume.
+- Expected: Continue either advances immediately to an available personalized reel or retains exactly one pending advance until the queued candidate is appended.
+- Root cause: Assessment-close navigation reused a tail-move helper whose first action intentionally clears autoplay debt, even when no next reel exists yet.
+- Fix: Assessment close advances immediately when a next reel exists; otherwise, when inventory is available or being generated, it retains exactly one pending autoplay move and asks the existing loader to continue.
+- Regression test: Compiled callback coverage proves a queued adaptive tail retains one advancement debt until the candidate arrives.
+- Exact retest: Pending.
+
+### AF-016 — Keyboard navigation can open recall without recording the forward move
+
+- Status: Fixed locally; production retest pending
+- Severity: Medium — the keyboard path can complete quiz adaptation yet remain on the old reel
+- Reproduction:
+  1. Reach the current tail and press ArrowDown or PageDown when recall is due.
+  2. Complete recall while the personalized replacement reel is still queued.
+- Evidence:
+  - The tail branch of `jumpOneReel(1)` calls `reportForwardScrollForReel()` but discards its gate request, leaving `advanceRequested=false`.
+  - If a pending hidden assessment is opened at the tail, its close-debt flag is based only on whether a reel already exists, ignoring available/queued generation work.
+- Expected: Every forward input path marks the recall gate as owing one move when the user intended to advance and a next reel is available or still being produced.
+- Root cause: Wheel-tail handling records `advanceRequested`, but the shared keyboard/direct jump tail branch and hidden-assessment reopen path did not preserve the same intent.
+- Fix: Keyboard/direct tail movement now records the gate's forward intent, and a hidden pending assessment treats available, requestable, or in-flight inventory as an owed next reel.
+- Regression test: Compiled tail-jump and hidden-assessment callbacks prove the forward debt survives both paths.
+- Exact retest: Pending.
+
+### AF-017 — Final quiz adaptation can commit before its job cancellation on SQLite
+
+- Status: Fixed locally; production retest pending
+- Severity: High — a failed request can persist mastery while leaving the old generation active
+- Evidence:
+  - `get_conn(transactional=True)` uses SQLite's deferred transaction mode.
+  - `AssessmentService.answer()` opens a savepoint; when no outer DML has begun, releasing that outermost savepoint commits the final attempt, outcomes, and feedback revision before the endpoint recomputes difficulty and cancels stale jobs.
+  - An exception after `answer()` can therefore leave partial adaptive state committed.
+- Expected: The final answer, per-concept outcomes, difficulty adjustment, and stale-job cancellation commit or roll back together.
+- Root cause: The endpoint did not begin/lock the caller-owned SQLite transaction before entering the assessment service's nested atomic write.
+- Fix: The answer endpoint resolves the learner-owned session and locks its learner-material progress row before calling the assessment service. That DML begins the real outer SQLite transaction and also serializes completed-session replays with concurrent feedback.
+- Regression test: A real file-backed API test forces a failure after final assessment persistence and proves the final attempt/outcomes roll back while the first two answers remain. A two-connection SQLite test proves the adaptation lock blocks the competing transaction until commit.
+- Exact retest: Pending.
+
+### AF-018 — A selected-level change does not make an in-flight job stale
+
+- Status: Fixed locally; production retest pending
+- Severity: Medium — a beginner batch can publish or occupy the only learner slot after switching to advanced
+- Evidence:
+  - Worker staleness compared request schema and concept fingerprint, but the concept fingerprint intentionally excludes the named knowledge level.
+  - The level PATCH changed `selected_level` without immediately cancelling active generation.
+- Expected: A job may publish only under the selected level that created it, and a level change immediately frees the learner slot for the replacement difficulty.
+- Root cause: Knowledge-level compatibility existed in lookup/request keys but not in the leased-worker stale guard or stale-active cancellation helper.
+- Fix: Worker and active-job cancellation now compare stored and current selected levels; the level PATCH uses the same adaptation lock and cancels old-level work in its transaction.
+- Regression test: Focused tests prove an old-level lease is cancelled before provider work and a level PATCH cancels its queued old-difficulty job.
+- Exact retest: Pending.
+
+### AF-019 — First-use adaptation locking can reset newly committed progress
+
+- Status: Fixed locally; production retest pending
+- Severity: High — concurrent first feedback/generation can erase level, mastery adjustment, and revision
+- Evidence:
+  - The initial adaptation lock called `learner_progress()` when no progress row existed.
+  - Its generic upsert uses `ON CONFLICT DO UPDATE` for all progress fields.
+  - Two first-use transactions can both observe no row; after the winner commits a signal, the waiting loser's conflict update can replace the winner's level, adjustment, reset timestamp, and revision with defaults.
+- Expected: Creating the serialization row must never alter an existing learner-progress value, including a row committed while the creator was waiting.
+- Root cause: A read-or-overwriting-upsert helper was reused for insert-only lock seeding.
+- Fix: Adaptation locking now seeds with `INSERT ... ON CONFLICT DO NOTHING`, then acquires the no-op row update lock. The conflict path preserves every winner-owned value on SQLite and PostgreSQL.
+- Regression test: The two-connection SQLite test now begins with no progress row; transaction one creates and changes it to advanced/0.2/revision 7 while transaction two waits, then proves transaction two acquires the lock without resetting any value.
+- Exact retest: Pending.
+
 ## Verification Matrix
 
 | Requirement | Baseline | After fix | Evidence |
@@ -212,11 +336,11 @@
 
 ## Local verification
 
-- Adaptive/clip-focused backend suite: 412 passed, 14 subtests passed.
-- Full active backend suite: 2,405 passed, 1 skipped, 37 subtests passed.
-- Frontend suite: 179 passed.
-- Feed-focused frontend suite: 69 passed.
+- Affected generation/job/billing/feedback/assessment backend suite: 231 passed.
+- Full active backend suite: 2,418 passed, 1 skipped, 37 subtests passed.
+- Frontend suite: 182 passed.
+- Feed-focused frontend suite: 72 passed.
 - TypeScript check: passed.
-- Production Next.js build: passed (outside the filesystem sandbox because Turbopack's worker tried to bind an internal port).
+- Production Next.js build: passed.
 - `git diff --check`: passed after the final graph rebuild.
 - The only excluded backend test file was `backend/tests/test_labels_api.py`; collection imports the unrelated standalone `backend/main.py` and the local environment lacks `sse_starlette`. The active runtime under review is `backend.app.main`, and every active-backend/adaptive test collected and passed.

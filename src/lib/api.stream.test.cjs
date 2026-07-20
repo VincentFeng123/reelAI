@@ -323,6 +323,7 @@ test("generation honors the requested count within the mode ceiling and omits de
       generationMode: "fast",
       numReels: 2,
       continuationToken: " previous-batch ",
+      excludeVideoIds: ["source-a", "source-a", "bad,source"],
       targetClipDurationSec: 55,
       targetClipDurationMinSec: 20,
       targetClipDurationMaxSec: 90,
@@ -366,7 +367,7 @@ test("generation honors the requested count within the mode ceiling and omits de
   assert.equal(generationBody.num_reels, 2);
   assert.equal(generationBody.generation_mode, "fast");
   assert.equal(generationBody.continuation_token, "previous-batch");
-  assert.equal(Object.hasOwn(generationBody, "exclude_video_ids"), false);
+  assert.deepEqual(generationBody.exclude_video_ids, ["source-a"]);
   assert.equal(slowGenerationBody.num_reels, 2);
   assert.equal(slowGenerationBody.generation_mode, "slow");
   assert.equal(clampedGenerationBody.num_reels, 9);

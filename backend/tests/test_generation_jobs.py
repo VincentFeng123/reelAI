@@ -244,6 +244,21 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
             target_clip_duration_min_sec=20,
             target_clip_duration_max_sec=55,
         )
+        explicit_empty_adaptation = jobs.build_request_key(
+            material_id="material-1",
+            concept_id="concept-1",
+            content_fingerprint=fingerprint,
+            learner_id="learner-1",
+            knowledge_level="beginner",
+            generation_mode="slow",
+            creative_commons_only=False,
+            source_duration="medium",
+            target_clip_duration_sec=55,
+            target_clip_duration_min_sec=20,
+            target_clip_duration_max_sec=55,
+            adaptation_fingerprint=jobs.EMPTY_ADAPTATION_FINGERPRINT,
+        )
+        assert explicit_empty_adaptation == base
         changed_level = jobs.build_request_key(
             material_id="material-1",
             concept_id="concept-1",
