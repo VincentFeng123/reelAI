@@ -216,6 +216,7 @@ def test_search_all_returns_primary_result_when_optional_query_exhausts_budget(m
     context.reserve("search")
     context.reserve("search")
     context.reserve("search")
+    context.reserve("search")
 
     result = ss.search_all(["primary", "optional"], context=context)
 
@@ -233,6 +234,7 @@ def test_search_all_raises_when_budget_exhausts_before_primary_succeeds(monkeypa
     context = GenerationContext("fast", cache_store=MemoryProviderCache())
     context.reserve("search")
     context.reserve("search")
+    context.reserve("search")
 
     with pytest.raises(ProviderBudgetExceededError):
         ss.search_all(["primary", "optional"], context=context)
@@ -248,6 +250,7 @@ def test_search_all_keeps_primary_when_optional_retries_consume_budget(monkeypat
     )
     monkeypatch.setattr(ss.httpx, "get", lambda *args, **kwargs: next(responses))
     context = GenerationContext("fast", cache_store=MemoryProviderCache())
+    context.reserve("search")
     context.reserve("search")
 
     result = ss.search_all(["primary", "optional"], context=context)
@@ -288,7 +291,7 @@ def test_three_query_fast_prefix_keeps_retry_headroom_for_transient_primary(
         "facet-two",
     ]
     assert calls == {"primary": 2, "facet-one": 1, "facet-two": 1}
-    assert context.budget.remaining("search") == 0
+    assert context.budget.remaining("search") == 1
     assert result["warning"] is None
 
 

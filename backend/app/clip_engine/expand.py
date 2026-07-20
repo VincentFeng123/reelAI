@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import config
 from .cancellation import raise_if_cancelled, run_cancellable
-from .errors import CancellationError
+from .errors import CancellationError, ProviderError
 from .segment_cache import SEGMENT_CACHE_TTL_SEC
 from .singleflight import singleflight
 from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
@@ -43,6 +43,7 @@ PRACTICE_FAST_EXPAND_MODEL = "gemini-3.1-flash-lite"
 # Gemini rejects manually configured deadlines below ten seconds.
 PRACTICE_FAST_EXPAND_TIMEOUT_MS = 10_000
 PRACTICE_FAST_EXPAND_OUTPUT_TOKENS = 2_048
+PRACTICE_FAST_EXPAND_ATTEMPTS = 2
 PRACTICE_FAST_EXPAND_CACHE_VERSION = 7
 # An expansion can be nearly one segment-cache lifetime old when it discovers a
 # newly analyzed source. Keeping it for two lifetimes guarantees that source's
@@ -321,7 +322,7 @@ def _validated_ai_queries(
     parsed: _PracticeFastExpansion,
     count: int,
 ) -> list[str]:
-    """Keep one exact-request query plus subject-grounded facet queries."""
+    """Prefer broad-plus-focused coverage, or a complete all-focused cover."""
     constraints = list(parsed.intent_constraints)
     constraint_ids = {constraint.constraint_id for constraint in constraints}
     if not constraint_ids:
@@ -410,6 +411,17 @@ def _validated_ai_queries(
         non_subject_ids,
         focused_limit,
     )
+    if selected_indices is None and not normalized_model_broad:
+        selected_indices = _covering_focus_indices(
+            normalized_focused,
+            non_subject_ids,
+            count,
+        )
+        if selected_indices is not None:
+            return _normalize(
+                [normalized_focused[index][0] for index in selected_indices],
+                count,
+            )
     if selected_indices is None:
         return []
     selected_index_set = set(selected_indices)
@@ -606,6 +618,20 @@ def _practice_fast_gemini_raw(
     )
 
 
+def _practice_fast_failure_is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, ProviderError):
+        return bool(exc.retryable)
+    raw_status = getattr(exc, "status_code", None)
+    if raw_status is None:
+        raw_status = getattr(exc, "code", None)
+    raw_status = getattr(raw_status, "value", raw_status)
+    try:
+        status = int(raw_status) if raw_status is not None else None
+    except (TypeError, ValueError):
+        status = None
+    return status not in {400, 401, 402, 403, 404}
+
+
 def expand_query_practice_fast(
     topic: str,
     n: int,
@@ -646,36 +672,46 @@ def expand_query_practice_fast(
                 metadata={"cache_key": cache_key},
             )
             return cached
-        try:
-            kwargs = {
-                "model": PRACTICE_FAST_EXPAND_MODEL,
-                "level": level,
-                "should_cancel": should_cancel,
-            }
-            if context is not None:
-                kwargs["context"] = context
-            raw = _practice_fast_gemini_raw(topic, count, **kwargs)
-            parsed = _PracticeFastExpansion.model_validate_json(raw)
-            corrected = " ".join(str(parsed.corrected or topic).split()) or topic
-            queries = _validated_ai_queries(topic, parsed, count)
-            if not queries:
-                raise ValueError(
-                    "Gemini returned no search query preserving the exact intent contract"
+        for attempt in range(PRACTICE_FAST_EXPAND_ATTEMPTS):
+            raise_if_cancelled(should_cancel)
+            try:
+                kwargs = {
+                    "model": PRACTICE_FAST_EXPAND_MODEL,
+                    "level": level,
+                    "should_cancel": should_cancel,
+                }
+                if context is not None:
+                    kwargs["context"] = context
+                raw = _practice_fast_gemini_raw(topic, count, **kwargs)
+                parsed = _PracticeFastExpansion.model_validate_json(raw)
+                corrected = " ".join(str(parsed.corrected or topic).split()) or topic
+                queries = _validated_ai_queries(topic, parsed, count)
+                if not queries:
+                    raise ValueError(
+                        "Gemini returned no search query preserving the exact intent "
+                        "contract"
+                    )
+                raise_if_cancelled(should_cancel)
+                result = {
+                    "corrected": corrected,
+                    "queries": queries,
+                    "provider_used": "gemini",
+                }
+                if cache_key:
+                    _write_cached_expansion(cache_key, result)
+                return result
+            except CancellationError:
+                raise
+            except Exception as exc:
+                raise_if_cancelled(should_cancel)
+                errors.append(
+                    f"{PRACTICE_FAST_EXPAND_MODEL} attempt {attempt + 1}: {exc}"
                 )
-            raise_if_cancelled(should_cancel)
-            result = {
-                "corrected": corrected,
-                "queries": queries,
-                "provider_used": "gemini",
-            }
-            if cache_key:
-                _write_cached_expansion(cache_key, result)
-            return result
-        except CancellationError:
-            raise
-        except Exception as exc:
-            raise_if_cancelled(should_cancel)
-            errors.append(f"{PRACTICE_FAST_EXPAND_MODEL}: {exc}")
+                if (
+                    attempt + 1 >= PRACTICE_FAST_EXPAND_ATTEMPTS
+                    or not _practice_fast_failure_is_retryable(exc)
+                ):
+                    break
     logger.info(
         "practice-fast Gemini expansion unavailable; using literal fallback: %s",
         "; ".join(errors),

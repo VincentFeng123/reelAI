@@ -124,10 +124,11 @@ class GenerationBudget:
     _LIMITS: dict[GenerationMode, dict[BudgetedProviderOperation, int]] = {
         # Reservations count provider attempts, including retries.
         # Three complementary initial queries can cover a broad request plus
-        # distinct named facets. Keep one additional reservation so a single
-        # transient Supadata failure can still use the bounded retry path.
-        "fast": {"search": 4, "transcript": 2, "segmentation": 2},
-        "slow": {"search": 4, "transcript": 3, "segmentation": 3},
+        # distinct named facets. Keep two additional reservations so a rejected
+        # provider cursor can be isolated and discovery can retry through one
+        # independent query branch without exceeding the bounded request cap.
+        "fast": {"search": 5, "transcript": 2, "segmentation": 2},
+        "slow": {"search": 5, "transcript": 3, "segmentation": 3},
     }
     _PASS_LIMITS: dict[GenerationMode, tuple[int, int]] = {
         "fast": (1, 0),

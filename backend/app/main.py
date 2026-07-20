@@ -2986,10 +2986,12 @@ def _apply_generation_lesson_order(
     generation_id: str | None,
     reels: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Apply a persisted non-empty selection when every selected reel exists."""
+    """Apply or project the persisted selection onto the current valid reels."""
     ordered_ids = _stored_generation_lesson_order_ids(conn, generation_id)
     if ordered_ids is None:
         return reels
+    if not reels:
+        return []
     reel_ids = [
         value if isinstance(value, str) else ""
         for reel in reels
@@ -2999,7 +3001,6 @@ def _apply_generation_lesson_order(
         not ordered_ids
         or any(not reel_id for reel_id in reel_ids)
         or len(set(reel_ids)) != len(reel_ids)
-        or not set(ordered_ids).issubset(reel_ids)
     ):
         logger.warning(
             "Ignoring invalid lesson selection generation_id=%s stored=%d valid=%d",
@@ -3009,7 +3010,19 @@ def _apply_generation_lesson_order(
         )
         return reels
     by_id = dict(zip(reel_ids, reels, strict=True))
-    return [by_id[reel_id] for reel_id in ordered_ids]
+    stored_id_set = set(ordered_ids)
+    current_id_set = set(reel_ids)
+    if stored_id_set.issubset(current_id_set):
+        return [by_id[reel_id] for reel_id in ordered_ids]
+    if current_id_set.issubset(stored_id_set):
+        return [by_id[reel_id] for reel_id in ordered_ids if reel_id in by_id]
+    logger.warning(
+        "Ignoring invalid lesson selection generation_id=%s stored=%d valid=%d",
+        generation_id,
+        len(ordered_ids),
+        len(reel_ids),
+    )
+    return reels
 
 
 def _persist_generation_lesson_order(
@@ -3360,6 +3373,54 @@ def _response_generation_ids(conn, generation_id: str | None) -> list[str]:
     return ordered
 
 
+def _authoritative_generation_release_reel_ids(
+    conn,
+    generation_id: str,
+) -> list[str] | None:
+    """Return one generation's exact authoritative release, including empty."""
+    jobs = fetch_all(
+        conn,
+        """
+        SELECT id
+        FROM reel_generation_jobs
+        WHERE result_generation_id = ?
+          AND status IN ('completed', 'partial', 'exhausted')
+        ORDER BY completed_at DESC, updated_at DESC, created_at DESC, id DESC
+        LIMIT 20
+        """,
+        (generation_id,),
+    )
+    for job in jobs:
+        authoritative_payload: dict[str, Any] | None = None
+        events = replay_generation_events(
+            conn,
+            job_id=str(job.get("id") or ""),
+        )
+        for event in reversed(events):
+            if str(event.get("type") or "") != "final":
+                continue
+            payload = event.get("payload")
+            if isinstance(payload, dict) and payload.get("authoritative") is True:
+                authoritative_payload = payload
+                break
+        if authoritative_payload is None:
+            continue
+        ordered_ids: list[str] = []
+        seen_ids: set[str] = set()
+        reels = authoritative_payload.get("reels")
+        if isinstance(reels, list):
+            for reel in reels:
+                if not isinstance(reel, dict):
+                    continue
+                reel_id = str(reel.get("reel_id") or "").strip()
+                if not reel_id or reel_id in seen_ids:
+                    continue
+                seen_ids.add(reel_id)
+                ordered_ids.append(reel_id)
+        return ordered_ids
+    return None
+
+
 def _authoritative_release_reel_ids(
     conn,
     generation_id: str | None,
@@ -3369,47 +3430,18 @@ def _authoritative_release_reel_ids(
     seen_ids: set[str] = set()
     found_authoritative_release = False
     for current_generation_id in _response_generation_ids(conn, generation_id):
-        jobs = fetch_all(
+        released_ids = _authoritative_generation_release_reel_ids(
             conn,
-            """
-            SELECT id
-            FROM reel_generation_jobs
-            WHERE result_generation_id = ?
-              AND status IN ('completed', 'partial', 'exhausted')
-            ORDER BY completed_at DESC, updated_at DESC, created_at DESC, id DESC
-            LIMIT 20
-            """,
-            (current_generation_id,),
+            current_generation_id,
         )
-        for job in jobs:
-            authoritative_payload: dict[str, Any] | None = None
-            events = replay_generation_events(
-                conn,
-                job_id=str(job.get("id") or ""),
-            )
-            for event in reversed(events):
-                if str(event.get("type") or "") != "final":
-                    continue
-                payload = event.get("payload")
-                if isinstance(payload, dict) and payload.get("authoritative") is True:
-                    authoritative_payload = payload
-                    break
-            if authoritative_payload is None:
+        if released_ids is None:
+            continue
+        found_authoritative_release = True
+        for reel_id in released_ids:
+            if reel_id in seen_ids:
                 continue
-            found_authoritative_release = True
-            reels = authoritative_payload.get("reels")
-            if isinstance(reels, list):
-                for reel in reels:
-                    if not isinstance(reel, dict):
-                        continue
-                    reel_id = str(reel.get("reel_id") or "").strip()
-                    if not reel_id or reel_id in seen_ids:
-                        continue
-                    seen_ids.add(reel_id)
-                    ordered_ids.append(reel_id)
-            # The latest terminal job for this generation is authoritative,
-            # including an explicit empty or malformed release.
-            break
+            seen_ids.add(reel_id)
+            ordered_ids.append(reel_id)
     return ordered_ids if found_authoritative_release else None
 
 
@@ -4127,6 +4159,32 @@ def _ranked_request_reels(
             generation_id=generation_id,
             reels=ranked,
         )
+    else:
+        release_batches = [
+            (current_generation_id, released_ids)
+            for current_generation_id in generation_ids
+            if (
+                released_ids := _authoritative_generation_release_reel_ids(
+                    conn,
+                    current_generation_id,
+                )
+            )
+        ]
+        if release_batches and all(
+            _stored_generation_lesson_order_ids(conn, current_generation_id)
+            == released_ids
+            for current_generation_id, released_ids in release_batches
+        ):
+            by_id = {
+                str(reel.get("reel_id") or "").strip(): reel
+                for reel in ranked
+                if str(reel.get("reel_id") or "").strip()
+            }
+            ranked = [
+                by_id[reel_id]
+                for reel_id in authoritative_release_ids
+                if reel_id in by_id
+            ]
 
     if page <= 1:
         shaped = _shape_request_page_reels(

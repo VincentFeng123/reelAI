@@ -66,14 +66,14 @@ def test_generation_budgets_match_fast_and_slow_contracts() -> None:
     fast = GenerationBudget.for_mode("fast")
     slow = GenerationBudget.for_mode("slow")
     assert fast.snapshot()["limits"] == {
-        "search": 4,
+        "search": 5,
         "transcript": 2,
         "segmentation": 2,
     }
     assert (fast.max_passes, fast.max_no_growth_passes) == (1, 0)
-    assert slow.snapshot()["limits"] == {"search": 4, "transcript": 3, "segmentation": 3}
+    assert slow.snapshot()["limits"] == {"search": 5, "transcript": 3, "segmentation": 3}
     assert (slow.max_passes, slow.max_no_growth_passes) == (1, 0)
-    for _ in range(4):
+    for _ in range(5):
         fast.reserve("search")
     with pytest.raises(ProviderBudgetExceededError):
         fast.reserve("search")

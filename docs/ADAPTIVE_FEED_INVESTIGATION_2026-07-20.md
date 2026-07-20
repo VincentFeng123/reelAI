@@ -345,7 +345,7 @@
 
 ### AF-022 — A clean material's automatic continuation is rejected by Supadata
 
-- Status: Fixed locally; production retest pending
+- Status: Fixed and verified on deployed revision `8d24b5d`
 - Severity: High — the initial batch stops before covering the requested curriculum, and the quiz/feedback matrix cannot observe healthy later batches
 - Production reproduction (2026-07-20, clean Postgres and Redis, deployed revision `4e0973f`):
   1. Submit the one-line beginner topic “Newton's laws: inertia and balanced forces, net force and F=ma, free-body diagrams, action-reaction pairs, then worked problems and common misconceptions.”
@@ -356,7 +356,7 @@
 - Root cause: The search orchestration correctly carried both the logical query and provider cursor into the Supadata adapter, but the adapter's `page_token` branch discarded the query and sent only `nextPageToken`. Production now validates its documented required `query` field and returned `400 query: Required`; the existing unit test incorrectly required the broken token-only wire shape.
 - Fix: Paginated Supadata calls now send the whitespace-normalized logical query together with `nextPageToken` while continuing to omit initial-page filters.
 - Regression test: The adapter fake now rejects a missing query exactly like production and asserts the paginated request is exactly `{query, nextPageToken}`. All 15 Supadata adapter tests and five focused provider-cursor/consumed-page tests pass; the old implementation raises `ProviderRequestError` under this test.
-- Exact retest: Pending on the same clean one-line topic and continuation sequence.
+- Exact retest: The deployed continuation now sends the required query and reaches Supadata pagination. Its different `400 Invalid or expired continuation token` response is not the missing-query defect and is tracked separately as AF-033.
 
 ### AF-023 — Degraded organizer fallback starts with an advanced misconception
 
@@ -477,6 +477,33 @@
 - Fix: Family-scoped concept rows now store the canonical family title, allowing the generated-concept classifier to recognize both legacy facet and family-v1 deterministic namespaces without querying reel state. Material-wide fingerprints ignore both forms, while concept-scoped fingerprints still include the selected generated concept. A shared family normalizer canonicalizes possessives and `1st`/`2nd`/`3rd`/`4th` spellings before persistence UUID generation, profile matching, and fingerprint classification.
 - Regression test: The material fingerprint remains stable after creating both legacy and family-v1 clip concepts, the family concept still changes its concept-scoped fingerprint, the exact live continuation regression uses the family-v1 path, and `Newton's 1st law` shares both its semantic identity and UUID with `Newton's first law`. The focused fingerprint/persistence/adaptation set passes all 43 tests.
 
+### AF-033 — The newest-schema live continuation is still rejected by Supadata
+
+- Status: Fixed locally; production retest pending
+- Severity: High — the first clean batch contains relevant foundations, but already-analyzed second-law and free-body clips remain unreachable when the automatic continuation fails
+- Production reproduction (2026-07-20, after the exact GitHub/Railway/Vercel SHA was verified and scoped Postgres/Redis state was cleared):
+  1. Submit the beginner topic “Newton's laws: begin with first-law inertia and balanced forces, then net force and F=ma, then free-body diagrams, then third-law action-reaction pairs, and finish with worked problems and common misconceptions.”
+  2. Material `588811b2-3bdb-4479-802c-dbbfd41a6747` creates initial job `162ca842-1579-4b39-b04a-c8d2a9ec3467` with request schema `adaptive_clip_concepts_v2` and active generation `1b76a5bd-1dce-4a29-bdd8-87e92d10ec24`.
+  3. Gemini family concepts persist successfully, and the organizer emits a non-degraded five-reel foundation beginning with first law, balanced forces, and inertia.
+  4. Automatic continuation job `3eee03f6-ca80-420f-bba9-db5624dbd572` fails with `provider_request_rejected`: `Supadata rejected the search request (400).`
+- Evidence: Ten relevant clips were persisted, including explicit `Newton's second law` and `free-body diagram` clips, but the active five-ID lesson omits both. The failed continuation creates an empty pending generation `cb2ddbbf-711f-4166-8117-f5eeea0a5e58`.
+- Expected: One unusable opaque cursor cannot fail the whole discovery stage. The step retries through another independent, subject-grounded query branch and can expose uncovered requested concepts; permanent authentication, quota, and non-pagination request failures remain terminal.
+- Root cause: Direct production-key probes proved Supadata's cursor itself was unusable for this long compound query: both the provider-issued escaped token and a once-decoded token returned the same `400 Invalid or expired continuation token`, while the documented `query + nextPageToken` wire contract was correct. The failure became fatal because intent validation reserved one of three slots for a literal broad query. Gemini had returned three collectively complete focused Newton queries, but no two could cover every named constraint beside that reserved literal, so validation discarded all three. The literal query was the only branch, and `_continue_provider_pages()` sent every cursor frontier in one call and propagated its first `400`.
+- Fix: When Gemini supplies no valid broad query, validation may now use all three focused slots only if their union preserves every request constraint. Expansion retries the same Flash-Lite step once for a transient dispatch, schema, or intent-contract failure before the deterministic literal fallback. Provider pagination now processes cursor branches FIFO one at a time; only a `400` whose detail explicitly identifies an invalid continuation/page token exhausts that opaque branch and retries discovery through the next grounded query. Cancellation, budget, authentication, quota, rate-limit, transient, unrelated-400, and non-400 failures retain their existing bounded/fatal semantics. A rejected token is never replayed within the attempt and is never logged. The search cap is five provider attempts: three complementary initial queries, one rejected cursor, and one independent recovery branch.
+- Regression test: The exact long Newton request accepts the three-query complete cover; an incomplete all-focused union still falls back literally; a first Flash failure succeeds on the bounded second attempt; permanent configuration is not retried; and a cold-cache, budgeted three-query cursor reproduction proves calls occur as `[initial, bad branch, good branch]`, returns fresh inventory on the fifth and final reservation, and preserves a generic warning. Unrelated `400 query is required`, non-400 rejection, empty pages, deeper cursor chains, and budget-open behavior remain covered.
+- Exact retest: Pending after the fix is deployed, its exact GitHub/Railway/Vercel revision is verified, and production Postgres/Redis learning state is cleared again.
+
+### AF-034 — A persisted organizer selection is rejected on feed reload
+
+- Status: Fixed locally; production retest pending
+- Severity: High — the first response can show the organizer's intended progression while a reload silently discards that same persisted lesson selection
+- Production evidence: For material `588811b2-3bdb-4479-802c-dbbfd41a6747`, generation `1b76a5bd-1dce-4a29-bdd8-87e92d10ec24` persisted a non-degraded five-ID `lesson_order_v4` plan. Production then logged `Ignoring invalid lesson selection generation_id=1b76a5bd-... stored=5 valid=0` twice while serving the feed.
+- Expected: A valid organizer plan remains valid across the initial response, polling, watched-reel filtering, and reload. Removing a watched reel projects the stored sequence onto the remaining clips rather than invalidating the sequence.
+- Root cause: `_apply_generation_lesson_order()` required every persisted organizer ID to remain present after seen/exclusion filtering. Once the first reel was completed, the current reel set was a proper subset of the five-ID plan, so the helper rejected the entire plan and ranking exposed a third-law clip before the intended balanced-force and inertia foundations. Terminal `/api/feed` additionally skipped the helper when an authoritative release existed.
+- Fix: The helper now projects a persisted order when current reels are a filtered subset, while retaining the existing selected-subset and invalid-mixed-set safeguards. For a terminal organizer chain, the feed projects filtered rows onto the chain-wide authoritative final-event sequence only when every contributing generation has lesson metadata exactly matching its own authoritative release. This preserves older unseen releases and reused source siblings across organizer continuation batches without letting one child plan freeze a legacy source batch; legacy or mismatched releases retain their existing allow-list/current-ranking behavior.
+- Regression test: Stored `[a,b,c]` with current `[c,b]` now returns `[b,c]`; an empty set stays empty and a mixed unknown set remains unchanged. A production-shaped released feed shuffled as `[third,second,first]` with `first` seen returns `[second,third]`. A two-generation reused-sibling case proves source release `[a,b]`, child release `[c,d]`, and `a` seen returns `[b,c,d]` rather than dropping `c` or `b`. Additional controls prove a legacy source batch is not frozen by a child organizer, unknown stored IDs cannot authorize terminal projection, and a later authoritative empty release hides its raw inventory without disabling an earlier valid organizer order.
+- Exact retest: Pending after deployment on the same fresh-material reload sequence.
+
 ## Verification Matrix
 
 | Requirement | Baseline | After fix | Evidence |
@@ -501,6 +528,7 @@
 - Full active backend suite after AF-020/AF-021: 2,420 passed, 1 skipped, 37 subtests passed.
 - Final affected adaptive/selection/generation/assessment suite after AF-022 through AF-032: 1,103 passed.
 - Final full active backend suite after AF-022 through AF-032: 2,435 passed, 1 skipped, 37 subtests passed.
+- Final full active backend suite after AF-033 and AF-034: 2,450 passed, 1 skipped, 37 subtests passed.
 - Independent atomic re-review: GO; all prior release blockers reproduced as fixed in five focused checks and direct probes.
 - Frontend suite: 182 passed.
 - Feed-focused frontend suite: 72 passed.

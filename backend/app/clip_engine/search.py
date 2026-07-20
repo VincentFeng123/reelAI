@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from . import expand, rank, supadata_search
 from .cancellation import raise_if_cancelled
-from .errors import ProviderBudgetExceededError, SearchError
+from .errors import ProviderBudgetExceededError, ProviderRequestError, SearchError
 from .metadata import normalize_youtube_video_id
 from .provider_cache import ProviderCacheStore, normalize_filters
 from .provider_runtime import GenerationContext
@@ -40,6 +40,15 @@ _LONG_TOPIC_LEAD = re.compile(
 )
 _LONG_TOPIC_RELATION = re.compile(
     r"\b(?:work together|interact|combine|to maintain|to preserve|to pass|across)\b",
+    re.IGNORECASE,
+)
+_INVALID_PROVIDER_CURSOR = re.compile(
+    r"\b(?:"
+    r"(?:invalid|expired)(?:\s+or\s+(?:invalid|expired))?\s+"
+    r"(?:continuation\s+token|page\s+token|nextpagetoken|cursor)"
+    r"|(?:continuation\s+token|page\s+token|nextpagetoken|cursor)\s+"
+    r"(?:is\s+)?(?:invalid|expired)"
+    r")\b",
     re.IGNORECASE,
 )
 _FOCUSED_ANALYSIS_SOURCE_MAX_SEC = 30 * 60
@@ -330,40 +339,50 @@ def _continue_provider_pages(
     credits_used = 0
     warning: str | None = None
     while frontier and not enough():
-        page_queries = [query for query, _token, _filters in frontier]
-        page_tokens = [token for _query, token, _filters in frontier]
-        page_filters = [entry_filters for _query, _token, entry_filters in frontier]
+        query, token, entry_filters = frontier.pop(0)
         try:
             page_result = supadata_search.search_all(
-                page_queries,
+                [query],
                 filters,
-                page_tokens=page_tokens,
-                request_filters=page_filters,
+                page_tokens=[token],
+                request_filters=[entry_filters],
                 **search_runtime,
             )
         except ProviderBudgetExceededError:
+            frontier.insert(0, (query, token, entry_filters))
             warning = "Search budget exhausted with provider pages remaining."
             break
+        except ProviderRequestError as exc:
+            if exc.status_code != 400 or not _INVALID_PROVIDER_CURSOR.search(
+                str(exc.detail or "")
+            ):
+                raise
+            logger.warning(
+                "Provider continuation cursor was rejected; continuing another "
+                "query branch query=%r",
+                query,
+            )
+            warning = (
+                warning
+                or "A provider continuation cursor was rejected; continued with "
+                "remaining search queries."
+            )
+            continue
 
         page_sets = list(page_result.get("per_query") or [])
         credits_used += int(page_result.get("credits_used") or 0)
         warning = str(page_result.get("warning") or "").strip() or warning
         if not page_sets:
-            break
+            continue
         annotate(page_sets)
         result_sets.extend(page_sets)
-
-        # A budget-limited search_all may complete only a prefix. Keep every
-        # unrequested cursor open instead of falsely declaring exhaustion.
-        unprocessed = frontier[len(page_sets) :]
-        frontier = [
-            *_provider_page_frontier(
+        frontier.extend(
+            _provider_page_frontier(
                 page_sets,
                 fallback_filters=filters,
                 seen=seen,
-            ),
-            *unprocessed,
-        ]
+            )
+        )
         if page_result.get("warning"):
             break
 

@@ -9,7 +9,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from backend.app.clip_engine import expand, rank, search, segment_cache
-from backend.app.clip_engine.errors import CancellationError
+from backend.app.clip_engine.errors import (
+    CancellationError,
+    ProviderConfigurationError,
+    ProviderRequestError,
+)
 from backend.app.clip_engine.provider_cache import MemoryProviderCache
 from backend.app.clip_engine.provider_runtime import GenerationContext
 
@@ -77,6 +81,7 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
 
     assert expand.PRACTICE_FAST_EXPAND_MODEL == "gemini-3.1-flash-lite"
     assert expand.PRACTICE_FAST_EXPAND_TIMEOUT_MS == 10_000
+    assert expand.PRACTICE_FAST_EXPAND_ATTEMPTS == 2
     assert result == {
         "corrected": "Calculus",
         "queries": ["calculus spoken lecture", "Derivatives", "Limits"],
@@ -308,6 +313,121 @@ def test_practice_fast_expansion_repairs_missing_model_broad_query_safely(monkey
             "Newton second law worked examples solve F m and a",
         ],
         "provider_used": "gemini",
+    }
+
+
+def test_practice_fast_expansion_uses_all_slots_for_complete_focused_cover(
+    monkeypatch,
+):
+    topic = (
+        "Newton's laws: begin with first-law inertia and balanced forces, then "
+        "net force and F=ma, then free-body diagrams, then third-law "
+        "action-reaction pairs, and finish with worked problems and common "
+        "misconceptions."
+    )
+    constraints = [
+        ("subject", "subject", "Newton's laws"),
+        ("first_law", "scope", "first-law inertia and balanced forces"),
+        ("second_law", "scope", "net force and F=ma"),
+        ("free_body", "scope", "free-body diagrams"),
+        ("third_law", "scope", "third-law action-reaction pairs"),
+        ("sequence", "format", "begin then then then and finish"),
+        (
+            "practice",
+            "outcome",
+            "worked problems and common misconceptions",
+        ),
+    ]
+    payload = {
+        "corrected": topic,
+        "intent_constraints": [
+            {
+                "constraint_id": constraint_id,
+                "kind": kind,
+                "source_phrase": source_phrase,
+                "requirement": f"Preserve {source_phrase}",
+            }
+            for constraint_id, kind, source_phrase in constraints
+        ],
+        "queries": [
+            {
+                "text": "Newton laws explained inertia F=ma action-reaction",
+                "preserved_constraint_ids": [
+                    "subject",
+                    "first_law",
+                    "second_law",
+                    "third_law",
+                    "sequence",
+                ],
+            },
+            {
+                "text": "Newton laws free-body diagram lesson",
+                "preserved_constraint_ids": ["subject", "free_body"],
+            },
+            {
+                "text": "Newton laws practice problems common misconceptions",
+                "preserved_constraint_ids": ["subject", "practice"],
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    result = expand.expand_query_practice_fast(topic, 3)
+
+    assert result == {
+        "corrected": topic,
+        "queries": [query["text"] for query in payload["queries"]],
+        "provider_used": "gemini",
+    }
+
+
+def test_practice_fast_expansion_rejects_incomplete_all_focused_cover(monkeypatch):
+    topic = "physics force mass acceleration units"
+    all_ids = ["subject", "force", "mass", "acceleration", "units"]
+    payload = {
+        "corrected": topic,
+        "intent_constraints": [
+            {
+                "constraint_id": constraint_id,
+                "kind": "subject" if constraint_id == "subject" else "scope",
+                "source_phrase": (
+                    "physics" if constraint_id == "subject" else constraint_id
+                ),
+                "requirement": f"Preserve {constraint_id}",
+            }
+            for constraint_id in all_ids
+        ],
+        "queries": [
+            {
+                "text": "physics force lesson",
+                "preserved_constraint_ids": ["subject", "force"],
+            },
+            {
+                "text": "physics mass lesson",
+                "preserved_constraint_ids": ["subject", "mass"],
+            },
+            {
+                "text": "physics acceleration lesson",
+                "preserved_constraint_ids": ["subject", "acceleration"],
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    result = expand.expand_query_practice_fast(topic, 3)
+
+    assert result == {
+        "corrected": topic,
+        "queries": [topic],
+        "provider_used": "literal_fallback",
     }
 
 
@@ -692,7 +812,7 @@ def test_practice_fast_expansion_never_falls_back_to_pro(monkeypatch):
 
     result = expand.expand_query_practice_fast("physics", 3)
 
-    assert calls == ["gemini-3.1-flash-lite"]
+    assert calls == ["gemini-3.1-flash-lite", "gemini-3.1-flash-lite"]
     assert result == {
         "corrected": "physics",
         "queries": ["physics"],
@@ -711,7 +831,59 @@ def test_practice_fast_expansion_uses_literal_fallback_after_flash(monkeypatch):
 
     result = expand.expand_query_practice_fast("physics", 3)
 
-    assert calls == ["gemini-3.1-flash-lite"]
+    assert calls == ["gemini-3.1-flash-lite", "gemini-3.1-flash-lite"]
+    assert result == {
+        "corrected": "physics",
+        "queries": ["physics"],
+        "provider_used": "literal_fallback",
+    }
+
+
+def test_practice_fast_expansion_retries_failed_flash_step_once(monkeypatch):
+    calls = 0
+
+    def fail_then_succeed(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary model failure")
+        return _intent_expansion_json(
+            corrected="Physics",
+            source_phrase="physics",
+            queries=["Physics", "mechanics", "waves"],
+        )
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fail_then_succeed)
+
+    result = expand.expand_query_practice_fast("physics", 3)
+
+    assert calls == 2
+    assert result == {
+        "corrected": "Physics",
+        "queries": ["Physics", "mechanics", "waves"],
+        "provider_used": "gemini",
+    }
+
+
+def test_practice_fast_expansion_does_not_retry_permanent_configuration(
+    monkeypatch,
+):
+    calls = 0
+
+    def fail_configuration(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise ProviderConfigurationError(
+            "GEMINI_API_KEY is not set.",
+            provider="gemini",
+            operation="expansion",
+        )
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fail_configuration)
+
+    result = expand.expand_query_practice_fast("physics", 3)
+
+    assert calls == 1
     assert result == {
         "corrected": "physics",
         "queries": ["physics"],
@@ -1742,6 +1914,147 @@ def test_search_budget_exhaustion_keeps_unfetched_provider_cursor_open(monkeypat
     assert result["videos"] == []
     assert result["provider_exhausted"] is False
     assert "provider pages remaining" in str(result["warning"])
+
+
+def test_rejected_provider_cursor_continues_through_another_query_branch(monkeypatch):
+    calls = []
+    topic = "Newton laws worked problems"
+    focused = "Newton laws free body diagrams"
+    practice = "Newton laws common misconceptions"
+    context = GenerationContext("slow")
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda *_args, **_kwargs: {
+            "corrected": topic,
+            "queries": [topic, focused, practice],
+            "provider_used": "gemini",
+        },
+    )
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        assert kwargs.get("context") is context
+        for _query in queries:
+            context.reserve("search")
+        page_tokens = kwargs.get("page_tokens")
+        calls.append(page_tokens)
+        if page_tokens is None:
+            return {
+                "per_query": [
+                    {
+                        "query": topic,
+                        "videos": [{"id": "consumed-topic"}],
+                        "next_page_token": "bad-cursor",
+                    },
+                    {
+                        "query": focused,
+                        "videos": [{"id": "consumed-focused"}],
+                        "next_page_token": "good-cursor",
+                    },
+                    {
+                        "query": practice,
+                        "videos": [{"id": "consumed-practice"}],
+                        "next_page_token": "unused-cursor",
+                    },
+                ],
+                "credits_used": 0,
+                "warning": None,
+            }
+        if page_tokens == ["bad-cursor"]:
+            raise ProviderRequestError(
+                "Supadata rejected the search request (400).",
+                provider="supadata",
+                operation="search",
+                status_code=400,
+                detail="Invalid or expired continuation token",
+            )
+        return {
+            "per_query": [{
+                "query": queries[0],
+                "videos": [{"id": "fresh-focused"}],
+                "next_page_token": None,
+            }],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        topic,
+        limit=1,
+        breadth=3,
+        consumed_video_ids=[
+            "consumed-topic",
+            "consumed-focused",
+            "consumed-practice",
+        ],
+        retrieval_profile="deep",
+        context=context,
+    )
+
+    assert calls == [None, ["bad-cursor"], ["good-cursor"]]
+    assert [video["id"] for video in result["videos"]] == ["fresh-focused"]
+    assert result["provider_exhausted"] is False
+    assert "continued with remaining search queries" in str(result["warning"])
+    assert context.budget.remaining("search") == 0
+
+
+@pytest.mark.parametrize(
+    ("status_code", "detail"),
+    [
+        (400, "query is required"),
+        (400, "cursor cannot be combined with query"),
+        (400, "Invalid request: cursor cannot be combined with query"),
+        (422, "request validation failed"),
+    ],
+)
+def test_unrelated_provider_cursor_rejection_still_propagates(
+    monkeypatch,
+    status_code,
+    detail,
+):
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda topic, *_args, **_kwargs: {
+            "corrected": topic,
+            "queries": [topic],
+            "provider_used": "literal_fallback",
+        },
+    )
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        if kwargs.get("page_tokens") is not None:
+            raise ProviderRequestError(
+                f"Supadata rejected the search request ({status_code}).",
+                provider="supadata",
+                operation="search",
+                status_code=status_code,
+                detail=detail,
+            )
+        return {
+            "per_query": [{
+                "query": queries[0],
+                "videos": [{"id": "already-consumed"}],
+                "next_page_token": "page-2",
+            }],
+            "credits_used": 0,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    with pytest.raises(ProviderRequestError) as exc_info:
+        search.discover_practice_fast(
+            "AP Statistics regression",
+            limit=1,
+            breadth=1,
+            consumed_video_ids=["already-consumed"],
+            retrieval_profile="deep",
+        )
+
+    assert exc_info.value.status_code == status_code
 
 
 def test_discover_practice_fast_limits_ai_queries_to_remaining_search_budget(monkeypatch):

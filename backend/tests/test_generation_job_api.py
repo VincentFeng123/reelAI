@@ -300,6 +300,45 @@ def test_persisted_lesson_order_reapplies_a_valid_selected_subset() -> None:
         conn.close()
 
 
+def test_persisted_lesson_order_projects_onto_remaining_unseen_reels() -> None:
+    conn = _conn()
+    try:
+        generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key="lesson-order-filtered-subset",
+            generation_mode="fast",
+            retrieval_profile="unified",
+        )
+        reels = [{"reel_id": "a"}, {"reel_id": "b"}, {"reel_id": "c"}]
+        main._persist_generation_lesson_order(
+            conn,
+            generation_id=generation_id,
+            metadata={"version": 2, "ordered_reel_ids": ["a", "b", "c"]},
+        )
+
+        assert main._apply_generation_lesson_order(
+            conn,
+            generation_id=generation_id,
+            reels=[reels[2], reels[1]],
+        ) == [reels[1], reels[2]]
+        assert main._apply_generation_lesson_order(
+            conn,
+            generation_id=generation_id,
+            reels=[],
+        ) == []
+
+        unknown = {"reel_id": "unknown"}
+        assert main._apply_generation_lesson_order(
+            conn,
+            generation_id=generation_id,
+            reels=[reels[1], unknown],
+        ) == [reels[1], unknown]
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize(
     ("checkpoint_ids", "preparation_complete"),
     [
@@ -887,6 +926,166 @@ def test_released_feed_uses_release_as_allow_list_not_frozen_display_order(
             "released-second",
             "released-first",
         ]
+    finally:
+        conn.close()
+
+
+def test_released_feed_keeps_organizer_order_after_seen_reel_is_filtered(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [(["first", "second", "third"], ["third", "second", "first"])],
+    )
+    main._persist_generation_lesson_order(
+        conn,
+        generation_id=generation_id,
+        metadata={
+            "version": 2,
+            "ordered_reel_ids": ["first", "second", "third"],
+        },
+    )
+    _patch_released_ranked_feed(monkeypatch, rows)
+    monkeypatch.setattr(
+        main,
+        "_learner_seen_reel_ids",
+        lambda *_args, **_kwargs: {"first"},
+    )
+    try:
+        ranked = _rank_released_feed(conn, generation_id=generation_id)
+
+        assert [reel["reel_id"] for reel in ranked] == ["second", "third"]
+    finally:
+        conn.close()
+
+
+def test_released_feed_keeps_reused_sibling_across_organizer_batches(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    child_generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [
+            (["a", "b"], ["b", "c", "a"]),
+            (["c", "d"], ["d"]),
+        ],
+    )
+    source_generation_id = str(
+        db.fetch_one(
+            conn,
+            "SELECT source_generation_id FROM reel_generations WHERE id = ?",
+            (child_generation_id,),
+        )["source_generation_id"]
+    )
+    main._persist_generation_lesson_order(
+        conn,
+        generation_id=source_generation_id,
+        metadata={"version": 2, "ordered_reel_ids": ["a", "b"]},
+    )
+    main._persist_generation_lesson_order(
+        conn,
+        generation_id=child_generation_id,
+        metadata={"version": 2, "ordered_reel_ids": ["c", "d"]},
+    )
+    _patch_released_ranked_feed(monkeypatch, rows)
+    monkeypatch.setattr(
+        main,
+        "_learner_seen_reel_ids",
+        lambda *_args, **_kwargs: {"a"},
+    )
+    try:
+        ranked = _rank_released_feed(
+            conn,
+            generation_id=child_generation_id,
+        )
+
+        assert [reel["reel_id"] for reel in ranked] == ["b", "c", "d"]
+    finally:
+        conn.close()
+
+
+def test_released_feed_does_not_freeze_legacy_source_batch_to_release_order(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    child_generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [
+            (["a", "b"], ["b", "a"]),
+            (["c", "d"], ["d", "c"]),
+        ],
+    )
+    main._persist_generation_lesson_order(
+        conn,
+        generation_id=child_generation_id,
+        metadata={"version": 2, "ordered_reel_ids": ["c", "d"]},
+    )
+    _patch_released_ranked_feed(monkeypatch, rows)
+    try:
+        ranked = _rank_released_feed(
+            conn,
+            generation_id=child_generation_id,
+        )
+
+        assert [reel["reel_id"] for reel in ranked] == ["b", "a", "d", "c"]
+    finally:
+        conn.close()
+
+
+def test_released_feed_rejects_unknown_organizer_metadata_before_projection(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [(["a", "b"], ["b", "a"])],
+    )
+    main._persist_generation_lesson_order(
+        conn,
+        generation_id=generation_id,
+        metadata={"version": 2, "ordered_reel_ids": ["unknown"]},
+    )
+    _patch_released_ranked_feed(monkeypatch, rows)
+    try:
+        ranked = _rank_released_feed(conn, generation_id=generation_id)
+
+        assert [reel["reel_id"] for reel in ranked] == ["b", "a"]
+    finally:
+        conn.close()
+
+
+def test_empty_child_release_does_not_disable_source_organizer_order(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    child_generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [
+            (["a", "b"], ["b", "a"]),
+            ([], ["raw-private"]),
+        ],
+    )
+    source_generation_id = str(
+        db.fetch_one(
+            conn,
+            "SELECT source_generation_id FROM reel_generations WHERE id = ?",
+            (child_generation_id,),
+        )["source_generation_id"]
+    )
+    main._persist_generation_lesson_order(
+        conn,
+        generation_id=source_generation_id,
+        metadata={"version": 2, "ordered_reel_ids": ["a", "b"]},
+    )
+    _patch_released_ranked_feed(monkeypatch, rows)
+    try:
+        ranked = _rank_released_feed(
+            conn,
+            generation_id=child_generation_id,
+        )
+
+        assert [reel["reel_id"] for reel in ranked] == ["a", "b"]
     finally:
         conn.close()
 
