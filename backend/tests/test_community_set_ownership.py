@@ -36,6 +36,8 @@ class CommunitySetOwnershipTests(unittest.TestCase):
         db_module._db_ready = False
         get_settings.cache_clear()
         main_module.settings = get_settings()
+        with main_module._rate_limit_lock:
+            main_module._rate_limit_hits.clear()
         self.client = TestClient(app)
         self.other_client = TestClient(app)
         self.addCleanup(self.client.close)
@@ -423,6 +425,169 @@ class CommunitySetOwnershipTests(unittest.TestCase):
         )
         self.assertEqual(mine_response.status_code, 200)
         self.assertEqual(mine_response.json()["sets"], [])
+
+    def test_bulk_delete_removes_two_owned_sets_and_dependent_rows(self) -> None:
+        owner_key = "bulk-delete-owner-key-abcdefghijklmnopqrstuvwxyz"
+        username = "bulkdeleteowner"
+        session_token = self._register_and_verify(
+            owner_key=owner_key,
+            username=username,
+            password="studyreels-password",
+        )
+        with get_conn(transactional=True) as conn:
+            account = fetch_one(
+                conn,
+                "SELECT id FROM community_accounts WHERE username_normalized = ? LIMIT 1",
+                (username,),
+            )
+        self.assertIsNotNone(account)
+        account_id = str(account["id"])
+        set_ids = ["user-set-bulk-first", "user-set-bulk-second"]
+        for set_id in set_ids:
+            self._insert_user_set(
+                set_id=set_id,
+                owner_key_hash=_owner_hash(owner_key),
+                owner_account_id=account_id,
+            )
+        with get_conn(transactional=True) as conn:
+            insert(
+                conn,
+                "community_set_votes",
+                {
+                    "account_id": account_id,
+                    "set_id": set_ids[0],
+                    "vote": "like",
+                    "created_at": now_iso(),
+                },
+            )
+            insert(
+                conn,
+                "community_starred_sets",
+                {
+                    "account_id": account_id,
+                    "set_id": set_ids[1],
+                    "created_at": now_iso(),
+                },
+            )
+
+        response = self.client.post(
+            "/api/community/sets/bulk-delete",
+            headers={COMMUNITY_SESSION_HEADER: session_token},
+            json={"set_ids": set_ids},
+        )
+
+        self.assertEqual(response.status_code, 204, response.text)
+        with get_conn(transactional=True) as conn:
+            for set_id in set_ids:
+                self.assertIsNone(
+                    fetch_one(conn, "SELECT id FROM community_sets WHERE id = ?", (set_id,))
+                )
+            self.assertIsNone(
+                fetch_one(
+                    conn,
+                    "SELECT set_id FROM community_set_votes WHERE set_id = ?",
+                    (set_ids[0],),
+                )
+            )
+            self.assertIsNone(
+                fetch_one(
+                    conn,
+                    "SELECT set_id FROM community_starred_sets WHERE set_id = ?",
+                    (set_ids[1],),
+                )
+            )
+
+    def test_bulk_delete_deduplicates_set_ids(self) -> None:
+        owner_key = "bulk-deduplicate-owner-key-abcdefghijklmnopqrstuvwxyz"
+        username = "bulkdedupeowner"
+        session_token = self._register_and_verify(
+            owner_key=owner_key,
+            username=username,
+            password="studyreels-password",
+        )
+        with get_conn(transactional=True) as conn:
+            account = fetch_one(
+                conn,
+                "SELECT id FROM community_accounts WHERE username_normalized = ? LIMIT 1",
+                (username,),
+            )
+        self.assertIsNotNone(account)
+        set_id = "user-set-bulk-duplicate"
+        self._insert_user_set(
+            set_id=set_id,
+            owner_key_hash=_owner_hash(owner_key),
+            owner_account_id=str(account["id"]),
+        )
+
+        response = self.client.post(
+            "/api/community/sets/bulk-delete",
+            headers={COMMUNITY_SESSION_HEADER: session_token},
+            json={"set_ids": [set_id, f" {set_id} ", set_id]},
+        )
+
+        self.assertEqual(response.status_code, 204, response.text)
+        with get_conn(transactional=True) as conn:
+            self.assertIsNone(
+                fetch_one(conn, "SELECT id FROM community_sets WHERE id = ?", (set_id,))
+            )
+
+    def test_bulk_delete_rejects_invalid_or_non_owned_ids_without_partial_deletion(self) -> None:
+        owner_key = "bulk-atomic-owner-key-abcdefghijklmnopqrstuvwxyz"
+        username = "bulkatomicowner"
+        session_token = self._register_and_verify(
+            owner_key=owner_key,
+            username=username,
+            password="studyreels-password",
+        )
+        with get_conn(transactional=True) as conn:
+            account = fetch_one(
+                conn,
+                "SELECT id FROM community_accounts WHERE username_normalized = ? LIMIT 1",
+                (username,),
+            )
+        self.assertIsNotNone(account)
+        account_id = str(account["id"])
+        self._insert_user_set(
+            set_id="user-set-bulk-foreign",
+            owner_key_hash=_owner_hash("another-owner-key-abcdefghijklmnopqrstuvwxyz"),
+            owner_account_id="another-account-id",
+        )
+        self._insert_user_set(
+            set_id="user-set-bulk-unclaimed",
+            owner_key_hash=_owner_hash("legacy-owner-key-abcdefghijklmnopqrstuvwxyz"),
+            owner_account_id=None,
+        )
+
+        invalid_cases = (
+            ("missing", "user-set-bulk-missing", 404),
+            ("foreign", "user-set-bulk-foreign", 403),
+            ("unclaimed", "user-set-bulk-unclaimed", 403),
+            ("non-user", "featured-community-set", 403),
+        )
+        for label, invalid_set_id, expected_status in invalid_cases:
+            with self.subTest(label=label):
+                owned_set_id = f"user-set-bulk-atomic-{label}"
+                self._insert_user_set(
+                    set_id=owned_set_id,
+                    owner_key_hash=_owner_hash(owner_key),
+                    owner_account_id=account_id,
+                )
+
+                response = self.client.post(
+                    "/api/community/sets/bulk-delete",
+                    headers={COMMUNITY_SESSION_HEADER: session_token},
+                    json={"set_ids": [owned_set_id, invalid_set_id]},
+                )
+
+                self.assertEqual(response.status_code, expected_status, response.text)
+                with get_conn(transactional=True) as conn:
+                    self.assertIsNotNone(
+                        fetch_one(
+                            conn,
+                            "SELECT id FROM community_sets WHERE id = ?",
+                            (owned_set_id,),
+                        )
+                    )
 
     def test_update_preserves_reel_ids_when_client_sends_existing_ids(self) -> None:
         owner_key = "owner-key-for-reel-id-preservation-abcdefghijklmnopqrstuvwxyz"

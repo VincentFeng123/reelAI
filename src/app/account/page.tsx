@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 
 import { CommunityAccountScreen } from "@/components/CommunityAccountScreen";
 import { FullscreenLoadingScreen } from "@/components/FullscreenLoadingScreen";
-import { COMMUNITY_AUTH_CHANGED_EVENT, fetchCommunityAccount, readCommunityAuthSession } from "@/lib/api";
+import { COMMUNITY_AUTH_CHANGED_EVENT, readCommunityAuthSession, restoreCommunityAccountFromSessionToken } from "@/lib/api";
 import { useLoadingScreenGate } from "@/lib/useLoadingScreenGate";
 import type { CommunityAccount } from "@/lib/types";
 
@@ -16,8 +16,8 @@ function normalizeReturnTab(value: string | null): "search" | "community" | "edi
   return null;
 }
 
-function normalizeAccountView(value: string | null): "default" | "change-password" | "delete-account" {
-  if (value === "change-password" || value === "delete-account") {
+function normalizeAccountView(value: string | null): "default" | "change-password" | "delete-account" | "billing" {
+  if (value === "change-password" || value === "delete-account" || value === "billing") {
     return value;
   }
   return "default";
@@ -28,8 +28,10 @@ function AccountPageContent() {
   const searchParams = useSearchParams();
   const returnTab = useMemo(() => normalizeReturnTab(searchParams.get("return_tab")), [searchParams]);
   const requestedView = useMemo(() => normalizeAccountView(searchParams.get("view")), [searchParams]);
+  const requestedAuthMode = searchParams.get("mode") === "register" ? "register" : "login";
   const [communityAccount, setCommunityAccount] = useState<CommunityAccount | null>(null);
   const [accountScreenReady, setAccountScreenReady] = useState(false);
+  const [authCompleted, setAuthCompleted] = useState(false);
   const showLoadingScreen = useLoadingScreenGate(accountScreenReady, { minimumVisibleMs: 1000 });
 
   useEffect(() => {
@@ -49,16 +51,11 @@ function AccountPageContent() {
       }
     };
     const validateStoredAccount = async () => {
-      const stored = readCommunityAuthSession();
-      if (!stored?.sessionToken) {
-        if (!cancelled) {
-          setCommunityAccount(null);
-        }
-        finishBootstrap();
-        return;
-      }
       try {
-        const account = await fetchCommunityAccount();
+        // Always probe the current tab's session token. Unverified logins keep
+        // their token without persisting account metadata, so /auth/me is the
+        // only authoritative way to restore their verification flow on reload.
+        const account = await restoreCommunityAccountFromSessionToken();
         if (!cancelled) {
           setCommunityAccount(account);
         }
@@ -88,10 +85,32 @@ function AccountPageContent() {
     };
   }, []);
 
+  const postAuthTarget = useMemo(() => {
+    if (returnTab === "settings") {
+      return "/?settings=account";
+    }
+    if (returnTab) {
+      return `/?tab=${returnTab}`;
+    }
+    return "/";
+  }, [returnTab]);
+
+  useEffect(() => {
+    if (requestedView === "billing") {
+      router.replace("/?settings=plan");
+      return;
+    }
+    if (communityAccount?.isVerified) {
+      router.replace(authCompleted ? postAuthTarget : "/?settings=account");
+    }
+  }, [authCompleted, communityAccount?.isVerified, postAuthTarget, requestedView, router]);
+
   const accountBaseTarget = returnTab ? `/account?return_tab=${returnTab}` : "/account";
   const backTarget = requestedView === "change-password" || requestedView === "delete-account"
     ? accountBaseTarget
-    : returnTab
+    : returnTab === "settings"
+      ? "/?settings=account"
+      : returnTab
       ? `/?tab=${returnTab}`
       : "/";
   const changePasswordTarget = returnTab
@@ -100,7 +119,7 @@ function AccountPageContent() {
   const deleteAccountTarget = returnTab
     ? `/account?view=delete-account&return_tab=${returnTab}`
     : "/account?view=delete-account";
-  const accountView = communityAccount ? requestedView : "default";
+  const accountView = communityAccount?.isVerified && requestedView !== "billing" ? requestedView : "default";
   const onBack = useCallback(() => {
     router.push(backTarget);
   }, [backTarget, router]);
@@ -110,8 +129,25 @@ function AccountPageContent() {
   const onOpenDeleteAccount = useCallback(() => {
     router.push(deleteAccountTarget);
   }, [deleteAccountTarget, router]);
+  const onAccountChange = useCallback((nextAccount: CommunityAccount | null) => {
+    setCommunityAccount(nextAccount);
+    if (nextAccount?.isVerified) {
+      setAuthCompleted(true);
+    }
+  }, []);
+  const onAuthModeChange = useCallback((mode: "login" | "register") => {
+    const nextQuery = new URLSearchParams();
+    if (mode === "register") {
+      nextQuery.set("mode", "register");
+    }
+    if (returnTab) {
+      nextQuery.set("return_tab", returnTab);
+    }
+    const query = nextQuery.toString();
+    router.replace(query ? `/account?${query}` : "/account");
+  }, [returnTab, router]);
 
-  if (showLoadingScreen) {
+  if (showLoadingScreen || requestedView === "billing" || communityAccount?.isVerified) {
     return <FullscreenLoadingScreen />;
   }
 
@@ -119,8 +155,10 @@ function AccountPageContent() {
     <CommunityAccountScreen
       account={communityAccount}
       view={accountView}
+      initialAuthMode={requestedAuthMode}
       onBack={onBack}
-      onAccountChange={setCommunityAccount}
+      onAccountChange={onAccountChange}
+      onAuthModeChange={onAuthModeChange}
       onOpenChangePassword={onOpenChangePassword}
       onOpenDeleteAccount={onOpenDeleteAccount}
     />

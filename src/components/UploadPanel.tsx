@@ -1,9 +1,10 @@
 "use client";
 
-import { type DragEvent, type FormEvent, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, type KeyboardEvent, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { BillingGateDialog, type BillingGateReason } from "@/components/BillingGateDialog";
+import { CustomSelect } from "@/components/CustomSelect";
 import {
   ingestUrl,
   isDailySearchLimitError,
@@ -13,9 +14,9 @@ import {
 } from "@/lib/api";
 import { safeStorageSetItem } from "@/lib/browserStorage";
 import { buildSearchFeedQuery } from "@/lib/feedQuery";
-import { type GenerationMode, type SearchInputMode, readStudyReelsSettings, subscribeToStudyReelsSettings } from "@/lib/settings";
-import { requestBillingStatusRefresh, useBillingStatus } from "@/lib/useBillingStatus";
-import { CURRENT_SELECTION_CONTRACT_VERSION, type CommunityAccount, type Reel } from "@/lib/types";
+import { type GenerationMode, readStudyReelsSettings } from "@/lib/settings";
+import { requestBillingStatusRefresh } from "@/lib/useBillingStatus";
+import { CURRENT_SELECTION_CONTRACT_VERSION, type BillingStatus, type CommunityAccount, type Reel } from "@/lib/types";
 
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
@@ -29,15 +30,95 @@ const INGEST_SENTINEL_MATERIAL_ID = "ingest-scratch";
 // generation job for an ingest-search/ingest-scratch sentinel material, which has
 // no independently searchable material record.
 const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
-type InputMode = SearchInputMode;
 type KnowledgeLevel = "beginner" | "intermediate" | "advanced";
+type HomeIdeaIconName =
+  | "fa-building"
+  | "fa-chart-bar"
+  | "fa-chess-knight"
+  | "fa-clipboard"
+  | "fa-clock"
+  | "fa-cloud"
+  | "fa-comments"
+  | "fa-compass"
+  | "fa-file-code"
+  | "fa-file-lines"
+  | "fa-flag"
+  | "fa-headphones"
+  | "fa-hospital"
+  | "fa-keyboard"
+  | "fa-lightbulb"
+  | "fa-map"
+  | "fa-money-bill-1"
+  | "fa-moon"
+  | "fa-newspaper"
+  | "fa-paper-plane"
+  | "fa-rectangle-list"
+  | "fa-star"
+  | "fa-sun";
 
-const INPUT_MODE_OPTIONS: Array<{ value: InputMode; label: string }> = [
-  { value: "topic", label: "Topic" },
-  { value: "source", label: "Text" },
-  { value: "file", label: "File Upload" },
-  { value: "url", label: "YouTube URL" },
+const HOME_IDEAS_PER_PAGE = 4;
+const HOME_IDEA_ROTATION_MS = 5 * 60 * 1_000;
+const HOME_IDEA_OFFSET_STORAGE_KEY = "studyreels-home-idea-offset";
+
+export const HOME_IDEAS: ReadonlyArray<{ title: string; icon: HomeIdeaIconName }> = [
+  { title: "Learn calculus basics", icon: "fa-chart-bar" },
+  { title: "How do black holes work?", icon: "fa-moon" },
+  { title: "Intro to Python", icon: "fa-file-code" },
+  { title: "The French Revolution", icon: "fa-flag" },
+  { title: "Understand supply and demand", icon: "fa-chart-bar" },
+  { title: "How does DNA store information?", icon: "fa-file-lines" },
+  { title: "Practice conversational Spanish", icon: "fa-comments" },
+  { title: "Explore the psychology of habits", icon: "fa-lightbulb" },
+  { title: "Explain quantum entanglement", icon: "fa-star" },
+  { title: "Learn SQL joins visually", icon: "fa-file-code" },
+  { title: "How do vaccines train immunity?", icon: "fa-hospital" },
+  { title: "Why did the Roman Empire fall?", icon: "fa-building" },
+  { title: "Master fractions step by step", icon: "fa-chart-bar" },
+  { title: "How does the internet work?", icon: "fa-compass" },
+  { title: "Learn to read a balance sheet", icon: "fa-newspaper" },
+  { title: "Introduction to music theory", icon: "fa-headphones" },
+  { title: "What drives climate change?", icon: "fa-cloud" },
+  { title: "Learn linear algebra basics", icon: "fa-rectangle-list" },
+  { title: "How do neural networks learn?", icon: "fa-lightbulb" },
+  { title: "What sparked the Industrial Revolution?", icon: "fa-clock" },
+  { title: "Practice probability with examples", icon: "fa-chart-bar" },
+  { title: "Why does gravity slow time?", icon: "fa-moon" },
+  { title: "Build a simple JavaScript app", icon: "fa-keyboard" },
+  { title: "Understand natural selection", icon: "fa-compass" },
+  { title: "Learn the scientific method", icon: "fa-clipboard" },
+  { title: "What causes inflation?", icon: "fa-money-bill-1" },
+  { title: "Explore ancient Egyptian history", icon: "fa-building" },
+  { title: "How does human memory work?", icon: "fa-lightbulb" },
+  { title: "Solve quadratic equations", icon: "fa-file-lines" },
+  { title: "Learn basic statistics", icon: "fa-chart-bar" },
+  { title: "How do airplanes stay in the air?", icon: "fa-paper-plane" },
+  { title: "Introduction to philosophy", icon: "fa-comments" },
+  { title: "How does photosynthesis work?", icon: "fa-sun" },
+  { title: "Learn the basics of chess strategy", icon: "fa-chess-knight" },
+  { title: "How do maps represent the world?", icon: "fa-map" },
+  { title: "What makes a star explode?", icon: "fa-star" },
 ];
+
+export function homeGreetingForHour(hour: number, username?: string | null): string {
+  const base = hour >= 5 && hour < 12
+    ? "Good morning"
+    : hour >= 12 && hour < 17
+      ? "Good afternoon"
+      : "Good evening";
+  const name = username?.trim();
+  return name ? `${base}, ${name}` : base;
+}
+
+function HomeIdeaIcon({ name }: { name: HomeIdeaIconName }) {
+  return (
+    <i
+      aria-hidden="true"
+      className={`fa-regular ${name} w-[18px] shrink-0 text-center text-[15px] font-normal leading-none`}
+    />
+  );
+}
+
+export type UnifiedComposerRoute = "file" | "url" | "source" | "topic";
 
 const KNOWLEDGE_LEVEL_OPTIONS: Array<{ value: KnowledgeLevel; label: string }> = [
   { value: "beginner", label: "Beginner" },
@@ -58,7 +139,7 @@ const YOUTUBE_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
  * Lightweight client-side sanity check so we don't POST every keystroke to the backend.
  * The backend still does the authoritative host check via the yt-dlp adapter.
  */
-function isLikelyIngestUrl(raw: string): boolean {
+export function isLikelyIngestUrl(raw: string): boolean {
   const trimmed = raw.trim();
   if (!trimmed) {
     return false;
@@ -90,6 +171,23 @@ function isLikelyIngestUrl(raw: string): boolean {
   } catch {
     return false;
   }
+}
+
+export function resolveUnifiedComposerRoute(params: {
+  attachment?: { name: string } | null;
+  prompt: string;
+}): UnifiedComposerRoute {
+  if (params.attachment) {
+    return "file";
+  }
+  const prompt = params.prompt.trim();
+  if (isLikelyIngestUrl(prompt)) {
+    return "url";
+  }
+  if (/[\r\n]/.test(params.prompt) || prompt.length > 80) {
+    return "source";
+  }
+  return "topic";
 }
 
 type MaterialSeed = {
@@ -193,6 +291,8 @@ function parseMaterialGroups(raw: string | null): Record<string, MaterialGroup> 
 type UploadPanelProps = {
   active?: boolean;
   account?: CommunityAccount | null;
+  billingStatus?: BillingStatus | null;
+  demoMode?: boolean;
   onMaterialCreated?: (params: {
     materialId: string;
     title: string;
@@ -300,54 +400,97 @@ function buildMaterialTitle(params: { topic: string; text: string; fileName: str
   return "New Study Session";
 }
 
-export function UploadPanel({ active = true, account, onMaterialCreated, onScrollOffsetChange, onScrollGesture, onScrollabilityChange, heroTitleRef }: UploadPanelProps) {
+export function UploadPanel({ active = true, account, billingStatus = null, demoMode = false, onMaterialCreated, onScrollOffsetChange, onScrollGesture, onScrollabilityChange, heroTitleRef }: UploadPanelProps) {
   const router = useRouter();
   const touchStartYRef = useRef<number | null>(null);
   const formRef = useRef<HTMLFormElement | null>(null);
-  const [topic, setTopic] = useState("");
-  const [text, setText] = useState("");
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const didRotateHomeIdeasOnMountRef = useRef(false);
+  const [prompt, setPrompt] = useState("");
   const [file, setFile] = useState<File | undefined>();
-  const [reelUrl, setReelUrl] = useState("");
-  const [inputMode, setInputMode] = useState<InputMode>("source");
   const [knowledgeLevel, setKnowledgeLevel] = useState<KnowledgeLevel>("beginner");
-  const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [billingGate, setBillingGate] = useState<{ reason: BillingGateReason; requiredSearches: number } | null>(null);
+  const [localHour, setLocalHour] = useState<number | null>(null);
+  const [homeIdeaOffset, setHomeIdeaOffset] = useState(0);
   const abortControllerRef = useRef<AbortController | null>(null);
-  const [generationMode, setGenerationMode] = useState<GenerationMode>("slow");
   const selectedFileName = file?.name ?? "";
   // The parent hydrates this account after mount. Avoid reading localStorage during
   // render, which would make the first browser render differ from the server HTML.
   const verifiedAccount = account?.isVerified ? account : null;
-  const { status: billingStatus } = useBillingStatus(verifiedAccount);
   const searchCost = 1;
-
-  useEffect(() => {
-    const saved = readStudyReelsSettings();
-    setGenerationMode(saved.generationMode);
-    setInputMode(saved.defaultInputMode);
-    return subscribeToStudyReelsSettings((next) => {
-      setGenerationMode(next.generationMode);
-      setInputMode(next.defaultInputMode);
+  const composerRoute = useMemo(
+    () => resolveUnifiedComposerRoute({ attachment: file, prompt }),
+    [file, prompt],
+  );
+  const visibleHomeIdeas = useMemo(
+    () => HOME_IDEAS.slice(homeIdeaOffset, homeIdeaOffset + HOME_IDEAS_PER_PAGE),
+    [homeIdeaOffset],
+  );
+  const advanceHomeIdeas = useCallback(() => {
+    setHomeIdeaOffset((offset) => {
+      const nextOffset = (offset + HOME_IDEAS_PER_PAGE) % HOME_IDEAS.length;
+      safeStorageSetItem(window.sessionStorage, HOME_IDEA_OFFSET_STORAGE_KEY, String(nextOffset));
+      return nextOffset;
     });
   }, []);
 
-  const disabled = useMemo(() => {
-    if (loading) {
-      return true;
+  const disabled = loading || (!file && !prompt.trim());
+
+  const resizeTextarea = useCallback(() => {
+    const element = textareaRef.current;
+    if (!element) {
+      return;
     }
-    if (inputMode === "topic") {
-      return !topic.trim();
+    element.style.height = "auto";
+    // Three 28px lines plus the textarea's vertical padding.
+    const nextHeight = Math.min(element.scrollHeight, 92);
+    element.style.height = `${Math.max(nextHeight, 72)}px`;
+    element.style.overflowY = element.scrollHeight > 92 ? "auto" : "hidden";
+  }, []);
+
+  useEffect(() => {
+    resizeTextarea();
+  }, [prompt, resizeTextarea]);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => setLocalHour(new Date().getHours()));
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
+  useEffect(() => {
+    if (didRotateHomeIdeasOnMountRef.current) {
+      return;
     }
-    if (inputMode === "source") {
-      return !text.trim();
+    didRotateHomeIdeasOnMountRef.current = true;
+    let previousOffset = 0;
+    try {
+      const storedOffset = Number(window.sessionStorage.getItem(HOME_IDEA_OFFSET_STORAGE_KEY));
+      if (
+        Number.isInteger(storedOffset)
+        && storedOffset >= 0
+        && storedOffset < HOME_IDEAS.length
+        && storedOffset % HOME_IDEAS_PER_PAGE === 0
+      ) {
+        previousOffset = storedOffset;
+      }
+    } catch {
+      // Storage can be unavailable in privacy-restricted browser contexts.
     }
-    if (inputMode === "url") {
-      return !isLikelyIngestUrl(reelUrl);
+    const refreshOffset = (previousOffset + HOME_IDEAS_PER_PAGE) % HOME_IDEAS.length;
+    setHomeIdeaOffset(refreshOffset);
+    safeStorageSetItem(window.sessionStorage, HOME_IDEA_OFFSET_STORAGE_KEY, String(refreshOffset));
+  }, []);
+
+  useEffect(() => {
+    if (!active || prompt.trim()) {
+      return;
     }
-    return !file;
-  }, [file, inputMode, loading, reelUrl, text, topic]);
+    const interval = window.setInterval(advanceHomeIdeas, HOME_IDEA_ROTATION_MS);
+    return () => window.clearInterval(interval);
+  }, [active, advanceHomeIdeas, prompt]);
 
   useEffect(() => {
     return () => {
@@ -375,7 +518,11 @@ export function UploadPanel({ active = true, account, onMaterialCreated, onScrol
 
   const onSubmit = useCallback(async (event: FormEvent) => {
     event.preventDefault();
-    if (!active) {
+    if (!active || loading || (!file && !prompt.trim())) {
+      return;
+    }
+    if (demoMode) {
+      router.push("/feed?demo=player&return_tab=search");
       return;
     }
     if (!verifiedAccount?.isVerified) {
@@ -402,8 +549,8 @@ export function UploadPanel({ active = true, account, onMaterialCreated, onScrol
       // URL ingest path diverges completely from the material-upload path: we call
       // /api/ingest/url instead of /api/material, then land on the feed scoped to
       // the `ingest-scratch` sentinel material so prior ingests form a scrollable feed.
-      if (inputMode === "url") {
-        const trimmed = reelUrl.trim();
+      if (composerRoute === "url") {
+        const trimmed = prompt.trim();
         const normalized = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
         const result = await ingestUrl({
           sourceUrl: normalized,
@@ -469,13 +616,14 @@ export function UploadPanel({ active = true, account, onMaterialCreated, onScrol
         });
         router.push(`/feed?${ingestFeedQuery}&active_reel_id=${encodeURIComponent(ingestedReel.reel_id)}`);
         requestBillingStatusRefresh();
-        setReelUrl("");
+        setPrompt("");
         return;
       }
 
-      const topicValue = inputMode === "topic" ? topic.trim() : "";
-      const textValue = inputMode === "source" ? text.trim() : "";
-      const fileValue = inputMode === "file" ? file : undefined;
+      const promptValue = prompt.trim();
+      const topicValue = composerRoute === "topic" ? promptValue : "";
+      const textValue = composerRoute === "source" || composerRoute === "file" ? promptValue : "";
+      const fileValue = composerRoute === "file" ? file : undefined;
       const title = buildMaterialTitle({
         topic: topicValue,
         text: textValue,
@@ -547,6 +695,8 @@ export function UploadPanel({ active = true, account, onMaterialCreated, onScrol
       });
       router.push(`/feed?${nextQuery}`);
       requestBillingStatusRefresh();
+      setPrompt("");
+      setFile(undefined);
     } catch (e) {
       if (isRequestInterruptedError(e) || (e instanceof DOMException && e.name === "AbortError")) {
         return;
@@ -567,16 +717,7 @@ export function UploadPanel({ active = true, account, onMaterialCreated, onScrol
         setLoading(false);
       }
     }
-  }, [active, billingStatus, file, inputMode, knowledgeLevel, onMaterialCreated, reelUrl, router, searchCost, text, topic, verifiedAccount]);
-
-  const onFileDrop = (event: DragEvent<HTMLLabelElement>) => {
-    event.preventDefault();
-    setIsDraggingFile(false);
-    const dropped = event.dataTransfer.files?.[0];
-    if (dropped) {
-      setFile(dropped);
-    }
-  };
+  }, [active, billingStatus, composerRoute, demoMode, file, knowledgeLevel, loading, onMaterialCreated, prompt, router, searchCost, verifiedAccount]);
 
   const reportScrollability = useCallback(() => {
     const element = formRef.current;
@@ -613,7 +754,37 @@ export function UploadPanel({ active = true, account, onMaterialCreated, onScrol
 
   useEffect(() => {
     reportScrollability();
-  }, [inputMode, reportScrollability, text, selectedFileName, error]);
+  }, [error, loading, prompt, reportScrollability, selectedFileName]);
+
+  const onPromptKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (
+      event.key !== "Enter"
+      || event.shiftKey
+      || event.nativeEvent.isComposing
+      || event.nativeEvent.keyCode === 229
+    ) {
+      return;
+    }
+    if (typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches) {
+      return;
+    }
+    event.preventDefault();
+    if (disabled) {
+      return;
+    }
+    formRef.current?.requestSubmit();
+  };
+
+  const compactStatus = loading
+    ? "Preparing your reels…"
+    : error
+      ? error
+      : !verifiedAccount?.isVerified
+        ? "Sign in with a verified account to search."
+        : billingStatus && billingStatus.remaining_searches <= Math.min(3, billingStatus.daily_limit)
+          ? `${billingStatus.remaining_searches} search${billingStatus.remaining_searches === 1 ? "" : "es"} left today.`
+          : null;
+  const showBottomSignInStatus = !loading && !error && !verifiedAccount?.isVerified;
 
   return (
     <form
@@ -651,214 +822,155 @@ export function UploadPanel({ active = true, account, onMaterialCreated, onScrol
         const isScrollable = event.currentTarget.scrollHeight - event.currentTarget.clientHeight > 1;
         onScrollOffsetChange?.(isScrollable && event.currentTarget.scrollTop > 0);
       }}
-      className="mx-auto flex h-full w-full flex-col justify-center overflow-x-visible overflow-y-auto px-6 py-6 md:overflow-x-visible md:overflow-y-hidden md:px-10 md:py-8 lg:max-w-[1040px] lg:px-5"
+      className="relative mx-auto flex h-full w-full max-w-[960px] flex-col items-center justify-center overflow-y-auto px-4 py-20 sm:px-8"
     >
-      <header className="relative mb-4 overflow-visible text-center">
-        <img
-          src="/logo.png"
-          alt="StudyReels logo"
-          className="relative z-20 mx-auto hidden h-4 w-[4.75rem] max-w-[26vw] translate-y-16 object-cover opacity-70 md:block"
-        />
-        <div className="mt-8 md:mt-20">
-          <h1
-            ref={heroTitleRef}
-            className="relative z-[1] inline-block overflow-visible px-[0.12em] py-[0.12em] text-[clamp(2.9rem,10.4vw,7.7rem)] font-black leading-[0.96] tracking-tight"
-          >
-            <span
-              aria-hidden="true"
-              className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 whitespace-nowrap px-[0.04em] py-[0.08em] text-white/30 blur-[12px] opacity-45"
-            >
-              Study Reels
-            </span>
-            <span className="relative whitespace-nowrap text-white/[0.56] [text-shadow:0_0_18px_rgba(255,255,255,0.08),0_0_44px_rgba(255,255,255,0.03)]">
-              Study Reels
-            </span>
-          </h1>
-          <p className="relative z-20 mt-5 text-sm text-white/68">Pick a mode, add your material, and start your short study feed.</p>
-        </div>
+      <header
+        className={`mb-8 text-center transition-opacity duration-[420ms] ease-in-out motion-reduce:transition-none sm:mb-10 ${
+          localHour === null ? "opacity-0" : "opacity-100"
+        }`}
+      >
+        <h1 ref={heroTitleRef} className="text-[clamp(1.65rem,5vw,2rem)] font-semibold tracking-[-0.035em] text-white">
+          {homeGreetingForHour(localHour ?? 12, account?.username)}
+        </h1>
+        <p className="mt-2 text-sm text-white/50 sm:text-[15px]">What can I help you learn today?</p>
       </header>
 
       <input
+        ref={fileInputRef}
         id="material-file"
-        className="sr-only"
+        className="hidden"
+        tabIndex={-1}
+        aria-hidden="true"
         type="file"
-        accept=".pdf,.docx,.txt"
-        onChange={(e) => setFile(e.target.files?.[0])}
+        accept=".pdf,.docx,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
+        onChange={(event) => {
+          setFile(event.target.files?.[0]);
+          setError(null);
+        }}
       />
 
-      <div className="relative z-20 mt-8 max-w-[300px] md:mt-2 md:max-w-[430px]">
-        <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Input Mode</p>
-        <div
-          role="tablist"
-          aria-label="Select input mode"
-          className="relative grid w-full grid-cols-4 rounded-2xl border border-white/15 bg-white/[0.08] p-1 backdrop-blur-[18px] backdrop-saturate-150"
-        >
-          <span
-            aria-hidden="true"
-            className="pointer-events-none absolute bottom-1 left-1 top-1 w-[calc((100%-8px)/4)] rounded-xl bg-white transition-transform duration-300 ease-out"
-            style={{
-              transform: `translateX(${INPUT_MODE_OPTIONS.findIndex((option) => option.value === inputMode) * 100}%)`,
+      <div className="w-full max-w-[680px]">
+        <div className="rounded-[28px] border-[0.5px] border-[#3a3a3a] bg-[#242424] px-3 py-3">
+          {file ? (
+            <div className="mb-2 flex px-1 pt-1">
+              <div className="flex min-w-0 max-w-full items-center gap-2 rounded-2xl bg-[#343434] py-2 pl-3 pr-2 text-sm text-white">
+                <i className="fa-regular fa-file-lines shrink-0 text-white/70" aria-hidden="true" />
+                <span className="max-w-[15rem] truncate sm:max-w-[26rem]">{selectedFileName}</span>
+                <button
+                  type="button"
+                  aria-label={`Remove ${selectedFileName}`}
+                  onClick={() => {
+                    setFile(undefined);
+                    if (fileInputRef.current) {
+                      fileInputRef.current.value = "";
+                    }
+                  }}
+                  className="grid h-7 w-7 shrink-0 place-items-center rounded-full text-white/65 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-white"
+                >
+                  <i className="fa-solid fa-xmark text-xs" aria-hidden="true" />
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          <label htmlFor="reelai-composer" className="sr-only">Ask ReelAI</label>
+          <textarea
+            ref={textareaRef}
+            id="reelai-composer"
+            rows={1}
+            value={prompt}
+            onChange={(event) => {
+              setPrompt(event.target.value);
+              setError(null);
             }}
+            onKeyDown={onPromptKeyDown}
+            placeholder={file ? "Add instructions (optional)" : "Ask ReelAI"}
+            aria-describedby={compactStatus ? "composer-status" : undefined}
+            className="block min-h-[72px] max-h-[92px] w-full resize-none overflow-y-hidden bg-transparent px-1 py-1 text-[17px] leading-7 text-white outline-none placeholder:text-white/45"
           />
-          {INPUT_MODE_OPTIONS.map((option) => (
+
+          <div className="mt-2 flex items-center gap-2">
             <button
-              key={option.value}
-              role="tab"
               type="button"
-              aria-selected={inputMode === option.value}
-              onClick={() => {
-                setInputMode(option.value);
-                setError(null);
-              }}
-              className={`relative z-10 rounded-xl px-1.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.05em] transition-colors md:px-2.5 md:py-2 md:text-[11px] ${
-                inputMode === option.value ? "text-black" : "text-white/80 hover:text-white"
-              }`}
+              aria-label="Attach a PDF, DOCX, or TXT file"
+              onClick={() => fileInputRef.current?.click()}
+              className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-white/80 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-white"
             >
-              {option.label}
+              <i className="fa-solid fa-plus" aria-hidden="true" />
+            </button>
+
+            <CustomSelect
+              name="knowledge-level"
+              label="Knowledge level"
+              value={knowledgeLevel}
+              options={KNOWLEDGE_LEVEL_OPTIONS}
+              onChange={setKnowledgeLevel}
+              className="w-fit min-w-0"
+              buttonClassName="h-9 max-w-[10.5rem] rounded-full bg-transparent px-3 text-xs font-medium text-white/70 hover:bg-white/[0.07] hover:text-white sm:text-sm"
+              menuClassName="w-[200%] max-w-[calc(100vw-5rem)]"
+              showSelectedCheck
+            />
+
+            <span className="min-w-0 flex-1" />
+            <button
+              type="submit"
+              disabled={disabled}
+              aria-label={loading ? "Starting search" : "Send"}
+              className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-white text-black transition-opacity duration-300 motion-reduce:transition-none hover:bg-white/90 disabled:cursor-not-allowed disabled:bg-white/20 disabled:text-white/35 disabled:opacity-70 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+            >
+              <i className={`fa-solid ${loading ? "fa-spinner fa-spin" : "fa-arrow-up"}`} aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+
+        {compactStatus && !showBottomSignInStatus ? (
+          <div className="px-2 pt-2">
+            <p
+              id="composer-status"
+              role={error ? "alert" : "status"}
+              className={`text-xs ${error ? "text-red-300" : "text-white/50"}`}
+            >
+              {compactStatus}
+              {billingStatus
+                && verifiedAccount?.isVerified
+                && billingStatus.remaining_searches <= Math.min(3, billingStatus.daily_limit)
+                ? <> <span>Uses 1 search</span></>
+                : null}
+            </p>
+          </div>
+        ) : null}
+
+        <div
+          data-home-suggestions="true"
+          data-home-suggestion-offset={homeIdeaOffset}
+          className="mt-1 space-y-0"
+        >
+          {visibleHomeIdeas.map((idea) => (
+            <button
+              key={idea.title}
+              type="button"
+              onClick={() => {
+                setPrompt(idea.title);
+                setError(null);
+                window.requestAnimationFrame(() => textareaRef.current?.focus());
+              }}
+              className="flex min-h-11 w-full items-center gap-3.5 rounded-xl px-3 py-2 text-left text-[13px] text-white/60 transition-colors hover:bg-white/[0.07] hover:text-white/85 motion-reduce:transition-none sm:text-[14px]"
+            >
+              <HomeIdeaIcon name={idea.icon} />
+              <span>{idea.title}</span>
             </button>
           ))}
         </div>
       </div>
-
-      <div className="relative z-20 mt-6 h-[160px] min-h-[160px] md:mt-4 md:h-[175px] md:min-h-[175px]">
-        {inputMode === "topic" ? (
-          <>
-            <label htmlFor="material-topic" className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Topic</label>
-            <div className="w-full rounded-2xl border border-white/15 bg-white/[0.08] backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 focus-within:bg-white/[0.12]">
-              <input
-                id="material-topic"
-                className="h-12 w-full rounded-2xl border-0 bg-transparent px-4 text-sm text-white outline-none placeholder:text-white/40"
-                placeholder="e.g. linear regression"
-                value={topic}
-                onChange={(event) => setTopic(event.target.value)}
-              />
-            </div>
-          </>
-        ) : null}
-
-        {inputMode === "source" ? (
-          <>
-            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Text</label>
-            <div className="h-full rounded-2xl border border-white/15 bg-white/[0.08] backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 focus-within:bg-white/[0.12]">
-              <textarea
-                className="h-full min-h-[160px] w-full resize-none overflow-y-auto rounded-2xl border-0 bg-transparent p-5 text-sm leading-relaxed text-white outline-none placeholder:text-white/40 md:min-h-[175px]"
-                placeholder="Paste notes, textbook text, or any material here..."
-                value={text}
-                onChange={(e) => setText(e.target.value)}
-              />
-            </div>
-          </>
-        ) : null}
-
-        {inputMode === "file" ? (
-          <>
-            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">File Upload</label>
-            <label
-              htmlFor="material-file"
-              onDragOver={(event) => {
-                event.preventDefault();
-                setIsDraggingFile(true);
-              }}
-              onDragLeave={() => setIsDraggingFile(false)}
-              onDrop={onFileDrop}
-              className={`flex h-full min-h-[160px] w-full cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed bg-white/[0.08] p-6 text-center text-white outline-none backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 md:min-h-[175px] ${
-                isDraggingFile ? "border-white/30 bg-white/[0.12]" : "border-white/15"
-              }`}
-            >
-              <span className="grid h-12 w-12 place-items-center rounded-full border border-white/15 bg-white/[0.08] text-white/85 backdrop-blur-[18px] backdrop-saturate-150">
-                <i className="fa-solid fa-arrow-up-from-bracket text-base" aria-hidden="true" />
-              </span>
-              <p className={`mt-4 max-w-[90%] truncate text-sm font-semibold ${selectedFileName ? "text-white" : "text-white/85"}`}>
-                {selectedFileName || "Drag and drop your file here"}
-              </p>
-              <p className="mt-1 text-xs text-white/58">{selectedFileName ? "Click to replace file" : "Or click to browse (PDF, DOCX, TXT)"}</p>
-            </label>
-          </>
-        ) : null}
-
-        {inputMode === "url" ? (
-          <>
-            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">YouTube URL</label>
-            <div className="h-full flex flex-col gap-3">
-              <div className="rounded-2xl border border-white/15 bg-white/[0.08] backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 focus-within:bg-white/[0.12]">
-                <input
-                  type="url"
-                  inputMode="url"
-                  autoComplete="off"
-                  autoCapitalize="off"
-                  spellCheck={false}
-                  className="h-12 w-full rounded-2xl border-0 bg-transparent px-4 text-sm text-white outline-none placeholder:text-white/40"
-                  placeholder="Paste a YouTube video, playlist, or channel URL"
-                  value={reelUrl}
-                  onChange={(e) => setReelUrl(e.target.value)}
-                />
-              </div>
-              <p className="px-1 text-[11px] leading-snug text-white/55">
-                Uses hosted timestamped transcript cues to extract clips without downloading media or running local Whisper. Public YouTube sources only.
-              </p>
-            </div>
-          </>
-        ) : null}
-      </div>
-
-      <div className="relative z-20 mt-6 shrink-0 flex flex-col gap-2 md:mt-6">
-        <div className="flex min-h-5 flex-wrap items-center justify-between gap-x-3 gap-y-1 text-[11px] font-medium text-white/58">
-          <span>
-            {!verifiedAccount?.isVerified
-              ? "Sign in with a verified account to search"
-              : billingStatus
-                ? `${billingStatus.remaining_searches} of ${billingStatus.daily_limit} searches left today`
-                : "Daily usage is checked when you start"}
-          </span>
-          <span>Uses 1 search</span>
-        </div>
-        <p className="min-h-5 text-sm text-white/80">{error ?? ""}</p>
-        <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
-          {inputMode !== "url" ? (
-            <fieldset className="w-full md:w-[19rem]">
-              <legend className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-white/70">
-                Knowledge Level
-              </legend>
-              <div
-                className="grid grid-cols-3 rounded-2xl border border-white/15 bg-white/[0.08] p-1 backdrop-blur-[18px] backdrop-saturate-150"
-              >
-                {KNOWLEDGE_LEVEL_OPTIONS.map((option) => {
-                  const selected = option.value === knowledgeLevel;
-                  return (
-                    <label
-                      key={option.value}
-                      className={`cursor-pointer rounded-xl px-2 py-2 text-center text-[10px] font-semibold uppercase tracking-[0.04em] transition-colors focus-within:ring-2 focus-within:ring-white/70 md:text-[11px] ${
-                        selected
-                          ? "bg-white text-black shadow-[0_4px_18px_rgba(255,255,255,0.12)]"
-                          : "text-white/72 hover:bg-white/[0.07] hover:text-white"
-                      }`}
-                    >
-                      <input
-                        className="sr-only"
-                        type="radio"
-                        name="knowledge-level"
-                        value={option.value}
-                        checked={selected}
-                        onChange={() => setKnowledgeLevel(option.value)}
-                      />
-                      {option.label}
-                    </label>
-                  );
-                })}
-              </div>
-            </fieldset>
-          ) : null}
-          <button
-            type="submit"
-            disabled={disabled}
-            className="inline-flex w-full items-center justify-center rounded-2xl border border-white/30 bg-white px-7 py-3 text-sm font-bold text-black transition-colors hover:bg-white/92 disabled:cursor-not-allowed disabled:opacity-60 md:w-[12rem]"
-          >
-            <span className="inline-flex w-[9.5rem] items-center justify-center text-center">
-              {loading ? "Starting..." : "Start Learning"}
-            </span>
-          </button>
-        </div>
-      </div>
+      {showBottomSignInStatus ? (
+        <p
+          id="composer-status"
+          role="status"
+          className="absolute bottom-[calc(max(env(safe-area-inset-bottom),0px)+18px)] left-1/2 w-[calc(100%-2rem)] -translate-x-1/2 text-center text-xs text-white/45"
+        >
+          Sign in with a verified account to search.
+        </p>
+      ) : null}
       {billingGate ? (
         <BillingGateDialog
           reason={billingGate.reason}

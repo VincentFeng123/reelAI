@@ -15,20 +15,27 @@ import {
   verifyCommunitySignupEmail,
 } from "@/lib/api";
 import { BillingPlanUsageCard } from "@/components/BillingPlanUsageCard";
+import { FadePresence } from "@/components/FadePresence";
 import { ViewportModalPortal } from "@/components/ViewportModalPortal";
 import type { CommunityAccount } from "@/lib/types";
 
 type CommunityAccountScreenProps = {
   account: CommunityAccount | null;
   view: "default" | "change-password" | "delete-account";
+  initialAuthMode?: "login" | "register";
   onBack: () => void;
   onAccountChange: (account: CommunityAccount | null) => void;
+  onAuthModeChange?: (mode: "login" | "register") => void;
   onOpenChangePassword: () => void;
   onOpenDeleteAccount: () => void;
 };
 
-const AUTH_MODE_FADE_MS = 160;
+const AUTH_MODE_FADE_MS = 420;
 const VERIFICATION_CODE_LENGTH = 6;
+
+function getAuthModeFadeMs(): number {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : AUTH_MODE_FADE_MS;
+}
 
 function normalizeSignupEmailForComparison(value: string): string {
   return value.trim().toLowerCase();
@@ -37,12 +44,14 @@ function normalizeSignupEmailForComparison(value: string): string {
 export function CommunityAccountScreen({
   account,
   view,
+  initialAuthMode = "login",
   onBack,
   onAccountChange,
+  onAuthModeChange,
   onOpenChangePassword,
   onOpenDeleteAccount,
 }: CommunityAccountScreenProps) {
-  const [authMode, setAuthMode] = useState<"register" | "login">("login");
+  const [authMode, setAuthMode] = useState<"register" | "login">(initialAuthMode);
   const [displayView, setDisplayView] = useState<"default" | "change-password" | "delete-account">(view);
   const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
@@ -63,6 +72,12 @@ export function CommunityAccountScreen({
   const [authContentVisible, setAuthContentVisible] = useState(true);
   const [authModeTransitioning, setAuthModeTransitioning] = useState(false);
   const authModeTransitionTimerRef = useRef<number | null>(null);
+  const authModeTransitionFrameRef = useRef<number | null>(null);
+  const pendingAuthModeFocusRef = useRef<"register" | "login" | null>(null);
+  const authModeFirstFieldRefs = useRef<Record<"register" | "login", HTMLInputElement | null>>({
+    login: null,
+    register: null,
+  });
   const [showChangeEmail, setShowChangeEmail] = useState(false);
   const [changeEmailValue, setChangeEmailValue] = useState("");
   const [changeEmailPassword, setChangeEmailPassword] = useState("");
@@ -76,6 +91,25 @@ export function CommunityAccountScreen({
   const [deleteAccountError, setDeleteAccountError] = useState<string | null>(null);
   const authSubmitInFlightRef = useRef(false);
   const verificationDigitInputRefs = useRef<Array<HTMLInputElement | null>>([]);
+  const verificationDialogRef = useRef<HTMLDivElement | null>(null);
+  const verificationReturnFocusRef = useRef<HTMLElement | null>(null);
+
+  const openVerificationModal = useCallback(() => {
+    verificationReturnFocusRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    setIsVerificationModalOpen(true);
+  }, []);
+
+  const restoreVerificationFocus = useCallback(() => {
+    const returnFocus = verificationReturnFocusRef.current;
+    verificationReturnFocusRef.current = null;
+    window.requestAnimationFrame(() => {
+      if (returnFocus?.isConnected) {
+        returnFocus.focus();
+      }
+    });
+  }, []);
 
   const closeVerificationModal = useCallback(() => {
     if (verificationBusy) {
@@ -85,22 +119,57 @@ export function CommunityAccountScreen({
     if (!account) {
       setVerificationFlow(null);
     }
-  }, [account, verificationBusy]);
+    restoreVerificationFocus();
+  }, [account, restoreVerificationFocus, verificationBusy]);
+
+  useEffect(() => {
+    setAuthMode(initialAuthMode);
+  }, [initialAuthMode]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && isVerificationModalOpen && !verificationBusy) {
+      if (event.key === "Tab" && isVerificationModalOpen) {
+        const dialog = verificationDialogRef.current;
+        if (!dialog) {
+          return;
+        }
+        const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(
+          "a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])",
+        ));
+        if (focusable.length === 0) {
+          event.preventDefault();
+          dialog.focus();
+          return;
+        }
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        const activeElement = document.activeElement;
+        if (event.shiftKey && (activeElement === first || !dialog.contains(activeElement))) {
+          event.preventDefault();
+          last.focus();
+          return;
+        }
+        if (!event.shiftKey && (activeElement === last || !dialog.contains(activeElement))) {
+          event.preventDefault();
+          first.focus();
+        }
+        return;
+      }
+      if (event.key === "Escape" && isVerificationModalOpen) {
         event.preventDefault();
-        closeVerificationModal();
+        event.stopPropagation();
+        if (!verificationBusy) {
+          closeVerificationModal();
+        }
         return;
       }
       if (event.key === "Escape" && !busy && !sendVerificationBusy && !verificationBusy && !resendBusy && !changeEmailBusy && !deleteAccountBusy) {
         onBack();
       }
     };
-    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keydown", onKeyDown, true);
     return () => {
-      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keydown", onKeyDown, true);
     };
   }, [busy, changeEmailBusy, closeVerificationModal, deleteAccountBusy, isVerificationModalOpen, onBack, resendBusy, sendVerificationBusy, verificationBusy]);
 
@@ -140,8 +209,19 @@ export function CommunityAccountScreen({
       if (authModeTransitionTimerRef.current !== null) {
         window.clearTimeout(authModeTransitionTimerRef.current);
       }
+      if (authModeTransitionFrameRef.current !== null) {
+        window.cancelAnimationFrame(authModeTransitionFrameRef.current);
+      }
     };
   }, []);
+
+  useEffect(() => {
+    if (authModeTransitioning || pendingAuthModeFocusRef.current !== authMode) {
+      return;
+    }
+    pendingAuthModeFocusRef.current = null;
+    authModeFirstFieldRefs.current[authMode]?.focus();
+  }, [authMode, authModeTransitioning]);
 
   useEffect(() => {
     if (verificationFlow === "account" && (!account || account.isVerified)) {
@@ -184,18 +264,35 @@ export function CommunityAccountScreen({
     if (authModeTransitionTimerRef.current !== null) {
       window.clearTimeout(authModeTransitionTimerRef.current);
     }
+    if (authModeTransitionFrameRef.current !== null) {
+      window.cancelAnimationFrame(authModeTransitionFrameRef.current);
+    }
     setAuthModeTransitioning(true);
     setAuthContentVisible(false);
+    const fadeMs = getAuthModeFadeMs();
     authModeTransitionTimerRef.current = window.setTimeout(() => {
       setDisplayView(view);
-      window.requestAnimationFrame(() => {
+      const revealContent = () => {
         setAuthContentVisible(true);
+        authModeTransitionFrameRef.current = null;
+        if (fadeMs === 0) {
+          setAuthModeTransitioning(false);
+          authModeTransitionTimerRef.current = null;
+          return;
+        }
         authModeTransitionTimerRef.current = window.setTimeout(() => {
           setAuthModeTransitioning(false);
           authModeTransitionTimerRef.current = null;
-        }, AUTH_MODE_FADE_MS);
+        }, fadeMs);
+      };
+      if (fadeMs === 0) {
+        revealContent();
+        return;
+      }
+      authModeTransitionFrameRef.current = window.requestAnimationFrame(() => {
+        authModeTransitionFrameRef.current = window.requestAnimationFrame(revealContent);
       });
-    }, AUTH_MODE_FADE_MS);
+    }, fadeMs);
   }, [displayView, view]);
 
   const submitCommunityAuth = useCallback(async () => {
@@ -237,7 +334,7 @@ export function CommunityAccountScreen({
         const targetEmail = session.account.email ?? (authMode === "register" ? trimmedEmail : "");
         setPendingVerificationEmail(targetEmail || null);
         setVerificationFlow("account");
-        setIsVerificationModalOpen(true);
+        openVerificationModal();
         setSuccess(
           targetEmail
             ? null
@@ -261,7 +358,7 @@ export function CommunityAccountScreen({
       authSubmitInFlightRef.current = false;
       setBusy(false);
     }
-  }, [authMode, busy, email, onAccountChange, password, sendVerificationBusy, username, verifiedSignupEmail]);
+  }, [authMode, busy, email, onAccountChange, openVerificationModal, password, sendVerificationBusy, username, verifiedSignupEmail]);
 
   const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -297,7 +394,7 @@ export function CommunityAccountScreen({
       } else {
         setVerifiedSignupEmail(null);
         setVerificationFlow("signup");
-        setIsVerificationModalOpen(true);
+        openVerificationModal();
         setSuccess(null);
       }
     } catch (submitError) {
@@ -445,6 +542,7 @@ export function CommunityAccountScreen({
         setPendingVerificationEmail(result.email);
         setVerificationFlow(null);
         setIsVerificationModalOpen(false);
+        restoreVerificationFocus();
         setSuccess("Email verified. Click Create Account to continue.");
         return;
       }
@@ -455,6 +553,7 @@ export function CommunityAccountScreen({
       setPendingVerificationEmail(null);
       setVerificationFlow(null);
       setIsVerificationModalOpen(false);
+      restoreVerificationFocus();
       if (result.claimedLegacySets > 0) {
         setSuccess(`Account verified and linked ${result.claimedLegacySets} existing set${result.claimedLegacySets === 1 ? "" : "s"} from this device.`);
       } else {
@@ -482,7 +581,7 @@ export function CommunityAccountScreen({
       setVerificationCode("");
       setPendingVerificationEmail(result.account.email ?? null);
       setVerificationFlow("account");
-      setIsVerificationModalOpen(true);
+      openVerificationModal();
       setSuccess(
         result.account.email
           ? `Sent a new verification code to ${result.account.email}.`
@@ -522,7 +621,7 @@ export function CommunityAccountScreen({
       setPendingVerificationEmail(result.account.email ?? null);
       setShowChangeEmail(false);
       setVerificationFlow("account");
-      setIsVerificationModalOpen(true);
+      openVerificationModal();
       setSuccess(
         result.account.email
           ? `Verification email updated. Enter the code sent to ${result.account.email}.`
@@ -536,13 +635,15 @@ export function CommunityAccountScreen({
     }
   };
 
-  const isRegister = authMode === "register";
   const switchAuthMode = useCallback((nextMode: "register" | "login") => {
     if (nextMode === authMode || authModeTransitioning) {
       return;
     }
     if (authModeTransitionTimerRef.current !== null) {
       window.clearTimeout(authModeTransitionTimerRef.current);
+    }
+    if (authModeTransitionFrameRef.current !== null) {
+      window.cancelAnimationFrame(authModeTransitionFrameRef.current);
     }
     setPassword("");
     setError(null);
@@ -557,19 +658,20 @@ export function CommunityAccountScreen({
     setShowChangeEmail(false);
     setChangeEmailPassword("");
     authSubmitInFlightRef.current = false;
-    setAuthModeTransitioning(true);
-    setAuthContentVisible(false);
+    const fadeMs = getAuthModeFadeMs();
+    pendingAuthModeFocusRef.current = nextMode;
+    setAuthModeTransitioning(fadeMs > 0);
+    setAuthMode(nextMode);
+    onAuthModeChange?.(nextMode);
+    if (fadeMs === 0) {
+      authModeTransitionTimerRef.current = null;
+      return;
+    }
     authModeTransitionTimerRef.current = window.setTimeout(() => {
-      setAuthMode(nextMode);
-      window.requestAnimationFrame(() => {
-        setAuthContentVisible(true);
-        authModeTransitionTimerRef.current = window.setTimeout(() => {
-          setAuthModeTransitioning(false);
-          authModeTransitionTimerRef.current = null;
-        }, AUTH_MODE_FADE_MS);
-      });
-    }, AUTH_MODE_FADE_MS);
-  }, [authMode, authModeTransitioning]);
+      setAuthModeTransitioning(false);
+      authModeTransitionTimerRef.current = null;
+    }, fadeMs);
+  }, [authMode, authModeTransitioning, onAuthModeChange]);
 
   const verificationDigits = Array.from({ length: VERIFICATION_CODE_LENGTH }, (_, index) => verificationCode[index] ?? "");
 
@@ -630,49 +732,36 @@ export function CommunityAccountScreen({
   const backLabel = displayView === "default" ? "Back to ReelAI" : "Back to Account Manager";
 
   return (
-    <main className="fixed inset-0 h-[100dvh] w-screen overflow-hidden bg-black text-black">
-      <div className="absolute inset-0">
-        <img
-          src="/images/community/80543.jpg"
-          alt=""
-          aria-hidden="true"
-          className="h-full w-full scale-[1.04] rotate-180 object-cover opacity-[0.14]"
-        />
-        <div className="absolute inset-0 bg-black/46" />
-      </div>
-
-      <div className="fixed left-0 top-0 z-20 px-4 pb-2 pt-[calc(env(safe-area-inset-top)+1rem)] sm:px-6 lg:hidden">
+    <main className="fixed inset-0 h-[100dvh] w-screen overflow-y-auto bg-black text-white">
+      <div
+        data-top-chrome="account-back"
+        aria-hidden={isVerificationModalOpen}
+        inert={isVerificationModalOpen}
+        className="top-nav-fade fixed inset-x-0 top-0 z-20 px-4 pb-2 pt-[calc(env(safe-area-inset-top)+1rem)] sm:px-6"
+      >
         <button
           type="button"
           onClick={onBack}
-          className="inline-flex items-center gap-2 rounded-full px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-white transition-colors hover:bg-white/10"
+          className="inline-flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-medium text-white/72 transition-colors hover:bg-white/[0.07] hover:text-white"
         >
           <i className="fa-solid fa-arrow-left text-[10px]" aria-hidden="true" />
           {backLabel}
         </button>
       </div>
-
-      <div className="relative z-10 h-full w-full lg:flex lg:items-center lg:justify-center lg:px-10 lg:py-8">
-        <div className="h-full w-full lg:h-auto lg:max-w-[1080px] xl:max-w-[1120px]">
-          <div className="h-full overflow-hidden bg-white/[0.07] backdrop-blur-[18px] backdrop-saturate-150 lg:h-auto lg:rounded-[32px] lg:shadow-[0_32px_140px_rgba(10,5,20,0.38)]">
-            <div className="grid h-full w-full lg:h-[min(82dvh,680px)] lg:grid-cols-[minmax(0,0.94fr)_minmax(320px,0.96fr)]">
-            <section className="order-2 flex min-h-full bg-transparent px-6 pb-8 pt-24 sm:px-10 sm:pt-28 lg:order-1 lg:px-12 lg:py-10 xl:px-14 xl:py-12">
-              <div className="mx-auto flex h-full w-full max-w-[360px] flex-col">
-                <div className="shrink-0">
-                  <button
-                    type="button"
-                    onClick={onBack}
-                    className="hidden items-center gap-2 rounded-full px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-white transition-colors hover:bg-white/10 lg:inline-flex"
-                  >
-                    <i className="fa-solid fa-arrow-left text-[10px]" aria-hidden="true" />
-                    {backLabel}
-                  </button>
-                </div>
+      <div
+        aria-hidden={isVerificationModalOpen}
+        inert={isVerificationModalOpen}
+        className="relative z-10 flex min-h-full w-full items-center justify-center px-5 py-24 sm:px-8"
+      >
+        <section className="flex w-full max-w-[380px] flex-col bg-transparent">
+          <p aria-label="ReelAI" className="mb-10 text-center text-[28px] font-semibold tracking-[-0.04em] text-white">
+            ReelAI
+          </p>
 
                 {account ? (
                   displayView === "change-password" ? (
                     <div
-                      className={`flex flex-1 flex-col justify-center pb-6 transition-opacity duration-150 lg:pb-0 ${
+                      className={`flex flex-1 flex-col justify-center pb-6 transition-opacity duration-[420ms] ease-in-out motion-reduce:transition-none lg:pb-0 ${
                         authContentVisible ? "opacity-100" : "pointer-events-none opacity-0"
                       }`}
                     >
@@ -683,7 +772,7 @@ export function CommunityAccountScreen({
                         Enter your old password and choose a new one for this account.
                       </p>
 
-                      <div className="mt-7 rounded-[24px] bg-black/22 px-5 py-5 shadow-[0_16px_40px_rgba(16,16,16,0.16)] backdrop-blur-[16px]">
+                      <div className="mt-7 rounded-[24px] bg-[#202020] px-5 py-5">
                         <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-white">Active Session</p>
                         <p className="mt-3 text-2xl font-semibold tracking-[-0.03em] text-white">@{account.username}</p>
                         {account.email ? <p className="mt-2 text-sm text-white">{account.email}</p> : null}
@@ -696,7 +785,7 @@ export function CommunityAccountScreen({
                           onChange={(event) => setCurrentPassword(event.target.value)}
                           autoComplete="current-password"
                           placeholder="Old password"
-                          className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
+                          className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100"
                         />
                         <input
                           type="password"
@@ -704,14 +793,14 @@ export function CommunityAccountScreen({
                           onChange={(event) => setNewPassword(event.target.value)}
                           autoComplete="new-password"
                           placeholder="New password"
-                          className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
+                          className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100"
                         />
                         {changePasswordError ? <p className="text-sm text-[#ffb4b4]">{changePasswordError}</p> : null}
                         {changePasswordSuccess ? <p className="text-sm text-[#9ef8cb]">{changePasswordSuccess}</p> : null}
                         <button
                           type="submit"
                           disabled={changePasswordBusy}
-                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
+                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition-colors hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
                         >
                           {changePasswordBusy ? "Changing..." : "Change Password"}
                         </button>
@@ -719,7 +808,7 @@ export function CommunityAccountScreen({
                     </div>
                   ) : displayView === "delete-account" ? (
                     <div
-                      className={`flex flex-1 flex-col justify-center pb-6 transition-opacity duration-150 lg:pb-0 ${
+                      className={`flex flex-1 flex-col justify-center pb-6 transition-opacity duration-[420ms] ease-in-out motion-reduce:transition-none lg:pb-0 ${
                         authContentVisible ? "opacity-100" : "pointer-events-none opacity-0"
                       }`}
                     >
@@ -730,7 +819,7 @@ export function CommunityAccountScreen({
                         Permanently delete this account, its signed-in sessions, saved history, settings, and your sets.
                       </p>
 
-                      <div className="mt-7 rounded-[24px] bg-black/22 px-5 py-5 shadow-[0_16px_40px_rgba(16,16,16,0.16)] backdrop-blur-[16px]">
+                      <div className="mt-7 rounded-[24px] bg-[#202020] px-5 py-5">
                         <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-white">Active Session</p>
                         <p className="mt-3 text-2xl font-semibold tracking-[-0.03em] text-white">@{account.username}</p>
                         {account.email ? <p className="mt-2 text-sm text-white">{account.email}</p> : null}
@@ -749,7 +838,7 @@ export function CommunityAccountScreen({
                           onChange={(event) => setDeleteAccountPassword(event.target.value)}
                           autoComplete="current-password"
                           placeholder="Current password"
-                          className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
+                          className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100"
                         />
                         {deleteAccountError ? <p className="text-sm text-[#ffb4b4]">{deleteAccountError}</p> : null}
                         <button
@@ -763,7 +852,7 @@ export function CommunityAccountScreen({
                     </div>
                   ) : account.isVerified ? (
                     <div
-                      className={`flex flex-1 flex-col justify-start overflow-y-auto py-4 transition-opacity duration-150 lg:py-2 ${
+                      className={`flex flex-1 flex-col justify-start overflow-y-auto py-4 transition-opacity duration-300 motion-reduce:transition-none lg:py-2 ${
                         authContentVisible ? "opacity-100" : "pointer-events-none opacity-0"
                       }`}
                     >
@@ -774,7 +863,7 @@ export function CommunityAccountScreen({
                         This account can open and manage your sets from any device that signs in with the same username and password.
                       </p>
 
-                      <div className="mt-7 rounded-[24px] bg-black/22 px-5 py-5 shadow-[0_16px_40px_rgba(16,16,16,0.16)] backdrop-blur-[16px]">
+                      <div className="mt-7 rounded-[24px] bg-[#202020] px-5 py-5">
                         <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-white">Active Session</p>
                         <p className="mt-3 text-2xl font-semibold tracking-[-0.03em] text-white">@{account.username}</p>
                         {account.email ? <p className="mt-2 text-sm text-white">{account.email}</p> : null}
@@ -790,7 +879,7 @@ export function CommunityAccountScreen({
                           type="button"
                           onClick={onOpenChangePassword}
                           disabled={busy || deleteAccountBusy}
-                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
+                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition-colors hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
                         >
                           Change Password
                         </button>
@@ -798,7 +887,7 @@ export function CommunityAccountScreen({
                           type="button"
                           onClick={onSignOut}
                           disabled={busy || deleteAccountBusy}
-                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
+                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition-colors hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
                         >
                           {busy ? "Signing out..." : "Sign Out"}
                         </button>
@@ -814,7 +903,7 @@ export function CommunityAccountScreen({
                     </div>
                   ) : (
                     <div
-                      className={`flex flex-1 flex-col justify-center pb-6 transition-opacity duration-150 lg:pb-0 ${
+                      className={`flex flex-1 flex-col justify-center pb-6 transition-opacity duration-[420ms] ease-in-out motion-reduce:transition-none lg:pb-0 ${
                         authContentVisible ? "opacity-100" : "pointer-events-none opacity-0"
                       }`}
                     >
@@ -825,7 +914,7 @@ export function CommunityAccountScreen({
                         Confirm the email attached to this account before you can open or edit Your Sets.
                       </p>
 
-                      <div className="mt-7 rounded-[24px] bg-black/22 px-5 py-5 shadow-[0_16px_40px_rgba(16,16,16,0.16)] backdrop-blur-[16px]">
+                      <div className="mt-7 rounded-[24px] bg-[#202020] px-5 py-5">
                         <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-white">Pending Verification</p>
                         <p className="mt-3 text-2xl font-semibold tracking-[-0.03em] text-white">@{account.username}</p>
                         {account.email ? <p className="mt-2 text-sm text-white">{account.email}</p> : null}
@@ -841,7 +930,7 @@ export function CommunityAccountScreen({
                           inputMode="numeric"
                           autoComplete="one-time-code"
                           placeholder="Verification code"
-                          className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
+                          className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100"
                         />
                         {verificationCodeDebug ? (
                           <p className="text-sm text-[#f6d38b]">Local debug code: {verificationCodeDebug}</p>
@@ -851,7 +940,7 @@ export function CommunityAccountScreen({
                         <button
                           type="submit"
                           disabled={verificationBusy}
-                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
+                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition-colors hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
                         >
                           {verificationBusy ? "Verifying..." : "Verify Account"}
                         </button>
@@ -862,7 +951,7 @@ export function CommunityAccountScreen({
                           type="button"
                           onClick={onResendVerification}
                           disabled={resendBusy || changeEmailBusy}
-                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
+                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition-colors hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
                         >
                           {resendBusy ? "Sending..." : "Resend Code"}
                         </button>
@@ -876,7 +965,7 @@ export function CommunityAccountScreen({
                             setSuccess(null);
                           }}
                           disabled={changeEmailBusy || resendBusy}
-                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
+                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition-colors hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
                         >
                           {showChangeEmail ? "Cancel Email Change" : "Change Email"}
                         </button>
@@ -888,7 +977,7 @@ export function CommunityAccountScreen({
                               onChange={(event) => setChangeEmailValue(event.target.value)}
                               autoComplete="email"
                               placeholder="New email"
-                              className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
+                              className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100"
                             />
                             <input
                               type="password"
@@ -896,12 +985,12 @@ export function CommunityAccountScreen({
                               onChange={(event) => setChangeEmailPassword(event.target.value)}
                               autoComplete="current-password"
                               placeholder="Current password"
-                              className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
+                              className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100"
                             />
                             <button
                               type="submit"
                               disabled={changeEmailBusy}
-                              className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
+                              className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition-colors hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
                             >
                               {changeEmailBusy ? "Updating..." : "Update Email"}
                             </button>
@@ -911,7 +1000,7 @@ export function CommunityAccountScreen({
                           type="button"
                           onClick={onSignOut}
                           disabled={busy || verificationBusy || resendBusy || changeEmailBusy}
-                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
+                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition-colors hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
                         >
                           {busy ? "Signing out..." : "Sign Out"}
                         </button>
@@ -919,144 +1008,134 @@ export function CommunityAccountScreen({
                     </div>
                   )
                 ) : (
-                  <div
-                    className={`flex flex-1 flex-col justify-center pb-6 transition-opacity duration-150 lg:pb-0 ${
-                      authContentVisible ? "opacity-100" : "pointer-events-none opacity-0"
-                    }`}
-                  >
-                    <h1 className="text-[2.3rem] font-semibold leading-[1.05] tracking-[-0.05em] text-white sm:text-[2.8rem]">
-                      {isRegister ? "Create account" : "Login"}
-                    </h1>
-                    <p className="mt-3 text-sm leading-6 text-white">
-                      {isRegister
-                        ? "Create credentials for your private cross-device reel library."
-                        : "Enter your credentials to get in."}
-                    </p>
+                  <div className="grid w-full">
+                    {(["login", "register"] as const).map((mode) => {
+                      const isActiveMode = authMode === mode;
+                      const isRegister = mode === "register";
+                      return (
+                        <div
+                          key={mode}
+                          data-auth-mode={mode}
+                          aria-hidden={!isActiveMode}
+                          inert={!isActiveMode || authModeTransitioning}
+                          className={`col-start-1 row-start-1 flex flex-col justify-center pb-6 transition-opacity duration-[420ms] ease-in-out [will-change:opacity] motion-reduce:transition-none lg:pb-0 ${
+                            isActiveMode ? (authModeTransitioning ? "pointer-events-none opacity-100" : "opacity-100") : "pointer-events-none opacity-0"
+                          }`}
+                        >
+                          <h1 className="text-center text-[2rem] font-semibold leading-tight tracking-[-0.04em] text-white sm:text-[2.2rem]">
+                            {isRegister ? "Create your account" : "Welcome back"}
+                          </h1>
+                          <p className="mt-3 text-center text-sm leading-6 text-white/55">
+                            {isRegister
+                              ? "Sign up to save searches and build your reel library."
+                              : "Sign in to continue to ReelAI."}
+                          </p>
 
-                    <form onSubmit={onSubmit} className="mt-5 flex flex-col gap-4">
-                      <label className="block">
-                        <span className="mb-1.5 block text-sm font-medium text-white">Username</span>
-                        <input
-                          value={username}
-                          onChange={(event) => setUsername(event.target.value)}
-                          autoComplete="username"
-                          placeholder="Username"
-                          className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
-                        />
-                      </label>
-                      {isRegister ? (
-                        <label className="block">
-                          <span className="mb-1.5 block text-sm font-medium text-white">Email</span>
-                          <div className="relative">
-                            <input
-                              type="email"
-                              value={email}
-                              onChange={onSignupEmailChange}
-                              autoComplete="email"
-                              placeholder="you@example.com"
-                              className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 pr-[5.75rem] text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
-                            />
+                          <form onSubmit={onSubmit} className="mt-8 flex flex-col gap-4">
+                            <label className="block">
+                              <span className="mb-1.5 block text-sm font-medium text-white">Username</span>
+                              <input
+                                ref={(node) => {
+                                  authModeFirstFieldRefs.current[mode] = node;
+                                }}
+                                value={username}
+                                onChange={(event) => setUsername(event.target.value)}
+                                autoComplete="username"
+                                placeholder="Username"
+                                className="community-auth-input h-12 w-full rounded-[10px] bg-[#202020] px-4 text-sm text-white outline-none placeholder:text-white/35 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+                              />
+                            </label>
+                            {isRegister ? (
+                              <label className="block">
+                                <span className="mb-1.5 block text-sm font-medium text-white">Email</span>
+                                <div className="relative">
+                                  <input
+                                    type="email"
+                                    value={email}
+                                    onChange={onSignupEmailChange}
+                                    autoComplete="email"
+                                    placeholder="you@example.com"
+                                    className="community-auth-input h-12 w-full rounded-[10px] bg-[#202020] px-4 pr-[5.75rem] text-sm text-white outline-none placeholder:text-white/35 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      void onSendVerificationEmail();
+                                    }}
+                                    disabled={busy || sendVerificationBusy || !email.trim()}
+                                    className="absolute right-1.5 top-1/2 inline-flex h-9 -translate-y-1/2 items-center justify-center rounded-lg bg-black px-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-white transition-colors duration-300 enabled:hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:bg-black/35 disabled:text-white/40 disabled:transition-none"
+                                  >
+                                    Send
+                                  </button>
+                                </div>
+                              </label>
+                            ) : null}
+                            <label className="block">
+                              <span className="mb-1.5 block text-sm font-medium text-white">Password</span>
+                              <input
+                                type="password"
+                                value={password}
+                                onChange={(event) => setPassword(event.target.value)}
+                                autoComplete={isRegister ? "new-password" : "current-password"}
+                                placeholder={isRegister ? "At least 8 characters" : "Enter your password"}
+                                className="community-auth-input h-12 w-full rounded-[10px] bg-[#202020] px-4 text-sm text-white outline-none placeholder:text-white/35 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+                              />
+                            </label>
+                            <div className="space-y-2">
+                              {error ? <p className="text-sm text-[#ffb4b4]">{error}</p> : null}
+                              {success ? <p className="text-sm text-[#9ef8cb]">{success}</p> : null}
+                            </div>
+                            <button
+                              type="submit"
+                              disabled={busy || sendVerificationBusy}
+                              className="inline-flex h-12 w-full items-center justify-center rounded-[10px] bg-white px-5 text-sm font-semibold text-black transition-colors duration-300 hover:bg-white/90 disabled:cursor-not-allowed disabled:bg-white/20 disabled:text-white/35"
+                            >
+                              {busy
+                                ? isRegister
+                                  ? "Creating account..."
+                                  : "Signing in..."
+                                : isRegister
+                                  ? "Create Account"
+                                  : "Login"}
+                            </button>
+                          </form>
+
+                          <div className="mt-7 text-center text-sm text-white/55">
+                            {isRegister ? "Already have an account?" : "Need an account?"}
+                            {" "}
                             <button
                               type="button"
-                              onClick={() => {
-                                void onSendVerificationEmail();
-                              }}
-                              disabled={busy || sendVerificationBusy || !email.trim()}
-                              className="absolute right-1.5 top-1/2 inline-flex h-9 -translate-y-1/2 items-center justify-center rounded-[10px] bg-black px-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-white transition-colors duration-150 enabled:hover:bg-[#181818] disabled:cursor-not-allowed disabled:bg-black/35 disabled:text-white/40 disabled:transition-none"
+                              onClick={() => switchAuthMode(isRegister ? "login" : "register")}
+                              disabled={authModeTransitioning}
+                              className="ml-1 px-1 py-1 font-semibold text-white transition-opacity hover:opacity-70 disabled:cursor-not-allowed disabled:opacity-45"
                             >
-                              Send
+                              {isRegister ? "Sign in" : "Create one"}
                             </button>
                           </div>
-                        </label>
-                      ) : null}
-                      <label className="block">
-                        <span className="mb-1.5 block text-sm font-medium text-white">Password</span>
-                        <input
-                          type="password"
-                          value={password}
-                          onChange={(event) => setPassword(event.target.value)}
-                          autoComplete={isRegister ? "new-password" : "current-password"}
-                          placeholder={isRegister ? "At least 8 characters" : "Enter your password"}
-                          className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
-                        />
-                      </label>
-                      <div className="space-y-2">
-                        {error ? <p className="text-sm text-[#ffb4b4]">{error}</p> : null}
-                        {success ? <p className="text-sm text-[#9ef8cb]">{success}</p> : null}
-                      </div>
-                      <button
-                        type="submit"
-                        disabled={busy || sendVerificationBusy}
-                        className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45"
-                      >
-                        {busy
-                          ? isRegister
-                            ? "Creating account..."
-                            : "Signing in..."
-                          : isRegister
-                            ? "Create Account"
-                            : "Login"}
-                      </button>
-                    </form>
-
-                    <div className="mt-7 text-center text-sm text-white">
-                      {isRegister ? "Already have an account?" : "Need an account?"}
-                      {" "}
-                      <button
-                        type="button"
-                        onClick={() => switchAuthMode(isRegister ? "login" : "register")}
-                        disabled={authModeTransitioning}
-                        className="font-semibold text-white transition hover:text-white"
-                      >
-                        {isRegister ? "Sign in" : "Create one"}
-                      </button>
-                    </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
-              </div>
-            </section>
-
-            <section className="relative hidden bg-transparent lg:order-2 lg:block lg:h-full lg:p-5">
-              <div className="relative h-full min-h-[260px] overflow-hidden rounded-[28px] bg-[#170f24] sm:min-h-[320px]">
-                <img
-                  src="/images/community/80543.jpg"
-                  alt=""
-                  aria-hidden="true"
-                  className="absolute inset-0 h-full w-full object-cover"
-                />
-                <div className="absolute inset-0 bg-[linear-gradient(180deg,rgba(18,9,28,0.08)_0%,rgba(18,9,28,0.2)_38%,rgba(18,9,28,0.72)_100%)]" />
-                <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_center,rgba(255,142,208,0.18),transparent_28%),radial-gradient(circle_at_bottom_left,rgba(106,98,255,0.22),transparent_34%)]" />
-
-                <div className="absolute right-4 top-4 z-10 grid h-11 w-11 place-items-center rounded-full bg-black text-sm font-semibold tracking-[-0.04em] text-white shadow-[0_12px_28px_rgba(0,0,0,0.32)]">
-                  R.
-                </div>
-
-                <div className="absolute inset-x-0 bottom-0 z-10 px-6 pb-12 pt-24 sm:px-8 sm:pb-14">
-                  <p className="max-w-[16rem] text-[2rem] font-medium leading-[1.05] tracking-[-0.05em] text-white sm:text-[2.45rem]">
-                    {account ? "Your reel sets stay with you." : "Your reel sets, everywhere you sign in."}
-                  </p>
-                  <p className="mt-4 max-w-[22rem] text-sm leading-6 text-white">
-                    Private by default, synced by account, and ready from any device that uses the same login.
-                  </p>
-                </div>
-              </div>
-            </section>
-          </div>
-        </div>
-        </div>
+        </section>
       </div>
-      {isVerificationModalOpen ? (
+      <FadePresence show={isVerificationModalOpen}>
+        {(modalVisible) => isVerificationModalOpen ? (
         <ViewportModalPortal>
           <div
-            className="fixed inset-0 z-[140] flex items-center justify-center bg-black/72 px-4 py-6 backdrop-blur-[4px]"
+            className={`fixed inset-0 z-[170] flex items-center justify-center bg-black/80 px-4 py-6 transition-opacity duration-300 motion-reduce:transition-none ${
+              modalVisible ? "opacity-100" : "opacity-0"
+            }`}
             role="presentation"
             onClick={closeVerificationModal}
-          >
+            >
             <div
+              ref={verificationDialogRef}
               role="dialog"
               aria-modal="true"
               aria-label="Verify account"
-              className="w-full max-w-md rounded-[28px] bg-[#111111] p-5 text-white shadow-[0_28px_90px_rgba(0,0,0,0.52)] sm:p-6"
+              tabIndex={-1}
+              className="w-full max-w-md rounded-[14px] bg-[#202020] p-5 text-white sm:p-6"
               onClick={(event) => event.stopPropagation()}
             >
               <div className="flex items-center justify-between gap-3">
@@ -1064,7 +1143,7 @@ export function CommunityAccountScreen({
                   type="button"
                   onClick={closeVerificationModal}
                   disabled={verificationBusy}
-                  className="inline-flex items-center gap-2 rounded-full px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-white/72 transition hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  className="inline-flex items-center gap-2 rounded-full px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-white/72 transition-colors hover:bg-white/[0.07] hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <i className="fa-solid fa-arrow-left text-[10px]" aria-hidden="true" />
                   Return
@@ -1105,7 +1184,7 @@ export function CommunityAccountScreen({
                 <button
                   type="submit"
                   disabled={verificationBusy || verificationCode.trim().length !== VERIFICATION_CODE_LENGTH}
-                  className="mt-5 inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
+                  className="mt-5 inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition-colors hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
                 >
                   {verificationBusy ? "Verifying..." : verificationFlow === "signup" ? "Verify Email" : "Verify"}
                 </button>
@@ -1113,7 +1192,8 @@ export function CommunityAccountScreen({
             </div>
           </div>
         </ViewportModalPortal>
-      ) : null}
+        ) : null}
+      </FadePresence>
     </main>
   );
 }

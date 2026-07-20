@@ -5,8 +5,8 @@ import "@fortawesome/fontawesome-free/css/all.min.css";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "StudyReels",
-  description: "Learn from your own material through short video reels.",
+  title: "ReelAI",
+  description: "Turn your own material into short learning reels.",
 };
 
 export const viewport: Viewport = {

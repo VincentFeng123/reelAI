@@ -4,6 +4,7 @@ import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { BillingGateDialog, type BillingGateReason } from "@/components/BillingGateDialog";
+import { FadePresence } from "@/components/FadePresence";
 import { FullscreenLoadingScreen } from "@/components/FullscreenLoadingScreen";
 import { RecallCheck, type RecallAnswerReveal } from "@/components/RecallCheck";
 import { ReelCard } from "@/components/ReelCard";
@@ -41,6 +42,12 @@ import {
 } from "@/lib/historyStorage";
 import { useLoadingScreenGate } from "@/lib/useLoadingScreenGate";
 import { requestBillingStatusRefresh } from "@/lib/useBillingStatus";
+import {
+  LOCAL_DEMO_ASSESSMENT_ANSWERS,
+  LOCAL_DEMO_ASSESSMENT_SESSION,
+  LOCAL_DEMO_REELS,
+  isLocalDemoView,
+} from "@/lib/localDemo";
 import {
   type GenerationMode,
   type PreferredVideoDuration,
@@ -87,13 +94,10 @@ function shouldRefillReadyBuffer(reelCount: number, activeIndex: number): boolea
 const REEL_SNAP_DURATION_MS = 300;
 const POST_SNAP_COOLDOWN_MS = 30;
 const WHEEL_GESTURE_RELEASE_MS = 220;
-const WHEEL_DELTA_THRESHOLD = 110;
+const WHEEL_DELTA_THRESHOLD = 12;
 const TOUCH_GESTURE_COOLDOWN_MS = 30;
 const RIGHT_PANEL_MIN_PX = 300;
 const LEFT_PANEL_MIN_PX = 380;
-const RIGHT_SPLIT_BAR_PX = 14;
-const RIGHT_TOP_MIN_PX = 220;
-const RIGHT_BOTTOM_MIN_PX = 180;
 const MOBILE_DETAILS_CLOSE_MS = 240;
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
@@ -112,8 +116,24 @@ const COMMUNITY_SET_FEED_HANDOFF_PREFIX = "studyreels-community-feed-handoff-";
 const DESCRIPTION_PREVIEW_CHAR_LIMIT = 180;
 const FEED_PLAYBACK_RATE_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as const;
 type FeedbackAction = "helpful" | "confusing" | "save";
+type DesktopPanel = "info" | "chat";
 type FeedRecoveryPhase = "idle" | "fetching-page" | "generating";
 type KnowledgeLevel = "beginner" | "intermediate" | "advanced";
+
+type FeedItem =
+  | { kind: "reel"; key: string; reel: Reel; reelIndex: number }
+  | { kind: "recall-check"; key: string; reelIndex: number };
+
+function buildFeedItems(reels: Reel[], assessmentAnchorIndex: number | null): FeedItem[] {
+  const items: FeedItem[] = [];
+  reels.forEach((reel, reelIndex) => {
+    items.push({ kind: "reel", key: `reel:${reel.reel_id}`, reel, reelIndex });
+    if (assessmentAnchorIndex === reelIndex) {
+      items.push({ kind: "recall-check", key: `recall-check:${reel.reel_id}`, reelIndex });
+    }
+  });
+  return items;
+}
 
 type FeedTuningSettings = {
   minRelevance: number;
@@ -288,7 +308,7 @@ function GenerationStageStatus({
     return (
       <div role="status" aria-live="polite" className="w-full">
         <div className="relative h-1 overflow-hidden rounded-full bg-white/10">
-          <div className="animate-progress-shimmer absolute inset-y-0 w-1/3 bg-gradient-to-r from-transparent via-white/60 to-transparent" />
+          <div className="animate-progress-shimmer absolute inset-0 bg-white/15" />
         </div>
         <p className="mt-3 text-sm font-semibold">{label}</p>
         <p className="mt-1 text-xs text-white/72">Verified clips appear here as soon as they are ready.</p>
@@ -298,7 +318,7 @@ function GenerationStageStatus({
   return (
     <div className="pointer-events-none absolute inset-x-0 top-0 z-[9998]" role="status" aria-live="polite">
       <div className="relative h-1 overflow-hidden bg-white/10">
-        <div className="animate-progress-shimmer absolute inset-y-0 w-1/3 bg-gradient-to-r from-transparent via-white/60 to-transparent" />
+        <div className="animate-progress-shimmer absolute inset-0 bg-white/15" />
       </div>
       <div className="flex justify-center py-1.5">
         <span className="rounded-full bg-black/56 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-white/80 backdrop-blur-sm">
@@ -1012,6 +1032,9 @@ function FeedPageInner() {
   const router = useRouter();
   const feedRouteKey = params.toString();
   const materialId = params.get("material_id") || "";
+  const demoQuizEnabled = isLocalDemoView(params.get("demo"), "quiz");
+  const demoPlayerEnabled = isLocalDemoView(params.get("demo"), "player") || demoQuizEnabled;
+  const demoAccountReturnEnabled = isLocalDemoView(params.get("return_demo"), "account");
   // Ingest-only sentinel materials have reels persisted by /api/ingest/search or
   // /api/ingest/url and primed into the feed session snapshot in
   // `UploadPanel.primeFeedSessionSnapshot`. They do not have an independently
@@ -1083,8 +1106,9 @@ function FeedPageInner() {
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
-  const [chatPanelOpen, setChatPanelOpen] = useState(true);
+  const [desktopPanel, setDesktopPanel] = useState<DesktopPanel | null>(null);
   const [assessmentSession, setAssessmentSession] = useState<AssessmentSession | null>(null);
+  const [assessmentSlideActive, setAssessmentSlideActive] = useState(false);
   const [assessmentQuestionIndex, setAssessmentQuestionIndex] = useState(0);
   const [assessmentAnswerReveal, setAssessmentAnswerReveal] = useState<RecallAnswerReveal | null>(null);
   const [assessmentAnswering, setAssessmentAnswering] = useState(false);
@@ -1096,7 +1120,6 @@ function FeedPageInner() {
   const [assessmentGatePending, setAssessmentGatePending] = useState(false);
   const [assessmentAdvanceAfterClose, setAssessmentAdvanceAfterClose] = useState(false);
   const [rightPanelWidthPx, setRightPanelWidthPx] = useState(360);
-  const [rightTopRatio, setRightTopRatio] = useState(0.62);
   const [generationMode, setGenerationMode] = useState<GenerationMode>("slow");
   const [knowledgeLevel, setKnowledgeLevel] = useState<string | null>(null);
   const [sessionHydrated, setSessionHydrated] = useState(false);
@@ -1126,8 +1149,7 @@ function FeedPageInner() {
   const touchStartYRef = useRef<number | null>(null);
   const bootstrapAttemptedRef = useRef(false);
   const desktopShellRef = useRef<HTMLDivElement | null>(null);
-  const rightColumnRef = useRef<HTMLDivElement | null>(null);
-  const dragModeRef = useRef<"lr" | "tb" | null>(null);
+  const dragModeRef = useRef<"lr" | null>(null);
   const pendingResumeRef = useRef<FeedProgressEntry | null>(null);
   const resumeAppliedRef = useRef(false);
   const resumeLoadingRef = useRef(false);
@@ -2698,14 +2720,20 @@ function FeedPageInner() {
       knowledgeLevelByMaterialRef.current.clear();
       adaptiveExcludeReelIdsRef.current = [];
       hydratedMaterialIdRef.current = null;
-      setSessionHydrated(false);
+      setSessionHydrated(demoPlayerEnabled);
       pendingResumeRef.current = null;
       resumeAppliedRef.current = false;
       resumeLoadingRef.current = false;
-      let communityRows = communityPreviewReel ? [communityPreviewReel] : [];
-      let preferredCommunityReelId = communityPreviewReel?.reel_id || "";
+      let communityRows = demoPlayerEnabled
+        ? LOCAL_DEMO_REELS
+        : communityPreviewReel
+          ? [communityPreviewReel]
+          : [];
+      let preferredCommunityReelId = demoPlayerEnabled
+        ? LOCAL_DEMO_REELS[0]?.reel_id || ""
+        : communityPreviewReel?.reel_id || "";
       let handoffMissing = false;
-      if (typeof window !== "undefined" && communityHandoffIdParam) {
+      if (!demoPlayerEnabled && typeof window !== "undefined" && communityHandoffIdParam) {
         const storageKey = `${COMMUNITY_SET_FEED_HANDOFF_PREFIX}${communityHandoffIdParam}`;
         const handoffPayload = parseCommunityFeedHandoff(window.sessionStorage.getItem(storageKey));
         if (handoffPayload) {
@@ -2749,7 +2777,7 @@ function FeedPageInner() {
       setMobileDetailsOpen(false);
       setBootstrappingFirstReels(false);
       setGeneratingMore(false);
-      setKnowledgeLevel(null);
+      setKnowledgeLevel(demoPlayerEnabled ? "beginner" : null);
       bootstrapAttemptedRef.current = false;
       pendingAutoplayAdvanceRef.current = false;
       setPendingTailAdvance(false);
@@ -2907,7 +2935,7 @@ function FeedPageInner() {
     } else {
       void loadPage(1, { autofill: true });
     }
-  }, [clearBillingWorkBlock, communityHandoffIdParam, communityPreviewReel, generationModeParam, isSearchScopeActive, loadPage, materialId, mergeSessionReels, settingsScopeReady, setVisibleFeedError, updateSessionReels]);
+  }, [clearBillingWorkBlock, communityHandoffIdParam, communityPreviewReel, demoPlayerEnabled, generationModeParam, isSearchScopeActive, loadPage, materialId, mergeSessionReels, settingsScopeReady, setVisibleFeedError, updateSessionReels]);
 
   useEffect(() => {
     if (!materialId || sessionHydrated || loading) {
@@ -2921,6 +2949,7 @@ function FeedPageInner() {
     reportedForwardScrollKeysRef.current.clear();
     assessmentStartRequestRef.current = null;
     setAssessmentSession(null);
+    setAssessmentSlideActive(false);
     setAssessmentQuestionIndex(0);
     setAssessmentAnswerReveal(null);
     setAssessmentAnswering(false);
@@ -2934,6 +2963,31 @@ function FeedPageInner() {
   }, [feedRouteKey, materialId]);
 
   useEffect(() => {
+    if (!demoQuizEnabled) {
+      return;
+    }
+    setAssessmentSession({
+      ...LOCAL_DEMO_ASSESSMENT_SESSION,
+      questions: LOCAL_DEMO_ASSESSMENT_SESSION.questions.map((question) => ({
+        ...question,
+        options: [...question.options],
+      })),
+      understood_concepts: [],
+      revisit_concepts: [],
+    });
+    setAssessmentSlideActive(false);
+    setAssessmentQuestionIndex(0);
+    setAssessmentAnswerReveal(null);
+    setAssessmentResultsVisible(false);
+    setAssessmentError(null);
+    setAssessmentBootstrapPending(false);
+  }, [demoQuizEnabled, feedRouteKey]);
+
+  useEffect(() => {
+    if (demoQuizEnabled) {
+      setAssessmentBootstrapPending(false);
+      return;
+    }
     if (!materialId) {
       setAssessmentBootstrapPending(false);
       return;
@@ -2974,6 +3028,7 @@ function FeedPageInner() {
           ) {
             const nextSession = withAssessmentAccuracy(pendingSession, assessmentResponse);
             setAssessmentSession(nextSession);
+            setAssessmentSlideActive(false);
             setAssessmentQuestionIndex(clamp(nextSession.current_index, 0, nextSession.questions.length - 1));
             setAssessmentAnswerReveal(null);
             setAssessmentResultsVisible(false);
@@ -2995,7 +3050,7 @@ function FeedPageInner() {
     return () => {
       cancelled = true;
     };
-  }, [getFeedMaterialIds, isSearchScopeActive, materialId, sessionHydrated, settingsScopeReady]);
+  }, [demoQuizEnabled, getFeedMaterialIds, isSearchScopeActive, materialId, sessionHydrated, settingsScopeReady]);
 
   const refreshFeedInventory = useCallback(async () => {
     const feedMaterialIds = getFeedMaterialIds();
@@ -3361,6 +3416,7 @@ function FeedPageInner() {
         const nextSession = withAssessmentAccuracy(response.session, response);
         decision = "assessment";
         setAssessmentSession(nextSession);
+        setAssessmentSlideActive(assessmentRequest.advanceRequested);
         setAssessmentQuestionIndex(clamp(nextSession.current_index, 0, nextSession.questions.length - 1));
         setAssessmentAnswerReveal(null);
         setAssessmentResultsVisible(nextSession.answered_count >= nextSession.question_count);
@@ -3396,10 +3452,16 @@ function FeedPageInner() {
       if (direction <= 0 || reels.length === 0) {
         return false;
       }
+      if (assessmentSession && !assessmentSlideActive) {
+        return false;
+      }
       if (activeIndexRef.current < reels.length - 1) {
         return false;
       }
-      reportForwardScrollForReel(reelsRef.current[activeIndexRef.current]);
+      const gateRequest = reportForwardScrollForReel(reelsRef.current[activeIndexRef.current]);
+      if (gateRequest) {
+        gateRequest.advanceRequested = true;
+      }
       const canWaitForMore = hasMore
         || canRequestMore
         || isGeneratingRef.current
@@ -3417,7 +3479,7 @@ function FeedPageInner() {
       wheelAccumRef.current = 0;
       return true;
     },
-    [canRequestMore, hasMore, maybeLoadMore, reels.length, reportForwardScrollForReel],
+    [assessmentSession, assessmentSlideActive, canRequestMore, hasMore, maybeLoadMore, reels.length, reportForwardScrollForReel],
   );
 
   const maybeResumeProgress = useCallback(() => {
@@ -3560,12 +3622,14 @@ function FeedPageInner() {
     }, MOBILE_DETAILS_CLOSE_MS);
   }, [abortActiveChat, mobileDetailsClosing, mobileDetailsOpen]);
 
-  const closeActiveChat = useCallback(() => {
-    abortActiveChat();
-    setChatLoading(false);
-    setChatError(null);
-    setChatPanelOpen(false);
-  }, [abortActiveChat]);
+  const toggleDesktopPanel = useCallback((panel: DesktopPanel) => {
+    if (desktopPanel === "chat") {
+      abortActiveChat();
+      setChatLoading(false);
+      setChatError(null);
+    }
+    setDesktopPanel((current) => (current === panel ? null : panel));
+  }, [abortActiveChat, desktopPanel]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !materialId || !sessionHydrated) {
@@ -3631,34 +3695,18 @@ function FeedPageInner() {
   useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
       const mode = dragModeRef.current;
-      if (!mode) {
+      if (mode !== "lr") {
         return;
       }
 
-      if (mode === "lr") {
-        const shell = desktopShellRef.current;
-        if (!shell) {
-          return;
-        }
-        const rect = shell.getBoundingClientRect();
-        const pointerX = event.clientX - rect.left;
-        const nextRight = clamp(rect.width - pointerX, RIGHT_PANEL_MIN_PX, rect.width - LEFT_PANEL_MIN_PX);
-        setRightPanelWidthPx(nextRight);
+      const shell = desktopShellRef.current;
+      if (!shell) {
         return;
       }
-
-      const rightCol = rightColumnRef.current;
-      if (!rightCol) {
-        return;
-      }
-      const rect = rightCol.getBoundingClientRect();
-      const available = rect.height - RIGHT_SPLIT_BAR_PX;
-      if (available <= RIGHT_TOP_MIN_PX + RIGHT_BOTTOM_MIN_PX) {
-        return;
-      }
-      const pointerY = event.clientY - rect.top;
-      const topPx = clamp(pointerY, RIGHT_TOP_MIN_PX, available - RIGHT_BOTTOM_MIN_PX);
-      setRightTopRatio(topPx / available);
+      const rect = shell.getBoundingClientRect();
+      const pointerX = event.clientX - rect.left;
+      const nextRight = clamp(rect.width - pointerX, RIGHT_PANEL_MIN_PX, rect.width - LEFT_PANEL_MIN_PX);
+      setRightPanelWidthPx(nextRight);
     };
 
     const onPointerUp = () => {
@@ -3683,16 +3731,6 @@ function FeedPageInner() {
     dragModeRef.current = "lr";
     document.body.style.userSelect = "none";
     document.body.style.cursor = "col-resize";
-  }, []);
-
-  const onStartTopBottomResize = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
-    if (event.button !== 0) {
-      return;
-    }
-    event.preventDefault();
-    dragModeRef.current = "tb";
-    document.body.style.userSelect = "none";
-    document.body.style.cursor = "row-resize";
   }, []);
 
   useEffect(() => {
@@ -3753,10 +3791,18 @@ function FeedPageInner() {
 
   const jumpOneReel = useCallback(
     (direction: 1 | -1) => {
-      if (
-        assessmentBootstrapPending
-        || assessmentSession
-      ) {
+      if (assessmentBootstrapPending) {
+        return;
+      }
+      if (assessmentSession) {
+        if (direction > 0 && !assessmentSlideActive) {
+          beginSnapTransitionLock();
+          setAssessmentAdvanceAfterClose(activeIndexRef.current < reelsRef.current.length - 1);
+          setAssessmentSlideActive(true);
+        } else if (direction < 0 && assessmentSlideActive) {
+          beginSnapTransitionLock();
+          setAssessmentSlideActive(false);
+        }
         return;
       }
       if (direction < 0) {
@@ -3808,6 +3854,8 @@ function FeedPageInner() {
       assessmentBootstrapPending,
       assessmentGatePending,
       assessmentSession,
+      assessmentSlideActive,
+      beginSnapTransitionLock,
       commitOneReelMove,
       isSearchScopeActive,
       maybeLoadMore,
@@ -3995,8 +4043,37 @@ function FeedPageInner() {
     [isControlTarget, jumpOneReel, reels.length, shouldBlockDownwardAtEnd],
   );
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (
+        isControlTarget(target)
+        || target instanceof HTMLInputElement
+        || target instanceof HTMLTextAreaElement
+        || target instanceof HTMLSelectElement
+        || (target instanceof HTMLElement && target.isContentEditable)
+      ) {
+        return;
+      }
+      if (event.key === "ArrowDown" || event.key === "PageDown") {
+        event.preventDefault();
+        jumpOneReel(1);
+      } else if (event.key === "ArrowUp" || event.key === "PageUp") {
+        event.preventDefault();
+        jumpOneReel(-1);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isControlTarget, jumpOneReel]);
+
   const activeReel = reels[activeIndex] ?? null;
-  const assessmentPlaybackBlocked = assessmentBootstrapPending || assessmentGatePending || Boolean(assessmentSession);
+  const feedItems = useMemo(
+    () => buildFeedItems(reels, assessmentSession ? activeIndex : null),
+    [activeIndex, assessmentSession, reels],
+  );
+  const activeFeedPageIndex = activeIndex + (assessmentSession && assessmentSlideActive ? 1 : 0);
+  const assessmentPlaybackBlocked = assessmentBootstrapPending || assessmentGatePending || assessmentSlideActive;
   const [descriptionExpanded, setDescriptionExpanded] = useState(false);
   const [descriptionHydrating, setDescriptionHydrating] = useState(false);
   const atEndOfVisibleReels = reels.length > 0 && activeIndex >= reels.length - 1;
@@ -4109,6 +4186,18 @@ function FeedPageInner() {
     setChatByReel((prev) => ({ ...prev, [activeReel.reel_id]: nextHistory }));
     setChatInput("");
 
+    if (demoPlayerEnabled || demoAccountReturnEnabled) {
+      const demoReply = activeReel.ai_summary
+        || `This demo reel focuses on ${activeReel.concept_title}.`;
+      setChatByReel((prev) => ({
+        ...prev,
+        [reelId]: [...nextHistory, { role: "assistant", content: demoReply }],
+      }));
+      chatAbortControllerRef.current = null;
+      setChatLoading(false);
+      return;
+    }
+
     try {
       const contextText = [
         activeReel.video_description,
@@ -4156,7 +4245,7 @@ function FeedPageInner() {
         setChatLoading(false);
       }
     }
-  }, [abortActiveChat, activeReel, chatByReel, chatInput, chatLoading]);
+  }, [abortActiveChat, activeReel, chatByReel, chatInput, chatLoading, demoAccountReturnEnabled, demoPlayerEnabled]);
 
   const rerankUnseenTail = useCallback(async () => {
     const feedMaterialIds = getFeedMaterialIds();
@@ -4343,6 +4432,44 @@ function FeedPageInner() {
       setAssessmentError("This question is unavailable. Choose Later to continue learning.");
       return;
     }
+    if (demoQuizEnabled) {
+      const demoAnswer = LOCAL_DEMO_ASSESSMENT_ANSWERS[question.id];
+      if (!demoAnswer) {
+        setAssessmentError("This demo question is unavailable.");
+        return;
+      }
+      const correct = choiceIndex === demoAnswer.correctIndex;
+      const previousCorrectCount = Math.round(
+        (Number(assessmentSession.score) || 0) * assessmentSession.answered_count,
+      );
+      const nextAnsweredCount = Math.min(
+        assessmentSession.question_count,
+        assessmentSession.answered_count + 1,
+      );
+      const nextCorrectCount = previousCorrectCount + (correct ? 1 : 0);
+      setAssessmentSession({
+        ...assessmentSession,
+        status: nextAnsweredCount >= assessmentSession.question_count ? "completed" : "pending",
+        current_index: Math.min(nextAnsweredCount, assessmentSession.question_count),
+        answered_count: nextAnsweredCount,
+        score: nextCorrectCount / Math.max(1, nextAnsweredCount),
+        understood_concepts: correct
+          ? Array.from(new Set([...assessmentSession.understood_concepts, question.concept_title]))
+          : assessmentSession.understood_concepts,
+        revisit_concepts: correct
+          ? assessmentSession.revisit_concepts.filter((concept) => concept !== question.concept_title)
+          : Array.from(new Set([...assessmentSession.revisit_concepts, question.concept_title])),
+      });
+      setAssessmentAnswerReveal({
+        questionId: question.id,
+        choiceIndex,
+        correct,
+        correctIndex: demoAnswer.correctIndex,
+        explanation: demoAnswer.explanation,
+      });
+      setAssessmentError(null);
+      return;
+    }
     const searchScope = activeSearchScopeRef.current;
     setAssessmentAnswering(true);
     setAssessmentError(null);
@@ -4378,7 +4505,7 @@ function FeedPageInner() {
         setAssessmentAnswering(false);
       }
     }
-  }, [assessmentAnswerReveal, assessmentAnswering, assessmentQuestionIndex, assessmentSession, isSearchScopeActive]);
+  }, [assessmentAnswerReveal, assessmentAnswering, assessmentQuestionIndex, assessmentSession, demoQuizEnabled, isSearchScopeActive]);
 
   const showNextAssessmentQuestion = useCallback(() => {
     if (!assessmentSession || !assessmentAnswerReveal) {
@@ -4387,6 +4514,10 @@ function FeedPageInner() {
     if (assessmentSession.answered_count >= assessmentSession.question_count) {
       setAssessmentResultsVisible(true);
       persistAssessmentRecall(assessmentSession);
+      if (demoQuizEnabled) {
+        setAssessmentPreparingFeed(false);
+        return;
+      }
       setAssessmentPreparingFeed(true);
       const searchScope = activeSearchScopeRef.current;
       void rerankUnseenTail().finally(() => {
@@ -4404,11 +4535,12 @@ function FeedPageInner() {
     setAssessmentQuestionIndex(nextIndex);
     setAssessmentAnswerReveal(null);
     setAssessmentError(null);
-  }, [assessmentAnswerReveal, assessmentQuestionIndex, assessmentSession, isSearchScopeActive, persistAssessmentRecall, rerankUnseenTail]);
+  }, [assessmentAnswerReveal, assessmentQuestionIndex, assessmentSession, demoQuizEnabled, isSearchScopeActive, persistAssessmentRecall, rerankUnseenTail]);
 
   const closeAssessmentAndContinue = useCallback(() => {
     const shouldAdvance = assessmentAdvanceAfterClose;
     assessmentStartRequestRef.current = null;
+    setAssessmentSlideActive(false);
     setAssessmentSession(null);
     setAssessmentQuestionIndex(0);
     setAssessmentAnswerReveal(null);
@@ -4428,6 +4560,10 @@ function FeedPageInner() {
     if (!assessmentSession || assessmentSnoozing) {
       return;
     }
+    if (demoQuizEnabled) {
+      closeAssessmentAndContinue();
+      return;
+    }
     const searchScope = activeSearchScopeRef.current;
     setAssessmentSnoozing(true);
     setAssessmentError(null);
@@ -4445,7 +4581,7 @@ function FeedPageInner() {
         setAssessmentSnoozing(false);
       }
     }
-  }, [assessmentSession, assessmentSnoozing, closeAssessmentAndContinue, isSearchScopeActive]);
+  }, [assessmentSession, assessmentSnoozing, closeAssessmentAndContinue, demoQuizEnabled, isSearchScopeActive]);
 
   const handleActivePlaybackProgress = useCallback((maxFraction: number, naturalEnd: boolean) => {
     if (activeReel) {
@@ -4493,6 +4629,17 @@ function FeedPageInner() {
         };
       }
 
+      if (demoPlayerEnabled || demoAccountReturnEnabled) {
+        setFeedbackByReel((prev) => ({
+          ...prev,
+          [activeReel.reel_id]: {
+            ...prev[activeReel.reel_id],
+            ...payload,
+          },
+        }));
+        return;
+      }
+
       setPendingAction(action);
       setError(null);
       try {
@@ -4511,36 +4658,63 @@ function FeedPageInner() {
         setPendingAction(null);
       }
     },
-    [activeFeedback, activeReel, rerankUnseenTail],
+    [activeFeedback, activeReel, demoAccountReturnEnabled, demoPlayerEnabled, rerankUnseenTail],
   );
 
   const renderMobileFeedbackButton = (action: FeedbackAction, label: string, iconClass: string, active: boolean) => (
     <button
       type="button"
       onClick={() => submitActiveFeedback(action)}
-      className={`relative grid h-10 w-10 place-items-center overflow-hidden rounded-2xl border-[0.8px] text-sm transition-colors duration-200 disabled:pointer-events-none backdrop-blur-lg ${
-        active ? "border-white/70 text-white" : "border-white/35 text-white/90 hover:border-white/55"
+      className={`grid h-11 w-11 place-items-center rounded-full bg-transparent text-sm transition-[color,transform] duration-200 hover:scale-105 focus-visible:scale-105 disabled:pointer-events-none ${
+        active
+          ? "text-white"
+          : "text-white/65 hover:text-white focus-visible:text-white"
       }`}
       disabled={pendingAction !== null}
       aria-label={label}
+      aria-pressed={active}
       title={label}
     >
-      <span aria-hidden="true" className={`pointer-events-none absolute inset-0 ${active ? "bg-black/55" : "bg-black/45"}`} />
       {pendingAction === action ? (
-        <i className="fa-solid fa-spinner fa-spin relative z-10" aria-hidden="true" />
+        <i className="fa-solid fa-spinner fa-spin" aria-hidden="true" />
       ) : (
-        <i className={`fa-solid ${iconClass} relative z-10`} aria-hidden="true" />
+        <i className={`${active ? "fa-solid" : "fa-regular"} ${iconClass}`} aria-hidden="true" />
       )}
     </button>
   );
-  const rightTopPercent = Math.round(rightTopRatio * 1000) / 10;
+  const renderDesktopPanelButton = (panel: DesktopPanel, label: string, iconClass: string) => {
+    const active = desktopPanel === panel;
+    const iconStyle = active || iconClass === "fa-ellipsis" ? "fa-solid" : "fa-regular";
+    return (
+      <button
+        type="button"
+        onClick={() => toggleDesktopPanel(panel)}
+        className={`hidden h-11 w-11 place-items-center rounded-full bg-transparent text-sm transition-[color,transform] duration-200 hover:scale-105 focus-visible:scale-105 lg:grid ${
+          active
+            ? "text-white"
+            : "text-white/65 hover:text-white focus-visible:text-white"
+        }`}
+        aria-label={label}
+        aria-pressed={active}
+        title={label}
+      >
+        <i className={`${iconStyle} ${iconClass}`} aria-hidden="true" />
+      </button>
+    );
+  };
   const feedFallbackPath = useMemo(() => {
+    if (demoPlayerEnabled) {
+      return "/?demo=account";
+    }
     if (returnTabParam === "search") {
       return "/?tab=search";
     }
     const returnSetId = (returnCommunitySetIdParam.trim() || communitySetIdParam.trim());
     if (returnTabParam === "community" || returnSetId || communityPreviewReel || communityHandoffIdParam) {
       const nextParams = new URLSearchParams();
+      if (demoAccountReturnEnabled) {
+        nextParams.set("demo", "account");
+      }
       nextParams.set("tab", "community");
       if (returnSetId) {
         nextParams.set("community_set_id", returnSetId);
@@ -4548,7 +4722,7 @@ function FeedPageInner() {
       return `/?${nextParams.toString()}`;
     }
     return "/?tab=search";
-  }, [communityHandoffIdParam, communityPreviewReel, communitySetIdParam, returnCommunitySetIdParam, returnTabParam]);
+  }, [communityHandoffIdParam, communityPreviewReel, communitySetIdParam, demoAccountReturnEnabled, demoPlayerEnabled, returnCommunitySetIdParam, returnTabParam]);
 
   const navigateBackToPreviousPage = useCallback(() => {
     abortActiveChat();
@@ -4579,12 +4753,12 @@ function FeedPageInner() {
 
   if (!materialId && !communityPreviewReel && invalidCommunityHandoff) {
     return (
-      <main className="fixed inset-0 px-6 md:inset-4">
+      <main className="fixed inset-0 bg-black px-6 md:inset-4">
         <div className="flex h-full items-center justify-center">
-          <div className="rounded-3xl border border-white/25 bg-black/60 p-6 text-center text-white backdrop-blur-sm">
+          <div className="rounded-2xl bg-[#181818] p-6 text-center text-white">
             <p className="text-sm">Community reel preview expired. Reopen this set from the Community tab.</p>
             <button
-              className="mt-4 rounded-2xl border border-white/25 bg-white px-4 py-2 text-xs font-semibold text-black"
+              className="mt-4 rounded-full bg-white px-4 py-2 text-xs font-semibold text-black transition-colors hover:bg-white/88"
               onClick={navigateBackToPreviousPage}
             >
               Back to Community
@@ -4595,14 +4769,14 @@ function FeedPageInner() {
     );
   }
 
-  if (!materialId && !communityPreviewReel && !communityHandoffIdParam) {
+  if (!demoPlayerEnabled && !materialId && !communityPreviewReel && !communityHandoffIdParam) {
     return (
-      <main className="fixed inset-0 px-6 md:inset-4">
+      <main className="fixed inset-0 bg-black px-6 md:inset-4">
         <div className="flex h-full items-center justify-center">
-          <div className="rounded-3xl border border-white/25 bg-black/60 p-6 text-center text-white backdrop-blur-sm">
+          <div className="rounded-2xl bg-[#181818] p-6 text-center text-white">
             <p className="text-sm">Missing material_id or community reel selection.</p>
             <button
-              className="mt-4 rounded-2xl border border-white/25 bg-white px-4 py-2 text-xs font-semibold text-black"
+              className="mt-4 rounded-full bg-white px-4 py-2 text-xs font-semibold text-black transition-colors hover:bg-white/88"
               onClick={navigateBackToPreviousPage}
             >
               Back to Upload
@@ -4618,24 +4792,23 @@ function FeedPageInner() {
   }
 
   return (
-    <main className="fixed inset-0 overflow-visible md:inset-4 md:overflow-hidden">
+    <main className="fixed inset-0 overflow-visible bg-black md:inset-4 md:overflow-hidden">
       <button
         type="button"
         onClick={navigateBackToPreviousPage}
         aria-label="Back to main page"
-        className="absolute left-3 top-3 z-[9999] grid h-9 w-9 place-items-center rounded-xl border border-white/20 bg-black/50 text-white shadow-[0_8px_24px_rgba(0,0,0,0.35)] backdrop-blur-md transition hover:bg-white/12"
+        className="absolute left-3 top-3 z-[9999] grid h-8 w-8 place-items-center rounded-lg bg-transparent text-white/78 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:bg-white/[0.07] focus-visible:text-white focus-visible:outline-none"
       >
-        <i className="fa-solid fa-arrow-left text-xs" aria-hidden="true" />
+        <i className="fa-solid fa-chevron-left text-sm" aria-hidden="true" />
       </button>
       {error && error !== SAVED_SESSION_UNAVAILABLE_MESSAGE ? (
         <div className="absolute left-0 right-0 top-3 z-[2147483647] mx-auto w-fit">
-          <div className="relative flex items-center gap-3 overflow-hidden rounded-xl border border-gray-300/45 bg-white/10 px-4 py-2 text-xs text-white shadow-[0_12px_28px_rgba(0,0,0,0.35)] backdrop-blur-xl backdrop-saturate-150">
-            <div aria-hidden="true" className="pointer-events-none absolute inset-0 bg-black/45" />
-            <span className="relative">{error}</span>
+          <div className="flex items-center gap-3 overflow-hidden rounded-full bg-[#272727] px-4 py-2 text-xs text-white">
+            <span>{error}</span>
             <button
               type="button"
               onClick={() => void requestReadyBatch(REEL_BATCH_SIZE, true)}
-              className="relative rounded-lg border border-white/25 bg-white/15 px-2.5 py-1 font-semibold transition hover:bg-white/25"
+              className="rounded-full bg-white/12 px-2.5 py-1 font-semibold transition-colors hover:bg-white hover:text-black focus-visible:bg-white focus-visible:text-black"
             >
               Retry
             </button>
@@ -4653,77 +4826,98 @@ function FeedPageInner() {
         />
       ) : null}
 
-      {assessmentSession ? (
-        <RecallCheck
-          session={assessmentSession}
-          questionIndex={assessmentQuestionIndex}
-          answerReveal={assessmentAnswerReveal}
-          answering={assessmentAnswering}
-          showResults={assessmentResultsVisible}
-          preparingFeed={assessmentPreparingFeed}
-          snoozing={assessmentSnoozing}
-          error={assessmentError}
-          onAnswer={submitAssessmentAnswer}
-          onNextQuestion={showNextAssessmentQuestion}
-          onLater={snoozeActiveAssessment}
-          onContinue={closeAssessmentAndContinue}
-        />
-      ) : null}
-
-      {(assessmentBootstrapPending || assessmentGatePending) && !assessmentSession ? (
-        <div className="fixed inset-0 z-[10000] grid place-items-center bg-black/86 px-6 text-white backdrop-blur-xl" role="status" aria-live="polite">
-          <div className="rounded-full border border-white/16 bg-white/[0.05] px-5 py-3 text-xs font-semibold uppercase tracking-[0.14em] text-white/72">
-            {assessmentGatePending ? "Preparing recall check..." : "Loading learning progress..."}
-          </div>
-        </div>
-      ) : null}
-
-      <div ref={desktopShellRef} className="h-full min-h-[100dvh] md:min-h-0 lg:flex">
-        <section className="relative h-[100dvh] min-h-[100dvh] md:h-full md:min-h-0 lg:min-w-0 lg:flex-1">
-          {activeReel && !mobileDetailsOpen ? (
-            <div className="absolute right-3 top-1/2 z-30 flex -translate-y-1/2 flex-col gap-2">
-              {renderMobileFeedbackButton("helpful", "Got it", "fa-thumbs-up", Boolean(activeFeedback.helpful))}
-              {renderMobileFeedbackButton("confusing", "Need help", "fa-circle-question", Boolean(activeFeedback.confusing))}
-              {renderMobileFeedbackButton("save", "Save", "fa-bookmark", Boolean(activeFeedback.saved))}
+      <FadePresence show={(assessmentBootstrapPending || assessmentGatePending) && !assessmentSession}>
+        {(statusVisible) => (
+          <div
+            className={`fixed inset-0 z-[10000] grid place-items-center bg-black/86 px-6 text-white transition-opacity duration-300 motion-reduce:transition-none ${
+              statusVisible ? "opacity-100" : "opacity-0"
+            }`}
+            role="status"
+            aria-live="polite"
+          >
+            <div className="px-5 py-3 text-xs font-semibold uppercase tracking-[0.14em] text-white/72">
+              {assessmentGatePending ? "Preparing recall check..." : "Loading learning progress..."}
             </div>
-          ) : null}
-          {generationProgress !== null && reels.length > 0 ? (
+          </div>
+        )}
+      </FadePresence>
+
+      <div ref={desktopShellRef} className="h-full min-h-[100dvh] md:min-h-0 lg:flex lg:items-center lg:justify-center">
+        <section className={`relative h-[100dvh] min-h-[100dvh] md:h-full md:min-h-0 lg:min-w-0 ${
+          assessmentSlideActive
+            ? "lg:w-[min(calc(56.25dvh-1.6875rem),29.25rem)] lg:flex-none"
+            : "lg:w-[calc(min(calc(56.25dvh-1.6875rem),29.25rem)+3.5rem)] lg:flex-none"
+        }`}>
+          {generationProgress !== null && reels.length > 0 && !assessmentSlideActive ? (
             <GenerationStageStatus ready={reels.length} reconnecting={generationProgress.reconnecting} />
           ) : null}
-          <div
-            ref={feedViewportRef}
-            onTouchStart={onFeedTouchStart}
-            onTouchMove={onFeedTouchMove}
-            onTouchEnd={onFeedTouchEnd}
-            className="reel-scroll m-4 h-[calc(100dvh-2rem)] min-h-[calc(100dvh-2rem)] overflow-hidden rounded-3xl overscroll-none touch-none md:m-0 md:h-full md:min-h-0 lg:h-full lg:min-h-0"
-          >
+          <div className="relative h-full w-full lg:flex lg:items-center lg:justify-center lg:gap-3">
             <div
-              className="flex h-full flex-col transition-transform duration-300 ease-out"
-              style={{ transform: `translate3d(0, -${activeIndex * 100}%, 0)` }}
+              ref={feedViewportRef}
+              tabIndex={0}
+              aria-label="Learning reel feed"
+              onTouchStart={onFeedTouchStart}
+              onTouchMove={onFeedTouchMove}
+              onTouchEnd={onFeedTouchEnd}
+              className={`reel-scroll m-4 h-[calc(100dvh-2rem)] min-h-[calc(100dvh-2rem)] overflow-hidden rounded-3xl overscroll-none focus:outline-none md:m-0 md:h-full md:min-h-0 ${
+                assessmentSlideActive
+                  ? "touch-pan-y lg:aspect-[9/16] lg:h-[min(calc(100dvh-3rem),52rem)] lg:w-auto lg:max-w-full lg:rounded-[1.25rem]"
+                  : "touch-none lg:aspect-[9/16] lg:h-[min(calc(100dvh-3rem),52rem)] lg:min-h-0 lg:w-auto lg:max-w-[calc(100%-4rem)] lg:rounded-[1.25rem]"
+              }`}
             >
-              {reels.map((reel, index) => (
-                <div key={reel.reel_id} className="h-[calc(100dvh-2rem)] shrink-0 grow-0 basis-full md:h-full lg:h-full">
-                  {Math.abs(index - activeIndex) <= 1 ? (
-                    <ReelCard
-                      reel={reel}
-                      isActive={index === activeIndex && !assessmentPlaybackBlocked}
-                      mutedPreference={mutedPreference}
-                      onMutedPreferenceChange={setMutedPreference}
-                      autoplayEnabled={autoplayEnabled}
-                      onAutoplayEnabledChange={setAutoplayEnabled}
-                      playbackRate={playbackRate}
-                      onPlaybackRateChange={setPlaybackRate}
-                      onRequestNextReel={index === activeIndex ? requestAutoplayAdvance : undefined}
-                      onPlaybackProgress={index === activeIndex ? handleActivePlaybackProgress : undefined}
-                      onOpenContent={index === activeIndex ? openMobileDetails : undefined}
-                    />
-                  ) : null}
-                </div>
-              ))}
+            <div
+              className="flex h-full flex-col transition-transform duration-300 ease-out motion-reduce:transition-none"
+              style={{ transform: `translate3d(0, -${activeFeedPageIndex * 100}%, 0)` }}
+            >
+              {feedItems.map((item) => {
+                if (item.kind === "recall-check") {
+                  return (
+                    <div key={item.key} className="h-[calc(100dvh-2rem)] shrink-0 grow-0 basis-full md:h-full lg:h-full">
+                      {assessmentSession ? (
+                        <RecallCheck
+                          active={assessmentSlideActive}
+                          session={assessmentSession}
+                          questionIndex={assessmentQuestionIndex}
+                          answerReveal={assessmentAnswerReveal}
+                          answering={assessmentAnswering}
+                          showResults={assessmentResultsVisible}
+                          preparingFeed={assessmentPreparingFeed}
+                          snoozing={assessmentSnoozing}
+                          error={assessmentError}
+                          onAnswer={submitAssessmentAnswer}
+                          onNextQuestion={showNextAssessmentQuestion}
+                          onLater={snoozeActiveAssessment}
+                          onContinue={closeAssessmentAndContinue}
+                        />
+                      ) : null}
+                    </div>
+                  );
+                }
+                const { reel, reelIndex } = item;
+                return (
+                  <div key={item.key} className="h-[calc(100dvh-2rem)] shrink-0 grow-0 basis-full md:h-full lg:h-full">
+                    {Math.abs(reelIndex - activeIndex) <= 1 ? (
+                      <ReelCard
+                        reel={reel}
+                        isActive={reelIndex === activeIndex && !assessmentPlaybackBlocked}
+                        mutedPreference={mutedPreference}
+                        onMutedPreferenceChange={setMutedPreference}
+                        autoplayEnabled={autoplayEnabled}
+                        onAutoplayEnabledChange={setAutoplayEnabled}
+                        playbackRate={playbackRate}
+                        onPlaybackRateChange={setPlaybackRate}
+                        onRequestNextReel={reelIndex === activeIndex ? requestAutoplayAdvance : undefined}
+                        onPlaybackProgress={reelIndex === activeIndex ? handleActivePlaybackProgress : undefined}
+                        onOpenContent={reelIndex === activeIndex ? openMobileDetails : undefined}
+                      />
+                    ) : null}
+                  </div>
+                );
+              })}
             </div>
             {reels.length === 0 ? (
               <div className="absolute inset-0 grid place-items-center p-6">
-                <div className="max-w-sm rounded-3xl border border-white/20 bg-black/68 px-5 py-4 text-center text-white backdrop-blur">
+                <div className="max-w-sm rounded-2xl bg-[#181818] px-5 py-4 text-center text-white">
                   {error === SAVED_SESSION_UNAVAILABLE_MESSAGE ? (
                     <>
                       <p className="text-sm font-semibold">Saved session unavailable</p>
@@ -4731,7 +4925,7 @@ function FeedPageInner() {
                       <button
                         type="button"
                         onClick={navigateBackToPreviousPage}
-                        className="mt-3 rounded-xl border border-white/25 bg-white px-3.5 py-2 text-xs font-semibold text-black"
+                        className="mt-3 rounded-full bg-white px-3.5 py-2 text-xs font-semibold text-black transition-colors hover:bg-white/88"
                       >
                         Start a new search
                       </button>
@@ -4751,7 +4945,7 @@ function FeedPageInner() {
                       <button
                         type="button"
                         onClick={() => void bootstrapFirstReels(true)}
-                        className="mt-3 rounded-xl border border-white/25 bg-white px-3.5 py-2 text-xs font-semibold text-black"
+                        className="mt-3 rounded-full bg-white px-3.5 py-2 text-xs font-semibold text-black transition-colors hover:bg-white/88"
                       >
                         Generate Reels
                       </button>
@@ -4760,9 +4954,9 @@ function FeedPageInner() {
                 </div>
               </div>
             ) : null}
-            {reels.length > 0 && (activelyFindingMoreReels || pendingTailAdvance) ? (
+            {reels.length > 0 && !assessmentSlideActive && (activelyFindingMoreReels || pendingTailAdvance) ? (
               <div className="pointer-events-none absolute inset-x-0 bottom-4 z-20 flex justify-center px-4">
-                <div className="max-w-xs rounded-2xl border border-white/20 bg-black/80 px-5 py-3 text-center text-white shadow-[0_12px_30px_rgba(0,0,0,0.35)] backdrop-blur-sm">
+                <div className="max-w-xs rounded-2xl bg-black/80 px-5 py-3 text-center text-white backdrop-blur-sm">
                   <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/85">
                     {generationProgress?.reconnecting ? "Reconnecting to the same clip job..." : "Finding the next verified clip..."}
                   </p>
@@ -4770,16 +4964,27 @@ function FeedPageInner() {
                 </div>
               </div>
             ) : null}
-            {reels.length > 0 && noMoreReelsAvailable ? (
+            {reels.length > 0 && !assessmentSlideActive && noMoreReelsAvailable ? (
               <div className="pointer-events-none absolute inset-x-0 bottom-4 z-20 flex justify-center px-4">
-                <div className="rounded-full border border-white/20 bg-black/72 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-white/78 backdrop-blur-sm">
+                <div className="rounded-full bg-black/72 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-white/78 backdrop-blur-sm">
                   No more reels found for this topic.
                 </div>
               </div>
             ) : null}
+            </div>
+
+            {activeReel && !mobileDetailsOpen && !assessmentSlideActive ? (
+              <div className="absolute right-3 top-1/2 z-30 flex -translate-y-1/2 flex-col gap-2 lg:static lg:translate-y-0">
+                {renderMobileFeedbackButton("helpful", "Got it", "fa-thumbs-up", Boolean(activeFeedback.helpful))}
+                {renderMobileFeedbackButton("confusing", "Need help", "fa-thumbs-down", Boolean(activeFeedback.confusing))}
+                {renderMobileFeedbackButton("save", "Save", "fa-bookmark", Boolean(activeFeedback.saved))}
+                {renderDesktopPanelButton("info", "Reel info", "fa-ellipsis")}
+                {renderDesktopPanelButton("chat", "AI chat", "fa-message")}
+              </div>
+            ) : null}
           </div>
 
-          {mobileDetailsOpen && activeReel ? (
+          {mobileDetailsOpen && activeReel && !assessmentSlideActive ? (
             <div className="absolute inset-0 z-30 lg:hidden">
               <button
                 aria-label="Close content panel"
@@ -4787,7 +4992,7 @@ function FeedPageInner() {
                 onClick={closeMobileDetails}
               />
               <div
-                className={`absolute inset-x-4 bottom-8 max-h-[80svh] touch-pan-y overflow-y-auto overscroll-y-contain rounded-3xl border border-white/20 bg-black/92 px-4 pt-4 pb-4 text-white backdrop-blur [-webkit-overflow-scrolling:touch] ${
+                className={`absolute inset-x-2 bottom-2 max-h-[84svh] touch-pan-y overflow-y-auto overscroll-y-contain rounded-[1.75rem] bg-[#181818] px-5 pt-5 pb-6 text-white [-webkit-overflow-scrolling:touch] ${
                   mobileDetailsClosing ? "animate-mobile-sheet-out" : "animate-mobile-sheet-in"
                 }`}
               >
@@ -4795,18 +5000,18 @@ function FeedPageInner() {
                   type="button"
                   onClick={closeMobileDetails}
                   aria-label="Close content panel"
-                  className="absolute right-3 top-3 grid h-8 w-8 place-items-center text-base text-white/85 transition hover:text-white"
+                  className="absolute right-3 top-3 grid h-11 w-11 place-items-center rounded-full bg-white/[0.07] text-base text-white/85 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:bg-white/[0.07]"
                 >
                   <i className="fa-solid fa-xmark" aria-hidden="true" />
                 </button>
-                <h2 className="pr-8 text-xl font-bold leading-tight">{activeReel.concept_title}</h2>
+                <h2 className="pr-12 text-xl font-semibold leading-tight">{activeReel.concept_title}</h2>
 
-                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                <div className="mt-5 min-w-0 text-sm text-white/90">
                   <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">AI Summary</p>
                   <p className="break-words leading-snug [overflow-wrap:anywhere]">{activeReelDetails.summary}</p>
                 </div>
 
-                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                <div className="mt-5 min-w-0 text-sm text-white/90">
                   <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Key Takeaways</p>
                   <ul className="space-y-1.5">
                     {activeReelDetails.takeaways.map((takeaway) => (
@@ -4818,7 +5023,7 @@ function FeedPageInner() {
                   </ul>
                 </div>
 
-                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                <div className="mt-5 min-w-0 text-sm text-white/90">
                   <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Video Description</p>
                   <ExpandableText
                     text={activeVideoDescription.text}
@@ -4833,7 +5038,7 @@ function FeedPageInner() {
                   />
                 </div>
 
-                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                <div className="mt-5 min-w-0 text-sm text-white/90">
                   <div className="mb-1 flex items-center justify-between gap-2">
                     <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Why This Matches</p>
                     {typeof activeReel.relevance_score === "number" ? (
@@ -4848,7 +5053,7 @@ function FeedPageInner() {
                       {(activeReel.matched_terms ?? []).slice(0, 6).map((term) => (
                         <span
                           key={`mobile-match-${activeReel.reel_id}-${term}`}
-                          className="rounded-full border border-white/20 bg-black/60 px-2 py-0.5 text-[10px] text-white/78"
+                          className="rounded-full bg-white/[0.08] px-2 py-0.5 text-[10px] text-white/78"
                         >
                           {term}
                         </span>
@@ -4858,7 +5063,7 @@ function FeedPageInner() {
                 </div>
 
                 {(activeReel.captions && activeReel.captions.length > 0) || (activeReel.transcript_snippet && activeReel.transcript_snippet.trim()) ? (
-                  <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                  <div className="mt-5 min-w-0 text-sm text-white/90">
                     <div className="mb-1 flex items-center justify-between gap-2">
                       <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Transcript</p>
                       {activeReel.captions && activeReel.captions.length > 0 ? (
@@ -4901,38 +5106,60 @@ function FeedPageInner() {
           ) : null}
         </section>
 
-        <button
-          type="button"
-          aria-label="Resize panels"
-          onPointerDown={onStartLeftRightResize}
-          className="group hidden w-3 cursor-col-resize touch-none select-none items-center justify-center bg-transparent lg:flex"
-        >
-          <span className="h-20 w-px rounded-full bg-white/35 transition group-hover:bg-white/55 group-focus-visible:bg-white/55" />
-        </button>
+        <FadePresence show={!assessmentSlideActive && desktopPanel !== null} exitMs={320}>
+          {(panelVisible) => (
+            <>
+              <button
+                type="button"
+                aria-label="Resize panels"
+                onPointerDown={onStartLeftRightResize}
+                className={`group hidden cursor-col-resize touch-none select-none items-center justify-center overflow-hidden bg-transparent transition-[width,opacity] duration-300 ease-out motion-reduce:transition-none lg:flex ${
+                  panelVisible ? "w-6 opacity-100" : "pointer-events-none w-0 opacity-0"
+                }`}
+              >
+                <span className="h-20 w-px rounded-full bg-transparent transition-colors group-hover:bg-white/24 group-focus-visible:bg-white/40" />
+              </button>
 
-        <div
-          ref={rightColumnRef}
-          className="hidden h-full min-h-0 flex-none lg:grid"
-          style={{
-            width: `${Math.round(rightPanelWidthPx)}px`,
-            minWidth: `${RIGHT_PANEL_MIN_PX}px`,
-            maxWidth: "52vw",
-            gridTemplateRows: `${rightTopPercent}% ${RIGHT_SPLIT_BAR_PX}px minmax(0, 1fr)`,
-          }}
-        >
-          <aside className="min-h-0 min-w-0 overflow-y-auto rounded-3xl border border-white/20 bg-black/72 px-5 pt-5 pb-2 text-white">
+              <div
+                className={`hidden h-full min-h-0 flex-none transition-[width] duration-300 ease-out motion-reduce:transition-none lg:block lg:h-[min(calc(100dvh-3rem),52rem)] ${
+                  panelVisible ? "" : "pointer-events-none"
+                }`}
+                style={{
+                  width: panelVisible ? `${Math.round(rightPanelWidthPx)}px` : "0px",
+                  minWidth: "0px",
+                  maxWidth: "52vw",
+                }}
+              >
+                <div
+                  className={`relative h-full transition-opacity duration-300 ease-out motion-reduce:transition-none ${
+                    panelVisible ? "opacity-100" : "opacity-0"
+                  }`}
+                  style={{ width: `min(${Math.round(rightPanelWidthPx)}px, 52vw)` }}
+                >
+          {desktopPanel ? (
+            <button
+              type="button"
+              onClick={() => toggleDesktopPanel(desktopPanel)}
+              aria-label={desktopPanel === "info" ? "Close reel info panel" : "Close AI chat panel"}
+              className="absolute right-3 top-3 z-10 grid h-8 w-8 place-items-center rounded-lg bg-transparent text-xs text-white/60 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:bg-white/[0.07] focus-visible:text-white focus-visible:outline-none"
+            >
+              <i className="fa-solid fa-xmark" aria-hidden="true" />
+            </button>
+          ) : null}
+          {desktopPanel === "info" ? (
+          <aside className="h-full min-h-0 min-w-0 overflow-y-auto rounded-2xl bg-[#181818] px-6 pt-6 pb-3 text-white">
             {!activeReel ? (
               <div className="flex h-full items-center justify-center text-sm text-white/80">Loading reel details...</div>
             ) : (
               <div className="flex min-h-full flex-col pb-2">
-                <h2 className="text-2xl font-bold leading-tight">{activeReel.concept_title}</h2>
+                <h2 className="pr-10 text-2xl font-semibold leading-tight">{activeReel.concept_title}</h2>
 
-                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                <div className="mt-5 min-w-0 text-sm text-white/90">
                   <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">AI Summary</p>
                   <p className="break-words leading-snug [overflow-wrap:anywhere]">{activeReelDetails.summary}</p>
                 </div>
 
-                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                <div className="mt-5 min-w-0 text-sm text-white/90">
                   <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Key Takeaways</p>
                   <ul className="space-y-1.5">
                     {activeReelDetails.takeaways.map((takeaway) => (
@@ -4944,7 +5171,7 @@ function FeedPageInner() {
                   </ul>
                 </div>
 
-                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                <div className="mt-5 min-w-0 text-sm text-white/90">
                   <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Video Description</p>
                   <ExpandableText
                     text={activeVideoDescription.text}
@@ -4959,7 +5186,7 @@ function FeedPageInner() {
                   />
                 </div>
 
-                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                <div className="mt-5 min-w-0 text-sm text-white/90">
                   <div className="mb-1 flex items-center justify-between gap-2">
                     <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Why This Matches</p>
                     {typeof activeReel.relevance_score === "number" ? (
@@ -4974,7 +5201,7 @@ function FeedPageInner() {
                       {(activeReel.matched_terms ?? []).slice(0, 6).map((term) => (
                         <span
                           key={`desktop-match-${activeReel.reel_id}-${term}`}
-                          className="rounded-full border border-white/20 bg-black/60 px-2 py-0.5 text-[10px] text-white/78"
+                          className="rounded-full bg-white/[0.08] px-2 py-0.5 text-[10px] text-white/78"
                         >
                           {term}
                         </span>
@@ -4984,7 +5211,7 @@ function FeedPageInner() {
                 </div>
 
                 {(activeReel.captions && activeReel.captions.length > 0) || (activeReel.transcript_snippet && activeReel.transcript_snippet.trim()) ? (
-                  <div className="mt-3 mb-0 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                  <div className="mt-5 mb-0 min-w-0 text-sm text-white/90">
                     <div className="mb-1 flex items-center justify-between gap-2">
                       <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Transcript</p>
                       {activeReel.captions && activeReel.captions.length > 0 ? (
@@ -5026,53 +5253,26 @@ function FeedPageInner() {
               </div>
             )}
           </aside>
+          ) : null}
 
-          <button
-            type="button"
-            aria-label="Resize right panels"
-            onPointerDown={onStartTopBottomResize}
-            className="group grid h-[14px] cursor-row-resize touch-none select-none place-items-center bg-transparent"
-          >
-            <span className="h-px w-20 rounded-full bg-white/35 transition group-hover:bg-white/55" />
-          </button>
-
-          <section className="flex min-h-0 min-w-0 flex-col rounded-3xl border border-white/20 bg-black/62 px-4 pt-4 pb-0 text-white">
-            <div className="mb-2 flex items-center justify-between">
+          {desktopPanel === "chat" ? (
+          <section className="flex h-full min-h-0 min-w-0 flex-col rounded-2xl bg-[#181818] px-4 pt-4 pb-0 text-white">
+            <div className="mb-4 flex h-8 items-center pr-10">
               <p className="text-xs font-semibold uppercase tracking-[0.11em] text-white/75">AI Chat</p>
-              {chatPanelOpen ? (
-                <button
-                  type="button"
-                  onClick={closeActiveChat}
-                  aria-label="Close AI chat"
-                  className="grid h-7 w-7 place-items-center rounded-lg text-white/55 transition hover:bg-white/10 hover:text-white"
-                >
-                  <i className="fa-solid fa-xmark text-xs" aria-hidden="true" />
-                </button>
-              ) : null}
             </div>
 
-            {!chatPanelOpen ? (
-              <div className="grid min-h-0 flex-1 place-items-center">
-                <button
-                  type="button"
-                  onClick={() => setChatPanelOpen(true)}
-                  className="rounded-full border border-white/18 bg-white/[0.05] px-4 py-2 text-xs font-semibold text-white/72 transition hover:border-white/32 hover:text-white"
-                >
-                  Open AI Chat
-                </button>
-              </div>
-            ) : !activeReel ? (
+            {!activeReel ? (
               <div className="flex h-full items-center justify-center text-sm text-white/70">Open a reel to chat.</div>
             ) : (
               <>
-                <div className="min-h-0 flex-1 space-y-2 overflow-y-auto rounded-2xl bg-black/45 p-2.5">
+                <div className="min-h-0 flex-1 space-y-2 overflow-y-auto">
                   {activeChatMessages.map((msg, idx) => (
                     <div
                       key={`${activeReel.reel_id}-chat-${idx}`}
                       className={`rounded-xl px-3 py-2 text-sm leading-relaxed break-words [overflow-wrap:anywhere] ${
                         msg.role === "user"
-                          ? "ml-auto w-fit max-w-[85%] bg-[#1b1b1b] text-right text-white"
-                          : "mr-8 bg-white/10 text-white/92"
+                          ? "ml-auto w-fit max-w-[85%] bg-[#303030] text-right text-white"
+                          : "mr-8 bg-white/[0.07] text-white/92"
                       }`}
                     >
                       {msg.content}
@@ -5094,23 +5294,28 @@ function FeedPageInner() {
                       }
                     }}
                     placeholder="Ask about this reel..."
-                    className="h-9 flex-1 rounded-xl border border-white/20 bg-black/55 px-3 text-sm text-white outline-none placeholder:text-white/45 focus:border-white/45"
+                    className="h-11 flex-1 rounded-full bg-[#272727] px-4 text-sm text-white outline-none transition-colors placeholder:text-white/45 focus:bg-[#333]"
                   />
                   <button
                     type="button"
                     onClick={() => void sendActiveChat()}
                     disabled={chatLoading || !chatInput.trim()}
                     aria-label="Send message"
-                    className="grid h-9 w-9 place-items-center rounded-xl border border-white/25 bg-white/12 text-white transition hover:bg-white/18 disabled:opacity-45"
+                    className="grid h-11 w-11 place-items-center rounded-full bg-white text-black transition-colors hover:bg-white/[0.88] focus-visible:bg-white/[0.88] disabled:bg-white/[0.12] disabled:text-white/[0.65]"
                   >
-                    <i className="fa-solid fa-arrow-up text-xs" aria-hidden="true" />
+                    <i className="fa-solid fa-arrow-up text-sm" aria-hidden="true" />
                   </button>
                 </div>
                 {chatError ? <p className="mb-4 text-xs text-white/65">{chatError}</p> : null}
               </>
             )}
           </section>
-        </div>
+          ) : null}
+                </div>
+              </div>
+            </>
+          )}
+        </FadePresence>
       </div>
     </main>
   );

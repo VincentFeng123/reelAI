@@ -99,10 +99,10 @@ start_backend() {
   fi
 
   spawn_detached \
-    "$ROOT_DIR/backend" \
+    "$ROOT_DIR" \
     "$LOG_DIR/backend.log" \
     "$ROOT_DIR/backend/.venv/bin/python" \
-    -m uvicorn app.main:app --host 0.0.0.0 --port 8000 \
+    -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 \
     >"$PID_DIR/backend.pid"
   if wait_for_port 8000 30 0.5 && wait_for_backend_health 30 0.5; then
     echo "Backend started on localhost:8000"

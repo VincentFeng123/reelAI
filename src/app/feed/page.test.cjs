@@ -8,6 +8,7 @@ const filePath = path.join(__dirname, "page.tsx");
 const source = fs.readFileSync(filePath, "utf8");
 const reelCardSource = fs.readFileSync(path.join(__dirname, "../../components/ReelCard.tsx"), "utf8");
 const feedQuerySource = fs.readFileSync(path.join(__dirname, "../../lib/feedQuery.ts"), "utf8");
+const localDemoSource = fs.readFileSync(path.join(__dirname, "../../lib/localDemo.ts"), "utf8");
 const typesSource = fs.readFileSync(path.join(__dirname, "../../lib/types.ts"), "utf8");
 const sourceFile = ts.createSourceFile(
   filePath,
@@ -16,6 +17,263 @@ const sourceFile = ts.createSourceFile(
   true,
   ts.ScriptKind.TSX,
 );
+
+test("local demo player hydrates real reel UI without backend-owned work", () => {
+  assert.match(source, /isLocalDemoView\(params\.get\("demo"\), "player"\)/);
+  assert.match(source, /demoPlayerEnabled[\s\S]*LOCAL_DEMO_REELS/);
+  assert.match(source, /setCanRequestMore\(false\)[\s\S]*setFeedPagesExhausted\(true\)/);
+  assert.match(source, /if \(demoPlayerEnabled \|\| demoAccountReturnEnabled\) \{[\s\S]*demoReply[\s\S]*setChatLoading\(false\)/);
+  assert.match(source, /if \(demoPlayerEnabled \|\| demoAccountReturnEnabled\) \{[\s\S]*setFeedbackByReel/);
+  assert.match(source, /if \(!demoPlayerEnabled && !materialId/);
+  assert.match(localDemoSource, /reel_id: "community:demo:/);
+});
+
+test("local demo quiz opens the real recall UI and handles answers without backend writes", async () => {
+  assert.match(source, /const demoQuizEnabled = isLocalDemoView\(params\.get\("demo"\), "quiz"\)/);
+  assert.match(source, /isLocalDemoView\(params\.get\("demo"\), "player"\) \|\| demoQuizEnabled/);
+  assert.match(source, /if \(!demoQuizEnabled\) \{[\s\S]{0,120}?return;[\s\S]{0,260}?setAssessmentSession\(\{[\s\S]{0,160}?LOCAL_DEMO_ASSESSMENT_SESSION/);
+  assert.match(source, /if \(demoQuizEnabled\) \{\s*setAssessmentBootstrapPending\(false\);\s*return;\s*\}/);
+  assert.match(source, /assessmentSession\.answered_count >= assessmentSession\.question_count[\s\S]{0,260}?if \(demoQuizEnabled\) \{[\s\S]{0,120}?return;/);
+  assert.match(source, /if \(demoQuizEnabled\) \{\s*closeAssessmentAndContinue\(\);\s*return;\s*\}/);
+  assert.match(localDemoSource, /LOCAL_DEMO_ASSESSMENT_SESSION/);
+  assert.match(localDemoSource, /LOCAL_DEMO_ASSESSMENT_ANSWERS/);
+
+  const session = {
+    id: "demo-session",
+    material_id: "demo-material",
+    status: "pending",
+    current_index: 0,
+    question_count: 1,
+    answered_count: 0,
+    questions: [{
+      id: "demo-question",
+      reel_id: "demo-reel",
+      concept_id: "demo-concept",
+      concept_title: "Demo concept",
+      prompt: "Demo prompt?",
+      options: ["No", "Yes", "Maybe", "Later"],
+    }],
+    score: null,
+    understood_concepts: [],
+    revisit_concepts: [],
+  };
+  let nextSession = null;
+  let reveal = null;
+  let answerCalls = 0;
+  const submitAnswer = compileUseCallback("submitAssessmentAnswer", {
+    assessmentSession: session,
+    assessmentAnswering: false,
+    assessmentAnswerReveal: null,
+    assessmentQuestionIndex: 0,
+    demoQuizEnabled: true,
+    LOCAL_DEMO_ASSESSMENT_ANSWERS: {
+      "demo-question": { correctIndex: 1, explanation: "That is correct." },
+    },
+    setAssessmentSession: (value) => { nextSession = value; },
+    setAssessmentAnswerReveal: (value) => { reveal = value; },
+    setAssessmentError: () => {},
+    answerAssessmentQuestion: async () => {
+      answerCalls += 1;
+      throw new Error("demo answer reached the backend");
+    },
+  });
+  await submitAnswer(1);
+  assert.equal(answerCalls, 0);
+  assert.equal(nextSession.status, "completed");
+  assert.equal(nextSession.current_index, 1);
+  assert.equal(nextSession.answered_count, 1);
+  assert.equal(nextSession.score, 1);
+  assert.deepEqual(nextSession.understood_concepts, ["Demo concept"]);
+  assert.equal(reveal.correct, true);
+
+  let closed = false;
+  let snoozeCalls = 0;
+  const chooseLater = compileUseCallback("snoozeActiveAssessment", {
+    assessmentSession: session,
+    assessmentSnoozing: false,
+    demoQuizEnabled: true,
+    closeAssessmentAndContinue: () => { closed = true; },
+    snoozeAssessment: async () => {
+      snoozeCalls += 1;
+      throw new Error("demo snooze reached the backend");
+    },
+  });
+  await chooseLater();
+  assert.equal(snoozeCalls, 0);
+  assert.equal(closed, true);
+});
+
+test("recall check is inserted immediately after its anchor reel as a feed page", () => {
+  const buildFeedItems = compileFunctionDeclaration("buildFeedItems");
+  const reels = [
+    { reel_id: "reel-1" },
+    { reel_id: "reel-2" },
+    { reel_id: "reel-3" },
+  ];
+  const anchoredItems = buildFeedItems(reels, 1);
+  assert.deepEqual(
+    anchoredItems.map((item) => item.kind === "reel" ? item.reel.reel_id : item.kind),
+    ["reel-1", "reel-2", "recall-check", "reel-3"],
+  );
+  assert.deepEqual(
+    buildFeedItems(reels, null).map((item) => item.reel.reel_id),
+    ["reel-1", "reel-2", "reel-3"],
+  );
+  assert.match(source, /const activeFeedPageIndex = activeIndex \+ \(assessmentSession && assessmentSlideActive \? 1 : 0\)/);
+  assert.match(source, /feedItems\.map\(\(item\) => \{[\s\S]{0,260}?item\.kind === "recall-check"[\s\S]{0,700}?<RecallCheck/);
+  assert.doesNotMatch(source, /<FadePresence show=\{assessmentSession !== null\}>/);
+});
+
+test("one deliberate wheel gesture can reach the recall page", () => {
+  const thresholdMatch = source.match(/const WHEEL_DELTA_THRESHOLD = (\d+);/);
+  assert.ok(thresholdMatch);
+  assert.ok(Number(thresholdMatch[1]) <= 12, "the feed should respond to small trackpad deltas");
+
+  const wheelGestureReleaseTimerRef = { current: null };
+  const jumps = [];
+  let prevented = false;
+  const handleFeedWheelNative = compileUseCallback("handleFeedWheelNative", {
+    reels: [{ reel_id: "demo-reel" }],
+    isControlTarget: () => false,
+    resetFeedScrollPosition: () => {},
+    wheelGestureReleaseTimerRef,
+    wheelAccumRef: { current: 0 },
+    wheelReadyToRearmRef: { current: false },
+    wheelGestureConsumedRef: { current: false },
+    WHEEL_GESTURE_RELEASE_MS: 220,
+    isTransitioningRef: { current: false },
+    stepLockUntilRef: { current: 0 },
+    WHEEL_DELTA_THRESHOLD: Number(thresholdMatch[1]),
+    shouldBlockDownwardAtEnd: () => false,
+    jumpOneReel: (direction) => jumps.push(direction),
+  });
+  for (const deltaY of [3, 3, 3, 3]) {
+    handleFeedWheelNative({
+      target: null,
+      deltaX: 0,
+      deltaY,
+      preventDefault: () => { prevented = true; },
+    });
+  }
+  handleFeedWheelNative({
+    target: null,
+    deltaX: 0,
+    deltaY: 80,
+    preventDefault: () => { prevented = true; },
+  });
+  clearTimeout(wheelGestureReleaseTimerRef.current);
+
+  assert.equal(prevented, true);
+  assert.deepEqual(jumps, [1], "momentum from one trackpad gesture must not skip another reel");
+});
+
+test("the active recall page keeps the reel's compact desktop footprint", () => {
+  assert.match(
+    source,
+    /assessmentSlideActive\s*\? "lg:w-\[min\(calc\(56\.25dvh-1\.6875rem\),29\.25rem\)\] lg:flex-none"/,
+  );
+  assert.match(
+    source,
+    /assessmentSlideActive\s*\? "touch-pan-y lg:aspect-\[9\/16\][^"]*lg:h-\[min\(calc\(100dvh-3rem\),52rem\)\]/,
+  );
+});
+
+test("the reel player's genuine top strip uses the shared gradient", () => {
+  assert.match(
+    reelCardSource,
+    /data-top-chrome="reel-player"[\s\S]{0,160}?className="top-nav-fade pointer-events-none absolute inset-x-0 top-0 z-\[16\] h-20"/,
+  );
+  assert.doesNotMatch(reelCardSource, /inset-x-0 top-0 z-\[16\] h-20 bg-black\/95/);
+});
+
+test("custom captions sit above masked iframe chrome", () => {
+  assert.match(reelCardSource, /currentSec >= Number\(candidate\.start\) && currentSec < Number\(candidate\.end\)/);
+  assert.match(localDemoSource, /cue_id: "demo-nn-1", start: 0, end: 22/);
+  assert.doesNotMatch(reelCardSource, /cc_load_policy|modestbranding/);
+  assert.match(
+    reelCardSource,
+    /data-bottom-chrome="reel-player"[\s\S]{0,180}?h-32 bg-gradient-to-t from-black via-black\/75 to-transparent/,
+  );
+  assert.match(
+    reelCardSource,
+    /data-reel-caption="true"[\s\S]{0,220}?bottom-24[\s\S]{0,100}?lg:bottom-28/,
+  );
+  assert.match(reelCardSource, /text-base[\s\S]{0,180}?sm:text-lg[\s\S]{0,100}?lg:text-xl/);
+});
+
+test("a normal pause preserves the current video frame", () => {
+  const surfaceMaskDeclaration = reelCardSource.match(/const hidePlayerSurface = .*;/)?.[0] || "";
+  assert.match(surfaceMaskDeclaration, /!isReady \|\| !isSurfaceVisible \|\| Boolean\(loadError\)/);
+  assert.doesNotMatch(surfaceMaskDeclaration, /!isPlaying/);
+  assert.match(
+    reelCardSource,
+    /isReady && !isPlaying && !loadError[\s\S]{0,260}?fa-solid fa-play/,
+  );
+});
+
+test("the reel view uses a borderless desktop theater and accessible action rail", () => {
+  assert.doesNotMatch(source, /\bborder\b/);
+  assert.doesNotMatch(reelCardSource, /\bborder\b/);
+  assert.doesNotMatch(source, /bg-\[#0f0f0f\]/);
+  assert.match(source, /<main className="fixed inset-0 overflow-visible bg-black/);
+  assert.match(source, /lg:aspect-\[9\/16\][\s\S]{0,120}?lg:h-\[min\(calc\(100dvh-3rem\),52rem\)\][\s\S]{0,120}?lg:w-auto/);
+  assert.match(source, /aria-pressed=\{active\}/);
+  assert.match(source, /active[\s\S]{0,80}?\? "text-white"[\s\S]{0,120}?: "text-white\/65 hover:text-white focus-visible:text-white"/);
+  assert.match(source, /rounded-full bg-transparent text-sm transition-\[color,transform\]/);
+  assert.match(source, /className=\{`\$\{active \? "fa-solid" : "fa-regular"\} \$\{iconClass\}`\}/);
+  assert.match(source, /const iconStyle = active \|\| iconClass === "fa-ellipsis" \? "fa-solid" : "fa-regular"/);
+  assert.match(source, /renderMobileFeedbackButton\("confusing", "Need help", "fa-thumbs-down", Boolean\(activeFeedback\.confusing\)\)/);
+  assert.doesNotMatch(source, /fa-circle-question/);
+  assert.match(reelCardSource, /aria-label="Playback settings"[\s\S]{0,260}?fa-solid fa-gear/);
+  assert.doesNotMatch(reelCardSource, /fa-solid fa-ellipsis/);
+  assert.match(
+    reelCardSource,
+    /ref=\{hostContainerRef\}[\s\S]{0,220}?data-youtube-crop="true"[\s\S]{0,220}?style=\{\{ top: "-10%", height: "120%" \}\}/,
+  );
+  assert.match(reelCardSource, /<iframe[\s\S]{0,240}?className="absolute inset-0 h-full w-full"/);
+});
+
+test("desktop info and chat are mutually exclusive collapsed card extensions", () => {
+  assert.match(source, /useState<DesktopPanel \| null>\(null\)/);
+  assert.match(source, /renderDesktopPanelButton\("info", "Reel info", "fa-ellipsis"\)[\s\S]{0,120}?renderDesktopPanelButton\("chat", "AI chat", "fa-message"\)/);
+  assert.match(source, /desktopPanel === "info" \? \([\s\S]{0,160}?<aside className="h-full[^"]*rounded-2xl bg-\[#181818\]/);
+  assert.match(source, /desktopPanel === "chat" \? \([\s\S]{0,160}?<section className="flex h-full[^"]*rounded-2xl bg-\[#181818\]/);
+  assert.match(source, /desktopShellRef[\s\S]{0,120}?lg:flex lg:items-center lg:justify-center/);
+  assert.match(source, /lg:w-\[calc\(min\(calc\(56\.25dvh-1\.6875rem\),29\.25rem\)\+3\.5rem\)\] lg:flex-none/);
+  assert.match(source, /<FadePresence show=\{!assessmentSlideActive && desktopPanel !== null\} exitMs=\{320\}>/);
+  assert.match(source, /transition-\[width,opacity\][\s\S]{0,180}?panelVisible \? "w-6 opacity-100" : "pointer-events-none w-0 opacity-0"/);
+  assert.match(source, /flex-none transition-\[width\][\s\S]{0,180}?panelVisible \? "" : "pointer-events-none"/);
+  assert.match(source, /h-full transition-opacity duration-300[\s\S]{0,160}?panelVisible \? "opacity-100" : "opacity-0"/);
+  assert.match(source, /lg:block lg:h-\[min\(calc\(100dvh-3rem\),52rem\)\]/);
+  assert.match(source, /width: panelVisible \? `\$\{Math\.round\(rightPanelWidthPx\)\}px` : "0px"/);
+  assert.match(source, /style=\{\{ width: `min\(\$\{Math\.round\(rightPanelWidthPx\)\}px, 52vw\)` \}\}/);
+  assert.doesNotMatch(source, /gridTemplateRows|Resize right panels/);
+  assert.match(source, /relative h-full transition-opacity[\s\S]{0,520}?onClick=\{\(\) => toggleDesktopPanel\(desktopPanel\)\}[\s\S]{0,180}?aria-label=\{desktopPanel === "info" \? "Close reel info panel" : "Close AI chat panel"\}[\s\S]{0,260}?hover:bg-white\/\[0\.07\][\s\S]{0,180}?fa-xmark/);
+  assert.match(source, /aria-label="Back to main page"[\s\S]{0,280}?h-8 w-8[^"\n]*rounded-lg[^"\n]*bg-transparent[^"\n]*hover:bg-white\/\[0\.07\][^"\n]*focus-visible:bg-white\/\[0\.07\][\s\S]{0,180}?fa-chevron-left/);
+});
+
+test("the AI chat send arrow remains visible while sending is unavailable", () => {
+  assert.match(
+    source,
+    /aria-label="Send message"[\s\S]{0,320}?disabled:bg-white\/\[0\.12\][^"\n]*disabled:text-white\/\[0\.65\][\s\S]{0,120}?fa-arrow-up text-sm/,
+  );
+  assert.doesNotMatch(source, /aria-label="Send message"[\s\S]{0,260}?disabled:bg-white\/12/);
+});
+
+test("the player timeline is thin and tucked under its control row", () => {
+  assert.match(reelCardSource, /className="mb-0 flex items-center justify-between gap-2"/);
+  assert.match(reelCardSource, /className="group\/progress relative h-4 w-full leading-none"/);
+  assert.match(reelCardSource, /top-1\/2 h-0\.5 -translate-y-1\/2/);
+  assert.match(reelCardSource, /top-1\/2 z-\[1\] h-2 w-2/);
+  assert.match(reelCardSource, /className="reel-range relative z-10 block h-4 w-full/);
+});
+
+test("demo community handoffs keep their reels and return to the demo account", () => {
+  assert.match(source, /isLocalDemoView\(params\.get\("return_demo"\), "account"\)/);
+  assert.match(source, /if \(demoAccountReturnEnabled\) \{\s*nextParams\.set\("demo", "account"\)/);
+  assert.match(source, /nextParams\.set\("tab", "community"\)/);
+  assert.doesNotMatch(source, /isLocalDemoView\(params\.get\("return_demo"\), "player"\)/);
+});
 
 function findVariableInitializer(name) {
   let initializer = null;
@@ -49,6 +307,9 @@ function compileUseCallback(name, bindings) {
   );
   const effectiveBindings = {
     billingWorkBlockedRef: { current: false },
+    assessmentSession: null,
+    assessmentSlideActive: false,
+    setAssessmentSlideActive: () => {},
     isDailySearchLimitError: () => false,
     isVerifiedAccountRequiredError: () => false,
     isTransportError: () => false,
@@ -1876,6 +2137,7 @@ test("a checkpoint scroll gate serializes rapid swipes before opening recall", a
   };
   const gateStates = [];
   const openedSessions = [];
+  const slideStates = [];
   const advanceAfterClose = [];
   let scrollCalls = 0;
   let assessmentCalls = 0;
@@ -1911,6 +2173,7 @@ test("a checkpoint scroll gate serializes rapid swipes before opening recall", a
     },
     withAssessmentAccuracy: (session) => session,
     setAssessmentSession: (session) => openedSessions.push(session),
+    setAssessmentSlideActive: (value) => slideStates.push(value),
     setAssessmentQuestionIndex: () => {},
     clamp: (value, min, max) => Math.max(min, Math.min(max, value)),
     setAssessmentAnswerReveal: () => {},
@@ -1962,14 +2225,16 @@ test("a checkpoint scroll gate serializes rapid swipes before opening recall", a
   });
   await gatePromise;
 
-  assert.equal(activeIndexRef.current, 2, "the outgoing reel remains active behind recall");
+  assert.equal(activeIndexRef.current, 2, "the reel index remains anchored while recall occupies the next feed page");
   assert.equal(openedSessions.length, 1);
+  assert.deepEqual(slideStates, [true], "the original downward gesture should land on the recall page");
   assert.deepEqual(advanceAfterClose, [true], "closing recall should consume exactly the queued move");
   assert.deepEqual(gateStates, [true, false]);
 
   const closeAssessmentAndContinue = compileUseCallback("closeAssessmentAndContinue", {
     assessmentAdvanceAfterClose: true,
     assessmentStartRequestRef,
+    setAssessmentSlideActive: (value) => slideStates.push(value),
     setAssessmentSession: () => {},
     setAssessmentQuestionIndex: () => {},
     setAssessmentAnswerReveal: () => {},
@@ -1985,6 +2250,7 @@ test("a checkpoint scroll gate serializes rapid swipes before opening recall", a
   closeAssessmentAndContinue();
   assert.equal(activeIndexRef.current, 3);
   assert.equal(commits, 1);
+  assert.deepEqual(slideStates, [true, false]);
   assert.equal(assessmentStartRequestRef.current, null);
 });
 

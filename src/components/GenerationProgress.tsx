@@ -30,10 +30,10 @@ export function GenerationProgress({ received, requested, variant = "bar" }: Gen
       <div role="status" aria-live="polite" className="w-full">
         <div className="relative h-1 overflow-hidden rounded-full bg-white/10">
           {isIndeterminate ? (
-            <div className="animate-progress-shimmer absolute inset-y-0 w-1/3 bg-gradient-to-r from-transparent via-white/60 to-transparent" />
+            <div className="animate-progress-shimmer absolute inset-0 bg-white/15" />
           ) : (
             <div
-              className="absolute inset-y-0 left-0 bg-white/80 transition-all duration-500 ease-out"
+              className="absolute inset-y-0 left-0 bg-white/80"
               style={{ width: `${pct * 100}%` }}
             />
           )}
@@ -54,10 +54,10 @@ export function GenerationProgress({ received, requested, variant = "bar" }: Gen
     >
       <div className="relative h-1 overflow-hidden bg-white/10">
         {isIndeterminate ? (
-          <div className="animate-progress-shimmer absolute inset-y-0 w-1/3 bg-gradient-to-r from-transparent via-white/60 to-transparent" />
+          <div className="animate-progress-shimmer absolute inset-0 bg-white/15" />
         ) : (
           <div
-            className="absolute inset-y-0 left-0 bg-white/80 transition-all duration-500 ease-out"
+            className="absolute inset-y-0 left-0 bg-white/80"
             style={{ width: `${pct * 100}%` }}
           />
         )}

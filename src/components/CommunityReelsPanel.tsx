@@ -1,7 +1,6 @@
 "use client";
 
 import { type ChangeEvent, type DragEvent, type FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
 
 import {
@@ -10,6 +9,7 @@ import {
   expireCommunityAuthSession,
   createCommunitySet,
   deleteCommunitySet,
+  deleteCommunitySets,
   fetchCommunityAccount,
   fetchCommunityReelDuration,
   fetchCommunitySets,
@@ -22,11 +22,21 @@ import {
 import { safeStorageRemoveItem, safeStorageSetItem } from "@/lib/browserStorage";
 import type { CommunityAccount } from "@/lib/types";
 import { ViewportModalPortal } from "@/components/ViewportModalPortal";
+import { FadePresence } from "@/components/FadePresence";
+import {
+  LOCAL_DEMO_ACCOUNT,
+  LOCAL_DEMO_AVAILABLE,
+  LOCAL_DEMO_COMMUNITY_SETS,
+} from "@/lib/localDemo";
 import { loadYouTubeIframeApi } from "@/lib/youtubeIframeApi";
 
 const COMMUNITY_SETS_STORAGE_KEY = "studyreels-community-sets";
 const COMMUNITY_CREATE_DRAFT_STORAGE_KEY = "studyreels-community-create-draft";
 const COMMUNITY_EDIT_DRAFT_PREFIX = "studyreels-community-edit-draft-";
+const LOCAL_DEMO_SETS_STORAGE_KEY = "studyreels-local-demo-community-sets";
+const LOCAL_DEMO_STARRED_SET_IDS_STORAGE_KEY = "studyreels-local-demo-community-starred-set-ids";
+const LOCAL_DEMO_CREATE_DRAFT_STORAGE_KEY = "studyreels-local-demo-community-create-draft";
+const LOCAL_DEMO_EDIT_DRAFT_PREFIX = "studyreels-local-demo-community-edit-draft-";
 const MAX_USER_SETS = 120;
 const FALLBACK_THUMBNAIL_URL = "/images/community/ai-systems.svg";
 const SUPPORTED_PLATFORMS_LABEL = "YouTube, Instagram, TikTok";
@@ -35,17 +45,11 @@ const MAX_SET_TAGS = 6;
 const FEATURED_CAROUSEL_INTERVAL_MS = 5200;
 const FEATURED_CAROUSEL_TRANSITION_MS = 520;
 const FEATURED_CAROUSEL_PAUSE_MS = 200;
-const FEATURED_CAROUSEL_CONTENT_MIN_HEIGHT_FALLBACK = 410;
-const FEATURED_CAROUSEL_CONTENT_MIN_HEIGHT_TOUCH_FALLBACK = 280;
-const FEATURED_CAROUSEL_BUTTON_BOTTOM_MARGIN_PX = 18;
-const FEATURED_CAROUSEL_IMAGE_BOTTOM_MARGIN_PX = 18;
+const FEATURED_CAROUSEL_CONTENT_MIN_HEIGHT_FALLBACK = 250;
+const FEATURED_CAROUSEL_CONTENT_MIN_HEIGHT_TOUCH_FALLBACK = 220;
+const FEATURED_CAROUSEL_BUTTON_BOTTOM_MARGIN_PX = 14;
+const FEATURED_CAROUSEL_IMAGE_BOTTOM_MARGIN_PX = 14;
 const DIRECTORY_DETAIL_TRANSITION_MS = 440;
-const DETAIL_CONTENT_TOP_PADDING_FALLBACK = 420;
-const DETAIL_CONTENT_TOP_PADDING_GUTTER = 16;
-const DETAIL_CONTENT_TOP_PADDING_UPSHIFT_PX = 56;
-const DETAIL_REEL_CAROUSEL_INTERVAL_MS = 5200;
-const DETAIL_BANNER_LEFT_EXPANSION_PX = 10;
-const DETAIL_BANNER_LEFT_INSET_PX = 8;
 const COMMUNITY_SET_FEED_HANDOFF_PREFIX = "studyreels-community-feed-handoff-";
 const COMMUNITY_SET_RETURN_SNAPSHOT_PREFIX = "studyreels-community-return-set-";
 const COMMUNITY_STARRED_SET_IDS_STORAGE_KEY = "studyreels-community-starred-set-ids";
@@ -63,7 +67,6 @@ const DAY_MS = 24 * HOUR_MS;
 const WEEK_MS = 7 * DAY_MS;
 const MONTH_MS = 30 * DAY_MS;
 const YEAR_MS = 365 * DAY_MS;
-
 type ReelPlatform = "youtube" | "instagram" | "tiktok";
 
 type CommunityReelEmbed = {
@@ -170,7 +173,7 @@ type PublishResultModalState = {
 };
 
 type DeleteSetConfirmModalState = {
-  setId: string;
+  setIds: string[];
   title: string;
 };
 
@@ -540,12 +543,38 @@ function formatRelativeElapsed(elapsedMs: number): string {
   return `${years} year${years === 1 ? "" : "s"} ago`;
 }
 
-function formatLastEditedLabel(set: Pick<CommunitySet, "updatedAt" | "updatedLabel">, nowMs: number): string {
+function formatModifiedLabel(set: Pick<CommunitySet, "updatedAt" | "updatedLabel">, nowMs: number): string {
   const updatedMs = parseTimestampMs(set.updatedAt);
   if (updatedMs != null) {
-    return `Last Edited: ${formatRelativeElapsed(nowMs - updatedMs)}`;
+    const nowDate = new Date(nowMs);
+    const updatedDate = new Date(updatedMs);
+    const todayStartMs = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate()).getTime();
+    const updatedDayStartMs = new Date(updatedDate.getFullYear(), updatedDate.getMonth(), updatedDate.getDate()).getTime();
+    const calendarDayDelta = Math.max(0, Math.round((todayStartMs - updatedDayStartMs) / DAY_MS));
+    if (calendarDayDelta === 0) {
+      return "Today";
+    }
+    if (calendarDayDelta === 1) {
+      return "Yesterday";
+    }
+    if (calendarDayDelta < 7) {
+      return `${calendarDayDelta} days ago`;
+    }
+    return updatedDate.toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+      ...(updatedDate.getFullYear() === nowDate.getFullYear() ? {} : { year: "numeric" }),
+    });
   }
-  return normalizeLastEditedLabel(set.updatedLabel);
+
+  const relativeLabel = normalizeLastEditedLabel(set.updatedLabel).replace(/^Last Edited:\s*/i, "");
+  if (/^(today|just now|less than 1 minute ago)$/i.test(relativeLabel)) {
+    return "Today";
+  }
+  if (/^(yesterday|1 day ago)$/i.test(relativeLabel)) {
+    return "Yesterday";
+  }
+  return relativeLabel;
 }
 
 function parseAllTags(value: string): string[] {
@@ -922,6 +951,44 @@ function parseStoredSetDraft(raw: string | null): StoredSetDraft | null {
   }
 }
 
+let localDemoSetSequence = 0;
+
+function buildLocalDemoSet(params: {
+  existingSet?: CommunitySet | null;
+  setId?: string;
+  title: string;
+  description: string;
+  tags: string[];
+  reels: Array<Omit<CommunityReelEmbed, "id"> & { id?: string }>;
+  thumbnailUrl: string;
+}): CommunitySet {
+  const now = new Date().toISOString();
+  localDemoSetSequence += 1;
+  const id = params.existingSet?.id
+    ?? params.setId?.trim()
+    ?? `local-demo-set-created-${Date.now()}-${localDemoSetSequence}`;
+  const reels = params.reels.map((reel, index) => ({
+    ...reel,
+    id: reel.id?.trim() || `${id}-reel-${index + 1}`,
+  }));
+  return {
+    id,
+    title: params.title,
+    description: params.description,
+    tags: params.tags,
+    reels,
+    reelCount: reels.length,
+    curator: LOCAL_DEMO_ACCOUNT.username,
+    likes: params.existingSet?.likes ?? 0,
+    learners: params.existingSet?.learners ?? 0,
+    updatedLabel: "Last Edited: just now",
+    updatedAt: now,
+    createdAt: params.existingSet?.createdAt ?? now,
+    thumbnailUrl: params.thumbnailUrl,
+    featured: params.existingSet?.featured ?? false,
+  };
+}
+
 function draftRowsFromReels(reels: CommunityReelEmbed[]): DraftReelInput[] {
   if (reels.length === 0) {
     return [createDraftReelRow()];
@@ -1002,6 +1069,7 @@ type CommunityReelsPanelMode = "community" | "create" | "edit";
 
 type CommunityReelsPanelProps = {
   mode?: CommunityReelsPanelMode;
+  demoMode?: boolean;
   isVisible?: boolean;
   onDetailOpenChange?: (isOpen: boolean) => void;
   onActiveCommunitySetChange?: (setId: string | null) => void;
@@ -1016,6 +1084,7 @@ type FeaturedTransitionStage = "idle" | "exiting" | "pause" | "entering";
 
 export function CommunityReelsPanel({
   mode = "community",
+  demoMode = false,
   isVisible = true,
   onDetailOpenChange,
   onActiveCommunitySetChange,
@@ -1026,17 +1095,29 @@ export function CommunityReelsPanel({
   onOpenCommunityReelInFeed,
 }: CommunityReelsPanelProps) {
   const router = useRouter();
+  const localDemoEnabled = demoMode && LOCAL_DEMO_AVAILABLE;
+  const starredSetsStorageKey = localDemoEnabled
+    ? LOCAL_DEMO_STARRED_SET_IDS_STORAGE_KEY
+    : COMMUNITY_STARRED_SET_IDS_STORAGE_KEY;
+  const createDraftStorageKey = localDemoEnabled
+    ? LOCAL_DEMO_CREATE_DRAFT_STORAGE_KEY
+    : COMMUNITY_CREATE_DRAFT_STORAGE_KEY;
+  const editDraftStoragePrefix = localDemoEnabled
+    ? LOCAL_DEMO_EDIT_DRAFT_PREFIX
+    : COMMUNITY_EDIT_DRAFT_PREFIX;
   const [activeCommunityCategory, setActiveCommunityCategory] = useState("Featured");
   const [activeFeaturedIndex, setActiveFeaturedIndex] = useState(0);
   const [leavingFeaturedIndex, setLeavingFeaturedIndex] = useState<number | null>(null);
   const [pendingFeaturedIndex, setPendingFeaturedIndex] = useState<number | null>(null);
   const [featuredTransitionStage, setFeaturedTransitionStage] = useState<FeaturedTransitionStage>("idle");
-  const [featuredTransitionDirection, setFeaturedTransitionDirection] = useState<1 | -1>(1);
   const [featuredCarouselContentHeight, setFeaturedCarouselContentHeight] = useState(FEATURED_CAROUSEL_CONTENT_MIN_HEIGHT_FALLBACK);
   const [selectedDirectorySet, setSelectedDirectorySet] = useState<CommunitySet | null>(null);
   const [isDirectoryDetailOpen, setIsDirectoryDetailOpen] = useState(false);
   const [communityQuery, setCommunityQuery] = useState("");
   const [yourSetsQuery, setYourSetsQuery] = useState("");
+  const [yourSetsModifiedSortDirection, setYourSetsModifiedSortDirection] = useState<"newest" | "oldest">("newest");
+  const [isCompactCommunitySearchOpen, setIsCompactCommunitySearchOpen] = useState(false);
+  const [isCompactYourSetsSearchOpen, setIsCompactYourSetsSearchOpen] = useState(false);
   const [setTitle, setSetTitle] = useState("");
   const [setDescription, setSetDescription] = useState("");
   const [setTags, setSetTags] = useState("");
@@ -1059,30 +1140,35 @@ export function CommunityReelsPanel({
   const [starredSetIds, setStarredSetIds] = useState<string[]>([]);
   const [starredSetsHydrated, setStarredSetsHydrated] = useState(false);
   const [activeSetActionsMenuId, setActiveSetActionsMenuId] = useState<string | null>(null);
-  const [deletingSetId, setDeletingSetId] = useState<string | null>(null);
+  const [selectedEditableSetIds, setSelectedEditableSetIds] = useState<string[]>([]);
+  const [deletingSetIds, setDeletingSetIds] = useState<string[]>([]);
   const [publicSets, setPublicSets] = useState<CommunitySet[]>([]);
-  const [ownedSets, setOwnedSets] = useState<CommunitySet[]>([]);
-  const [ownedSetIds, setOwnedSetIds] = useState<string[]>([]);
-  const [communityAccount, setCommunityAccount] = useState<CommunityAccount | null>(null);
+  const [ownedSets, setOwnedSets] = useState<CommunitySet[]>(() => (
+    localDemoEnabled ? [...LOCAL_DEMO_COMMUNITY_SETS] : []
+  ));
+  const [ownedSetIds, setOwnedSetIds] = useState<string[]>(() => (
+    localDemoEnabled ? LOCAL_DEMO_COMMUNITY_SETS.map((set) => set.id) : []
+  ));
+  const [communityAccount, setCommunityAccount] = useState<CommunityAccount | null>(
+    localDemoEnabled ? LOCAL_DEMO_ACCOUNT : null,
+  );
   const [authBusy, setAuthBusy] = useState(false);
-  const [authHydrated, setAuthHydrated] = useState(false);
+  const [authHydrated, setAuthHydrated] = useState(localDemoEnabled);
   const [storageHydrated, setStorageHydrated] = useState(false);
-  const [portalReady, setPortalReady] = useState(false);
   const [relativeTimeNowMs, setRelativeTimeNowMs] = useState(() => Date.now());
-  const [detailBannerLeft, setDetailBannerLeft] = useState(0);
-  const [detailBannerRight, setDetailBannerRight] = useState(0);
-  const [detailBannerHeight, setDetailBannerHeight] = useState(0);
-  const [isDetailBannerCompact, setIsDetailBannerCompact] = useState(false);
   const [skipDetailTransitionOnce, setSkipDetailTransitionOnce] = useState(false);
   const [isInitialDetailRestorePending, setIsInitialDetailRestorePending] = useState(
     () => mode === "community" && Boolean(initialOpenSetId?.trim()),
   );
   const [isThumbnailDragOver, setIsThumbnailDragOver] = useState(false);
   const [thumbnailFileName, setThumbnailFileName] = useState("");
-  const panelRootRef = useRef<HTMLDivElement | null>(null);
-  const detailBannerRef = useRef<HTMLDivElement | null>(null);
+  const directoryViewRef = useRef<HTMLDivElement | null>(null);
   const detailContentScrollRef = useRef<HTMLDivElement | null>(null);
+  const detailBackButtonRef = useRef<HTMLButtonElement | null>(null);
+  const detailReturnFocusRef = useRef<HTMLElement | null>(null);
   const communityScrollRef = useRef<HTMLDivElement | null>(null);
+  const compactCommunitySearchInputRef = useRef<HTMLInputElement | null>(null);
+  const compactYourSetsSearchInputRef = useRef<HTMLInputElement | null>(null);
   const activeFeaturedSlideRef = useRef<HTMLDivElement | null>(null);
   const directoryDetailCloseTimerRef = useRef<number | null>(null);
   const reelDurationCacheRef = useRef<Record<string, number | null>>({});
@@ -1096,6 +1182,7 @@ export function CommunityReelsPanel({
   const clearOwnedCommunityState = useCallback(() => {
     setOwnedSets([]);
     setOwnedSetIds([]);
+    setSelectedEditableSetIds([]);
     saveOwnedCommunitySetIds([]);
   }, []);
 
@@ -1113,9 +1200,7 @@ export function CommunityReelsPanel({
     }
     let cancelled = false;
     let authSyncSequence = 0;
-    setPortalReady(true);
-    safeStorageRemoveItem(window.localStorage, COMMUNITY_SETS_STORAGE_KEY);
-    const starredSetIdsRaw = window.localStorage.getItem(COMMUNITY_STARRED_SET_IDS_STORAGE_KEY);
+    const starredSetIdsRaw = window.localStorage.getItem(starredSetsStorageKey);
     if (starredSetIdsRaw) {
       try {
         const parsed = JSON.parse(starredSetIdsRaw);
@@ -1129,8 +1214,31 @@ export function CommunityReelsPanel({
       } catch {
         // Ignore malformed starred set storage values.
       }
+    } else {
+      setStarredSetIds([]);
     }
     setStarredSetsHydrated(true);
+
+    if (localDemoEnabled) {
+      const storedDemoSetsRaw = window.localStorage.getItem(LOCAL_DEMO_SETS_STORAGE_KEY);
+      const demoSets = storedDemoSetsRaw === null
+        ? [...LOCAL_DEMO_COMMUNITY_SETS]
+        : parseStoredSets(storedDemoSetsRaw);
+      setCommunityAccount(LOCAL_DEMO_ACCOUNT);
+      setOwnedSets(demoSets);
+      setOwnedSetIds(demoSets.map((set) => set.id));
+      setPublicSets([]);
+      ownedSetsAccountIdRef.current = LOCAL_DEMO_ACCOUNT.id;
+      setAuthHydrated(true);
+      setStorageHydrated(true);
+      return () => {
+        cancelled = true;
+        authSyncSequence += 1;
+      };
+    }
+
+    setAuthHydrated(false);
+    safeStorageRemoveItem(window.localStorage, COMMUNITY_SETS_STORAGE_KEY);
     setStorageHydrated(true);
 
     const syncCommunityAuthState = async (options?: { validateSession?: boolean }) => {
@@ -1225,7 +1333,7 @@ export function CommunityReelsPanel({
       window.removeEventListener("storage", onStorage);
       window.removeEventListener(COMMUNITY_AUTH_CHANGED_EVENT, onAuthChanged);
     };
-  }, [clearOwnedCommunityState, refreshOwnedCommunitySets]);
+  }, [clearOwnedCommunityState, localDemoEnabled, refreshOwnedCommunitySets, starredSetsStorageKey]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1243,15 +1351,19 @@ export function CommunityReelsPanel({
     if (typeof window === "undefined" || !storageHydrated) {
       return;
     }
+    if (localDemoEnabled) {
+      safeStorageSetItem(window.localStorage, LOCAL_DEMO_SETS_STORAGE_KEY, JSON.stringify(ownedSets));
+      return;
+    }
     saveOwnedCommunitySetIds(ownedSetIds);
-  }, [ownedSetIds, storageHydrated]);
+  }, [localDemoEnabled, ownedSetIds, ownedSets, storageHydrated]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !starredSetsHydrated) {
       return;
     }
-    safeStorageSetItem(window.localStorage, COMMUNITY_STARRED_SET_IDS_STORAGE_KEY, JSON.stringify(starredSetIds));
-  }, [starredSetIds, starredSetsHydrated]);
+    safeStorageSetItem(window.localStorage, starredSetsStorageKey, JSON.stringify(starredSetIds));
+  }, [starredSetIds, starredSetsHydrated, starredSetsStorageKey]);
 
   useEffect(() => {
     if (!starredSetsHydrated) {
@@ -1299,27 +1411,6 @@ export function CommunityReelsPanel({
     };
   }, [clearDirectoryDetailCloseTimer]);
 
-  const updateDetailBannerGeometry = useCallback(() => {
-    if (!panelRootRef.current) {
-      return;
-    }
-    const panelRect = panelRootRef.current.getBoundingClientRect();
-    if (panelRect.width < 40 || panelRect.height < 40) {
-      // Skip geometry updates while the panel is hidden/off-layout.
-      return;
-    }
-    const nextLeft = Math.max(0, Math.round(panelRect.left) - DETAIL_BANNER_LEFT_EXPANSION_PX);
-    setDetailBannerLeft((prev) => (prev === nextLeft ? prev : nextLeft));
-    const nextRight = Math.max(0, Math.round(window.innerWidth - panelRect.right) - DETAIL_BANNER_LEFT_EXPANSION_PX);
-    setDetailBannerRight((prev) => (prev === nextRight ? prev : nextRight));
-
-    if (!detailBannerRef.current) {
-      return;
-    }
-    const nextHeight = Math.round(detailBannerRef.current.getBoundingClientRect().height);
-    setDetailBannerHeight((prev) => (prev === nextHeight ? prev : nextHeight));
-  }, []);
-
   const isYourSetsMode = mode === "edit";
   const isStandaloneCreateMode = mode === "create";
   const isFormEditMode = isYourSetsMode && isEditSetEditorOpen;
@@ -1352,31 +1443,48 @@ export function CommunityReelsPanel({
     return merged;
   }, [editableSets, publicSets]);
   const starredSetIdSet = useMemo(() => new Set(starredSetIds), [starredSetIds]);
-  const orderedEditableSets = useMemo(() => {
-    const starred: CommunitySet[] = [];
-    const regular: CommunitySet[] = [];
-    for (const set of editableSets) {
-      if (starredSetIdSet.has(set.id)) {
-        starred.push(set);
-      } else {
-        regular.push(set);
-      }
-    }
-    return [...starred, ...regular];
-  }, [editableSets, starredSetIdSet]);
+  const selectedEditableSetIdSet = useMemo(() => new Set(selectedEditableSetIds), [selectedEditableSetIds]);
+  const deletingSetIdSet = useMemo(() => new Set(deletingSetIds), [deletingSetIds]);
+  const isDeletingSets = deletingSetIds.length > 0;
   const filteredEditableSets = useMemo(() => {
     const normalized = yourSetsQuery.trim().toLowerCase();
-    if (!normalized) {
-      return orderedEditableSets;
-    }
-    return orderedEditableSets.filter((set) => matchesSetSearchQuery(set, normalized));
-  }, [orderedEditableSets, yourSetsQuery]);
+    const filtered = normalized
+      ? editableSets.filter((set) => matchesSetSearchQuery(set, normalized))
+      : [...editableSets];
+    return filtered.sort((left, right) => {
+      const leftUpdatedMs = parseTimestampMs(left.updatedAt);
+      const rightUpdatedMs = parseTimestampMs(right.updatedAt);
+      if (leftUpdatedMs == null && rightUpdatedMs != null) {
+        return 1;
+      }
+      if (leftUpdatedMs != null && rightUpdatedMs == null) {
+        return -1;
+      }
+      if (leftUpdatedMs != null && rightUpdatedMs != null && leftUpdatedMs !== rightUpdatedMs) {
+        return yourSetsModifiedSortDirection === "newest"
+          ? rightUpdatedMs - leftUpdatedMs
+          : leftUpdatedMs - rightUpdatedMs;
+      }
+      return left.title.localeCompare(right.title);
+    });
+  }, [editableSets, yourSetsModifiedSortDirection, yourSetsQuery]);
   const activeEditableSet = useMemo(
     () => editableSets.find((set) => set.id === activeEditSetId) ?? null,
     [activeEditSetId, editableSets],
   );
   const featuredCarouselSets = useMemo(() => FEATURED_SETS.slice(0, 3), []);
   const detailCarouselReels = useMemo(() => selectedDirectorySet?.reels ?? [], [selectedDirectorySet]);
+
+  useEffect(() => {
+    if (!shouldShowEditSetGrid || !canManageYourSets) {
+      setSelectedEditableSetIds((prev) => (prev.length > 0 ? [] : prev));
+      return;
+    }
+    setSelectedEditableSetIds((prev) => {
+      const next = prev.filter((setId) => ownedSetIdSet.has(setId));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [canManageYourSets, ownedSetIdSet, shouldShowEditSetGrid]);
 
   useEffect(() => {
     if (mode === "edit") {
@@ -1475,9 +1583,6 @@ export function CommunityReelsPanel({
     if (normalized === activeFeaturedIndex) {
       return;
     }
-    const forwardSteps = (normalized - activeFeaturedIndex + setCount) % setCount;
-    const backwardSteps = (activeFeaturedIndex - normalized + setCount) % setCount;
-    setFeaturedTransitionDirection(forwardSteps <= backwardSteps ? 1 : -1);
     setLeavingFeaturedIndex(activeFeaturedIndex);
     setPendingFeaturedIndex(normalized);
     setFeaturedTransitionStage("exiting");
@@ -1495,7 +1600,7 @@ export function CommunityReelsPanel({
   }, [activeFeaturedIndex, startFeaturedTransition]);
 
   useEffect(() => {
-    if (mode !== "community" || featuredCarouselSets.length <= 1) {
+    if (mode !== "community" || isDirectoryDetailOpen || featuredCarouselSets.length <= 1) {
       return;
     }
     const intervalId = window.setInterval(() => {
@@ -1504,7 +1609,7 @@ export function CommunityReelsPanel({
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [featuredCarouselSets.length, goToNextFeaturedSet, mode]);
+  }, [featuredCarouselSets.length, goToNextFeaturedSet, isDirectoryDetailOpen, mode]);
 
   useEffect(() => {
     if (featuredTransitionStage !== "exiting") {
@@ -1551,6 +1656,8 @@ export function CommunityReelsPanel({
 
   const isCommunitySearchActive = communityQuery.trim().length > 0;
   const isYourSetsSearchActive = yourSetsQuery.trim().length > 0;
+  const isCompactCommunitySearchExpanded = isCompactCommunitySearchOpen || isCommunitySearchActive;
+  const isCompactYourSetsSearchExpanded = isCompactYourSetsSearchOpen || isYourSetsSearchActive;
 
   useEffect(() => {
     if (mode !== "community" || isCommunitySearchActive || featuredCarouselSets.length === 0) {
@@ -1801,8 +1908,8 @@ export function CommunityReelsPanel({
     if (typeof window === "undefined") {
       return;
     }
-    window.localStorage.removeItem(COMMUNITY_CREATE_DRAFT_STORAGE_KEY);
-  }, []);
+    window.localStorage.removeItem(createDraftStorageKey);
+  }, [createDraftStorageKey]);
 
   const resetCreateSetForm = useCallback(() => {
     const nextDraft = normalizeStoredDraft({
@@ -1853,13 +1960,13 @@ export function CommunityReelsPanel({
     if (mode !== "create" || typeof window === "undefined") {
       return;
     }
-    const storedDraft = parseStoredSetDraft(window.localStorage.getItem(COMMUNITY_CREATE_DRAFT_STORAGE_KEY));
+    const storedDraft = parseStoredSetDraft(window.localStorage.getItem(createDraftStorageKey));
     if (storedDraft) {
       applyDraftToForm(storedDraft, COMMUNITY_CREATE_DRAFT_CONTEXT_KEY);
       return;
     }
     resetCreateSetForm();
-  }, [applyDraftToForm, mode, resetCreateSetForm]);
+  }, [applyDraftToForm, createDraftStorageKey, mode, resetCreateSetForm]);
 
   useEffect(() => {
     if (!requiresCommunityAuth || canManageYourSets) {
@@ -1903,14 +2010,14 @@ export function CommunityReelsPanel({
     if (!selectedSet) {
       return;
     }
-    const storedDraft = parseStoredSetDraft(window.localStorage.getItem(`${COMMUNITY_EDIT_DRAFT_PREFIX}${activeEditSetId}`));
+    const storedDraft = parseStoredSetDraft(window.localStorage.getItem(`${editDraftStoragePrefix}${activeEditSetId}`));
     if (storedDraft) {
       applyDraftToForm(storedDraft, `edit:${activeEditSetId}`);
     } else {
       applySetToForm(selectedSet);
     }
     loadedEditSetIdRef.current = activeEditSetId;
-  }, [activeEditSetId, applyDraftToForm, applySetToForm, editableSets, isEditSetEditorOpen, isYourSetsMode]);
+  }, [activeEditSetId, applyDraftToForm, applySetToForm, editDraftStoragePrefix, editableSets, isEditSetEditorOpen, isYourSetsMode]);
 
   const parsedDraftReels = useMemo<ParsedDraftReel[]>(
     () =>
@@ -1988,10 +2095,12 @@ export function CommunityReelsPanel({
       }
       void (async () => {
         let durationSec: number | null = null;
-        try {
-          durationSec = await fetchCommunityReelDuration({ sourceUrl });
-        } catch {
-          durationSec = null;
+        if (!localDemoEnabled) {
+          try {
+            durationSec = await fetchCommunityReelDuration({ sourceUrl });
+          } catch {
+            durationSec = null;
+          }
         }
         if (row.parsed?.platform === "youtube") {
           const iframeDuration = await detectYouTubeDurationWithIframeApi(sourceUrl);
@@ -2026,7 +2135,7 @@ export function CommunityReelsPanel({
     return () => {
       cancelled = true;
     };
-  }, [mode, parsedDraftReels]);
+  }, [localDemoEnabled, mode, parsedDraftReels]);
 
   useEffect(() => {
     if (mode !== "create" && mode !== "edit") {
@@ -2080,6 +2189,7 @@ export function CommunityReelsPanel({
   const normalizedSetDescription = setDescription.trim();
   const descriptionCharsRemaining = Math.max(0, MIN_SET_DESCRIPTION_LENGTH - normalizedSetDescription.length);
   const descriptionHasTooFewChars = descriptionCharsRemaining > 0;
+  const shouldShowDescriptionError = Boolean(normalizedSetDescription) && descriptionHasTooFewChars;
   const parsedSetTags = useMemo(() => parseTags(setTags), [setTags]);
   const hasMaxTags = parsedSetTags.length >= MAX_SET_TAGS;
   const requiredCompletionCount =
@@ -2087,11 +2197,6 @@ export function CommunityReelsPanel({
     (normalizedSetDescription.length >= MIN_SET_DESCRIPTION_LENGTH ? 1 : 0) +
     (thumbnailPreview ? 1 : 0) +
     (validDraftReelCount > 0 && invalidDraftReelCount === 0 ? 1 : 0);
-  const completionPercent = Math.round((requiredCompletionCount / 4) * 100);
-  const progressPercent = Math.min(100, Math.max(0, completionPercent));
-  const progressRadius = 34;
-  const progressCircumference = 2 * Math.PI * progressRadius;
-  const progressOffset = progressCircumference * (1 - progressPercent / 100);
   const canPostSet = requiredCompletionCount === 4 && !isPostingSet && (!isFormEditMode || Boolean(activeEditableSet));
   const remainingPreviewRequirements = useMemo(() => {
     const items: string[] = [];
@@ -2301,32 +2406,50 @@ export function CommunityReelsPanel({
     setIsPostingSet(true);
     try {
       if (isFormEditMode && editSetId) {
-        const updatedSet = await updateCommunitySet({
-          setId: editSetId,
-          title,
-          description,
-          tags,
-          reels: parsedReels,
-          thumbnailUrl: thumbnailPreview,
-          curator: communityAccount?.username || activeEditableSet?.curator || "Community member",
-        });
+        const updatedSet = localDemoEnabled
+          ? buildLocalDemoSet({
+              existingSet: activeEditableSet,
+              setId: editSetId,
+              title,
+              description,
+              tags,
+              reels: parsedReels,
+              thumbnailUrl: thumbnailPreview,
+            })
+          : await updateCommunitySet({
+              setId: editSetId,
+              title,
+              description,
+              tags,
+              reels: parsedReels,
+              thumbnailUrl: thumbnailPreview,
+              curator: communityAccount?.username || activeEditableSet?.curator || "Community member",
+            });
         setOwnedSets((prev) => [updatedSet, ...prev.filter((item) => item.id !== updatedSet.id)].slice(0, MAX_USER_SETS));
         if (typeof window !== "undefined") {
-          window.localStorage.removeItem(`${COMMUNITY_EDIT_DRAFT_PREFIX}${updatedSet.id}`);
+          window.localStorage.removeItem(`${editDraftStoragePrefix}${updatedSet.id}`);
         }
         setDraftBaselineForContext(`edit:${updatedSet.id}`, buildCurrentDraftPayload());
         setCreateError(null);
         setCreateSuccess(`Saved changes to "${updatedSet.title}".`);
         return true;
       } else {
-        const createdSet = await createCommunitySet({
-          title,
-          description,
-          tags,
-          reels: parsedReels,
-          thumbnailUrl: thumbnailPreview,
-          curator: communityAccount?.username || "Community member",
-        });
+        const createdSet = localDemoEnabled
+          ? buildLocalDemoSet({
+              title,
+              description,
+              tags,
+              reels: parsedReels,
+              thumbnailUrl: thumbnailPreview,
+            })
+          : await createCommunitySet({
+              title,
+              description,
+              tags,
+              reels: parsedReels,
+              thumbnailUrl: thumbnailPreview,
+              curator: communityAccount?.username || "Community member",
+            });
         setOwnedSetIds((prev) => (prev.includes(createdSet.id) ? prev : [createdSet.id, ...prev]));
         setOwnedSets((prev) => [createdSet, ...prev.filter((item) => item.id !== createdSet.id)].slice(0, MAX_USER_SETS));
         clearCreateSetDraftProgress();
@@ -2342,7 +2465,7 @@ export function CommunityReelsPanel({
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : isFormEditMode ? "Could not update community set." : "Could not post community set.";
-      if (isSessionExpiredError(error)) {
+      if (!localDemoEnabled && isSessionExpiredError(error)) {
         expireCommunityAuthSession();
         setCommunityAccount(null);
         ownedSetsAccountIdRef.current = null;
@@ -2365,7 +2488,9 @@ export function CommunityReelsPanel({
     buildCurrentDraftPayload,
     clearCreateSetDraftProgress,
     communityAccount,
+    editDraftStoragePrefix,
     isFormEditMode,
+    localDemoEnabled,
     parsedDraftReels,
     resetCreateSetForm,
     setDraftBaselineForContext,
@@ -2433,7 +2558,7 @@ export function CommunityReelsPanel({
         });
         return false;
       }
-      const persistResult = persistDraftPayload(`${COMMUNITY_EDIT_DRAFT_PREFIX}${editSetId}`, draftPayload);
+      const persistResult = persistDraftPayload(`${editDraftStoragePrefix}${editSetId}`, draftPayload);
       if (!persistResult.ok) {
         setCreateSuccess(null);
         setPublishResultModal({
@@ -2453,7 +2578,7 @@ export function CommunityReelsPanel({
       }
       return true;
     }
-    const persistResult = persistDraftPayload(COMMUNITY_CREATE_DRAFT_STORAGE_KEY, draftPayload);
+    const persistResult = persistDraftPayload(createDraftStorageKey, draftPayload);
     if (!persistResult.ok) {
       setCreateSuccess(null);
       setPublishResultModal({
@@ -2472,7 +2597,7 @@ export function CommunityReelsPanel({
       setCreateSuccess(null);
     }
     return true;
-  }, [activeEditSetId, activeEditableSet, buildCurrentDraftPayload, isFormEditMode, persistDraftPayload, setDraftBaselineForContext]);
+  }, [activeEditSetId, activeEditableSet, buildCurrentDraftPayload, createDraftStorageKey, editDraftStoragePrefix, isFormEditMode, persistDraftPayload, setDraftBaselineForContext]);
 
   const discardCurrentDraftChanges = useCallback(() => {
     if (!formDraftContextKey) {
@@ -2499,7 +2624,7 @@ export function CommunityReelsPanel({
   const clearCreateSetProgress = useCallback(() => {
     try {
       if (typeof window !== "undefined") {
-        window.localStorage.removeItem(COMMUNITY_CREATE_DRAFT_STORAGE_KEY);
+        window.localStorage.removeItem(createDraftStorageKey);
       }
       resetCreateSetForm();
       setCreateSuccess("Create set progress cleared.");
@@ -2514,7 +2639,7 @@ export function CommunityReelsPanel({
       });
       return false;
     }
-  }, [resetCreateSetForm]);
+  }, [createDraftStorageKey, resetCreateSetForm]);
 
   const onSaveDraftProgress = useCallback(() => {
     setDraftActionConfirmModal({
@@ -2573,7 +2698,7 @@ export function CommunityReelsPanel({
     setActiveEditSetId(null);
     loadedEditSetIdRef.current = null;
     if (typeof window !== "undefined") {
-      const storedDraft = parseStoredSetDraft(window.localStorage.getItem(COMMUNITY_CREATE_DRAFT_STORAGE_KEY));
+      const storedDraft = parseStoredSetDraft(window.localStorage.getItem(createDraftStorageKey));
       if (storedDraft) {
         applyDraftToForm(storedDraft, COMMUNITY_CREATE_DRAFT_CONTEXT_KEY);
       } else {
@@ -2584,7 +2709,7 @@ export function CommunityReelsPanel({
     }
     setCreateError(null);
     setCreateSuccess(null);
-  }, [applyDraftToForm, canManageYourSets, resetCreateSetForm]);
+  }, [applyDraftToForm, canManageYourSets, createDraftStorageKey, resetCreateSetForm]);
 
   useEffect(() => {
     onDraftUnsavedChangesChange?.(hasUnsavedDraftChanges);
@@ -2682,6 +2807,19 @@ export function CommunityReelsPanel({
     setDraftActionConfirmModal(null);
   }, [draftActionConfirmModal, shouldShowEditSetForm]);
 
+  const onToggleEditableSetSelection = useCallback((setId: string) => {
+    const normalized = setId.trim();
+    if (!normalized || isDeletingSets) {
+      return;
+    }
+    setSelectedEditableSetIds((prev) => (
+      prev.includes(normalized)
+        ? prev.filter((id) => id !== normalized)
+        : [...prev, normalized]
+    ));
+    setActiveSetActionsMenuId(null);
+  }, [isDeletingSets]);
+
   const onToggleSetStar = useCallback((setId: string) => {
     const normalized = setId.trim();
     if (!normalized) {
@@ -2698,50 +2836,90 @@ export function CommunityReelsPanel({
 
   const onRequestDeleteEditableSet = useCallback((setId: string) => {
     const normalized = setId.trim();
-    if (!normalized || deletingSetId) {
+    if (!normalized || isDeletingSets) {
       return;
     }
     const target = editableSets.find((set) => set.id === normalized);
     const targetTitle = target?.title?.trim() || "this set";
     setActiveSetActionsMenuId(null);
-    setDeleteSetConfirmModal({ setId: normalized, title: targetTitle });
-  }, [deletingSetId, editableSets]);
+    setDeleteSetConfirmModal({ setIds: [normalized], title: targetTitle });
+  }, [editableSets, isDeletingSets]);
+
+  const onRequestDeleteSelectedEditableSets = useCallback(() => {
+    if (selectedEditableSetIds.length === 0 || isDeletingSets) {
+      return;
+    }
+    const editableSetIds = new Set(editableSets.map((set) => set.id));
+    const targetIds = selectedEditableSetIds.filter((setId) => editableSetIds.has(setId));
+    if (targetIds.length === 0) {
+      setSelectedEditableSetIds([]);
+      return;
+    }
+    const singleTarget = targetIds.length === 1
+      ? editableSets.find((set) => set.id === targetIds[0])
+      : null;
+    setActiveSetActionsMenuId(null);
+    setDeleteSetConfirmModal({
+      setIds: targetIds,
+      title: singleTarget?.title?.trim() || `${targetIds.length} selected sets`,
+    });
+  }, [editableSets, isDeletingSets, selectedEditableSetIds]);
 
   const closeDeleteSetConfirmModal = useCallback(() => {
-    if (deletingSetId) {
+    if (isDeletingSets) {
       return;
     }
     setDeleteSetConfirmModal(null);
-  }, [deletingSetId]);
+  }, [isDeletingSets]);
 
-  const onDeleteEditableSet = useCallback(async (setId: string) => {
-    const normalized = setId.trim();
-    if (!normalized || deletingSetId) {
+  const onDeleteEditableSets = useCallback(async (setIds: string[]) => {
+    const normalizedSetIds = [...new Set(setIds.map((setId) => setId.trim()).filter(Boolean))]
+      .filter((setId) => editableSets.some((set) => set.id === setId));
+    if (normalizedSetIds.length === 0 || isDeletingSets) {
       return;
     }
-    const target = editableSets.find((set) => set.id === normalized);
-    const targetTitle = target?.title || "this set";
+    const deletedSetIdSet = new Set(normalizedSetIds);
+    const singleTarget = normalizedSetIds.length === 1
+      ? editableSets.find((set) => set.id === normalizedSetIds[0])
+      : null;
     setDeleteSetConfirmModal(null);
     setPublishResultModal(null);
-    setDeletingSetId(normalized);
+    setDeletingSetIds(normalizedSetIds);
     try {
-      await deleteCommunitySet({ setId: normalized });
-      setOwnedSets((prev) => prev.filter((set) => set.id !== normalized));
-      setOwnedSetIds((prev) => prev.filter((id) => id !== normalized));
-      setStarredSetIds((prev) => prev.filter((id) => id !== normalized));
-      if (typeof window !== "undefined") {
-        window.localStorage.removeItem(`${COMMUNITY_EDIT_DRAFT_PREFIX}${normalized}`);
+      if (!localDemoEnabled) {
+        if (normalizedSetIds.length === 1) {
+          await deleteCommunitySet({ setId: normalizedSetIds[0] });
+        } else {
+          await deleteCommunitySets({ setIds: normalizedSetIds });
+        }
       }
-      if (activeEditSetId === normalized) {
+      setOwnedSets((prev) => prev.filter((set) => !deletedSetIdSet.has(set.id)));
+      setOwnedSetIds((prev) => prev.filter((id) => !deletedSetIdSet.has(id)));
+      setStarredSetIds((prev) => prev.filter((id) => !deletedSetIdSet.has(id)));
+      setSelectedEditableSetIds((prev) => prev.filter((id) => !deletedSetIdSet.has(id)));
+      if (typeof window !== "undefined") {
+        for (const setId of normalizedSetIds) {
+          window.localStorage.removeItem(`${editDraftStoragePrefix}${setId}`);
+        }
+      }
+      if (activeEditSetId && deletedSetIdSet.has(activeEditSetId)) {
         loadedEditSetIdRef.current = null;
         setActiveEditSetId(null);
         setIsEditSetEditorOpen(false);
       }
       setCreateError(null);
-      setCreateSuccess(`Deleted "${targetTitle}".`);
+      setCreateSuccess(
+        normalizedSetIds.length === 1
+          ? `Deleted "${singleTarget?.title || "this set"}".`
+          : `Deleted ${normalizedSetIds.length} sets.`,
+      );
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Could not delete this set.";
-      if (isSessionExpiredError(error)) {
+      const message = error instanceof Error
+        ? error.message
+        : normalizedSetIds.length === 1
+          ? "Could not delete this set."
+          : "Could not delete the selected sets.";
+      if (!localDemoEnabled && isSessionExpiredError(error)) {
         expireCommunityAuthSession();
         setCommunityAccount(null);
         ownedSetsAccountIdRef.current = null;
@@ -2754,10 +2932,10 @@ export function CommunityReelsPanel({
         message,
       });
     } finally {
-      setDeletingSetId(null);
+      setDeletingSetIds([]);
       setActiveSetActionsMenuId(null);
     }
-  }, [activeEditSetId, clearOwnedCommunityState, deletingSetId, editableSets]);
+  }, [activeEditSetId, clearOwnedCommunityState, editDraftStoragePrefix, editableSets, isDeletingSets, localDemoEnabled]);
 
   const removeReelInputRow = (rowId: string) => {
     setReelInputs((prev) => {
@@ -2823,12 +3001,19 @@ export function CommunityReelsPanel({
     if (!selectedDirectorySet) {
       return;
     }
+    const returnFocusTarget = detailReturnFocusRef.current;
+    const closingSetId = selectedDirectorySet.id;
     clearDirectoryDetailCloseTimer();
-    setIsDetailBannerCompact(false);
     setIsDirectoryDetailOpen(false);
     directoryDetailCloseTimerRef.current = window.setTimeout(() => {
       setSelectedDirectorySet(null);
       directoryDetailCloseTimerRef.current = null;
+      const fallbackTarget = document.querySelector<HTMLElement>(
+        `[data-community-set-row][data-community-set-id="${CSS.escape(closingSetId)}"]`,
+      );
+      const focusTarget = returnFocusTarget?.isConnected ? returnFocusTarget : fallbackTarget;
+      focusTarget?.focus({ preventScroll: true });
+      detailReturnFocusRef.current = null;
     }, DIRECTORY_DETAIL_TRANSITION_MS);
   }, [clearDirectoryDetailCloseTimer, selectedDirectorySet]);
 
@@ -2837,12 +3022,12 @@ export function CommunityReelsPanel({
       return;
     }
     clearDirectoryDetailCloseTimer();
-    setIsDetailBannerCompact(false);
     setSkipDetailTransitionOnce(false);
     setIsDirectoryDetailOpen(false);
     setSelectedDirectorySet(null);
     setSelectedDetailReelId(null);
     setDetailCarouselIndex(0);
+    detailReturnFocusRef.current = null;
     consumedInitialSetIdRef.current = null;
     setIsInitialDetailRestorePending(false);
   }, [clearDirectoryDetailCloseTimer, isVisible, mode]);
@@ -2882,12 +3067,12 @@ export function CommunityReelsPanel({
       return;
     }
     clearDirectoryDetailCloseTimer();
-    setIsDetailBannerCompact(false);
     setSkipDetailTransitionOnce(false);
     setIsDirectoryDetailOpen(false);
     setSelectedDirectorySet(null);
     setSelectedDetailReelId(null);
     setDetailCarouselIndex(0);
+    detailReturnFocusRef.current = null;
     // Allow the follow-up initial-open effect to restore the targeted set detail
     // after returning from the feed back button.
     consumedInitialSetIdRef.current = null;
@@ -2896,9 +3081,10 @@ export function CommunityReelsPanel({
   const openDirectorySet = useCallback(
     (set: CommunitySet, options?: { immediate?: boolean; skipTransition?: boolean }) => {
       clearDirectoryDetailCloseTimer();
-      updateDetailBannerGeometry();
+      const activeElement = document.activeElement;
+      detailReturnFocusRef.current =
+        activeElement instanceof HTMLElement && directoryViewRef.current?.contains(activeElement) ? activeElement : null;
       setSelectedDirectorySet(set);
-      setIsDetailBannerCompact(false);
       if (options?.skipTransition) {
         setSkipDetailTransitionOnce(true);
       }
@@ -2910,7 +3096,7 @@ export function CommunityReelsPanel({
         setIsDirectoryDetailOpen(true);
       });
     },
-    [clearDirectoryDetailCloseTimer, updateDetailBannerGeometry],
+    [clearDirectoryDetailCloseTimer],
   );
 
   useLayoutEffect(() => {
@@ -2931,7 +3117,6 @@ export function CommunityReelsPanel({
     setSkipDetailTransitionOnce(true);
     clearDirectoryDetailCloseTimer();
     setSelectedDirectorySet(snapshot);
-    setIsDetailBannerCompact(false);
     setIsDirectoryDetailOpen(true);
     setIsInitialDetailRestorePending(false);
     consumedInitialSetIdRef.current = targetSetId;
@@ -2990,6 +3175,21 @@ export function CommunityReelsPanel({
   }, [closeDirectorySetModal, isDirectoryDetailOpen]);
 
   useEffect(() => {
+    if (mode !== "community" || !isVisible || !isDirectoryDetailOpen || !selectedDirectorySet) {
+      return;
+    }
+    if (detailContentScrollRef.current) {
+      detailContentScrollRef.current.scrollTop = 0;
+    }
+    const frameId = window.requestAnimationFrame(() => {
+      detailBackButtonRef.current?.focus({ preventScroll: true });
+    });
+    return () => {
+      window.cancelAnimationFrame(frameId);
+    };
+  }, [isDirectoryDetailOpen, isVisible, mode, selectedDirectorySet?.id]);
+
+  useEffect(() => {
     if (!onDetailOpenChange) {
       return;
     }
@@ -3020,12 +3220,6 @@ export function CommunityReelsPanel({
   ]);
 
   useEffect(() => {
-    if (!selectedDirectorySet) {
-      setIsDetailBannerCompact(false);
-    }
-  }, [selectedDirectorySet]);
-
-  useEffect(() => {
     setDetailCarouselIndex(0);
   }, [selectedDirectorySet?.id]);
 
@@ -3047,69 +3241,6 @@ export function CommunityReelsPanel({
     setDetailCarouselIndex((prev) => Math.min(prev, maxDetailCarouselIndex));
   }, [maxDetailCarouselIndex]);
 
-  useEffect(() => {
-    if (mode !== "community" || !isVisible || !isDirectoryDetailOpen || detailCarouselReels.length <= 1) {
-      return;
-    }
-    const intervalId = window.setInterval(() => {
-      setDetailCarouselIndex((prev) => (prev + 1) % detailCarouselReels.length);
-    }, DETAIL_REEL_CAROUSEL_INTERVAL_MS);
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [detailCarouselReels.length, isDirectoryDetailOpen, isVisible, mode]);
-
-  useEffect(() => {
-    if (mode !== "community" || !isDirectoryDetailOpen || !selectedDirectorySet) {
-      return;
-    }
-    const el = detailContentScrollRef.current;
-    if (!el) {
-      return;
-    }
-    const onScroll = () => {
-      setIsDetailBannerCompact((prev) => {
-        const next = el.scrollTop > 0;
-        return prev === next ? prev : next;
-      });
-    };
-    onScroll();
-    el.addEventListener("scroll", onScroll, { passive: true });
-    return () => {
-      el.removeEventListener("scroll", onScroll);
-    };
-  }, [isDirectoryDetailOpen, mode, selectedDirectorySet]);
-
-  useEffect(() => {
-    if (mode !== "community" || !isVisible || !portalReady || !selectedDirectorySet) {
-      return;
-    }
-    const update = () => {
-      updateDetailBannerGeometry();
-    };
-    update();
-    const rafId = window.requestAnimationFrame(update);
-    window.addEventListener("resize", update);
-
-    const resizeObserver = typeof ResizeObserver !== "undefined" ? new ResizeObserver(update) : null;
-    if (resizeObserver && panelRootRef.current) {
-      resizeObserver.observe(panelRootRef.current);
-    }
-    if (resizeObserver && detailBannerRef.current) {
-      resizeObserver.observe(detailBannerRef.current);
-    }
-
-    return () => {
-      window.cancelAnimationFrame(rafId);
-      window.removeEventListener("resize", update);
-      resizeObserver?.disconnect();
-    };
-  }, [isDirectoryDetailOpen, isVisible, mode, portalReady, selectedDirectorySet, updateDetailBannerGeometry]);
-
-  const detailContentTopPadding = Math.max(
-    DETAIL_CONTENT_TOP_PADDING_FALLBACK,
-    detailBannerHeight + DETAIL_CONTENT_TOP_PADDING_GUTTER - DETAIL_CONTENT_TOP_PADDING_UPSHIFT_PX,
-  );
   const selectedDirectorySetHasReels = (selectedDirectorySet?.reels.length ?? 0) > 0;
 
   const openCommunityReelInFeed = useCallback(
@@ -3124,6 +3255,9 @@ export function CommunityReelsPanel({
         return_tab: "community",
         return_community_set_id: set.id,
       });
+      if (localDemoEnabled) {
+        nextParams.set("return_demo", "account");
+      }
       if (Number.isFinite(reel.tStartSec) && Number(reel.tStartSec) >= 0) {
         nextParams.set("community_t_start_sec", String(reel.tStartSec));
       }
@@ -3168,7 +3302,7 @@ export function CommunityReelsPanel({
       });
       router.push(`/feed?${feedQuery}`);
     },
-    [onOpenCommunityReelInFeed, router],
+    [localDemoEnabled, onOpenCommunityReelInFeed, router],
   );
 
   const openSelectedSetReelsInFeed = useCallback(() => {
@@ -3180,169 +3314,130 @@ export function CommunityReelsPanel({
     openCommunityReelInFeed(selectedDirectorySet, selectedReel);
   }, [openCommunityReelInFeed, selectedDetailReelId, selectedDirectorySet]);
 
-  const detailBannerPortal =
-    mode === "community" && isVisible && portalReady && selectedDirectorySet
-      ? createPortal(
-        <div
-          ref={detailBannerRef}
-          className={`pointer-events-none fixed top-0 z-[96] overflow-hidden ${
-            isDetailBannerCompact ? "bg-transparent backdrop-blur-[10px]" : "bg-white/[0.04] backdrop-blur-[4px]"
-          } transition-[opacity,backdrop-filter] duration-[560ms] ease-[cubic-bezier(0.25,0.1,0.25,1)] ${
-            isDirectoryDetailOpen ? "opacity-100" : "opacity-0 pointer-events-none"
-          }`}
-            style={{
-              left: `${detailBannerLeft + DETAIL_BANNER_LEFT_INSET_PX}px`,
-              right: `${detailBannerRight}px`,
-            }}
-          >
-            <div
-              className={`relative z-10 transition-[padding] duration-[840ms] ease-[cubic-bezier(0.2,0.85,0.25,1)] ${
-                isDetailBannerCompact
-                  ? "px-4 pt-4 sm:px-6 sm:pt-4 md:px-7"
-                  : "px-4 pt-[calc(max(env(safe-area-inset-top),0px)+24px)] sm:px-6 sm:pt-[calc(max(env(safe-area-inset-top),0px)+28px)] md:px-7 md:pt-[calc(max(env(safe-area-inset-top),0px)+34px)]"
-              }`}
-            >
-              <div
-                className={`overflow-hidden will-change-[max-height,transform,opacity] transition-[max-height,opacity,transform,padding] duration-[840ms] ease-[cubic-bezier(0.2,0.85,0.25,1)] ${
-                  isDetailBannerCompact ? "max-h-0 -translate-y-3 opacity-0 pb-0" : "max-h-[920px] translate-y-0 opacity-100 pb-12 sm:pb-14 md:pb-16"
-                }`}
-              >
-                <button
-                  type="button"
-                  onClick={closeDirectorySetModal}
-                  className="pointer-events-auto mt-1 inline-flex items-center gap-2 rounded-full px-2.5 py-2 text-[13px] font-semibold text-white/90 transition hover:text-white sm:text-sm"
-                >
-                  <i className="fa-solid fa-chevron-left text-[11px] sm:text-xs" aria-hidden="true" />
-                  Community Sets
-                </button>
-
-                <div className="mt-12 flex flex-col gap-5 sm:mt-14 sm:gap-6 md:mt-16">
-                  <span className="grid h-12 w-12 shrink-0 overflow-hidden rounded-2xl bg-black/28 text-white/90 sm:h-14 sm:w-14">
-                    {selectedDirectorySet.thumbnailUrl ? (
-                      <img src={selectedDirectorySet.thumbnailUrl} alt="" aria-hidden="true" className="h-full w-full object-cover" />
-                    ) : (
-                      <i className={`${getSetIconClass(selectedDirectorySet)} text-lg sm:text-xl`} aria-hidden="true" />
-                    )}
-                  </span>
-
-                  <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-                    <div className="min-w-0">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/70">Community Set</p>
-                      <h3 className="mt-1 text-[1.9rem] font-semibold leading-[1.08] text-white sm:text-[2.2rem] md:text-[2.8rem]">{selectedDirectorySet.title}</h3>
-                      <p className="mt-2 max-w-3xl text-sm leading-relaxed text-white/85 sm:text-[0.98rem] md:text-[1.05rem]">{selectedDirectorySet.description}</p>
-                    </div>
-
-                    <button
-                      type="button"
-                      onClick={openSelectedSetReelsInFeed}
-                      disabled={!selectedDirectorySetHasReels}
-                      className={`pointer-events-auto inline-flex h-10 items-center justify-center self-start rounded-full px-5 text-sm font-semibold transition md:self-center ${
-                        selectedDirectorySetHasReels
-                          ? "bg-white text-[#06233a] hover:bg-[#e6e6e6]"
-                          : "cursor-not-allowed bg-white/45 text-[#06233a]/70"
-                      }`}
-                    >
-                      View Reels
-                    </button>
-                  </div>
-                </div>
-
-                <div className="mt-4 flex flex-wrap items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/80 sm:mt-5 sm:text-[11px]">
-                  <span className="rounded-full bg-black/28 px-2.5 py-1">{getSetReelCount(selectedDirectorySet)} reels</span>
-                  <span className="rounded-full bg-black/28 px-2.5 py-1">{formatCompact(selectedDirectorySet.learners)} learners</span>
-                  <span className="rounded-full bg-black/28 px-2.5 py-1">{formatCompact(selectedDirectorySet.likes)} likes</span>
-                  <span className="rounded-full bg-black/28 px-2.5 py-1">Curated by {selectedDirectorySetCuratorLabel}</span>
-                </div>
-              </div>
-
-              <div
-                className={`overflow-hidden transition-[max-height,opacity,transform,backdrop-filter] duration-[640ms] ease-[cubic-bezier(0.2,0.85,0.25,1)] ${
-                  isDetailBannerCompact
-                    ? "pointer-events-auto h-16 max-h-16 translate-y-0 rounded-2xl border border-[#8d8d8d]/35 bg-black/30 opacity-100 backdrop-blur-[12px] sm:h-20 sm:max-h-20"
-                    : "pointer-events-none h-0 max-h-0 -translate-y-2 opacity-0"
-                }`}
-              >
-                <div className="mx-auto flex h-full w-full max-w-none items-center justify-between gap-3 px-3 sm:px-4">
-                  <div className="ml-1 min-w-0 max-w-[62%] flex items-center gap-2.5 sm:ml-2">
-                    <span className="grid h-9 w-9 shrink-0 overflow-hidden rounded-xl bg-black/28 text-white/90">
-                      {selectedDirectorySet.thumbnailUrl ? (
-                        <img src={selectedDirectorySet.thumbnailUrl} alt="" aria-hidden="true" className="h-full w-full object-cover" />
-                      ) : (
-                        <i className={`${getSetIconClass(selectedDirectorySet)} text-sm`} aria-hidden="true" />
-                      )}
-                    </span>
-                    <p className="truncate text-[0.96rem] font-semibold text-white sm:text-[1.02rem]">{selectedDirectorySet.title}</p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={openSelectedSetReelsInFeed}
-                    disabled={!selectedDirectorySetHasReels}
-                    className={`pointer-events-auto mr-2 inline-flex h-9 shrink-0 items-center justify-center rounded-full px-4 text-xs font-semibold transition sm:mr-3 sm:px-5 ${
-                      selectedDirectorySetHasReels
-                        ? "bg-white text-[#06233a] hover:bg-[#e6e6e6]"
-                        : "cursor-not-allowed bg-white/45 text-[#06233a]/70"
-                    }`}
-                  >
-                    View Reels
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>,
-          document.body,
-        )
-      : null;
-
   return (
     <div
-      ref={panelRootRef}
-      className={`flex h-full min-h-0 flex-col overflow-hidden text-white ${
+      className={`relative flex h-full min-h-0 flex-col overflow-hidden text-white ${
         mode === "community"
           ? "px-3 pb-0 pt-14 sm:px-5 sm:pb-0 md:px-7 md:pb-0 md:pt-20 lg:px-8 lg:pt-7 lg:pb-0"
           : "px-3 pb-0 pt-14 sm:px-5 sm:pb-0 md:px-7 md:pb-0 md:pt-20 lg:px-8 lg:pt-7 lg:pb-0"
       }`}
     >
       {mode === "community" ? (
-        <div className="relative min-h-0 flex-1 overflow-hidden">
+        <div className="relative mx-auto min-h-0 w-full flex-1 overflow-hidden lg:w-11/12 xl:w-4/5 2xl:w-full 2xl:max-w-5xl">
           <div
+            ref={directoryViewRef}
             className={`absolute inset-0 flex min-h-0 flex-col transition-opacity duration-[440ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
               isDirectoryDetailOpen || shouldSuppressDirectoryDuringRestore ? "opacity-0 pointer-events-none" : "opacity-100"
             }`}
-            aria-hidden={isDirectoryDetailOpen}
+            aria-hidden={isDirectoryDetailOpen || shouldSuppressDirectoryDuringRestore}
+            inert={isDirectoryDetailOpen || shouldSuppressDirectoryDuringRestore}
           >
-            <div className="shrink-0">
-              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between md:gap-4">
-                <div className="w-full pl-5 sm:pl-6 md:w-auto md:pl-8 lg:pl-3">
-                  <div className="flex items-center justify-center gap-2 md:justify-start">
-                    <h2 className="text-xl font-semibold tracking-tight text-white sm:text-2xl md:text-[1.9rem]">Community Sets</h2>
-                    <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/55">Beta</span>
-                  </div>
+            <div data-top-chrome="community-directory" className="top-nav-fade absolute inset-x-0 top-0 z-20 w-full shrink-0">
+              <div className="relative flex min-h-12 w-full items-center gap-3 px-1 sm:px-2 md:px-3">
+                <div className="flex min-w-0 flex-1 items-center pl-4 sm:pl-5 lg:pl-0">
+                  <h2 className="truncate text-xl font-semibold tracking-tight text-white sm:text-2xl md:text-[1.9rem]">Community Sets</h2>
                 </div>
-                <label className="mx-auto block w-[calc(100%-0.25rem)] self-stretch md:mx-0 md:mr-5 md:w-[20.5rem] md:self-auto lg:mr-3 lg:w-[23rem]">
+                <div
+                  data-compact-search="community"
+                  data-compact-search-expanded={isCompactCommunitySearchExpanded ? "true" : "false"}
+                  className={`absolute right-1 top-1/2 z-10 h-10 shrink-0 -translate-y-1/2 overflow-hidden transition-[width] duration-[440ms] ease-in-out motion-reduce:transition-none sm:right-2 md:right-3 xl:hidden ${
+                    isCompactCommunitySearchExpanded ? "w-[clamp(7.5rem,48vw,17rem)]" : "w-10"
+                  }`}
+                >
+                  <div
+                    aria-hidden={!isCompactCommunitySearchExpanded}
+                    className={`absolute inset-0 transition-opacity duration-300 motion-reduce:transition-none ${
+                      isCompactCommunitySearchExpanded ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
+                    }`}
+                  >
+                    <input
+                      ref={compactCommunitySearchInputRef}
+                      value={communityQuery}
+                      onChange={(event) => setCommunityQuery(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Escape") {
+                          setCommunityQuery("");
+                          setIsCompactCommunitySearchOpen(false);
+                        }
+                      }}
+                      tabIndex={isCompactCommunitySearchExpanded ? 0 : -1}
+                      aria-label="Search community sets"
+                      placeholder="Search sets"
+                      className="h-10 w-full rounded-full bg-white/[0.08] pl-4 pr-9 text-xs text-white outline-none backdrop-blur-[18px] backdrop-saturate-150 placeholder:text-white/35 focus:bg-white/[0.12]"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCommunityQuery("");
+                        setIsCompactCommunitySearchOpen(false);
+                      }}
+                      tabIndex={isCompactCommunitySearchExpanded ? 0 : -1}
+                      aria-label="Close community search"
+                      className="absolute right-1 top-1/2 grid h-8 w-8 -translate-y-1/2 place-items-center rounded-full text-white/55 transition-colors hover:bg-white/[0.07] hover:text-white"
+                    >
+                      <i className="fa-solid fa-xmark text-xs" aria-hidden="true" />
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsCompactCommunitySearchOpen(true);
+                      window.requestAnimationFrame(() => compactCommunitySearchInputRef.current?.focus());
+                    }}
+                    disabled={isCompactCommunitySearchExpanded}
+                    aria-hidden={isCompactCommunitySearchExpanded}
+                    aria-label="Open community search"
+                    className={`absolute inset-0 grid h-10 w-10 place-items-center rounded-full bg-transparent text-white/72 transition-[background-color,color,opacity] duration-300 hover:bg-white/[0.07] hover:text-white motion-reduce:transition-none ${
+                      isCompactCommunitySearchExpanded ? "pointer-events-none opacity-0" : "pointer-events-auto opacity-100"
+                    }`}
+                  >
+                    <svg
+                      data-community-search-icon
+                      aria-hidden="true"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      className="h-[18px] w-[18px]"
+                    >
+                      <circle cx="10.5" cy="10.5" r="6.25" />
+                      <path d="m15.25 15.25 4.25 4.25" />
+                    </svg>
+                  </button>
+                </div>
+                <label className="hidden w-[23rem] shrink-0 xl:block">
                   <div className="relative">
-                    <i className="fa-solid fa-magnifying-glass pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-sm text-white/38" />
+                    <i
+                      data-community-search-icon
+                      className="fa-solid fa-magnifying-glass pointer-events-none absolute left-4 top-1/2 z-10 -translate-y-1/2 text-sm text-white/45"
+                      aria-hidden="true"
+                    />
                     <input
                       value={communityQuery}
                       onChange={(event) => setCommunityQuery(event.target.value)}
                       placeholder="Search community sets"
-                      className="h-11 w-full rounded-[1.5rem] bg-white/[0.08] pl-11 pr-4 text-sm text-white outline-none backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 placeholder:text-white/35 focus:bg-white/[0.12] sm:h-12 sm:rounded-[1.75rem] sm:pl-12"
+                      className="h-12 w-full rounded-[1.75rem] bg-white/[0.08] pl-12 pr-4 text-sm text-white outline-none backdrop-blur-[18px] backdrop-saturate-150 placeholder:text-white/35 focus:bg-white/[0.12]"
                     />
                   </div>
                 </label>
               </div>
             </div>
 
-            <div className="mt-3 min-h-0 flex-1 overflow-hidden md:mt-4">
-              <div ref={communityScrollRef} className="balanced-scroll-gutter h-full min-h-0 space-y-4 overflow-y-auto pb-6 md:space-y-5 md:pb-8 lg:pb-10">
+            <div className="min-h-0 flex-1 overflow-hidden">
+              <div ref={communityScrollRef} className="balanced-scroll-gutter h-full min-h-0 space-y-4 overflow-y-auto pb-6 pt-[4.5rem] md:space-y-5 md:pb-8 md:pt-20 lg:pb-10">
             {!isCommunitySearchActive && featuredCarouselSets.length > 0 ? (
-              <section className="group/featured relative overflow-hidden rounded-[1.5rem] bg-white/[0.07] p-4 pb-12 backdrop-blur-[18px] backdrop-saturate-150 max-[380px]:pb-10 sm:rounded-[2rem] sm:p-5 sm:pb-14 md:p-7 md:pb-16 lg:p-8">
+              <section
+                data-community-featured-carousel
+                className="group/featured relative overflow-hidden rounded-[14px] bg-white/[0.07] p-3 pb-9 backdrop-blur-[18px] backdrop-saturate-150 sm:p-4 sm:pb-10"
+              >
                 {featuredCarouselSets.length > 1 ? (
                   <>
                     <button
                       type="button"
                       aria-label="Next featured set"
                       onClick={goToNextFeaturedSet}
-                      className="absolute right-4 top-4 z-30 grid h-9 w-9 place-items-center rounded-full bg-black/45 text-white/82 transition-all duration-200 hover:bg-black/60 hover:text-white md:pointer-events-none md:right-6 md:top-1/2 md:-translate-y-1/2 md:opacity-0 md:group-hover/featured:pointer-events-auto md:group-hover/featured:opacity-100 md:group-focus-within/featured:pointer-events-auto md:group-focus-within/featured:opacity-100"
+                      className="community-featured-next-control absolute right-3 top-3 z-30 grid h-8 w-8 place-items-center rounded-full bg-black/45 text-white/82 transition-[background-color,color,opacity] duration-300 motion-reduce:transition-none hover:bg-white/[0.07] hover:text-white sm:right-4 sm:top-4 md:pointer-events-none md:top-1/2 md:-translate-y-1/2 md:opacity-0 md:group-hover/featured:pointer-events-auto md:group-hover/featured:opacity-100 md:group-focus-within/featured:pointer-events-auto md:group-focus-within/featured:opacity-100"
                     >
                       <i className="fa-solid fa-chevron-right text-[10px]" aria-hidden="true" />
                     </button>
@@ -3357,13 +3452,9 @@ export function CommunityReelsPanel({
                       return null;
                     }
                     const motionClass = isLeaving
-                      ? featuredTransitionDirection === 1
-                        ? "animate-featured-fade-exit animate-featured-slide-exit-forward"
-                        : "animate-featured-fade-exit animate-featured-slide-exit-backward"
+                      ? "animate-featured-fade-exit"
                       : featuredTransitionStage === "entering"
-                        ? featuredTransitionDirection === 1
-                          ? "animate-featured-fade-enter animate-featured-slide-enter-forward"
-                          : "animate-featured-fade-enter animate-featured-slide-enter-backward"
+                        ? "animate-featured-fade-enter"
                         : "opacity-100";
                     return (
                       <article
@@ -3372,16 +3463,16 @@ export function CommunityReelsPanel({
                       >
                         <div
                           ref={isLeaving ? null : activeFeaturedSlideRef}
-                          className="grid min-h-[285px] gap-5 max-[380px]:gap-4 sm:min-h-[320px] sm:gap-7 md:min-h-[410px] md:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)] md:items-center"
+                          className="community-featured-grid grid min-w-0 gap-4 sm:gap-5 md:items-center"
                         >
-                          <div className="flex max-w-2xl flex-col items-start text-left md:pl-2 lg:pl-8">
-                            <p className="inline-flex rounded-full bg-white/12 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.1em] text-white/88">
+                          <div className="flex w-full min-w-0 max-w-2xl flex-col items-start text-left">
+                            <p className="inline-flex rounded-full bg-white/12 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/88">
                               Featured Set
                             </p>
-                            <h3 className="mt-5 text-[1.65rem] font-semibold leading-[1.12] text-white max-[380px]:mt-3 sm:mt-4 sm:text-[2rem] md:text-[2.6rem] lg:text-[3.05rem]">{set.title}</h3>
-                            <p className="mt-5 max-w-xl text-[0.95rem] leading-relaxed text-white/84 max-[380px]:mt-3 sm:mt-4 sm:text-[1.02rem] md:text-[1.08rem] lg:text-[1.18rem]">{set.description}</p>
+                            <h3 className="mt-3 text-xl font-semibold leading-[1.12] text-white sm:text-2xl md:text-3xl">{set.title}</h3>
+                            <p className="mt-3 w-full max-w-xl break-words text-sm leading-relaxed text-white/80 md:text-base">{set.description}</p>
 
-                            <div className="mt-7 flex flex-wrap items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/78 max-[380px]:mt-5 sm:mt-5 sm:gap-2.5 sm:text-[11px]">
+                            <div className="mt-4 flex flex-wrap items-center gap-1.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-white/72 sm:text-[10px]">
                               <span className="rounded-full bg-black/30 px-2 py-1">{getSetReelCount(set)} reels</span>
                               <span className="rounded-full bg-black/30 px-2 py-1">{formatCompact(set.learners)} learners</span>
                               <span className="rounded-full bg-black/30 px-2 py-1">{formatCompact(set.likes)} likes</span>
@@ -3391,24 +3482,21 @@ export function CommunityReelsPanel({
                               type="button"
                               data-featured-view-set-button
                               onClick={() => openDirectorySet(set)}
-                              className="mt-8 inline-flex w-full items-center justify-center rounded-full bg-white px-6 py-2.5 text-sm font-semibold text-black transition max-[380px]:mt-6 hover:bg-[#f1eee5] sm:mt-7 sm:w-auto sm:px-8 sm:py-3"
+                              className="mt-5 inline-flex w-auto items-center justify-center rounded-full bg-white px-6 py-2 text-xs font-semibold text-black transition hover:bg-[#f1eee5]"
                             >
                               View Set
                             </button>
                           </div>
 
-                          <div className="relative hidden h-full min-h-[320px] md:block">
-                            <div className="absolute right-8 top-2 z-20 max-w-[78%] rounded-full border border-white/35 bg-white/20 px-3 py-1.5 text-xs font-semibold text-white/92 backdrop-blur-xl lg:right-16 lg:max-w-[72%] lg:px-4 lg:py-2 lg:text-sm">
-                              @{set.curator} trending this week
-                            </div>
+                          <div className="relative hidden h-full min-h-[250px] md:block">
                             <div
                               data-featured-image-target
-                              className="absolute bottom-0 right-8 w-[84%] overflow-hidden rounded-[1.4rem] border border-white/25 bg-black/30 lg:right-12 lg:w-[80%] lg:rounded-[1.7rem]"
+                              className="community-featured-image-frame absolute bottom-0 right-0 overflow-hidden rounded-[10px] bg-black/30"
                             >
                               <img
                                 src={set.thumbnailUrl || FALLBACK_THUMBNAIL_URL}
                                 alt={`${set.title} cover`}
-                                className="h-[280px] w-full object-contain md:h-[310px] lg:h-[330px]"
+                                className="community-featured-image w-full object-contain"
                               />
                             </div>
                           </div>
@@ -3419,15 +3507,15 @@ export function CommunityReelsPanel({
                 </div>
 
                 {featuredCarouselSets.length > 1 ? (
-                  <div className="absolute bottom-4 left-1/2 z-20 flex -translate-x-1/2 items-center justify-center gap-2 md:bottom-5">
+                  <div className="absolute bottom-3 left-1/2 z-20 flex -translate-x-1/2 items-center justify-center gap-1.5 sm:bottom-4">
                     {featuredCarouselSets.map((set, index) => (
                       <button
                         key={`featured-dot-${set.id}`}
                         type="button"
                         aria-label={`Go to featured set ${index + 1}`}
                         onClick={() => goToFeaturedSet(index)}
-                        className={`h-2 rounded-full transition-all ${
-                          index === activeFeaturedIndex ? "w-6 bg-white" : "w-2 bg-white/45 hover:bg-white/70"
+                        className={`h-1.5 rounded-full ${
+                          index === activeFeaturedIndex ? "w-5 bg-white" : "w-1.5 bg-white/45 hover:bg-white/70"
                         }`}
                       />
                     ))}
@@ -3443,10 +3531,10 @@ export function CommunityReelsPanel({
                   key={category}
                   type="button"
                   onClick={() => onCommunityCategoryChange(category)}
-                  className={`whitespace-nowrap rounded-full px-3 py-1.5 text-xs font-medium transition-all duration-200 ease-out sm:px-4 sm:py-2 sm:text-sm ${
+                  className={`whitespace-nowrap rounded-full px-3 py-1.5 text-xs font-medium sm:px-4 sm:py-2 sm:text-sm ${
                     activeCommunityCategory === category
                       ? "bg-white text-black"
-                      : "bg-black/30 text-white/75 hover:bg-white/20 hover:text-white hover:backdrop-blur-sm"
+                      : "bg-black/30 text-white/75 transition-colors hover:bg-white/[0.07] hover:text-white"
                   }`}
                 >
                   {category}
@@ -3455,30 +3543,32 @@ export function CommunityReelsPanel({
             </section>
             ) : null}
 
-            <section className="relative overflow-hidden rounded-2xl bg-white/[0.07] px-3 pt-3 pb-3 backdrop-blur-[18px] backdrop-saturate-150 sm:px-4 sm:pt-3.5 sm:pb-4">
+            <section data-community-directory className="relative">
               <div className="relative z-10">
-              <div className="mb-2 flex items-center justify-between">
+              <div className="mb-1.5 flex items-center justify-between px-1">
                 <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/60">
                   {isCommunitySearchActive ? "Search Results" : "Community Directory"}
                 </p>
                 <p className="text-[10px] font-semibold uppercase tracking-[0.09em] text-white/45">{directorySets.length} sets</p>
               </div>
               {directorySets.length === 0 ? (
-                <p className="px-3 py-4 text-sm text-white/65">
+                <p className="px-1 py-4 text-sm text-white/65">
                   {isCommunitySearchActive ? "No sets matched your search." : "No sets matched that search."}
                 </p>
               ) : (
-                <div className={isCommunitySearchActive ? "flex flex-col gap-2.5" : "grid gap-2.5 md:grid-cols-2 md:gap-x-4 md:gap-y-3 lg:gap-x-10"}>
+                <div className={isCommunitySearchActive ? "flex flex-col gap-1.5" : "grid gap-1.5 md:grid-cols-2 md:gap-x-3 md:gap-y-2 lg:gap-x-5"}>
                   {directorySets.map((set) => {
                     const reelCount = getSetReelCount(set);
                     return (
                       <button
                         type="button"
                         key={set.id}
+                        data-community-set-row
+                        data-community-set-id={set.id}
                         onClick={() => openDirectorySet(set)}
-                        className="group relative flex w-full items-center gap-2.5 rounded-xl bg-[#1c1c1c] px-3 py-3 text-left transition-all duration-200 ease-out hover:bg-[#121212] sm:gap-3 sm:rounded-2xl"
+                        className="group relative flex min-h-14 w-full items-center gap-2 rounded-lg bg-transparent px-2 py-1.5 text-left transition-colors hover:bg-white/[0.07] focus-visible:bg-white/[0.07] sm:gap-2.5 sm:rounded-xl"
                       >
-                        <span className="grid h-[3.75rem] w-[3.75rem] shrink-0 overflow-hidden rounded-lg bg-black/30 text-white/82 transition-colors duration-200 group-hover:text-white sm:h-16 sm:w-16 sm:rounded-xl">
+                        <span className="grid h-11 w-11 shrink-0 overflow-hidden rounded-lg bg-black/30 text-white/82 transition-colors duration-200 group-hover:text-white">
                           {set.thumbnailUrl ? (
                             <img src={set.thumbnailUrl} alt="" aria-hidden="true" className="h-full w-full object-cover" />
                           ) : (
@@ -3486,17 +3576,17 @@ export function CommunityReelsPanel({
                           )}
                         </span>
                         <div className="min-w-0 flex-1 text-left">
-                          <p className="w-full truncate text-[0.97rem] font-medium text-white transition-colors duration-200 group-hover:text-white sm:text-[1.02rem]">{set.title}</p>
-                          <p className="mt-0.5 hidden w-full truncate text-sm text-white/58 transition-colors duration-200 group-hover:text-white/78 lg:block">{set.description}</p>
-                          <span className="mt-1 inline-flex rounded-full bg-white/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/62 transition-colors duration-200 group-hover:text-white/80">
+                          <p className="w-full truncate text-sm font-medium text-white transition-colors duration-200 group-hover:text-white">{set.title}</p>
+                          <p className="mt-0.5 hidden w-full truncate text-xs text-white/58 transition-colors duration-200 group-hover:text-white/78 2xl:block">{set.description}</p>
+                          <span className="mt-0.5 inline-flex text-[9px] font-semibold uppercase tracking-[0.08em] text-white/50 transition-colors duration-200 group-hover:text-white/75">
                             {reelCount} reels
                           </span>
                         </div>
                         <span
-                          className="grid h-7 w-7 shrink-0 place-items-center self-center rounded-full text-white/58 transition-colors duration-200 group-hover:text-white/80 sm:h-8 sm:w-8"
+                          className="grid h-6 w-6 shrink-0 place-items-center self-center rounded-full text-white/50 transition-colors duration-200 group-hover:text-white/80"
                           aria-hidden="true"
                         >
-                          <i className="fa-solid fa-chevron-right text-[11px]" />
+                          <i className="fa-solid fa-chevron-right text-[10px]" />
                         </span>
                       </button>
                     );
@@ -3510,57 +3600,118 @@ export function CommunityReelsPanel({
           </div>
 
           <section
-            role="dialog"
-            aria-modal="true"
-            aria-label={selectedDirectorySet ? `${selectedDirectorySet.title} details` : "Community set details"}
+            role="region"
+            aria-labelledby={selectedDirectorySet ? "community-set-detail-title" : undefined}
             className={`absolute inset-0 flex min-h-0 flex-col ${skipDetailTransitionOnce ? "" : "transition-opacity duration-[440ms] ease-[cubic-bezier(0.22,1,0.36,1)]"} ${
               isDirectoryDetailOpen ? "opacity-100" : "opacity-0 pointer-events-none"
             }`}
+            aria-hidden={!isDirectoryDetailOpen}
+            inert={!isDirectoryDetailOpen}
           >
             {selectedDirectorySet ? (
               <div
                 ref={detailContentScrollRef}
-                className="balanced-scroll-gutter min-h-0 flex-1 overflow-y-auto pb-6 md:pb-8 lg:pb-10"
-                style={{ paddingTop: detailContentTopPadding }}
+                className="balanced-scroll-gutter min-h-0 flex-1 overflow-y-auto"
               >
-                <div className="px-1 sm:px-2 md:px-3">
-                  <section className="rounded-2xl px-4 py-4 sm:px-5 sm:py-5">
-                    <div className="flex items-center justify-between gap-3">
-                      <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/65">Reel Preview</p>
-                      <div className="flex items-center gap-1.5">
+                <div data-community-detail-view className="mx-auto w-full max-w-4xl pb-14 md:pb-20">
+                  <div
+                    data-top-chrome="community-detail-back"
+                    className="top-nav-fade sticky top-0 z-20 w-full px-1 pb-5 pt-1 sm:px-2 md:px-3 md:pb-6"
+                  >
+                    <button
+                      ref={detailBackButtonRef}
+                      type="button"
+                      onClick={closeDirectorySetModal}
+                      className="inline-flex items-center gap-2 rounded-lg px-2 py-2 text-sm font-medium text-white/82 transition-colors hover:bg-white/[0.07] hover:text-white"
+                    >
+                      <i className="fa-solid fa-chevron-left text-[11px]" aria-hidden="true" />
+                      Community Sets
+                    </button>
+                  </div>
+
+                  <header
+                    data-community-detail-header
+                    className="pt-8 sm:pt-10 md:pt-12"
+                  >
+                    <div className="px-3 sm:px-5 md:px-8">
+                      <span className="grid h-16 w-16 shrink-0 overflow-hidden rounded-[14px] bg-[#151515] text-white/90 sm:h-[72px] sm:w-[72px]">
+                        {selectedDirectorySet.thumbnailUrl ? (
+                          <img src={selectedDirectorySet.thumbnailUrl} alt="" aria-hidden="true" className="h-full w-full object-cover" />
+                        ) : (
+                          <i className={`${getSetIconClass(selectedDirectorySet)} m-auto text-xl`} aria-hidden="true" />
+                        )}
+                      </span>
+
+                      <div className="mt-7 flex flex-col gap-5 sm:mt-8 md:flex-row md:items-end md:justify-between">
+                        <div className="min-w-0 max-w-2xl">
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-white/52">Community Set</p>
+                          <h3 id="community-set-detail-title" className="mt-2 break-words text-[2rem] font-semibold leading-[1.08] tracking-[-0.025em] text-white sm:text-[2.45rem]">
+                            {selectedDirectorySet.title}
+                          </h3>
+                          <p className="mt-3 break-words text-sm leading-relaxed text-white/68 sm:text-base">{selectedDirectorySet.description}</p>
+                        </div>
+
                         <button
                           type="button"
-                          onClick={goToPreviousDetailCarousel}
-                          disabled={detailCarouselCount <= 1}
-                          aria-label="Previous reel"
-                          className="grid h-8 w-8 place-items-center rounded-full bg-black/45 text-white/80 transition hover:bg-black/60 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
+                          onClick={openSelectedSetReelsInFeed}
+                          disabled={!selectedDirectorySetHasReels}
+                          className={`inline-flex h-10 shrink-0 items-center justify-center self-start rounded-full px-5 text-sm font-semibold transition-colors duration-300 md:self-end ${
+                            selectedDirectorySetHasReels
+                              ? "bg-white text-black hover:bg-white/[0.88]"
+                              : "cursor-not-allowed bg-white/[0.32] text-black/60"
+                          }`}
                         >
-                          <i className="fa-solid fa-chevron-left text-[10px]" aria-hidden="true" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={goToNextDetailCarousel}
-                          disabled={detailCarouselCount <= 1}
-                          aria-label="Next reel"
-                          className="grid h-8 w-8 place-items-center rounded-full bg-black/45 text-white/80 transition hover:bg-black/60 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
-                        >
-                          <i className="fa-solid fa-chevron-right text-[10px]" aria-hidden="true" />
+                          View Reels
                         </button>
                       </div>
-                    </div>
 
-                    <div className="mt-3">
+                      <div className="mt-5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 break-words text-xs text-white/50 sm:text-[13px]">
+                        <span>{getSetReelCount(selectedDirectorySet)} reels</span>
+                        <span aria-hidden="true">·</span>
+                        <span>{formatCompact(selectedDirectorySet.learners)} learners</span>
+                        <span aria-hidden="true">·</span>
+                        <span>{formatCompact(selectedDirectorySet.likes)} likes</span>
+                        <span aria-hidden="true">·</span>
+                        <span>Curated by {selectedDirectorySetCuratorLabel}</span>
+                      </div>
+                    </div>
+                  </header>
+
+                  <div className="px-3 sm:px-5 md:px-8">
+                    <section data-community-detail-media className="mt-10 overflow-hidden rounded-[14px] bg-[#151515] sm:mt-12">
                       {activeDetailCarouselReel ? (
                         <>
-                          <iframe
-                            src={activeDetailCarouselReel.embedUrl}
-                            title={`${selectedDirectorySet.title} reel preview`}
-                            className="h-[270px] w-full border-0 sm:h-[360px] md:h-[440px]"
-                            loading="lazy"
-                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-                            allowFullScreen
-                          />
-                          <div className="mt-2 flex items-center justify-between gap-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/62">
+                          <div className="relative aspect-video w-full overflow-hidden bg-black">
+                            <iframe
+                              src={activeDetailCarouselReel.embedUrl}
+                              title={`${selectedDirectorySet.title} reel preview`}
+                              className="absolute inset-0 h-full w-full border-0"
+                              loading="lazy"
+                              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                              allowFullScreen
+                            />
+                            {detailCarouselCount > 1 ? (
+                              <div className="absolute bottom-3 right-3 flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={goToPreviousDetailCarousel}
+                                  aria-label="Previous reel"
+                                  className="grid h-9 w-9 place-items-center rounded-full bg-black/[0.68] text-white/82 backdrop-blur-md transition-colors hover:bg-white/[0.07] hover:text-white"
+                                >
+                                  <i className="fa-solid fa-chevron-left text-[10px]" aria-hidden="true" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={goToNextDetailCarousel}
+                                  aria-label="Next reel"
+                                  className="grid h-9 w-9 place-items-center rounded-full bg-black/[0.68] text-white/82 backdrop-blur-md transition-colors hover:bg-white/[0.07] hover:text-white"
+                                >
+                                  <i className="fa-solid fa-chevron-right text-[10px]" aria-hidden="true" />
+                                </button>
+                              </div>
+                            ) : null}
+                          </div>
+                          <div className="flex items-center justify-between gap-2 px-4 py-3 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/55">
                             <span className="inline-flex items-center gap-1.5">
                               <i className={PLATFORM_ICON[activeDetailCarouselReel.platform]} aria-hidden="true" />
                               {PLATFORM_LABEL[activeDetailCarouselReel.platform]}
@@ -3573,31 +3724,27 @@ export function CommunityReelsPanel({
                           </div>
                         </>
                       ) : (
-                        <p className="rounded-xl bg-black/30 px-3 py-6 text-sm text-white/65">No reels uploaded for this set yet.</p>
+                        <div className="relative aspect-video w-full overflow-hidden">
+                          <img
+                            src={selectedDirectorySet.thumbnailUrl || FALLBACK_THUMBNAIL_URL}
+                            alt={`${selectedDirectorySet.title} cover`}
+                            className="h-full w-full object-cover"
+                          />
+                        </div>
                       )}
-                    </div>
-                  </section>
+                    </section>
 
-                  <section className="mt-4 rounded-2xl px-4 py-4 sm:px-5 sm:py-5">
-                    <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/65">Information</p>
-                    {selectedDirectorySet.tags.length > 0 ? (
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        {selectedDirectorySet.tags.map((tag) => (
-                          <span key={`${selectedDirectorySet.id}-tag-${tag}`} className="rounded-full bg-white/10 px-2.5 py-1 text-[11px] text-white/72">
-                            #{tag}
-                          </span>
+                    <section data-community-detail-about className="mt-9 sm:mt-11">
+                      <h4 className="text-xl font-semibold tracking-[-0.015em] text-white">About this set</h4>
+                      <div className="mt-4 max-w-3xl space-y-4">
+                        {buildCommunitySetInformationParagraphs(selectedDirectorySet, selectedDirectorySetCuratorLabel).map((paragraph, index) => (
+                          <p key={`${selectedDirectorySet.id}-detail-info-${index}`} className="break-words text-sm leading-7 text-white/66 sm:text-[15px]">
+                            {paragraph}
+                          </p>
                         ))}
                       </div>
-                    ) : null}
-                    <div className="mt-3 space-y-3">
-                      {buildCommunitySetInformationParagraphs(selectedDirectorySet, selectedDirectorySetCuratorLabel).map((paragraph, index) => (
-                        <p key={`${selectedDirectorySet.id}-detail-info-${index}`} className="text-sm leading-relaxed text-white/78">
-                          {paragraph}
-                        </p>
-                      ))}
-                    </div>
-                  </section>
-
+                    </section>
+                  </div>
                 </div>
               </div>
             ) : null}
@@ -3605,34 +3752,33 @@ export function CommunityReelsPanel({
         </div>
       ) : (
         <>
-          <div className="flex min-h-0 flex-1 flex-col pt-1 md:pt-2">
-            <div className="shrink-0">
-              <div
-                className="flex flex-col gap-3 md:-mx-2 md:flex-row md:items-center md:justify-between md:gap-4 lg:-mx-3"
-              >
+          <div className="relative mx-auto flex min-h-0 w-full flex-1 flex-col lg:w-11/12 xl:w-4/5 2xl:w-full 2xl:max-w-5xl">
+            <div data-top-chrome="community-management" className="top-nav-fade absolute inset-x-0 top-0 z-20 w-full shrink-0">
+              <div className="relative flex min-h-12 w-full items-center gap-3 px-1 sm:px-2 md:px-3">
                 <div
                   className={
                     isYourSetsMode && shouldShowEditSetGrid
-                      ? "min-w-0 flex-1 pl-7 sm:pl-8 md:w-auto md:pl-10 lg:pl-5"
-                      : "w-full pl-7 sm:pl-8 md:w-auto md:pl-10 lg:pl-5"
+                      ? "flex min-w-0 flex-1 items-center pl-4 sm:pl-5 lg:pl-0"
+                      : "flex min-w-0 flex-1 items-center justify-center pl-4 sm:pl-5 lg:justify-start lg:pl-0"
                   }
                 >
                   <div
-                    className={`flex items-center gap-2 md:justify-start ${
-                      isYourSetsMode && shouldShowEditSetGrid ? "justify-start" : "justify-center"
+                    className={`flex min-w-0 items-center gap-2 ${
+                      isYourSetsMode && shouldShowEditSetForm ? "lg:pl-11" : ""
                     }`}
                   >
                     {isYourSetsMode && shouldShowEditSetForm ? (
                       <button
                         type="button"
                         onClick={onBackToEditSetGrid}
+                        data-create-set-back="true"
                         aria-label="Back to all sets"
-                        className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-[#2b2b2b] text-white/80 transition hover:bg-white/10 hover:text-white"
+                        className="absolute left-1 sm:left-2 md:left-1.5 lg:left-0.5 inline-flex h-9 w-9 items-center justify-center rounded-xl text-white/70 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:bg-white/[0.09]"
                       >
                         <i className="fa-solid fa-chevron-left text-[11px]" aria-hidden="true" />
                       </button>
                     ) : null}
-                    <h2 className="text-xl font-semibold tracking-tight text-white sm:text-2xl md:text-[1.9rem]">
+                    <h2 className="truncate text-xl font-semibold tracking-tight text-white sm:text-2xl md:text-[1.9rem]">
                       {isYourSetsMode
                         ? shouldShowEditSetForm
                           ? isFormEditMode
@@ -3641,29 +3787,113 @@ export function CommunityReelsPanel({
                           : "Your Sets"
                         : "Create Set"}
                     </h2>
-                    <span className="rounded-full border border-[#2b2b2b] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/55">Beta</span>
                   </div>
                 </div>
                 {shouldShowYourSetsSearch ? (
-                  <div className="flex w-full flex-col items-end gap-2 pr-2 sm:pr-2 md:w-auto md:flex-row md:flex-wrap md:items-center md:justify-end md:pr-2 lg:pr-2">
-                    <label className="block w-full self-stretch md:w-[20.5rem] md:self-auto lg:w-[23rem]">
+                  <>
+                    <div
+                      data-compact-search="your-sets"
+                      data-compact-search-expanded={isCompactYourSetsSearchExpanded ? "true" : "false"}
+                      className={`absolute right-1 top-1/2 z-10 h-10 shrink-0 -translate-y-1/2 overflow-hidden transition-[width] duration-[440ms] ease-in-out motion-reduce:transition-none sm:right-2 md:right-3 xl:hidden ${
+                        isCompactYourSetsSearchExpanded ? "w-[clamp(7.5rem,48vw,17rem)]" : "w-10"
+                      }`}
+                    >
+                      <div
+                        aria-hidden={!isCompactYourSetsSearchExpanded}
+                        className={`absolute inset-0 transition-opacity duration-300 motion-reduce:transition-none ${
+                          isCompactYourSetsSearchExpanded ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
+                        }`}
+                      >
+                        <input
+                          ref={compactYourSetsSearchInputRef}
+                          value={yourSetsQuery}
+                          onChange={(event) => setYourSetsQuery(event.target.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Escape") {
+                              setYourSetsQuery("");
+                              setIsCompactYourSetsSearchOpen(false);
+                            }
+                          }}
+                          tabIndex={isCompactYourSetsSearchExpanded ? 0 : -1}
+                          aria-label="Search your sets"
+                          placeholder="Search sets"
+                          className="h-10 w-full rounded-full bg-white/[0.08] pl-4 pr-9 text-xs text-white outline-none backdrop-blur-[18px] backdrop-saturate-150 placeholder:text-white/35 focus:bg-white/[0.12]"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setYourSetsQuery("");
+                            setIsCompactYourSetsSearchOpen(false);
+                          }}
+                          tabIndex={isCompactYourSetsSearchExpanded ? 0 : -1}
+                          aria-label="Close your sets search"
+                          className="absolute right-1 top-1/2 grid h-8 w-8 -translate-y-1/2 place-items-center rounded-full text-white/55 transition-colors hover:bg-white/[0.07] hover:text-white"
+                        >
+                          <i className="fa-solid fa-xmark text-xs" aria-hidden="true" />
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsCompactYourSetsSearchOpen(true);
+                          window.requestAnimationFrame(() => compactYourSetsSearchInputRef.current?.focus());
+                        }}
+                        disabled={isCompactYourSetsSearchExpanded}
+                        aria-hidden={isCompactYourSetsSearchExpanded}
+                        aria-label="Open your sets search"
+                        className={`absolute inset-0 grid h-10 w-10 place-items-center rounded-full bg-transparent text-white/72 transition-[background-color,color,opacity] duration-300 hover:bg-white/[0.07] hover:text-white motion-reduce:transition-none ${
+                          isCompactYourSetsSearchExpanded ? "pointer-events-none opacity-0" : "pointer-events-auto opacity-100"
+                        }`}
+                      >
+                        <svg
+                          data-your-sets-search-icon
+                          aria-hidden="true"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.5"
+                          strokeLinecap="round"
+                          className="h-[18px] w-[18px]"
+                        >
+                          <circle cx="10.5" cy="10.5" r="6.25" />
+                          <path d="m15.25 15.25 4.25 4.25" />
+                        </svg>
+                      </button>
+                    </div>
+                    <label className="hidden w-[23rem] shrink-0 xl:block">
                       <div className="relative">
-                        <i className="fa-solid fa-magnifying-glass pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-sm text-white/38" />
+                        <svg
+                          data-your-sets-search-icon
+                          aria-hidden="true"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.5"
+                          strokeLinecap="round"
+                          className="pointer-events-none absolute left-4 top-1/2 z-10 h-[18px] w-[18px] -translate-y-1/2 text-white/55"
+                        >
+                          <circle cx="10.5" cy="10.5" r="6.25" />
+                          <path d="m15.25 15.25 4.25 4.25" />
+                        </svg>
                         <input
                           value={yourSetsQuery}
                           onChange={(event) => setYourSetsQuery(event.target.value)}
                           placeholder="Search your sets"
-                          className="h-11 w-full rounded-[1.5rem] bg-white/[0.08] pl-11 pr-4 text-sm text-white outline-none backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 placeholder:text-white/35 focus:bg-white/[0.12] sm:h-12 sm:rounded-[1.75rem] sm:pl-12"
+                          className="h-12 w-full rounded-[1.75rem] bg-white/[0.08] pl-12 pr-4 text-sm text-white outline-none backdrop-blur-[18px] backdrop-saturate-150 placeholder:text-white/35 focus:bg-white/[0.12]"
                         />
                       </div>
                     </label>
-                  </div>
+                  </>
                 ) : null}
               </div>
             </div>
 
-            <div className="mt-3 min-h-0 flex-1 overflow-hidden md:-mx-1.5 md:mt-4 lg:-mx-2.5">
-              <div className="balanced-scroll-gutter h-full min-h-0 overflow-y-auto pb-0">
+            <div className="min-h-0 flex-1 overflow-hidden md:-mx-1.5 lg:-mx-2.5">
+              <div
+                className={`balanced-scroll-gutter h-full min-h-0 overflow-y-auto pb-0 ${
+                  shouldShowEditSetGrid ? "pt-[5.5rem] md:pt-24" : "pt-[3.75rem] md:pt-16"
+                }`}
+              >
                 {!isCommunityAuthReady ? (
                   <section className="rounded-3xl px-1 pt-1 pb-2 sm:px-2 sm:pt-2 sm:pb-3 md:px-3 md:pt-3 md:pb-4">
                     <div className="relative overflow-hidden rounded-2xl bg-white/[0.07] p-5 backdrop-blur-[18px] backdrop-saturate-150">
@@ -3718,136 +3948,262 @@ export function CommunityReelsPanel({
                 ) : (
                   <>
                 {shouldShowEditSetGrid ? (
-                  <section className="rounded-3xl px-0 pt-1 pb-2 sm:px-1 sm:pt-2 sm:pb-3 md:px-2 md:pt-3 md:pb-4">
-                    <div className="relative overflow-hidden rounded-2xl bg-white/[0.07] p-4 pb-5 backdrop-blur-[18px] backdrop-saturate-150 sm:p-5 sm:pb-6">
+                  <section className="px-0 pb-1">
+                    <div className="relative pb-2">
                       <div className="relative z-10">
-                        <div className="flex flex-wrap items-center justify-between gap-3">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">Your Created Sets</p>
-                            <span className="rounded-full border border-[#2b2b2b] bg-black/45 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/72">
-                              {filteredEditableSets.length} set{filteredEditableSets.length === 1 ? "" : "s"}
-                            </span>
-                          </div>
-                          <div className="flex items-center">
-                            <button
-                              type="button"
-                              onClick={onOpenCreateSetFromGrid}
-                              className="inline-flex h-10 min-w-[8.25rem] items-center justify-center rounded-xl border border-[#2b2b2b] bg-black px-4 text-xs font-semibold uppercase tracking-[0.08em] text-white/80 backdrop-blur-md transition hover:bg-[#111] hover:text-white"
-                            >
-                              Create Set
-                            </button>
-                          </div>
-                        </div>
                         {filteredEditableSets.length > 0 ? (
-                          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                            {filteredEditableSets.map((set) => {
-                              const reelCount = getSetReelCount(set);
-                              const isStarred = starredSetIdSet.has(set.id);
-                              const isDeleting = deletingSetId === set.id;
-                              const isActionsMenuOpen = activeSetActionsMenuId === set.id;
-                              return (
-                                <div
-                                  key={`edit-set-grid-${set.id}`}
-                                  className="group relative overflow-hidden rounded-2xl bg-black/35 text-left transition hover:bg-black/55"
+                          <div
+                            data-your-sets-list
+                            className="pt-0"
+                          >
+                            <div
+                              data-your-sets-list-header
+                              className="grid grid-cols-[1.75rem_minmax(0,1fr)_7rem_3rem] items-center px-2 pb-1 text-sm text-white/62 sm:grid-cols-[1.75rem_minmax(0,1fr)_10rem_3.25rem]"
+                            >
+                              <div
+                                data-your-sets-name-action
+                                className={`relative col-start-2 min-w-0 transition-[height] duration-300 ease-out motion-reduce:transition-none ${
+                                  selectedEditableSetIds.length > 0 ? "h-7" : "h-5"
+                                }`}
+                              >
+                                <span
+                                  aria-hidden={selectedEditableSetIds.length > 0}
+                                  className={`absolute inset-y-0 left-0 flex min-w-0 max-w-full items-center truncate transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-none ${
+                                    selectedEditableSetIds.length > 0
+                                      ? "pointer-events-none -translate-y-1 opacity-0"
+                                      : "translate-y-0 opacity-100"
+                                  }`}
                                 >
-                                  <div
-                                    data-your-set-actions="true"
-                                    data-force-visible={isActionsMenuOpen ? "true" : undefined}
-                                    className="reveal-on-desktop-hover absolute right-2 top-2 z-20 transition-opacity"
+                                  Name
+                                </span>
+                                <button
+                                  type="button"
+                                  data-your-sets-delete-selected
+                                  onClick={onRequestDeleteSelectedEditableSets}
+                                  disabled={isDeletingSets || selectedEditableSetIds.length === 0}
+                                  tabIndex={selectedEditableSetIds.length > 0 ? 0 : -1}
+                                  aria-hidden={selectedEditableSetIds.length === 0}
+                                  aria-label={`Delete ${selectedEditableSetIds.length} selected ${selectedEditableSetIds.length === 1 ? "set" : "sets"}`}
+                                  className={`absolute left-0 top-0 inline-flex h-7 w-fit min-w-0 items-center justify-center overflow-hidden rounded-full border border-red-400/55 px-3 font-medium text-red-300 transition-[transform,opacity,background-color,border-color,color] [transition-duration:220ms,140ms,150ms,150ms,150ms] ease-out hover:border-red-300 hover:bg-white/[0.07] hover:text-red-200 focus-visible:border-red-300 focus-visible:text-red-200 focus-visible:outline-none motion-reduce:transition-none disabled:cursor-not-allowed ${
+                                    selectedEditableSetIds.length > 0
+                                      ? "translate-y-0 opacity-100 [transition-delay:0ms,220ms,0ms,0ms,0ms] disabled:opacity-50"
+                                      : "pointer-events-none translate-y-2 opacity-0 [transition-delay:0ms]"
+                                  }`}
+                                >
+                                  <span className="truncate">Delete</span>
+                                </button>
+                              </div>
+                              <button
+                                type="button"
+                                data-your-sets-modified-sort
+                                onClick={() => {
+                                  setYourSetsModifiedSortDirection((current) => current === "newest" ? "oldest" : "newest");
+                                }}
+                                aria-label={`Sort by modified date, currently ${yourSetsModifiedSortDirection} first`}
+                                title={`Sort by modified date (${yourSetsModifiedSortDirection} first)`}
+                                className="col-start-3 inline-flex min-w-0 max-w-full items-center gap-1 overflow-hidden font-normal text-white/62 transition-colors hover:text-white focus-visible:text-white focus-visible:outline-none"
+                              >
+                                <span className="truncate">Modified</span>
+                                <svg
+                                  data-your-sets-sort-arrow
+                                  viewBox="0 0 16 16"
+                                  aria-hidden="true"
+                                  className={`h-3.5 w-3.5 fill-none stroke-current transition-transform duration-200 ${
+                                    yourSetsModifiedSortDirection === "oldest" ? "rotate-180" : "rotate-0"
+                                  }`}
+                                  strokeWidth="1.5"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                >
+                                  <path d="m4.5 6.5 3.5 3.5 3.5-3.5" />
+                                </svg>
+                              </button>
+                            </div>
+                            <ul className="space-y-1">
+                              {filteredEditableSets.map((set) => {
+                                const isStarred = starredSetIdSet.has(set.id);
+                                const isSelected = selectedEditableSetIdSet.has(set.id);
+                                const isDeleting = deletingSetIdSet.has(set.id);
+                                const isActionsMenuOpen = activeSetActionsMenuId === set.id;
+                                const modifiedLabel = formatModifiedLabel(set, relativeTimeNowMs);
+                                return (
+                                  <li
+                                    key={`edit-set-list-${set.id}`}
+                                    data-your-set-row
+                                    className={`group relative grid min-h-[3rem] grid-cols-[1.75rem_minmax(0,1fr)_7rem_3rem] items-stretch bg-transparent text-left sm:min-h-[3.25rem] sm:grid-cols-[1.75rem_minmax(0,1fr)_10rem_3.25rem] ${
+                                      isActionsMenuOpen ? "z-40" : "z-0"
+                                    }`}
                                   >
+                                    <span
+                                      data-your-set-surface
+                                      aria-hidden="true"
+                                      className="pointer-events-none absolute bottom-0 left-7 right-0 top-0 rounded-[12px] bg-transparent transition-colors duration-300 group-hover:bg-white/[0.07] motion-reduce:transition-none"
+                                    />
                                     <button
                                       type="button"
+                                      role="checkbox"
+                                      data-your-set-checkbox
+                                      data-selected={isSelected ? "true" : "false"}
+                                      aria-checked={isSelected}
+                                      aria-label={`${isSelected ? "Deselect" : "Select"} ${set.title}`}
+                                      disabled={isDeletingSets}
                                       onClick={(event) => {
                                         event.preventDefault();
                                         event.stopPropagation();
-                                        setActiveSetActionsMenuId((prev) => (prev === set.id ? null : set.id));
+                                        onToggleEditableSetSelection(set.id);
                                       }}
-                                      aria-label={`Actions for ${set.title}`}
-                                      className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[#2b2b2b] bg-black text-white/80 transition hover:bg-black hover:text-white"
-                                    >
-                                      <i className="fa-solid fa-ellipsis text-xs" aria-hidden="true" />
-                                    </button>
-                                    <div
-                                      className={`absolute right-0 top-full mt-1 w-36 transition-opacity duration-180 ${
-                                        isActionsMenuOpen
-                                          ? "pointer-events-auto opacity-100"
-                                          : "pointer-events-none opacity-0"
+                                      className={`relative z-20 col-start-1 row-start-1 grid place-items-center rounded-l-[12px] transition-opacity duration-200 focus-visible:opacity-100 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40 motion-reduce:transition-none ${
+                                        isSelected
+                                          ? "opacity-100"
+                                          : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
                                       }`}
                                     >
-                                      <div
-                                        role="menu"
-                                        className="overflow-hidden rounded-2xl border border-white/15 bg-black p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)]"
+                                      <span
+                                        aria-hidden="true"
+                                        className={`grid h-4 w-4 place-items-center rounded-[4px] border transition-colors duration-200 motion-reduce:transition-none ${
+                                          isSelected
+                                            ? "border-white bg-white text-black"
+                                            : "border-white/45 bg-black/30 text-transparent"
+                                        }`}
                                       >
-                                        <button
-                                          type="button"
-                                          onClick={() => {
-                                            onOpenEditableSet(set.id);
-                                            setActiveSetActionsMenuId(null);
-                                          }}
-                                          className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                                        <svg viewBox="0 0 16 16" className="h-3 w-3 fill-none stroke-current" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                          <path d="m3.25 8.25 3 3 6.5-7" />
+                                        </svg>
+                                      </span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => onOpenEditableSet(set.id)}
+                                      aria-label={`Open ${set.title}`}
+                                      className="relative z-10 col-start-2 col-span-2 grid min-w-0 grid-cols-[minmax(0,1fr)_7rem] items-center rounded-l-[12px] px-2 py-1.5 text-left outline-none focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-[-2px] focus-visible:outline-white/70 sm:grid-cols-[minmax(0,1fr)_10rem]"
+                                    >
+                                      <span className="flex min-w-0 items-center gap-3 overflow-hidden">
+                                        <span
+                                          data-your-set-thumbnail
+                                          className="relative h-9 w-9 shrink-0 overflow-hidden rounded-[8px] bg-black sm:h-10 sm:w-10"
                                         >
-                                          <i className="fa-solid fa-pen-to-square text-[11px] text-white/80" aria-hidden="true" />
-                                          Edit
-                                        </button>
-                                        <button
-                                          type="button"
-                                          onClick={() => onToggleSetStar(set.id)}
-                                          className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                                          <img
+                                            src={set.thumbnailUrl || FALLBACK_THUMBNAIL_URL}
+                                            alt=""
+                                            aria-hidden="true"
+                                            loading="lazy"
+                                            className="h-full w-full object-cover"
+                                          />
+                                        </span>
+                                        <span className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
+                                          <span
+                                            data-your-set-title
+                                            title={set.title}
+                                            className="min-w-0 flex-1 truncate text-sm font-medium text-white sm:text-[15px]"
+                                          >
+                                            {set.title}
+                                          </span>
+                                          {isStarred ? <i className="fa-solid fa-star shrink-0 text-[10px] text-white/80" aria-hidden="true" /> : null}
+                                        </span>
+                                      </span>
+                                      <span
+                                        data-your-set-modified
+                                        title={modifiedLabel}
+                                        className="min-w-0 truncate pr-2 text-sm text-white/62"
+                                      >
+                                        {modifiedLabel}
+                                      </span>
+                                    </button>
+                                    <div
+                                      data-your-set-actions="true"
+                                      className="relative z-30 col-start-4 flex items-center justify-center"
+                                    >
+                                      <button
+                                        type="button"
+                                        onClick={(event) => {
+                                          event.preventDefault();
+                                          event.stopPropagation();
+                                          setActiveSetActionsMenuId((prev) => (prev === set.id ? null : set.id));
+                                        }}
+                                        aria-label={`Actions for ${set.title}`}
+                                        aria-haspopup="menu"
+                                        aria-expanded={isActionsMenuOpen}
+                                        aria-controls={`your-set-actions-menu-${set.id}`}
+                                        className="grid h-9 w-9 place-items-center rounded-lg text-white/58 transition-colors hover:bg-white/[0.07] hover:text-white"
+                                      >
+                                        <svg
+                                          data-your-set-more-icon
+                                          viewBox="0 0 24 24"
+                                          aria-hidden="true"
+                                          className="h-5 w-5 shrink-0 fill-none stroke-current"
+                                          strokeWidth="1.5"
+                                          strokeLinecap="round"
+                                          strokeLinejoin="round"
                                         >
-                                          <i className={`fa-${isStarred ? "solid" : "regular"} fa-star text-[11px] text-white/80`} aria-hidden="true" />
-                                          {isStarred ? "Unstar" : "Star"}
-                                        </button>
-                                        <button
-                                          type="button"
-                                          onClick={() => {
-                                            onRequestDeleteEditableSet(set.id);
-                                          }}
-                                          disabled={isDeleting}
-                                          className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
+                                          <circle cx="6" cy="12" r="1.15" fill="currentColor" stroke="none" />
+                                          <circle cx="12" cy="12" r="1.15" fill="currentColor" stroke="none" />
+                                          <circle cx="18" cy="12" r="1.15" fill="currentColor" stroke="none" />
+                                        </svg>
+                                      </button>
+                                      <div
+                                        aria-hidden={!isActionsMenuOpen}
+                                        className={`absolute right-2 top-[calc(50%+1.5rem)] z-50 w-44 transition-opacity duration-300 motion-reduce:transition-none ${
+                                          isActionsMenuOpen
+                                            ? "pointer-events-auto opacity-100"
+                                            : "pointer-events-none opacity-0"
+                                        }`}
+                                      >
+                                        <div
+                                          id={`your-set-actions-menu-${set.id}`}
+                                          role="menu"
+                                          className="overflow-hidden rounded-xl bg-[#202020] p-1.5"
                                         >
-                                          <i className="fa-regular fa-trash-can text-[11px] text-white/80" aria-hidden="true" />
-                                          {isDeleting ? "Deleting..." : "Delete"}
-                                        </button>
-                                      </div>
-                                    </div>
-                                  </div>
-                                  <button
-                                    type="button"
-                                    onClick={() => onOpenEditableSet(set.id)}
-                                    className="w-full text-left"
-                                  >
-                                    <div className="h-32 w-full overflow-hidden bg-black/45">
-                                      {set.thumbnailUrl ? (
-                                        <img src={set.thumbnailUrl} alt="" aria-hidden="true" className="h-full w-full object-cover transition duration-300 group-hover:scale-[1.03]" />
-                                      ) : (
-                                        <div className="grid h-full w-full place-items-center text-white/68">
-                                          <i className={`${getSetIconClass(set)} text-base`} aria-hidden="true" />
+                                          <button
+                                            type="button"
+                                            role="menuitem"
+                                            tabIndex={isActionsMenuOpen ? 0 : -1}
+                                            onClick={() => {
+                                              onOpenEditableSet(set.id);
+                                              setActiveSetActionsMenuId(null);
+                                            }}
+                                            className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-white/90 transition-colors hover:bg-white/[0.07]"
+                                          >
+                                            <i className="fa-solid fa-pen-to-square text-[11px] text-white/80" aria-hidden="true" />
+                                            Edit
+                                          </button>
+                                          <button
+                                            type="button"
+                                            role="menuitem"
+                                            tabIndex={isActionsMenuOpen ? 0 : -1}
+                                            onClick={() => onToggleSetStar(set.id)}
+                                            className="mt-0.5 flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-white/90 transition-colors hover:bg-white/[0.07]"
+                                          >
+                                            <i className={`fa-${isStarred ? "solid" : "regular"} fa-star text-[11px] text-white/80`} aria-hidden="true" />
+                                            {isStarred ? "Unstar" : "Star"}
+                                          </button>
+                                          <button
+                                            type="button"
+                                            role="menuitem"
+                                            tabIndex={isActionsMenuOpen ? 0 : -1}
+                                            onClick={() => {
+                                              onRequestDeleteEditableSet(set.id);
+                                            }}
+                                            disabled={isDeleting}
+                                            className="mt-0.5 flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-white/90 transition-colors hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:opacity-60"
+                                          >
+                                            <i className="fa-regular fa-trash-can text-[11px] text-white/80" aria-hidden="true" />
+                                            {isDeleting ? "Deleting..." : "Delete"}
+                                          </button>
                                         </div>
-                                      )}
-                                    </div>
-                                    <div className="space-y-2 px-3 py-3">
-                                      <div className="flex items-center gap-1.5">
-                                        {isStarred ? <i className="fa-solid fa-star shrink-0 text-[11px] text-white" aria-hidden="true" /> : null}
-                                        <p className="truncate text-sm font-semibold text-white">{set.title}</p>
-                                      </div>
-                                      <p className="line-clamp-2 text-xs leading-relaxed text-white/62">{set.description}</p>
-                                      <div className="flex items-center justify-between text-[10px] font-semibold uppercase tracking-[0.08em] text-white/58">
-                                        <span>{reelCount} reels</span>
-                                        <span>{formatLastEditedLabel(set, relativeTimeNowMs)}</span>
                                       </div>
                                     </div>
-                                  </button>
-                                </div>
-                              );
-                            })}
+                                  </li>
+                                );
+                              })}
+                            </ul>
                           </div>
                         ) : isYourSetsSearchActive ? (
-                          <p className="mt-4 text-sm text-white/66">
+                          <p data-your-sets-empty-state className="mt-4 pl-5 text-sm text-white/66 sm:pl-7 md:pl-[2.375rem] lg:pl-[1.375rem]">
                             No sets matched your search.
                           </p>
                         ) : (
-                          <p className="mt-4 text-sm text-white/66">
-                            No sets yet. Use Create Set to publish your first one.
+                          <p data-your-sets-empty-state className="mt-4 pl-5 text-sm text-white/66 sm:pl-7 md:pl-[2.375rem] lg:pl-[1.375rem]">
+                            No sets yet. Use the plus button to publish your first one.
                           </p>
                         )}
                       </div>
@@ -3855,14 +4211,17 @@ export function CommunityReelsPanel({
                   </section>
                 ) : null}
                 {shouldShowEditSetForm ? (
-                <section className="rounded-3xl px-1 pt-1 pb-2 sm:px-2 sm:pt-2 sm:pb-3 md:px-3 md:pt-3 md:pb-4">
-                <div className="grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,0.9fr)] lg:items-start">
-                  <form onSubmit={onCreateSet} className="space-y-4 md:space-y-5">
-                    <div className="relative overflow-hidden rounded-2xl bg-white/[0.07] p-4 pb-5 backdrop-blur-[18px] backdrop-saturate-150 sm:p-5 sm:pb-6">
-                      <div className="relative z-10 space-y-5">
+                <section data-create-set-view="true" className="px-1 pb-6 pt-2 sm:px-2 md:px-3 md:pb-8">
+                <div className="grid gap-8 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,0.9fr)] lg:items-start lg:gap-10">
+                  <form onSubmit={onCreateSet} className="space-y-8">
+                    <div className="space-y-5">
+                      <div>
+                        <h3 className="text-base font-semibold text-white">Set details</h3>
+                        <p className="mt-1 text-xs leading-5 text-white/48">Give learners a clear, useful preview of what this set covers.</p>
+                      </div>
                       <label className="block">
-                        <span className="mb-2 flex items-center justify-between gap-2 text-xs text-white/72">
-                          <span>Set Name</span>
+                        <span className="mb-2 flex items-center justify-between gap-2 text-xs font-medium text-white/62">
+                          <span>Name</span>
                           <span className="text-[10px] text-white/45">{normalizedSetTitle.length}/70</span>
                         </span>
                         <input
@@ -3870,14 +4229,14 @@ export function CommunityReelsPanel({
                           onChange={(event) => setSetTitle(event.target.value)}
                           maxLength={70}
                           placeholder="Example: Organic Chemistry Reactions"
-                          className="h-11 w-full rounded-xl border border-[#2b2b2b] bg-black/55 px-3 text-sm text-white outline-none placeholder:text-white/40 transition-colors focus:border-[#2b2b2b]"
+                          className="h-11 w-full rounded-xl bg-white/[0.08] px-3 text-sm text-white outline-none placeholder:text-white/32 transition-colors focus:bg-white/[0.12]"
                         />
                       </label>
 
                       <label className="block">
-                        <span className="mb-2 flex items-center justify-between gap-2 text-xs text-white/72">
+                        <span className="mb-2 flex items-center justify-between gap-2 text-xs font-medium text-white/62">
                           <span>Description</span>
-                          <span className={`text-[10px] ${descriptionHasTooFewChars ? "text-[#ff8f8f]" : "text-[#9ef8cb]"}`}>
+                          <span className={`text-[10px] ${shouldShowDescriptionError ? "text-[#ff9b9b]" : descriptionHasTooFewChars ? "text-white/45" : "text-[#9ef8cb]"}`}>
                             {normalizedSetDescription.length} / {MIN_SET_DESCRIPTION_LENGTH} min
                           </span>
                         </span>
@@ -3885,12 +4244,14 @@ export function CommunityReelsPanel({
                           value={setDescription}
                           onChange={(event) => setSetDescription(event.target.value)}
                           placeholder="What does this set cover and who is it for?"
-                          className={`h-24 w-full resize-none rounded-xl border bg-black/55 px-3 py-2 text-sm text-white outline-none placeholder:text-white/40 transition-colors md:h-24 ${
-                            descriptionHasTooFewChars ? "border-[#ff8f8f]/70 focus:border-[#ff8f8f]" : "border-[#2b2b2b] focus:border-[#2b2b2b]"
+                          aria-invalid={shouldShowDescriptionError}
+                          aria-describedby={shouldShowDescriptionError ? "community-set-description-error" : undefined}
+                          className={`h-24 w-full resize-none rounded-xl px-3 py-2.5 text-sm text-white outline-none placeholder:text-white/32 transition-colors ${
+                            shouldShowDescriptionError ? "bg-red-400/[0.09] focus:bg-red-400/[0.13]" : "bg-white/[0.08] focus:bg-white/[0.12]"
                           }`}
                         />
-                        {descriptionHasTooFewChars ? (
-                          <p className="mt-1.5 text-[11px] text-[#ff8f8f]">
+                        {shouldShowDescriptionError ? (
+                          <p id="community-set-description-error" className="mt-1.5 text-[11px] text-[#ff9b9b]">
                             Description must be at least {MIN_SET_DESCRIPTION_LENGTH} characters. Add {descriptionCharsRemaining} more
                             {descriptionCharsRemaining === 1 ? " character." : " characters."}
                           </p>
@@ -3898,9 +4259,9 @@ export function CommunityReelsPanel({
                       </label>
 
                       <label className="block">
-                        <span className="mb-2 flex items-center justify-between gap-2 text-xs text-white/72">
+                        <span className="mb-2 flex items-center justify-between gap-2 text-xs font-medium text-white/62">
                           <span>Tags</span>
-                          <span className={`text-[10px] ${tagLimitError ? "text-[#ff8f8f]" : "text-white/45"}`}>
+                          <span className={`text-[10px] ${tagLimitError ? "text-[#ff9b9b]" : "text-white/45"}`}>
                             {parsedSetTags.length}/{MAX_SET_TAGS}
                           </span>
                         </span>
@@ -3908,13 +4269,13 @@ export function CommunityReelsPanel({
                           value={setTags}
                           onChange={onSetTagsChange}
                           placeholder={hasMaxTags ? "Max tags reached. Edit or remove one to add another." : "chemistry, reaction mechanisms, exam prep"}
-                          className={`h-11 w-full rounded-xl border bg-black/55 px-3 text-sm text-white outline-none placeholder:text-white/40 transition-colors ${
-                            tagLimitError
-                              ? "border-[#ff8f8f]/70 focus:border-[#ff8f8f]"
-                              : "border-[#2b2b2b] focus:border-[#2b2b2b]"
+                          aria-invalid={tagLimitError}
+                          aria-describedby="community-set-tags-help"
+                          className={`h-11 w-full rounded-xl px-3 text-sm text-white outline-none placeholder:text-white/32 transition-colors ${
+                            tagLimitError ? "bg-red-400/[0.09] focus:bg-red-400/[0.13]" : "bg-white/[0.08] focus:bg-white/[0.12]"
                           }`}
                         />
-                        <p className={`mt-1.5 text-[11px] ${tagLimitError ? "text-[#ff8f8f]" : "text-zinc-400"}`}>
+                        <p id="community-set-tags-help" className={`mt-1.5 text-[11px] ${tagLimitError ? "text-[#ff9b9b]" : "text-white/42"}`}>
                           {tagLimitError
                             ? `You can add up to ${MAX_SET_TAGS} tags. Remove one to add another.`
                             : hasMaxTags
@@ -3928,7 +4289,7 @@ export function CommunityReelsPanel({
                                 key={`create-tag-${tag}`}
                                 type="button"
                                 onClick={() => onRemoveSetTag(tag)}
-                                className="inline-flex items-center gap-1 rounded-full border border-[#2b2b2b] bg-white/6 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/75 transition hover:bg-white/10 hover:text-white"
+                                className="inline-flex items-center gap-1 rounded-full bg-white/[0.09] px-2.5 py-1 text-[10px] font-medium text-white/72 transition-colors hover:bg-white/[0.07] hover:text-white"
                                 aria-label={`Remove tag ${tag}`}
                               >
                                 <span>#{tag}</span>
@@ -3940,41 +4301,41 @@ export function CommunityReelsPanel({
                       </label>
 
                       <div>
-                        <p className="mb-2 block text-xs text-white/72">Thumbnail Image</p>
-                        <input id="community-set-thumbnail" type="file" accept="image/*" className="sr-only" onChange={onThumbnailFileChange} />
+                        <p className="mb-2 block text-xs font-medium text-white/62">Cover image</p>
+                        <input id="community-set-thumbnail" type="file" accept="image/*" className="peer sr-only" onChange={onThumbnailFileChange} />
                         <label
                           htmlFor="community-set-thumbnail"
                           onDragEnter={onThumbnailDragEnter}
                           onDragOver={onThumbnailDragOver}
                           onDragLeave={onThumbnailDragLeave}
                           onDrop={onThumbnailDrop}
-                          className={`group relative block h-[220px] w-full cursor-pointer overflow-hidden rounded-xl border border-dashed ${
-                            isThumbnailDragOver ? "border-white/60 bg-white/10" : "border-[#2b2b2b] bg-black/55"
-                          } sm:h-[250px]`}
+                          className={`group relative block h-[190px] w-full cursor-pointer overflow-hidden rounded-xl transition-colors peer-focus-visible:bg-white/[0.12] ${
+                            isThumbnailDragOver ? "bg-white/[0.14]" : "bg-white/[0.055] hover:bg-white/[0.07]"
+                          } sm:h-[220px]`}
                         >
                           {thumbnailPreview ? (
                             <img
                               src={thumbnailPreview}
                               alt="Set thumbnail preview"
-                              className="h-full w-full object-cover transition opacity-100"
+                              className="h-full w-full object-cover"
                             />
                           ) : (
-                            <div className="grid h-full w-full place-items-center bg-[linear-gradient(145deg,rgba(255,255,255,0.16),rgba(255,255,255,0.04))] text-white/70 transition group-hover:text-white/85">
-                              <i className="fa-regular fa-image -translate-y-6 text-lg sm:-translate-y-7" aria-hidden="true" />
+                            <div className="grid h-full w-full place-items-center text-white/48 transition-colors group-hover:text-white/68">
+                              <i className="fa-regular fa-image -translate-y-5 text-lg" aria-hidden="true" />
                             </div>
                           )}
-                          <span className="absolute inset-0 grid place-items-center bg-black/35 text-white/85">
-                            <span className="flex max-w-[90%] translate-y-5 flex-col items-center text-center sm:translate-y-6">
-                              <span className={`truncate text-sm font-semibold ${thumbnailPreview ? "text-white" : "text-white/85"}`}>
-                                {thumbnailPreview ? thumbnailFileName || "Image selected" : "Drag and drop your image here"}
+                          <span className={`absolute inset-0 grid place-items-center text-white/85 ${thumbnailPreview ? "bg-black/45" : ""}`}>
+                            <span className="flex max-w-[90%] translate-y-5 flex-col items-center text-center">
+                              <span className={`truncate text-sm font-medium ${thumbnailPreview ? "text-white" : "text-white/78"}`}>
+                                {thumbnailPreview ? thumbnailFileName || "Image selected" : "Drop an image here"}
                               </span>
                               <span className="mt-1 text-xs text-white/58">
-                                {thumbnailPreview ? "Click to replace image" : "Or click to browse (PNG, JPG, WEBP)"}
+                                {thumbnailPreview ? "Click to replace" : "or click to browse · PNG, JPG, WEBP"}
                               </span>
                             </span>
                           </span>
                         </label>
-                        <p className="mt-2 text-[11px] text-zinc-400">Use a vertical image for better mobile previews.</p>
+                        <p className="mt-2 text-[11px] text-white/42">A vertical image works best in mobile previews.</p>
                         {thumbnailPreview ? (
                           <button
                             type="button"
@@ -3982,7 +4343,7 @@ export function CommunityReelsPanel({
                               setThumbnailPreview("");
                               setThumbnailFileName("");
                             }}
-                            className="mt-2 inline-flex items-center gap-1 rounded-lg border border-[#2b2b2b] bg-black/45 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/72 transition hover:bg-white/10 hover:text-white"
+                            className="mt-2 inline-flex h-8 items-center gap-1.5 rounded-lg px-2 text-xs font-medium text-white/52 transition-colors hover:bg-white/[0.07] hover:text-white"
                           >
                             <i className="fa-solid fa-trash text-[9px]" aria-hidden="true" />
                             Remove
@@ -3990,17 +4351,18 @@ export function CommunityReelsPanel({
                         ) : null}
                       </div>
                     </div>
-                    </div>
 
-                    <div className="relative min-h-0 overflow-hidden rounded-2xl bg-white/[0.07] p-3.5 pb-4 backdrop-blur-[18px] backdrop-saturate-150 sm:p-4 sm:pb-5">
-                      <div className="relative z-10">
-                      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.09em] text-white/68">Embed Reels ({SUPPORTED_PLATFORMS_LABEL})</p>
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-white/55">
-                          {validDraftReelCount} valid / {invalidDraftReelCount} invalid
+                    <div className="space-y-4">
+                      <div className="flex flex-wrap items-end justify-between gap-3">
+                        <div>
+                          <h3 className="text-base font-semibold text-white">Reels</h3>
+                          <p className="mt-1 text-xs leading-5 text-white/48">Paste links from {SUPPORTED_PLATFORMS_LABEL}. Add at least one to publish.</p>
+                        </div>
+                        <p className={`text-xs ${invalidDraftReelCount > 0 ? "text-[#ff9b9b]" : "text-white/45"}`}>
+                          {validDraftReelCount} ready{invalidDraftReelCount > 0 ? ` · ${invalidDraftReelCount} needs attention` : ""}
                         </p>
                       </div>
-                      <div className="balanced-scroll-gutter max-h-[320px] space-y-3 overflow-y-auto">
+                      <div className="space-y-5">
                         {parsedDraftReels.map((row, index) => {
                           const hasInput = Boolean(row.value.trim());
                           const hasValidEmbed = row.parsed !== null;
@@ -4032,18 +4394,18 @@ export function CommunityReelsPanel({
                           const shouldShowSlider = hasInput && hasValidEmbed && sliderMaxSec !== null;
                           const isDurationLoading = hasInput && hasValidEmbed && (durationState?.loading ?? true);
                           return (
-                            <div key={row.id} className="rounded-xl p-3">
+                            <div key={row.id} data-create-set-reel-row="true">
                               <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:gap-3">
                                 <input
                                   value={row.value}
                                   onChange={(event) => updateReelInputRow(row.id, event.target.value)}
                                   placeholder="Paste YouTube, Instagram reel, or TikTok URL"
-                                  className="h-10 w-full rounded-lg bg-black/60 px-2.5 text-xs text-white outline-none placeholder:text-white/40 sm:h-9"
+                                  className="h-11 w-full rounded-xl bg-white/[0.08] px-3 text-sm text-white outline-none placeholder:text-white/32 transition-colors focus:bg-white/[0.12]"
                                 />
                                 <button
                                   type="button"
                                   onClick={() => removeReelInputRow(row.id)}
-                                  className="inline-flex h-9 w-full shrink-0 items-center justify-center gap-1 rounded-lg bg-black/55 text-white/72 transition hover:bg-white/10 hover:text-white sm:grid sm:h-8 sm:w-8 sm:place-items-center"
+                                  className="inline-flex h-10 w-full shrink-0 items-center justify-center gap-1 rounded-xl bg-white/[0.055] text-white/52 transition-colors hover:bg-white/[0.07] hover:text-white sm:grid sm:h-11 sm:w-11 sm:place-items-center"
                                   aria-label={`Remove reel input ${index + 1}`}
                                 >
                                   <i className="fa-solid fa-xmark text-xs" aria-hidden="true" />
@@ -4112,7 +4474,7 @@ export function CommunityReelsPanel({
                               ) : null}
 
                               {row.parsed ? (
-                                <div className="mt-3 overflow-hidden rounded-lg">
+                                <div className="mt-3 overflow-hidden rounded-xl bg-black/30">
                                   <div className="flex items-center gap-1.5 px-2 py-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/70">
                                     <i className={PLATFORM_ICON[row.parsed.platform]} aria-hidden="true" />
                                     {PLATFORM_LABEL[row.parsed.platform]} embed
@@ -4125,14 +4487,22 @@ export function CommunityReelsPanel({
                                     ) : null}
                                   </div>
                                   <iframe
+                                    data-create-set-reel-preview="true"
                                     src={row.parsed.embedUrl}
                                     title={`${PLATFORM_LABEL[row.parsed.platform]} reel preview`}
-                                    className="h-[180px] w-full border-0 sm:h-[160px]"
+                                    className="h-[320px] w-full border-0 sm:h-[360px]"
                                     loading="lazy"
                                     allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
                                     allowFullScreen
                                   />
                                 </div>
+                              ) : null}
+                              {index < parsedDraftReels.length - 1 ? (
+                                <div
+                                  data-create-set-reel-divider="true"
+                                  aria-hidden="true"
+                                  className="mt-5 h-px bg-white/[0.08]"
+                                />
                               ) : null}
                             </div>
                           );
@@ -4141,12 +4511,11 @@ export function CommunityReelsPanel({
                       <button
                         type="button"
                         onClick={addReelInputRow}
-                        className="mt-3 inline-flex items-center gap-1 px-1 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/72 transition hover:text-white"
+                        className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-white/[0.07] px-3 text-xs font-medium text-white/72 transition-colors hover:bg-white/[0.07] hover:text-white"
                       >
                         <i className="fa-solid fa-plus text-[9px]" aria-hidden="true" />
-                        Add Reels
+                        Add another reel
                       </button>
-                    </div>
                     </div>
 
                     {isFormEditMode ? (
@@ -4154,137 +4523,102 @@ export function CommunityReelsPanel({
                         <button
                           type="submit"
                           disabled={!canPostSet}
-                          className={`inline-flex h-11 w-full items-center justify-center rounded-xl border px-4 text-sm font-semibold transition ${
+                          className={`inline-flex h-11 w-full items-center justify-center rounded-xl px-4 text-sm font-semibold transition-colors ${
                             canPostSet
-                              ? "border-[#2b2b2b] bg-black/55 text-white hover:bg-white hover:text-black"
-                              : "cursor-not-allowed border-[#2b2b2b] bg-black/35 text-white/45"
+                              ? "bg-white text-black hover:bg-white/90"
+                              : "cursor-not-allowed bg-white/[0.09] text-white/32"
                           }`}
                         >
                           {isPostingSet ? "Saving..." : "Save Set Changes"}
                         </button>
                       </div>
                     ) : (
-                      <div className="grid gap-2 sm:grid-cols-3">
+                      <div data-create-set-actions="true" className="grid gap-2 sm:grid-cols-[auto_auto_minmax(12rem,1fr)]">
                         <button
                           type="button"
                           onClick={onClearCreateProgress}
-                          className="inline-flex h-11 w-full items-center justify-center rounded-xl border border-[#2b2b2b] bg-black/35 px-4 text-sm font-semibold text-white/80 transition hover:bg-white/10 hover:text-white"
+                          className="inline-flex h-11 w-full items-center justify-center rounded-xl px-4 text-sm font-medium text-white/52 transition-colors hover:bg-white/[0.07] hover:text-white"
                         >
-                          Clear Progress
+                          Clear
                         </button>
                         <button
                           type="button"
                           onClick={onSaveDraftProgress}
-                          className="inline-flex h-11 w-full items-center justify-center rounded-xl border border-[#2b2b2b] bg-black/35 px-4 text-sm font-semibold text-white/80 transition hover:bg-white/10 hover:text-white"
+                          className="inline-flex h-11 w-full items-center justify-center rounded-xl bg-white/[0.08] px-4 text-sm font-medium text-white/82 transition-colors hover:bg-white/[0.07] hover:text-white"
                         >
-                          Save Progress
+                          Save draft
                         </button>
                         <button
                           type="submit"
                           disabled={!canPostSet}
-                          className={`inline-flex h-11 w-full items-center justify-center rounded-xl border px-4 text-sm font-semibold transition ${
+                          className={`inline-flex h-11 w-full items-center justify-center rounded-xl px-5 text-sm font-semibold transition-colors ${
                             canPostSet
-                              ? "border-[#2b2b2b] bg-black/55 text-white hover:bg-white hover:text-black"
-                              : "cursor-not-allowed border-[#2b2b2b] bg-black/35 text-white/45"
+                              ? "bg-white text-black hover:bg-white/90"
+                              : "cursor-not-allowed bg-white/[0.09] text-white/32"
                           }`}
                         >
-                          {isPostingSet ? "Posting..." : "Post Community Set"}
+                          {isPostingSet ? "Posting..." : "Post set"}
                         </button>
                       </div>
                     )}
                   </form>
 
-                  <aside className="relative overflow-hidden rounded-2xl bg-white/[0.07] p-4 pb-5 backdrop-blur-[18px] backdrop-saturate-150 sm:p-5 sm:pb-6 lg:sticky lg:top-3">
-                    <div className="relative z-10">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/62">Live Preview</p>
-                      <div className="mt-3 overflow-hidden rounded-xl border border-[#2b2b2b] bg-black/45">
-                        {thumbnailPreview ? (
-                          <img
-                            src={thumbnailPreview}
-                            alt="Draft set cover"
-                            className="h-[220px] w-full object-cover"
-                          />
-                        ) : (
-                          <div className="grid h-[220px] w-full place-items-center bg-[linear-gradient(145deg,rgba(255,255,255,0.16),rgba(255,255,255,0.04))] text-white/70">
-                            <i className="fa-regular fa-image text-lg" aria-hidden="true" />
-                          </div>
-                        )}
-                      </div>
-                      <h3 className="mt-3 text-lg font-semibold leading-tight text-white">
-                        {normalizedSetTitle || "Your set title"}
-                      </h3>
-                      <p className="mt-2 text-sm leading-relaxed text-white/70">
-                        {normalizedSetDescription || "Add a description to show what learners will get from this set."}
-                      </p>
+                  <aside className="rounded-2xl bg-white/[0.035] p-4 sm:p-5 lg:sticky lg:top-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-sm font-medium text-white/72">Preview</p>
+                      <span className={`text-xs font-medium ${canPostSet ? "text-[#9ef8cb]" : "text-white/42"}`}>
+                        {canPostSet ? (isFormEditMode ? "Ready to save" : "Ready to post") : "Draft"}
+                      </span>
+                    </div>
+                    <div className="mt-3 overflow-hidden rounded-xl bg-white/[0.055]">
+                      {thumbnailPreview ? (
+                        <img
+                          src={thumbnailPreview}
+                          alt="Draft set cover"
+                          className="h-[200px] w-full object-cover"
+                        />
+                      ) : (
+                        <div className="grid h-[200px] w-full place-items-center text-white/42">
+                          <i className="fa-regular fa-image text-lg" aria-hidden="true" />
+                        </div>
+                      )}
+                    </div>
+                    <h3 className="mt-4 text-lg font-semibold leading-tight text-white">
+                      {normalizedSetTitle || "Your set title"}
+                    </h3>
+                    <p className="mt-2 text-sm leading-relaxed text-white/64">
+                      {normalizedSetDescription || "Add a description to show what learners will get from this set."}
+                    </p>
+                    {parsedSetTags.length > 0 ? (
                       <div className="mt-3 flex flex-wrap gap-1.5">
-                        {parsedSetTags.length > 0
-                          ? parsedSetTags.map((tag) => (
-                            <span key={`preview-tag-${tag}`} className="rounded-full bg-white/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/72">
-                              #{tag}
-                            </span>
-                          ))
-                          : null}
+                        {parsedSetTags.map((tag) => (
+                          <span key={`preview-tag-${tag}`} className="rounded-full bg-white/[0.09] px-2.5 py-1 text-[10px] font-medium text-white/68">
+                            #{tag}
+                          </span>
+                        ))}
                       </div>
-                      <div className="mt-3 rounded-xl border border-[#2b2b2b] bg-black/35 px-3 py-3">
-                        <div className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-4">
-                          <div className="flex flex-col items-center">
-                            <div className="relative h-[86px] w-[86px]">
-                              <svg viewBox="0 0 88 88" className="h-full w-full -rotate-90" aria-hidden="true">
-                                <circle cx="44" cy="44" r={progressRadius} stroke="rgba(255,255,255,0.14)" strokeWidth="7" fill="none" />
-                                <circle
-                                  cx="44"
-                                  cy="44"
-                                  r={progressRadius}
-                                  stroke="#ffffff"
-                                  strokeWidth="7"
-                                  strokeLinecap="round"
-                                  fill="none"
-                                  strokeDasharray={progressCircumference}
-                                  strokeDashoffset={progressOffset}
-                                  style={{
-                                    transition: "stroke-dashoffset 420ms cubic-bezier(0.22, 1, 0.36, 1)",
-                                  }}
-                                />
-                              </svg>
-                              <div className="absolute inset-0 flex flex-col items-center justify-center">
-                                <span className="text-base font-semibold leading-none text-white">{progressPercent}%</span>
-                              </div>
-                            </div>
-                            <p className="mt-2 text-center text-[10px] font-semibold uppercase tracking-[0.08em] text-white/62">
-                              {requiredCompletionCount}/4 done
-                            </p>
-                          </div>
-                          <div>
-                            <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-white/58">
-                              {isFormEditMode ? "Still needed to save" : "Still needed to post"}
-                            </p>
-                            {remainingPreviewRequirements.length > 0 ? (
-                              <ul className="mt-2 space-y-1.5">
-                                {remainingPreviewRequirements.map((item) => (
-                                  <li key={`remaining-requirement-${item}`} className="flex items-start gap-2 text-xs text-white/80">
-                                    <i className="fa-regular fa-circle text-[8px] text-white/55 mt-[4px]" aria-hidden="true" />
-                                    <span>{item}</span>
-                                  </li>
-                                ))}
-                              </ul>
-                            ) : (
-                              <p className="mt-2 text-xs text-[#9ef8cb]">All required items completed.</p>
-                            )}
-                          </div>
-                        </div>
+                    ) : null}
+                    <div className="mt-5 rounded-xl bg-white/[0.045] px-3.5 py-3.5">
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="text-xs font-medium text-white/68">
+                          {remainingPreviewRequirements.length > 0
+                            ? isFormEditMode ? "Before you save" : "Before you post"
+                            : "Ready when you are"}
+                        </p>
+                        <span className="text-[11px] text-white/42">{requiredCompletionCount}/4</span>
                       </div>
-                      <div className="mt-3 grid grid-cols-2 gap-2">
-                        <div className="rounded-lg border border-[#2b2b2b] bg-black/35 px-2.5 py-2">
-                          <p className="text-[10px] uppercase tracking-[0.08em] text-white/52">Reels</p>
-                          <p className="mt-1 text-sm font-semibold text-white">{validDraftReelCount}</p>
-                        </div>
-                        <div className="rounded-lg border border-[#2b2b2b] bg-black/35 px-2.5 py-2">
-                          <p className="text-[10px] uppercase tracking-[0.08em] text-white/52">Status</p>
-                          <p className={`mt-1 text-sm font-semibold ${canPostSet ? "text-[#9ef8cb]" : "text-white/76"}`}>
-                            {canPostSet ? (isFormEditMode ? "Ready to save" : "Ready to post") : "Draft"}
-                          </p>
-                        </div>
-                      </div>
+                      {remainingPreviewRequirements.length > 0 ? (
+                        <ul className="mt-3 space-y-2">
+                          {remainingPreviewRequirements.map((item) => (
+                            <li key={`remaining-requirement-${item}`} className="flex items-start gap-2.5 text-xs leading-5 text-white/72">
+                              <i className="fa-regular fa-circle mt-[6px] text-[7px] text-white/38" aria-hidden="true" />
+                              <span>{item}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="mt-2 text-xs text-[#9ef8cb]">All required details are complete.</p>
+                      )}
                     </div>
                   </aside>
                 </div>
@@ -4295,13 +4629,29 @@ export function CommunityReelsPanel({
             </div>
           </div>
           </div>
+          {shouldShowEditSetGrid && canManageYourSets ? (
+            <button
+              type="button"
+              onClick={onOpenCreateSetFromGrid}
+              data-floating-create-set
+              aria-label="Create set"
+              title="Create set"
+              className="absolute bottom-[max(40px,env(safe-area-inset-bottom))] right-[max(40px,env(safe-area-inset-right))] z-30 grid h-14 w-14 place-items-center rounded-full bg-white text-black transition-colors duration-300 hover:bg-white/90"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true" className="h-6 w-6 fill-none stroke-current" strokeWidth="1.5" strokeLinecap="round">
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+            </button>
+          ) : null}
       </>
     )}
-      {detailBannerPortal}
-      {draftActionConfirmModal ? (
+      <FadePresence show={Boolean(draftActionConfirmModal)}>
+        {(modalVisible) => draftActionConfirmModal ? (
         <ViewportModalPortal>
           <div
-            className="fixed inset-0 z-[128] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
+            className={`fixed inset-0 z-[128] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 transition-opacity duration-300 motion-reduce:transition-none ${
+              modalVisible ? "opacity-100" : "opacity-0"
+            }`}
             role="presentation"
             onClick={closeDraftActionConfirmModal}
           >
@@ -4309,7 +4659,7 @@ export function CommunityReelsPanel({
               role="dialog"
               aria-modal="true"
               aria-label="Draft action confirmation"
-              className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
+              className="w-full max-w-xl rounded-[14px] bg-[#202020] p-5 text-white md:p-6"
               onClick={(event) => event.stopPropagation()}
             >
               <div className="flex items-start justify-between gap-4">
@@ -4322,7 +4672,7 @@ export function CommunityReelsPanel({
                   onClick={closeDraftActionConfirmModal}
                   aria-label="Close"
                   disabled={isPostingSet}
-                  className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-55"
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-white/80 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-55"
                 >
                   <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
                     <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
@@ -4337,7 +4687,7 @@ export function CommunityReelsPanel({
                   type="button"
                   onClick={closeDraftActionConfirmModal}
                   disabled={isPostingSet}
-                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-55"
+                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:opacity-55"
                 >
                   Cancel
                 </button>
@@ -4355,11 +4705,15 @@ export function CommunityReelsPanel({
             </div>
           </div>
         </ViewportModalPortal>
-      ) : null}
-      {unsavedDraftExitModal ? (
+        ) : null}
+      </FadePresence>
+      <FadePresence show={Boolean(unsavedDraftExitModal)}>
+        {(modalVisible) => unsavedDraftExitModal ? (
         <ViewportModalPortal>
           <div
-            className="fixed inset-0 z-[127] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
+            className={`fixed inset-0 z-[127] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 transition-opacity duration-300 motion-reduce:transition-none ${
+              modalVisible ? "opacity-100" : "opacity-0"
+            }`}
             role="presentation"
             onClick={closeUnsavedDraftExitModal}
           >
@@ -4367,7 +4721,7 @@ export function CommunityReelsPanel({
               role="dialog"
               aria-modal="true"
               aria-label="Unsaved set draft changes"
-              className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
+              className="w-full max-w-xl rounded-[14px] bg-[#202020] p-5 text-white md:p-6"
               onClick={(event) => event.stopPropagation()}
             >
               <div className="flex items-start justify-between gap-4">
@@ -4379,7 +4733,7 @@ export function CommunityReelsPanel({
                   type="button"
                   onClick={closeUnsavedDraftExitModal}
                   aria-label="Close"
-                  className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-white/80 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline-none"
                 >
                   <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
                     <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
@@ -4396,7 +4750,7 @@ export function CommunityReelsPanel({
                   type="button"
                   onClick={confirmUnsavedDraftExitDiscard}
                   disabled={isPostingSet}
-                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
+                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   Discard
                 </button>
@@ -4412,32 +4766,42 @@ export function CommunityReelsPanel({
             </div>
           </div>
         </ViewportModalPortal>
-      ) : null}
-      {deleteSetConfirmModal ? (
+        ) : null}
+      </FadePresence>
+      <FadePresence show={Boolean(deleteSetConfirmModal)}>
+        {(modalVisible) => deleteSetConfirmModal ? (
         <ViewportModalPortal>
           <div
-            className="fixed inset-0 z-[126] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
+            className={`fixed inset-0 z-[126] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 transition-opacity duration-300 motion-reduce:transition-none ${
+              modalVisible ? "opacity-100" : "opacity-0"
+            }`}
             role="presentation"
             onClick={closeDeleteSetConfirmModal}
           >
             <div
               role="dialog"
               aria-modal="true"
-              aria-label="Delete set confirmation"
-              className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
+              aria-label={deleteSetConfirmModal.setIds.length === 1 ? "Delete set confirmation" : "Delete sets confirmation"}
+              className="w-full max-w-xl rounded-[14px] bg-[#202020] p-5 text-white md:p-6"
               onClick={(event) => event.stopPropagation()}
             >
               <div className="flex items-start justify-between gap-4">
                 <div>
-                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Delete Set</p>
-                  <h3 className="mt-2 text-lg font-semibold text-white">Delete "{deleteSetConfirmModal.title}"?</h3>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">
+                    {deleteSetConfirmModal.setIds.length === 1 ? "Delete Set" : "Delete Sets"}
+                  </p>
+                  <h3 className="mt-2 text-lg font-semibold text-white">
+                    {deleteSetConfirmModal.setIds.length === 1
+                      ? `Delete "${deleteSetConfirmModal.title}"?`
+                      : `Delete ${deleteSetConfirmModal.setIds.length} selected sets?`}
+                  </h3>
                 </div>
                 <button
                   type="button"
                   onClick={closeDeleteSetConfirmModal}
                   aria-label="Close"
-                  disabled={Boolean(deletingSetId)}
-                  className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-55"
+                  disabled={isDeletingSets}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-white/80 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-55"
                 >
                   <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
                     <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
@@ -4451,30 +4815,34 @@ export function CommunityReelsPanel({
                 <button
                   type="button"
                   onClick={closeDeleteSetConfirmModal}
-                  disabled={Boolean(deletingSetId)}
-                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-55"
+                  disabled={isDeletingSets}
+                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:opacity-55"
                 >
                   Cancel
                 </button>
                 <button
                   type="button"
                   onClick={() => {
-                    void onDeleteEditableSet(deleteSetConfirmModal.setId);
+                    void onDeleteEditableSets(deleteSetConfirmModal.setIds);
                   }}
-                  disabled={Boolean(deletingSetId)}
+                  disabled={isDeletingSets}
                   className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-70"
                 >
-                  {deletingSetId === deleteSetConfirmModal.setId ? "Deleting..." : "Delete"}
+                  {isDeletingSets ? "Deleting..." : "Delete"}
                 </button>
               </div>
             </div>
           </div>
         </ViewportModalPortal>
-      ) : null}
-      {publishResultModal ? (
+        ) : null}
+      </FadePresence>
+      <FadePresence show={Boolean(publishResultModal)}>
+        {(modalVisible) => publishResultModal ? (
         <ViewportModalPortal>
           <div
-            className="fixed inset-0 z-[125] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 backdrop-blur-[2px]"
+            className={`fixed inset-0 z-[125] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 transition-opacity duration-300 motion-reduce:transition-none ${
+              modalVisible ? "opacity-100" : "opacity-0"
+            }`}
             role="presentation"
             onClick={() => setPublishResultModal(null)}
           >
@@ -4482,7 +4850,7 @@ export function CommunityReelsPanel({
               role="dialog"
               aria-modal="true"
               aria-label="Publish result"
-              className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl md:p-6"
+              className="w-full max-w-xl rounded-[14px] bg-[#202020] p-5 text-white backdrop-blur-2xl md:p-6"
               onClick={(event) => event.stopPropagation()}
             >
               <div className="flex items-start justify-between gap-4">
@@ -4494,7 +4862,7 @@ export function CommunityReelsPanel({
                   type="button"
                   onClick={() => setPublishResultModal(null)}
                   aria-label="Close publish result"
-                  className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-white/80 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline-none"
                 >
                   <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
                     <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
@@ -4520,7 +4888,7 @@ export function CommunityReelsPanel({
                   className={`inline-flex min-w-[8rem] items-center justify-center whitespace-nowrap rounded-xl px-5 py-2.5 text-sm font-semibold transition-colors ${
                     publishResultModal.status === "success"
                       ? "bg-white text-black hover:bg-white/90"
-                      : "bg-black/35 text-white hover:bg-white/10"
+                      : "bg-black/35 text-white hover:bg-white/[0.07]"
                   }`}
                 >
                   OK
@@ -4529,7 +4897,8 @@ export function CommunityReelsPanel({
             </div>
           </div>
         </ViewportModalPortal>
-      ) : null}
+        ) : null}
+      </FadePresence>
     </div>
   );
 }

@@ -37,9 +37,10 @@ type BillingActionsProps = {
   status: BillingStatus | null;
   plans: BillingPlan[];
   onError?: (message: string | null) => void;
+  demoMode?: boolean;
 };
 
-export function BillingActions({ status, plans, onError }: BillingActionsProps) {
+export function BillingActions({ status, plans, onError, demoMode = false }: BillingActionsProps) {
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const activeSubscription = activeBillingSubscription(status);
 
@@ -48,6 +49,10 @@ export function BillingActions({ status, plans, onError }: BillingActionsProps) 
   };
 
   const openCheckout = async (plan: Exclude<BillingPlanCode, "free">) => {
+    if (demoMode) {
+      onError?.("Billing actions are disabled for the local demo account.");
+      return;
+    }
     if (busyAction) {
       return;
     }
@@ -62,6 +67,10 @@ export function BillingActions({ status, plans, onError }: BillingActionsProps) 
   };
 
   const openPortal = async () => {
+    if (demoMode) {
+      onError?.("Billing actions are disabled for the local demo account.");
+      return;
+    }
     if (busyAction) {
       return;
     }
@@ -101,7 +110,7 @@ export function BillingActions({ status, plans, onError }: BillingActionsProps) 
             type="button"
             onClick={() => void openCheckout(plan.code)}
             disabled={Boolean(busyAction)}
-            className="rounded-[14px] border border-white/20 bg-white px-3 py-2.5 text-left text-black transition hover:bg-white/90 disabled:cursor-wait disabled:opacity-60"
+            className="rounded-[14px] bg-white px-3 py-2.5 text-left text-black transition hover:bg-white/90 disabled:cursor-wait disabled:opacity-60"
           >
             <span className="block text-sm font-bold">{busyAction === plan.code ? "Opening..." : plan.name}</span>
             <span className="mt-0.5 block text-[11px] font-medium text-black/60">

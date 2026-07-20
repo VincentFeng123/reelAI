@@ -216,6 +216,16 @@ export function ReelCard({
   const clipStart = Number.isFinite(clipStartRaw) && clipStartRaw >= 0 ? clipStartRaw : 0;
   const clipEnd = Number.isFinite(clipEndRaw) && clipEndRaw > clipStart ? clipEndRaw : clipStart;
   const clipDuration = Math.max(0, clipEnd - clipStart);
+  const activeCaption = useMemo(() => {
+    const cues = reel.captions ?? [];
+    if (!isActive || !isYouTubeVideo || cues.length === 0) {
+      return null;
+    }
+    const cue = cues.find(
+      (candidate) => currentSec >= Number(candidate.start) && currentSec < Number(candidate.end),
+    );
+    return cue?.text.trim() || null;
+  }, [currentSec, isActive, isYouTubeVideo, reel.captions]);
   const progressPercent = clipDuration > 0 ? clamp((currentSec / clipDuration) * 100, 0, 100) : 0;
   const reelProgressStyle = { width: `${progressPercent}%` } as CSSProperties;
   const reelProgressDotStyle = { left: `${progressPercent}%` } as CSSProperties;
@@ -1145,36 +1155,38 @@ export function ReelCard({
     };
   }, [isActive, toggleMute, togglePlayPause]);
 
-  const hidePlayerSurface = isActive && isYouTubeVideo && (!isReady || !isPlaying || !isSurfaceVisible || Boolean(loadError));
+  const hidePlayerSurface = isActive && isYouTubeVideo && (!isReady || !isSurfaceVisible || Boolean(loadError));
   const showTransitionMask = isActive && isYouTubeVideo && isResumeMaskVisible;
   const showBoundaryMask = isActive && isYouTubeVideo && isBoundaryMaskVisible;
   const canToggleFromSurface = isYouTubeVideo && isActive && isReady && !loadError;
   const surfaceAriaLabel = isPlaying ? "Pause clip" : "Play clip";
   const controlsEnabled = isReady && isActive && isYouTubeVideo;
   const controlButtonClass = (active: boolean) =>
-    `grid h-9 w-9 place-items-center rounded-full text-base transition-colors duration-200 disabled:pointer-events-none disabled:text-white/35 ${
+    `grid h-11 w-11 place-items-center rounded-full text-base transition-colors duration-200 focus-visible:bg-white/[0.07] disabled:pointer-events-none disabled:text-white/35 lg:h-10 lg:w-10 ${
       active
         ? "bg-white/12 text-white"
-        : "bg-transparent text-white/88 hover:bg-white/10 hover:text-white"
+        : "bg-transparent text-white/88 hover:bg-white/[0.07] hover:text-white"
     }`;
   const controlsChromeClass = isMobilePhoneDevice
-    ? "rounded-2xl border border-white/20 bg-black/70 px-3 py-2 shadow-[0_10px_26px_rgba(0,0,0,0.38)] backdrop-blur-md"
+    ? "rounded-2xl bg-black/70 px-3 py-2 backdrop-blur-md"
     : "px-0 py-0";
 
   return (
-    <section className="relative h-full min-h-full w-full snap-start overflow-hidden rounded-none border-0 bg-transparent lg:rounded-3xl lg:border lg:border-white/20">
+    <section className="relative h-full min-h-full w-full snap-start overflow-hidden rounded-none bg-black lg:rounded-[1.25rem]">
       {isActive ? (
         <div className="absolute inset-0 overflow-hidden">
           {isYouTubeVideo ? (
             <div
               ref={hostContainerRef}
-              className="pointer-events-none absolute inset-0 h-full w-full"
+              data-youtube-crop="true"
+              className="pointer-events-none absolute inset-x-0 w-full"
+              style={{ top: "-10%", height: "120%" }}
             />
           ) : safeExternalUrl ? (
             <iframe
               src={safeExternalUrl}
               title={reel.video_title || reel.concept_title || "Community reel"}
-              className="absolute inset-0 h-full w-full border-0"
+              className="absolute inset-0 h-full w-full"
               loading="eager"
               allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
               sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-presentation"
@@ -1210,7 +1222,15 @@ export function ReelCard({
         }`}
       />
 
-      <div className="pointer-events-none absolute inset-x-0 top-0 z-[16] h-16 bg-black/95" />
+      <div
+        data-top-chrome="reel-player"
+        className="top-nav-fade pointer-events-none absolute inset-x-0 top-0 z-[16] h-20"
+      />
+
+      <div
+        data-bottom-chrome="reel-player"
+        className="pointer-events-none absolute inset-x-0 bottom-0 z-[16] h-32 bg-gradient-to-t from-black via-black/75 to-transparent"
+      />
 
       {isActive && isYouTubeVideo ? (
         <button
@@ -1224,9 +1244,20 @@ export function ReelCard({
 
       {isActive && isYouTubeVideo && isReady && !isPlaying && !loadError ? (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
-          <div className="grid h-14 w-14 place-items-center rounded-full border border-white/28 bg-black/78 text-white/90">
+          <div className="grid h-14 w-14 place-items-center rounded-full bg-black/72 text-white/90 backdrop-blur-sm">
             <i className="fa-solid fa-play text-base" aria-hidden="true" />
           </div>
+        </div>
+      ) : null}
+
+      {activeCaption ? (
+        <div
+          data-reel-caption="true"
+          className="pointer-events-none absolute inset-x-5 bottom-24 z-[19] flex justify-center lg:bottom-28"
+        >
+          <span className="max-w-[92%] rounded-lg bg-black/80 px-3 py-1.5 text-center text-base font-semibold leading-snug text-white shadow-sm [text-shadow:0_1px_2px_rgba(0,0,0,0.9)] sm:text-lg lg:max-w-[88%] lg:text-xl">
+            {activeCaption}
+          </span>
         </div>
       ) : null}
 
@@ -1239,9 +1270,9 @@ export function ReelCard({
         className="absolute inset-x-0 bottom-0 z-20 p-3"
       >
         <div className={controlsChromeClass}>
-          <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="mb-0 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
-              <div className="inline-flex h-9 items-center rounded-full border border-white/30 bg-black/82 px-3 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/92">
+              <div className="inline-flex h-9 items-center rounded-full bg-black/68 px-3 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/92 backdrop-blur-sm">
                 {isYouTubeVideo ? `${formatClock(currentSec)} / ${formatClock(clipDuration)}` : "Embedded Reel"}
               </div>
               {onOpenContent ? (
@@ -1249,7 +1280,7 @@ export function ReelCard({
                   type="button"
                   data-reel-control="true"
                   onClick={onOpenContent}
-                  className="inline-flex h-8 items-center rounded-full border-[0.8px] border-white/30 px-3 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/90 transition hover:bg-white/10 lg:hidden"
+                  className="inline-flex h-11 items-center rounded-full bg-black/68 px-3 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/90 backdrop-blur-sm transition-colors hover:bg-white/[0.07] focus-visible:bg-white/[0.07] lg:hidden"
                 >
                   Content
                 </button>
@@ -1289,10 +1320,10 @@ export function ReelCard({
                     aria-haspopup="menu"
                     title="Playback settings"
                   >
-                    <i className="fa-solid fa-ellipsis" aria-hidden="true" />
+                    <i className="fa-solid fa-gear" aria-hidden="true" />
                   </button>
                   <div
-                    className={`absolute bottom-full right-0 z-30 mb-2 w-56 transition-opacity duration-180 ${
+                    className={`absolute bottom-full right-0 z-30 mb-2 w-56 transition-opacity duration-300 motion-reduce:transition-none ${
                       isPlaybackMenuOpen
                         ? "pointer-events-auto opacity-100"
                         : "pointer-events-none opacity-0"
@@ -1300,14 +1331,14 @@ export function ReelCard({
                   >
                     <div
                       role="menu"
-                      className="overflow-hidden rounded-2xl border border-white/15 bg-black p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)]"
+                      className="overflow-hidden rounded-2xl bg-[#202020] p-1.5"
                     >
                       <button
                         type="button"
                         data-reel-control="true"
                         onClick={toggleAutoplayPreference}
                         aria-pressed={autoplayEnabled}
-                        className="flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                        className="flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition-colors hover:bg-white/[0.07]"
                       >
                         <span className="flex items-center gap-2.5">
                           <i className="fa-solid fa-play text-[11px] text-white/80" aria-hidden="true" />
@@ -1315,12 +1346,12 @@ export function ReelCard({
                         </span>
                         <span
                           aria-hidden="true"
-                          className={`relative inline-flex h-6 w-10 shrink-0 rounded-full border transition-colors duration-200 ${
-                            autoplayEnabled ? "border-white bg-white" : "border-white/32 bg-black/50"
+                          className={`relative inline-flex h-6 w-10 shrink-0 rounded-full transition-colors duration-300 ${
+                            autoplayEnabled ? "bg-white" : "bg-white/24"
                           }`}
                         >
                           <span
-                            className={`absolute top-0.5 h-[18px] w-[18px] rounded-full transition-transform duration-200 ${
+                            className={`absolute top-0.5 h-[18px] w-[18px] rounded-full transition-transform duration-300 ease-out motion-reduce:transition-none ${
                               autoplayEnabled ? "translate-x-[20px] bg-black" : "translate-x-[2px] bg-white"
                             }`}
                           />
@@ -1362,7 +1393,7 @@ export function ReelCard({
                   href={reel.video_url}
                   target="_blank"
                   rel="noreferrer"
-                  className="inline-flex h-8 items-center rounded-full border-[0.8px] border-white/30 px-3 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/90 transition hover:bg-white/10"
+                  className="inline-flex h-10 items-center rounded-full bg-black/68 px-3 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/90 backdrop-blur-sm transition-colors hover:bg-white/[0.07] focus-visible:bg-white/[0.07]"
                 >
                   Open
                 </a>
@@ -1371,17 +1402,17 @@ export function ReelCard({
           </div>
 
           {isYouTubeVideo ? (
-            <div className="group/progress relative w-full py-2">
+            <div className="group/progress relative h-4 w-full leading-none">
               <div
                 aria-hidden="true"
-                className="pointer-events-none absolute inset-x-0 top-1/2 h-1.5 -translate-y-1/2 overflow-hidden rounded-full bg-[rgba(255,255,255,0.38)]"
+                className="pointer-events-none absolute inset-x-0 top-1/2 h-0.5 -translate-y-1/2 overflow-hidden rounded-full bg-[rgba(255,255,255,0.38)]"
               >
                 <div className="h-full rounded-full bg-white" style={reelProgressStyle} />
               </div>
               <div
                 aria-hidden="true"
                 style={reelProgressDotStyle}
-                className="pointer-events-none absolute top-1/2 z-[1] h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white shadow-[0_0_0_1px_rgba(0,0,0,0.28)] transition-transform duration-150 group-hover/progress:scale-150 group-focus-within/progress:scale-150"
+                className="pointer-events-none absolute top-1/2 z-[1] h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white"
               />
               <input
                 data-reel-control="true"
@@ -1391,7 +1422,7 @@ export function ReelCard({
                 step={0.1}
                 value={currentSec}
                 onChange={onSeek}
-                className="reel-range relative z-10 h-5 w-full cursor-pointer disabled:opacity-40"
+                className="reel-range relative z-10 block h-4 w-full cursor-pointer disabled:opacity-40"
                 disabled={!controlsEnabled}
               />
             </div>
@@ -1407,7 +1438,7 @@ export function ReelCard({
                   type="button"
                   data-reel-control="true"
                   onClick={retryBoundaryAlignment}
-                  className="rounded-full bg-white/14 px-2 py-0.5 font-semibold text-white hover:bg-white/22"
+                  className="rounded-full bg-white/14 px-2 py-0.5 font-semibold text-white transition-colors hover:bg-white/[0.07]"
                 >
                   Retry
                 </button>

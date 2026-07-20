@@ -28,7 +28,7 @@ export function BillingPlanUsageCard({ account }: { account: CommunityAccount })
     : Math.min(100, Math.max(0, (status.used_searches / status.daily_limit) * 100));
 
   return (
-    <section className="mt-4 rounded-[22px] border border-white/10 bg-black/25 px-4 py-4 shadow-[0_16px_40px_rgba(16,16,16,0.14)] backdrop-blur-[16px]" aria-labelledby="plan-usage-title">
+    <section className="mt-4 rounded-[22px] bg-white/[0.045] px-4 py-4" aria-labelledby="plan-usage-title">
       <div className="flex items-start justify-between gap-3">
         <div>
           <p id="plan-usage-title" className="text-[10px] font-semibold uppercase tracking-[0.14em] text-white/65">Plan &amp; Usage</p>
@@ -37,7 +37,7 @@ export function BillingPlanUsageCard({ account }: { account: CommunityAccount })
           </p>
         </div>
         {status ? (
-          <div className="rounded-full border border-white/14 bg-white/[0.08] px-3 py-1.5 text-[11px] font-semibold text-white">
+          <div className="rounded-full bg-white/[0.08] px-3 py-1.5 text-[11px] font-semibold text-white">
             {status.remaining_searches} left
           </div>
         ) : null}
@@ -46,7 +46,7 @@ export function BillingPlanUsageCard({ account }: { account: CommunityAccount })
       {status ? (
         <>
           <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/12" aria-hidden="true">
-            <div className="h-full rounded-full bg-white transition-[width] duration-500" style={{ width: `${percentUsed}%` }} />
+            <div className="h-full rounded-full bg-white" style={{ width: `${percentUsed}%` }} />
           </div>
           <p className="mt-2 text-xs leading-5 text-white/70">
             {status.used_searches} of {status.daily_limit} searches used · resets {formatResetTime(status.reset_at)}
@@ -73,7 +73,7 @@ export function BillingPlanUsageCard({ account }: { account: CommunityAccount })
               type="button"
               onClick={() => void refresh()}
               disabled={loading}
-              className="shrink-0 rounded-full border border-white/15 bg-white/[0.08] px-3 py-1.5 text-[11px] font-semibold text-white transition hover:bg-white/[0.13] disabled:cursor-wait disabled:opacity-50"
+              className="shrink-0 rounded-full bg-white/[0.08] px-3 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-white/[0.07] disabled:cursor-wait disabled:opacity-50"
             >
               {loading ? "Trying…" : "Try again"}
             </button>

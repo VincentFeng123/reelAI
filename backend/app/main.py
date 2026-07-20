@@ -91,6 +91,7 @@ from .models import (
     CommunitySetFeedbackResponse,
     CommunitySetOut,
     CommunitySetUpdateRequest,
+    CommunitySetsDeleteRequest,
     CommunitySetsResponse,
     CommunityVerifyAccountRequest,
     CommunityVerifyAccountResponse,
@@ -8593,6 +8594,70 @@ def update_community_set(request: Request, set_id: str, payload: CommunitySetUpd
         raise HTTPException(status_code=500, detail="Failed to persist community set changes.")
 
     return _serialize_community_set(updated_rows[0])
+
+
+@app.post("/api/community/sets/bulk-delete", status_code=204)
+def delete_community_sets(request: Request, payload: CommunitySetsDeleteRequest):
+    _enforce_rate_limit(request, "community-write", limit=COMMUNITY_WRITE_RATE_LIMIT_PER_WINDOW)
+    normalized_set_ids = list(dict.fromkeys(set_id.strip() for set_id in payload.set_ids))
+    if any(not set_id for set_id in normalized_set_ids):
+        raise HTTPException(status_code=400, detail="Every set_id is required.")
+    if any(not set_id.startswith("user-set-") for set_id in normalized_set_ids):
+        raise HTTPException(status_code=403, detail="Only user-created sets can be deleted.")
+
+    placeholders = ", ".join("?" for _ in normalized_set_ids)
+    with get_conn(transactional=True) as conn:
+        account = _require_verified_community_account(conn, request)
+        account_id = str(account["id"])
+        rows = fetch_all(
+            conn,
+            f"""
+            SELECT id, owner_account_id, featured
+            FROM community_sets
+            WHERE id IN ({placeholders})
+            """,
+            tuple(normalized_set_ids),
+        )
+        rows_by_id = {str(row.get("id") or ""): row for row in rows}
+        for set_id in normalized_set_ids:
+            existing = rows_by_id.get(set_id)
+            if not existing:
+                raise HTTPException(status_code=404, detail="Community set not found.")
+            if _to_int(existing.get("featured"), 0) != 0:
+                raise HTTPException(status_code=403, detail="Featured sets cannot be deleted.")
+            _require_community_set_owner_access(
+                existing.get("owner_account_id"),
+                account_id,
+                action="delete",
+            )
+
+        execute_modify(
+            conn,
+            f"DELETE FROM community_set_votes WHERE set_id IN ({placeholders})",
+            tuple(normalized_set_ids),
+        )
+        execute_modify(
+            conn,
+            f"DELETE FROM community_starred_sets WHERE set_id IN ({placeholders})",
+            tuple(normalized_set_ids),
+        )
+        deleted_count = execute_modify(
+            conn,
+            f"""
+            DELETE FROM community_sets
+            WHERE owner_account_id = ?
+              AND featured = 0
+              AND id IN ({placeholders})
+            """,
+            (account_id, *normalized_set_ids),
+        )
+        if deleted_count != len(normalized_set_ids):
+            raise HTTPException(
+                status_code=409,
+                detail="One or more community sets changed before they could be deleted.",
+            )
+
+    return Response(status_code=204)
 
 
 def _delete_community_set_impl(request: Request, set_id: str) -> Response:

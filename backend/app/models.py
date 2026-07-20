@@ -373,6 +373,10 @@ class CommunitySetUpdateRequest(BaseModel):
     curator: str | None = None
 
 
+class CommunitySetsDeleteRequest(BaseModel):
+    set_ids: list[str] = Field(min_length=1, max_length=120)
+
+
 class CommunitySetOut(BaseModel):
     id: str
     title: str

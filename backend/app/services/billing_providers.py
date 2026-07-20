@@ -277,8 +277,8 @@ def create_stripe_checkout(
         customer=customer_id,
         payment_method_types=["card"],
         line_items=[{"price": price_id, "quantity": 1}],
-        success_url=f"{origin}/account?view=billing&checkout=success",
-        cancel_url=f"{origin}/account?view=billing&checkout=cancelled",
+        success_url=f"{origin}/?settings=plan&checkout=success",
+        cancel_url=f"{origin}/?settings=plan&checkout=cancelled",
         client_reference_id=account_id,
         metadata={"account_id": account_id, "plan": plan_code},
         subscription_data={"metadata": {"account_id": account_id}},
@@ -307,7 +307,7 @@ def create_stripe_portal(conn: Any, *, account_id: str) -> str:
     stripe = _stripe_module()
     session = stripe.billing_portal.Session.create(
         customer=customer_id,
-        return_url=f"{_web_origin()}/account?view=billing",
+        return_url=f"{_web_origin()}/?settings=plan",
     )
     url = str(_obj_get(session, "url", "") or "")
     if not url:

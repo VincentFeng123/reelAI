@@ -847,6 +847,42 @@ export async function fetchCommunityAccount(): Promise<CommunityAccount | null> 
   }
 }
 
+export async function restoreCommunityAccountFromSessionToken(): Promise<CommunityAccount | null> {
+  const stored = readCommunityAuthSession();
+  if (stored) {
+    return fetchCommunityAccount();
+  }
+  const sessionToken = readCommunitySessionToken();
+  if (sessionToken.length < 24) {
+    return null;
+  }
+  try {
+    const res = await safeFetch(apiUrl("/community/auth/me"), {
+      cache: "no-store",
+      headers: { ...communitySessionHeaders(sessionToken) },
+    });
+    const json = await parseJsonResponse<{ account?: unknown }>(res);
+    if (readCommunitySessionToken() !== sessionToken) {
+      return null;
+    }
+    const account = normalizeCommunityAccount(json?.account);
+    if (!account) {
+      expireCommunityAuthSession();
+      return null;
+    }
+    saveCommunityAuthSessionStorage({ account, sessionToken });
+    return account;
+  } catch (error) {
+    if (isSessionExpiredError(error)) {
+      if (readCommunitySessionToken() === sessionToken) {
+        expireCommunityAuthSession();
+      }
+      return null;
+    }
+    throw error;
+  }
+}
+
 export async function logoutCommunityAccount(): Promise<void> {
   const stored = readCommunityAuthSession();
   try {
@@ -2309,6 +2345,7 @@ async function replaceCommunitySettingsForSession(
       default_input_mode: settings.defaultInputMode,
       min_relevance_threshold: settings.minRelevanceThreshold,
       start_muted: settings.startMuted,
+      autoplay_next_reel: settings.autoplayNextReel,
       creative_commons_only: settings.creativeCommonsOnly,
       preferred_video_duration: settings.preferredVideoDuration,
     }),
@@ -2494,6 +2531,24 @@ export async function deleteCommunitySet(params: { setId: string }): Promise<voi
   await safeFetch(apiUrl(`/community/sets/${encodedSetId}/delete`), {
     method: "POST",
     headers: communityRequestHeaders(),
+  });
+}
+
+export async function deleteCommunitySets(params: { setIds: string[] }): Promise<void> {
+  const setIds = normalizeOwnedCommunitySetIds(params.setIds);
+  if (!setIds.length) {
+    throw new Error("At least one setId is required.");
+  }
+  if (setIds.length > 120) {
+    throw new Error("No more than 120 sets can be deleted at once.");
+  }
+  await safeFetch(apiUrl("/community/sets/bulk-delete"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...communityRequestHeaders(),
+    },
+    body: JSON.stringify({ set_ids: setIds }),
   });
 }
 

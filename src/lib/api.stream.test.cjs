@@ -27,6 +27,7 @@ const {
   queueCommunitySettingsSync,
   readCommunityAuthSession,
   reportReelScroll,
+  restoreCommunityAccountFromSessionToken,
   startNextAssessment,
 } = require("./api.ts");
 const TEST_OPTIONS = { timeout: 1_000 };
@@ -76,6 +77,67 @@ function queuedGenerationResponse() {
     headers: { "Content-Type": "application/json" },
   });
 }
+
+test("token-only sessions restore an unverified account for the dedicated auth page", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  const originalWindow = global.window;
+  const env = installCommunitySessionTestWindow();
+  const sessionToken = `session-${"u".repeat(32)}`;
+  env.sessionValues.set(env.sessionKey, sessionToken);
+  let requestHeaders;
+  global.fetch = async (_url, init = {}) => {
+    requestHeaders = new Headers(init.headers);
+    return new Response(JSON.stringify({
+      account: { id: "unverified-account", username: "pending", email: "pending@example.com", is_verified: false },
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  try {
+    assert.equal(readCommunityAuthSession(), null);
+    const account = await restoreCommunityAccountFromSessionToken();
+    assert.equal(requestHeaders.get("X-StudyReels-Session-Token"), sessionToken);
+    assert.equal(account.id, "unverified-account");
+    assert.equal(account.isVerified, false);
+    assert.equal(readCommunityAuthSession().account.id, "unverified-account");
+    assert.equal(readCommunityAuthSession().verificationRequired, true);
+  } finally {
+    global.fetch = originalFetch;
+    global.window = originalWindow;
+  }
+});
+
+test("token-only account restoration ignores a superseded session response", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  const originalWindow = global.window;
+  const env = installCommunitySessionTestWindow();
+  const originalToken = `session-${"a".repeat(32)}`;
+  const replacementToken = `session-${"b".repeat(32)}`;
+  env.sessionValues.set(env.sessionKey, originalToken);
+  let resolveFetch;
+  global.fetch = () => new Promise((resolve) => {
+    resolveFetch = resolve;
+  });
+
+  try {
+    const pending = restoreCommunityAccountFromSessionToken();
+    env.sessionValues.set(env.sessionKey, replacementToken);
+    resolveFetch(new Response(JSON.stringify({
+      account: { id: "stale-account", username: "stale", is_verified: false },
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+    assert.equal(await pending, null);
+    assert.equal(env.localValues.has(env.accountKey), false);
+    assert.equal(env.sessionValues.get(env.sessionKey), replacementToken);
+  } finally {
+    global.fetch = originalFetch;
+    global.window = originalWindow;
+  }
+});
 
 test("scroll reporting uses the bodyless forward-scroll contract", TEST_OPTIONS, async () => {
   const originalFetch = global.fetch;
@@ -1075,6 +1137,7 @@ test("queued settings sync never crosses community sessions", TEST_OPTIONS, asyn
     defaultInputMode: "topic",
     minRelevanceThreshold: 0.3,
     startMuted: true,
+    autoplayNextReel: true,
     creativeCommonsOnly: false,
     preferredVideoDuration: "any",
   };
@@ -1133,6 +1196,7 @@ test("queued settings sync never crosses community sessions", TEST_OPTIONS, asyn
     await queueCommunitySettingsSync(settings);
     assert.equal(requests.length, 2);
     assert.equal(new Headers(requests[1].init.headers).get("X-StudyReels-Session-Token"), tokenB);
+    assert.equal(JSON.parse(requests[1].init.body).autoplay_next_reel, true);
     assert.equal(localValues.get(ownerKey), ownerValue);
   } finally {
     global.fetch = originalFetch;

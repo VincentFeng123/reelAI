@@ -1064,6 +1064,12 @@ def test_stripe_signature_checkout_and_portal_use_server_configuration(monkeypat
     assert calls["checkout"]["line_items"] == [{"price": "price_plus", "quantity": 1}]
     assert calls["checkout"]["client_reference_id"] == account_id
     assert calls["checkout"]["subscription_data"]["metadata"]["account_id"] == account_id
+    assert calls["checkout"]["success_url"] == (
+        "https://reelai.example/?settings=plan&checkout=success"
+    )
+    assert calls["checkout"]["cancel_url"] == (
+        "https://reelai.example/?settings=plan&checkout=cancelled"
+    )
     assert calls["checkout"]["idempotency_key"].startswith(
         f"reelai-checkout-sandbox-{account_id}-"
     )
@@ -1071,6 +1077,7 @@ def test_stripe_signature_checkout_and_portal_use_server_configuration(monkeypat
         conn, account_id=account_id
     ) == "https://billing.stripe.example/portal"
     assert calls["portal"]["customer"] == "cus_1"
+    assert calls["portal"]["return_url"] == "https://reelai.example/?settings=plan"
     assert billing_providers.construct_stripe_event(b"payload", "signature") == {
         "id": "evt_verified"
     }

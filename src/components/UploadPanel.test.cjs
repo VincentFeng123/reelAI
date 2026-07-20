@@ -4,18 +4,48 @@ const path = require("node:path");
 const test = require("node:test");
 const ts = require("typescript");
 
-test("topic, text, and file submissions use the selected learner level", () => {
-  const filePath = path.join(__dirname, "UploadPanel.tsx");
-  const source = fs.readFileSync(filePath, "utf8");
-  const sourceFile = ts.createSourceFile(
-    filePath,
-    source,
-    ts.ScriptTarget.Latest,
-    true,
-    ts.ScriptKind.TSX,
-  );
-  let submitCallback;
+const filePath = path.join(__dirname, "UploadPanel.tsx");
+const source = fs.readFileSync(filePath, "utf8");
+const sourceFile = ts.createSourceFile(
+  filePath,
+  source,
+  ts.ScriptTarget.Latest,
+  true,
+  ts.ScriptKind.TSX,
+);
 
+function routeHelpers() {
+  const names = new Set([
+    "HOME_IDEAS",
+    "INGEST_URL_HOST_ALLOWLIST",
+    "YOUTUBE_VIDEO_ID_RE",
+    "homeGreetingForHour",
+    "isLikelyIngestUrl",
+    "resolveUnifiedComposerRoute",
+  ]);
+  const declarations = sourceFile.statements
+    .filter((statement) => {
+      if (ts.isFunctionDeclaration(statement)) {
+        return names.has(statement.name?.text);
+      }
+      if (ts.isVariableStatement(statement)) {
+        return statement.declarationList.declarations.some(
+          (declaration) => ts.isIdentifier(declaration.name) && names.has(declaration.name.text),
+        );
+      }
+      return false;
+    })
+    .map((statement) => statement.getText(sourceFile).replace(/^export\s+/, ""))
+    .join("\n");
+  const compiled = ts.transpile(declarations, {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.None,
+  });
+  return new Function(`${compiled}\nreturn { HOME_IDEAS, homeGreetingForHour, isLikelyIngestUrl, resolveUnifiedComposerRoute };`)();
+}
+
+function submitCallbackText() {
+  let submitCallback;
   function visit(node) {
     if (
       ts.isVariableDeclaration(node)
@@ -30,77 +60,158 @@ test("topic, text, and file submissions use the selected learner level", () => {
     }
     ts.forEachChild(node, visit);
   }
-
   visit(sourceFile);
   assert.ok(submitCallback, "UploadPanel onSubmit must remain discoverable");
-  const callbackText = submitCallback.arguments[0].getText(sourceFile);
-  assert.match(
-    source,
-    /const \[knowledgeLevel, setKnowledgeLevel\] = useState<KnowledgeLevel>\("beginner"\)/,
-    "the visible selector must default to beginner",
+  return {
+    text: submitCallback.arguments[0].getText(sourceFile),
+    dependencies: submitCallback.arguments[1],
+  };
+}
+
+test("unified routing follows attachment, URL, source text, then topic precedence", () => {
+  const { resolveUnifiedComposerRoute } = routeHelpers();
+  const youtubeUrl = "https://youtu.be/abcdefghijk";
+
+  assert.equal(
+    resolveUnifiedComposerRoute({ attachment: { name: "notes.pdf" }, prompt: youtubeUrl }),
+    "file",
   );
-  assert.match(
-    callbackText,
-    /const material = await uploadMaterial\(\{[\s\S]*knowledgeLevel,/,
-    "topic, text, and file uploads must all use the selected level",
-  );
-  const dependencies = submitCallback.arguments[1];
-  assert.ok(
-    dependencies && ts.isArrayLiteralExpression(dependencies),
-    "onSubmit must declare its hook dependencies",
-  );
-  assert.ok(
-    dependencies.elements.some((element) => element.getText(sourceFile) === "knowledgeLevel"),
-    "onSubmit must refresh when the selected level changes",
-  );
-  assert.match(source, /type="radio"/);
-  assert.match(source, /name="knowledge-level"/);
-  assert.match(source, /knowledgeLevel\?: KnowledgeLevel;/);
-  assert.match(callbackText, /knowledgeLevel,\s*title,/);
-  assert.doesNotMatch(
-    callbackText,
-    /targetClipDuration/,
-    "URL ingestion must not send deprecated clip-duration preferences",
+  assert.equal(resolveUnifiedComposerRoute({ prompt: youtubeUrl }), "url");
+  assert.equal(resolveUnifiedComposerRoute({ prompt: "first line\nsecond line" }), "source");
+  assert.equal(resolveUnifiedComposerRoute({ prompt: "x".repeat(81) }), "source");
+  assert.equal(resolveUnifiedComposerRoute({ prompt: "x".repeat(80) }), "topic");
+  assert.equal(resolveUnifiedComposerRoute({ prompt: "linear regression" }), "topic");
+});
+
+test("only supported, complete YouTube locations route to URL ingestion", () => {
+  const { isLikelyIngestUrl, resolveUnifiedComposerRoute } = routeHelpers();
+
+  assert.equal(isLikelyIngestUrl("youtube.com/watch?v=abcdefghijk"), true);
+  assert.equal(isLikelyIngestUrl("https://www.youtube.com/shorts/abcdefghijk"), true);
+  assert.equal(isLikelyIngestUrl("https://youtu.be/abcdefghijk?t=12"), true);
+  assert.equal(isLikelyIngestUrl("https://vimeo.com/abcdefghijk"), false);
+  assert.equal(isLikelyIngestUrl("https://youtube.com/watch?v=short"), false);
+  assert.equal(
+    resolveUnifiedComposerRoute({ prompt: "Watch https://youtu.be/abcdefghijk" }),
+    "topic",
+    "a URL embedded in a prompt must not bypass topic routing",
   );
 });
 
-test("topic mode accepts exactly one topic", () => {
-  const filePath = path.join(__dirname, "UploadPanel.tsx");
-  const source = fs.readFileSync(filePath, "utf8");
-  assert.match(source, /const \[topic, setTopic\] = useState\(""\)/);
-  assert.match(source, /htmlFor="material-topic"/);
-  assert.match(source, /id="material-topic"/);
-  assert.match(source, /const topicValue = inputMode === "topic" \? topic\.trim\(\) : ""/);
+test("home greeting follows local time and rotates four quiet learning actions from a broad icon-backed pool", () => {
+  const { HOME_IDEAS, homeGreetingForHour } = routeHelpers();
+
+  assert.equal(homeGreetingForHour(4, " Vincent "), "Good evening, Vincent");
+  assert.equal(homeGreetingForHour(5, "Vincent"), "Good morning, Vincent");
+  assert.equal(homeGreetingForHour(11, "Vincent"), "Good morning, Vincent");
+  assert.equal(homeGreetingForHour(12, "Vincent"), "Good afternoon, Vincent");
+  assert.equal(homeGreetingForHour(16, "Vincent"), "Good afternoon, Vincent");
+  assert.equal(homeGreetingForHour(17, "Vincent"), "Good evening, Vincent");
+  assert.equal(homeGreetingForHour(23, null), "Good evening");
+  assert.ok(HOME_IDEAS.length >= 30);
+  assert.equal(HOME_IDEAS.length % 4, 0);
+  assert.equal(new Set(HOME_IDEAS.map(({ title }) => title)).size, HOME_IDEAS.length);
+  assert.ok(HOME_IDEAS.every(({ icon }) => icon.startsWith("fa-")));
+  assert.match(source, /What can I help you learn today\?/);
+  assert.match(source, /new Date\(\)\.getHours\(\)/);
+  assert.match(source, /data-home-suggestions="true"/);
+  assert.match(source, /const HOME_IDEAS_PER_PAGE = 4/);
+  assert.match(source, /const HOME_IDEA_ROTATION_MS = 5 \* 60 \* 1_000/);
+  assert.match(source, /didRotateHomeIdeasOnMountRef\.current = true/);
+  assert.match(source, /window\.sessionStorage\.getItem\(HOME_IDEA_OFFSET_STORAGE_KEY\)/);
+  assert.match(source, /const refreshOffset = \(previousOffset \+ HOME_IDEAS_PER_PAGE\) % HOME_IDEAS\.length/);
+  assert.match(source, /window\.setInterval\(advanceHomeIdeas, HOME_IDEA_ROTATION_MS\)/);
+  assert.match(source, /visibleHomeIdeas\.map/);
+  assert.match(source, /setPrompt\(idea\.title\)/);
+  assert.match(source, /textareaRef\.current\?\.focus\(\)/);
+  assert.match(source, /const showBottomSignInStatus = !loading && !error && !verifiedAccount\?\.isVerified/);
+  assert.match(source, /compactStatus && !showBottomSignInStatus/);
+  assert.match(source, /bottom-\[calc\(max\(env\(safe-area-inset-bottom\),0px\)\+18px\)\][^"\n]*left-1\/2[^"\n]*text-center/);
+  assert.match(source, /data-home-suggestion-offset=\{homeIdeaOffset\}/);
+  assert.match(source, /className=\{`fa-regular \$\{name\}[^`]*font-normal/);
+  const homeIdeaIcon = source.slice(source.indexOf("function HomeIdeaIcon"), source.indexOf("export type UnifiedComposerRoute"));
+  assert.match(homeIdeaIcon, /<i/);
+  assert.doesNotMatch(homeIdeaIcon, /<svg|<text|<path/);
+  assert.match(source, /min-h-11[^"\n]*gap-3\.5[^"\n]*py-2[^"\n]*text-\[13px\][^"\n]*sm:text-\[14px\]/);
+  assert.doesNotMatch(source, /min-h-8 px-2 pt-2/);
+  assert.doesNotMatch(source, /Ready when you are\./);
+});
+
+test("topic, source, and file submissions preserve one-search uploads and learner level", () => {
+  const callback = submitCallbackText();
+
+  assert.match(source, /const \[knowledgeLevel, setKnowledgeLevel\] = useState<KnowledgeLevel>\("beginner"\)/);
+  assert.match(source, /name="knowledge-level"/);
+  assert.match(callback.text, /const topicValue = composerRoute === "topic" \? promptValue : ""/);
+  assert.match(callback.text, /const textValue = composerRoute === "source" \|\| composerRoute === "file" \? promptValue : ""/);
+  assert.match(callback.text, /const fileValue = composerRoute === "file" \? file : undefined/);
+  assert.match(callback.text, /const material = await uploadMaterial\(\{[\s\S]*knowledgeLevel,/);
+  assert.match(callback.text, /knowledgeLevel,\s*title,/);
+  assert.equal((callback.text.match(/await uploadMaterial\(/g) || []).length, 1);
   assert.doesNotMatch(source, /Add topic|Promise\.allSettled|partial_topics|topicOperations/);
-  assert.match(source, /<span>Uses 1 search<\/span>/);
+  assert.doesNotMatch(callback.text, /targetClipDuration/);
+  assert.ok(
+    callback.dependencies
+      && ts.isArrayLiteralExpression(callback.dependencies)
+      && callback.dependencies.elements.some((element) => element.getText(sourceFile) === "knowledgeLevel"),
+    "onSubmit must refresh when the selected level changes",
+  );
+});
+
+test("composer is taller, narrower, subtly outlined, and retains native attachment controls", () => {
+  assert.match(source, /<textarea[\s\S]*rows=\{1\}[\s\S]*min-h-\[72px\][\s\S]*max-h-\[92px\]/);
+  assert.match(source, /Math\.min\(element\.scrollHeight, 92\)/);
+  assert.match(source, /Math\.max\(nextHeight, 72\)/);
+  assert.match(source, /max-w-\[680px\]/);
+  assert.match(source, /border-\[0\.5px\] border-\[#3a3a3a\] bg-\[#242424\]/);
+  assert.match(source, /bg-transparent px-1 py-1/);
+  assert.match(source, /text-\[17px\] leading-7/);
+  assert.match(source, /accept="\.pdf,\.docx,\.txt,/);
+  assert.match(source, /className="hidden"[\s\S]*tabIndex=\{-1\}[\s\S]*aria-hidden="true"[\s\S]*type="file"/);
+  assert.match(source, /aria-label="Attach a PDF, DOCX, or TXT file"/);
+  assert.match(source, /aria-label=\{`Remove \$\{selectedFileName\}`\}/);
+  assert.match(source, /aria-label=\{loading \? "Starting search" : "Send"\}/);
+  assert.match(source, /rounded-full bg-white text-black/);
+  assert.match(source, /<CustomSelect[\s\S]*label="Knowledge level"/);
+  assert.match(source, /className="w-fit min-w-0"/);
+  assert.match(source, /buttonClassName="[^"]*rounded-full bg-transparent[^"]*hover:text-white/);
+  assert.match(source, /buttonClassName="[^"]*bg-transparent px-3[^"]*hover:bg-white\/\[0\.07\]/);
+  assert.match(source, /buttonClassName="[^"]*hover:bg-white\/\[0\.07\][^"]*"/);
+  assert.match(source, /menuClassName="w-\[200%\] max-w-\[calc\(100vw-5rem\)\]"/);
+  assert.match(source, /showSelectedCheck/);
+  assert.doesNotMatch(source, /<select/);
+  assert.doesNotMatch(source, /Select input mode|defaultInputMode/);
+});
+
+test("billing is supplied by the shell and desktop Enter is IME-safe", () => {
+  assert.match(source, /billingStatus\?: BillingStatus \| null/);
+  assert.doesNotMatch(source, /useBillingStatus\(/);
+  assert.match(source, /event\.shiftKey/);
+  assert.match(source, /event\.nativeEvent\.isComposing/);
+  assert.match(source, /event\.nativeEvent\.keyCode === 229/);
+  assert.match(source, /window\.matchMedia\("\(pointer: coarse\)"\)\.matches/);
+  assert.match(source, /formRef\.current\?\.requestSubmit\(\)/);
+  assert.match(source, /!active \|\| loading \|\| \(!file && !prompt\.trim\(\)\)/);
+  assert.match(source, /if \(demoMode\) \{[\s\S]*router\.push\("\/feed\?demo=player&return_tab=search"\)/);
+});
+
+test("file submissions retain optional composer instructions", () => {
+  assert.match(source, /composerRoute === "source" \|\| composerRoute === "file" \? promptValue : ""/);
+  assert.match(source, /text: textValue \|\| undefined,[\s\S]*file: fileValue/);
 });
 
 test("URL ingestion primes every returned reel with a legacy single-reel fallback", () => {
-  const filePath = path.join(__dirname, "UploadPanel.tsx");
-  const source = fs.readFileSync(filePath, "utf8");
-
   assert.match(
     source,
     /Array\.isArray\(result\.reels\) && result\.reels\.length > 0[\s\S]*\? result\.reels[\s\S]*: \[result\.reel\]/,
-    "new URL responses must use all reels while old responses keep working",
   );
   assert.match(
     source,
     /primeFeedSessionSnapshot\(ingestMaterialId, ingestedReels, ingestedReel\.reel_id, activeSettings\)/,
-    "the feed snapshot must receive the complete verified URL inventory",
   );
 });
 
-test("URL ingestion primes feed snapshots with the current v38 selection contract", () => {
-  const filePath = path.join(__dirname, "UploadPanel.tsx");
-  const source = fs.readFileSync(filePath, "utf8");
-  const sourceFile = ts.createSourceFile(
-    filePath,
-    source,
-    ts.ScriptTarget.Latest,
-    true,
-    ts.ScriptKind.TSX,
-  );
+test("URL ingestion primes feed snapshots with the current selection contract", () => {
   let declaration;
   function visit(node) {
     if (ts.isFunctionDeclaration(node) && node.name?.text === "primeFeedSessionSnapshot") {
@@ -138,10 +249,7 @@ test("URL ingestion primes feed snapshots with the current v38 selection contrac
 
   primeFeedSessionSnapshot(
     "ingest-search:abc",
-    [
-      { reel_id: "reel-1" },
-      { reel_id: "reel-2" },
-    ],
+    [{ reel_id: "reel-1" }, { reel_id: "reel-2" }],
     "reel-2",
     { generationMode: "slow", startMuted: true, autoplayNextReel: true },
   );

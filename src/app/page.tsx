@@ -1,6 +1,16 @@
 "use client";
 
-import { Suspense, type MouseEvent as ReactMouseEvent, type UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Suspense,
+  type ReactNode,
+  type RefObject,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { type CommunityDraftExitActions, CommunityReelsPanel } from "@/components/CommunityReelsPanel";
@@ -28,15 +38,29 @@ import {
 } from "@/lib/historyStorage";
 import type { CommunityAccount } from "@/lib/types";
 import {
-  type SettingsAvailabilityModalSnapshot,
-  type SettingsAvailabilityState,
   type SettingsPanelHandle,
+  type SettingsSection,
   SettingsPanel,
 } from "@/components/SettingsPanel";
 import { UploadPanel } from "@/components/UploadPanel";
-import { VolumetricLightBackground } from "@/components/VolumetricLightBackground";
-import { setActiveStudyReelsSettingsScope, type StudyReelsSettings } from "@/lib/settings";
+import {
+  readStudyReelsSettings,
+  saveStudyReelsSettings,
+  setActiveStudyReelsSettingsScope,
+  subscribeToStudyReelsSettings,
+  type GenerationMode as SettingsGenerationMode,
+  type StudyReelsSettings,
+} from "@/lib/settings";
+import { useBillingStatus } from "@/lib/useBillingStatus";
 import { useLoadingScreenGate } from "@/lib/useLoadingScreenGate";
+import {
+  LOCAL_DEMO_ACCOUNT,
+  LOCAL_DEMO_AVAILABLE,
+  LOCAL_DEMO_BILLING_PLANS,
+  LOCAL_DEMO_BILLING_STATUS,
+  LOCAL_DEMO_HISTORY,
+  isLocalDemoView,
+} from "@/lib/localDemo";
 
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
@@ -46,15 +70,15 @@ const ACTIVE_SIDEBAR_TAB_SESSION_KEY = "studyreels-active-sidebar-tab";
 const ACTIVE_COMMUNITY_SET_ID_SESSION_KEY = "studyreels-active-community-set-id";
 const DESKTOP_SIDEBAR_COLLAPSED_SESSION_KEY = "studyreels-desktop-sidebar-collapsed";
 const MAX_HISTORY_ITEMS = 120;
-const MOBILE_SIDEBAR_CLOSE_MS = 260;
-const TOP_CHROME_GESTURE_WINDOW_MS = 220;
-const SIDEBAR_INFO_TOOLTIP_DELAY_MS = 1000;
-const SIDEBAR_INFO_TOOLTIP_VISIBLE_MS = 2200;
-const SIDEBAR_INFO_TOOLTIP_FADE_MS = 180;
-const SIDEBAR_INFO_TOOLTIP_ANIMATE_IN_MS = 24;
+const UI_FADE_MS = 340;
+const MOBILE_SIDEBAR_CLOSE_MS = UI_FADE_MS;
+const DESKTOP_SIDEBAR_EXPANDED_PX = 272;
+const DESKTOP_SIDEBAR_COLLAPSED_PX = 68;
+const LARGE_CENTERED_MODAL_PANEL_CLASS = "flex h-[calc(100dvh-24px)] w-full flex-col sm:h-[min(600px,calc(100dvh-64px))] sm:max-w-[820px]";
 type GenerationMode = StoredHistoryItem["generationMode"];
 type HistorySource = StoredHistoryItem["source"];
 type SidebarTab = "search" | "history" | "community" | "create" | "edit" | "settings";
+type AccountReturnTab = "search" | "community" | "edit" | "settings";
 type SidebarSwitchIntent = {
   tab: SidebarTab;
   clearHistoryQuery?: boolean;
@@ -69,11 +93,313 @@ type HistoryInfoSection = {
   fields: HistoryInfoField[];
 };
 
-const DEFAULT_SETTINGS_AVAILABILITY_STATE: SettingsAvailabilityState = {
-  status: "checking",
-  message: "Estimating success rate from configuration heuristics...",
-  limitingFactors: [],
+type ShellIconName =
+  | "search"
+  | "panel"
+  | "compose"
+  | "community"
+  | "sets"
+  | "close"
+  | "menu"
+  | "chevron"
+  | "settings"
+  | "auth"
+  | "chat"
+  | "more"
+  | "info"
+  | "star"
+  | "trash";
+
+function ShellIcon({
+  name,
+  className = "h-[18px] w-[18px]",
+  filled = false,
+}: {
+  name: ShellIconName;
+  className?: string;
+  filled?: boolean;
+}) {
+  let content: ReactNode;
+
+  switch (name) {
+    case "search":
+      content = (
+        <>
+          <circle cx="10.8" cy="10.8" r="6.3" />
+          <path d="m15.5 15.5 4 4" />
+        </>
+      );
+      break;
+    case "panel":
+      content = (
+        <>
+          <rect x="3.25" y="4.25" width="17.5" height="15.5" rx="2.75" />
+          <path d="M9 4.5v15" />
+        </>
+      );
+      break;
+    case "compose":
+      content = (
+        <>
+          <path d="M12 5H7a3 3 0 0 0-3 3v9a3 3 0 0 0 3 3h9a3 3 0 0 0 3-3v-5" />
+          <path d="m9.5 14.5.8-3 6.8-6.8a1.4 1.4 0 0 1 2 2l-6.8 6.8-2.8 1Z" />
+        </>
+      );
+      break;
+    case "community":
+      content = (
+        <>
+          <circle cx="9" cy="9" r="3" />
+          <circle cx="17" cy="10" r="2.25" />
+          <path d="M3.8 19c.5-3 2.3-4.5 5.2-4.5s4.7 1.5 5.2 4.5M15 14.7c2.8-.5 4.6.8 5.2 3.3" />
+        </>
+      );
+      break;
+    case "sets":
+      content = (
+        <>
+          <path d="M3.5 7.5h6l1.8 2h9.2v7.25A2.75 2.75 0 0 1 17.75 19.5H6.25a2.75 2.75 0 0 1-2.75-2.75V7.5Z" />
+          <path d="M3.5 7.5V6.75A2.25 2.25 0 0 1 5.75 4.5h3.4l1.7 2" />
+        </>
+      );
+      break;
+    case "close":
+      content = <path d="m6 6 12 12M18 6 6 18" />;
+      break;
+    case "menu":
+      content = <path d="M4 8h16M4 16h16" />;
+      break;
+    case "chevron":
+      content = <path d="m9 5 7 7-7 7" />;
+      break;
+    case "settings":
+      content = (
+        <>
+          <path d="M4 7h7M15 7h5M4 17h5M13 17h7" />
+          <circle cx="13" cy="7" r="2" />
+          <circle cx="11" cy="17" r="2" />
+        </>
+      );
+      break;
+    case "auth":
+      content = (
+        <>
+          <path d="M10 5H6.5A2.5 2.5 0 0 0 4 7.5v9A2.5 2.5 0 0 0 6.5 19H10" />
+          <path d="m14 8 4 4-4 4M18 12H9" />
+        </>
+      );
+      break;
+    case "chat":
+      content = <path d="M20 11.5a7.5 7.5 0 0 1-8 7.5 9 9 0 0 1-3.4-.7L4 20l1.5-4a7.5 7.5 0 1 1 14.5-4.5Z" />;
+      break;
+    case "more":
+      content = (
+        <>
+          <circle cx="6" cy="12" r="1" fill="currentColor" stroke="none" />
+          <circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" />
+          <circle cx="18" cy="12" r="1" fill="currentColor" stroke="none" />
+        </>
+      );
+      break;
+    case "info":
+      content = (
+        <>
+          <circle cx="12" cy="12" r="8.5" />
+          <path d="M12 10.5v5M12 7.5h.01" />
+        </>
+      );
+      break;
+    case "star":
+      content = <path d="m12 3.8 2.55 5.15 5.7.83-4.12 4.02.97 5.68L12 16.8l-5.1 2.68.97-5.68-4.12-4.02 5.7-.83L12 3.8Z" />;
+      break;
+    case "trash":
+      content = (
+        <>
+          <path d="M5 7h14M9 7V4.5h6V7M7 7l.75 12.5h8.5L17 7M10 10.5v5.5M14 10.5v5.5" />
+        </>
+      );
+      break;
+  }
+
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+      className={`${className} shrink-0 ${filled ? "fill-current" : "fill-none"} stroke-current`}
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      {content}
+    </svg>
+  );
+}
+
+const MODAL_FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]:not([tabindex='-1'])",
+].join(",");
+
+type ShellModalProps = {
+  open: boolean;
+  label: string;
+  onRequestClose: () => void;
+  children: ReactNode;
+  panelClassName?: string;
+  initialFocusRef?: RefObject<HTMLElement | null>;
 };
+
+function getModalReturnFocusTarget(): HTMLElement | null {
+  if (typeof document === "undefined" || !(document.activeElement instanceof HTMLElement)) {
+    return null;
+  }
+  const activeElement = document.activeElement;
+  return activeElement
+    .closest<HTMLElement>("[data-account-actions]")
+    ?.querySelector<HTMLElement>('button[aria-haspopup="menu"]')
+    ?? activeElement;
+}
+
+function ShellModal({ open, label, onRequestClose, children, panelClassName = "", initialFocusRef }: ShellModalProps) {
+  const [isRendered, setIsRendered] = useState(open);
+  const [isVisible, setIsVisible] = useState(false);
+  const [dialogElement, setDialogElement] = useState<HTMLDivElement | null>(null);
+  const renderedChildrenRef = useRef(children);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  const requestCloseRef = useRef(onRequestClose);
+
+  useLayoutEffect(() => {
+    if (open) {
+      renderedChildrenRef.current = children;
+    }
+  }, [children, open]);
+
+  useEffect(() => {
+    requestCloseRef.current = onRequestClose;
+  }, [onRequestClose]);
+
+  useEffect(() => {
+    let frame = 0;
+    let closeTimer = 0;
+    if (open) {
+      returnFocusRef.current = getModalReturnFocusTarget();
+      setIsRendered(true);
+      frame = window.requestAnimationFrame(() => setIsVisible(true));
+    } else {
+      setIsVisible(false);
+      const closeDelay = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : UI_FADE_MS;
+      closeTimer = window.setTimeout(() => {
+        setIsRendered(false);
+        const returnFocus = returnFocusRef.current;
+        window.requestAnimationFrame(() => {
+          if (returnFocus?.isConnected) {
+            returnFocus.focus();
+          }
+        });
+      }, closeDelay);
+    }
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(closeTimer);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    const dialog = dialogElement;
+    if (!dialog) {
+      return;
+    }
+    const getFocusableElements = () => Array.from(dialog.querySelectorAll<HTMLElement>(MODAL_FOCUSABLE_SELECTOR))
+      .filter((element) => (
+        !element.hidden
+        && element.getAttribute("aria-hidden") !== "true"
+        && !element.closest("[inert], [aria-hidden='true']")
+        && element.getClientRects().length > 0
+      ));
+    const requestedFocus = initialFocusRef?.current;
+    const focusTarget = requestedFocus && getFocusableElements().includes(requestedFocus)
+      ? requestedFocus
+      : getFocusableElements()[0] ?? dialog;
+    const frame = window.requestAnimationFrame(() => focusTarget?.focus());
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        requestCloseRef.current();
+        return;
+      }
+      if (event.key !== "Tab" || !dialog) {
+        return;
+      }
+      const focusable = getFocusableElements();
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [dialogElement, initialFocusRef]);
+
+  if (!isRendered) {
+    return null;
+  }
+
+  return (
+    <ViewportModalPortal>
+      <div
+        className={`fixed inset-0 z-[150] flex items-center justify-center bg-black/70 p-3 transition-opacity duration-300 motion-reduce:transition-none sm:p-6 ${
+          isVisible ? "opacity-100" : "opacity-0"
+        }`}
+        role="presentation"
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget) {
+            onRequestClose();
+          }
+        }}
+      >
+        <div
+          ref={setDialogElement}
+          role="dialog"
+          aria-modal="true"
+          aria-label={label}
+          tabIndex={-1}
+          className={`overflow-hidden rounded-[14px] bg-[#202020] text-white outline-none ${panelClassName}`}
+        >
+          {open ? children : renderedChildrenRef.current}
+        </div>
+      </div>
+    </ViewportModalPortal>
+  );
+}
+
+export function reelAIBrandLabel(plan: "free" | "plus" | "pro" | null | undefined): string {
+  if (plan === "plus") {
+    return "ReelAI Plus";
+  }
+  if (plan === "pro") {
+    return "ReelAI Pro";
+  }
+  return "ReelAI";
+}
 
 type HistoryItem = StoredHistoryItem;
 
@@ -82,6 +408,27 @@ function normalizeSidebarTab(value: string | null): SidebarTab | null {
     return "edit";
   }
   if (value === "search" || value === "history" || value === "community" || value === "settings") {
+    return value;
+  }
+  return null;
+}
+
+function accountReturnTabForSidebar(tab: SidebarTab): AccountReturnTab {
+  if (tab === "community") {
+    return "community";
+  }
+  if (tab === "create" || tab === "edit") {
+    return "edit";
+  }
+  return "search";
+}
+
+function buildAccountAuthPath(mode: "login" | "register", returnTab: AccountReturnTab): string {
+  return `/account?mode=${mode}&return_tab=${returnTab}`;
+}
+
+function normalizeSettingsSection(value: string | null): SettingsSection | null {
+  if (value === "search" || value === "playback" || value === "plan" || value === "data" || value === "account") {
     return value;
   }
   return null;
@@ -338,6 +685,7 @@ function buildHistoryInfoSections(item: HistoryItem): HistoryInfoSection[] {
 function HomePageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const demoAccountEnabled = isLocalDemoView(searchParams.get("demo"), "account");
   const forcedSidebarTab = useMemo(() => normalizeSidebarTab(searchParams.get("tab")), [searchParams]);
   const forcedCommunitySetId = useMemo(() => {
     const fromCommunitySet = searchParams.get("community_set_id");
@@ -353,9 +701,6 @@ function HomePageContent() {
   const [error, setError] = useState<string | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [mobileSidebarClosing, setMobileSidebarClosing] = useState(false);
-  const [topChromeOffset, setTopChromeOffset] = useState(false);
-  const [topChromeGestureActive, setTopChromeGestureActive] = useState(false);
-  const [searchPanelScrollable, setSearchPanelScrollable] = useState(false);
   const [activeSidebarHistoryMenuId, setActiveSidebarHistoryMenuId] = useState<string | null>(null);
   const [activeHistoryPageMenuId, setActiveHistoryPageMenuId] = useState<string | null>(null);
   const [selectedHistoryInfoId, setSelectedHistoryInfoId] = useState<string | null>(null);
@@ -365,40 +710,54 @@ function HomePageContent() {
   const [sidebarTabHydrated, setSidebarTabHydrated] = useState(false);
   const [activeCommunitySetId, setActiveCommunitySetId] = useState<string | null>(null);
   const [communityAccount, setCommunityAccount] = useState<CommunityAccount | null>(null);
+  const [historySearchOpen, setHistorySearchOpen] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null);
+  const [settingsClosePrompt, setSettingsClosePrompt] = useState(false);
+  const [pendingSettingsAuthMode, setPendingSettingsAuthMode] = useState<"login" | "register" | null>(null);
+  const [generationMode, setGenerationMode] = useState<SettingsGenerationMode>("slow");
+  const [composerResetKey, setComposerResetKey] = useState(0);
   const [hasUnsavedSettingsChanges, setHasUnsavedSettingsChanges] = useState(false);
-  const [settingsModalView, setSettingsModalView] = useState<null | "unsaved" | "availability">(null);
-  const [settingsAvailabilityModalSnapshot, setSettingsAvailabilityModalSnapshot] = useState<SettingsAvailabilityModalSnapshot | null>(null);
   const [hasUnsavedCommunityDraftChanges, setHasUnsavedCommunityDraftChanges] = useState(false);
   const [showUnsavedCommunityDraftModal, setShowUnsavedCommunityDraftModal] = useState(false);
-  const [pendingSidebarSwitchIntent, setPendingSidebarSwitchIntent] = useState<SidebarSwitchIntent | null>(null);
   const [pendingCommunityDraftSwitchIntent, setPendingCommunityDraftSwitchIntent] = useState<SidebarSwitchIntent | null>(null);
-  const [pendingSaveSwitchUntilHeuristicClose, setPendingSaveSwitchUntilHeuristicClose] = useState(false);
   const [communityDetailOpen, setCommunityDetailOpen] = useState(false);
   const [communityResetSignal, setCommunityResetSignal] = useState(0);
-  const [sidebarInfoTooltip, setSidebarInfoTooltip] = useState<{ text: string; left: number; top: number; visible: boolean; align: "left" | "right" } | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const historyRef = useRef<HistoryItem[]>([]);
   const searchHeroTitleRef = useRef<HTMLHeadingElement | null>(null);
+  const mainContentRef = useRef<HTMLElement | null>(null);
   const settingsPanelRef = useRef<SettingsPanelHandle | null>(null);
+  const settingsPromptFocusRef = useRef<HTMLButtonElement | null>(null);
+  const settingsPromptReturnFocusRef = useRef<HTMLElement | null>(null);
   const communityDraftExitActionsRef = useRef<CommunityDraftExitActions | null>(null);
   const hasProcessedInitialSidebarHydrationRef = useRef(false);
   const mobileSidebarCloseTimerRef = useRef<number | null>(null);
-  const sidebarInfoTooltipShowTimerRef = useRef<number | null>(null);
-  const sidebarInfoTooltipHideTimerRef = useRef<number | null>(null);
-  const sidebarInfoTooltipDismissTimerRef = useRef<number | null>(null);
-  const sidebarInfoTooltipAnimateInTimerRef = useRef<number | null>(null);
-  const topChromeGestureTimerRef = useRef<number | null>(null);
+  const mobileSidebarInitialFocusAppliedRef = useRef(false);
+  const mobileSidebarTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const shellModalPresenceTimerRef = useRef<number | null>(null);
+  const [shellModalPresenceActive, setShellModalPresenceActive] = useState(false);
   const historyMutationVersionRef = useRef(0);
   const historyLoadSequenceRef = useRef(0);
   const settingsLoadSequenceRef = useRef(0);
+  const historySearchInputRef = useRef<HTMLInputElement | null>(null);
+
+  const liveBilling = useBillingStatus(demoAccountEnabled ? null : communityAccount);
+  const shellAccount = demoAccountEnabled ? LOCAL_DEMO_ACCOUNT : communityAccount;
+  const billingStatus = demoAccountEnabled ? LOCAL_DEMO_BILLING_STATUS : liveBilling.status;
+  const billingPlans = demoAccountEnabled ? LOCAL_DEMO_BILLING_PLANS : liveBilling.plans;
+  const billingLoading = demoAccountEnabled ? false : liveBilling.loading;
+  const billingError = demoAccountEnabled ? null : liveBilling.error;
 
   const resolveHistoryAccountId = useCallback(() => {
+    if (demoAccountEnabled) {
+      return LOCAL_DEMO_ACCOUNT.id;
+    }
     const activeAccountId = communityAccount?.id?.trim();
     if (activeAccountId) {
       return activeAccountId;
     }
     return readCommunityAuthSession()?.account?.id?.trim() || null;
-  }, [communityAccount?.id]);
+  }, [communityAccount?.id, demoAccountEnabled]);
 
   const setHistorySnapshot = useCallback((next: HistoryItem[], options?: { accountId?: string | null }) => {
     const scopedAccountId = options?.accountId !== undefined ? options.accountId : resolveHistoryAccountId();
@@ -412,12 +771,15 @@ function HomePageContent() {
       return;
     }
     const scopedAccountId = resolveHistoryAccountId();
-    const base = parseMaterialHistory(readScopedHistorySnapshot(scopedAccountId));
+    const storedHistory = parseMaterialHistory(readScopedHistorySnapshot(scopedAccountId));
+    const base = demoAccountEnabled && storedHistory.length === 0
+      ? LOCAL_DEMO_HISTORY
+      : storedHistory;
     const legacy = scopedAccountId ? [] : parseLegacyTopicHistory(window.localStorage.getItem(LEGACY_TOPIC_HISTORY_STORAGE_KEY));
     const merged = mergeHistory(base, legacy);
     setHistorySnapshot(merged, { accountId: scopedAccountId });
 
-    if (!scopedAccountId) {
+    if (demoAccountEnabled || !scopedAccountId) {
       return;
     }
 
@@ -451,7 +813,7 @@ function HomePageContent() {
     return () => {
       cancelled = true;
     };
-  }, [resolveHistoryAccountId, setHistorySnapshot]);
+  }, [demoAccountEnabled, resolveHistoryAccountId, setHistorySnapshot]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -460,7 +822,7 @@ function HomePageContent() {
     const scopedAccountId = resolveHistoryAccountId();
     setActiveStudyReelsSettingsScope(scopedAccountId);
 
-    if (!scopedAccountId) {
+    if (demoAccountEnabled || !scopedAccountId) {
       return;
     }
 
@@ -494,10 +856,13 @@ function HomePageContent() {
     return () => {
       cancelled = true;
     };
-  }, [resolveHistoryAccountId]);
+  }, [demoAccountEnabled, resolveHistoryAccountId]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
+      return;
+    }
+    if (demoAccountEnabled) {
       return;
     }
     let cancelled = false;
@@ -549,7 +914,7 @@ function HomePageContent() {
       window.removeEventListener("storage", onStorage);
       window.removeEventListener(COMMUNITY_AUTH_CHANGED_EVENT, onAuthChanged);
     };
-  }, []);
+  }, [demoAccountEnabled]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -558,9 +923,9 @@ function HomePageContent() {
     const savedTab = normalizeSidebarTab(window.sessionStorage.getItem(ACTIVE_SIDEBAR_TAB_SESSION_KEY));
     const savedCommunitySetIdRaw = window.sessionStorage.getItem(ACTIVE_COMMUNITY_SET_ID_SESSION_KEY);
     const savedCommunitySetId = savedCommunitySetIdRaw?.trim() || null;
-    const nextTab = savedTab ?? forcedSidebarTab ?? (forcedCommunitySetId ? "community" : "search");
+    const nextTab = forcedSidebarTab ?? (forcedCommunitySetId ? "community" : savedTab ?? "search");
     setActiveSidebarTab(nextTab);
-    setActiveCommunitySetId(savedCommunitySetId ?? (!savedTab ? forcedCommunitySetId : null));
+    setActiveCommunitySetId(forcedCommunitySetId ?? savedCommunitySetId);
     setSidebarTabHydrated(true);
   }, [forcedCommunitySetId, forcedSidebarTab]);
 
@@ -627,13 +992,17 @@ function HomePageContent() {
       }),
     [history],
   );
+  const historyRecent = useMemo(
+    () => [...history].sort((a, b) => b.updatedAt - a.updatedAt),
+    [history],
+  );
   const filteredHistory = useMemo(() => {
     const query = historyQuery.trim().toLowerCase();
     if (!query) {
-      return historySorted;
+      return historyRecent;
     }
-    return historySorted.filter((item) => item.title.toLowerCase().includes(query));
-  }, [historyQuery, historySorted]);
+    return historyRecent.filter((item) => item.title.toLowerCase().includes(query));
+  }, [historyQuery, historyRecent]);
   const selectedHistoryInfoItem = useMemo(
     () => (selectedHistoryInfoId ? history.find((item) => item.materialId === selectedHistoryInfoId) ?? null : null),
     [history, selectedHistoryInfoId],
@@ -646,12 +1015,38 @@ function HomePageContent() {
     () => (selectedHistoryInfoItem?.feedQuery?.trim() ? selectedHistoryInfoItem.feedQuery.trim() : null),
     [selectedHistoryInfoItem],
   );
+  const shellModalLogicallyOpen = historySearchOpen
+    || settingsSection !== null
+    || showUnsavedCommunityDraftModal
+    || selectedHistoryInfoItem !== null;
+
+  useEffect(() => {
+    if (shellModalPresenceTimerRef.current !== null) {
+      window.clearTimeout(shellModalPresenceTimerRef.current);
+      shellModalPresenceTimerRef.current = null;
+    }
+    if (shellModalLogicallyOpen) {
+      setShellModalPresenceActive(true);
+      return;
+    }
+    const fadeMs = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : UI_FADE_MS;
+    shellModalPresenceTimerRef.current = window.setTimeout(() => {
+      setShellModalPresenceActive(false);
+      shellModalPresenceTimerRef.current = null;
+    }, fadeMs);
+    return () => {
+      if (shellModalPresenceTimerRef.current !== null) {
+        window.clearTimeout(shellModalPresenceTimerRef.current);
+        shellModalPresenceTimerRef.current = null;
+      }
+    };
+  }, [shellModalLogicallyOpen]);
 
   const persistHistory = useCallback((next: HistoryItem[]) => {
     const scopedAccountId = resolveHistoryAccountId();
     historyMutationVersionRef.current += 1;
     setHistorySnapshot(next, { accountId: scopedAccountId });
-    if (!scopedAccountId) {
+    if (demoAccountEnabled || !scopedAccountId) {
       return;
     }
     void queueCommunityHistorySync(next).catch((error) => {
@@ -660,11 +1055,11 @@ function HomePageContent() {
         setCommunityAccount(null);
       }
     });
-  }, [resolveHistoryAccountId, setHistorySnapshot]);
+  }, [demoAccountEnabled, resolveHistoryAccountId, setHistorySnapshot]);
 
   const syncSavedSettings = useCallback((settings: StudyReelsSettings) => {
     const scopedAccountId = resolveHistoryAccountId();
-    if (!scopedAccountId) {
+    if (demoAccountEnabled || !scopedAccountId) {
       return;
     }
     void queueCommunitySettingsSync(settings).catch((error) => {
@@ -673,7 +1068,43 @@ function HomePageContent() {
         setCommunityAccount(null);
       }
     });
-  }, [resolveHistoryAccountId]);
+  }, [demoAccountEnabled, resolveHistoryAccountId]);
+
+  useEffect(() => {
+    setGenerationMode(readStudyReelsSettings().generationMode);
+    return subscribeToStudyReelsSettings((settings) => {
+      setGenerationMode(settings.generationMode);
+    });
+  }, [communityAccount?.id, demoAccountEnabled]);
+
+  useEffect(() => {
+    if (!sidebarTabHydrated) {
+      return;
+    }
+    const requestedSection = normalizeSettingsSection(searchParams.get("settings"));
+    if (requestedSection) {
+      setSettingsSection(requestedSection);
+      setActiveSidebarTab((current) => (current === "settings" ? "search" : current));
+      return;
+    }
+    if (forcedSidebarTab === "settings") {
+      const nextQuery = new URLSearchParams(searchParams.toString());
+      nextQuery.delete("tab");
+      nextQuery.set("settings", "search");
+      router.replace(`/?${nextQuery.toString()}`);
+      setSettingsSection("search");
+      setActiveSidebarTab("search");
+      return;
+    }
+    if (forcedSidebarTab === "history") {
+      const nextQuery = new URLSearchParams(searchParams.toString());
+      nextQuery.delete("tab");
+      const query = nextQuery.toString();
+      router.replace(query ? `/?${query}` : "/");
+      setHistorySearchOpen(true);
+      setActiveSidebarTab("search");
+    }
+  }, [forcedSidebarTab, router, searchParams, sidebarTabHydrated]);
 
   const upsertHistory = useCallback(
     (entry: {
@@ -721,6 +1152,10 @@ function HomePageContent() {
     setError(null);
     closeHistoryMenus();
     setSelectedHistoryInfoId(null);
+    if (demoAccountEnabled) {
+      writeScopedHistorySnapshot(scopedAccountId, JSON.stringify([]));
+      return;
+    }
     if (typeof window !== "undefined") {
       if (scopedAccountId) {
         writeScopedHistorySnapshot(scopedAccountId, JSON.stringify([]));
@@ -741,7 +1176,7 @@ function HomePageContent() {
       window.localStorage.removeItem(FEED_PROGRESS_STORAGE_KEY);
       window.localStorage.removeItem(FEED_SESSION_STORAGE_KEY);
     }
-  }, [closeHistoryMenus, resolveHistoryAccountId]);
+  }, [closeHistoryMenus, demoAccountEnabled, resolveHistoryAccountId]);
 
   const clearMobileSidebarCloseTimer = useCallback(() => {
     if (mobileSidebarCloseTimerRef.current !== null) {
@@ -750,118 +1185,9 @@ function HomePageContent() {
     }
   }, []);
 
-  const clearTopChromeGestureTimer = useCallback(() => {
-    if (topChromeGestureTimerRef.current !== null) {
-      window.clearTimeout(topChromeGestureTimerRef.current);
-      topChromeGestureTimerRef.current = null;
-    }
-  }, []);
-
-  const triggerTopChromeGesture = useCallback(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    if (activeSidebarTab === "search" && !searchPanelScrollable) {
-      return;
-    }
-    clearTopChromeGestureTimer();
-    setTopChromeGestureActive(true);
-    topChromeGestureTimerRef.current = window.setTimeout(() => {
-      setTopChromeGestureActive(false);
-      topChromeGestureTimerRef.current = null;
-    }, TOP_CHROME_GESTURE_WINDOW_MS);
-  }, [activeSidebarTab, clearTopChromeGestureTimer, searchPanelScrollable]);
-
-  const clearSidebarInfoTooltipTimers = useCallback(() => {
-    if (sidebarInfoTooltipShowTimerRef.current !== null) {
-      window.clearTimeout(sidebarInfoTooltipShowTimerRef.current);
-      sidebarInfoTooltipShowTimerRef.current = null;
-    }
-    if (sidebarInfoTooltipHideTimerRef.current !== null) {
-      window.clearTimeout(sidebarInfoTooltipHideTimerRef.current);
-      sidebarInfoTooltipHideTimerRef.current = null;
-    }
-    if (sidebarInfoTooltipDismissTimerRef.current !== null) {
-      window.clearTimeout(sidebarInfoTooltipDismissTimerRef.current);
-      sidebarInfoTooltipDismissTimerRef.current = null;
-    }
-    if (sidebarInfoTooltipAnimateInTimerRef.current !== null) {
-      window.clearTimeout(sidebarInfoTooltipAnimateInTimerRef.current);
-      sidebarInfoTooltipAnimateInTimerRef.current = null;
-    }
-  }, []);
-
-  const shouldDisableSidebarTooltips = useCallback(() => {
-    if (typeof window === "undefined") {
-      return false;
-    }
-    return window.matchMedia("(max-width: 1023px), (hover: none), (pointer: coarse)").matches;
-  }, []);
-
-  const onSidebarInfoHoverStart = useCallback(
-    (event: ReactMouseEvent<HTMLElement>, text: string, align: "left" | "right" = "left") => {
-      if (typeof window === "undefined") {
-        return;
-      }
-      const target = event.currentTarget;
-      if (shouldDisableSidebarTooltips()) {
-        clearSidebarInfoTooltipTimers();
-        delete target.dataset.tooltipHoverLocked;
-        setSidebarInfoTooltip(null);
-        return;
-      }
-      if (target.dataset.tooltipHoverLocked === "true") {
-        return;
-      }
-      target.dataset.tooltipHoverLocked = "true";
-      const rect = target.getBoundingClientRect();
-      clearSidebarInfoTooltipTimers();
-      setSidebarInfoTooltip(null);
-      sidebarInfoTooltipShowTimerRef.current = window.setTimeout(() => {
-        const left = align === "right"
-          ? Math.min(window.innerWidth - 12, Math.max(232, rect.right))
-          : Math.min(window.innerWidth - 232, Math.max(12, rect.left));
-        const top = Math.min(window.innerHeight - 12, rect.bottom + 8);
-        setSidebarInfoTooltip({ text, left, top, visible: false, align });
-        sidebarInfoTooltipAnimateInTimerRef.current = window.setTimeout(() => {
-          setSidebarInfoTooltip((prev) => (prev ? { ...prev, visible: true } : prev));
-          sidebarInfoTooltipAnimateInTimerRef.current = null;
-        }, SIDEBAR_INFO_TOOLTIP_ANIMATE_IN_MS);
-        sidebarInfoTooltipShowTimerRef.current = null;
-        sidebarInfoTooltipHideTimerRef.current = window.setTimeout(() => {
-          setSidebarInfoTooltip((prev) => (prev ? { ...prev, visible: false } : prev));
-          sidebarInfoTooltipDismissTimerRef.current = window.setTimeout(() => {
-            setSidebarInfoTooltip(null);
-            sidebarInfoTooltipDismissTimerRef.current = null;
-          }, SIDEBAR_INFO_TOOLTIP_FADE_MS);
-          sidebarInfoTooltipHideTimerRef.current = null;
-        }, SIDEBAR_INFO_TOOLTIP_VISIBLE_MS);
-      }, SIDEBAR_INFO_TOOLTIP_DELAY_MS);
-    },
-    [clearSidebarInfoTooltipTimers, shouldDisableSidebarTooltips],
-  );
-
-  const onSidebarInfoHoverEnd = useCallback((event: ReactMouseEvent<HTMLElement>) => {
-    delete event.currentTarget.dataset.tooltipHoverLocked;
-    if (shouldDisableSidebarTooltips()) {
-      clearSidebarInfoTooltipTimers();
-      setSidebarInfoTooltip(null);
-      return;
-    }
-    clearSidebarInfoTooltipTimers();
-    setSidebarInfoTooltip((prev) => (prev ? { ...prev, visible: false } : prev));
-    if (typeof window === "undefined") {
-      setSidebarInfoTooltip(null);
-      return;
-    }
-    sidebarInfoTooltipDismissTimerRef.current = window.setTimeout(() => {
-      setSidebarInfoTooltip(null);
-      sidebarInfoTooltipDismissTimerRef.current = null;
-    }, SIDEBAR_INFO_TOOLTIP_FADE_MS);
-  }, [clearSidebarInfoTooltipTimers, shouldDisableSidebarTooltips]);
-
   const openMobileSidebar = useCallback(() => {
     clearMobileSidebarCloseTimer();
+    mobileSidebarInitialFocusAppliedRef.current = false;
     setMobileSidebarClosing(false);
     setMobileSidebarOpen(true);
   }, [clearMobileSidebarCloseTimer]);
@@ -876,15 +1202,76 @@ function HomePageContent() {
     mobileSidebarCloseTimerRef.current = window.setTimeout(() => {
       setMobileSidebarOpen(false);
       setMobileSidebarClosing(false);
+      mobileSidebarInitialFocusAppliedRef.current = false;
       mobileSidebarCloseTimerRef.current = null;
+      window.requestAnimationFrame(() => mobileSidebarTriggerRef.current?.focus());
     }, MOBILE_SIDEBAR_CLOSE_MS);
   }, [clearMobileSidebarCloseTimer, mobileSidebarClosing, mobileSidebarOpen]);
+
+  useEffect(() => {
+    if (
+      !mobileSidebarOpen
+      || mobileSidebarClosing
+      || shellModalLogicallyOpen
+      || shellModalPresenceActive
+    ) {
+      return;
+    }
+    const drawer = document.querySelector<HTMLElement>("[data-mobile-drawer]");
+    if (!drawer) {
+      return;
+    }
+    const getFocusableElements = () => Array.from(drawer.querySelectorAll<HTMLElement>(MODAL_FOCUSABLE_SELECTOR))
+      .filter((element) => (
+        !element.hidden
+        && element.getAttribute("aria-hidden") !== "true"
+        && !element.closest("[inert], [aria-hidden='true']")
+        && element.getClientRects().length > 0
+      ));
+    const frame = mobileSidebarInitialFocusAppliedRef.current
+      ? 0
+      : window.requestAnimationFrame(() => {
+        mobileSidebarInitialFocusAppliedRef.current = true;
+        drawer.querySelector<HTMLElement>('button[aria-label="Close sidebar"]')?.focus();
+      });
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeMobileSidebar();
+        return;
+      }
+      if (event.key !== "Tab") {
+        return;
+      }
+      const focusable = getFocusableElements();
+      if (focusable.length === 0) {
+        event.preventDefault();
+        drawer.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [closeMobileSidebar, mobileSidebarClosing, mobileSidebarOpen, shellModalLogicallyOpen, shellModalPresenceActive]);
 
   const forceCloseMobileSidebar = useCallback(() => {
     clearMobileSidebarCloseTimer();
     setAccountMenuOpen(false);
     setMobileSidebarClosing(false);
     setMobileSidebarOpen(false);
+    mobileSidebarInitialFocusAppliedRef.current = false;
   }, [clearMobileSidebarCloseTimer]);
 
   const clearCommunitySelectionFromUrl = useCallback(() => {
@@ -908,6 +1295,7 @@ function HomePageContent() {
   }, []);
 
   const applySidebarSwitchIntent = useCallback((intent: SidebarSwitchIntent) => {
+    const shouldMoveFocusToContent = mobileSidebarOpen;
     setActiveSidebarTab(intent.tab);
     if (intent.tab === "community" && intent.resetCommunityView && activeSidebarTab === "community") {
       setCommunityResetSignal((prev) => prev + 1);
@@ -921,16 +1309,13 @@ function HomePageContent() {
       setHistoryQuery("");
     }
     forceCloseMobileSidebar();
-  }, [activeSidebarTab, clearCommunitySelectionFromUrl, closeHistoryMenus, forceCloseMobileSidebar]);
+    if (shouldMoveFocusToContent) {
+      window.requestAnimationFrame(() => mainContentRef.current?.focus());
+    }
+  }, [activeSidebarTab, clearCommunitySelectionFromUrl, closeHistoryMenus, forceCloseMobileSidebar, mobileSidebarOpen]);
 
   const requestSidebarSwitch = useCallback(
     (intent: SidebarSwitchIntent) => {
-      const hasPendingUnsavedSettings = hasUnsavedSettingsChanges || Boolean(settingsPanelRef.current?.hasUnsavedChanges());
-      if (activeSidebarTab === "settings" && intent.tab !== "settings" && hasPendingUnsavedSettings) {
-        setPendingSidebarSwitchIntent(intent);
-        setSettingsModalView("unsaved");
-        return;
-      }
       const leavingCommunityDraftForm = (activeSidebarTab === "create" || activeSidebarTab === "edit")
         && intent.tab !== activeSidebarTab
         && hasUnsavedCommunityDraftChanges;
@@ -941,35 +1326,32 @@ function HomePageContent() {
       }
       applySidebarSwitchIntent(intent);
     },
-    [activeSidebarTab, applySidebarSwitchIntent, hasUnsavedCommunityDraftChanges, hasUnsavedSettingsChanges],
+    [activeSidebarTab, applySidebarSwitchIntent, hasUnsavedCommunityDraftChanges],
   );
 
   const startNewSearch = useCallback(() => {
+    setComposerResetKey((current) => current + 1);
     requestSidebarSwitch({ tab: "search", clearHistoryQuery: true });
   }, [requestSidebarSwitch]);
 
   const toggleDesktopSidebarCollapsed = useCallback(() => {
     closeHistoryMenus();
     setAccountMenuOpen(false);
-    clearSidebarInfoTooltipTimers();
-    setSidebarInfoTooltip(null);
     setDesktopSidebarCollapsed((prev) => !prev);
-  }, [clearSidebarInfoTooltipTimers, closeHistoryMenus]);
+  }, [closeHistoryMenus]);
 
-  const openAccountScreen = useCallback(() => {
+  const openAuthPage = useCallback((mode: "login" | "register" = "login") => {
     closeHistoryMenus();
     setSelectedHistoryInfoId(null);
     setAccountMenuOpen(false);
-    forceCloseMobileSidebar();
-    const returnTab = activeSidebarTab === "create" ? "edit" : activeSidebarTab;
-    router.push(`/account?return_tab=${returnTab}`);
-  }, [activeSidebarTab, closeHistoryMenus, forceCloseMobileSidebar, router]);
+    router.push(buildAccountAuthPath(mode, accountReturnTabForSidebar(activeSidebarTab)));
+  }, [activeSidebarTab, closeHistoryMenus, router]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
-    const hasPendingUnsavedSettings = activeSidebarTab === "settings"
+    const hasPendingUnsavedSettings = settingsSection !== null
       && (hasUnsavedSettingsChanges || Boolean(settingsPanelRef.current?.hasUnsavedChanges()));
     const hasPendingUnsavedCommunityDraft = (activeSidebarTab === "create" || activeSidebarTab === "edit")
       && hasUnsavedCommunityDraftChanges;
@@ -984,7 +1366,7 @@ function HomePageContent() {
     return () => {
       window.removeEventListener("beforeunload", onBeforeUnload);
     };
-  }, [activeSidebarTab, hasUnsavedCommunityDraftChanges, hasUnsavedSettingsChanges]);
+  }, [activeSidebarTab, hasUnsavedCommunityDraftChanges, hasUnsavedSettingsChanges, settingsSection]);
 
   const isSidebarInteractiveTarget = useCallback((target: EventTarget | null): boolean => {
     if (!(target instanceof Element)) {
@@ -1000,42 +1382,8 @@ function HomePageContent() {
   useEffect(() => {
     return () => {
       clearMobileSidebarCloseTimer();
-      clearSidebarInfoTooltipTimers();
-      clearTopChromeGestureTimer();
     };
-  }, [clearMobileSidebarCloseTimer, clearSidebarInfoTooltipTimers, clearTopChromeGestureTimer]);
-
-  const onMainScroll = useCallback((event: UIEvent<HTMLElement>) => {
-    const isOffset = event.currentTarget.scrollTop > 0;
-    setTopChromeOffset((prev) => (prev === isOffset ? prev : isOffset));
-  }, []);
-
-  const onSearchPanelScrollOffsetChange = useCallback((isOffset: boolean) => {
-    if (activeSidebarTab !== "search") {
-      return;
-    }
-    setTopChromeOffset((prev) => (prev === isOffset ? prev : isOffset));
-    if (!isOffset) {
-      clearTopChromeGestureTimer();
-      setTopChromeGestureActive(false);
-    }
-  }, [activeSidebarTab, clearTopChromeGestureTimer]);
-
-  const onSearchPanelScrollabilityChange = useCallback((isScrollable: boolean) => {
-    setSearchPanelScrollable((prev) => (prev === isScrollable ? prev : isScrollable));
-    if (!isScrollable) {
-      setTopChromeOffset(false);
-      clearTopChromeGestureTimer();
-      setTopChromeGestureActive(false);
-    }
-  }, [clearTopChromeGestureTimer]);
-
-  useEffect(() => {
-    if (activeSidebarTab === "search") {
-      setTopChromeOffset(false);
-      setTopChromeGestureActive(false);
-    }
-  }, [activeSidebarTab]);
+  }, [clearMobileSidebarCloseTimer]);
 
   useEffect(() => {
     if (activeSidebarTab !== "community") {
@@ -1048,18 +1396,7 @@ function HomePageContent() {
   }, [activeSidebarTab, clearCommunitySelectionFromUrl, forcedCommunitySetId]);
 
   const visibleSidebarTab = sidebarTabHydrated ? activeSidebarTab : null;
-  const shouldShowTopChromeStrip = sidebarTabHydrated
-    && !mobileSidebarOpen
-    && (
-      visibleSidebarTab === "settings"
-        ? true
-        : visibleSidebarTab === "search"
-        ? searchPanelScrollable && (topChromeOffset || topChromeGestureActive)
-        : topChromeOffset
-    );
-  // Keep settings content position stable even when the mobile sidebar temporarily hides the top chrome.
-  const shouldInsetSettingsForTopChrome = visibleSidebarTab === "settings";
-
+  const showGenerationSpeedToggle = visibleSidebarTab === "search";
   const openMaterialFeed = useCallback(
     (materialId: string) => {
       const existing = historyRef.current.find((item) => item.materialId === materialId);
@@ -1156,21 +1493,6 @@ function HomePageContent() {
   }, [activeHistoryPageMenuId, activeSidebarHistoryMenuId, closeHistoryMenus]);
 
   useEffect(() => {
-    if (!selectedHistoryInfoItem) {
-      return;
-    }
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setSelectedHistoryInfoId(null);
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [selectedHistoryInfoItem]);
-
-  useEffect(() => {
     if (!accountMenuOpen) {
       return;
     }
@@ -1240,161 +1562,160 @@ function HomePageContent() {
   const sidebarPrimaryActions = [
     {
       key: "search",
-      label: "Search",
-      tooltip: "Start a new chat session",
-      iconClassName: "fa-solid fa-magnifying-glass",
+      label: "New search",
+      icon: "compose",
       isActive: visibleSidebarTab === "search",
       onClick: startNewSearch,
     },
     {
-      key: "history",
-      label: "Search History",
-      tooltip: "Browse your saved search sessions",
-      iconClassName: "fa-solid fa-clock-rotate-left",
-      isActive: visibleSidebarTab === "history",
-      onClick: () => switchSidebarTab("history"),
-    },
-    {
       key: "community",
       label: "Community Reels",
-      tooltip: "Curated reel sets from the community",
-      iconClassName: "fa-solid fa-users",
+      icon: "community",
       isActive: visibleSidebarTab === "community",
       onClick: () => switchSidebarTab("community", { resetCommunityView: true }),
     },
-    {
+    ...(shellAccount ? [{
       key: "edit",
       label: "Your Sets",
-      tooltip: "Create and edit your community sets",
-      iconClassName: "fa-solid fa-pen-to-square",
+      icon: "sets" as const,
       isActive: visibleSidebarTab === "edit" || visibleSidebarTab === "create",
       onClick: () => switchSidebarTab("edit"),
-    },
-  ] as const;
-  const settingsSidebarAction = {
-    label: "Settings",
-    tooltip: "Open settings",
-    iconClassName: "fa-solid fa-gear",
-    isActive: visibleSidebarTab === "settings",
-    onClick: () => switchSidebarTab("settings"),
-  } as const;
-  const renderSidebarActionButton = (
-    action: {
-      label: string;
-      tooltip: string;
-      iconClassName: string;
-      isActive: boolean;
-      onClick: () => void;
-    },
-    options?: { collapsed?: boolean; className?: string },
-  ) => {
-    const collapsed = options?.collapsed ?? false;
-    const wrapperClassName = options?.className ?? "";
-    return (
-      <div
-        className={`group relative ${wrapperClassName}`.trim()}
-        onMouseEnter={(event) => onSidebarInfoHoverStart(event, action.tooltip)}
-        onMouseLeave={onSidebarInfoHoverEnd}
-      >
-        <button
-          type="button"
-          onClick={action.onClick}
-          aria-label={action.label}
-          className={
-            collapsed
-              ? `grid h-9 w-9 place-items-center rounded-xl bg-transparent transition-colors duration-200 ${
-                action.isActive ? "bg-white text-black" : "text-white/85 hover:bg-white/10 hover:text-white"
-              }`
-              : `h-9 w-full rounded-xl bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
-                action.isActive ? "bg-white text-black" : "text-white/85 hover:bg-white/10 hover:text-white"
-              }`
-          }
-        >
-          {collapsed ? (
-            <i
-              className={`${action.iconClassName} text-[11px] ${
-                action.isActive ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
-              }`}
-              aria-hidden="true"
-            />
-          ) : (
-            <div className="flex h-full items-center justify-between gap-1.5">
-              <p className="truncate font-semibold leading-none">{action.label}</p>
-              <i
-                className={`${action.iconClassName} text-[11px] ${
-                  action.isActive ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
-                }`}
-                aria-hidden="true"
-              />
-            </div>
-          )}
-        </button>
-      </div>
-    );
-  };
-  const openYourSetsFromAccountMenu = useCallback(() => {
-    setAccountMenuOpen(false);
-    switchSidebarTab("edit");
-  }, [switchSidebarTab]);
+    }] : []),
+  ] satisfies ReadonlyArray<{
+    key: string;
+    label: string;
+    icon: ShellIconName;
+    isActive: boolean;
+    onClick: () => void;
+  }>;
+  const exitDemoAccount = useCallback(() => {
+    const nextQuery = new URLSearchParams(searchParams.toString());
+    nextQuery.delete("demo");
+    const query = nextQuery.toString();
+    router.replace(query ? `/?${query}` : "/");
+  }, [router, searchParams]);
   const onAccountMenuSignOut = useCallback(async () => {
     setAccountMenuOpen(false);
+    if (demoAccountEnabled) {
+      exitDemoAccount();
+      return;
+    }
     try {
       await logoutCommunityAccount();
     } finally {
       setCommunityAccount(null);
     }
+  }, [demoAccountEnabled, exitDemoAccount]);
+  const closeHistorySearch = useCallback(() => {
+    setHistorySearchOpen(false);
+    setHistoryQuery("");
   }, []);
+  const closeHistoryInfo = useCallback(() => {
+    setSelectedHistoryInfoId(null);
+  }, []);
+  const openSettings = useCallback((section: SettingsSection = "search") => {
+    setAccountMenuOpen(false);
+    setHistorySearchOpen(false);
+    setSettingsClosePrompt(false);
+    setPendingSettingsAuthMode(null);
+    setSettingsSection(section);
+    const nextQuery = new URLSearchParams(searchParams.toString());
+    nextQuery.delete("tab");
+    nextQuery.set("settings", section);
+    router.replace(`/?${nextQuery.toString()}`);
+  }, [router, searchParams]);
+  const finishCloseSettings = useCallback((authMode?: "login" | "register") => {
+    setSettingsSection(null);
+    setSettingsClosePrompt(false);
+    setPendingSettingsAuthMode(null);
+    if (authMode) {
+      const navigationDelay = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : UI_FADE_MS;
+      window.setTimeout(() => {
+        router.push(buildAccountAuthPath(authMode, "settings"));
+      }, navigationDelay);
+      return;
+    }
+    const nextQuery = new URLSearchParams(searchParams.toString());
+    nextQuery.delete("settings");
+    const query = nextQuery.toString();
+    router.replace(query ? `/?${query}` : "/");
+  }, [router, searchParams]);
+  const onSettingsSectionChange = useCallback((section: SettingsSection) => {
+    setSettingsSection(section);
+    const nextQuery = new URLSearchParams(searchParams.toString());
+    nextQuery.delete("tab");
+    nextQuery.set("settings", section);
+    router.replace(`/?${nextQuery.toString()}`);
+  }, [router, searchParams]);
+  const showSettingsClosePrompt = useCallback((authMode: "login" | "register" | null) => {
+    settingsPromptReturnFocusRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    setPendingSettingsAuthMode(authMode);
+    setSettingsClosePrompt(true);
+  }, []);
+  const keepEditingSettings = useCallback(() => {
+    const returnFocus = settingsPromptReturnFocusRef.current;
+    setSettingsClosePrompt(false);
+    setPendingSettingsAuthMode(null);
+    window.requestAnimationFrame(() => {
+      if (returnFocus?.isConnected) {
+        returnFocus.focus();
+      }
+    });
+  }, []);
+  const requestCloseSettings = useCallback(() => {
+    setPendingSettingsAuthMode(null);
+    const dirty = hasUnsavedSettingsChanges || Boolean(settingsPanelRef.current?.hasUnsavedChanges());
+    if (dirty) {
+      showSettingsClosePrompt(null);
+      return;
+    }
+    finishCloseSettings();
+  }, [finishCloseSettings, hasUnsavedSettingsChanges, showSettingsClosePrompt]);
+  const requestOpenAuth = useCallback((mode: "login" | "register" | "verify" = "login") => {
+    const authMode = mode === "register" ? "register" : "login";
+    const dirty = hasUnsavedSettingsChanges || Boolean(settingsPanelRef.current?.hasUnsavedChanges());
+    if (dirty) {
+      showSettingsClosePrompt(authMode);
+      return;
+    }
+    finishCloseSettings(authMode);
+  }, [finishCloseSettings, hasUnsavedSettingsChanges, showSettingsClosePrompt]);
+  const onSettingsModalRequestClose = useCallback(() => {
+    if (settingsClosePrompt) {
+      keepEditingSettings();
+      return;
+    }
+    requestCloseSettings();
+  }, [keepEditingSettings, requestCloseSettings, settingsClosePrompt]);
+  useEffect(() => {
+    if (!settingsClosePrompt) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => settingsPromptFocusRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [settingsClosePrompt]);
+  const applyGenerationMode = useCallback((nextMode: SettingsGenerationMode) => {
+    if (nextMode === generationMode) {
+      return;
+    }
+    const saved = saveStudyReelsSettings({
+      ...readStudyReelsSettings(),
+      generationMode: nextMode,
+    });
+    setGenerationMode(saved.generationMode);
+    syncSavedSettings(saved);
+  }, [generationMode, syncSavedSettings]);
   const onCommunityDraftExitActionsChange = useCallback((actions: CommunityDraftExitActions | null) => {
     // Unsaved draft state is owned by the panel's explicit dirty-state callback.
     // Clearing it here would incorrectly mark the form clean during effect cleanups.
     communityDraftExitActionsRef.current = actions;
   }, []);
-  const closeSettingsModal = useCallback((source: "close-button" | "backdrop" = "close-button") => {
-    if (settingsModalView === "availability") {
-      settingsPanelRef.current?.dismissAvailabilityModal(source);
-      return;
-    }
-    setSettingsModalView(null);
-    setPendingSidebarSwitchIntent(null);
-    setPendingSaveSwitchUntilHeuristicClose(false);
-  }, [settingsModalView]);
   const closeUnsavedCommunityDraftModal = useCallback(() => {
     setShowUnsavedCommunityDraftModal(false);
     setPendingCommunityDraftSwitchIntent(null);
   }, []);
-  const discardSettingsAndContinue = useCallback(() => {
-    const intent = pendingSidebarSwitchIntent;
-    if (!intent) {
-      closeSettingsModal();
-      return;
-    }
-    settingsPanelRef.current?.discardUnsavedChanges();
-    setHasUnsavedSettingsChanges(false);
-    setSettingsModalView(null);
-    setPendingSidebarSwitchIntent(null);
-    setPendingSaveSwitchUntilHeuristicClose(false);
-    applySidebarSwitchIntent(intent);
-  }, [applySidebarSwitchIntent, closeSettingsModal, pendingSidebarSwitchIntent]);
-  const saveSettingsAndContinue = useCallback(() => {
-    const intent = pendingSidebarSwitchIntent;
-    if (!intent) {
-      closeSettingsModal();
-      return;
-    }
-    const settingsPanel = settingsPanelRef.current;
-    if (!settingsPanel) {
-      setHasUnsavedSettingsChanges(false);
-      setSettingsModalView(null);
-      setPendingSidebarSwitchIntent(null);
-      setPendingSaveSwitchUntilHeuristicClose(false);
-      applySidebarSwitchIntent(intent);
-      return;
-    }
-    setSettingsModalView("availability");
-    setPendingSaveSwitchUntilHeuristicClose(true);
-    settingsPanel.savePreferences();
-    setHasUnsavedSettingsChanges(false);
-  }, [applySidebarSwitchIntent, closeSettingsModal, pendingSidebarSwitchIntent]);
   const discardCommunityDraftAndContinue = useCallback(() => {
     const intent = pendingCommunityDraftSwitchIntent;
     if (!intent) {
@@ -1422,27 +1743,7 @@ function HomePageContent() {
     setHasUnsavedCommunityDraftChanges(false);
     applySidebarSwitchIntent(intent);
   }, [applySidebarSwitchIntent, closeUnsavedCommunityDraftModal, pendingCommunityDraftSwitchIntent]);
-  const onSettingsAvailabilityModalClose = useCallback(
-    (source: "close-button" | "backdrop") => {
-      setSettingsModalView(null);
-      if (!pendingSaveSwitchUntilHeuristicClose) {
-        return;
-      }
-      const intent = pendingSidebarSwitchIntent;
-      setPendingSaveSwitchUntilHeuristicClose(false);
-      setPendingSidebarSwitchIntent(null);
-      if (source !== "close-button" || !intent) {
-        return;
-      }
-      applySidebarSwitchIntent(intent);
-    },
-    [applySidebarSwitchIntent, pendingSaveSwitchUntilHeuristicClose, pendingSidebarSwitchIntent],
-  );
   const isCommunityPanel = visibleSidebarTab === "community" || visibleSidebarTab === "create" || visibleSidebarTab === "edit";
-  const usesCommunityShell = isCommunityPanel || visibleSidebarTab === "history";
-  const showSearchVolumetricBackground = false;
-  const showSearchCommunityBackdrop = visibleSidebarTab === "search";
-  const hasCommunityBackdrop = usesCommunityShell || visibleSidebarTab === "settings" || showSearchCommunityBackdrop;
   const hideMobileTopControls = isCommunityPanel && communityDetailOpen;
   const [lastCommunityPanelMode, setLastCommunityPanelMode] = useState<"community" | "create" | "edit">("community");
 
@@ -1459,766 +1760,559 @@ function HomePageContent() {
       : visibleSidebarTab === "edit"
         ? "edit"
         : "community";
-  const activeSettingsAvailabilityState = settingsAvailabilityModalSnapshot?.state ?? DEFAULT_SETTINGS_AVAILABILITY_STATE;
-  const desktopSidebarWidthPx = desktopSidebarCollapsed ? 72 : 264;
+  const desktopSidebarWidthPx = desktopSidebarCollapsed
+    ? DESKTOP_SIDEBAR_COLLAPSED_PX
+    : DESKTOP_SIDEBAR_EXPANDED_PX;
   const showLoadingScreen = useLoadingScreenGate(sidebarTabHydrated, { minimumVisibleMs: 250 });
 
   if (showLoadingScreen) {
     return <FullscreenLoadingScreen />;
   }
 
-  const historyPanelContent = (
-    <div className={visibleSidebarTab === "history" ? "flex h-full min-h-0 flex-col" : "hidden h-full min-h-0"}>
-      <div className="flex h-full min-h-0 flex-col px-5 pb-6 pt-[calc(max(env(safe-area-inset-top),0px)+5rem)] sm:px-6 md:px-8 lg:px-10 lg:pt-12">
-        <div className="shrink-0 text-center">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-white/52">Library</p>
-          <h2 className="mt-3 text-3xl font-semibold tracking-tight text-white sm:text-[2.5rem]">Search History</h2>
-          <p className="mt-3 text-sm text-white/58">Search your saved sessions and reopen them from here.</p>
-        </div>
-
-        <div className="mx-auto mt-8 w-full max-w-2xl shrink-0">
-          <div className="relative">
-            <i className="fa-solid fa-magnifying-glass pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-sm text-white/38" aria-hidden="true" />
-            <input
-              value={historyQuery}
-              onChange={(event) => setHistoryQuery(event.target.value)}
-              placeholder="Search history..."
-              className="h-14 w-full rounded-[1.75rem] bg-white/[0.08] pl-12 pr-4 text-base text-white outline-none backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 placeholder:text-white/35 focus:bg-white/[0.12]"
-            />
-          </div>
-
-          <div className="mt-3 flex items-center justify-between gap-3 text-xs text-white/52">
-            <p>
-              {historyQuery.trim()
-                ? `${filteredHistory.length} ${filteredHistory.length === 1 ? "result" : "results"}`
-                : `${historySorted.length} saved ${historySorted.length === 1 ? "session" : "sessions"}`}
-            </p>
-            {historySorted.length > 0 ? (
-              <button
-                type="button"
-                onClick={clearAllHistory}
-                aria-label="Clear history"
-                className="grid h-7 w-7 place-items-center rounded-lg text-white/48 transition hover:bg-white/10 hover:text-white"
-              >
-                <i className="fa-solid fa-trash-can text-[11px]" aria-hidden="true" />
-              </button>
-            ) : null}
-          </div>
-        </div>
-
-        <div className="mx-auto mt-8 min-h-0 w-full max-w-4xl flex-1 overflow-y-auto pb-2">
-          {historySorted.length === 0 ? (
-            <div className="grid min-h-full place-items-center px-4 py-12">
-              <div className="max-w-md text-center">
-                <p className="text-lg font-semibold text-white">No search history yet.</p>
-                <p className="mt-3 text-sm leading-6 text-white/58">
-                  Start a search or open a community reel set, and your recent sessions will show up here.
-                </p>
-              </div>
-            </div>
-          ) : filteredHistory.length === 0 ? (
-            <div className="grid min-h-full place-items-center px-4 py-12">
-              <div className="max-w-md text-center">
-                <p className="text-lg font-semibold text-white">No matching history items.</p>
-                <p className="mt-3 text-sm leading-6 text-white/58">Try a different title or clear the search box.</p>
-              </div>
-            </div>
-          ) : (
-            <div className="space-y-3 pb-4">
-              {filteredHistory.map((entry) => (
-                <div
-                  key={`history-${entry.materialId}`}
-                  className={`group relative ${activeHistoryPageMenuId === entry.materialId ? "z-40" : "z-0"}`}
-                >
-                  <button
-                    type="button"
-                    onClick={() => openMaterialFeed(entry.materialId)}
-                    className="w-full rounded-[1.75rem] bg-white/[0.07] px-4 py-4 pr-14 text-left backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 hover:bg-white/[0.11] sm:px-5 sm:py-5"
-                  >
-                    <div className="flex items-start gap-3">
-                      <span className="mt-0.5 grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-black/30 text-white/78 transition-colors duration-200 group-hover:text-white">
-                        <i className={`fa-solid ${entry.source === "community" ? "fa-users" : "fa-magnifying-glass"} text-sm`} aria-hidden="true" />
-                      </span>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          {entry.starred ? <i className="fa-solid fa-star text-[11px] text-white/72 transition-colors group-hover:text-white" aria-hidden="true" /> : null}
-                          <p className="truncate text-sm font-semibold text-white sm:text-base">{entry.title}</p>
-                          <span
-                            className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] ${
-                              entry.source === "community"
-                                ? "bg-white/16 text-white/88"
-                                : "bg-black/45 text-white/62"
-                            }`}
-                          >
-                            {entry.source === "community" ? "Community" : entry.generationMode}
-                          </span>
-                        </div>
-                        <p className="mt-2 text-xs text-white/48">{formatHistoryInfoDate(entry.updatedAt)}</p>
-                      </div>
-                    </div>
-                  </button>
-
-                  <div data-history-actions="true" className="absolute right-3 top-3 z-30">
-                    <button
-                      type="button"
-                      aria-label="History item actions"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        setActiveSidebarHistoryMenuId(null);
-                        setActiveHistoryPageMenuId((prev) => (prev === entry.materialId ? null : entry.materialId));
-                      }}
-                      data-force-visible={activeHistoryPageMenuId === entry.materialId ? "true" : undefined}
-                      className="grid h-8 w-8 place-items-center rounded-lg text-white/62 transition hover:bg-white/10 hover:text-white"
-                    >
-                      <i className="fa-solid fa-ellipsis text-[12px]" aria-hidden="true" />
-                    </button>
-
-                    <div
-                      className={`absolute right-0 top-full z-50 mt-2 w-44 transition-opacity duration-180 ${
-                        activeHistoryPageMenuId === entry.materialId
-                          ? "pointer-events-auto opacity-100"
-                          : "pointer-events-none opacity-0"
-                      }`}
-                    >
-                      <div
-                        role="menu"
-                        className="overflow-hidden rounded-2xl bg-black p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)]"
-                      >
-                        <button
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            setSelectedHistoryInfoId(entry.materialId);
-                            closeHistoryMenus();
-                          }}
-                          className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
-                        >
-                          <i className="fa-regular fa-circle-info text-[11px] text-white/80" aria-hidden="true" />
-                          More information
-                        </button>
-                        <button
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            toggleHistoryStar(entry.materialId);
-                          }}
-                          className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
-                        >
-                          <i
-                            className={`fa-${entry.starred ? "solid" : "regular"} fa-star text-[11px] text-white/80`}
-                            aria-hidden="true"
-                          />
-                          {entry.starred ? "Unstar" : "Star"}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            deleteHistoryItem(entry.materialId);
-                          }}
-                          className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
-                        >
-                          <i className="fa-regular fa-trash-can text-[11px] text-white/80" aria-hidden="true" />
-                          Delete
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-
-  const sidebarPanelContent = (
-    <div className="flex h-full min-h-0 flex-col lg:pt-2">
-      <div className="mt-2 flex items-center justify-end gap-2 lg:mt-0 lg:justify-between">
-        <span
-          aria-hidden="true"
-          className="hidden h-8 w-8 -translate-x-2 items-center justify-center text-xl font-black leading-none tracking-tight text-white/58 lg:inline-flex"
-        >
-          R
-        </span>
-        <div
-          className="group relative lg:hidden"
-          onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Start a new search", "right")}
-          onMouseLeave={onSidebarInfoHoverEnd}
-        >
-          <button
-            type="button"
-            onClick={startNewSearch}
-            aria-label="Start new search"
-            className="grid h-8 w-8 place-items-center rounded-xl bg-transparent text-sm font-semibold text-white/90 transition-colors duration-200 hover:bg-white/10 hover:text-white"
-          >
-            <span className="translate-x-[0.5px] -translate-y-[0.5px] leading-none">+</span>
-          </button>
-        </div>
-        <div
-          className="group relative hidden lg:block"
-          onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Collapse sidebar", "right")}
-          onMouseLeave={onSidebarInfoHoverEnd}
-        >
-          <button
-            type="button"
-            onClick={toggleDesktopSidebarCollapsed}
-            aria-label="Collapse sidebar"
-            className="grid h-8 w-8 place-items-center rounded-xl bg-transparent text-white/90 transition-colors duration-200 hover:bg-white/10 hover:text-white"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="18"
-              height="18"
-              viewBox="0 0 20 20"
-              aria-hidden="true"
-              className="max-md:hidden"
-            >
-              <rect x="3.5" y="4" width="13" height="12" rx="2.25" fill="none" stroke="currentColor" strokeWidth="1.4" />
-              <path d="M8 4.75v10.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-            </svg>
-          </button>
-        </div>
-      </div>
-
-      {sidebarPrimaryActions.map((action, index) => (
-        <div key={action.key}>
-          {renderSidebarActionButton(action, { className: index === 0 ? "mt-2" : "mt-1" })}
-        </div>
-      ))}
-
-      <div className="mt-3 min-h-0 flex-1 overflow-y-auto px-2.5 lg:flex-[0.95]">
-        <div className="mb-2 flex items-center justify-between">
-          <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">History</p>
-          <button
-            type="button"
-            onClick={clearAllHistory}
-            aria-label="Clear history"
-            className="grid h-7 w-7 translate-x-1.5 place-items-center rounded-lg text-white/60 transition hover:bg-white/10 hover:text-white"
-          >
-            <i className="fa-solid fa-trash-can text-[11px]" aria-hidden="true" />
-          </button>
-        </div>
-        <div className="relative pb-1">
-          <div className="relative space-y-1">
-            {historySorted.length === 0 ? (
-              <p className="text-xs text-zinc-400">No history yet.</p>
-            ) : (
-              historySorted.map((entry) => (
-                <div
-                  key={`history-${entry.materialId}`}
-                  className="group relative"
-                >
-                  <button
-                    type="button"
-                    onClick={() => openMaterialFeed(entry.materialId)}
-                    className="h-9 w-full rounded-xl bg-transparent px-2.5 pr-10 text-left text-xs text-white/85 transition-colors duration-200 hover:bg-white/10 hover:text-white"
-                  >
-                    <div className="flex items-center gap-1.5">
-                      {entry.starred ? <i className="fa-solid fa-star text-[10px] text-white/75 transition-colors group-hover:text-white" aria-hidden="true" /> : null}
-                      <p className="truncate font-semibold leading-none transition-colors group-hover:text-white">{entry.title}</p>
-                      {entry.source === "community" ? (
-                        <span className="shrink-0 rounded-md bg-white/16 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-white/92 transition-colors group-hover:bg-white/22 group-hover:text-white">
-                          Community
-                        </span>
-                      ) : (
-                        <span className="shrink-0 rounded-md bg-black/55 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-white/68 transition-colors group-hover:text-white">
-                          {entry.generationMode}
-                        </span>
-                      )}
-                    </div>
-                  </button>
-
-                  <div data-history-actions="true" className="absolute right-1.5 top-1.5 z-20">
-                    <button
-                      type="button"
-                      aria-label="History item actions"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        setActiveHistoryPageMenuId(null);
-                        setActiveSidebarHistoryMenuId((prev) => (prev === entry.materialId ? null : entry.materialId));
-                      }}
-                      data-force-visible={activeSidebarHistoryMenuId === entry.materialId ? "true" : undefined}
-                      className="reveal-on-desktop-hover grid h-6 w-6 place-items-center rounded-md text-white/70 transition hover:bg-white/10 hover:text-white"
-                    >
-                      <i className="fa-solid fa-ellipsis text-[11px]" aria-hidden="true" />
-                    </button>
-
-                    <div
-                      className={`absolute right-0 top-full z-30 mt-1 w-44 transition-opacity duration-180 ${
-                        activeSidebarHistoryMenuId === entry.materialId
-                          ? "pointer-events-auto opacity-100"
-                          : "pointer-events-none opacity-0"
-                      }`}
-                    >
-                      <div
-                        role="menu"
-                        className="overflow-hidden rounded-2xl bg-black p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)]"
-                      >
-                        <button
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            setSelectedHistoryInfoId(entry.materialId);
-                            closeHistoryMenus();
-                          }}
-                          className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
-                        >
-                          <i className="fa-regular fa-circle-info text-[11px] text-white/80" aria-hidden="true" />
-                          More information
-                        </button>
-                        <button
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            toggleHistoryStar(entry.materialId);
-                          }}
-                          className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
-                        >
-                          <i
-                            className={`fa-${entry.starred ? "solid" : "regular"} fa-star text-[11px] text-white/80`}
-                            aria-hidden="true"
-                          />
-                          {entry.starred ? "Unstar" : "Star"}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            deleteHistoryItem(entry.materialId);
-                          }}
-                          className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
-                        >
-                          <i className="fa-regular fa-trash-can text-[11px] text-white/80" aria-hidden="true" />
-                          Delete
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-      </div>
-
-      <div className="mb-0 mt-auto pt-3 lg:pt-0">
-        {renderSidebarActionButton(settingsSidebarAction)}
-        <div
-          data-account-actions="true"
-          className="group relative mt-1"
-        >
-          {communityAccount ? (
-            <div
-              className={`absolute inset-x-0 bottom-full z-30 mb-2 ${
-                accountMenuOpen ? "pointer-events-auto" : "pointer-events-none"
-              }`}
-            >
-              <div
-                role="menu"
-                className={`overflow-hidden rounded-2xl bg-black p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)] transition duration-180 ${
-                  accountMenuOpen ? "pointer-events-auto translate-y-0 opacity-100" : "pointer-events-none translate-y-1 opacity-0"
-                }`}
-              >
-                <button
-                  type="button"
-                  onClick={openAccountScreen}
-                  className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
-                >
-                  <i className="fa-regular fa-id-badge text-[11px] text-white/75" aria-hidden="true" />
-                  Manage Account
-                </button>
-                <button
-                  type="button"
-                  onClick={openYourSetsFromAccountMenu}
-                  className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
-                >
-                  <i className="fa-regular fa-folder-open text-[11px] text-white/75" aria-hidden="true" />
-                  Your Sets
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    void onAccountMenuSignOut();
-                  }}
-                  className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
-                >
-                  <i className="fa-solid fa-right-from-bracket text-[11px] text-white/75" aria-hidden="true" />
-                  Log Out
-                </button>
-              </div>
-            </div>
-          ) : null}
-          <button
-            type="button"
-            onClick={() => {
-              if (communityAccount) {
-                closeHistoryMenus();
-                setAccountMenuOpen((prev) => !prev);
-                return;
-              }
-              openAccountScreen();
-            }}
-            aria-haspopup={communityAccount ? "menu" : undefined}
-            aria-expanded={communityAccount ? accountMenuOpen : undefined}
-            className="h-10 w-full rounded-xl bg-transparent px-2.5 text-left text-xs text-white/85 transition-colors duration-200 hover:bg-white/10 hover:text-white"
-          >
-            <div className="flex h-full items-center justify-between gap-1.5">
-              <p className="truncate font-semibold leading-none">
-                {communityAccount ? `@${communityAccount.username}` : "Login / Sign Up"}
-              </p>
-              <i
-                className={`text-[11px] ${
-                  communityAccount
-                    ? `fa-solid ${accountMenuOpen ? "fa-chevron-up" : "fa-user"} text-white/74 transition-colors duration-200 group-hover:text-white`
-                    : "fa-solid fa-right-to-bracket text-white/74 transition-colors duration-200 group-hover:text-white"
-                }`}
-                aria-hidden="true"
-              />
-            </div>
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-
-  const collapsedDesktopSidebarPanelContent = (
-    <div className="flex h-full min-h-0 flex-col items-center lg:pt-2">
-      <div className="mt-2 flex w-full items-center justify-center lg:mt-0">
-        <div
-          className="group relative"
-          onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Expand sidebar")}
-          onMouseLeave={onSidebarInfoHoverEnd}
-        >
-          <button
-            type="button"
-            onClick={toggleDesktopSidebarCollapsed}
-            aria-label="Expand sidebar"
-            className="relative grid h-8 w-8 place-items-center rounded-xl bg-transparent text-white/90 transition-colors duration-200 hover:bg-white/10 hover:text-white"
-          >
-            <span
-              aria-hidden="true"
-              className="text-xl font-black leading-none tracking-tight text-white/58 transition-[opacity,transform] duration-150 group-hover:scale-90 group-hover:opacity-0"
-            >
-              R
-            </span>
-            <i
-              className="fa-solid fa-chevron-right absolute text-[11px] opacity-0 transition-[opacity,transform] duration-150 group-hover:scale-100 group-hover:opacity-100"
-              aria-hidden="true"
-            />
-          </button>
-        </div>
-      </div>
-
-      <div className="flex min-h-0 w-full flex-1 flex-col">
-        <div className="flex flex-col items-center">
-          {sidebarPrimaryActions.map((action, index) => (
-            <div key={action.key} className={`flex w-full justify-center ${index === 0 ? "mt-2" : "mt-1"}`}>
-              {renderSidebarActionButton(action, { collapsed: true })}
-            </div>
-          ))}
-        </div>
-
-        <div className="mb-0 mt-auto flex w-full flex-col items-center pt-3 lg:pt-0">
-          {renderSidebarActionButton(settingsSidebarAction, { collapsed: true })}
-          <div
-            data-account-actions="true"
-            className="group relative mt-1 flex w-full justify-center"
-            onMouseEnter={(event) => onSidebarInfoHoverStart(
-              event,
-              communityAccount ? `@${communityAccount.username}` : "Login or sign up",
-            )}
-            onMouseLeave={onSidebarInfoHoverEnd}
-          >
-            {communityAccount ? (
-              <div
-                className={`absolute bottom-0 left-full z-30 ml-3 w-44 ${
-                  accountMenuOpen ? "pointer-events-auto" : "pointer-events-none"
-                }`}
-              >
-                <div
-                  role="menu"
-                  className={`overflow-hidden rounded-2xl bg-black p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)] transition duration-180 ${
-                    accountMenuOpen ? "pointer-events-auto translate-y-0 opacity-100" : "pointer-events-none translate-x-1 opacity-0"
-                  }`}
-                >
-                  <button
-                    type="button"
-                    onClick={openAccountScreen}
-                    className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
-                  >
-                    <i className="fa-regular fa-id-badge text-[11px] text-white/75" aria-hidden="true" />
-                    Manage Account
-                  </button>
-                  <button
-                    type="button"
-                    onClick={openYourSetsFromAccountMenu}
-                    className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
-                  >
-                    <i className="fa-regular fa-folder-open text-[11px] text-white/75" aria-hidden="true" />
-                    Your Sets
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      void onAccountMenuSignOut();
-                    }}
-                    className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
-                  >
-                    <i className="fa-solid fa-right-from-bracket text-[11px] text-white/75" aria-hidden="true" />
-                    Log Out
-                  </button>
-                </div>
-              </div>
-            ) : null}
-            <button
-              type="button"
-              onClick={() => {
-                if (communityAccount) {
-                  closeHistoryMenus();
-                  setAccountMenuOpen((prev) => !prev);
-                  return;
-                }
-                openAccountScreen();
-              }}
-              aria-label={communityAccount ? `@${communityAccount.username}` : "Login or sign up"}
-              aria-haspopup={communityAccount ? "menu" : undefined}
-              aria-expanded={communityAccount ? accountMenuOpen : undefined}
-              className="grid h-10 w-10 place-items-center rounded-xl bg-transparent text-white/85 transition-colors duration-200 hover:bg-white/10 hover:text-white"
-            >
-              <i
-                className={`text-[12px] ${
-                  communityAccount
-                    ? `fa-solid ${accountMenuOpen ? "fa-chevron-up" : "fa-user"} text-white/74 transition-colors duration-200 group-hover:text-white`
-                    : "fa-solid fa-right-to-bracket text-white/74 transition-colors duration-200 group-hover:text-white"
-                }`}
-                aria-hidden="true"
-              />
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-
-  return (
-    <main onScroll={onMainScroll} className="home-hero-shell fixed inset-0 h-[100dvh] overflow-x-hidden overflow-y-auto lg:overflow-hidden">
-      {showSearchVolumetricBackground ? (
-        <div className="absolute -top-[28%] -right-[0%] bottom-0 z-[2] w-[100%]">
-          <VolumetricLightBackground titleElementRef={searchHeroTitleRef} />
-        </div>
-      ) : null}
-      {hasCommunityBackdrop ? (
-        <div className="pointer-events-none absolute inset-0 z-[3] overflow-hidden">
-          <div className="absolute inset-0 bg-black/30" />
-          <img
-            src="/images/community/80543.jpg"
-            alt=""
-            aria-hidden="true"
-            className="absolute bottom-0 right-0 h-auto w-[82vw] max-w-none rotate-180 object-contain sm:w-[74vw] md:w-[66vw] lg:w-[58vw]"
-            style={{
-              opacity: 0.15,
-              WebkitMaskImage: "linear-gradient(to right, rgba(0, 0, 0, 1) 0%, rgba(0, 0, 0, 1) 90%, rgba(0, 0, 0, 0) 100%)",
-              maskImage: "linear-gradient(to right, rgba(0, 0, 0, 1) 0%, rgba(0, 0, 0, 1) 90%, rgba(0, 0, 0, 0) 100%)",
-              WebkitMaskRepeat: "no-repeat",
-              maskRepeat: "no-repeat",
-              WebkitMaskSize: "100% 100%",
-              maskSize: "100% 100%",
-            }}
-          />
-        </div>
-      ) : null}
-      {error ? (
-        <div className="absolute left-0 right-0 top-3 z-30 mx-auto w-fit rounded-full border border-white/25 bg-black/80 px-4 py-2 text-xs text-white">
-          {error}
-        </div>
-      ) : null}
-      {sidebarInfoTooltip && !shouldDisableSidebarTooltips() ? (
-        <div
-          className={`pointer-events-none fixed z-[90] max-w-[220px] rounded-lg bg-black/95 px-2 py-1 text-left text-[10px] text-white/92 shadow-[0_12px_30px_rgba(0,0,0,0.5)] backdrop-blur-sm transition-[opacity,transform] duration-[220ms] ease-out will-change-[transform,opacity] ${
-            sidebarInfoTooltip.visible ? "translate-y-0 opacity-100" : "-translate-y-1.5 opacity-0"
-          } ${sidebarInfoTooltip.align === "right" ? "origin-top-right -translate-x-full" : "origin-top-left"}`}
-          style={{ left: `${sidebarInfoTooltip.left}px`, top: `${sidebarInfoTooltip.top}px` }}
-        >
-          {sidebarInfoTooltip.text}
-        </div>
-      ) : null}
-
-      <div
+  const visibleBillingPlan = billingStatus?.plan;
+  const brandLabel = reelAIBrandLabel(visibleBillingPlan);
+  const accountPlanLabel = visibleBillingPlan === "pro"
+    ? "Pro"
+    : visibleBillingPlan === "plus"
+      ? "Plus"
+      : visibleBillingPlan === "free" || !shellAccount || !shellAccount.isVerified
+        ? "Free"
+        : billingError
+          ? "Plan unavailable"
+          : "Loading…";
+  const accountInitial = (shellAccount?.username?.trim().charAt(0) || "R").toUpperCase();
+  const showGuestAuthActions = !shellAccount
+    && (visibleSidebarTab === "search" || visibleSidebarTab === "edit" || visibleSidebarTab === "create");
+  const fastSlowToggle = (
+    <div
+      role="group"
+      aria-label="Generation speed"
+      className="relative flex h-9 w-[218px] items-center rounded-full bg-[#181818] text-sm font-medium text-zinc-400"
+    >
+      <span
+        data-generation-speed-indicator
         aria-hidden="true"
-          className={`pointer-events-none fixed inset-x-0 top-0 z-[68] h-[calc(max(env(safe-area-inset-top),0px)+68px)] ${
-          visibleSidebarTab === "search" ? "transition-none" : "transition-opacity duration-150"
-        } lg:hidden ${
-          shouldShowTopChromeStrip ? "opacity-100" : "opacity-0"
+        className={`absolute -left-0.5 -top-0.5 h-10 w-[calc(50%+2px)] rounded-full bg-[#242424] transition-transform duration-[360ms] ease-in-out motion-reduce:transition-none ${
+          generationMode === "slow" ? "translate-x-full" : "translate-x-0"
         }`}
-      >
-        <div
-          className={`h-full w-full ${
-            visibleSidebarTab === "community" || visibleSidebarTab === "edit" || visibleSidebarTab === "settings" || visibleSidebarTab === "history"
-              ? "bg-black"
-              : visibleSidebarTab === "search"
-                ? "relative overflow-hidden bg-white/[0.05] backdrop-blur-[10px] backdrop-saturate-160"
-                : "bg-black/28 backdrop-blur-[28px] backdrop-saturate-180"
+      />
+      {(["fast", "slow"] as const).map((mode) => (
+        <button
+          key={mode}
+          type="button"
+          aria-pressed={generationMode === mode}
+          onClick={() => applyGenerationMode(mode)}
+          className={`relative z-10 h-9 flex-1 rounded-full capitalize transition-colors duration-300 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white ${
+            generationMode === mode ? "text-white" : "hover:text-zinc-200"
           }`}
         >
-          {visibleSidebarTab === "search" ? <div className="absolute inset-0 bg-black/45" /> : null}
-        </div>
+          {mode}
+        </button>
+      ))}
+    </div>
+  );
+
+  const renderAccountPopover = (collapsed = false) => (
+    <div
+      data-shell-account-popover={collapsed ? "collapsed" : "expanded"}
+      role="menu"
+      aria-hidden={!accountMenuOpen}
+      inert={!accountMenuOpen}
+      className={`absolute z-40 w-[256px] rounded-2xl bg-[#202020] p-2 transition-opacity duration-300 motion-reduce:transition-none ${
+        collapsed ? "bottom-[calc(100%+24px)] left-[-6px]" : "bottom-[calc(100%+10px)] left-0"
+      } ${
+        accountMenuOpen ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
+      }`}
+    >
+      {shellAccount ? (
+        <button
+          type="button"
+          role="menuitem"
+          onClick={() => openSettings("account")}
+          className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left transition-colors hover:bg-white/[0.07] focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+        >
+          <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-emerald-500 text-sm font-semibold text-white">
+            {accountInitial}
+          </span>
+          <span className="min-w-0">
+            <span className="block truncate text-sm font-medium text-white">@{shellAccount.username}</span>
+            <span className="mt-0.5 block text-xs text-zinc-400">{accountPlanLabel}</span>
+          </span>
+          <ShellIcon name="chevron" className="ml-auto h-3.5 w-3.5 text-zinc-400" />
+        </button>
+      ) : (
+        <button
+          type="button"
+          role="menuitem"
+          onClick={() => openAuthPage("login")}
+          className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-sm text-white transition-colors hover:bg-white/[0.07] focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+        >
+          <ShellIcon name="auth" className="h-[18px] w-[18px] text-zinc-300" />
+          Log in / Sign up
+        </button>
+      )}
+      <button
+        type="button"
+        role="menuitem"
+        onClick={() => openSettings("search")}
+        className="mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-white transition-colors hover:bg-white/[0.07] focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+      >
+        <ShellIcon name="settings" className="h-[18px] w-[18px] text-zinc-300" />
+        Settings
+      </button>
+      {LOCAL_DEMO_AVAILABLE && !demoAccountEnabled ? (
+        <button
+          type="button"
+          role="menuitem"
+          onClick={() => {
+            setAccountMenuOpen(false);
+            router.push("/?demo=account");
+          }}
+          className="mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-white transition-colors hover:bg-white/[0.07] focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+        >
+          <ShellIcon name="auth" className="h-[18px] w-[18px] text-zinc-300" />
+          Use demo account
+        </button>
+      ) : null}
+      {LOCAL_DEMO_AVAILABLE ? (
+        <button
+          type="button"
+          role="menuitem"
+          onClick={() => {
+            setAccountMenuOpen(false);
+            router.push("/feed?demo=player&return_tab=search");
+          }}
+          className="mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-white transition-colors hover:bg-white/[0.07] focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+        >
+          <ShellIcon name="chat" className="h-[18px] w-[18px] text-zinc-300" />
+          Open demo reel player
+        </button>
+      ) : null}
+      {LOCAL_DEMO_AVAILABLE ? (
+        <button
+          type="button"
+          role="menuitem"
+          onClick={() => {
+            setAccountMenuOpen(false);
+            router.push("/feed?demo=quiz&return_tab=search");
+          }}
+          className="mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-white transition-colors hover:bg-white/[0.07] focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+        >
+          <ShellIcon name="info" className="h-[18px] w-[18px] text-zinc-300" />
+          Open demo quiz
+        </button>
+      ) : null}
+      {shellAccount ? (
+        <button
+          type="button"
+          role="menuitem"
+          onClick={() => void onAccountMenuSignOut()}
+          className="mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-white transition-colors hover:bg-white/[0.07] focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+        >
+          <ShellIcon name="auth" className="h-[18px] w-[18px] rotate-180 text-zinc-300" />
+          {demoAccountEnabled ? "Exit demo" : "Log out"}
+        </button>
+      ) : null}
+    </div>
+  );
+
+  const chatGPTSidebarContent = (
+    <div className="flex h-full min-h-0 flex-col px-2 pb-[max(10px,env(safe-area-inset-bottom))] pt-[max(10px,env(safe-area-inset-top))] text-white">
+      <div className="flex h-11 shrink-0 items-center gap-1 px-2">
+        <p aria-label={brandLabel} data-reelai-wordmark="true" className="flex min-w-0 flex-1 items-baseline gap-1.5 truncate tracking-tight">
+          <span aria-hidden="true" className="text-[24px] font-semibold">ReelAI</span>
+          {visibleBillingPlan === "plus" || visibleBillingPlan === "pro" ? (
+            <span aria-hidden="true" data-plan-suffix="true" className="text-[18px] font-normal text-white/78">
+              {visibleBillingPlan === "plus" ? "Plus" : "Pro"}
+            </span>
+          ) : null}
+        </p>
+        <button
+          type="button"
+          onClick={() => {
+            setHistoryQuery("");
+            setHistorySearchOpen(true);
+            setAccountMenuOpen(false);
+          }}
+          aria-label="Search history"
+          className="grid h-9 w-9 place-items-center rounded-lg text-zinc-300 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+        >
+          <ShellIcon name="search" />
+        </button>
+        <button
+          type="button"
+          onClick={toggleDesktopSidebarCollapsed}
+          aria-label="Collapse sidebar"
+          className="hidden h-9 w-9 place-items-center rounded-lg text-zinc-300 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-white lg:grid"
+        >
+          <ShellIcon name="panel" />
+        </button>
+        <button
+          type="button"
+          onClick={closeMobileSidebar}
+          aria-label="Close sidebar"
+          className="grid h-9 w-9 place-items-center rounded-lg text-zinc-300 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-white lg:hidden"
+        >
+          <ShellIcon name="close" />
+        </button>
+      </div>
+
+      <nav aria-label="Primary" className="mt-3 shrink-0 space-y-1">
+        {sidebarPrimaryActions.map((action) => (
+          <button
+            key={action.key}
+            type="button"
+            onClick={action.onClick}
+            className={`flex h-11 w-full items-center gap-3 rounded-xl px-3 text-left text-sm transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-white ${
+              action.isActive ? "bg-[#2a2a2a] text-white" : "text-zinc-200 hover:bg-white/[0.07]"
+            }`}
+          >
+            <ShellIcon name={action.icon} className="h-[18px] w-[18px]" />
+            <span className="truncate">{action.label}</span>
+          </button>
+        ))}
+      </nav>
+
+      <div className="mt-5 min-h-0 flex-1 overflow-y-auto px-1">
+        <p className="px-2 pb-2 text-xs font-semibold text-zinc-400">Recents</p>
+        {historySorted.length === 0 ? (
+          <p className="px-2 py-2 text-xs text-zinc-500">Your searches will appear here.</p>
+        ) : (
+          <div className="space-y-0.5">
+            {historySorted.slice(0, 40).map((entry) => (
+              <div key={`recent-${entry.materialId}`} className="group relative">
+                <button
+                  type="button"
+                  onClick={() => openMaterialFeed(entry.materialId)}
+                  className="flex h-10 w-full min-w-0 items-center gap-2 rounded-xl px-2.5 pr-10 text-left text-sm text-zinc-300 hover:bg-white/[0.07] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+                >
+                  {entry.starred ? <ShellIcon name="star" filled className="h-3.5 w-3.5 text-zinc-400" /> : null}
+                  <span className="min-w-0 truncate">{entry.title}</span>
+                </button>
+                <div data-history-actions="true" className="absolute right-1.5 top-1.5">
+                  <button
+                    type="button"
+                    aria-label={`Actions for ${entry.title}`}
+                    data-force-visible={activeSidebarHistoryMenuId === entry.materialId ? "true" : undefined}
+                    onClick={() => setActiveSidebarHistoryMenuId((current) => current === entry.materialId ? null : entry.materialId)}
+                    className="reveal-on-desktop-hover grid h-7 w-7 place-items-center rounded-lg text-zinc-300 transition-colors hover:bg-white/[0.07] hover:text-white"
+                  >
+                    <ShellIcon name="more" className="h-4 w-4" />
+                  </button>
+                  <div
+                    role="menu"
+                    aria-hidden={activeSidebarHistoryMenuId !== entry.materialId}
+                    inert={activeSidebarHistoryMenuId !== entry.materialId}
+                    className={`absolute right-0 top-8 z-50 w-44 rounded-xl bg-[#202020] p-1.5 transition-opacity duration-300 motion-reduce:transition-none ${
+                      activeSidebarHistoryMenuId === entry.materialId
+                        ? "pointer-events-auto opacity-100"
+                        : "pointer-events-none opacity-0"
+                    }`}
+                  >
+                      <button type="button" role="menuitem" onClick={() => setSelectedHistoryInfoId(entry.materialId)} className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition-colors hover:bg-white/[0.07]">
+                        <ShellIcon name="info" className="h-4 w-4" /> More information
+                      </button>
+                      <button type="button" role="menuitem" onClick={() => toggleHistoryStar(entry.materialId)} className="mt-0.5 flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition-colors hover:bg-white/[0.07]">
+                        <ShellIcon name="star" className="h-4 w-4" filled={entry.starred} /> {entry.starred ? "Unstar" : "Star"}
+                      </button>
+                      <button type="button" role="menuitem" onClick={() => deleteHistoryItem(entry.materialId)} className="mt-0.5 flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-red-300 transition-colors hover:bg-white/[0.07]">
+                        <ShellIcon name="trash" className="h-4 w-4" /> Delete
+                      </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div data-account-actions="true" className="relative mt-2 shrink-0">
+        {shellAccount ? (
+          <>
+            {renderAccountPopover()}
+            <button
+              type="button"
+              onClick={() => setAccountMenuOpen((current) => !current)}
+              aria-haspopup="menu"
+              aria-expanded={accountMenuOpen}
+              className="flex h-14 w-full items-center gap-3 rounded-xl px-2.5 text-left transition-colors hover:bg-white/[0.07] focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+            >
+              <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-emerald-500 text-sm font-semibold text-white">
+                {accountInitial}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm text-white">@{shellAccount.username}</span>
+                <span className="mt-0.5 block text-xs text-zinc-500">{accountPlanLabel}</span>
+              </span>
+            </button>
+          </>
+        ) : (
+          <button
+            type="button"
+            onClick={() => openAuthPage("login")}
+            data-guest-sidebar-login="true"
+            className="flex h-10 w-full items-center gap-2 rounded-lg px-2 text-left text-sm text-white transition-colors hover:bg-white/[0.07]"
+          >
+            <ShellIcon name="auth" className="h-[18px] w-[18px] text-zinc-300" />
+            <span>Login</span>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+
+  const chatGPTCollapsedSidebarContent = (
+    <div className="flex h-full flex-col items-center gap-1 px-2 py-3 text-white">
+      <button type="button" onClick={toggleDesktopSidebarCollapsed} aria-label="Expand sidebar" className="group relative grid h-10 w-10 place-items-center rounded-xl text-zinc-300 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-white">
+        <img
+          src="/reelai-mark-white-2.svg"
+          alt=""
+          aria-hidden="true"
+          data-collapsed-sidebar-brand="true"
+          className="absolute h-5 w-5 opacity-100 transition-opacity duration-150 ease-out group-hover:opacity-0 group-focus-visible:opacity-0 motion-reduce:transition-none"
+        />
+        <span
+          aria-hidden="true"
+          data-collapsed-sidebar-expand-icon="true"
+          className="absolute inset-0 grid place-items-center opacity-0 transition-opacity duration-150 ease-out group-hover:opacity-100 group-focus-visible:opacity-100 motion-reduce:transition-none"
+        >
+          <ShellIcon name="panel" />
+        </span>
+      </button>
+      <button type="button" onClick={() => setHistorySearchOpen(true)} aria-label="Search history" className="grid h-10 w-10 place-items-center rounded-xl text-zinc-300 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-white">
+        <ShellIcon name="search" />
+      </button>
+      <div className="mt-2 flex flex-col gap-1">
+        {sidebarPrimaryActions.map((action) => (
+          <button key={action.key} type="button" onClick={action.onClick} aria-label={action.label} title={action.label} className={`grid h-10 w-10 place-items-center rounded-xl transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-white ${action.isActive ? "bg-[#2a2a2a] text-white" : "text-zinc-300 hover:bg-white/[0.07] hover:text-white"}`}>
+            <ShellIcon name={action.icon} />
+          </button>
+        ))}
+      </div>
+      <div data-account-actions="true" className="relative mt-auto">
+        {shellAccount ? (
+          <>
+            {renderAccountPopover(true)}
+            <button type="button" onClick={() => setAccountMenuOpen((current) => !current)} aria-label={`@${shellAccount.username}`} aria-haspopup="menu" aria-expanded={accountMenuOpen} className="grid h-10 w-10 place-items-center rounded-full bg-emerald-500 text-sm font-semibold text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-white">
+              {accountInitial}
+            </button>
+          </>
+        ) : (
+          <button type="button" onClick={() => openAuthPage("login")} aria-label="Login" className="grid h-10 w-10 place-items-center rounded-xl text-zinc-300 transition-colors hover:bg-white/[0.07] hover:text-white">
+            <ShellIcon name="auth" />
+          </button>
+        )}
+      </div>
+    </div>
+  );
+
+  const shellIsInert = shellModalLogicallyOpen || shellModalPresenceActive;
+
+  return (
+    <main className="home-hero-shell fixed inset-0 h-[100dvh] overflow-hidden bg-black">
+      <div
+        aria-hidden={!error}
+        className={`pointer-events-none absolute left-0 right-0 top-3 z-30 mx-auto w-fit rounded-full bg-[#2b2b2b] px-4 py-2 text-xs text-white transition-opacity duration-300 motion-reduce:transition-none ${
+          error ? "opacity-100" : "opacity-0"
+        }`}
+      >
+        {error}
+      </div>
+      <div
+        aria-hidden="true"
+        className={`top-nav-fade pointer-events-none fixed right-0 top-0 z-[109] hidden h-20 transition-[left,opacity] duration-300 motion-reduce:transition-none lg:block ${
+          showGenerationSpeedToggle ? "opacity-100" : "opacity-0"
+        }`}
+        style={{ left: `calc(${desktopSidebarWidthPx}px + 2.5rem)` }}
+      />
+      <div
+        aria-hidden={shellIsInert || mobileSidebarOpen || !showGuestAuthActions}
+        inert={shellIsInert || mobileSidebarOpen || !showGuestAuthActions}
+        style={{
+          right: "calc(max(env(safe-area-inset-right), 0px) + 12px)",
+          top: "calc(max(env(safe-area-inset-top), 0px) + 10px)",
+        }}
+        className={`fixed z-[112] flex h-10 items-center gap-2 transition-opacity duration-300 motion-reduce:transition-none ${
+          showGuestAuthActions && !mobileSidebarOpen && !hideMobileTopControls
+            ? "opacity-100"
+            : "pointer-events-none opacity-0"
+        }`}
+        data-guest-auth-actions="true"
+      >
+        <button
+          type="button"
+          onClick={() => openAuthPage("login")}
+          className="h-10 rounded-xl bg-[#2b2b2b] px-4 text-sm font-medium text-white transition-colors hover:bg-white/[0.07]"
+        >
+          Login
+        </button>
+        <button
+          type="button"
+          onClick={() => openAuthPage("register")}
+          className="h-10 rounded-xl bg-white px-4 text-sm font-semibold text-black hover:bg-zinc-100"
+        >
+          Sign up
+        </button>
+      </div>
+      <div
+        aria-hidden={shellIsInert || !showGenerationSpeedToggle}
+        inert={shellIsInert || !showGenerationSpeedToggle}
+        className={`pointer-events-none fixed top-3 z-[112] hidden -translate-x-1/2 transition-[left,opacity] duration-300 ease-out motion-reduce:transition-none lg:block ${
+          showGenerationSpeedToggle ? "opacity-100" : "opacity-0"
+        }`}
+        style={{ left: `calc(50% + ${desktopSidebarWidthPx / 2}px)` }}
+      >
+        <div className="pointer-events-auto">{fastSlowToggle}</div>
       </div>
 
       <button
+        ref={mobileSidebarTriggerRef}
         type="button"
+        data-mobile-sidebar-trigger="true"
+        disabled={shellIsInert || mobileSidebarOpen}
+        aria-hidden={shellIsInert || mobileSidebarOpen}
+        inert={shellIsInert || mobileSidebarOpen}
         onClick={openMobileSidebar}
-        aria-label="Open topic menu"
+        aria-label="Open sidebar"
         style={{
           left: "calc(max(env(safe-area-inset-left), 0px) + 10px)",
           top: "calc(max(env(safe-area-inset-top), 0px) + 10px)",
         }}
-        className={`fixed z-[110] grid h-10 w-10 place-items-center text-white/90 transition-opacity hover:text-white md:left-7 md:top-7 lg:hidden ${
+        className={`fixed z-[110] grid h-10 w-10 place-items-center rounded-xl text-white/90 transition-colors duration-300 motion-reduce:transition-none hover:bg-white/[0.07] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-white md:left-7 md:top-7 lg:hidden ${
           mobileSidebarOpen || hideMobileTopControls ? "pointer-events-none opacity-0" : "opacity-100"
         }`}
       >
-        <i className="fa-solid fa-bars text-base" aria-hidden="true" />
+        <ShellIcon name="menu" className="h-5 w-5" />
       </button>
+      <p
+        aria-label={brandLabel}
+        data-mobile-shell-brand="true"
+        className={`fixed left-1/2 z-[110] flex h-10 max-w-[42vw] -translate-x-1/2 items-center gap-1.5 truncate text-[16px] tracking-tight text-white transition-opacity duration-300 motion-reduce:transition-none lg:hidden ${
+          mobileSidebarOpen || hideMobileTopControls || shellIsInert
+            ? "pointer-events-none opacity-0"
+            : "opacity-100"
+        }`}
+        style={{ top: "calc(max(env(safe-area-inset-top), 0px) + 10px)" }}
+      >
+        <span aria-hidden="true" className="truncate font-semibold">ReelAI</span>
+        {visibleBillingPlan === "plus" || visibleBillingPlan === "pro" ? (
+          <span aria-hidden="true" className="shrink-0 font-normal text-white/78">
+            {visibleBillingPlan === "plus" ? "Plus" : "Pro"}
+          </span>
+        ) : null}
+      </p>
       <div
-        aria-hidden="true"
-        style={{
-          top: "calc(max(env(safe-area-inset-top), 0px) + 10px)",
-        }}
-        className={`pointer-events-none fixed left-1/2 z-[110] flex h-10 -translate-x-1/2 items-center transition-opacity lg:hidden ${
-          mobileSidebarOpen || hideMobileTopControls ? "opacity-0" : "opacity-100"
+        aria-hidden={shellIsInert || mobileSidebarOpen || !showGenerationSpeedToggle}
+        inert={shellIsInert || mobileSidebarOpen || !showGenerationSpeedToggle}
+        style={{ top: "calc(max(env(safe-area-inset-top), 0px) + 62px)" }}
+        className={`fixed left-1/2 z-[110] flex h-11 -translate-x-1/2 items-center transition-opacity duration-300 motion-reduce:transition-none lg:hidden ${
+          showGenerationSpeedToggle && !mobileSidebarOpen && !hideMobileTopControls ? "opacity-100" : "pointer-events-none opacity-0"
         }`}
       >
-        <img src="/logo.png" alt="" className="h-auto w-[5rem] object-contain opacity-70 md:w-[5.5rem]" />
+        {fastSlowToggle}
       </div>
 
       {mobileSidebarOpen ? (
-        <div className="fixed left-0 top-0 z-50 h-[100dvh] w-screen lg:hidden">
+        <div aria-hidden={shellIsInert} inert={shellIsInert} className="fixed left-0 top-0 z-50 h-[100dvh] w-screen lg:hidden">
           <button
             type="button"
-            aria-label="Close topic menu overlay"
+            aria-label="Close sidebar overlay"
             onClick={closeMobileSidebar}
             className={`absolute inset-0 bg-black/70 ${mobileSidebarClosing ? "animate-mobile-overlay-out" : "animate-mobile-overlay-in"}`}
           />
           <aside
+            data-mobile-drawer="true"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Navigation drawer"
+            tabIndex={-1}
             onClick={(event) => {
               if (isSidebarInteractiveTarget(event.target)) {
                 return;
               }
               closeMobileSidebar();
             }}
-            className={`absolute bottom-4 left-4 top-6 w-[min(23rem,calc(100vw-2rem))] rounded-3xl bg-white/[0.06] px-3 pb-3 pt-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.32)] backdrop-blur-[26px] backdrop-saturate-150 ${
+            className={`absolute inset-y-0 left-0 w-[min(272px,86vw)] bg-black text-white ${
               mobileSidebarClosing ? "animate-mobile-sidenav-out" : "animate-mobile-sidenav-in"
             }`}
           >
-            <div className="flex h-full min-h-0 flex-col">
-              <div className="-mx-3 shrink-0 px-3 pb-2 pt-0.5">
-                <div className="relative flex h-10 items-center justify-between overflow-hidden rounded-2xl px-0.5">
-                  <span
-                    aria-hidden="true"
-                    className="relative z-10 inline-flex h-10 w-10 -translate-x-2 items-center justify-center text-2xl font-black leading-none tracking-tight text-white/58"
-                  >
-                    R
-                  </span>
-                  <button
-                    type="button"
-                    onClick={closeMobileSidebar}
-                    aria-label="Close topic menu"
-                    className="relative z-10 mr-1 -translate-y-0.5 p-1 text-white/80 transition hover:text-white"
-                  >
-                    <i className="fa-solid fa-xmark text-base" aria-hidden="true" />
-                  </button>
-                </div>
-              </div>
-              <div className="min-h-0 flex-1 overflow-y-auto">
-                <div className="h-full rounded-2xl">
-                  {sidebarPanelContent}
-                </div>
-              </div>
-            </div>
+            {chatGPTSidebarContent}
+            <span aria-hidden="true" className="pointer-events-none absolute inset-y-0 right-0 w-px bg-white/[0.07]" />
           </aside>
         </div>
       ) : null}
 
       <div
-        className="relative z-20 mx-auto h-full min-h-0 w-full max-w-[1680px] lg:mx-0 lg:max-w-none lg:pl-4 lg:grid lg:transition-[grid-template-columns] lg:duration-[460ms] lg:ease-[cubic-bezier(0.22,1,0.36,1)]"
+        aria-hidden={shellIsInert || mobileSidebarOpen}
+        inert={shellIsInert || mobileSidebarOpen}
+        className="relative z-20 h-full min-h-0 w-full transition-[grid-template-columns] duration-300 ease-out motion-reduce:transition-none lg:grid"
         style={{ gridTemplateColumns: `minmax(0, ${desktopSidebarWidthPx}px) minmax(0, 1fr)` }}
       >
         <aside
-          className={`relative z-20 hidden min-h-0 flex-col rounded-3xl bg-white/[0.06] px-3 pt-3 pb-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.24)] backdrop-blur-[18px] backdrop-saturate-150 lg:mt-6 lg:mb-6 lg:flex lg:justify-self-start lg:transition-[width,padding] lg:duration-[460ms] lg:ease-[cubic-bezier(0.22,1,0.36,1)] ${
-            desktopSidebarCollapsed ? "lg:px-3 lg:pb-5" : "lg:px-5 lg:pb-5"
-          }`}
+          className="relative z-30 hidden min-h-0 bg-black text-white transition-[width] duration-300 ease-out motion-reduce:transition-none lg:flex"
           style={{ width: `${desktopSidebarWidthPx}px` }}
         >
           <div className="relative h-full min-h-0 w-full">
             <div
               aria-hidden={desktopSidebarCollapsed}
               inert={desktopSidebarCollapsed}
-              className={`absolute inset-0 transition-[opacity,transform] duration-[360ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
-                desktopSidebarCollapsed ? "pointer-events-none -translate-x-5 opacity-0" : "translate-x-0 opacity-100"
+              className={`absolute inset-0 transition-opacity duration-300 motion-reduce:transition-none ${
+                desktopSidebarCollapsed ? "pointer-events-none opacity-0" : "opacity-100"
               }`}
             >
-              {sidebarPanelContent}
+              {chatGPTSidebarContent}
             </div>
             <div
               aria-hidden={!desktopSidebarCollapsed}
               inert={!desktopSidebarCollapsed}
-              className={`absolute inset-0 transition-[opacity,transform] duration-[360ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
-                desktopSidebarCollapsed ? "translate-x-0 opacity-100" : "pointer-events-none -translate-x-3 opacity-0"
+              className={`absolute inset-0 transition-opacity duration-300 motion-reduce:transition-none ${
+                desktopSidebarCollapsed ? "opacity-100" : "pointer-events-none opacity-0"
               }`}
             >
-              {collapsedDesktopSidebarPanelContent}
+              {chatGPTCollapsedSidebarContent}
             </div>
           </div>
+          <span aria-hidden="true" className="pointer-events-none absolute inset-y-0 right-0 w-px bg-white/[0.07]" />
         </aside>
 
         <section
-          className={`relative z-20 h-full min-h-0 w-full overflow-hidden rounded-3xl ${
-            hasCommunityBackdrop ? "bg-transparent" : "bg-black/62"
-          } ${
-            usesCommunityShell
-              ? "lg:mt-2 lg:mb-0"
-              : "lg:my-2"
-          } lg:max-w-[1280px] lg:justify-self-center lg:transition-[transform,width,max-width] lg:duration-[460ms] lg:ease-[cubic-bezier(0.22,1,0.36,1)] ${
-            usesCommunityShell
-              ? "translate-x-0 md:translate-x-1 lg:translate-x-0"
-              : ""
-          } ${
-            usesCommunityShell ? "lg:w-[99%]" : "lg:w-[97%]"
-          }`}
+          ref={mainContentRef}
+          tabIndex={-1}
+          aria-label={visibleSidebarTab === "community"
+            ? "Community Reels"
+            : visibleSidebarTab === "edit" || visibleSidebarTab === "create"
+              ? "Your Sets"
+              : "New search"}
+          className="relative z-20 h-full min-h-0 w-full overflow-hidden bg-black"
         >
-          <div className={visibleSidebarTab === "search" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
+          <div
+            aria-hidden={visibleSidebarTab !== "search"}
+            inert={visibleSidebarTab !== "search"}
+            className={`absolute inset-0 h-full min-h-0 transition-opacity duration-300 motion-reduce:transition-none ${
+              visibleSidebarTab === "search" ? "opacity-100" : "pointer-events-none opacity-0"
+            }`}
+          >
             <UploadPanel
+              key={composerResetKey}
               active={visibleSidebarTab === "search"}
-              account={communityAccount}
+              account={shellAccount}
+              billingStatus={billingStatus}
+              demoMode={demoAccountEnabled}
               onMaterialCreated={onUploadMaterialCreated}
-              onScrollOffsetChange={onSearchPanelScrollOffsetChange}
-              onScrollGesture={triggerTopChromeGesture}
-              onScrollabilityChange={onSearchPanelScrollabilityChange}
               heroTitleRef={searchHeroTitleRef}
             />
           </div>
-          {historyPanelContent}
           <div
-            className={
-              visibleSidebarTab === "settings"
-                ? `h-full min-h-0 ${shouldInsetSettingsForTopChrome ? "pt-[calc(max(env(safe-area-inset-top),0px)+0px)] -mt-[10px] md:mt-0 md:pt-[calc(max(env(safe-area-inset-top),0px)+30px)] lg:pt-0" : ""}`
-                : "hidden h-full min-h-0"
-            }
+            aria-hidden={!isCommunityPanel}
+            inert={!isCommunityPanel}
+            className={`absolute inset-0 h-full min-h-0 transition-opacity duration-300 motion-reduce:transition-none ${
+              isCommunityPanel ? "opacity-100" : "pointer-events-none opacity-0"
+            }`}
           >
-            <SettingsPanel
-              ref={settingsPanelRef}
-              onClearSearchData={clearAllHistory}
-              onSettingsSaved={syncSavedSettings}
-              onUnsavedChangesChange={setHasUnsavedSettingsChanges}
-              onAvailabilityModalClose={onSettingsAvailabilityModalClose}
-              availabilityModalMode={settingsModalView === "availability" ? "inline" : "overlay"}
-              onAvailabilityModalStateChange={setSettingsAvailabilityModalSnapshot}
-            />
-          </div>
-          <div className={visibleSidebarTab === "community" || visibleSidebarTab === "create" || visibleSidebarTab === "edit" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
             <CommunityReelsPanel
+              key={demoAccountEnabled ? "local-demo" : "community"}
               mode={communityPanelMode}
+              demoMode={demoAccountEnabled}
               isVisible={visibleSidebarTab === "community" || visibleSidebarTab === "create" || visibleSidebarTab === "edit"}
               onDetailOpenChange={setCommunityDetailOpen}
               initialOpenSetId={activeCommunitySetId}
@@ -2231,20 +2325,152 @@ function HomePageContent() {
           </div>
         </section>
       </div>
-      {showUnsavedCommunityDraftModal ? (
-        <ViewportModalPortal>
-          <div
-            className="fixed inset-0 z-[121] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
-            role="presentation"
-            onClick={closeUnsavedCommunityDraftModal}
-          >
-            <div
-              role="dialog"
-              aria-modal="true"
-              aria-label="Unsaved set draft changes"
-              className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
-              onClick={(event) => event.stopPropagation()}
+      <ShellModal
+          open={historySearchOpen}
+          label="Search recent sessions"
+          onRequestClose={closeHistorySearch}
+          initialFocusRef={historySearchInputRef}
+          panelClassName={LARGE_CENTERED_MODAL_PANEL_CLASS}
+        >
+          <div className="top-nav-fade top-nav-fade-charcoal sticky top-0 z-10 flex shrink-0 items-center gap-3 px-5 pb-4 pt-[max(20px,env(safe-area-inset-top))] sm:px-8 sm:pt-7">
+            <ShellIcon name="search" className="h-[18px] w-[18px] text-zinc-400" />
+            <input
+              ref={historySearchInputRef}
+              value={historyQuery}
+              onChange={(event) => setHistoryQuery(event.target.value)}
+              placeholder="Search..."
+              aria-label="Search recent sessions"
+              className="h-11 min-w-0 flex-1 bg-transparent text-base text-white outline-none placeholder:text-zinc-500 focus-visible:outline-none sm:text-lg"
+            />
+            <button
+              type="button"
+              onClick={closeHistorySearch}
+              aria-label="Close search"
+              className="grid h-9 w-9 place-items-center rounded-lg text-zinc-300 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
             >
+              <ShellIcon name="close" />
+            </button>
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-[max(24px,env(safe-area-inset-bottom))] sm:px-8">
+            <p className="px-3 pb-3 pt-2 text-sm font-medium text-zinc-400">
+              {historyQuery.trim() ? "Search results" : "Recent sessions"}
+            </p>
+            {filteredHistory.length === 0 ? (
+              <div className="grid min-h-52 place-items-center px-6 text-center text-sm text-zinc-500">
+                {historyRecent.length === 0 ? "Your recent searches will appear here." : "No sessions match that title."}
+              </div>
+            ) : (
+              <div className="space-y-1">
+                {filteredHistory.map((entry) => (
+                  <button
+                    key={`search-modal-${entry.materialId}`}
+                    type="button"
+                    onClick={() => {
+                      closeHistorySearch();
+                      const navigationDelay = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : UI_FADE_MS;
+                      window.setTimeout(() => openMaterialFeed(entry.materialId), navigationDelay);
+                    }}
+                    className="flex min-h-14 w-full items-center gap-4 rounded-xl px-3 py-3 text-left text-zinc-100 transition-colors hover:bg-white/[0.07] focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+                  >
+                    <ShellIcon name="chat" className="h-[18px] w-[18px] text-zinc-300" />
+                    {entry.starred ? <ShellIcon name="star" filled className="h-3.5 w-3.5 text-zinc-400" /> : null}
+                    <span className="min-w-0 flex-1 truncate text-sm sm:text-base">{entry.title}</span>
+                    <span className="shrink-0 text-xs text-zinc-500">{formatHistoryInfoDate(entry.updatedAt)}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+      </ShellModal>
+      <ShellModal
+          open={settingsSection !== null}
+          label="Settings"
+          onRequestClose={onSettingsModalRequestClose}
+          panelClassName={LARGE_CENTERED_MODAL_PANEL_CLASS}
+        >
+          <div className="relative h-full">
+            <div
+              aria-hidden={settingsClosePrompt}
+              inert={settingsClosePrompt}
+              className={`h-full transition-opacity duration-300 motion-reduce:transition-none ${
+                settingsClosePrompt ? "pointer-events-none opacity-0" : "opacity-100"
+              }`}
+            >
+              <SettingsPanel
+                ref={settingsPanelRef}
+                account={shellAccount}
+                billingStatus={billingStatus}
+                billingPlans={billingPlans}
+                billingLoading={billingLoading}
+                billingError={billingError}
+                onBillingRefresh={demoAccountEnabled ? undefined : liveBilling.refresh}
+                demoMode={demoAccountEnabled}
+                initialSection={settingsSection ?? "search"}
+                onSectionChange={onSettingsSectionChange}
+                onClose={requestCloseSettings}
+                onOpenAuth={requestOpenAuth}
+                onAccountChange={setCommunityAccount}
+                onClearSearchData={clearAllHistory}
+                onSettingsSaved={syncSavedSettings}
+                onUnsavedChangesChange={setHasUnsavedSettingsChanges}
+                availabilityModalMode="inline"
+              />
+            </div>
+            <div
+              aria-hidden={!settingsClosePrompt}
+              inert={!settingsClosePrompt}
+              className={`absolute inset-0 z-10 flex h-full flex-col justify-between bg-[#202020] p-6 transition-opacity duration-300 motion-reduce:transition-none sm:p-8 ${
+                settingsClosePrompt ? "opacity-100" : "pointer-events-none opacity-0"
+              }`}
+            >
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-zinc-400">Unsaved changes</p>
+                <h2 className="mt-3 text-2xl font-semibold tracking-tight text-white">Save settings before closing?</h2>
+                <p className="mt-3 max-w-lg text-sm leading-6 text-zinc-400">
+                  Save to apply your Search and Playback changes, discard them, or keep editing.
+                </p>
+              </div>
+              <div className="mt-8 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                <button
+                  ref={settingsPromptFocusRef}
+                  type="button"
+                  onClick={keepEditingSettings}
+                  className="rounded-xl bg-white/[0.07] px-4 py-3 text-sm font-medium text-white transition-colors hover:bg-white/[0.07] focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+                >
+                  Keep Editing
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    settingsPanelRef.current?.discardUnsavedChanges();
+                    setHasUnsavedSettingsChanges(false);
+                    finishCloseSettings(pendingSettingsAuthMode ?? undefined);
+                  }}
+                  className="rounded-xl bg-white/[0.07] px-4 py-3 text-sm font-medium text-white transition-colors hover:bg-white/[0.07] focus-visible:outline focus-visible:outline-2 focus-visible:outline-white"
+                >
+                  Discard
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    settingsPanelRef.current?.savePreferences();
+                    setHasUnsavedSettingsChanges(false);
+                    finishCloseSettings(pendingSettingsAuthMode ?? undefined);
+                  }}
+                  className="rounded-xl bg-white px-5 py-3 text-sm font-semibold text-black hover:bg-zinc-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+                >
+                  Save
+                </button>
+              </div>
+            </div>
+          </div>
+      </ShellModal>
+      <ShellModal
+          open={showUnsavedCommunityDraftModal}
+          label="Unsaved set draft changes"
+          onRequestClose={closeUnsavedCommunityDraftModal}
+          panelClassName="w-full max-w-xl p-5 md:p-6"
+        >
               <div className="flex items-start justify-between gap-4">
                 <div>
                   <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Unsaved changes</p>
@@ -2254,7 +2480,7 @@ function HomePageContent() {
                   type="button"
                   onClick={closeUnsavedCommunityDraftModal}
                   aria-label="Close"
-                  className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-white/80 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline-none"
                 >
                   <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
                     <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
@@ -2268,7 +2494,7 @@ function HomePageContent() {
                 <button
                   type="button"
                   onClick={discardCommunityDraftAndContinue}
-                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10"
+                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/[0.07]"
                 >
                   Discard
                 </button>
@@ -2280,41 +2506,32 @@ function HomePageContent() {
                   Save
                 </button>
               </div>
-            </div>
-          </div>
-        </ViewportModalPortal>
-      ) : null}
-      {selectedHistoryInfoItem ? (
-        <ViewportModalPortal>
-          <div
-            className="fixed inset-0 z-[122] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
-            role="presentation"
-            onClick={() => setSelectedHistoryInfoId(null)}
-          >
-            <div
-              role="dialog"
-              aria-modal="true"
-              aria-label={`${selectedHistoryInfoItem.title} history information`}
-              className="w-full max-w-2xl rounded-3xl border border-zinc-600/35 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
-              onClick={(event) => event.stopPropagation()}
-            >
-              <div className="flex items-start justify-between gap-4">
+      </ShellModal>
+      <ShellModal
+          open={selectedHistoryInfoItem !== null}
+          label={`${selectedHistoryInfoItem?.title ?? "Search"} history information`}
+          onRequestClose={closeHistoryInfo}
+          panelClassName="flex max-h-[calc(100dvh-24px)] w-full max-w-2xl flex-col sm:max-h-[min(760px,calc(100dvh-48px))]"
+        >
+          {selectedHistoryInfoItem ? (
+            <>
+              <div className="flex shrink-0 items-start justify-between gap-4 px-5 pt-5 md:px-6 md:pt-6">
                 <div>
                   <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">More information</p>
                   <h3 className="mt-2 text-lg font-semibold text-white">{selectedHistoryInfoItem.title}</h3>
                 </div>
                 <button
                   type="button"
-                  onClick={() => setSelectedHistoryInfoId(null)}
+                  onClick={closeHistoryInfo}
                   aria-label="Close"
-                  className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-white/80 transition-colors hover:bg-white/[0.07] hover:text-white focus-visible:outline-none"
                 >
                   <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
                     <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
                   </svg>
                 </button>
               </div>
-              <div className="mt-4 max-h-[70vh] space-y-4 overflow-y-auto pr-1">
+              <div className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain px-5 pb-5 md:px-6 md:pb-6">
                 {selectedHistoryInfoSections.map((section) => (
                   <section key={section.title}>
                     <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/58">{section.title}</p>
@@ -2322,7 +2539,7 @@ function HomePageContent() {
                       {section.fields.map((field) => (
                         <div
                           key={`${section.title}-${field.label}`}
-                          className="rounded-2xl border border-zinc-800 bg-white/[0.04] px-3 py-3"
+                          className="rounded-2xl bg-white/[0.045] px-3 py-3"
                         >
                           <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/52">{field.label}</p>
                           <p className="mt-1 break-words text-sm text-white/92">{field.value}</p>
@@ -2334,138 +2551,19 @@ function HomePageContent() {
                 {selectedHistoryInfoQuery ? (
                   <section>
                     <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/58">Saved feed query</p>
-                    <div className="mt-2 rounded-2xl border border-zinc-800 bg-white/[0.04] px-3 py-3">
+                    <div className="mt-2 rounded-2xl bg-white/[0.045] px-3 py-3">
                       <p className="break-all font-mono text-[11px] leading-5 text-white/72">{selectedHistoryInfoQuery}</p>
                     </div>
                   </section>
                 ) : (
-                  <div className="rounded-2xl border border-zinc-800 bg-white/[0.04] px-4 py-3 text-sm text-white/72">
+                  <div className="rounded-2xl bg-white/[0.045] px-4 py-3 text-sm text-white/72">
                     Detailed feed settings were not saved for this history item.
                   </div>
                 )}
               </div>
-              <div className="mt-4 flex items-center justify-end">
-                <button
-                  type="button"
-                  onClick={() => setSelectedHistoryInfoId(null)}
-                  className="inline-flex min-w-[8rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
-                >
-                  Close
-                </button>
-              </div>
-            </div>
-          </div>
-        </ViewportModalPortal>
-      ) : null}
-      {settingsModalView ? (
-        <ViewportModalPortal>
-          <div
-            className="fixed inset-0 z-[120] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
-            role="presentation"
-            onClick={() => closeSettingsModal("backdrop")}
-          >
-            <div
-              role="dialog"
-              aria-modal="true"
-              aria-label={settingsModalView === "availability" ? "Configuration success rate" : "Unsaved settings changes"}
-              className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
-              onClick={(event) => event.stopPropagation()}
-            >
-              <div className="flex items-start justify-between gap-4">
-                <div>
-                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">
-                    {settingsModalView === "availability" ? "Configuration check" : "Unsaved changes"}
-                  </p>
-                  <h3 className="mt-2 text-lg font-semibold text-white">
-                    {settingsModalView === "availability"
-                      ? activeSettingsAvailabilityState.status === "checking"
-                        ? "Checking success rate..."
-                        : "Success rate result"
-                      : "Save settings before leaving?"}
-                  </h3>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => closeSettingsModal("close-button")}
-                  aria-label="Close"
-                  className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
-                >
-                  <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
-                    <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
-                  </svg>
-                </button>
-              </div>
-              {settingsModalView === "availability" ? (
-                <>
-                  <div
-                    className={`mt-4 rounded-2xl border px-4 py-3 text-sm ${
-                      activeSettingsAvailabilityState.status === "ok"
-                        ? "border-emerald-300/45 bg-emerald-500/14 text-emerald-100"
-                        : activeSettingsAvailabilityState.status === "partial"
-                        ? "border-sky-300/45 bg-sky-500/14 text-sky-100"
-                        : activeSettingsAvailabilityState.status === "blocked"
-                        ? "border-rose-300/45 bg-rose-500/16 text-rose-100"
-                        : activeSettingsAvailabilityState.status === "none"
-                        ? "border-amber-300/45 bg-amber-500/16 text-amber-100"
-                        : activeSettingsAvailabilityState.status === "error"
-                        ? "border-rose-300/45 bg-rose-500/16 text-rose-100"
-                        : "border-white/24 bg-white/[0.06] text-white/88"
-                    }`}
-                  >
-                    <p>{activeSettingsAvailabilityState.message}</p>
-                    {activeSettingsAvailabilityState.limitingFactors.length > 0 ? (
-                      <div className="mt-2 border-t border-white/20 pt-2 text-xs">
-                        <p className="font-semibold">
-                          {activeSettingsAvailabilityState.limitingFactors.length > 1 ? "Main limits:" : "Main limit:"}
-                        </p>
-                        <ul className="mt-1.5 space-y-1">
-                          {activeSettingsAvailabilityState.limitingFactors.map((factor) => (
-                            <li key={factor} className="flex items-start gap-1.5">
-                              <span aria-hidden="true" className="leading-[1.2] opacity-80">•</span>
-                              <span>{factor}</span>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    ) : null}
-                  </div>
-                  <div className="mt-4 flex items-center justify-end">
-                    <button
-                      type="button"
-                      onClick={() => closeSettingsModal("close-button")}
-                      className="inline-flex min-w-[8rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
-                    >
-                      OK
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <>
-                  <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
-                    You changed settings. Save to apply them, or discard these edits and continue.
-                  </p>
-                  <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
-                    <button
-                      type="button"
-                      onClick={discardSettingsAndContinue}
-                      className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10"
-                    >
-                      Discard
-                    </button>
-                    <button
-                      type="button"
-                      onClick={saveSettingsAndContinue}
-                      className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
-                    >
-                      Save
-                    </button>
-                  </div>
-                </>
-              )}
-            </div>
-          </div>
-        </ViewportModalPortal>
-      ) : null}
+            </>
+          ) : null}
+      </ShellModal>
     </main>
   );
 }
