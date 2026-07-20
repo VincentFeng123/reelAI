@@ -317,6 +317,32 @@
 - Regression test: The two-connection SQLite test now begins with no progress row; transaction one creates and changes it to advanced/0.2/revision 7 while transaction two waits, then proves transaction two acquires the lock without resetting any value.
 - Exact retest: Pending.
 
+### AF-020 — Fresh production generation immediately rejects its continuation requests
+
+- Status: Fixed locally; production retest pending
+- Severity: High — a newly created material can remain indefinitely on “Finding the first clips” with no baseline reels
+- Production reproduction (2026-07-20):
+  1. Signed in to `studyreels.app` and submitted a new slow-mode beginner material covering Newton's laws, balanced forces, F=ma, free-body diagrams, action–reaction pairs, worked problems, and misconceptions.
+  2. The app created material `ed4192fd-fdb9-46f3-92b7-2a4144c3b65a` and navigated to its feed.
+  3. No reel appeared; the feed remained on “Finding the first clips”.
+- Evidence: The production browser emitted four same-second warnings from the feed's background generation path: `ApiError: The requested reel batch can no longer be continued.`
+- Expected: A fresh material's current generation job is adopted and streamed, or a compatible replacement job is created; the client must not issue an already-invalid continuation that leaves the initial feed empty.
+- Root cause: `material_content_fingerprint()` treated every material concept as input content. Gemini clip analysis deterministically persisted four new narrow clip concepts while the job ran, so the job changed its own content fingerprint. Its `partial` terminal token then failed the continuation validator's current-fingerprint check.
+- Fix: Material-wide fingerprints now exclude only concepts whose IDs prove they were deterministically generated from clip analysis; explicitly requested clip concepts remain fingerprinted, and ordinary source/user concepts still invalidate inventory when changed. The request schema advances to `adaptive_clip_concepts_v2` so old fingerprint semantics cannot be reused.
+- Regression test: A focused fingerprint test proves a generated clip facet is inert while a source concept changes the hash. A full generate API regression persists a clip facet during a material-wide partial batch, then proves its continuation queues successfully. The complete generation job/API files pass: 168 tests.
+- Exact retest: Pending on the same production material sequence.
+
+### AF-021 — A long single-line learning request is silently treated as pasted source text
+
+- Status: Fixed locally; production retest pending
+- Severity: Medium — detailed user requests seed fragmented concepts before clip analysis and weaken the adaptive curriculum
+- Production evidence: The single-line Newton request used for AF-020 exceeded 80 characters. `resolveUnifiedComposerRoute()` therefore sent it as `raw_text` instead of `subject_tag`; production seeded phrase-fragment concepts such as “Teach Newton'S”, “Laws First”, “Principles Inertia”, and “Diagrams Action-Reaction”.
+- Expected: A normal single-line “Ask ReelAI” request remains a topic prompt regardless of useful detail; pasted source text should require an unambiguous signal such as line breaks or a file.
+- Root cause: The composer uses `prompt.length > 80` as a hidden source-mode switch.
+- Fix: The unified composer now uses an unambiguous line-break signal for pasted source text. A non-URL single-line request remains a topic regardless of length; file and URL routing are unchanged.
+- Regression test: The composer routing test proves a 240-character single-line request remains a topic while multiline text remains source input. All 9 UploadPanel tests pass.
+- Exact retest: Pending with a detailed single-line topic prompt.
+
 ## Verification Matrix
 
 | Requirement | Baseline | After fix | Evidence |
@@ -336,8 +362,9 @@
 
 ## Local verification
 
-- Affected generation/job/billing/feedback/assessment backend suite: 231 passed.
-- Full active backend suite: 2,418 passed, 1 skipped, 37 subtests passed.
+- Original affected generation/job/billing/feedback/assessment backend suite: 231 passed.
+- AF-020/AF-021 affected backend suite: 396 passed, 14 subtests passed.
+- Full active backend suite after AF-020/AF-021: 2,420 passed, 1 skipped, 37 subtests passed.
 - Frontend suite: 182 passed.
 - Feed-focused frontend suite: 72 passed.
 - TypeScript check: passed.

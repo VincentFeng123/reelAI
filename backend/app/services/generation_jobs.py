@@ -19,6 +19,7 @@ from ..db import (
     insert,
     loads_json,
 )
+from ..ingestion.persistence import normalize_clip_concept
 
 
 JobStatus = Literal[
@@ -43,7 +44,7 @@ DEFAULT_LEASE_SECONDS = 90
 DEFAULT_DEADLINE_SECONDS = 60 * 60
 DEFAULT_QUEUE_TTL_SECONDS = 8 * 60
 # Request-key version doubles as a production inventory compatibility gate.
-REQUEST_SCHEMA_VERSION = "adaptive_clip_concepts_v1"
+REQUEST_SCHEMA_VERSION = "adaptive_clip_concepts_v2"
 EMPTY_ADAPTATION_FINGERPRINT = hashlib.sha256(b"{}").hexdigest()
 GENERATION_SUBMIT_ADVISORY_LOCK_ID = 0x5354554459524545
 
@@ -163,6 +164,12 @@ def material_content_fingerprint(conn: Any, material_id: str, concept_id: str | 
             concepts = []
     if concept_id and not concepts:
         raise ValueError("concept not found for material")
+    if not concept_id:
+        concepts = [
+            concept
+            for concept in concepts
+            if not _is_generated_clip_concept(material_id, concept)
+        ]
     normalized_concepts: list[dict[str, Any]] = []
     for concept in concepts:
         keywords = loads_json(str(concept.get("keywords_json") or "[]"), default=[])
@@ -184,6 +191,18 @@ def material_content_fingerprint(conn: Any, material_id: str, concept_id: str | 
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _is_generated_clip_concept(material_id: str, concept: dict[str, Any]) -> bool:
+    """Return whether this material-wide facet was deterministically created from a clip."""
+    _title, concept_key = normalize_clip_concept(concept.get("title"))
+    if not concept_key:
+        return False
+    expected_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"reelai:clip-concept:{material_id}:{concept_key}",
+    )
+    return str(concept.get("id") or "") == str(expected_id)
 
 
 def build_request_key(

@@ -68,7 +68,7 @@ function submitCallbackText() {
   };
 }
 
-test("unified routing follows attachment, URL, source text, then topic precedence", () => {
+test("unified routing follows attachment, URL, multiline source text, then topic precedence", () => {
   const { resolveUnifiedComposerRoute } = routeHelpers();
   const youtubeUrl = "https://youtu.be/abcdefghijk";
 
@@ -78,7 +78,8 @@ test("unified routing follows attachment, URL, source text, then topic precedenc
   );
   assert.equal(resolveUnifiedComposerRoute({ prompt: youtubeUrl }), "url");
   assert.equal(resolveUnifiedComposerRoute({ prompt: "first line\nsecond line" }), "source");
-  assert.equal(resolveUnifiedComposerRoute({ prompt: "x".repeat(81) }), "source");
+  assert.equal(resolveUnifiedComposerRoute({ prompt: "detailed one-line topic\n" }), "topic");
+  assert.equal(resolveUnifiedComposerRoute({ prompt: "x".repeat(240) }), "topic");
   assert.equal(resolveUnifiedComposerRoute({ prompt: "x".repeat(80) }), "topic");
   assert.equal(resolveUnifiedComposerRoute({ prompt: "linear regression" }), "topic");
 });

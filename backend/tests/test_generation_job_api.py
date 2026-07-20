@@ -19,6 +19,7 @@ from backend.app.clip_engine import segment_cache
 from backend.app.clip_engine import silence as clip_engine_silence
 from backend.app.clip_engine.errors import ProviderQuotaError, ProviderTransientError
 from backend.app.ingestion import pipeline as ingestion_pipeline
+from backend.app.ingestion.persistence import ensure_clip_concept
 from backend.app.ingestion.models import (
     IngestMetadata,
     IngestRequest,
@@ -52,7 +53,7 @@ def test_fresh_inventory_and_selector_cache_share_current_contract() -> None:
         main.SELECTION_CONTRACT_VERSION,
         ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
     } == {"quality_silence_v38"}
-    assert generation_jobs.REQUEST_SCHEMA_VERSION == "adaptive_clip_concepts_v1"
+    assert generation_jobs.REQUEST_SCHEMA_VERSION == "adaptive_clip_concepts_v2"
     assert segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v38"
     assert "quality_silence_v18" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v19" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
@@ -3660,6 +3661,59 @@ def test_generate_continuation_queues_one_new_batch_from_the_previous_job(monkey
         assert conn.execute(
             "SELECT COUNT(*) FROM reel_generation_jobs"
         ).fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_generate_continuation_survives_clip_concepts_created_by_the_previous_batch(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    root_payload = ReelsGenerateRequest(material_id="m1", num_reels=3)
+    try:
+        root_response = asyncio.run(main.generate_reels(object(), root_payload))
+        root_job_id = json.loads(root_response.body)["job_id"]
+        root_job = generation_jobs.get_job(conn, root_job_id)
+        assert root_job
+        root_fingerprint = str(root_job["content_fingerprint"])
+        root_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id=None,
+            request_key=str(root_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        ensure_clip_concept(
+            conn,
+            material_id="m1",
+            title="ATP synthesis",
+        )
+        assert generation_jobs.material_content_fingerprint(conn, "m1") == root_fingerprint
+        completed_at = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE reel_generation_jobs SET status = 'partial', phase = 'terminal', "
+            "progress = 1.0, result_generation_id = ?, completed_at = ?, updated_at = ? "
+            "WHERE id = ?",
+            (root_generation_id, completed_at, completed_at, root_job_id),
+        )
+
+        continuation = asyncio.run(main.generate_reels(
+            object(),
+            ReelsGenerateRequest(
+                material_id="m1",
+                num_reels=3,
+                continuation_token=root_job_id,
+            ),
+        ))
+
+        assert continuation.status_code == 202
+        continuation_job_id = json.loads(continuation.body)["job_id"]
+        continuation_job = generation_jobs.get_job(conn, continuation_job_id)
+        assert continuation_job
+        assert main._job_request_params(continuation_job)["continuation_token"] == root_job_id
     finally:
         conn.close()
 

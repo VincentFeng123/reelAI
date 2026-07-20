@@ -9,6 +9,7 @@ import pytest
 
 from backend.app import db
 from backend.app.config import get_settings
+from backend.app.ingestion.persistence import ensure_clip_concept
 from backend.app.services import generation_jobs as jobs
 
 
@@ -419,6 +420,38 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
         conn.close()
 
 
+def test_material_fingerprint_ignores_generated_clip_facets_but_tracks_source_concepts() -> None:
+    conn = _memory_conn()
+    try:
+        initial = jobs.material_content_fingerprint(conn, "material-1")
+        generated_id, _title, _key = ensure_clip_concept(
+            conn,
+            material_id="material-1",
+            title="ATP synthesis",
+        )
+
+        assert jobs.material_content_fingerprint(conn, "material-1") == initial
+        assert jobs.material_content_fingerprint(conn, "material-1", generated_id) != initial
+
+        conn.execute(
+            """
+            INSERT INTO concepts (id, material_id, title, keywords_json, summary, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "source-concept-2",
+                "material-1",
+                "Cell membrane",
+                '["membrane"]',
+                "A source-derived concept.",
+                BASE_TIME.isoformat(),
+            ),
+        )
+        assert jobs.material_content_fingerprint(conn, "material-1") != initial
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize(
     "stale_version",
     [
@@ -460,7 +493,7 @@ def test_request_key_version_invalidates_stale_inventory(
         "target_clip_duration_min_sec": 20,
         "target_clip_duration_max_sec": 55,
     }
-    assert jobs.REQUEST_SCHEMA_VERSION == "adaptive_clip_concepts_v1"
+    assert jobs.REQUEST_SCHEMA_VERSION == "adaptive_clip_concepts_v2"
     verified_key = jobs.build_request_key(**params)
     monkeypatch.setattr(jobs, "REQUEST_SCHEMA_VERSION", stale_version)
 

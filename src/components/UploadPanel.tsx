@@ -184,7 +184,7 @@ export function resolveUnifiedComposerRoute(params: {
   if (isLikelyIngestUrl(prompt)) {
     return "url";
   }
-  if (/[\r\n]/.test(params.prompt) || prompt.length > 80) {
+  if (/[\r\n]/.test(prompt)) {
     return "source";
   }
   return "topic";
