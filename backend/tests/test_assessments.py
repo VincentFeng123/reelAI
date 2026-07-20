@@ -476,6 +476,97 @@ def test_v2_without_a_valid_checkpoint_never_invents_numeric_cadence(
     )["status"] == "not_ready"
 
 
+def test_degraded_v2_plan_uses_legacy_cadence_and_reaches_quiz(conn) -> None:
+    service = AssessmentService()
+    reel_ids = [f"degraded-cadence-{index}" for index in range(9)]
+    for index, reel_id in enumerate(reel_ids):
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=f"degraded-cadence-c{index}",
+            video_id=f"degraded-cadence-v{index}",
+            with_question=False,
+        )
+    _seed_organizer_plan(
+        conn,
+        reel_ids=reel_ids,
+        checkpoint_ids=None,
+        degraded=True,
+    )
+
+    results = [
+        service.record_scroll(conn, learner_id=LEARNER, reel_id=reel_id)
+        for reel_id in reel_ids
+    ]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM reel_assessment_questions"
+    ).fetchone()[0] == 0
+    created = service.next_session(
+        conn, learner_id=LEARNER, material_id=MATERIAL
+    )
+
+    assert [result["assessment_ready"] for result in results] == [
+        False,
+        False,
+        *([True] * 7),
+    ]
+    assert all(result["cadence_target"] == 3 for result in results)
+    assert created["status"] == "ready"
+    assert created["session"]["question_count"] == 3
+    assert conn.execute(
+        "SELECT COUNT(*) FROM reel_assessment_questions"
+    ).fetchone()[0] == 9
+
+
+def test_degraded_plan_reaches_cadence_after_authoritative_empty_reel(conn) -> None:
+    service = AssessmentService()
+    authoritative_reel = "mixed-authoritative-empty"
+    degraded_reels = [f"mixed-degraded-{index}" for index in range(3)]
+    reel_ids = [authoritative_reel, *degraded_reels]
+    for index, reel_id in enumerate(reel_ids):
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=f"mixed-degraded-c{index}",
+            video_id=f"mixed-degraded-v{index}",
+            with_question=False,
+        )
+    _seed_organizer_plan(
+        conn,
+        reel_ids=[authoritative_reel],
+        checkpoint_ids=[],
+        generation_id="mixed-authoritative-generation",
+        job_id="mixed-authoritative-job",
+    )
+    _seed_organizer_plan(
+        conn,
+        reel_ids=degraded_reels,
+        checkpoint_ids=None,
+        generation_id="mixed-degraded-generation",
+        job_id="mixed-degraded-job",
+        degraded=True,
+        completed_at="2026-07-09T14:00:00+00:00",
+    )
+
+    results = [
+        service.record_scroll(conn, learner_id=LEARNER, reel_id=reel_id)
+        for reel_id in reel_ids
+    ]
+    created = service.next_session(
+        conn, learner_id=LEARNER, material_id=MATERIAL
+    )
+
+    assert [result["assessment_ready"] for result in results] == [
+        False,
+        False,
+        False,
+        True,
+    ]
+    assert [result["cadence_target"] for result in results] == [0, 0, 0, 4]
+    assert created["status"] == "ready"
+    assert created["session"]["question_count"] == 3
+
+
 @pytest.mark.parametrize("invalid_order", [None, [], ["suppressed-0", "suppressed-0"]])
 def test_invalid_v2_order_suppresses_legacy_cadence_for_current_window(
     conn,

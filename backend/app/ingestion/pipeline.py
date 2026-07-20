@@ -79,6 +79,7 @@ from .persistence import (
     load_existing_reel,
     load_reel_by_selection_candidate,
     normalize_clip_concept,
+    normalize_clip_concept_family,
     resolve_material_concept,
     store_ingest_metadata_blob,
     update_reel_boundary_state,
@@ -135,6 +136,18 @@ GROQ_BOUNDARY_END_POSTROLL_SEC = 0.02
 GROQ_BOUNDARY_NEIGHBOR_GUARD_SEC = 0.01
 GROQ_BOUNDARY_WINDOW_SEC = 12.0
 GROQ_BOUNDARY_WINDOW_MARGIN_SEC = 2.0
+CONCEPT_FAMILY_CONTRACT_VERSION = "concept_family_v1"
+_CONCEPT_FAMILY_ORDINALS = (
+    frozenset({"first", "1st"}),
+    frozenset({"second", "2nd"}),
+    frozenset({"third", "3rd"}),
+    frozenset({"fourth", "4th"}),
+)
+_CONCEPT_FAMILY_NON_DOMAIN_TOKENS = frozenset({
+    "a", "an", "and", "concept", "equation", "formula", "identity", "law",
+    "method", "model", "of", "principle", "process", "relationship", "rule",
+    "system", "the", "theorem", "theory", "topic",
+})
 # Live boundary windows regularly need 9-12 seconds including local WAV decode
 # and the provider round trip. Keep the request bounded while leaving enough
 # headroom for a healthy short-window transcription to finish.
@@ -506,6 +519,69 @@ def _gemini_selection_is_authoritative(clip: dict[str, Any]) -> bool:
     return str(
         clip.get("selection_authority") or context_authority or ""
     ).strip().casefold() == "gemini"
+
+
+def _concept_family_identity_key(value: object) -> str:
+    """Return a domain-qualified family key, rejecting ambiguous bare ordinals."""
+    _title, key = normalize_clip_concept_family(value)
+    tokens = set(key.split())
+    ordinal_tokens = set().union(*_CONCEPT_FAMILY_ORDINALS)
+    if not tokens or len({
+        index
+        for index, values in enumerate(_CONCEPT_FAMILY_ORDINALS)
+        if tokens & values
+    }) > 1:
+        return ""
+    domain_tokens = (
+        tokens - ordinal_tokens - _CONCEPT_FAMILY_NON_DOMAIN_TOKENS
+    )
+    return key if domain_tokens else ""
+
+
+def _concept_family_search_context(clip: dict[str, Any]) -> dict[str, Any]:
+    """Return bounded, versioned Gemini family metadata for persistence."""
+    if not _gemini_selection_is_authoritative(clip):
+        return {}
+    family = " ".join(
+        unicodedata.normalize(
+            "NFKC", str(clip.get("concept_family") or "")
+        ).split()
+    ).strip()[:96]
+    raw_aliases = clip.get("concept_aliases")
+    if (
+        not family
+        or not _concept_family_identity_key(family)
+        or not isinstance(raw_aliases, list)
+        or len(raw_aliases) > 4
+    ):
+        return {}
+    aliases: list[str] = []
+    seen = {family.casefold()}
+    for value in raw_aliases:
+        alias = " ".join(
+            unicodedata.normalize("NFKC", str(value or "")).split()
+        ).strip()[:96]
+        key = alias.casefold()
+        if not alias or not _concept_family_identity_key(alias) or key in seen:
+            continue
+        seen.add(key)
+        aliases.append(alias)
+    ordinal_indexes = {
+        index
+        for index, values in enumerate(_CONCEPT_FAMILY_ORDINALS)
+        if any(
+            set(_concept_family_identity_key(value).split()) & values
+            for value in (family, *aliases)
+        )
+    }
+    if len(ordinal_indexes) > 1:
+        return {}
+    return {
+        "concept_family_contract_version": CONCEPT_FAMILY_CONTRACT_VERSION,
+        "selection_authority": "gemini",
+        "concept_family": family,
+        "concept_aliases": aliases,
+    }
 
 
 def _best_effort_gemini_transcript_clip(
@@ -3718,6 +3794,7 @@ def _verified_direct_adapter_clips(
         if gemini_authoritative:
             search_context.pop("surface_reason", None)
         search_context.update(
+            **_concept_family_search_context(clip),
             selection_contract_version="quality_silence_v38",
             **(
                 {"selection_authority": "gemini"}
@@ -6314,6 +6391,7 @@ class IngestionPipeline:
             )
             search_context = {
                 **dict(v.get("_search_context") or {}),
+                **_concept_family_search_context(clip),
                 **(
                     {"selection_authority": "gemini"}
                     if gemini_authoritative
@@ -6713,6 +6791,19 @@ class IngestionPipeline:
             if isinstance(details.get("search_context"), dict)
             else {}
         )
+        concept_family_context = _concept_family_search_context(
+            {**details, "search_context": selection_context}
+        )
+        if (
+            _gemini_selection_is_authoritative(
+                {**details, "search_context": selection_context}
+            )
+            and not concept_family_context
+        ):
+            raise SegmentationError(
+                "Gemini-selected clips require a domain-qualified concept family."
+            )
+        selection_context.update(concept_family_context)
         selection_snapshot = _selection_snapshot_payload(
             selection_context,
             clip_start=clip_start,
@@ -6777,6 +6868,16 @@ class IngestionPipeline:
         clip_concept_raw, clip_concept_key = normalize_clip_concept(
             details.get("concept")
         )
+        clip_concept_family = (
+            str(selection_context.get("concept_family") or "").strip()
+            if selection_context.get("concept_family_contract_version")
+            == CONCEPT_FAMILY_CONTRACT_VERSION
+            and str(selection_context.get("selection_authority") or "")
+            .strip()
+            .casefold()
+            == "gemini"
+            else ""
+        )
         raise_if_cancelled(should_cancel)
 
         with get_conn(transactional=True) as conn:
@@ -6805,6 +6906,7 @@ class IngestionPipeline:
                     conn,
                     material_id=effective_material_id,
                     title=clip_concept_raw,
+                    semantic_identity=clip_concept_family or None,
                 )
                 selection_context.update(
                     {

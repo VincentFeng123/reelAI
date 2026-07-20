@@ -432,6 +432,20 @@ class AssessmentService:
             matching = unresolved.intersection(ordered)
             if not matching:
                 continue
+            if (
+                payload.get("degraded") is True
+                and "assessment_checkpoint_reel_ids" in payload
+                and payload.get("assessment_checkpoint_reel_ids") is None
+            ):
+                # A degraded plan still identifies its own reels, but its null
+                # checkpoint contract is not authoritative. Keep older plans
+                # from reclaiming these reels and use the legacy cadence.
+                for reel_id in matching:
+                    assignments[reel_id] = (False, False)
+                unresolved.difference_update(matching)
+                if not unresolved:
+                    break
+                continue
             checkpoint_set = set(
                 assessment_checkpoint_reel_ids(
                     ordered,
@@ -476,10 +490,15 @@ class AssessmentService:
             for row in scroll_rows
         )
         if organizer_controls_window:
+            degraded_positions: list[int] = []
             for position, row in enumerate(scroll_rows, start=1):
                 reel_id = str(row.get("reel_id") or "")
                 if assignments.get(reel_id, (False, False))[1]:
                     return position, reel_id, True
+                if reel_id in assignments and not assignments[reel_id][0]:
+                    degraded_positions.append(position)
+            if len(degraded_positions) >= LEGACY_CADENCE_TARGET:
+                return degraded_positions[LEGACY_CADENCE_TARGET - 1], None, False
             return 0, None, True
         return LEGACY_CADENCE_TARGET, None, False
 

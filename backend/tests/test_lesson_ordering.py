@@ -168,22 +168,21 @@ def test_organizer_may_omit_a_mastered_concept(monkeypatch) -> None:
 
 
 def test_organizer_subset_cannot_orphan_a_declared_prerequisite(monkeypatch) -> None:
-    reels = [
-        _reel(
-            "definition",
-            video_id="a",
-            start=0,
-            concept="definition",
-            selection_candidate_id="candidate-definition",
-        ),
-        _reel(
-            "example",
-            video_id="b",
-            start=0,
-            concept="example",
-            prerequisite_ids=["candidate-definition"],
-        ),
-    ]
+    definition = _reel(
+        "definition",
+        video_id="a",
+        start=0,
+        concept="definition",
+        selection_candidate_id="candidate-definition",
+    )
+    example = _reel(
+        "example",
+        video_id="b",
+        start=0,
+        concept="example",
+        prerequisite_ids=["candidate-definition"],
+    )
+    reels = [example, definition]
     monkeypatch.setattr(
         lesson_ordering,
         "_generate_lesson_order",
@@ -192,31 +191,31 @@ def test_organizer_subset_cannot_orphan_a_declared_prerequisite(monkeypatch) -> 
 
     result = lesson_ordering.order_lesson_batch(reels, topic="topic")
 
-    assert result.reels == reels
+    assert result.reels == [definition, example]
+    assert result.ordered_reel_ids == ["definition", "example"]
     assert result.degraded is True
     assert result.fallback_reason == "invalid_model_order"
 
 
 def test_organizer_subset_cannot_skip_an_earlier_chain_member(monkeypatch) -> None:
-    reels = [
-        _reel(
-            "chain-one",
-            video_id="a",
-            start=0,
-            concept="setup",
-            chain_id="derivation",
-            chain_position=1,
-        ),
-        _reel(
-            "chain-two",
-            video_id="a",
-            start=20,
-            concept="result",
-            chain_id="derivation",
-            chain_position=2,
-        ),
-        _reel("independent", video_id="b", start=0, concept="recap"),
-    ]
+    chain_one = _reel(
+        "chain-one",
+        video_id="a",
+        start=0,
+        concept="setup",
+        chain_id="derivation",
+        chain_position=1,
+    )
+    chain_two = _reel(
+        "chain-two",
+        video_id="a",
+        start=20,
+        concept="result",
+        chain_id="derivation",
+        chain_position=2,
+    )
+    independent = _reel("independent", video_id="b", start=0, concept="recap")
+    reels = [chain_two, independent, chain_one]
     monkeypatch.setattr(
         lesson_ordering,
         "_generate_lesson_order",
@@ -225,7 +224,8 @@ def test_organizer_subset_cannot_skip_an_earlier_chain_member(monkeypatch) -> No
 
     result = lesson_ordering.order_lesson_batch(reels, topic="topic")
 
-    assert result.reels == reels
+    assert result.reels == [independent, chain_one, chain_two]
+    assert result.ordered_reel_ids == ["independent", "chain-one", "chain-two"]
     assert result.degraded is True
 
 
@@ -302,9 +302,142 @@ def test_same_source_chronology_cannot_be_reversed(monkeypatch) -> None:
 
     result = lesson_ordering.order_lesson_batch(reels, topic="topic")
 
-    assert result.reels == reels
+    assert result.reels == [reels[1], reels[0]]
+    assert result.ordered_reel_ids == ["earlier", "later"]
     assert result.degraded is True
     assert result.assessment_checkpoint_reel_ids is None
+
+
+def test_degraded_mixed_source_fallback_orders_and_dedupes_overlapping_clips(
+    monkeypatch,
+) -> None:
+    reels = [
+        _reel(
+            "third-misconception",
+            video_id="third",
+            start=96.9,
+            concept="misconception",
+        ),
+        _reel("third-intro", video_id="third", start=10.24, concept="third law"),
+        _reel("first-law", video_id="first", start=4.799, concept="first law"),
+        {
+            **_reel("inertia", video_id="first", start=38.52, concept="inertia"),
+            "t_end": 148.61,
+        },
+        _reel(
+            "balanced-chair",
+            video_id="third",
+            start=77.495,
+            concept="balanced forces",
+        ),
+        {
+            **_reel(
+                "balanced-ball",
+                video_id="first",
+                start=38.52,
+                concept="balanced forces",
+            ),
+            "t_end": 120.25,
+        },
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *args, **kwargs: _generation_result(
+            [reel["reel_id"] for reel in reels]
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(reels, topic="Newton's laws")
+
+    assert result.ordered_reel_ids == [
+        "third-intro",
+        "first-law",
+        "inertia",
+        "balanced-chair",
+        "third-misconception",
+    ]
+    assert len(result.reels) == len(reels) - 1
+    assert lesson_ordering._preserves_source_chronology(
+        result.ordered_reel_ids,
+        {reel["reel_id"]: reel for reel in reels},
+    )
+    assert result.degraded is True
+
+
+def test_organizer_first_choice_wins_same_source_overlap_and_checkpoint_is_filtered(
+    monkeypatch,
+) -> None:
+    longer = {
+        **_reel("inertia", video_id="same", start=38.52, concept="inertia"),
+        "t_end": 148.61,
+    }
+    shorter = {
+        **_reel(
+            "balanced-ball",
+            video_id="same",
+            start=38.52,
+            concept="balanced forces",
+        ),
+        "t_end": 120.25,
+    }
+    later = _reel("later", video_id="same", start=180.0, concept="application")
+    reels = [longer, shorter, later]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *args, **kwargs: _generation_result(
+            ["balanced-ball", "inertia", "later"],
+            ["balanced-ball", "inertia", "later"],
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(reels, topic="Newton's laws")
+
+    assert result.ordered_reel_ids == ["balanced-ball", "later"]
+    assert result.reels == [shorter, later]
+    assert result.assessment_checkpoint_reel_ids == ["balanced-ball", "later"]
+    assert result.degraded is False
+
+
+@pytest.mark.parametrize(
+    ("first_metadata", "second_metadata"),
+    [
+        (
+            {"selection_candidate_id": "setup"},
+            {"prerequisite_ids": ["setup"]},
+        ),
+        (
+            {"chain_id": "derivation", "chain_position": 1},
+            {"chain_id": "derivation", "chain_position": 2},
+        ),
+    ],
+)
+def test_overlap_filter_preserves_declared_lesson_edges(
+    monkeypatch,
+    first_metadata,
+    second_metadata,
+) -> None:
+    first = {
+        **_reel("first", video_id="same", start=10, concept="setup"),
+        "t_end": 100.0,
+        **first_metadata,
+    }
+    second = {
+        **_reel("second", video_id="same", start=10, concept="application"),
+        "t_end": 90.0,
+        **second_metadata,
+    }
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *args, **kwargs: _generation_result(["first", "second"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch([first, second], topic="topic")
+
+    assert result.ordered_reel_ids == ["first", "second"]
+    assert result.degraded is False
 
 
 def test_invalid_permutation_and_dependency_order_fall_back_without_dropping_clips(

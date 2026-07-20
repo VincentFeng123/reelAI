@@ -129,7 +129,10 @@ async def _search_one_async(
     key = config.require_supadata_key()
 
     if page_token:
-        params: dict[str, Any] = {"nextPageToken": str(page_token).strip()}
+        params: dict[str, Any] = {
+            "query": " ".join(str(query or "").split()),
+            "nextPageToken": str(page_token).strip(),
+        }
     else:
         wire_features = list(normalized_filters["features"])
         if len(wire_features) == 1:

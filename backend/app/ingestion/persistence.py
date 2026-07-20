@@ -59,6 +59,12 @@ _CLIP_CONCEPT_TOKEN_RE = re.compile(
 _CLIP_CONCEPT_APOSTROPHES = str.maketrans(
     {"\u2018": "'", "\u2019": "'", "\u02bc": "'"}
 )
+_CLIP_CONCEPT_ORDINAL_CANONICAL = {
+    "1st": "first",
+    "2nd": "second",
+    "3rd": "third",
+    "4th": "fourth",
+}
 
 
 # --------------------------------------------------------------------- #
@@ -207,35 +213,56 @@ def normalize_clip_concept(value: object) -> tuple[str, str]:
     return title, key
 
 
+def normalize_clip_concept_family(value: object) -> tuple[str, str]:
+    """Return a family key with possessives and ordinal spellings canonicalized."""
+    title, key = normalize_clip_concept(value)
+    canonical_tokens: list[str] = []
+    for raw_token in key.split():
+        token = raw_token[:-2] if raw_token.endswith("'s") else raw_token
+        canonical_tokens.append(_CLIP_CONCEPT_ORDINAL_CANONICAL.get(token, token))
+    return title, " ".join(canonical_tokens)
+
+
 def ensure_clip_concept(
     conn: Any,
     *,
     material_id: str,
     title: str,
+    semantic_identity: str | None = None,
 ) -> tuple[str, str, str]:
-    """Reuse or deterministically create a material-scoped clip concept."""
+    """Reuse or create a material-scoped concept, optionally keyed by family."""
     clean_title, concept_key = normalize_clip_concept(title)
     if not clean_title or not concept_key:
         raise InvalidReferenceError("The clip concept is empty after normalization.")
+    identity_title, semantic_key = normalize_clip_concept_family(
+        semantic_identity
+    )
+    if semantic_identity is not None and not semantic_key:
+        raise InvalidReferenceError("The clip concept family is empty after normalization.")
 
     material = fetch_one(conn, "SELECT id FROM materials WHERE id = ?", (material_id,))
     if not material:
         raise InvalidReferenceError("The supplied material does not exist.")
 
-    existing_rows = fetch_all(
-        conn,
-        "SELECT id, title FROM concepts WHERE material_id = ? ORDER BY created_at, id",
-        (material_id,),
-    )
-    for row in existing_rows:
-        _existing_title, existing_key = normalize_clip_concept(row.get("title"))
-        if existing_key == concept_key:
-            return str(row["id"]), str(row["title"]), concept_key
+    if not semantic_key:
+        existing_rows = fetch_all(
+            conn,
+            "SELECT id, title FROM concepts WHERE material_id = ? ORDER BY created_at, id",
+            (material_id,),
+        )
+        for row in existing_rows:
+            _existing_title, existing_key = normalize_clip_concept(row.get("title"))
+            if existing_key == concept_key:
+                return str(row["id"]), str(row["title"]), concept_key
 
     concept_id = str(
         uuid.uuid5(
             uuid.NAMESPACE_URL,
-            f"reelai:clip-concept:{material_id}:{concept_key}",
+            (
+                f"reelai:clip-concept-family-v1:{material_id}:{semantic_key}"
+                if semantic_key
+                else f"reelai:clip-concept:{material_id}:{concept_key}"
+            ),
         )
     )
     existing_id = fetch_one(
@@ -244,7 +271,21 @@ def ensure_clip_concept(
         (concept_id,),
     )
     if existing_id:
-        _existing_title, existing_key = normalize_clip_concept(existing_id.get("title"))
+        if semantic_key:
+            _existing_title, existing_key = normalize_clip_concept_family(
+                existing_id.get("title")
+            )
+            if (
+                existing_id.get("material_id") == material_id
+                and existing_key == semantic_key
+            ):
+                return concept_id, str(existing_id["title"]), concept_key
+            raise DatabaseIntegrityError(
+                "Deterministic clip concept ID is already in use."
+            )
+        _existing_title, existing_key = normalize_clip_concept(
+            existing_id.get("title")
+        )
         if existing_id.get("material_id") == material_id and existing_key == concept_key:
             return concept_id, str(existing_id["title"]), concept_key
         raise DatabaseIntegrityError("Deterministic clip concept ID is already in use.")
@@ -256,8 +297,10 @@ def ensure_clip_concept(
             {
                 "id": concept_id,
                 "material_id": material_id,
-                "title": clean_title,
-                "keywords_json": dumps_json(concept_key.split()[:12]),
+                "title": identity_title if semantic_key else clean_title,
+                "keywords_json": dumps_json(
+                    (semantic_key or concept_key).split()[:12]
+                ),
                 "summary": "",
                 "embedding_json": None,
                 "created_at": now_iso(),
@@ -272,11 +315,16 @@ def ensure_clip_concept(
         )
         if not existing_id or existing_id.get("material_id") != material_id:
             raise
-        _existing_title, existing_key = normalize_clip_concept(existing_id.get("title"))
-        if existing_key != concept_key:
+        normalizer = (
+            normalize_clip_concept_family
+            if semantic_key
+            else normalize_clip_concept
+        )
+        _existing_title, existing_key = normalizer(existing_id.get("title"))
+        if existing_key != (semantic_key or concept_key):
             raise
         return concept_id, str(existing_id["title"]), concept_key
-    return concept_id, clean_title, concept_key
+    return concept_id, identity_title if semantic_key else clean_title, concept_key
 
 
 # --------------------------------------------------------------------- #

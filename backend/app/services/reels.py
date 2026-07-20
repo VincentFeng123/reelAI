@@ -29,6 +29,9 @@ from ..db import (
 from . import llm_router
 from .concepts import build_takeaways
 from ..ingestion.errors import RateLimitedError as _IngestRateLimitedError
+from ..ingestion.persistence import (
+    normalize_clip_concept_family,
+)
 from ..ingestion.segment import normalize_clip_window as _normalize_clip_window_fn
 from ..clip_engine.cancellation import raise_if_cancelled as _raise_if_clip_cancelled
 from ..clip_engine.errors import CancellationError as _ClipEngineCancellationError
@@ -1220,8 +1223,9 @@ class ReelService:
     # v40: require the v33 grounded atomic-claim selector contract.
     # v41: require authoritative Flash word edges and outward-only silence refinement.
     # v42: retain Gemini-authoritative clips when boundary refinement is incomplete.
+    # v43: join adaptive signals through versioned Gemini concept-family metadata.
     # The separate contract key below invalidates prior inventory under v38.
-    RANKED_FEED_CACHE_VERSION = 42
+    RANKED_FEED_CACHE_VERSION = 43
     RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v38"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
@@ -1265,6 +1269,85 @@ class ReelService:
     NEED_HELP_CONCEPT_STEP = 0.06
     GLOBAL_FEEDBACK_WINDOW = 12
     GLOBAL_FEEDBACK_MIN_ROWS = 3
+    CONCEPT_FAMILY_NOISE_TOKENS = frozenset(
+        {
+            "a",
+            "an",
+            "and",
+            "application",
+            "applications",
+            "applying",
+            "basic",
+            "basics",
+            "common",
+            "definition",
+            "definitions",
+            "demonstration",
+            "derivation",
+            "example",
+            "examples",
+            "explained",
+            "explaining",
+            "explanation",
+            "for",
+            "from",
+            "fundamental",
+            "fundamentals",
+            "identification",
+            "identify",
+            "identifying",
+            "in",
+            "intro",
+            "introduction",
+            "intuition",
+            "intuitive",
+            "misconception",
+            "misconceptions",
+            "of",
+            "on",
+            "overview",
+            "pair",
+            "pairs",
+            "practice",
+            "problem",
+            "problems",
+            "recap",
+            "summary",
+            "the",
+            "to",
+            "using",
+            "via",
+            "with",
+            "worked",
+        }
+    )
+    CONCEPT_FAMILY_ORDINALS = (
+        frozenset({"first", "1st"}),
+        frozenset({"second", "2nd"}),
+        frozenset({"third", "3rd"}),
+        frozenset({"fourth", "4th"}),
+    )
+    CONCEPT_FAMILY_CONTRACT_VERSION = "concept_family_v1"
+    CONCEPT_FAMILY_GENERIC_TOKENS = frozenset(
+        {
+            "concept",
+            "effect",
+            "equation",
+            "formula",
+            "identity",
+            "law",
+            "method",
+            "model",
+            "principle",
+            "process",
+            "relationship",
+            "rule",
+            "system",
+            "theorem",
+            "theory",
+            "topic",
+        }
+    )
     def __init__(self, embedding_service, youtube_service=None, ingestion_pipeline=None) -> None:
         settings = get_settings()
         self.embedding_service = embedding_service
@@ -5320,6 +5403,229 @@ class ReelService:
         end = Decimal(str(float(t_end))).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
         return f"{video_id}:{start}:{end}"
 
+    @classmethod
+    def _concept_family_tokens(cls, title: object) -> tuple[str, ...]:
+        """Keep a facet's subject words while discarding its teaching role."""
+        _clean_title, concept_key = normalize_clip_concept_family(title)
+        tokens: list[str] = []
+        for raw_token in concept_key.split():
+            token = raw_token[:-2] if raw_token.endswith("'s") else raw_token
+            if token in cls.CONCEPT_FAMILY_NOISE_TOKENS:
+                continue
+            if token.endswith("ies") and len(token) > 4:
+                token = token[:-3] + "y"
+            elif token.endswith("s") and len(token) > 4 and not token.endswith("ss"):
+                token = token[:-1]
+            if token:
+                tokens.append(token)
+        return tuple(tokens)
+
+    @classmethod
+    def _same_concept_family(cls, left_title: object, right_title: object) -> bool:
+        """Match narrow Gemini facets without merging their persisted identities."""
+        left = cls._concept_family_tokens(left_title)
+        right = cls._concept_family_tokens(right_title)
+        if not left or not right:
+            return False
+        if (
+            not cls._concept_family_identity(left_title)
+            or not cls._concept_family_identity(right_title)
+        ):
+            return False
+        if left == right:
+            return True
+
+        left_tokens = set(left)
+        right_tokens = set(right)
+        left_ordinal = next(
+            (index for index, values in enumerate(cls.CONCEPT_FAMILY_ORDINALS) if left_tokens & values),
+            None,
+        )
+        right_ordinal = next(
+            (index for index, values in enumerate(cls.CONCEPT_FAMILY_ORDINALS) if right_tokens & values),
+            None,
+        )
+        if left_ordinal != right_ordinal and (
+            left_ordinal is not None or right_ordinal is not None
+        ):
+            ordinal_tokens = set().union(*cls.CONCEPT_FAMILY_ORDINALS)
+            shared_subject = (left_tokens & right_tokens) - ordinal_tokens - {
+                "law",
+                "newton",
+            }
+            if len(shared_subject) < 2:
+                return False
+
+        smaller, larger = sorted(
+            (left_tokens, right_tokens), key=lambda values: (len(values), sorted(values))
+        )
+        return len(smaller) >= 2 and smaller.issubset(larger)
+
+    @classmethod
+    def _concept_family_identity(cls, value: object) -> str:
+        """Normalize one model-supplied exact-equivalence label."""
+        tokens = cls._concept_family_tokens(value)
+        if not tokens:
+            return ""
+        token_set = set(tokens)
+        ordinal_tokens = set().union(*cls.CONCEPT_FAMILY_ORDINALS)
+        domain_tokens = (
+            token_set - ordinal_tokens - cls.CONCEPT_FAMILY_GENERIC_TOKENS
+        )
+        if not domain_tokens:
+            return ""
+        return " ".join(tokens)
+
+    @classmethod
+    def _concept_family_ordinal_indexes(
+        cls, values: list[object] | tuple[object, ...] | set[str]
+    ) -> set[int]:
+        tokens = {
+            token
+            for value in values
+            for token in cls._concept_family_tokens(value)
+        }
+        return {
+            index
+            for index, ordinal_values in enumerate(cls.CONCEPT_FAMILY_ORDINALS)
+            if tokens & ordinal_values
+        }
+
+    @classmethod
+    def _persisted_concept_family_profiles(
+        cls,
+        conn,
+        material_id: str,
+    ) -> dict[str, set[str]]:
+        """Read only trusted, versioned exact-equivalence labels for this material."""
+        profile_rows: dict[str, list[set[str]]] = defaultdict(list)
+        for row in fetch_all(
+            conn,
+            "SELECT concept_id, search_context_json FROM reels WHERE material_id = ?",
+            (material_id,),
+        ):
+            concept_id = str(row.get("concept_id") or "")
+            if not concept_id:
+                continue
+            try:
+                context = json.loads(str(row.get("search_context_json") or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                not isinstance(context, dict)
+                or context.get("concept_family_contract_version")
+                != cls.CONCEPT_FAMILY_CONTRACT_VERSION
+                or str(context.get("selection_authority") or "").strip().casefold()
+                != "gemini"
+            ):
+                continue
+            aliases = context.get("concept_aliases")
+            if not isinstance(aliases, list) or len(aliases) > 4:
+                continue
+            family = cls._concept_family_identity(context.get("concept_family"))
+            if not family:
+                continue
+            identities = {
+                identity
+                for identity in (
+                    family,
+                    *(cls._concept_family_identity(alias) for alias in aliases),
+                )
+                if identity
+            }
+            if len(cls._concept_family_ordinal_indexes(identities)) > 1:
+                continue
+            profile_rows[concept_id].append(identities)
+
+        profiles: dict[str, set[str]] = {}
+        for concept_id, rows in profile_rows.items():
+            connected = set(rows[0])
+            pending = [set(row) for row in rows[1:]]
+            while pending:
+                next_pending: list[set[str]] = []
+                changed = False
+                for identities in pending:
+                    if connected & identities:
+                        connected.update(identities)
+                        changed = True
+                    else:
+                        next_pending.append(identities)
+                if not changed:
+                    connected = set()
+                    break
+                pending = next_pending
+            if (
+                connected
+                and len(cls._concept_family_ordinal_indexes(connected)) <= 1
+            ):
+                profiles[concept_id] = connected
+        return profiles
+
+    @classmethod
+    def _concept_family_ids(
+        cls,
+        concepts: list[dict[str, Any]],
+        concept_family_profiles: dict[str, set[str]] | None = None,
+    ) -> dict[str, set[str]]:
+        rows = [
+            (str(row.get("id") or ""), row.get("title"))
+            for row in concepts
+            if str(row.get("id") or "")
+        ]
+        profiles = concept_family_profiles or {}
+
+        def same_family(
+            concept_id: str,
+            title: object,
+            candidate_id: str,
+            candidate_title: object,
+        ) -> bool:
+            if concept_id == candidate_id:
+                return True
+            left_profile = profiles.get(concept_id, set())
+            right_profile = profiles.get(candidate_id, set())
+            left_ordinals = cls._concept_family_ordinal_indexes(
+                [title, *left_profile]
+            )
+            right_ordinals = cls._concept_family_ordinal_indexes(
+                [candidate_title, *right_profile]
+            )
+            if (
+                len(left_ordinals) > 1
+                or len(right_ordinals) > 1
+                or (
+                    left_ordinals
+                    and right_ordinals
+                    and left_ordinals.isdisjoint(right_ordinals)
+                )
+            ):
+                return False
+            if left_profile and right_profile:
+                return bool(left_profile & right_profile)
+            left_identity = cls._concept_family_identity(title)
+            right_identity = cls._concept_family_identity(candidate_title)
+            if left_profile and right_identity in left_profile:
+                return True
+            if right_profile and left_identity in right_profile:
+                return True
+            if left_profile or right_profile:
+                return False
+            return cls._same_concept_family(title, candidate_title)
+
+        return {
+            concept_id: {
+                candidate_id
+                for candidate_id, candidate_title in rows
+                if same_family(
+                    concept_id,
+                    title,
+                    candidate_id,
+                    candidate_title,
+                )
+            }
+            for concept_id, title in rows
+        }
+
     def _order_concepts(
         self,
         conn,
@@ -5335,7 +5641,7 @@ class ReelService:
                 (material_id,),
             )
         }
-        concept_feedback = {
+        exact_concept_feedback = {
             row["concept_id"]: {
                 "helpful": float(row["helpful_votes"]),
                 "confusing": float(row["confusing_votes"]),
@@ -5359,8 +5665,32 @@ class ReelService:
                 (str(learner_id or LEGACY_LEARNER_ID), material_id),
             )
         }
+        material_concepts = fetch_all(
+            conn,
+            "SELECT id, title FROM concepts WHERE material_id = ?",
+            (material_id,),
+        )
+        family_ids = self._concept_family_ids(
+            material_concepts,
+            self._persisted_concept_family_profiles(conn, material_id),
+        )
+        concept_feedback: dict[str, dict[str, float]] = {}
+        for target_id, member_ids in family_ids.items():
+            exact_target = exact_concept_feedback.get(target_id, {})
+            concept_feedback[target_id] = {
+                "helpful": sum(
+                    exact_concept_feedback.get(member_id, {}).get("helpful", 0.0)
+                    for member_id in member_ids
+                ),
+                "confusing": sum(
+                    exact_concept_feedback.get(member_id, {}).get("confusing", 0.0)
+                    for member_id in member_ids
+                ),
+                # Ratings describe one clip, not the whole semantic family.
+                "avg_rating": float(exact_target.get("avg_rating", 3.0)),
+            }
         try:
-            assessment_adjustments = {
+            exact_assessment_adjustments = {
                 str(row["concept_id"]): float(row["adjustment"] or 0.0)
                 for row in fetch_all(
                     conn,
@@ -5376,7 +5706,14 @@ class ReelService:
         except sqlite3.OperationalError as exc:
             if "no such table: assessment_concept_outcomes" not in str(exc):
                 raise
-            assessment_adjustments = {}
+            exact_assessment_adjustments = {}
+        assessment_adjustments = {
+            target_id: sum(
+                exact_assessment_adjustments.get(member_id, 0.0)
+                for member_id in member_ids
+            )
+            for target_id, member_ids in family_ids.items()
+        }
 
         def concept_key(concept: dict[str, Any]) -> tuple[float, int, str]:
             feedback = concept_feedback.get(concept["id"], {"helpful": 0.0, "confusing": 0.0, "avg_rating": 3.0})
@@ -5493,7 +5830,12 @@ class ReelService:
         return adjustment
 
     def _learner_adaptation_context(
-        self, conn, material_id: str, learner_id: str,
+        self,
+        conn,
+        material_id: str,
+        learner_id: str,
+        *,
+        propagate_concept_families: bool = True,
     ) -> tuple[dict[str, dict[str, float]], dict[str, float], dict[str, Any] | None, float]:
         progress = self.learner_progress(conn, material_id, learner_id)
         reset_at = str(progress.get("difficulty_reset_at") or "")
@@ -5524,6 +5866,29 @@ class ReelService:
             if "no such table: assessment_concept_outcomes" not in str(exc):
                 raise
             assessment_rows = []
+        try:
+            concept_rows = fetch_all(
+                conn,
+                "SELECT id, title FROM concepts WHERE material_id = ?",
+                (material_id,),
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such table: concepts" not in str(exc):
+                raise
+            concept_rows = []
+            propagate_concept_families = False
+        family_ids = (
+            self._concept_family_ids(
+                concept_rows,
+                self._persisted_concept_family_profiles(conn, material_id),
+            )
+            if propagate_concept_families
+            else {
+                str(row.get("id") or ""): {str(row.get("id") or "")}
+                for row in concept_rows
+                if str(row.get("id") or "")
+            }
+        )
         coverage: dict[str, dict[str, float]] = {}
         post_reset: dict[str, list[float]] = {}
         assessment_adjustments: dict[str, float] = {}
@@ -5570,18 +5935,58 @@ class ReelService:
             }
             mastery_rows.append(mastery_row)
             post_reset_assessment_rows.append(mastery_row)
+        if propagate_concept_families:
+            exact_coverage = coverage
+            coverage = {}
+            for target_id, member_ids in family_ids.items():
+                helpful = sum(
+                    exact_coverage.get(member_id, {}).get("helpful", 0.0)
+                    for member_id in member_ids
+                )
+                confusing = sum(
+                    exact_coverage.get(member_id, {}).get("confusing", 0.0)
+                    for member_id in member_ids
+                )
+                if helpful or confusing:
+                    coverage[target_id] = {
+                        "helpful": helpful,
+                        "confusing": confusing,
+                    }
         adjustments: dict[str, float] = {}
-        for concept_id in set(post_reset) | set(assessment_adjustments):
-            values = post_reset.get(concept_id, [0.0, 0.0])
+        adjustment_targets = (
+            family_ids
+            if propagate_concept_families
+            else {
+                concept_id: {concept_id}
+                for concept_id in set(post_reset) | set(assessment_adjustments)
+            }
+        )
+        for concept_id, member_ids in adjustment_targets.items():
+            helpful = sum(
+                post_reset.get(member_id, [0.0, 0.0])[0]
+                for member_id in member_ids
+            )
+            confusing = sum(
+                post_reset.get(member_id, [0.0, 0.0])[1]
+                for member_id in member_ids
+            )
+            assessment_adjustment = sum(
+                assessment_adjustments.get(member_id, 0.0)
+                for member_id in member_ids
+            )
             combined = (
-                self.GOT_IT_CONCEPT_STEP * values[0]
-                - self.NEED_HELP_CONCEPT_STEP * values[1]
-                + assessment_adjustments.get(concept_id, 0.0)
+                self.GOT_IT_CONCEPT_STEP * helpful
+                - self.NEED_HELP_CONCEPT_STEP * confusing
+                + assessment_adjustment
             )
-            adjustments[concept_id] = max(
-                -self.CONCEPT_ADJUSTMENT_BOUND,
-                min(self.CONCEPT_ADJUSTMENT_BOUND, combined),
-            )
+            if any(
+                member_id in post_reset or member_id in assessment_adjustments
+                for member_id in member_ids
+            ):
+                adjustments[concept_id] = max(
+                    -self.CONCEPT_ADJUSTMENT_BOUND,
+                    min(self.CONCEPT_ADJUSTMENT_BOUND, combined),
+                )
         latest = max(
             mastery_rows,
             key=lambda row: (
@@ -5592,6 +5997,14 @@ class ReelService:
             ),
             default=None,
         )
+        if latest is not None:
+            latest_concept_id = str(latest.get("concept_id") or "")
+            latest = {
+                **latest,
+                "concept_family_ids": sorted(
+                    family_ids.get(latest_concept_id, {latest_concept_id})
+                ),
+            }
         assessment_remediations: list[dict[str, Any]] = []
         if post_reset_assessment_rows:
             newest_assessment = max(
@@ -5606,7 +6019,15 @@ class ReelService:
             if newest_assessment_at >= latest_manual_at:
                 assessment_remediations = sorted(
                     (
-                        row
+                        {
+                            **row,
+                            "concept_family_ids": sorted(
+                                family_ids.get(
+                                    str(row.get("concept_id") or ""),
+                                    {str(row.get("concept_id") or "")},
+                                )
+                            ),
+                        }
                         for row in post_reset_assessment_rows
                         if str(row.get("session_id") or "") == newest_session_id
                         and int(row.get("confusing") or 0) > 0
@@ -5852,6 +6273,30 @@ class ReelService:
                 parsed.get("intent_coverage"), 1.0
             ),
         }
+        raw_aliases = parsed.get("concept_aliases")
+        family_text = " ".join(
+            str(parsed.get("concept_family") or "").split()
+        ).strip()[:96]
+        if (
+            parsed.get("concept_family_contract_version")
+            == cls.CONCEPT_FAMILY_CONTRACT_VERSION
+            and selection_authority == "gemini"
+            and cls._concept_family_identity(family_text)
+            and isinstance(raw_aliases, list)
+            and len(raw_aliases) <= 4
+        ):
+            clean_aliases = [
+                " ".join(str(alias or "").split()).strip()[:96]
+                for alias in raw_aliases
+                if cls._concept_family_identity(alias)
+            ]
+            family_identities = {
+                cls._concept_family_identity(family_text),
+                *(cls._concept_family_identity(alias) for alias in clean_aliases),
+            }
+            if len(cls._concept_family_ordinal_indexes(family_identities)) <= 1:
+                metadata["_selection_concept_family"] = family_text
+                metadata["_selection_concept_aliases"] = clean_aliases
         for source_key, metadata_key in (
             ("quality_floor", "_selection_quality_floor"),
             ("quality_mean", "_selection_quality_mean"),
@@ -6085,11 +6530,15 @@ class ReelService:
             and int(latest_feedback.get("confusing") or 0) > 0
         ):
             remediation_signals = [latest_feedback]
-        remediation_by_concept = {
-            str(signal.get("concept_id") or ""): signal
-            for signal in remediation_signals
-            if str(signal.get("concept_id") or "")
-        }
+        remediation_by_concept: dict[str, dict[str, Any]] = {}
+        for signal in remediation_signals:
+            concept_id = str(signal.get("concept_id") or "")
+            if not concept_id:
+                continue
+            family_ids = signal.get("concept_family_ids") or [concept_id]
+            for family_id in family_ids:
+                if str(family_id or ""):
+                    remediation_by_concept[str(family_id)] = signal
 
         def adaptive_priority(node_id: str) -> tuple[Any, ...]:
             item = nodes[node_id]
@@ -6241,6 +6690,13 @@ class ReelService:
         last_video = str(previous_video_id or "")
         last_concept = ""
         latest_concept = str((latest or {}).get("concept_id") or "")
+        latest_concept_ids = {
+            str(concept_id)
+            for concept_id in (
+                (latest or {}).get("concept_family_ids") or [latest_concept]
+            )
+            if str(concept_id or "")
+        }
         latest_video = str((latest or {}).get("video_id") or "")
 
         heads = lambda: [(video_id, queue[0]) for video_id, queue in queues.items() if queue]
@@ -6250,12 +6706,20 @@ class ReelService:
             remediation_signals = [latest]
         for remediation_signal in remediation_signals:
             remediation_concept = str(remediation_signal.get("concept_id") or "")
+            remediation_concepts = {
+                str(concept_id)
+                for concept_id in (
+                    remediation_signal.get("concept_family_ids")
+                    or [remediation_concept]
+                )
+                if str(concept_id or "")
+            }
             remediation_video = str(remediation_signal.get("video_id") or "")
             current_difficulty = self._difficulty(remediation_signal)
             remediation = [
                 (video_id, row)
                 for video_id, row in heads()
-                if str(row.get("concept_id") or "") == remediation_concept
+                if str(row.get("concept_id") or "") in remediation_concepts
                 and self._difficulty(row) < current_difficulty
             ]
             alternate = [pair for pair in remediation if pair[0] != remediation_video]
@@ -6276,7 +6740,7 @@ class ReelService:
                     queues.pop(video_id, None)
                 ordered.append(row)
                 last_video = video_id
-                last_concept = remediation_concept
+                last_concept = str(row.get("concept_id") or "")
 
         first_after_helpful = bool(latest and int(latest.get("helpful") or 0) > 0)
         while queues:
@@ -6286,11 +6750,13 @@ class ReelService:
                 if other_source:
                     candidates = other_source
             if first_after_helpful and any(
-                str(row.get("concept_id") or "") != latest_concept for _, row in candidates
+                str(row.get("concept_id") or "") not in latest_concept_ids
+                for _, row in candidates
             ):
                 candidates = [
                     pair for pair in candidates
-                    if str(pair[1].get("concept_id") or "") != latest_concept
+                    if str(pair[1].get("concept_id") or "")
+                    not in latest_concept_ids
                 ]
             elif any(str(row.get("concept_id") or "") != last_concept for _, row in candidates):
                 candidates = [
@@ -8008,6 +8474,17 @@ class ReelService:
             selection_source_rank = int(
                 clean_item.get("_selection_source_rank") or 0
             )
+            selection_concept_family = str(
+                clean_item.get("_selection_concept_family") or ""
+            ).strip()
+            raw_selection_concept_aliases = clean_item.get(
+                "_selection_concept_aliases"
+            )
+            selection_concept_aliases = (
+                list(raw_selection_concept_aliases)
+                if isinstance(raw_selection_concept_aliases, list)
+                else []
+            )
             transcript_artifact_key = str(
                 clean_item.get("_selection_transcript_artifact_key") or ""
             ).strip()
@@ -8038,6 +8515,13 @@ class ReelService:
                         selection_educational_importance
                     )
                 clean_item["_selection_source_rank"] = selection_source_rank
+                if selection_concept_family:
+                    clean_item["_selection_concept_family"] = (
+                        selection_concept_family
+                    )
+                    clean_item["_selection_concept_aliases"] = (
+                        selection_concept_aliases
+                    )
             # Keep video_id on the response row so downstream filters (notably
             # main._ranked_request_reels's exclude_video_ids filter) can match
             # on it. Stripping it here silently defeated client pagination.

@@ -23,6 +23,8 @@ def _proposal(*, end_line: int = 0) -> gemini_segment._BoundaryTopic:
         title="How photosynthesis captures energy",
         learning_objective="Explain how chlorophyll powers photosynthesis",
         facet="photosynthesis",
+        concept_family="photosynthesis",
+        concept_aliases=[],
         reason="The span directly explains the core mechanism.",
         informativeness=0.9,
         topic_relevance=0.9,
@@ -156,6 +158,9 @@ def test_selector_contract_allows_short_exact_edges_without_padding() -> None:
     assert "4-8" not in f"{system}\n{user}"
 
     schema = gemini_segment._CompactBoundaryTopic.model_json_schema()
+    assert {"family", "aliases"}.issubset(schema["required"])
+    assert schema["properties"]["family"]["minLength"] == 1
+    assert schema["properties"]["aliases"]["maxItems"] == 4
     assert "first spoken word" in schema["properties"]["sq"]["description"]
     assert "independently understandable spoken sentence" in (
         schema["properties"]["sq"]["description"]
@@ -4066,6 +4071,8 @@ def test_pro_boundary_route_preserves_model_start_when_claim_is_unanchored(
             "title": "Defining Acceleration and Its Units",
             "obj": "Define acceleration, give its units, and explain direction changes",
             "facet": "acceleration definition and units",
+            "family": "kinematic acceleration",
+            "aliases": ["acceleration"],
             "info": 0.94,
             "rel": 0.96,
             "imp": 0.93,
@@ -15465,6 +15472,8 @@ def test_compact_selector_aliases_preserve_canonical_fields_and_supporting_rank(
         title="Derivative definition",
         learning_objective="Define a derivative before a worked example",
         facet="derivative definition",
+        concept_family="mathematical derivative",
+        concept_aliases=["derivative"],
         informativeness=0.9,
         topic_relevance=0.9,
         educational_importance=0.85,

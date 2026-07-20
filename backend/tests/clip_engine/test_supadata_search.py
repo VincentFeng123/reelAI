@@ -292,23 +292,25 @@ def test_three_query_fast_prefix_keeps_retry_headroom_for_transient_primary(
     assert result["warning"] is None
 
 
-def test_search_page_token_uses_documented_parameter_without_filters(monkeypatch):
+def test_search_page_token_keeps_required_query_without_filters(monkeypatch):
     calls = []
 
     def fake_get(url, headers=None, params=None, timeout=None):
         calls.append(params)
+        if not params or not params.get("query"):
+            return _Resp(400, {"details": "query: Required"})
         return _Resp(200, {"results": []})
 
     monkeypatch.setattr(ss.httpx, "get", fake_get)
     ss.search_one(
-        "ignored on continuation",
+        "  Newton's   laws  ",
         {"creative_commons_only": True, "duration": "long"},
         language="fr",
         page_token="next-token",
         cache_store=MemoryProviderCache(),
     )
 
-    assert calls == [{"nextPageToken": "next-token"}]
+    assert calls == [{"query": "Newton's laws", "nextPageToken": "next-token"}]
 
 
 def test_quota_is_typed_and_not_converted_to_empty_success(monkeypatch):

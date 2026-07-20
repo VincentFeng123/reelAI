@@ -3196,6 +3196,8 @@ _LESSON_ORDER_SELECTION_FIELDS = frozenset({
     "_selection_prerequisite_ids",
     "_selection_topic_relevance",
     "_selection_informativeness",
+    "_selection_concept_family",
+    "_selection_concept_aliases",
 })
 
 
@@ -4639,11 +4641,13 @@ def _learner_concept_signals(
     *,
     material_id: str,
     learner_id: str,
+    propagate_concept_families: bool = True,
 ) -> dict[str, dict[str, float]]:
     coverage, adjustments, _, _ = reel_service._learner_adaptation_context(
         conn,
         material_id,
         learner_id,
+        propagate_concept_families=propagate_concept_families,
     )
     return {
         concept_key: {
@@ -4669,6 +4673,9 @@ def _learner_adaptation_fingerprint(
         conn,
         material_id=material_id,
         learner_id=learner_id,
+        # Gemini-created target facets can appear while a job is running. Its
+        # stale-input fingerprint therefore stays keyed to signal sources only.
+        propagate_concept_families=False,
     )
     return hashlib.sha256(
         json.dumps(

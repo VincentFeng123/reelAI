@@ -207,6 +207,8 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
                             "Python variables store values such as numbers and strings"
                         ),
                         "facet": "variables",
+                        "concept_family": "Python variable assignment",
+                        "concept_aliases": ["Python variables"],
                             "informativeness": 0.95,
                             "topic_relevance": 0.99,
                                 "educational_importance": 0.97,

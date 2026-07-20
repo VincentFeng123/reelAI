@@ -19,7 +19,10 @@ from ..db import (
     insert,
     loads_json,
 )
-from ..ingestion.persistence import normalize_clip_concept
+from ..ingestion.persistence import (
+    normalize_clip_concept,
+    normalize_clip_concept_family,
+)
 
 
 JobStatus = Literal[
@@ -195,14 +198,23 @@ def material_content_fingerprint(conn: Any, material_id: str, concept_id: str | 
 
 def _is_generated_clip_concept(material_id: str, concept: dict[str, Any]) -> bool:
     """Return whether this material-wide facet was deterministically created from a clip."""
-    _title, concept_key = normalize_clip_concept(concept.get("title"))
-    if not concept_key:
-        return False
-    expected_id = uuid.uuid5(
-        uuid.NAMESPACE_URL,
-        f"reelai:clip-concept:{material_id}:{concept_key}",
+    _title, legacy_key = normalize_clip_concept(concept.get("title"))
+    _family_title, family_key = normalize_clip_concept_family(
+        concept.get("title")
     )
-    return str(concept.get("id") or "") == str(expected_id)
+    if not legacy_key or not family_key:
+        return False
+    expected_ids = {
+        str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"reelai:clip-concept:{material_id}:{legacy_key}",
+        )),
+        str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"reelai:clip-concept-family-v1:{material_id}:{family_key}",
+        )),
+    }
+    return str(concept.get("id") or "") in expected_ids
 
 
 def build_request_key(

@@ -753,6 +753,8 @@ def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
         title="Alpha lesson",
         learning_objective="Understand the complete alpha lesson.",
         facet="alpha",
+        concept_family="alpha lesson concept",
+        concept_aliases=["alpha concept"],
         informativeness=0.9,
         topic_relevance=0.9,
         educational_importance=0.9,

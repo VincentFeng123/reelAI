@@ -343,6 +343,140 @@
 - Regression test: The composer routing test proves a 240-character single-line request remains a topic while multiline text remains source input. All 9 UploadPanel tests pass.
 - Exact retest: Pending with a detailed single-line topic prompt.
 
+### AF-022 — A clean material's automatic continuation is rejected by Supadata
+
+- Status: Fixed locally; production retest pending
+- Severity: High — the initial batch stops before covering the requested curriculum, and the quiz/feedback matrix cannot observe healthy later batches
+- Production reproduction (2026-07-20, clean Postgres and Redis, deployed revision `4e0973f`):
+  1. Submit the one-line beginner topic “Newton's laws: inertia and balanced forces, net force and F=ma, free-body diagrams, action-reaction pairs, then worked problems and common misconceptions.”
+  2. Material `7e776465-5015-4234-baa1-7c0e94611f0b` correctly routes as `source_type=topic` and job `58e1f943-7378-46ce-a0ff-62c12458c1f5` publishes seven reels as a partial batch.
+  3. The automatic continuation job `dd36b76b-4f3d-4b01-ba9c-5d508cd6977d` immediately fails.
+- Evidence: The terminal code is `provider_request_rejected` with message `Supadata rejected the search request (400).` The active batch covers first-law/inertia, balanced forces, third-law pairs/misconceptions, and mass/acceleration intuition, but it has no explicit F=ma calculation, free-body-diagram instruction, or worked numerical problem.
+- Expected: A valid continuation searches the uncovered concepts and appends a later batch, so broad but normal learning prompts can reach the requested curriculum without a provider-level rejection.
+- Root cause: The search orchestration correctly carried both the logical query and provider cursor into the Supadata adapter, but the adapter's `page_token` branch discarded the query and sent only `nextPageToken`. Production now validates its documented required `query` field and returned `400 query: Required`; the existing unit test incorrectly required the broken token-only wire shape.
+- Fix: Paginated Supadata calls now send the whitespace-normalized logical query together with `nextPageToken` while continuing to omit initial-page filters.
+- Regression test: The adapter fake now rejects a missing query exactly like production and asserts the paginated request is exactly `{query, nextPageToken}`. All 15 Supadata adapter tests and five focused provider-cursor/consumed-page tests pass; the old implementation raises `ProviderRequestError` under this test.
+- Exact retest: Pending on the same clean one-line topic and continuation sequence.
+
+### AF-023 — Degraded organizer fallback starts with an advanced misconception
+
+- Status: Fixed locally; production retest pending
+- Severity: High — a beginner feed reverses the requested prerequisite progression
+- Production reproduction (2026-07-20): Open generation `e3cf97d7-6f6d-4dd8-9815-5dc9a04ec0bd` for fresh material `7e776465-5015-4234-baa1-7c0e94611f0b`.
+- Evidence:
+  - Seven concept-attributed reels are persisted. One `difficulty=0.35` reel is intentionally level-deferred for a beginner request, so the six-ID lesson/UI count is correct and is not part of this defect.
+  - The organizer metadata says `degraded=true` and `fallback_reason=invalid_model_order`.
+  - The visible order starts with `third law misconceptions`, then `action-reaction pairs`, and only afterward introduces `Newton's first law`, `concept of inertia`, and balanced forces. The `mass and acceleration relation` reel is omitted.
+- Expected: Even when model output is invalid, deterministic fallback preserves all surface-eligible clips in a constraint-safe educational sequence—source chronology, prerequisites, and derivation-chain order—so an explanation precedes its dependent example or misconception.
+- Root cause: Gemini returned schema-valid output that failed semantic order validation. The degraded `_fallback` then returned the raw ranked input unchanged even though that input itself ran the same source at `96.9s → 10.24s → 77.495s`, putting the third-law misconception before its introduction and first-law foundation.
+- Fix: Degraded fallback now performs a stable topological order over same-source chronology, declared prerequisites, and chain positions, using original rank as the tie-breaker and retaining every eligible clip. Contradictory metadata cycles break deterministically without dropping inventory.
+- Regression test: Updated prerequisite, chain, and chronology tests make the raw input intentionally invalid, and a production-shaped six-clip test proves the fallback retains every clip while restoring source chronology. All 18 lesson-ordering tests pass.
+- Exact retest: Pending on a fresh beginner Newton curriculum.
+
+### AF-024 — A visible reel is fully contained inside another visible reel
+
+- Status: Fixed locally; production retest pending
+- Severity: High — a near-duplicate consumes scarce curriculum inventory and repeats the same explanation instead of covering an unmet concept
+- Production evidence (generation `e3cf97d7-6f6d-4dd8-9815-5dc9a04ec0bd`):
+  - `ingest-d5af4e4fc4bd4331` (`concept of inertia`) uses YouTube source `LQyFshgm-hU` from `38.52–148.61` (110.09 seconds).
+  - `ingest-c0ac05a369874f2a` (`balanced forces on a ball`) uses the same source from `38.52–120.25` (81.73 seconds).
+  - The second span is fully contained in the first, and both IDs appear in the six-reel visible organizer order.
+- Expected: Same-source spans with complete or substantial temporal containment are treated as near-duplicates before final selection; the stronger clip remains and the freed slot is used for missing curriculum coverage.
+- Root cause: The trusted Gemini selector path intentionally bypassed the earlier candidate finalizer, while lesson validation checked IDs, chronology, prerequisites, and chains but had no temporal-overlap invariant. Both a valid organizer response and degraded raw-order fallback could therefore release substantially contained same-source spans.
+- Fix: The release layer now removes a later organizer-selected same-source clip when it overlaps at least 80% of the shorter span. The organizer's first choice wins, removed checkpoints are filtered, and clips participating in a declared prerequisite or chain remain protected so deduplication cannot break lesson closure.
+- Regression test: Focused tests reproduce the exact `38.52–148.61` / `38.52–120.25` production pair in degraded fallback, prove short-first organizer preference and checkpoint filtering, and preserve prerequisite/chain members. All 21 lesson-ordering tests pass.
+- Exact retest: Pending on a fresh Newton batch with overlapping candidate spans.
+
+### AF-025 — “Got it” suppresses only an exact concept ID, not the same concept family
+
+- Status: Fixed locally; production retest pending
+- Severity: High — thumbs-up appears to work at the storage layer while the next lesson repeats the same topic under newly generated labels
+- Production reproduction (2026-07-20):
+  1. On reel `ingest-15d951e27e4945f7`, submit “Got it” for concept `action-reaction pairs`.
+  2. Production persists `helpful=1`, increments `feedback_revision` to 1, changes the adaptation fingerprint, and creates completed generation `12bb9d09-a112-43c7-8abd-e3e66d50e007` while excluding the watched source video.
+  3. The new active organizer lesson nevertheless selects multiple action–reaction variants, including `identifying action-reaction pairs`, `gravitational action-reaction pairs`, and `action-reaction acceleration misconception`.
+- Expected: Positive mastery reduces the future frequency of that semantic concept family, not merely one deterministic concept UUID; new clip labels for equivalent or narrower variants must inherit the relevant learner signal before organizer selection.
+- Root cause: Gemini-created facets were correctly persisted as distinct normalized concept IDs, but acquisition ordering, feed ordering/remediation, organizer signals, and quiz adjustments all looked up learner state by exact `concept_id`. A signal on `action-reaction pairs` therefore never reached its narrower labels. The first conservative lexical patch handled those observed labels but could not safely infer true synonyms such as `Newton's first law` ↔ `law of inertia` or `Newton's second law` ↔ `F=ma`.
+- Fix: The production Gemini selector now returns a required domain-qualified `concept_family` plus at most four exact-equivalence aliases for every selected clip. Ingestion persists that trusted metadata under versioned `concept_family_v1`; adaptive reads join only direct normalized intersections from trusted same-material reel metadata and reject bare or conflicting ordinals. Legacy rows retain the conservative teaching-role lexical fallback. Family-aware signals feed acquisition, remediation, feed ordering, and organizer payloads, where the organizer now sees the clip family, aliases, transcript content, and inherited learner signal. Active-job stale fingerprints intentionally remain exact-source keyed so Gemini adding a related target facet cannot invalidate its own job.
+- Regression test: Focused tests cover both thumb directions across all observed action–reaction labels, correct/wrong quiz propagation into acquisition and easier remediation, first-law/inertia and second-law/F=ma equivalences, numbered-law and thermodynamics non-conflation, Gemini schema enforcement, public-output preservation, cache rejection of missing family metadata, durable ingestion provenance, organizer signal expansion, and active-job fingerprint stability. The final semantic-family matrix passes 73 tests; compilation and scoped `git diff --check` pass.
+- Exact retest: Pending with two post-feedback batches on a fresh isolated material.
+
+### AF-026 — The live recall checkpoint disappears without creating a quiz session
+
+- Status: Fixed locally; production retest pending
+- Severity: High — quiz answers cannot affect later reels when the checkpoint never becomes answerable
+- Production reproduction (2026-07-20, clean Postgres and Redis, deployed revision `4e0973f`):
+  1. Open beginner material `0de66b42-3765-45b6-a38f-5bbd0a5db336` and progress through all nine surfaced reels without submitting thumb feedback.
+  2. Forward navigation briefly displays `Preparing recall check...` while each scroll is recorded.
+  3. Even after the ninth distinct reel and a final tail swipe, no recall modal opens.
+- Evidence: A read-only production query immediately after the reproduction finds zero `assessment_sessions` and zero `assessment_session_questions` for this material, so this is not merely a hidden or snoozed frontend session.
+- Additional evidence: All nine distinct reels have durable `scrolled_at` rows. Their active version-2 lesson plan is `degraded=true` with `assessment_checkpoint_reel_ids=null`; no `/api/assessments/next` request is emitted because every scroll response remains not-ready.
+- Expected: The checkpoint creates an assessment session, presents answerable concept-grounded questions, records each outcome, and updates subsequent generation inputs.
+- Root cause: The degraded version-2 organizer plan is still treated as authoritative cadence control. With no valid checkpoint ID it returns `(cadence_target=0, organizer_plan_active=true)` forever, explicitly suppressing the three-scroll compatibility cadence even after the entire batch is traversed.
+- Fix: Canonical degraded lesson plans now mark their own reels as not organizer-controlled for cadence, allowing the existing safe three-scroll numeric cadence. Those assignments still resolve the reels, so an older plan cannot reclaim them. Valid non-degraded empty checkpoint lists and corrupt/incomplete metadata remain conservative and do not invent quizzes.
+- Regression test: The exact nine-reel/no-prepared-question regression proves the first two scrolls are not ready, scroll three and later are ready, and `/next` deterministically prepares questions and creates a three-question session. The assessment service/API files pass 59 tests.
+- Exact retest: Pending on a fresh isolated quiz material.
+
+### AF-027 — Existing selector-contract fixtures omit the new required concept-family fields
+
+- Status: Fixed locally
+- Severity: Release blocker — the runtime contract was correct, but a narrow test selection concealed stale fixtures in the full selector matrix
+- Reproduction: Run the combined clip-generation matrix after making `family` and `aliases` mandatory in the compact Gemini schema. Forty-one selector-contract tests fail while converting their old helper payloads because those payloads still represent the pre-family response contract; complete backend passes subsequently expose two stale Pro budget fixtures, one stale ranked-cache version assertion, and the captionless YouTube end-to-end mock.
+- Root cause: The first focused verification ran only the new schema assertion and semantic-family tests, not the complete selector and backend matrices. Shared/direct proposal fixtures still omitted `concept_family` / `concept_aliases`, and one cache test still pinned version 42.
+- Fix: Updated only those shared/direct test fixtures and the captionless Gemini mock to emit valid, exact concept-family metadata and advanced the cache assertion to version 43; the production requirement remains strict and missing live fields are still rejected.
+- Exact retest: The full selector-contract file passes all 637 tests; the final affected matrix passes all 1,103 tests; and the complete active backend passes 2,435 tests plus 37 subtests.
+
+### AF-028 — Family propagation crashes compatibility databases without a `concepts` table
+
+- Status: Fixed locally
+- Severity: Medium — feed finalization can fail instead of preserving exact-ID adaptation in a partially migrated or deliberately minimal database
+- Reproduction: Run the complete backend matrix. Five ranked-request regression cases build the established compatibility schema without `concepts`; `_learner_adaptation_context()` now queries that table unconditionally and raises `sqlite3.OperationalError` before returning the feed.
+- Root cause: The new family expansion read had no equivalent of the existing missing-assessment-table compatibility guard.
+- Fix: When SQLite specifically reports a missing `concepts` table, adaptation disables only semantic-family propagation for that call and preserves the established exact-ID path. All other database errors still raise.
+- Regression test: The five existing ranked-request cases reproduce the compatibility path; all pass on focused retest and in the final complete-backend matrix.
+
+### AF-029 — Ranked-feed shaping strips concept-family metadata before the organizer
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — stored family adaptation works, but the organizer cannot make the requested semantic include/exclude decision because it receives empty family fields
+- Reproduction: Persist a trusted `concept_family_v1` reel, run it through the real `ranked_feed()` and `_public_generation_reel(..., preserve_lesson_order_metadata=True)` path, then inspect the lesson-order prompt. The reel's family and aliases are absent even though direct `_selection_metadata()` output contains them.
+- Root cause: `ranked_feed()` removes every `_selection_*` key and selectively restores ordering metadata without restoring the two new family keys. The subsequent public-generation preservation allowlist also omits them. The first organizer regression bypassed both boundaries by calling `_selection_metadata()` directly.
+- Fix: Ranked-feed response shaping now preserves the already validated internal concept family and alias list, and the lesson-order-only allowlist carries both fields through the public-generation boundary. They remain excluded from ordinary public reel output.
+- Regression test: The organizer signal test now traverses persistence → real ranked feed → lesson-order-preserving generation shaping → organizer prompt and proves that `law of inertia`, its `Newton's first law` alias, and the inherited helpful signal all arrive together. Exact focused retest passes.
+
+### AF-030 — An older authoritative plan suppresses cadence for later degraded-plan reels
+
+- Status: Fixed locally; production retest pending
+- Severity: High — a mixed feed history can still prevent quiz answers from ever influencing future reels
+- Reproduction: Scroll one reel owned by an older valid organizer plan with an explicit empty checkpoint list, followed by three reels owned by a newer degraded plan with null checkpoints. All four scroll responses remain not-ready because the older reel makes the entire window organizer-controlled.
+- Root cause: `_cadence_target()` treated any authoritative assignment as control over the complete mixed scroll window and ignored the explicit degraded assignments on later reels.
+- Fix: Within a mixed organizer-controlled window, degraded-plan positions are counted separately. The third such reel activates the numeric fallback at its actual absolute position, while unrelated unassigned/legacy reels still cannot override an authoritative empty plan.
+- Regression test: The exact one-authoritative-plus-three-degraded sequence now reaches a three-question quiz on the fourth scroll. The focused cadence matrix passes 7 tests and the assessment service/API suites pass all 60 tests.
+
+### AF-031 — Rollout and ambiguity gaps in concept-family matching
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — adaptation can either fail to cross a trusted synonym boundary or leak across unrelated laws
+- Independent review reproductions:
+  1. A legacy concept titled `Newton's first law` does not join a new trusted `law of inertia` profile even when that profile explicitly aliases `Newton's first law`, because the matcher ignores the one available profile whenever the other side lacks metadata.
+  2. Legacy lexical fallback accepts the ambiguous bare title `first law` as a two-token subset of both `Newton's first law` and `first law of thermodynamics`.
+  3. Two individually valid Gemini profiles on reels sharing one broad facet/concept ID are unioned. First-law and second-law (or Newton and thermodynamics) identities can therefore form one aggregate bridge.
+- Follow-up adversarial review: The first patch still allowed a one-sided trusted profile to fall back to lexical matching after an exact miss (`Newton's law` → `Newton's law of cooling`), intersection-only profile consensus discarded valid optional-alias evidence, and discarding an unsafe profile could not undo feedback already aggregated under the same facet-derived concept ID.
+- Root cause: One-sided profile matching fell directly back to title containment; the bare-ordinal guard existed only in canonical identity creation; persisted profile evidence lacked an order-independent connected-consensus check; and durable clip concept IDs were still derived solely from `facet` rather than the trusted canonical family.
+- Fix: If either side has trusted metadata, family matching now succeeds only on an exact normalized family/alias identity and otherwise fails closed; lexical fallback is limited to two legacy rows and rejects titles that cannot form a domain-qualified identity. Repeated profiles are combined only when all evidence sets form one connected overlap component, with aggregate ordinal validation. Most importantly, new trusted Gemini clips use a versioned family-derived deterministic concept identity while retaining the narrower facet in `clip_concept_raw` / `clip_concept_key` provenance. Identical facets with different families therefore receive different concept IDs before any feedback or quiz aggregation. Family persistence also carries its Gemini authority through the direct ingest path.
+- Regression test: Focused cases prove trusted `law of inertia` → legacy `Newton's first law` rollout bridging, reject one-sided `Newton's law of cooling` and both bare-ordinal cross-domain matches, preserve connected optional-alias evidence, discard disconnected first-/second-law profiles sharing an old concept ID, and give identical `first law` facets separate Newton/thermodynamics concept IDs with isolated feedback adjustments. The focused persistence/adaptation/generation matrix passes all 79 tests.
+
+### AF-032 — Family-derived concepts break continuations and split ordinal synonyms
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — a job can invalidate its own material fingerprint after its first persisted clip, while exact family synonyms can fragment feedback and quiz history
+- Independent review reproductions:
+  1. Persisting a new `clip-concept-family-v1` concept changes the material-wide content fingerprint because `_is_generated_clip_concept()` recognizes only the older facet-derived UUID namespace. A continuation then cannot match its root request key, resurrecting AF-020.
+  2. `Newton's 1st law` and `Newton's first law` normalize to different family identities and deterministic UUIDs.
+- Root cause: The generated-concept classifier and concept-family normalizer were not advanced with the new identity contract.
+- Fix: Family-scoped concept rows now store the canonical family title, allowing the generated-concept classifier to recognize both legacy facet and family-v1 deterministic namespaces without querying reel state. Material-wide fingerprints ignore both forms, while concept-scoped fingerprints still include the selected generated concept. A shared family normalizer canonicalizes possessives and `1st`/`2nd`/`3rd`/`4th` spellings before persistence UUID generation, profile matching, and fingerprint classification.
+- Regression test: The material fingerprint remains stable after creating both legacy and family-v1 clip concepts, the family concept still changes its concept-scoped fingerprint, the exact live continuation regression uses the family-v1 path, and `Newton's 1st law` shares both its semantic identity and UUID with `Newton's first law`. The focused fingerprint/persistence/adaptation set passes all 43 tests.
+
 ## Verification Matrix
 
 | Requirement | Baseline | After fix | Evidence |
@@ -365,6 +499,9 @@
 - Original affected generation/job/billing/feedback/assessment backend suite: 231 passed.
 - AF-020/AF-021 affected backend suite: 396 passed, 14 subtests passed.
 - Full active backend suite after AF-020/AF-021: 2,420 passed, 1 skipped, 37 subtests passed.
+- Final affected adaptive/selection/generation/assessment suite after AF-022 through AF-032: 1,103 passed.
+- Final full active backend suite after AF-022 through AF-032: 2,435 passed, 1 skipped, 37 subtests passed.
+- Independent atomic re-review: GO; all prior release blockers reproduced as fixed in five focused checks and direct probes.
 - Frontend suite: 182 passed.
 - Feed-focused frontend suite: 72 passed.
 - TypeScript check: passed.

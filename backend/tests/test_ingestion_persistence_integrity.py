@@ -108,6 +108,37 @@ class PersistenceIntegrityTests(unittest.TestCase):
         db_module._db_ready = False
         get_settings.cache_clear()
 
+    def test_concept_family_context_rejects_ambiguous_or_conflicting_laws(self) -> None:
+        self.assertEqual(
+            pipeline_module._concept_family_search_context({
+                "selection_authority": "gemini",
+                "concept_family": "first law",
+                "concept_aliases": [],
+            }),
+            {},
+        )
+        self.assertEqual(
+            pipeline_module._concept_family_search_context({
+                "selection_authority": "gemini",
+                "concept_family": "Newton's first law",
+                "concept_aliases": ["Newton's second law"],
+            }),
+            {},
+        )
+        self.assertEqual(
+            pipeline_module._concept_family_search_context({
+                "selection_authority": "gemini",
+                "concept_family": "Newton's first law",
+                "concept_aliases": ["law of inertia", "first law"],
+            }),
+            {
+                "concept_family_contract_version": "concept_family_v1",
+                "selection_authority": "gemini",
+                "concept_family": "Newton's first law",
+                "concept_aliases": ["law of inertia"],
+            },
+        )
+
     @staticmethod
     def _seed_identity(conn, material_id: str, concept_id: str) -> None:
         db_module.insert(
@@ -169,6 +200,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
         end: float,
         context: dict,
         cue_id: str = "cue-1",
+        details_extra: dict | None = None,
     ):
         return pipeline._persist_ingest(
             adapter_result=adapter,
@@ -192,8 +224,37 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "cue_ids": [cue_id],
                 "selection_candidate_id": context["selection_candidate_id"],
                 "search_context": context,
+                **(details_extra or {}),
             },
         )
+
+    def test_authoritative_persistence_rejects_ambiguous_concept_family(self) -> None:
+        pipeline, adapter, metadata = self._boundary_persistence_fixture()
+        context = _strict_boundary_context(
+            "video-a::ambiguous-family",
+            start=10.0,
+            end=20.0,
+            surface=True,
+        )
+
+        with self.assertRaisesRegex(
+            pipeline_module.SegmentationError,
+            "domain-qualified concept family",
+        ):
+            self._persist_boundary_candidate(
+                pipeline=pipeline,
+                adapter=adapter,
+                metadata=metadata,
+                start=10.0,
+                end=20.0,
+                context=context,
+                details_extra={
+                    "selection_authority": "gemini",
+                    "concept": "first law",
+                    "concept_family": "first law",
+                    "concept_aliases": [],
+                },
+            )
 
     def test_intent_role_and_coverage_survive_persistence(self) -> None:
         pipeline, adapter, metadata = self._boundary_persistence_fixture()
@@ -232,10 +293,22 @@ class PersistenceIntegrityTests(unittest.TestCase):
     def test_gemini_clip_concept_is_normalized_reused_and_persisted(self) -> None:
         pipeline, adapter, metadata = self._boundary_persistence_fixture()
         first_clip = gemini_segment._public_clips(
-            [{"facet": "  Net   Force—Acceleration  ", "_private": "discard"}]
+            [{
+                "facet": "  Net   Force—Acceleration  ",
+                "concept_family": "Newton's second law",
+                "concept_aliases": ["F=ma", "net force equation"],
+                "selection_authority": "gemini",
+                "_private": "discard",
+            }]
         )[0]
         second_clip = gemini_segment._public_clips(
-            [{"facet": "net-force / acceleration", "_private": "discard"}]
+            [{
+                "facet": "net-force / acceleration",
+                "concept_family": "Newton's second law",
+                "concept_aliases": ["F=ma"],
+                "selection_authority": "gemini",
+                "_private": "discard",
+            }]
         )[0]
 
         first_context = _strict_boundary_context(
@@ -312,6 +385,8 @@ class PersistenceIntegrityTests(unittest.TestCase):
 
         self.assertEqual(first_clip["concept"], "Net Force—Acceleration")
         self.assertEqual(second_clip["concept"], "net-force / acceleration")
+        self.assertEqual(first_clip["concept_family"], "Newton's second law")
+        self.assertEqual(first_clip["concept_aliases"], ["F=ma", "net force equation"])
         self.assertEqual(first.concept_id, second.concept_id)
         self.assertNotEqual(first.concept_id, "concept-a")
         self.assertEqual(
@@ -319,12 +394,12 @@ class PersistenceIntegrityTests(unittest.TestCase):
             str(
                 uuid.uuid5(
                     uuid.NAMESPACE_URL,
-                    "reelai:clip-concept:material-a:net force acceleration",
+                    "reelai:clip-concept-family-v1:material-a:newton second law",
                 )
             ),
         )
-        self.assertEqual(first.concept_title, "Net Force—Acceleration")
-        self.assertEqual(second.concept_title, "Net Force—Acceleration")
+        self.assertEqual(first.concept_title, "Newton's second law")
+        self.assertEqual(second.concept_title, "Newton's second law")
 
         with db_module.get_conn() as conn:
             concept_rows = db_module.fetch_all(
@@ -341,7 +416,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
 
         self.assertCountEqual(
             [row["title"] for row in concept_rows],
-            ["Net Force—Acceleration", "Test concept"],
+            ["Newton's second law", "Test concept"],
         )
         self.assertEqual(
             [row["concept_id"] for row in reel_rows],
@@ -359,8 +434,14 @@ class PersistenceIntegrityTests(unittest.TestCase):
             self.assertEqual(provenance["clip_concept_key"], "net force acceleration")
             self.assertEqual(provenance["clip_concept_id"], first.concept_id)
             self.assertEqual(
-                provenance["clip_concept_title"], "Net Force—Acceleration"
+                provenance["clip_concept_title"], "Newton's second law"
             )
+            self.assertEqual(
+                provenance["concept_family_contract_version"],
+                "concept_family_v1",
+            )
+            self.assertEqual(provenance["concept_family"], "Newton's second law")
+            self.assertIn("F=ma", provenance["concept_aliases"])
 
     def test_scratch_concepts_are_scoped_to_their_material(self) -> None:
         with db_module.get_conn(transactional=True) as conn:

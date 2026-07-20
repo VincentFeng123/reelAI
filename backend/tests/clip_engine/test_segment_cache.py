@@ -71,7 +71,7 @@ def _key(transcript: dict, settings: dict | None = None, *, topic: str = "physic
 def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> None:
     transcript = _transcript()
     baseline = _key(transcript)
-    assert baseline.startswith("clip-segmentation:quality_silence_v38:v36:")
+    assert baseline.startswith("clip-segmentation:quality_silence_v38:v37:")
 
     changed_text = deepcopy(transcript)
     changed_text["segments"][0]["text"] = "changed lesson"
@@ -260,6 +260,8 @@ def test_segment_cache_gemini_authority_bypasses_only_semantic_rejection() -> No
     authoritative = _clip()
     authoritative.update({
         "selection_authority": "gemini",
+        "concept_family": "Newtonian force and motion",
+        "concept_aliases": ["Newtonian mechanics"],
         "informativeness": 0.1,
         "topic_relevance": 0.2,
         "educational_importance": 0.3,

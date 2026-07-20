@@ -33,11 +33,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-LESSON_ORDER_PROMPT_VERSION = "lesson_order_v3"
+LESSON_ORDER_PROMPT_VERSION = "lesson_order_v4"
 LESSON_ORDER_TIMEOUT_S = 10.0
 LESSON_ORDER_MAX_OUTPUT_TOKENS = 1_024
 LESSON_ORDER_CACHE_VERSION = 3
 LESSON_ORDER_CACHE_TTL_SEC = 30 * 24 * 60 * 60
+_SAME_SOURCE_DUPLICATE_OVERLAP = 0.8
 
 
 class _LessonOrderResponse(BaseModel):
@@ -234,6 +235,22 @@ def _clip_payload(
     concept_signals: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     concept_id = _opaque_id(reel.get("concept_id"))
+    raw_concept_aliases = (
+        reel.get("concept_aliases")
+        or reel.get("_selection_concept_aliases")
+        or []
+    )
+    concept_aliases = (
+        [
+            alias
+            for alias in (
+                _clean_text(value, 96) for value in raw_concept_aliases
+            )
+            if alias
+        ][:4]
+        if isinstance(raw_concept_aliases, (list, tuple))
+        else []
+    )
     return {
         "reel_id": _opaque_id(reel.get("reel_id")),
         "selection_candidate_id": _clean_text(
@@ -258,6 +275,12 @@ def _clip_payload(
         "ends_at_seconds": _finite_number(reel.get("t_end")),
         "concept_id": concept_id,
         "concept_title": _clean_text(reel.get("concept_title"), 240),
+        "concept_family": _clean_text(
+            reel.get("concept_family")
+            or reel.get("_selection_concept_family"),
+            96,
+        ),
+        "concept_aliases": concept_aliases,
         "learner_signal": _learner_signal(concept_id, concept_signals),
         "video_title": _clean_text(reel.get("video_title"), 240),
         "summary": _clean_text(
@@ -508,6 +531,160 @@ def _generate_lesson_order(
     )
 
 
+def _constraint_safe_fallback_order(
+    reels: list[dict[str, Any]],
+    reel_ids: list[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Keep every fallback clip while honoring all satisfiable order edges."""
+    if (
+        len(reels) != len(reel_ids)
+        or any(not reel_id for reel_id in reel_ids)
+        or len(set(reel_ids)) != len(reel_ids)
+    ):
+        return reels, reel_ids
+
+    input_position = {reel_id: index for index, reel_id in enumerate(reel_ids)}
+    reels_by_id = dict(zip(reel_ids, reels, strict=True))
+    successors = {reel_id: set() for reel_id in reel_ids}
+    indegree = dict.fromkeys(reel_ids, 0)
+
+    def add_edge(before: str, after: str) -> None:
+        if before == after or after in successors[before]:
+            return
+        successors[before].add(after)
+        indegree[after] += 1
+
+    by_source: dict[str, list[tuple[float, int, str]]] = {}
+    chains: dict[str, list[tuple[float, str]]] = {}
+    candidate_aliases = {reel_id: reel_id for reel_id in reel_ids}
+    for reel_id, reel in reels_by_id.items():
+        source_id = _source_video_id(reel)
+        starts_at = _finite_number(reel.get("t_start"))
+        if source_id and starts_at is not None:
+            by_source.setdefault(source_id, []).append(
+                (starts_at, input_position[reel_id], reel_id)
+            )
+        chain_id = _clean_text(
+            reel.get("chain_id") or reel.get("_selection_chain_id"), 256
+        )
+        chain_position = _finite_number(
+            reel.get("chain_position")
+            if reel.get("chain_position") is not None
+            else reel.get("_selection_chain_position")
+        )
+        if chain_id and chain_position is not None:
+            chains.setdefault(chain_id, []).append((chain_position, reel_id))
+        candidate_id = _clean_text(
+            reel.get("selection_candidate_id")
+            or reel.get("_selection_candidate_id"),
+            256,
+        )
+        if candidate_id:
+            candidate_aliases[candidate_id] = reel_id
+
+    for members in by_source.values():
+        ordered = [item[2] for item in sorted(members)]
+        for before, after in zip(ordered, ordered[1:]):
+            add_edge(before, after)
+    for members in chains.values():
+        ordered = [item[1] for item in sorted(members, key=lambda item: item[0])]
+        for before, after in zip(ordered, ordered[1:]):
+            add_edge(before, after)
+    for reel_id, reel in reels_by_id.items():
+        for prerequisite in _id_list(
+            reel.get("prerequisite_ids")
+            or reel.get("_selection_prerequisite_ids")
+        ):
+            prerequisite_reel_id = candidate_aliases.get(prerequisite)
+            if prerequisite_reel_id:
+                add_edge(prerequisite_reel_id, reel_id)
+
+    remaining = set(reel_ids)
+    ordered_ids: list[str] = []
+    while remaining:
+        ready = [reel_id for reel_id in remaining if indegree[reel_id] == 0]
+        # Conflicting metadata can form an impossible cycle. Break it by original
+        # rank so the degraded path still releases every clip deterministically.
+        current = min(ready or remaining, key=input_position.__getitem__)
+        remaining.remove(current)
+        ordered_ids.append(current)
+        for successor in successors[current]:
+            indegree[successor] -= 1
+
+    return [reels_by_id[reel_id] for reel_id in ordered_ids], ordered_ids
+
+
+def _filter_same_source_overlaps(
+    ordered_ids: Sequence[str],
+    checkpoint_ids: Sequence[str],
+    reels_by_id: Mapping[str, Mapping[str, Any]],
+) -> tuple[list[str], list[str]]:
+    """Drop later standalone repeats without breaking declared lesson edges."""
+    selected = set(ordered_ids)
+    candidate_aliases = {reel_id: reel_id for reel_id in ordered_ids}
+    protected: set[str] = set()
+    for reel_id in ordered_ids:
+        reel = reels_by_id[reel_id]
+        candidate_id = _clean_text(
+            reel.get("selection_candidate_id")
+            or reel.get("_selection_candidate_id"),
+            256,
+        )
+        if candidate_id:
+            candidate_aliases[candidate_id] = reel_id
+        if _clean_text(
+            reel.get("chain_id") or reel.get("_selection_chain_id"), 256
+        ):
+            protected.add(reel_id)
+
+    for reel_id in ordered_ids:
+        prerequisites = _id_list(
+            reels_by_id[reel_id].get("prerequisite_ids")
+            or reels_by_id[reel_id].get("_selection_prerequisite_ids")
+        )
+        if prerequisites:
+            protected.add(reel_id)
+        for prerequisite in prerequisites:
+            prerequisite_reel_id = candidate_aliases.get(prerequisite)
+            if prerequisite_reel_id in selected:
+                protected.add(prerequisite_reel_id)
+
+    kept_ids: list[str] = []
+    kept_spans_by_source: dict[str, list[tuple[float, float]]] = {}
+    for reel_id in ordered_ids:
+        reel = reels_by_id[reel_id]
+        source_id = _source_video_id(reel)
+        start = _finite_number(reel.get("t_start"))
+        end = _finite_number(reel.get("t_end"))
+        valid_span = (
+            bool(source_id)
+            and start is not None
+            and end is not None
+            and end > start
+        )
+        repeated = False
+        if reel_id not in protected and valid_span:
+            duration = end - start
+            for prior_start, prior_end in kept_spans_by_source.get(source_id, []):
+                overlap = min(end, prior_end) - max(start, prior_start)
+                shorter = min(duration, prior_end - prior_start)
+                if (
+                    overlap > 0.0
+                    and shorter > 0.0
+                    and overlap / shorter >= _SAME_SOURCE_DUPLICATE_OVERLAP
+                ):
+                    repeated = True
+                    break
+        if repeated:
+            continue
+        kept_ids.append(reel_id)
+        if valid_span:
+            kept_spans_by_source.setdefault(source_id, []).append((start, end))
+
+    kept = set(kept_ids)
+    return kept_ids, [reel_id for reel_id in checkpoint_ids if reel_id in kept]
+
+
 def _fallback(
     reels: list[dict[str, Any]],
     reel_ids: list[str],
@@ -517,9 +694,22 @@ def _fallback(
     provider_called: bool,
     telemetry: gemini_client.GeminiCallTelemetry | None = None,
 ) -> LessonOrderResult:
+    ordered_reels, ordered_reel_ids = _constraint_safe_fallback_order(
+        reels, reel_ids
+    )
+    if (
+        len(ordered_reels) == len(ordered_reel_ids)
+        and all(ordered_reel_ids)
+        and len(set(ordered_reel_ids)) == len(ordered_reel_ids)
+    ):
+        reels_by_id = dict(zip(ordered_reel_ids, ordered_reels, strict=True))
+        ordered_reel_ids, _ = _filter_same_source_overlaps(
+            ordered_reel_ids, (), reels_by_id
+        )
+        ordered_reels = [reels_by_id[reel_id] for reel_id in ordered_reel_ids]
     return LessonOrderResult(
-        reels=reels,
-        ordered_reel_ids=reel_ids,
+        reels=ordered_reels,
+        ordered_reel_ids=ordered_reel_ids,
         model_used=model_used,
         degraded=True,
         fallback_reason=reason,
@@ -735,10 +925,15 @@ def _read_cached_lesson_order(
     ordered_ids = list(raw_ordered_ids)
     checkpoint_ids = list(raw_checkpoint_ids)
     reels_by_id = dict(zip(reel_ids, original, strict=True))
+    if not _valid_selected_order(
+        ordered_ids, reel_ids
+    ) or not _valid_assessment_checkpoints(checkpoint_ids, ordered_ids):
+        return None
+    ordered_ids, checkpoint_ids = _filter_same_source_overlaps(
+        ordered_ids, checkpoint_ids, reels_by_id
+    )
     if (
-        not _valid_selected_order(ordered_ids, reel_ids)
-        or not _valid_assessment_checkpoints(checkpoint_ids, ordered_ids)
-        or not _preserves_source_chronology(ordered_ids, reels_by_id)
+        not _preserves_source_chronology(ordered_ids, reels_by_id)
         or not _preserves_declared_dependencies(ordered_ids, reels_by_id)
     ):
         return None
@@ -1103,12 +1298,18 @@ def _order_lesson_batch(
     ordered_ids = list(parsed.ordered_reel_ids)
     checkpoint_ids = list(parsed.assessment_checkpoint_reel_ids)
     reels_by_id = dict(zip(reel_ids, original, strict=True))
-    if (
-        not _valid_selected_order(ordered_ids, reel_ids)
-        or not _valid_assessment_checkpoints(checkpoint_ids, ordered_ids)
-        or not _preserves_source_chronology(ordered_ids, reels_by_id)
-        or not _preserves_declared_dependencies(ordered_ids, reels_by_id)
-    ):
+    model_order_valid = _valid_selected_order(
+        ordered_ids, reel_ids
+    ) and _valid_assessment_checkpoints(checkpoint_ids, ordered_ids)
+    if model_order_valid:
+        ordered_ids, checkpoint_ids = _filter_same_source_overlaps(
+            ordered_ids, checkpoint_ids, reels_by_id
+        )
+        model_order_valid = (
+            _preserves_source_chronology(ordered_ids, reels_by_id)
+            and _preserves_declared_dependencies(ordered_ids, reels_by_id)
+        )
+    if not model_order_valid:
         _record_gemini(
             generation_context,
             telemetry=generated.telemetry,

@@ -34,7 +34,7 @@ from backend.app.models import (
     ReelOut,
     ReelsGenerateRequest,
 )
-from backend.app.services import generation_jobs
+from backend.app.services import generation_jobs, lesson_ordering
 from backend.app.services.reels import ReelService
 
 
@@ -141,6 +141,112 @@ def _conn() -> sqlite3.Connection:
         "VALUES ('c1', 'm1', 'Mitochondria', '[]', 'Cell energy', '2026-07-10T00:00:00+00:00')"
     )
     return conn
+
+
+def test_semantic_family_expands_organizer_signals_without_staling_active_job() -> None:
+    conn = _conn()
+    learner_id = "owner:semantic-family"
+    try:
+        db._migrate_reel_feedback_uniqueness_sqlite(conn)
+        conn.execute("UPDATE concepts SET title = ? WHERE id = 'c1'", ("Newton's first law",))
+        source_context = json.dumps({
+            "selection_contract_version": "quality_silence_v38",
+            "selection_authority": "gemini",
+            "concept_family_contract_version": "concept_family_v1",
+            "concept_family": "Newton's first law",
+            "concept_aliases": ["law of inertia"],
+        })
+        conn.execute(
+            "INSERT INTO videos (id, title, channel_title, duration_sec, created_at) "
+            "VALUES ('family-video', 'Action reaction', 'channel', 300, "
+            "'2026-07-10T00:00:01+00:00')"
+        )
+        conn.execute(
+            "INSERT INTO reels "
+            "(id, material_id, concept_id, video_id, video_url, t_start, t_end, "
+            "transcript_snippet, takeaways_json, base_score, difficulty, created_at, "
+            "search_context_json) "
+            "VALUES ('family-reel', 'm1', 'c1', 'family-video', '', 0, 20, "
+            "'An object keeps its state of motion unless a net force acts.', '[]', "
+            "1.0, 0.5, '2026-07-10T00:00:02+00:00', ?)",
+            (source_context,),
+        )
+        main.reel_service.record_feedback(
+            conn,
+            "family-reel",
+            helpful=True,
+            confusing=False,
+            rating=None,
+            saved=False,
+            learner_id=learner_id,
+        )
+        before = main._learner_adaptation_fingerprint(
+            conn, material_id="m1", learner_id=learner_id
+        )
+
+        related_id, _, _ = ensure_clip_concept(
+            conn,
+            material_id="m1",
+            title="inertia and motion",
+        )
+        target_context = json.dumps({
+            "selection_contract_version": "quality_silence_v38",
+            "selection_authority": "gemini",
+            "concept_family_contract_version": "concept_family_v1",
+            "concept_family": "law of inertia",
+            "concept_aliases": ["Newton's first law"],
+        })
+        conn.execute(
+            "INSERT INTO reels "
+            "(id, material_id, concept_id, video_id, video_url, t_start, t_end, "
+            "transcript_snippet, takeaways_json, base_score, difficulty, created_at, "
+            "search_context_json) VALUES (?, 'm1', ?, 'family-video', '', 30, 50, "
+            "'Inertia resists changes to an object state of motion.', '[]', 1.0, "
+            "0.4, '2026-07-10T00:00:03+00:00', ?)",
+            ("new-family-reel", related_id, target_context),
+        )
+
+        assert main._learner_adaptation_fingerprint(
+            conn, material_id="m1", learner_id=learner_id
+        ) == before
+        signals = main._learner_concept_signals(
+            conn, material_id="m1", learner_id=learner_id
+        )
+        assert signals[related_id] == {
+            "helpful": 1.0,
+            "confusing": 0.0,
+            "adjustment": 0.04,
+        }
+        ranked = main.reel_service.ranked_feed(
+            conn,
+            material_id="m1",
+            learner_id=learner_id,
+        )
+        target_reel = next(
+            reel for reel in ranked if reel["reel_id"] == "new-family-reel"
+        )
+        organizer_reel = main._public_generation_reel(
+            target_reel,
+            preserve_lesson_order_metadata=True,
+        )
+        prompt = lesson_ordering._user_prompt(
+            [{
+                **organizer_reel,
+                "concept_id": related_id,
+            }],
+            topic="Newton's laws",
+            learner_level="beginner",
+            concept_signals=signals,
+        )
+        prompt_payload = json.loads(
+            prompt.split("CLIPS_JSON:\n", 1)[1].split("\n\nFinal request:", 1)[0]
+        )
+        organizer_clip = prompt_payload["clips"][0]
+        assert organizer_clip["concept_family"] == "law of inertia"
+        assert organizer_clip["concept_aliases"] == ["Newton's first law"]
+        assert organizer_clip["learner_signal"] == signals[related_id]
+    finally:
+        conn.close()
 
 
 def test_persisted_lesson_order_reapplies_a_valid_selected_subset() -> None:
@@ -3689,7 +3795,8 @@ def test_generate_continuation_survives_clip_concepts_created_by_the_previous_ba
         ensure_clip_concept(
             conn,
             material_id="m1",
-            title="ATP synthesis",
+            title="worked ATP example",
+            semantic_identity="ATP synthesis",
         )
         assert generation_jobs.material_content_fingerprint(conn, "m1") == root_fingerprint
         completed_at = datetime.now(timezone.utc).isoformat()

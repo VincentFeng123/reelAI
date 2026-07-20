@@ -1,6 +1,7 @@
 """Focused adaptive curriculum and learner-feedback contract tests."""
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 import unittest
@@ -12,6 +13,7 @@ if str(ROOT) not in sys.path:
 
 from backend.app.db import SCHEMA, _migrate_reel_feedback_uniqueness_sqlite
 from backend.app.db import now_iso
+from backend.app.ingestion.persistence import ensure_clip_concept
 from backend.app.services.reels import ReelService
 
 
@@ -157,6 +159,332 @@ class AdaptiveCurriculumTests(unittest.TestCase):
             self.conn, self.MATERIAL, self.LEARNER
         )[1]
         self.assertAlmostEqual(adjustments["c1"], 0.04)
+
+    def test_semantic_concept_family_propagates_both_thumb_directions(self) -> None:
+        family = {
+            "action": "action-reaction pairs",
+            "identify": "identifying action-reaction pairs",
+            "gravity": "gravitational action-reaction pairs",
+            "misconception": "action-reaction acceleration misconception",
+        }
+        for concept_id, title in family.items():
+            self.conn.execute(
+                "INSERT INTO concepts "
+                "(id, material_id, title, keywords_json, summary, embedding_json, created_at) "
+                "VALUES (?, ?, ?, '[]', '', NULL, '2026-07-09T00:00:01+00:00')",
+                (concept_id, self.MATERIAL, title),
+            )
+        self._insert_reel("watched-family", "action", "va", 1, 0.8)
+
+        self.svc.record_feedback(
+            self.conn,
+            "watched-family",
+            helpful=True,
+            confusing=False,
+            rating=None,
+            saved=False,
+            learner_id=self.LEARNER,
+        )
+        coverage, adjustments, _, _ = self.svc._learner_adaptation_context(
+            self.conn, self.MATERIAL, self.LEARNER
+        )
+        for concept_id in family:
+            self.assertEqual(coverage[concept_id], {"helpful": 1.0, "confusing": 0.0})
+            self.assertAlmostEqual(adjustments[concept_id], 0.04)
+
+        helpful_order = self.svc.adaptive_curriculum_order(
+            self.conn,
+            self.MATERIAL,
+            self.LEARNER,
+            [
+                self._item("family-repeat", "identify", "vb", 10, 10, 0.3),
+                self._item("different", "c2", "vc", 10, 1, 0.3),
+            ],
+        )
+        self.assertEqual(helpful_order[0]["reel_id"], "different")
+
+        self.svc.record_feedback(
+            self.conn,
+            "watched-family",
+            helpful=False,
+            confusing=True,
+            rating=None,
+            saved=False,
+            learner_id=self.LEARNER,
+        )
+        coverage, adjustments, _, _ = self.svc._learner_adaptation_context(
+            self.conn, self.MATERIAL, self.LEARNER
+        )
+        for concept_id in family:
+            self.assertEqual(coverage[concept_id], {"helpful": 0.0, "confusing": 1.0})
+            self.assertAlmostEqual(adjustments[concept_id], -0.06)
+
+        confusing_order = self.svc.adaptive_curriculum_order(
+            self.conn,
+            self.MATERIAL,
+            self.LEARNER,
+            [
+                self._item("family-remediation", "misconception", "vb", 10, 1, 0.3),
+                self._item("different", "c2", "vc", 10, 10, 0.3),
+            ],
+        )
+        self.assertEqual(confusing_order[0]["reel_id"], "family-remediation")
+
+    def test_concept_family_match_does_not_merge_numbered_laws(self) -> None:
+        self.assertTrue(
+            self.svc._same_concept_family(
+                "action-reaction pairs",
+                "action-reaction acceleration misconception",
+            )
+        )
+        self.assertTrue(
+            self.svc._same_concept_family(
+                "action-reaction pairs",
+                "Newton's third law action-reaction pairs",
+            )
+        )
+        self.assertFalse(
+            self.svc._same_concept_family(
+                "Newton's first law",
+                "Newton's second law",
+            )
+        )
+        self.assertFalse(
+            self.svc._same_concept_family(
+                "velocity-time graphs",
+                "position-time graphs",
+            )
+        )
+        self.assertEqual(
+            self.svc._concept_family_identity("Newton's 1st law"),
+            self.svc._concept_family_identity("Newton's first law"),
+        )
+        self.assertTrue(
+            self.svc._same_concept_family(
+                "Newton's 1st law",
+                "Newton's first law",
+            )
+        )
+        self.assertFalse(
+            self.svc._same_concept_family(
+                "first law",
+                "Newton's first law",
+            )
+        )
+        self.assertFalse(
+            self.svc._same_concept_family(
+                "first law",
+                "first law of thermodynamics",
+            )
+        )
+
+        concepts = [
+            {"id": "first", "title": "Newton's first law"},
+            {"id": "inertia", "title": "inertia and motion"},
+            {"id": "second", "title": "Newton's second law"},
+            {"id": "fma", "title": "F=ma and net force"},
+            {"id": "thermo", "title": "first law of thermodynamics"},
+        ]
+
+        def profile(*values: str) -> set[str]:
+            return {
+                identity
+                for identity in (
+                    self.svc._concept_family_identity(value) for value in values
+                )
+                if identity
+            }
+
+        families = self.svc._concept_family_ids(
+            concepts,
+            {
+                "first": profile("Newton's first law", "law of inertia"),
+                "inertia": profile("law of inertia", "Newton's first law"),
+                "second": profile("Newton's second law", "F=ma"),
+                "fma": profile("F=ma", "Newton's second law"),
+                "thermo": profile(
+                    "first law of thermodynamics",
+                    "thermodynamic energy conservation",
+                ),
+            },
+        )
+        self.assertIn("inertia", families["first"])
+        self.assertIn("first", families["inertia"])
+        self.assertIn("fma", families["second"])
+        self.assertIn("second", families["fma"])
+        self.assertNotIn("second", families["first"])
+        self.assertNotIn("first", families["second"])
+        self.assertNotIn("thermo", families["first"])
+        self.assertNotIn("first", families["thermo"])
+        self.assertEqual(self.svc._concept_family_identity("first law"), "")
+
+        rollout_families = self.svc._concept_family_ids(
+            [
+                {"id": "legacy-first", "title": "Newton's first law"},
+                {"id": "new-inertia", "title": "law of inertia"},
+            ],
+            {
+                "new-inertia": profile(
+                    "law of inertia",
+                    "Newton's first law",
+                ),
+            },
+        )
+        self.assertIn("new-inertia", rollout_families["legacy-first"])
+        self.assertIn("legacy-first", rollout_families["new-inertia"])
+
+        cooling_families = self.svc._concept_family_ids(
+            [
+                {"id": "profiled", "title": "Newton's law"},
+                {"id": "legacy-cooling", "title": "Newton's law of cooling"},
+            ],
+            {
+                "profiled": profile(
+                    "Newton's first law",
+                    "law of inertia",
+                ),
+            },
+        )
+        self.assertNotIn("legacy-cooling", cooling_families["profiled"])
+        self.assertNotIn("profiled", cooling_families["legacy-cooling"])
+
+    def test_connected_family_profile_evidence_preserves_optional_aliases(self) -> None:
+        contexts = (
+            ("Newton's first law", ["law of inertia"]),
+            ("Newton's first law", []),
+            ("law of inertia", []),
+        )
+        for index, ((family, aliases), video_id) in enumerate(
+            zip(contexts, ("va", "vb", "vc"))
+        ):
+            reel_id = f"connected-family-{index}"
+            self._insert_reel(reel_id, "c1", video_id, index * 30 + 1, 0.4)
+            self.conn.execute(
+                "UPDATE reels SET search_context_json = ? WHERE id = ?",
+                (
+                    json.dumps({
+                        "selection_contract_version": "quality_silence_v38",
+                        "selection_authority": "gemini",
+                        "concept_family_contract_version": "concept_family_v1",
+                        "concept_family": family,
+                        "concept_aliases": aliases,
+                    }),
+                    reel_id,
+                ),
+            )
+
+        profiles = self.svc._persisted_concept_family_profiles(
+            self.conn,
+            self.MATERIAL,
+        )
+        self.assertEqual(
+            profiles["c1"],
+            {
+                self.svc._concept_family_identity("Newton's first law"),
+                self.svc._concept_family_identity("law of inertia"),
+            },
+        )
+
+    def test_persisted_family_profiles_reject_conflicting_shared_facet(self) -> None:
+        self.conn.execute("UPDATE concepts SET title = 'Newton laws' WHERE id = 'c1'")
+        contexts = (
+            {
+                "selection_contract_version": "quality_silence_v38",
+                "selection_authority": "gemini",
+                "concept_family_contract_version": "concept_family_v1",
+                "concept_family": "Newton's first law",
+                "concept_aliases": ["law of inertia"],
+            },
+            {
+                "selection_contract_version": "quality_silence_v38",
+                "selection_authority": "gemini",
+                "concept_family_contract_version": "concept_family_v1",
+                "concept_family": "Newton's second law",
+                "concept_aliases": ["F=ma"],
+            },
+        )
+        for index, (video_id, context) in enumerate(zip(("va", "vb"), contexts)):
+            reel_id = f"conflicting-family-{index}"
+            self._insert_reel(reel_id, "c1", video_id, index * 30 + 1, 0.4)
+            self.conn.execute(
+                "UPDATE reels SET search_context_json = ? WHERE id = ?",
+                (json.dumps(context), reel_id),
+            )
+
+        profiles = self.svc._persisted_concept_family_profiles(
+            self.conn,
+            self.MATERIAL,
+        )
+        self.assertNotIn("c1", profiles)
+
+    def test_family_scoped_concept_ids_isolate_conflicting_shared_facets(self) -> None:
+        newton_id, _, _ = ensure_clip_concept(
+            self.conn,
+            material_id=self.MATERIAL,
+            title="first law",
+            semantic_identity="Newton's first law",
+        )
+        thermo_id, _, _ = ensure_clip_concept(
+            self.conn,
+            material_id=self.MATERIAL,
+            title="first law",
+            semantic_identity="first law of thermodynamics",
+        )
+        ordinal_variant_id, _, _ = ensure_clip_concept(
+            self.conn,
+            material_id=self.MATERIAL,
+            title="law of inertia",
+            semantic_identity="Newton's 1st law",
+        )
+        self.assertEqual(newton_id, ordinal_variant_id)
+        self.assertNotEqual(newton_id, thermo_id)
+
+        for index, (concept_id, family, aliases, video_id) in enumerate((
+            (newton_id, "Newton's first law", ["law of inertia"], "va"),
+            (
+                thermo_id,
+                "first law of thermodynamics",
+                ["thermodynamic energy conservation"],
+                "vb",
+            ),
+        )):
+            reel_id = f"isolated-family-{index}"
+            self._insert_reel(reel_id, concept_id, video_id, index * 30 + 1, 0.4)
+            self.conn.execute(
+                "UPDATE reels SET search_context_json = ? WHERE id = ?",
+                (
+                    json.dumps({
+                        "selection_contract_version": "quality_silence_v38",
+                        "selection_authority": "gemini",
+                        "concept_family_contract_version": "concept_family_v1",
+                        "concept_family": family,
+                        "concept_aliases": aliases,
+                    }),
+                    reel_id,
+                ),
+            )
+
+        self.svc.record_feedback(
+            self.conn,
+            "isolated-family-0",
+            helpful=True,
+            confusing=False,
+            rating=None,
+            saved=False,
+            learner_id=self.LEARNER,
+        )
+        coverage, adjustments, _, _ = self.svc._learner_adaptation_context(
+            self.conn,
+            self.MATERIAL,
+            self.LEARNER,
+        )
+        self.assertEqual(
+            coverage[newton_id],
+            {"helpful": 1.0, "confusing": 0.0},
+        )
+        self.assertNotIn(thermo_id, coverage)
+        self.assertAlmostEqual(adjustments[newton_id], 0.04)
+        self.assertNotIn(thermo_id, adjustments)
 
     def test_need_help_prefers_easier_same_concept_from_other_source(self) -> None:
         self._insert_reel("watched", "c1", "va", 1, 0.8)
@@ -391,6 +719,67 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         )
 
         self.assertEqual([row["id"] for row in ordered], ["c2", "c1"])
+
+    def test_quiz_signals_propagate_to_related_acquisition_and_remediation(self) -> None:
+        for concept_id, title in (
+            ("action", "action-reaction pairs"),
+            ("identify", "identifying action-reaction pairs"),
+            ("misconception", "action-reaction acceleration misconception"),
+        ):
+            self.conn.execute(
+                "INSERT INTO concepts "
+                "(id, material_id, title, keywords_json, summary, embedding_json, created_at) "
+                "VALUES (?, ?, ?, '[]', '', NULL, '2026-07-09T00:00:01+00:00')",
+                (concept_id, self.MATERIAL, title),
+            )
+        self.conn.execute(
+            "UPDATE learner_material_progress SET difficulty_reset_at = '' "
+            "WHERE learner_id = ? AND material_id = ?",
+            (self.LEARNER, self.MATERIAL),
+        )
+        self._insert_assessment_outcome(
+            session_id="quiz-right",
+            concept_id="action",
+            adjustment=0.08,
+        )
+        concepts = [
+            dict(row)
+            for row in self.conn.execute(
+                "SELECT * FROM concepts WHERE material_id = ? ORDER BY id",
+                (self.MATERIAL,),
+            ).fetchall()
+        ]
+        ordered = self.svc._order_concepts(
+            self.conn, self.MATERIAL, concepts, self.LEARNER
+        )
+        positions = {row["id"]: index for index, row in enumerate(ordered)}
+        self.assertLess(positions["c2"], positions["action"])
+        self.assertLess(positions["c2"], positions["identify"])
+        self.assertLess(positions["c2"], positions["misconception"])
+
+        self._insert_assessment_outcome(
+            session_id="quiz-wrong",
+            concept_id="action",
+            adjustment=-0.12,
+            difficulty=0.8,
+        )
+        coverage, adjustments, latest, _ = self.svc._learner_adaptation_context(
+            self.conn, self.MATERIAL, self.LEARNER
+        )
+        self.assertEqual(coverage["identify"], {"helpful": 1.0, "confusing": 1.0})
+        self.assertAlmostEqual(adjustments["identify"], -0.04)
+        self.assertIn("misconception", latest["concept_family_ids"])
+
+        remediation = self.svc.adaptive_curriculum_order(
+            self.conn,
+            self.MATERIAL,
+            self.LEARNER,
+            [
+                self._item("related-easier", "identify", "vb", 10, 1, 0.3),
+                self._item("different", "c2", "vc", 10, 10, 0.3),
+            ],
+        )
+        self.assertEqual(remediation[0]["reel_id"], "related-easier")
 
     def test_incorrect_assessment_prefers_easier_alternative_source(self) -> None:
         self.conn.execute(

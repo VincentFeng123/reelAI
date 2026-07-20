@@ -1881,6 +1881,10 @@ class _BoundaryTopic(_StrictModel):
     title: _ClipTitle
     learning_objective: _LearningObjective
     facet: _Facet
+    # Compatibility defaults keep older conversion fixtures readable. The live
+    # compact response schema and response validator require both fields.
+    concept_family: _Facet = ""
+    concept_aliases: list[_Facet] = Field(default_factory=list, max_length=4)
     reason: _OptionalReason = ""
     informativeness: float = Field(ge=0.0, le=1.0, strict=True)
     topic_relevance: float = Field(ge=0.0, le=1.0, strict=True)
@@ -1986,10 +1990,29 @@ class _CompactIntentEvidence(_StrictModel):
     )
 
 
+def _require_compact_concept_family_schema(schema: dict[str, object]) -> None:
+    """Keep compatibility defaults out of the live Gemini response contract."""
+    required = schema.setdefault("required", [])
+    if isinstance(required, list):
+        for field_name in ("family", "aliases"):
+            if field_name not in required:
+                required.append(field_name)
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        for field_name in ("family", "aliases"):
+            field_schema = properties.get(field_name)
+            if isinstance(field_schema, dict):
+                field_schema.pop("default", None)
+
+
 class _CompactBoundaryTopic(_StrictModel):
     """Token-efficient production schema; attributes retain canonical names."""
 
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        json_schema_extra=_require_compact_concept_family_schema,
+    )
     # Intentionally in-memory only: the final audit is converted immediately,
     # before finalized clip dictionaries (not this model) enter the cache.
     _pro_audit_start_authoritative: bool = PrivateAttr(default=False)
@@ -2051,6 +2074,25 @@ class _CompactBoundaryTopic(_StrictModel):
     title: _CompactTitle
     learning_objective: _CompactObjective = Field(alias="obj")
     facet: _CompactFacet
+    concept_family: _CompactFacet = Field(
+        default="",
+        alias="family",
+        description=(
+            "Canonical domain-qualified name for the exact underlying concept, law, "
+            "relationship, or system taught by this clip. Never use a bare ordinal such "
+            "as first law, and never merge different numbered laws."
+        ),
+    )
+    concept_aliases: list[_CompactFacet] = Field(
+        default_factory=list,
+        alias="aliases",
+        max_length=4,
+        description=(
+            "Zero to four canonical names or formulas that denote exactly the same "
+            "underlying concept as family, never prerequisites, examples, broader topics, "
+            "or neighboring numbered laws."
+        ),
+    )
     informativeness: float = Field(ge=0.0, le=1.0, strict=True, alias="info")
     topic_relevance: float = Field(ge=0.0, le=1.0, strict=True, alias="rel")
     educational_importance: float = Field(ge=0.0, le=1.0, strict=True, alias="imp")
@@ -2078,6 +2120,8 @@ class _CompactBoundaryPlan(_StrictModel):
 
 
 class _IntentBoundaryTopic(_BoundaryTopic):
+    concept_family: _Facet
+    concept_aliases: list[_Facet] = Field(max_length=4)
     intent_role: _IntentRole
     intent_evidence: list[_IntentEvidence] = Field(min_length=1, max_length=16)
 
@@ -2123,6 +2167,37 @@ class _ProCandidateAuditItem(_StrictModel):
 
 class _ProCandidateAuditPlan(_StrictModel):
     items: list[_ProCandidateAuditItem] = Field(max_length=_MAX_CLIPS)
+
+
+def _proposal_concept_family_payload(proposal: object) -> dict[str, object]:
+    """Return the bounded public semantic-family fields from one selector item."""
+    if isinstance(proposal, dict):
+        raw_family = proposal.get("concept_family")
+        raw_aliases = proposal.get("concept_aliases")
+    else:
+        raw_family = getattr(proposal, "concept_family", "")
+        raw_aliases = getattr(proposal, "concept_aliases", [])
+    family = " ".join(
+        unicodedata.normalize(
+            "NFKC", str(raw_family or "")
+        ).split()
+    ).strip()[:96]
+    if not family or not isinstance(raw_aliases, list):
+        return {}
+    aliases: list[str] = []
+    seen = {family.casefold()}
+    for value in raw_aliases:
+        alias = " ".join(
+            unicodedata.normalize("NFKC", str(value or "")).split()
+        ).strip()[:96]
+        key = alias.casefold()
+        if not alias or key in seen:
+            continue
+        seen.add(key)
+        aliases.append(alias)
+        if len(aliases) >= 4:
+            break
+    return {"concept_family": family, "concept_aliases": aliases}
 
 
 class _EnrichmentItem(_StrictModel):
@@ -2447,6 +2522,8 @@ def _selection_fields(*, enriched: bool, compact: bool = False) -> str:
         "crosses directly adjacent caption lines; never pad, paraphrase, skip, stitch, or reorder), "
         "title (at most 12 words), "
         "learning_objective (at most 24 words), facet (at most 12 words), "
+        "concept_family (a domain-qualified canonical name for the exact underlying "
+        "concept), concept_aliases (zero to four exact-equivalence names or formulas), "
         "informativeness, topic_relevance, "
         "educational_importance, difficulty, directly_teaches_topic, substantive, "
         "factually_grounded"
@@ -2469,6 +2546,7 @@ def _selection_fields(*, enriched: bool, compact: bool = False) -> str:
             "unanswered question; a sentence explicitly distinguishing two named sides is "
             "a substantive relationship claim, not an outline), obj=learning_objective, "
             "info=informativeness, rel=topic_relevance, imp=educational_importance, "
+            "family=concept_family, aliases=concept_aliases, "
             "diff=difficulty, direct=directly_teaches_topic, sub=substantive, "
             "fact=factually_grounded, self=self_contained, stand=is_standalone, "
             "ie=intent_evidence"
@@ -2528,6 +2606,16 @@ def _compact_output_guide() -> str:
   When context depends on a concrete actor, object, system, scenario, or referent, name that
   concrete subject in title, obj, or facet; generic labels such as "force and acceleration"
   do not identify a spring oscillator, cart pair, circuit, dataset, or other specific setup.
+- family = concept_family: the canonical, domain-qualified name of the exact underlying
+  principle, law, relationship, method, or system taught here. It is independent of teaching
+  role, example wording, or difficulty. Never return an ambiguous bare ordinal such as "first
+  law". Different numbered laws are different families: use "Newton's first law" and
+  "Newton's second law", not "Newton's laws" for both.
+- aliases = concept_aliases: zero to four canonical names, formulas, or standard terms that
+  denote exactly the same concept as family. Do not include a prerequisite, consequence,
+  application, broader/narrower topic, or neighboring law. Valid equivalences include
+  "law of inertia" for "Newton's first law" and "F=ma" for "Newton's second law"; the first
+  law of thermodynamics is never an alias for Newton's first law.
 - info = informativeness, 0.0-1.0: how much concrete, useful teaching the selected span contains.
 - rel = topic_relevance, 0.0-1.0: how strongly this exact unit serves the exact user request.
 - imp = educational_importance, 0.0-1.0: how valuable this unit is for learning that request.
@@ -2595,7 +2683,7 @@ Example transcript:
 [19] 02:15 provides stronger evidence against the null hypothesis. Next, confidence intervals measure uncertainty.
 Example exact user request: Explain p-values
 Example output:
-{"request_intent":{"exact_request":"Explain p-values","constraints":[{"constraint_id":"subject","kind":"subject","source_phrase":"p-values","requirement":"Explain p-values"}]},"topics":[{"id":"small-p-value-evidence","s":18,"e":19,"sq":"A small p value","eq":"against the null hypothesis.","cq":"small p value provides stronger evidence against the null hypothesis","title":"What a Small P-Value Means","obj":"Explain how a small p-value bears on the null hypothesis","facet":"small p-values","info":0.95,"rel":0.99,"imp":0.93,"diff":0.42,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"subject","q":"small p value provides stronger evidence against the null hypothesis"}]}]}
+{"request_intent":{"exact_request":"Explain p-values","constraints":[{"constraint_id":"subject","kind":"subject","source_phrase":"p-values","requirement":"Explain p-values"}]},"topics":[{"id":"small-p-value-evidence","s":18,"e":19,"sq":"A small p value","eq":"against the null hypothesis.","cq":"small p value provides stronger evidence against the null hypothesis","title":"What a Small P-Value Means","obj":"Explain how a small p-value bears on the null hypothesis","facet":"small p-values","family":"statistical p-value interpretation","aliases":["p-value interpretation"],"info":0.95,"rel":0.99,"imp":0.93,"diff":0.42,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"subject","q":"small p value provides stronger evidence against the null hypothesis"}]}]}
 Why: s remains 18 even though sq starts after "Welcome back" inside line 18. e remains 19
 even though eq ends before "Next, confidence intervals" inside line 19. sq's first word "A"
 is the semantic start; eq's last word "hypothesis" is the semantic end; cq anchors the claim.
@@ -2667,7 +2755,7 @@ Example output boundaries: s=40, e=45, sq="So let's say if f of x is equal to x 
 eq="the derivative of x squared is two x". The topic's ie must evidence the named function,
 limit-definition task, algebra-step requirement, and final two-x outcome.
 Example compact output:
-{"request_intent":{"exact_request":"Use the limit definition to derive f of x equal x squared, include every algebra step, and finish at two x.","constraints":[{"constraint_id":"object","kind":"subject","source_phrase":"f of x equal x squared","requirement":"Derive f of x equal x squared"},{"constraint_id":"method","kind":"task","source_phrase":"Use the limit definition","requirement":"Use the limit definition"},{"constraint_id":"steps","kind":"format","source_phrase":"include every algebra step","requirement":"Include every spoken algebra step"},{"constraint_id":"result","kind":"outcome","source_phrase":"finish at two x","requirement":"Reach the final result two x"}]},"topics":[{"id":"x-squared-limit-derivation","s":40,"e":45,"sq":"So let's say if f of x is equal to x squared","eq":"the derivative of x squared is two x","cq":"Taking h to zero gives two x","title":"Derive x Squared from the Limit Definition","obj":"Derive the derivative of x squared through every algebra step","facet":"x-squared limit derivation","info":0.99,"rel":1.0,"imp":0.99,"diff":0.45,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"object","q":"f of x is equal to x squared"},{"id":"method","q":"Use the limit definition of the derivative"},{"id":"steps","q":"Expand the square to x squared plus two x h"},{"id":"result","q":"Taking h to zero gives two x"}]}]}
+{"request_intent":{"exact_request":"Use the limit definition to derive f of x equal x squared, include every algebra step, and finish at two x.","constraints":[{"constraint_id":"object","kind":"subject","source_phrase":"f of x equal x squared","requirement":"Derive f of x equal x squared"},{"constraint_id":"method","kind":"task","source_phrase":"Use the limit definition","requirement":"Use the limit definition"},{"constraint_id":"steps","kind":"format","source_phrase":"include every algebra step","requirement":"Include every spoken algebra step"},{"constraint_id":"result","kind":"outcome","source_phrase":"finish at two x","requirement":"Reach the final result two x"}]},"topics":[{"id":"x-squared-limit-derivation","s":40,"e":45,"sq":"So let's say if f of x is equal to x squared","eq":"the derivative of x squared is two x","cq":"Taking h to zero gives two x","title":"Derive x Squared from the Limit Definition","obj":"Derive the derivative of x squared through every algebra step","facet":"x-squared limit derivation","family":"derivative of x squared","aliases":["d/dx x squared","power rule for x squared"],"info":0.99,"rel":1.0,"imp":0.99,"diff":0.45,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"object","q":"f of x is equal to x squared"},{"id":"method","q":"Use the limit definition of the derivative"},{"id":"steps","q":"Expand the square to x squared plus two x h"},{"id":"result","q":"Taking h to zero gives two x"}]}]}
 
 Same-source breadth for that original prompt:
 If the same transcript also completely derives five x minus four, one over x, square root of
@@ -17148,6 +17236,7 @@ def _trusted_universal_compact_plan_to_report(
             "title": str(proposal.title or "").strip(),
             "learning_objective": str(proposal.learning_objective or "").strip(),
             "facet": str(proposal.facet or "").strip(),
+            **_proposal_concept_family_payload(proposal),
             "reason": str(proposal.learning_objective or "").strip(),
             "kind": "educational",
             "informativeness": float(proposal.informativeness),
@@ -18359,6 +18448,7 @@ def _trusted_compact_plan_to_report(
             "title": str(proposal.title or "").strip(),
             "learning_objective": str(proposal.learning_objective or "").strip(),
             "facet": str(proposal.facet or "").strip(),
+            **_proposal_concept_family_payload(proposal),
             "reason": str(proposal.learning_objective or "").strip(),
             "kind": "educational",
             "informativeness": float(proposal.informativeness),
@@ -20450,6 +20540,7 @@ def _plan_to_report(
             "title": clip_title,
             "learning_objective": learning_objective,
             "facet": clip_facet,
+            **_proposal_concept_family_payload(proposal),
             "reason": clip_reason,
             "kind": "educational",
             "informativeness": info,
@@ -20569,6 +20660,22 @@ def _public_clips(clips: list[dict]) -> list[dict]:
         ).strip()
         if concept:
             item["concept"] = concept
+        family = " ".join(
+            unicodedata.normalize(
+                "NFKC", str(item.get("concept_family") or "")
+            ).split()
+        ).strip()[:96]
+        aliases = item.get("concept_aliases")
+        if family and isinstance(aliases, list):
+            item["concept_family"] = family
+            item["concept_aliases"] = list(
+                _proposal_concept_family_payload(
+                    {"concept_family": family, "concept_aliases": aliases}
+                )["concept_aliases"]
+            )
+        else:
+            item.pop("concept_family", None)
+            item.pop("concept_aliases", None)
         public.append(item)
     return public
 
@@ -20738,8 +20845,19 @@ def _validate_model_response(
     rejection_reasons: list[str] = []
     for index, raw_topic in enumerate(payload["topics"]):
         try:
+            if topic_schema is _CompactBoundaryTopic and (
+                not isinstance(raw_topic, dict)
+                or "family" not in raw_topic
+                or "aliases" not in raw_topic
+            ):
+                raise ValueError("compact topic requires family and aliases")
             topics.append(topic_schema.model_validate(raw_topic))
-        except ValidationError as exc:
+        except (ValidationError, ValueError) as exc:
+            if not isinstance(exc, ValidationError):
+                rejection_reasons.append(
+                    f"proposal_{index}:schema_invalid:family:missing"
+                )
+                continue
             first_error = exc.errors(include_url=False)[0]
             location = ".".join(str(part) for part in first_error.get("loc", ()))
             rejection_reasons.append(

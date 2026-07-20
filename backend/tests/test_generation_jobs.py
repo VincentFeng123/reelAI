@@ -429,9 +429,27 @@ def test_material_fingerprint_ignores_generated_clip_facets_but_tracks_source_co
             material_id="material-1",
             title="ATP synthesis",
         )
+        family_generated_id, family_title, _key = ensure_clip_concept(
+            conn,
+            material_id="material-1",
+            title="worked ATP example",
+            semantic_identity="ATP synthesis",
+        )
+        legacy_ordinal_id, _title, _key = ensure_clip_concept(
+            conn,
+            material_id="material-1",
+            title="Newton's 1st law",
+        )
 
         assert jobs.material_content_fingerprint(conn, "material-1") == initial
         assert jobs.material_content_fingerprint(conn, "material-1", generated_id) != initial
+        assert family_title == "ATP synthesis"
+        assert jobs.material_content_fingerprint(
+            conn, "material-1", family_generated_id
+        ) != initial
+        assert jobs.material_content_fingerprint(
+            conn, "material-1", legacy_ordinal_id
+        ) != initial
 
         conn.execute(
             """

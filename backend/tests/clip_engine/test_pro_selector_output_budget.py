@@ -39,6 +39,8 @@ def _newton_plan() -> gemini_segment._CompactBoundaryPlan:
             title="Newton's second law",
             learning_objective="Explain how net force, mass, and acceleration relate",
             facet="F equals ma",
+            concept_family="Newton's second law",
+            concept_aliases=["F=ma"],
             informativeness=0.99,
             topic_relevance=0.99,
             educational_importance=0.99,
