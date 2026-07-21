@@ -12,7 +12,9 @@ import pytest
 from backend import gemini_client as gemini_client_module
 from backend.app import main
 from backend.app.clip_engine.errors import (
+    ProviderQuotaError,
     ProviderRateLimitError,
+    ProviderRequestError,
     ProviderTransientError,
     TranscriptUnavailableError,
 )
@@ -486,7 +488,7 @@ def test_generation_records_discovered_sources_before_video_timeout(monkeypatch)
     assert retrieved == {"dQw4w9WgXcQ"}
 
 
-def test_mixed_provider_failure_and_successful_empty_source_is_not_total_outage(
+def test_successful_empty_source_does_not_mask_retryable_sibling_failures(
     monkeypatch,
 ) -> None:
     videos = [
@@ -513,17 +515,188 @@ def test_mixed_provider_failure_and_successful_empty_source_is_not_total_outage(
     monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
     context = GenerationContext("slow", require_acoustic_boundaries=False)
 
-    reels, video_ids = pipeline.ingest_topic(
-        topic="Intro to Python",
-        material_id="material",
-        concept_id="concept",
-        generation_context=context,
-        max_videos=3,
-    )
+    with pytest.raises(ProviderTransientError):
+        pipeline.ingest_topic(
+            topic="Intro to Python",
+            material_id="material",
+            concept_id="concept",
+            generation_context=context,
+            max_videos=3,
+        )
 
-    assert reels == []
-    assert video_ids == [video["id"] for video in videos]
     assert context.counters()["provider_failures"] == 2
+
+
+@pytest.mark.parametrize("permanent_video_id", ["dQw4w9WgXcQ", "abcdefghijk"])
+def test_all_source_global_and_retryable_failures_propagate_global_error(
+    monkeypatch,
+    permanent_video_id: str,
+) -> None:
+    videos = [
+        {**_video(), "id": video_id, "url": f"https://youtu.be/{video_id}"}
+        for video_id in ("dQw4w9WgXcQ", "abcdefghijk")
+    ]
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: {**_discovery(), "videos": videos},
+    )
+    pipeline = _pipeline()
+
+    def clip_and_filter(video, *_args, **_kwargs):
+        if video["id"] == permanent_video_id:
+            raise ProviderQuotaError(
+                "Provider quota is exhausted.",
+                provider="gemini",
+                operation="segmentation",
+            )
+        raise ProviderTransientError(
+            "Gemini is temporarily unavailable.",
+            provider="gemini",
+            operation="segmentation",
+            status_code=503,
+        )
+
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+
+    with pytest.raises(ProviderQuotaError):
+        pipeline.ingest_topic(
+            topic="Intro to Python",
+            material_id="material",
+            concept_id="concept",
+            generation_context=GenerationContext("slow"),
+            max_videos=2,
+        )
+
+
+@pytest.mark.parametrize("quota_video_id", ["dQw4w9WgXcQ", "abcdefghijk"])
+def test_nonretryable_global_error_precedes_global_rate_limit(
+    monkeypatch,
+    quota_video_id: str,
+) -> None:
+    videos = [
+        {**_video(), "id": video_id, "url": f"https://youtu.be/{video_id}"}
+        for video_id in ("dQw4w9WgXcQ", "abcdefghijk")
+    ]
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: {**_discovery(), "videos": videos},
+    )
+    pipeline = _pipeline()
+
+    def clip_and_filter(video, *_args, **_kwargs):
+        if video["id"] == quota_video_id:
+            raise ProviderQuotaError(
+                "Provider quota is exhausted.",
+                provider="gemini",
+                operation="segmentation",
+            )
+        raise ProviderRateLimitError(
+            "Provider asked the client to retry later.",
+            provider="gemini",
+            operation="segmentation",
+            status_code=429,
+            retry_after_sec=5.0,
+        )
+
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+
+    with pytest.raises(ProviderQuotaError):
+        pipeline.ingest_topic(
+            topic="Intro to Python",
+            material_id="material",
+            concept_id="concept",
+            generation_context=GenerationContext("slow"),
+            max_videos=2,
+        )
+
+
+@pytest.mark.parametrize("rate_limited_video_id", ["dQw4w9WgXcQ", "abcdefghijk"])
+def test_global_rate_limit_precedes_source_transient_failure(
+    monkeypatch,
+    rate_limited_video_id: str,
+) -> None:
+    videos = [
+        {**_video(), "id": video_id, "url": f"https://youtu.be/{video_id}"}
+        for video_id in ("dQw4w9WgXcQ", "abcdefghijk")
+    ]
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: {**_discovery(), "videos": videos},
+    )
+    pipeline = _pipeline()
+
+    def clip_and_filter(video, *_args, **_kwargs):
+        if video["id"] == rate_limited_video_id:
+            raise ProviderRateLimitError(
+                "Provider asked the client to retry later.",
+                provider="gemini",
+                operation="segmentation",
+                status_code=429,
+                retry_after_sec=5.0,
+            )
+        raise ProviderTransientError(
+            "This source failed transiently.",
+            provider="supadata",
+            operation="transcript",
+            status_code=503,
+        )
+
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+
+    with pytest.raises(ProviderRateLimitError) as exc_info:
+        pipeline.ingest_topic(
+            topic="Intro to Python",
+            material_id="material",
+            concept_id="concept",
+            generation_context=GenerationContext("slow"),
+            max_videos=2,
+        )
+    assert exc_info.value.retry_after_sec == 5.0
+
+
+@pytest.mark.parametrize("request_error_video_id", ["dQw4w9WgXcQ", "abcdefghijk"])
+def test_all_source_local_and_retryable_failures_propagate_retryable_error(
+    monkeypatch,
+    request_error_video_id: str,
+) -> None:
+    videos = [
+        {**_video(), "id": video_id, "url": f"https://youtu.be/{video_id}"}
+        for video_id in ("dQw4w9WgXcQ", "abcdefghijk")
+    ]
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: {**_discovery(), "videos": videos},
+    )
+    pipeline = _pipeline()
+
+    def clip_and_filter(video, *_args, **_kwargs):
+        if video["id"] == request_error_video_id:
+            raise ProviderRequestError(
+                "This source request was rejected.",
+                provider="gemini",
+                operation="segmentation",
+            )
+        raise ProviderTransientError(
+            "Gemini is temporarily unavailable.",
+            provider="gemini",
+            operation="segmentation",
+            status_code=503,
+        )
+
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+
+    with pytest.raises(ProviderTransientError):
+        pipeline.ingest_topic(
+            topic="Intro to Python",
+            material_id="material",
+            concept_id="concept",
+            generation_context=GenerationContext("slow"),
+            max_videos=2,
+        )
 
 
 def test_mixed_provider_failures_do_not_block_a_valid_completed_source(

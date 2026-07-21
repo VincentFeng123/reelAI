@@ -74,6 +74,7 @@ def test_submitted_job_stamps_current_request_schema_without_mutating_input() ->
 
         assert created is True
         assert params == {"generation_mode": "slow"}
+        assert row["max_attempts"] == 3
         assert json.loads(row["request_params_json"])["request_schema_version"] == (
             jobs.REQUEST_SCHEMA_VERSION
         )
@@ -580,6 +581,7 @@ def test_sqlite_init_migrates_legacy_job_and_metadata_tables(tmp_path, monkeypat
                 "lease_owner",
                 "lease_expires_at",
                 "heartbeat_at",
+                "retry_not_before_at",
                 "attempt_count",
                 "max_attempts",
                 "deadline_at",
@@ -711,7 +713,7 @@ def test_lease_expiry_recovery_and_heartbeat() -> None:
         conn.close()
 
 
-def test_retry_cap_fails_expired_second_attempt_with_terminal_event() -> None:
+def test_retry_cap_fails_expired_third_attempt_with_terminal_event() -> None:
     conn = _memory_conn()
     try:
         job, _ = _submit(conn)
@@ -727,14 +729,240 @@ def test_retry_cap_fails_expired_second_attempt_with_terminal_event() -> None:
             job_id=job["id"],
             lease_owner="worker-c",
             now=BASE_TIME + timedelta(seconds=182),
+        )
+        assert jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-d",
+            now=BASE_TIME + timedelta(seconds=273),
         ) is None
 
         failed = jobs.get_job(conn, job["id"])
         assert failed and failed["status"] == "failed"
-        assert failed["attempt_count"] == 2
+        assert failed["attempt_count"] == 3
         assert failed["terminal_error_code"] == "attempts_exhausted"
         events = jobs.replay_events(conn, job_id=job["id"])
         assert [(event["seq"], event["type"]) for event in events] == [(1, "terminal")]
+    finally:
+        conn.close()
+
+
+def test_retryable_failure_requeues_same_job_without_terminalizing_or_settling(
+    monkeypatch,
+) -> None:
+    conn = _memory_conn()
+    settled: list[str] = []
+    monkeypatch.setattr(jobs, "_settle_search_quota", lambda _conn, job_id: settled.append(job_id))
+    try:
+        job, _ = _submit(conn, request_key="retryable-requeue")
+        first = jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-a",
+            now=BASE_TIME,
+        )
+        assert first and first["attempt_count"] == 1
+
+        requeued = jobs.requeue_retryable_failure(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-a",
+            expected_attempt_count=1,
+            usage={"retry_errors": [{"code": "provider_transient"}]},
+            now=BASE_TIME + timedelta(seconds=1),
+        )
+        assert requeued and requeued["status"] == "queued"
+        assert requeued["phase"] == "retrying"
+        assert requeued["attempt_count"] == 1
+        assert requeued["result_generation_id"] == first["result_generation_id"]
+        assert requeued["lease_owner"] is None
+        assert json.loads(requeued["usage_json"])["retry_errors"][0]["code"] == (
+            "provider_transient"
+        )
+        assert jobs.replay_events(conn, job_id=job["id"]) == []
+        assert settled == []
+
+        replayed = jobs.requeue_retryable_failure(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-a",
+            expected_attempt_count=1,
+            now=BASE_TIME + timedelta(seconds=1),
+        )
+        assert replayed and replayed["status"] == "queued"
+
+        second = jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-b",
+            now=BASE_TIME + timedelta(seconds=2),
+        )
+        assert second and second["attempt_count"] == 2
+        assert jobs.requeue_retryable_failure(
+            conn,
+            job_id=job["id"],
+            lease_owner="stale-worker",
+            expected_attempt_count=2,
+            now=BASE_TIME + timedelta(seconds=3),
+        ) is None
+        assert jobs.requeue_retryable_failure(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-b",
+            expected_attempt_count=2,
+            now=BASE_TIME + timedelta(seconds=3),
+        )
+
+        third = jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-c",
+            now=BASE_TIME + timedelta(seconds=4),
+        )
+        assert third and third["attempt_count"] == 3
+        assert jobs.requeue_retryable_failure(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-c",
+            expected_attempt_count=3,
+            now=BASE_TIME + timedelta(seconds=5),
+        ) is None
+        jobs.transition_terminal(
+            conn,
+            job_id=job["id"],
+            status="failed",
+            lease_owner="worker-c",
+            error_code="provider_transient",
+            now=BASE_TIME + timedelta(seconds=5),
+        )
+        assert [
+            event["type"] for event in jobs.replay_events(conn, job_id=job["id"])
+        ] == ["terminal"]
+        assert settled == [job["id"]]
+    finally:
+        conn.close()
+
+
+def test_retryable_failure_requeue_respects_deadline_and_cancellation(
+    monkeypatch,
+) -> None:
+    conn = _memory_conn()
+    settled: list[str] = []
+    monkeypatch.setattr(jobs, "_settle_search_quota", lambda _conn, job_id: settled.append(job_id))
+    try:
+        deadline_job, _ = jobs.submit_or_get_active(
+            conn,
+            material_id="material-1",
+            concept_id="concept-1",
+            request_key="retry-deadline",
+            content_fingerprint="fingerprint-1",
+            learner_id="learner-1",
+            request_params={},
+            now=BASE_TIME,
+            deadline_seconds=10,
+        )
+        deadline_lease = jobs.lease_job(
+            conn,
+            job_id=deadline_job["id"],
+            lease_owner="deadline-worker",
+            now=BASE_TIME,
+        )
+        assert deadline_lease
+        assert jobs.requeue_retryable_failure(
+            conn,
+            job_id=deadline_job["id"],
+            lease_owner="deadline-worker",
+            expected_attempt_count=1,
+            now=BASE_TIME + timedelta(seconds=10),
+        ) is None
+        assert jobs.replay_events(conn, job_id=deadline_job["id"]) == []
+        assert jobs.lease_job(
+            conn,
+            job_id=deadline_job["id"],
+            lease_owner="late-worker",
+            now=BASE_TIME + timedelta(seconds=10),
+        ) is None
+        deadline_terminal = jobs.get_job(conn, deadline_job["id"])
+        assert deadline_terminal and deadline_terminal["status"] == "failed"
+        assert deadline_terminal["terminal_error_code"] == "deadline_exceeded"
+
+        cancelled_job, _ = _submit(
+            conn,
+            request_key="retry-cancelled",
+            now=BASE_TIME + timedelta(seconds=20),
+        )
+        cancelled_lease = jobs.lease_job(
+            conn,
+            job_id=cancelled_job["id"],
+            lease_owner="cancelled-worker",
+            now=BASE_TIME + timedelta(seconds=20),
+        )
+        assert cancelled_lease
+        jobs.request_cancellation(
+            conn,
+            job_id=cancelled_job["id"],
+            now=BASE_TIME + timedelta(seconds=21),
+        )
+        replayed_cancel = jobs.requeue_retryable_failure(
+            conn,
+            job_id=cancelled_job["id"],
+            lease_owner="cancelled-worker",
+            expected_attempt_count=1,
+            now=BASE_TIME + timedelta(seconds=21),
+        )
+        assert replayed_cancel and replayed_cancel["status"] == "cancelled"
+        assert [
+            event["type"]
+            for event in jobs.replay_events(conn, job_id=cancelled_job["id"])
+        ] == ["terminal"]
+        assert settled == [deadline_job["id"], cancelled_job["id"]]
+    finally:
+        conn.close()
+
+
+def test_rate_limit_requeue_waits_until_retry_not_before() -> None:
+    conn = _memory_conn()
+    try:
+        job, _ = _submit(conn, request_key="retry-rate-limit")
+        first = jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="rate-limit-worker-1",
+            now=BASE_TIME,
+        )
+        assert first
+        requeued = jobs.requeue_retryable_failure(
+            conn,
+            job_id=job["id"],
+            lease_owner="rate-limit-worker-1",
+            expected_attempt_count=1,
+            retry_after_sec=5.0,
+            now=BASE_TIME + timedelta(seconds=1),
+        )
+        assert requeued and requeued["status"] == "queued"
+        assert datetime.fromisoformat(requeued["retry_not_before_at"]) == (
+            BASE_TIME + timedelta(seconds=6)
+        )
+        assert jobs.next_queued_retry_delay(
+            conn,
+            now=BASE_TIME + timedelta(seconds=2),
+        ) == pytest.approx(4.0)
+        assert jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="rate-limit-worker-early",
+            now=BASE_TIME + timedelta(seconds=5),
+        ) is None
+        still_queued = jobs.get_job(conn, job["id"])
+        assert still_queued and still_queued["status"] == "queued"
+        second = jobs.lease_next_job(
+            conn,
+            lease_owner="rate-limit-worker-2",
+            now=BASE_TIME + timedelta(seconds=6),
+        )
+        assert second and second["id"] == job["id"]
+        assert second["attempt_count"] == 2
+        assert second["retry_not_before_at"] is None
     finally:
         conn.close()
 
@@ -1180,6 +1408,8 @@ def test_postgres_schema_and_migration_sql_cover_durable_foundation() -> None:
     migration_sql = "\n".join(connection.statements)
     assert "ADD COLUMN IF NOT EXISTS lease_owner TEXT" in migration_sql
     assert "ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0" in migration_sql
+    assert "ADD COLUMN IF NOT EXISTS retry_not_before_at TEXT" in migration_sql
+    assert "ALTER COLUMN max_attempts SET DEFAULT 3" in migration_sql
     assert "ADD COLUMN IF NOT EXISTS model_used TEXT" in migration_sql
     assert "Legacy refinement work was replaced by durable generation jobs" in migration_sql
     assert "CREATE UNIQUE INDEX IF NOT EXISTS idx_reel_generation_jobs_active_request" in migration_sql

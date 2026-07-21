@@ -175,12 +175,21 @@ from .ingestion.errors import (
     TranscriptionError as IngestTranscriptionError,
     UnsupportedSourceError as IngestUnsupportedSourceError,
 )
-from .clip_engine.errors import CancellationError as ClipEngineCancellationError, EngineError as ClipEngineError
+from .clip_engine.errors import (
+    CancellationError as ClipEngineCancellationError,
+    EngineError as ClipEngineError,
+    JOB_GLOBAL_PROVIDER_ERROR_CODES,
+    ProviderRateLimitError,
+)
 from .clip_engine.errors import ProviderError as ClipEngineProviderError
 from .clip_engine.provider_cache import DatabaseProviderCache, TRANSCRIPT_SCHEMA_VERSION
 from .clip_engine.provider_cache import normalize_filters as normalize_provider_filters
 from .clip_engine.provider_cache import search_cache_key
-from .clip_engine.provider_runtime import GenerationContext, ProviderUsageRecord
+from .clip_engine.provider_runtime import (
+    GenerationContext,
+    ProviderUsageRecord,
+    gemini_usage_records_exposure,
+)
 from .clip_engine.clipper.supadata_client import fetch_transcript_artifact
 from .clip_engine.supadata_search import search_one as supadata_search_one
 from .clip_engine.metadata import canonicalize_youtube_url, normalize_youtube_video_id
@@ -214,7 +223,9 @@ from .services.generation_jobs import (
     heartbeat_job as heartbeat_generation_job,
     lease_next_job,
     material_content_fingerprint,
+    next_queued_retry_delay,
     record_provider_usage,
+    requeue_retryable_failure as requeue_generation_retryable_failure,
     replay_events as replay_generation_events,
     request_cancellation as request_generation_cancellation,
     submit_or_get_active as submit_generation_job,
@@ -3801,6 +3812,8 @@ def _generation_job_has_retryable_source_work(
     """Return whether a terminal failure has bounded source work remaining."""
     if not job_row:
         return False
+    if str(job_row.get("terminal_error_code") or "") in JOB_GLOBAL_PROVIDER_ERROR_CODES:
+        return False
     generation_id = str(job_row.get("result_generation_id") or "").strip()
     if not generation_id:
         return False
@@ -4624,6 +4637,47 @@ def _persist_generation_provider_usage(
     )
 
 
+def _generation_gemini_ledger_exposure(
+    conn: Any,
+    job_id: str,
+    *,
+    prior_records: Iterable[dict[str, Any]] = (),
+) -> dict[str, float]:
+    records = [dict(record) for record in prior_records if isinstance(record, dict)]
+    for row in fetch_all(
+        conn,
+        """
+        SELECT provider, operation, model, billable_requests, input_tokens,
+               output_tokens, total_tokens, metadata_json
+        FROM generation_provider_usage
+        WHERE job_id = ? AND provider = 'gemini'
+        ORDER BY created_at, id
+        """,
+        (job_id,),
+    ):
+        try:
+            metadata = json.loads(str(row.get("metadata_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        safe_metadata = metadata if isinstance(metadata, dict) else {}
+        records.append({
+            "provider": "gemini",
+            "operation": str(row.get("operation") or ""),
+            "model_used": str(row.get("model") or ""),
+            "attempt": safe_metadata.get("attempt"),
+            "timestamp": safe_metadata.get("timestamp"),
+            "status_code": safe_metadata.get("status_code"),
+            "billable_requests": int(row.get("billable_requests") or 0),
+            "input_tokens": int(row.get("input_tokens") or 0),
+            "output_tokens": int(row.get("output_tokens") or 0),
+            "total_tokens": int(row.get("total_tokens") or 0),
+            "quality_degraded": bool(safe_metadata.get("quality_degraded")),
+            "error_code": str(safe_metadata.get("error_code") or ""),
+            "metadata": safe_metadata,
+        })
+    return gemini_usage_records_exposure(records)
+
+
 def _job_request_params(job_row: dict[str, Any]) -> dict[str, Any]:
     try:
         payload = json.loads(str(job_row.get("request_params_json") or "{}"))
@@ -4875,7 +4929,7 @@ def _generation_job_status_payload(conn, job_row: dict[str, Any]) -> dict[str, A
         "phase": str(job_row.get("phase") or ""),
         "progress": float(job_row.get("progress") or 0.0),
         "attempt_count": int(job_row.get("attempt_count") or 0),
-        "max_attempts": int(job_row.get("max_attempts") or 2),
+        "max_attempts": int(job_row.get("max_attempts") or 3),
         "lease_expires_at": _normalize_datetime_for_api(job_row.get("lease_expires_at")),
         "heartbeat_at": _normalize_datetime_for_api(job_row.get("heartbeat_at")),
         "deadline_at": _normalize_datetime_for_api(job_row.get("deadline_at")),
@@ -5191,6 +5245,7 @@ def _run_leased_generation_job(
 ) -> None:
     job_id = str(job_row.get("id") or "")
     lease_owner = str(job_row.get("lease_owner") or "")
+    durable_attempt_count = max(1, int(job_row.get("attempt_count") or 1))
     params = _job_request_params(job_row)
     is_continuation = bool(str(params.get("continuation_token") or "").strip())
     has_fresh_source_budget = bool(params.get("fresh_source_budget"))
@@ -5230,7 +5285,6 @@ def _run_leased_generation_job(
         name=f"generation-heartbeat-{job_id[:8]}",
         daemon=True,
     )
-    heartbeat_thread.start()
 
     last_cancel_check = 0.0
     cached_cancelled = False
@@ -5267,15 +5321,211 @@ def _run_leased_generation_job(
     setup_generation_candidate_id = (
         str(job_row.get("result_generation_id") or "").strip() or str(uuid.uuid4())
     )
-    completed_source_ids: set[str] = set()
+    try:
+        previous_usage = json.loads(str(job_row.get("usage_json") or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        previous_usage = {}
+    if not isinstance(previous_usage, dict):
+        previous_usage = {}
+    raw_previous_provider_calls = previous_usage.get("provider_calls")
+    previous_provider_calls = (
+        [dict(record) for record in raw_previous_provider_calls if isinstance(record, dict)]
+        if isinstance(raw_previous_provider_calls, list)
+        else []
+    )
+    context.budget.restore_gemini_retry_exposure(previous_usage.get("budget"))
+    if durable_attempt_count > 1:
+        ledger_exposure = _run_generation_db_transaction(
+            "provider_usage_recovery",
+            lambda usage_conn: _generation_gemini_ledger_exposure(
+                usage_conn,
+                job_id,
+                prior_records=previous_provider_calls,
+            ),
+            retry_should_stop=db_retry_should_stop,
+        )
+        context.budget.restore_gemini_retry_exposure({
+            "mode": mode,
+            "gemini": ledger_exposure,
+        })
+    previous_consumed_source_ids = {
+        video_id
+        for raw_id in previous_usage.get("consumed_video_ids", [])
+        if (video_id := normalize_youtube_video_id(raw_id)) is not None
+    } if isinstance(previous_usage.get("consumed_video_ids"), list) else set()
+    previous_capacity_deferred_source_ids = {
+        video_id
+        for raw_id in previous_usage.get("capacity_deferred_video_ids", [])
+        if (video_id := normalize_youtube_video_id(raw_id)) is not None
+    } if isinstance(previous_usage.get("capacity_deferred_video_ids"), list) else set()
+    previous_failed_source_attempts: dict[str, int] = {}
+    raw_previous_failures = previous_usage.get("failed_source_attempts")
+    if isinstance(raw_previous_failures, dict):
+        for raw_id, raw_count in raw_previous_failures.items():
+            video_id = normalize_youtube_video_id(raw_id)
+            if video_id is None:
+                continue
+            try:
+                count = max(0, min(100, int(raw_count or 0)))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if count:
+                previous_failed_source_attempts[video_id] = count
+    raw_previous_counters = previous_usage.get("counters")
+    previous_counters = (
+        raw_previous_counters if isinstance(raw_previous_counters, dict) else {}
+    )
+    raw_retry_errors = previous_usage.get("retry_errors")
+    previous_retry_errors = (
+        [dict(error) for error in raw_retry_errors if isinstance(error, dict)]
+        if isinstance(raw_retry_errors, list)
+        else []
+    )
+    completed_source_ids: set[str] = set(previous_consumed_source_ids)
     attempted_source_ids: set[str] = set()
-    capacity_deferred_source_ids: set[str] = set()
+    capacity_deferred_source_ids: set[str] = set(
+        previous_capacity_deferred_source_ids
+    )
     retrieved_video_ids: set[str] = set()
 
-    def generation_usage_payload() -> dict[str, Any]:
+    def generation_usage_payload(
+        *,
+        retry_error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         payload = context.usage_payload()
+        if previous_provider_calls:
+            payload["provider_calls"] = [
+                dict(record)
+                for record in previous_provider_calls
+            ] + list(payload.get("provider_calls") or [])
+
+        previous_by_stage = previous_usage.get("by_stage")
+        if isinstance(previous_by_stage, dict):
+            by_stage = {
+                str(stage): dict(bucket)
+                for stage, bucket in (payload.get("by_stage") or {}).items()
+                if isinstance(bucket, dict)
+            }
+            for stage, previous_bucket in previous_by_stage.items():
+                if not isinstance(previous_bucket, dict):
+                    continue
+                bucket = by_stage.setdefault(str(stage), {})
+                for field, previous_value in previous_bucket.items():
+                    current_value = bucket.get(field)
+                    if (
+                        isinstance(previous_value, (int, float))
+                        and not isinstance(previous_value, bool)
+                        and isinstance(current_value, (int, float))
+                        and not isinstance(current_value, bool)
+                    ):
+                        bucket[field] = previous_value + current_value
+                    elif field not in bucket:
+                        bucket[field] = previous_value
+            payload["by_stage"] = by_stage
+
+        previous_summary = previous_usage.get("summary")
+        if isinstance(previous_summary, dict):
+            summary = dict(payload.get("summary") or {})
+            non_additive_summary_fields = {
+                "cost_limit_usd",
+                "cost_per_accepted_clip_usd",
+                "current_cost_exposure_usd",
+                "lifetime_reserved_worst_case_cost_usd",
+                "reserved_worst_case_cost_usd",
+            }
+            for field, previous_value in previous_summary.items():
+                current_value = summary.get(field)
+                if field == "fallback_reasons":
+                    previous_reasons = (
+                        [
+                            str(value)
+                            for value in previous_value
+                            if str(value).strip()
+                        ]
+                        if isinstance(previous_value, list)
+                        else []
+                    )
+                    current_reasons = (
+                        [
+                            str(value)
+                            for value in current_value
+                            if str(value).strip()
+                        ]
+                        if isinstance(current_value, list)
+                        else []
+                    )
+                    summary[field] = list(dict.fromkeys([
+                        *previous_reasons,
+                        *current_reasons,
+                    ]))
+                elif field == "rejection_reason_counts":
+                    counts = (
+                        dict(current_value)
+                        if isinstance(current_value, dict)
+                        else {}
+                    )
+                    if isinstance(previous_value, dict):
+                        for reason, raw_count in previous_value.items():
+                            try:
+                                counts[str(reason)] = int(counts.get(str(reason)) or 0) + int(
+                                    raw_count or 0
+                                )
+                            except (TypeError, ValueError, OverflowError):
+                                continue
+                    summary[field] = dict(sorted(counts.items()))
+                elif (
+                    field not in non_additive_summary_fields
+                    and isinstance(previous_value, (int, float))
+                    and not isinstance(previous_value, bool)
+                    and isinstance(current_value, (int, float))
+                    and not isinstance(current_value, bool)
+                ):
+                    summary[field] = previous_value + current_value
+                elif field not in summary:
+                    summary[field] = previous_value
+            accepted_clips = int(summary.get("accepted_clips") or 0)
+            billing_unknown_calls = int(summary.get("billing_unknown_calls") or 0)
+            summary["cost_per_accepted_clip_usd"] = (
+                round(float(summary.get("estimated_cost_usd") or 0.0) / accepted_clips, 8)
+                if accepted_clips and not billing_unknown_calls
+                else None
+            )
+            payload["summary"] = summary
+
+        previous_attempt_budgets = previous_usage.get("attempt_budgets")
+        attempt_budgets = (
+            [
+                dict(budget)
+                for budget in previous_attempt_budgets
+                if isinstance(budget, dict)
+            ]
+            if isinstance(previous_attempt_budgets, list)
+            else []
+        )
+        previous_budget = previous_usage.get("budget")
+        if isinstance(previous_budget, dict):
+            attempt_budgets.append(dict(previous_budget))
+        if attempt_budgets:
+            payload["attempt_budgets"] = attempt_budgets
+
         counters = dict(payload.get("counters") or {})
+        for name, raw_count in previous_counters.items():
+            if name == "provider_cursor_open":
+                # This is a last-attempt work-availability gauge, not lifetime
+                # telemetry. Carrying an old open cursor past the retry ceiling
+                # would create an unbounded linked recovery job.
+                continue
+            try:
+                prior_count = max(0, int(raw_count or 0))
+                current_count = max(0, int(counters.get(name) or 0))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            counters[name] = prior_count + current_count
         counters["analyzed_sources"] = len(completed_source_ids)
+        counters["durable_attempts"] = max(
+            1,
+            int(job_row.get("attempt_count") or 1),
+        )
         payload["counters"] = counters
         payload["consumed_video_ids"] = sorted(
             video_id
@@ -5302,9 +5552,23 @@ def _run_leased_generation_job(
                 and video_id not in capacity_deferred_id_set
             )
         )
-        payload["failed_source_attempts"] = {
-            video_id: 1 for video_id in failed_ids
-        }
+        failed_source_attempts = dict(previous_failed_source_attempts)
+        for video_id in failed_ids:
+            # A known provider failure is a real source-analysis attempt even
+            # when the durable job itself remains active. Unknown crash/lease
+            # recovery does not enter this path and therefore is not invented.
+            failed_source_attempts[video_id] = min(
+                100,
+                failed_source_attempts.get(video_id, 0) + 1,
+            )
+        for video_id in completed_ids | capacity_deferred_id_set:
+            failed_source_attempts.pop(video_id, None)
+        payload["failed_source_attempts"] = dict(sorted(failed_source_attempts.items()))
+        retry_errors = list(previous_retry_errors)
+        if retry_error is not None:
+            retry_errors.append(dict(retry_error))
+        if retry_errors:
+            payload["retry_errors"] = retry_errors
         return payload
 
     def cancel_if_adaptation_stale(conn) -> bool:
@@ -5341,6 +5605,7 @@ def _run_leased_generation_job(
         logger.info("cancelled stale adaptive generation job_id=%s", job_id)
         return True
 
+    heartbeat_thread.start()
     try:
         def setup_generation(setup_conn: Any) -> str | None:
             if not update_generation_progress(
@@ -5420,10 +5685,16 @@ def _run_leased_generation_job(
                 conn,
                 generation_id=source_generation_id or "",
             )
+            prior_consumed_video_ids.update(previous_consumed_source_ids)
             prior_failed_source_attempts = _generation_chain_failed_source_attempts(
                 conn,
                 generation_id=source_generation_id or "",
             )
+            for video_id, count in previous_failed_source_attempts.items():
+                prior_failed_source_attempts[video_id] = min(
+                    100,
+                    prior_failed_source_attempts.get(video_id, 0) + count,
+                )
             retired_failed_video_ids = {
                 video_id
                 for video_id, count in prior_failed_source_attempts.items()
@@ -5449,6 +5720,7 @@ def _run_leased_generation_job(
                 # top-up also gets one fresh bounded budget when that cache is
                 # strict but too small for the nine-reel startup reservoir.
                 analyzed_source_budget = 0
+            analyzed_source_budget += len(previous_consumed_source_ids)
             remaining_source_budget = max(
                 0,
                 GENERATION_SOURCE_BUDGETS[mode] - analyzed_source_budget,
@@ -5872,23 +6144,72 @@ def _run_leased_generation_job(
                 # Shutdown, deadline, or a lost lease is not a user
                 # cancellation. Leave the durable row for expiry/recovery.
                 logger.info("generation worker yielded lease job_id=%s", job_id)
-    except ClipEngineProviderError as exc:
-        logger.warning("generation provider failure job_id=%s error=%s", job_id, exc.as_dict())
-        _run_generation_db_transaction(
-            "provider_failure_terminalization",
-            lambda terminal_conn: transition_generation_terminal(
-                terminal_conn,
-                job_id=job_id,
-                status="failed",
-                result_generation_id=generation_id or None,
-                lease_owner=lease_owner,
-                usage=generation_usage_payload(),
-                error_code=exc.code,
-                error_message=str(exc),
-                error_detail={**exc.as_dict(), "counters": context.counters()},
-            ),
-            retry_should_stop=db_retry_should_stop,
+    except (ClipEngineProviderError, IngestRateLimitedError) as exc:
+        provider_exc = (
+            ProviderRateLimitError(
+                str(exc),
+                provider="ingestion",
+                operation="platform_rate_limit",
+                status_code=429,
+                retry_after_sec=exc.retry_after_sec,
+                detail=exc.detail,
+            )
+            if isinstance(exc, IngestRateLimitedError)
+            else exc
         )
+        logger.warning(
+            "generation provider failure job_id=%s error=%s",
+            job_id,
+            provider_exc.as_dict(),
+        )
+        provider_usage = generation_usage_payload(retry_error=provider_exc.as_dict())
+        attempt_count = durable_attempt_count
+        if provider_exc.retryable:
+            retry_state = _run_generation_db_transaction(
+                "provider_failure_requeue",
+                lambda retry_conn: requeue_generation_retryable_failure(
+                    retry_conn,
+                    job_id=job_id,
+                    lease_owner=lease_owner,
+                    expected_attempt_count=attempt_count,
+                    usage=provider_usage,
+                    retry_after_sec=provider_exc.retry_after_sec,
+                ),
+                replay_after_unknown_commit=True,
+            )
+            if retry_state is not None:
+                logger.warning(
+                    "requeued retryable generation provider failure "
+                    "job_id=%s attempt=%d/%d status=%s",
+                    job_id,
+                    attempt_count,
+                    int(retry_state.get("max_attempts") or 0),
+                    str(retry_state.get("status") or ""),
+                )
+                _wake_generation_worker()
+                return
+        try:
+            _run_generation_db_transaction(
+                "provider_failure_terminalization",
+                lambda terminal_conn: transition_generation_terminal(
+                    terminal_conn,
+                    job_id=job_id,
+                    status="failed",
+                    result_generation_id=generation_id or None,
+                    lease_owner=lease_owner,
+                    usage=provider_usage,
+                    error_code=provider_exc.code,
+                    error_message=str(provider_exc),
+                    error_detail={
+                        **provider_exc.as_dict(),
+                        "counters": context.counters(),
+                    },
+                ),
+                retry_should_stop=db_retry_should_stop,
+            )
+        except JobLeaseLostError:
+            logger.info("generation worker lost lease during provider failure job_id=%s", job_id)
+            _wake_generation_worker()
     except JobLeaseLostError:
         logger.info("generation worker lost lease job_id=%s", job_id)
     except Exception as exc:
@@ -5939,7 +6260,15 @@ def _generation_worker_loop(
             logger.exception("generation worker poll failed")
         if stop_event.is_set():
             break
-        _generation_worker_wake.wait(GENERATION_WORKER_POLL_SEC)
+        wait_seconds = GENERATION_WORKER_POLL_SEC
+        try:
+            with get_conn() as wait_conn:
+                retry_delay = next_queued_retry_delay(wait_conn)
+            if retry_delay is not None:
+                wait_seconds = min(wait_seconds, max(0.05, retry_delay))
+        except Exception:
+            logger.exception("generation worker retry-delay lookup failed")
+        _generation_worker_wake.wait(wait_seconds)
 
 
 def _wake_generation_worker() -> None:
@@ -7606,6 +7935,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
         )
         source_generation_id: str | None = None
         continuation_job: dict[str, Any] | None = None
+        fresh_root_recovery = False
         if continuation_token:
             continuation_job = get_generation_job(conn, continuation_token)
             continuation_status = str((continuation_job or {}).get("status") or "")
@@ -7709,7 +8039,15 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                     completed_job = latest_compatible_job
                     active_job = None
             elif latest_status == "failed":
-                if _generation_job_has_retryable_source_work(
+                latest_error_code = str(
+                    (latest_compatible_job or {}).get("terminal_error_code") or ""
+                ).strip()
+                if latest_error_code in JOB_GLOBAL_PROVIDER_ERROR_CODES:
+                    completed_job = None
+                    active_job = None
+                    source_generation_id = None
+                    fresh_root_recovery = True
+                elif _generation_job_has_retryable_source_work(
                     conn,
                     latest_compatible_job,
                 ):
@@ -7751,6 +8089,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             not active_job
             and continuation_job is None
             and source_generation_id is None
+            and not fresh_root_recovery
         ):
             source_generation_id = _verified_cross_request_source_generation(
                 conn,
@@ -8773,7 +9112,7 @@ def feed(
         )
         latest_status = str((latest_compatible_job or {}).get("status") or "")
         retry_source_job: dict[str, Any] | None = None
-        source_retry_exhausted = False
+        terminal_retry_suppressed = False
         if latest_status in {"queued", "running"}:
             active_job = latest_compatible_job
         elif latest_status in {"completed", "partial"}:
@@ -8791,20 +9130,24 @@ def feed(
                 completed_job = latest_compatible_job
                 active_job = None
         elif latest_status == "failed":
-            if _generation_job_has_retryable_source_work(
+            latest_error_code = str(
+                (latest_compatible_job or {}).get("terminal_error_code") or ""
+            ).strip()
+            if latest_error_code in JOB_GLOBAL_PROVIDER_ERROR_CODES:
+                completed_job = None
+                active_job = None
+                terminal_retry_suppressed = True
+            elif _generation_job_has_retryable_source_work(
                 conn,
                 latest_compatible_job,
             ):
                 completed_job = None
                 active_job = None
                 retry_source_job = latest_compatible_job
-            elif _generation_job_has_failed_source_attempts(
-                conn,
-                latest_compatible_job,
-            ):
+            else:
                 completed_job = None
                 active_job = None
-                source_retry_exhausted = True
+                terminal_retry_suppressed = True
         cross_request_source = False
         cross_request_source_covers_mode = False
         if retry_source_job:
@@ -8819,14 +9162,14 @@ def feed(
             generation_id = str(
                 (completed_job or {}).get("result_generation_id") or ""
             ).strip() or None
-        if generation_id is None and not active_job and not source_retry_exhausted:
+        if generation_id is None and not active_job and not terminal_retry_suppressed:
             head = _fetch_active_generation_row(conn, material_id=material_id, request_key=request_key)
             generation_id = str((head or {}).get("id") or "") or None
         if (
             generation_id is None
             and not completed_job
             and not active_job
-            and not source_retry_exhausted
+            and not terminal_retry_suppressed
         ):
             generation_id = _verified_cross_request_source_generation(
                 conn,
@@ -8898,7 +9241,7 @@ def feed(
         if (
             autofill
             and page == 1
-            and not source_retry_exhausted
+            and not terminal_retry_suppressed
             and completed_job is None
             and active_job is None
             and (
@@ -8964,7 +9307,7 @@ def feed(
                 job_submitted = True
         reels = ranked[page_start:page_end]
         reported_job = active_job or completed_job or (
-            latest_compatible_job if source_retry_exhausted else None
+            latest_compatible_job if terminal_retry_suppressed else None
         )
         reported_status = str((reported_job or {}).get("status") or "")
         continuation_token = (

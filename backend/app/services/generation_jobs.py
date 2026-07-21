@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -41,11 +42,12 @@ TERMINAL_STATUSES = frozenset({"completed", "partial", "exhausted", "failed", "c
 ALL_STATUSES = ACTIVE_STATUSES | TERMINAL_STATUSES
 EVENT_TYPES = frozenset({"candidate", "final", "terminal"})
 
-DEFAULT_MAX_ATTEMPTS = 2
+DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_HEARTBEAT_SECONDS = 15
 DEFAULT_LEASE_SECONDS = 90
 DEFAULT_DEADLINE_SECONDS = 60 * 60
 DEFAULT_QUEUE_TTL_SECONDS = 8 * 60
+MAX_DURABLE_RETRY_AFTER_SECONDS = 30.0
 # Request-key version doubles as a production inventory compatibility gate.
 REQUEST_SCHEMA_VERSION = "adaptive_clip_concepts_v3"
 EMPTY_ADAPTATION_FINGERPRINT = hashlib.sha256(b"{}").hexdigest()
@@ -422,6 +424,7 @@ def submit_or_get_active(
             "lease_owner": None,
             "lease_expires_at": None,
             "heartbeat_at": None,
+            "retry_not_before_at": None,
             "attempt_count": 0,
             "max_attempts": DEFAULT_MAX_ATTEMPTS,
             "deadline_at": deadline_at,
@@ -734,6 +737,7 @@ def lease_job(
             END,
             lease_expires_at = ?,
             heartbeat_at = ?,
+            retry_not_before_at = NULL,
             attempt_count = attempt_count + 1,
             started_at = COALESCE(started_at, ?),
             updated_at = ?,
@@ -754,7 +758,14 @@ def lease_job(
               OR (
                   (deadline_at IS NULL OR deadline_at > ?)
                   AND (
-                      (status = 'queued' AND attempt_count > 0)
+                      (
+                          status = 'queued'
+                          AND attempt_count > 0
+                          AND (
+                              retry_not_before_at IS NULL
+                              OR retry_not_before_at <= ?
+                          )
+                      )
                       OR (
                           status = 'running'
                           AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
@@ -772,6 +783,7 @@ def lease_job(
             now_text,
             job_id,
             queue_cutoff,
+            now_text,
             now_text,
             now_text,
         ),
@@ -797,7 +809,15 @@ def lease_next_job(
         FROM reel_generation_jobs
         WHERE TRIM(content_fingerprint) <> ''
           AND (
-            status = 'queued'
+            (
+                status = 'queued'
+                AND (
+                    attempt_count = 0
+                    OR retry_not_before_at IS NULL
+                    OR retry_not_before_at <= ?
+                    OR (deadline_at IS NOT NULL AND deadline_at <= ?)
+                )
+            )
             OR (
                status = 'running'
                AND (
@@ -810,7 +830,7 @@ def lease_next_job(
         ORDER BY created_at, id
         LIMIT 32
         """,
-        (now_text, now_text),
+        (now_text, now_text, now_text, now_text),
     )
     for candidate in candidates:
         leased = lease_job(
@@ -963,6 +983,123 @@ def update_progress(
             values,
         )
     )
+
+
+def requeue_retryable_failure(
+    conn: Any,
+    *,
+    job_id: str,
+    lease_owner: str,
+    expected_attempt_count: int,
+    usage: dict[str, Any] | None = None,
+    retry_after_sec: float | None = None,
+    now: datetime | str | None = None,
+) -> dict[str, Any] | None:
+    """Release one live attempt for a bounded, replay-safe provider retry."""
+    if not str(lease_owner or "").strip():
+        raise ValueError("lease_owner is required")
+    attempt_count = int(expected_attempt_count)
+    if attempt_count < 1:
+        raise ValueError("expected_attempt_count must be positive")
+    now_dt = _utc_now(now)
+    timestamp = now_dt.isoformat()
+    try:
+        retry_delay = float(retry_after_sec or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        retry_delay = 0.0
+    if not math.isfinite(retry_delay):
+        retry_delay = 0.0
+    retry_delay = max(0.0, min(MAX_DURABLE_RETRY_AFTER_SECONDS, retry_delay))
+    retry_not_before_at = (
+        (now_dt + timedelta(seconds=retry_delay)).isoformat()
+        if retry_delay > 0.0
+        else None
+    )
+    with _atomic_write(conn):
+        existing = get_job(conn, job_id)
+        if not existing:
+            return None
+        current_attempt = int(existing.get("attempt_count") or 0)
+        current_status = str(existing.get("status") or "")
+        if current_attempt > attempt_count or current_status in TERMINAL_STATUSES:
+            return existing
+        if (
+            current_attempt == attempt_count
+            and current_status == "queued"
+            and str(existing.get("phase") or "") == "retrying"
+        ):
+            return existing
+        updated = execute_modify(
+            conn,
+            """
+            UPDATE reel_generation_jobs
+            SET status = 'queued',
+                phase = 'retrying',
+                progress = 0.0,
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                heartbeat_at = NULL,
+                retry_not_before_at = ?,
+                usage_json = ?,
+                terminal_error_code = NULL,
+                terminal_error_message = NULL,
+                terminal_error_json = NULL,
+                completed_at = NULL,
+                error_text = NULL,
+                updated_at = ?
+            WHERE id = ?
+              AND status = 'running'
+              AND lease_owner = ?
+              AND attempt_count = ?
+              AND attempt_count < max_attempts
+              AND cancel_requested = 0
+              AND lease_expires_at > ?
+              AND (deadline_at IS NULL OR deadline_at > ?)
+            """,
+            (
+                retry_not_before_at,
+                dumps_json(usage)
+                if usage is not None
+                else str(existing.get("usage_json") or "{}"),
+                timestamp,
+                job_id,
+                lease_owner,
+                attempt_count,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return get_job(conn, job_id) if updated else None
+
+
+def next_queued_retry_delay(
+    conn: Any,
+    *,
+    now: datetime | str | None = None,
+) -> float | None:
+    """Return seconds until the next delayed queued attempt or its deadline."""
+    now_dt = _utc_now(now)
+    rows = fetch_all(
+        conn,
+        """
+        SELECT retry_not_before_at, deadline_at
+        FROM reel_generation_jobs
+        WHERE status = 'queued'
+          AND attempt_count > 0
+          AND cancel_requested = 0
+          AND retry_not_before_at IS NOT NULL
+        """,
+    )
+    delays: list[float] = []
+    for row in rows:
+        try:
+            wake_at = _utc_now(row.get("retry_not_before_at"))
+            if row.get("deadline_at"):
+                wake_at = min(wake_at, _utc_now(row.get("deadline_at")))
+        except (TypeError, ValueError):
+            continue
+        delays.append(max(0.0, (wake_at - now_dt).total_seconds()))
+    return min(delays) if delays else None
 
 
 def transition_terminal(
@@ -1128,7 +1265,9 @@ __all__ = [
     "lease_job",
     "lease_next_job",
     "material_content_fingerprint",
+    "next_queued_retry_delay",
     "record_provider_usage",
+    "requeue_retryable_failure",
     "replay_events",
     "request_cancellation",
     "submit_or_get_active",

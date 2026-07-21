@@ -151,7 +151,7 @@ class GenerationJobStatusResponse(BaseModel):
     phase: str = ""
     progress: float = 0.0
     attempt_count: int = 0
-    max_attempts: int = 2
+    max_attempts: int = 3
     lease_expires_at: str | None = None
     heartbeat_at: str | None = None
     deadline_at: str | None = None

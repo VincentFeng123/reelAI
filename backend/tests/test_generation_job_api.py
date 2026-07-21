@@ -17,7 +17,11 @@ from backend.app import db
 from backend.app import main
 from backend.app.clip_engine import segment_cache
 from backend.app.clip_engine import silence as clip_engine_silence
-from backend.app.clip_engine.errors import ProviderQuotaError, ProviderTransientError
+from backend.app.clip_engine.errors import (
+    ProviderQuotaError,
+    ProviderRateLimitError,
+    ProviderTransientError,
+)
 from backend.app.clip_engine.provider_runtime import ProviderUsageRecord
 from backend.app.ingestion import pipeline as ingestion_pipeline
 from backend.app.ingestion.persistence import ensure_clip_concept
@@ -480,6 +484,84 @@ def test_generation_provider_usage_retries_once_with_stable_identity(
             "SELECT COUNT(*) FROM generation_provider_usage WHERE job_id = ?",
             (job["id"],),
         ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_generation_gemini_ledger_exposure_unions_and_deduplicates_snapshots() -> None:
+    conn = _conn()
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="provider-usage-union",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast"},
+    )
+    base_metadata = {
+        "provider_call": True,
+        "billing_usage_known": True,
+        "cached_tokens": 0,
+        "reserved_cost_usd": 0.25,
+        "admitted_cost_usd": 0.25,
+    }
+    prior_record = {
+        "provider": "gemini",
+        "operation": "segmentation",
+        "attempt": 1,
+        "timestamp": "2026-07-20T00:00:00+00:00",
+        "status_code": 200,
+        "billable_requests": 1,
+        "input_tokens": 100_000,
+        "output_tokens": 0,
+        "total_tokens": 100_000,
+        "model_used": "gemini-3.1-pro-preview",
+        "quality_degraded": False,
+        "error_code": "",
+        "metadata": dict(base_metadata),
+    }
+    prior_only_record = {
+        **prior_record,
+        "timestamp": "2026-07-19T23:59:59+00:00",
+        "metadata": dict(base_metadata),
+    }
+    for timestamp in (
+        "2026-07-20T00:00:00+00:00",
+        "2026-07-20T00:00:01+00:00",
+    ):
+        generation_jobs.record_provider_usage(
+            conn,
+            job_id=str(job["id"]),
+            provider="gemini",
+            operation="segmentation",
+            model="gemini-3.1-pro-preview",
+            billable_requests=1,
+            input_tokens=100_000,
+            output_tokens=0,
+            total_tokens=100_000,
+            metadata={
+                **base_metadata,
+                "attempt": 1,
+                "status_code": 200,
+                "quality_degraded": False,
+                "error_code": "",
+                "timestamp": timestamp,
+            },
+            now=timestamp,
+        )
+    try:
+        exposure = main._generation_gemini_ledger_exposure(
+            conn,
+            str(job["id"]),
+            prior_records=[prior_only_record, prior_record],
+        )
+
+        assert exposure["committed_cost_usd"] == pytest.approx(0.6)
+        assert exposure["cost_exposure_usd"] == pytest.approx(0.6)
+        assert exposure["lifetime_reserved_worst_case_cost_usd"] == pytest.approx(
+            0.75
+        )
     finally:
         conn.close()
 
@@ -1839,18 +1921,19 @@ def test_generation_worker_setup_lost_commit_ack_converges_before_provider_work(
     try:
         main._run_leased_generation_job(leased, threading.Event())
 
-        failed = generation_jobs.get_job(conn, str(job["id"]))
-        assert failed is not None
-        assert failed["status"] == "failed"
-        assert failed["terminal_error_code"] == "provider_transient"
+        requeued = generation_jobs.get_job(conn, str(job["id"]))
+        assert requeued is not None
+        assert requeued["status"] == "queued"
+        assert requeued["terminal_error_code"] is None
         assert retrieval_calls == 1
         assert first_committed_generation_id
-        assert failed["result_generation_id"] == first_committed_generation_id
+        assert requeued["result_generation_id"] == first_committed_generation_id
         assert created_generation_ids == [first_committed_generation_id]
         assert conn.execute(
             "SELECT COUNT(*) FROM reel_generations WHERE request_key = ?",
             ("setup-lost-ack-retry",),
         ).fetchone()[0] == 1
+        assert generation_jobs.replay_events(conn, job_id=str(job["id"])) == []
     finally:
         conn.close()
 
@@ -1858,14 +1941,6 @@ def test_generation_worker_setup_lost_commit_ack_converges_before_provider_work(
 @pytest.mark.parametrize(
     ("failure", "expected_code"),
     [
-        (
-            ProviderTransientError(
-                "provider unavailable",
-                provider="supadata",
-                operation="search",
-            ),
-            "provider_transient",
-        ),
         (RuntimeError("unexpected generation failure"), "generation_failed"),
     ],
 )
@@ -1925,6 +2000,604 @@ def test_generation_worker_retries_failure_terminalization_once(
             event["type"]
             for event in generation_jobs.replay_events(conn, job_id=str(job["id"]))
         ] == ["terminal"]
+    finally:
+        conn.close()
+
+
+def test_generation_worker_retries_transient_provider_twice_then_succeeds_same_job(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_transactional_worker_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="provider-retry-success-third-attempt",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    generated: list[dict] = []
+    retrieval_calls: list[dict] = []
+    wake = mock.Mock()
+    ledger_recovery = mock.Mock(wraps=main._generation_gemini_ledger_exposure)
+
+    def generate_stage(worker_conn, **kwargs) -> None:
+        retrieval_calls.append(kwargs)
+        reservation = kwargs["generation_context"].reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=100,
+            max_output_tokens=100,
+            max_physical_attempts=1,
+        )
+        kwargs["generation_context"].record_gemini(
+            operation="segmentation",
+            attempt=1,
+            model_used="gemini-3.1-pro-preview",
+            quality_degraded=False,
+            usage={
+                **reservation,
+                "prompt_tokens": 10,
+                "candidate_tokens": 2,
+                "total_tokens": 12,
+            },
+            status_code=503 if len(retrieval_calls) <= 2 else 200,
+            error_code=(
+                "provider_transient" if len(retrieval_calls) <= 2 else ""
+            ),
+            stage="segmentation",
+        )
+        if len(retrieval_calls) <= 2:
+            assert "AAAAAAAAAAA" not in kwargs["exclude_video_ids"]
+            kwargs["retrieved_video_ids"].add("AAAAAAAAAAA")
+            kwargs["attempted_video_ids"].add("AAAAAAAAAAA")
+            kwargs["generation_context"].increment_counter("provider_cursor_open")
+            raise ProviderTransientError(
+                "Gemini is temporarily unavailable.",
+                provider="gemini",
+                operation="segmentation",
+                status_code=503,
+            )
+        assert "AAAAAAAAAAA" in kwargs["exclude_video_ids"]
+        kwargs["retrieved_video_ids"].add("BBBBBBBBBBB")
+        kwargs["attempted_video_ids"].add("BBBBBBBBBBB")
+        kwargs["analyzed_video_ids"].add("BBBBBBBBBBB")
+        generated.append(
+            _insert_generation_reel(
+                worker_conn,
+                generation_id=str(kwargs["generation_id"]),
+                reel_id="provider-retry-reel",
+                video_id="BBBBBBBBBBB",
+                created_at=now.isoformat(),
+            )
+        )
+
+    def order_batch(reels, **_kwargs):
+        return mock.Mock(
+            reels=list(reels),
+            ordered_reel_ids=[reel["reel_id"] for reel in reels],
+            assessment_checkpoint_reel_ids=[],
+            model_used=None,
+            degraded=False,
+            fallback_reason=None,
+            provider_called=False,
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: list(generated),
+    )
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    monkeypatch.setattr(
+        main,
+        "_generation_gemini_ledger_exposure",
+        ledger_recovery,
+    )
+    try:
+        generation_id = ""
+        for attempt in (1, 2, 3):
+            leased = generation_jobs.lease_job(
+                conn,
+                job_id=str(job["id"]),
+                lease_owner=f"provider-retry-worker-{attempt}",
+                now=now + timedelta(seconds=attempt - 1),
+            )
+            assert leased and leased["attempt_count"] == attempt
+            main._run_leased_generation_job(leased, threading.Event())
+            current = generation_jobs.get_job(conn, str(job["id"]))
+            assert current is not None
+            if generation_id:
+                assert current["result_generation_id"] == generation_id
+            else:
+                generation_id = str(current["result_generation_id"] or "")
+                assert generation_id
+            if attempt < 3:
+                assert current["status"] == "queued"
+                usage = json.loads(str(current["usage_json"] or "{}"))
+                assert usage["failed_source_attempts"] == {
+                    "AAAAAAAAAAA": attempt,
+                }
+                assert len(usage["retry_errors"]) == attempt
+                assert generation_jobs.replay_events(
+                    conn,
+                    job_id=str(job["id"]),
+                ) == []
+            else:
+                assert current["status"] == "completed"
+
+        completed = generation_jobs.get_job(conn, str(job["id"]))
+        assert completed and completed["attempt_count"] == 3
+        usage = json.loads(str(completed["usage_json"] or "{}"))
+        assert usage["consumed_video_ids"] == ["BBBBBBBBBBB"]
+        assert usage["failed_source_attempts"] == {"AAAAAAAAAAA": 2}
+        assert len(usage["retry_errors"]) == 2
+        assert usage["counters"]["durable_attempts"] == 3
+        assert usage["counters"]["provider_cursor_open"] == 0
+        assert len(usage["provider_calls"]) == 3
+        assert usage["summary"]["gemini_calls"] == 3
+        assert usage["summary"]["input_tokens"] == 30
+        assert usage["by_stage"]["segmentation"]["calls"] == 3
+        assert len(usage["attempt_budgets"]) == 2
+        attempt_exposures = [
+            attempt_budget["gemini"]["cost_exposure_usd"]
+            for attempt_budget in usage["attempt_budgets"]
+        ]
+        assert 0 < attempt_exposures[0] < attempt_exposures[1]
+        final_budget = usage["budget"]["gemini"]
+        assert attempt_exposures[1] < final_budget["cost_exposure_usd"]
+        assert final_budget["cost_exposure_usd"] <= final_budget["cost_limit_usd"]
+        assert final_budget["selector_calls"] == 1
+        assert usage["summary"]["lifetime_reserved_worst_case_cost_usd"] == (
+            final_budget["lifetime_reserved_worst_case_cost_usd"]
+        )
+        assert main._generation_job_has_retryable_source_work(conn, completed) is False
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generations WHERE request_key = ?",
+            ("provider-retry-success-third-attempt",),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reels WHERE generation_id = ?",
+            (generation_id,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM generation_provider_usage WHERE job_id = ?",
+            (str(job["id"]),),
+        ).fetchone()[0] == 3
+        assert [
+            event["type"]
+            for event in generation_jobs.replay_events(conn, job_id=str(job["id"]))
+        ] == ["final", "terminal"]
+        assert wake.call_count == 2
+        assert len(retrieval_calls) == 3
+        assert ledger_recovery.call_count == 2
+    finally:
+        conn.close()
+
+
+def test_same_job_retry_composes_with_ancestral_source_attempt_bound(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_transactional_worker_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="ancestral-source-failure",
+        generation_mode="fast",
+        retrieval_profile="unified",
+    )
+    source_job = _terminal_job_for_generation(
+        conn,
+        request_key="ancestral-source-failure",
+        generation_id=source_generation_id,
+        completed_at=now.isoformat(),
+        status="failed",
+    )
+    conn.execute(
+        "UPDATE reel_generation_jobs SET usage_json = ? WHERE id = ?",
+        (
+            json.dumps({
+                "counters": {"provider_cursor_open": 0},
+                "consumed_video_ids": [],
+                "failed_source_attempts": {"AAAAAAAAAAA": 1},
+            }),
+            source_job["id"],
+        ),
+    )
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="same-job-with-ancestral-source-failure",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        source_generation_id=source_generation_id,
+        now=now,
+    )
+    generated: list[dict] = []
+    retrieval_calls = 0
+
+    def generate_stage(worker_conn, **kwargs) -> None:
+        nonlocal retrieval_calls
+        retrieval_calls += 1
+        if retrieval_calls == 1:
+            assert "AAAAAAAAAAA" not in kwargs["exclude_video_ids"]
+            kwargs["retrieved_video_ids"].add("AAAAAAAAAAA")
+            kwargs["attempted_video_ids"].add("AAAAAAAAAAA")
+            raise ProviderTransientError(
+                "Gemini is temporarily unavailable.",
+                provider="gemini",
+                operation="segmentation",
+                status_code=503,
+            )
+        assert "AAAAAAAAAAA" in kwargs["exclude_video_ids"]
+        kwargs["retrieved_video_ids"].add("BBBBBBBBBBB")
+        kwargs["attempted_video_ids"].add("BBBBBBBBBBB")
+        kwargs["analyzed_video_ids"].add("BBBBBBBBBBB")
+        generated.append(
+            _insert_generation_reel(
+                worker_conn,
+                generation_id=str(kwargs["generation_id"]),
+                reel_id="ancestral-retry-reel",
+                video_id="BBBBBBBBBBB",
+                created_at=now.isoformat(),
+            )
+        )
+
+    def order_batch(reels, **_kwargs):
+        return mock.Mock(
+            reels=list(reels),
+            ordered_reel_ids=[reel["reel_id"] for reel in reels],
+            assessment_checkpoint_reel_ids=[],
+            model_used=None,
+            degraded=False,
+            fallback_reason=None,
+            provider_called=False,
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: list(generated),
+    )
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
+    try:
+        first = generation_jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="ancestral-retry-worker-1",
+            now=now,
+        )
+        assert first
+        main._run_leased_generation_job(first, threading.Event())
+        requeued = generation_jobs.get_job(conn, job["id"])
+        assert requeued and requeued["status"] == "queued"
+        assert json.loads(requeued["usage_json"])["failed_source_attempts"] == {
+            "AAAAAAAAAAA": 1,
+        }
+
+        second = generation_jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="ancestral-retry-worker-2",
+            now=now + timedelta(seconds=1),
+        )
+        assert second and second["attempt_count"] == 2
+        main._run_leased_generation_job(second, threading.Event())
+
+        completed = generation_jobs.get_job(conn, job["id"])
+        assert completed and completed["status"] == "completed"
+        current_usage = json.loads(completed["usage_json"])
+        assert current_usage["failed_source_attempts"] == {"AAAAAAAAAAA": 1}
+        assert main._generation_chain_failed_source_attempts(
+            conn,
+            generation_id=str(completed["result_generation_id"]),
+        ) == {"AAAAAAAAAAA": 2}
+        assert retrieval_calls == 2
+    finally:
+        conn.close()
+
+
+def test_generation_worker_terminalizes_once_after_three_transient_failures(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_transactional_worker_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="provider-retry-exhausted-third-attempt",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    retrieval_calls = 0
+
+    def fail_stage(_worker_conn, **kwargs) -> None:
+        nonlocal retrieval_calls
+        retrieval_calls += 1
+        if retrieval_calls <= 2:
+            kwargs["retrieved_video_ids"].add("AAAAAAAAAAA")
+            kwargs["attempted_video_ids"].add("AAAAAAAAAAA")
+        else:
+            assert "AAAAAAAAAAA" in kwargs["exclude_video_ids"]
+        raise ProviderTransientError(
+            "Provider is temporarily unavailable.",
+            provider="gemini" if retrieval_calls <= 2 else "supadata",
+            operation="segmentation" if retrieval_calls <= 2 else "search",
+            status_code=503,
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", fail_stage)
+    try:
+        for attempt in (1, 2, 3):
+            leased = generation_jobs.lease_job(
+                conn,
+                job_id=str(job["id"]),
+                lease_owner=f"provider-failure-worker-{attempt}",
+                now=now + timedelta(seconds=attempt - 1),
+            )
+            assert leased and leased["attempt_count"] == attempt
+            main._run_leased_generation_job(leased, threading.Event())
+
+        failed = generation_jobs.get_job(conn, str(job["id"]))
+        assert failed and failed["status"] == "failed"
+        assert failed["attempt_count"] == failed["max_attempts"] == 3
+        assert failed["terminal_error_code"] == "provider_transient"
+        usage = json.loads(str(failed["usage_json"] or "{}"))
+        assert usage["failed_source_attempts"] == {"AAAAAAAAAAA": 2}
+        assert len(usage["retry_errors"]) == 3
+        assert usage["counters"]["provider_cursor_open"] == 0
+        assert main._generation_job_has_retryable_source_work(conn, failed) is False
+        assert [
+            event["type"]
+            for event in generation_jobs.replay_events(conn, job_id=str(job["id"]))
+        ] == ["terminal"]
+        assert generation_jobs.lease_job(
+            conn,
+            job_id=str(job["id"]),
+            lease_owner="provider-failure-worker-4",
+            now=now + timedelta(seconds=3),
+        ) is None
+        assert retrieval_calls == 3
+    finally:
+        conn.close()
+
+
+def test_reclaimed_lease_restores_gemini_exposure_from_durable_usage_ledger(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_transactional_worker_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="provider-ledger-budget-recovery",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    first = generation_jobs.lease_job(
+        conn,
+        job_id=str(job["id"]),
+        lease_owner="provider-ledger-crashed-worker",
+        lease_seconds=1,
+        now=now,
+    )
+    assert first and first["attempt_count"] == 1
+    generation_jobs.record_provider_usage(
+        conn,
+        job_id=str(job["id"]),
+        provider="gemini",
+        operation="segmentation",
+        model="gemini-3.1-pro-preview",
+        billable_requests=1,
+        input_tokens=100_000,
+        output_tokens=60_000,
+        total_tokens=160_000,
+        metadata={
+            "provider_call": True,
+            "billing_usage_known": True,
+            "cached_tokens": 0,
+            "reserved_cost_usd": 0.95,
+            "admitted_cost_usd": 0.95,
+        },
+        now=now,
+    )
+    reclaimed = generation_jobs.lease_job(
+        conn,
+        job_id=str(job["id"]),
+        lease_owner="provider-ledger-recovery-worker",
+        now=now + timedelta(seconds=2),
+    )
+    assert reclaimed and reclaimed["attempt_count"] == 2
+    seen_exposure: list[float] = []
+
+    def generate_stage(_worker_conn, **kwargs) -> None:
+        budget = kwargs["generation_context"].budget
+        seen_exposure.append(budget.snapshot()["gemini"]["cost_exposure_usd"])
+        budget_context = kwargs["generation_context"]
+        budget_context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=100_000,
+            max_output_tokens=6_000,
+            max_physical_attempts=1,
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    try:
+        main._run_leased_generation_job(reclaimed, threading.Event())
+
+        failed = generation_jobs.get_job(conn, str(job["id"]))
+        assert failed and failed["status"] == "failed"
+        assert failed["attempt_count"] == 2
+        assert failed["terminal_error_code"] == "provider_budget_exceeded"
+        assert seen_exposure == [pytest.approx(0.92)]
+        usage = json.loads(str(failed["usage_json"] or "{}"))
+        gemini_budget = usage["budget"]["gemini"]
+        assert gemini_budget["cost_exposure_usd"] == pytest.approx(0.92)
+        assert gemini_budget["cost_exposure_usd"] <= gemini_budget["cost_limit_usd"]
+        assert gemini_budget["lifetime_reserved_worst_case_cost_usd"] == pytest.approx(
+            0.95
+        )
+    finally:
+        conn.close()
+
+
+def test_retry_ledger_read_failure_never_starts_or_renews_heartbeat(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_transactional_worker_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="provider-ledger-read-failure",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    first = generation_jobs.lease_job(
+        conn,
+        job_id=str(job["id"]),
+        lease_owner="provider-ledger-read-crashed-worker",
+        lease_seconds=1,
+        now=now,
+    )
+    assert first
+    reclaimed = generation_jobs.lease_job(
+        conn,
+        job_id=str(job["id"]),
+        lease_owner="provider-ledger-read-worker-2",
+        lease_seconds=1,
+        now=now + timedelta(seconds=2),
+    )
+    assert reclaimed and reclaimed["attempt_count"] == 2
+    heartbeat_thread = mock.Mock()
+    monkeypatch.setattr(
+        main.threading,
+        "Thread",
+        mock.Mock(return_value=heartbeat_thread),
+    )
+    monkeypatch.setattr(
+        main,
+        "_generation_gemini_ledger_exposure",
+        mock.Mock(side_effect=RuntimeError("provider ledger unavailable")),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="provider ledger unavailable"):
+            main._run_leased_generation_job(reclaimed, threading.Event())
+
+        heartbeat_thread.start.assert_not_called()
+        heartbeat_thread.join.assert_not_called()
+        third = generation_jobs.lease_job(
+            conn,
+            job_id=str(job["id"]),
+            lease_owner="provider-ledger-read-worker-3",
+            lease_seconds=1,
+            now=now + timedelta(seconds=4),
+        )
+        assert third and third["attempt_count"] == 3
+    finally:
+        conn.close()
+
+
+def test_generation_worker_requeue_converges_after_lost_commit_ack(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="provider-requeue-lost-ack",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=str(job["id"]),
+        lease_owner="provider-requeue-lost-ack-worker",
+        now=now,
+    )
+    assert leased
+    ack_lost = False
+    requeue_calls = 0
+    original_requeue = main.requeue_generation_retryable_failure
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        nonlocal ack_lost
+        if transactional:
+            conn.execute("BEGIN")
+        try:
+            yield conn
+        except Exception:
+            if transactional:
+                conn.rollback()
+            raise
+        else:
+            if transactional:
+                conn.commit()
+                current = generation_jobs.get_job(conn, str(job["id"])) or {}
+                if current.get("status") == "queued" and not ack_lost:
+                    ack_lost = True
+                    raise _PostgresTransactionFailure("08006")
+
+    def track_requeue(worker_conn, **kwargs):
+        nonlocal requeue_calls
+        requeue_calls += 1
+        return original_requeue(worker_conn, **kwargs)
+
+    def fail_stage(_worker_conn, **_kwargs) -> None:
+        raise ProviderTransientError(
+            "Gemini is temporarily unavailable.",
+            provider="gemini",
+            operation="segmentation",
+            status_code=503,
+        )
+
+    monkeypatch.setattr(main, "get_conn", connection)
+    monkeypatch.setattr(main, "requeue_generation_retryable_failure", track_requeue)
+    monkeypatch.setattr(main.reel_service, "generate_reels", fail_stage)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        requeued = generation_jobs.get_job(conn, str(job["id"]))
+        assert ack_lost is True
+        assert requeue_calls == 2
+        assert requeued and requeued["status"] == "queued"
+        assert requeued["attempt_count"] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generations WHERE request_key = ?",
+            ("provider-requeue-lost-ack",),
+        ).fetchone()[0] == 1
+        assert generation_jobs.replay_events(conn, job_id=str(job["id"])) == []
     finally:
         conn.close()
 
@@ -5330,7 +6003,7 @@ def test_generation_worker_caps_stream_but_keeps_every_persisted_candidate(
     "mode",
     ["slow", "fast"],
 )
-def test_single_stage_deadline_provider_failure_is_fatal(
+def test_single_stage_retryable_provider_failure_is_requeued(
     monkeypatch,
     mode: str,
 ) -> None:
@@ -5372,44 +6045,33 @@ def test_single_stage_deadline_provider_failure_is_fatal(
         main._run_leased_generation_job(leased, threading.Event())
 
         completed_job = generation_jobs.get_job(conn, job["id"])
-        assert completed_job and completed_job["status"] == "failed"
+        assert completed_job and completed_job["status"] == "queued"
+        assert completed_job["attempt_count"] == 1
         assert [call["retrieval_profile"] for call in calls] == ["deep"]
         assert calls[0]["max_generation_videos"] == (2 if mode == "fast" else 3)
         terminal_error_code = conn.execute(
             "SELECT terminal_error_code FROM reel_generation_jobs WHERE id = ?",
             (job["id"],),
         ).fetchone()[0]
-        assert terminal_error_code == "provider_transient"
+        assert terminal_error_code is None
         failed_usage = json.loads(str(completed_job["usage_json"] or "{}"))
         assert failed_usage["consumed_video_ids"] == []
+        assert failed_usage["retry_errors"][0]["code"] == "provider_transient"
         assert main._generation_chain_consumed_video_ids(
             conn,
             generation_id=str(completed_job["result_generation_id"] or ""),
         ) == set()
+        assert generation_jobs.replay_events(conn, job_id=job["id"]) == []
     finally:
         conn.close()
 
 
-@pytest.mark.parametrize(
-    "provider_error",
-    [
-        ProviderQuotaError(
-            "Supadata quota is exhausted.",
-            provider="supadata",
-            operation="search",
-        ),
-        ProviderTransientError(
-            "Could not reach Supadata search.",
-            provider="supadata",
-            operation="search",
-            detail="connection reset",
-        ),
-    ],
-)
-def test_single_stage_non_deadline_provider_failures_remain_fatal(
-    monkeypatch,
-    provider_error,
-) -> None:
+def test_single_stage_nonretryable_provider_failure_remains_fatal(monkeypatch) -> None:
+    provider_error = ProviderQuotaError(
+        "Supadata quota is exhausted.",
+        provider="supadata",
+        operation="search",
+    )
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
     now = datetime.now(timezone.utc)
@@ -5447,6 +6109,193 @@ def test_single_stage_non_deadline_provider_failures_remain_fatal(
             "SELECT terminal_error_code FROM reel_generation_jobs WHERE id = ?",
             (job["id"],),
         ).fetchone()[0] == provider_error.code
+    finally:
+        conn.close()
+
+
+def test_rate_limited_provider_job_honors_retry_after_before_second_lease(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="provider-rate-limit-retry-after",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="provider-rate-limit-worker",
+        now=now,
+    )
+    assert leased
+
+    def fail_stage(_worker_conn, **_kwargs) -> None:
+        raise ProviderRateLimitError(
+            "Provider asked the client to retry later.",
+            provider="gemini",
+            operation="segmentation",
+            status_code=429,
+            retry_after_sec=5.0,
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", fail_stage)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        requeued = generation_jobs.get_job(conn, job["id"])
+        assert requeued and requeued["status"] == "queued"
+        retry_at = datetime.fromisoformat(requeued["retry_not_before_at"])
+        checked_at = datetime.now(timezone.utc)
+        assert 4.0 <= (retry_at - checked_at).total_seconds() <= 5.0
+        assert generation_jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="provider-rate-limit-too-early",
+            now=checked_at,
+        ) is None
+        second = generation_jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="provider-rate-limit-worker-2",
+            now=retry_at,
+        )
+        assert second and second["attempt_count"] == 2
+    finally:
+        conn.close()
+
+
+def test_ingestion_process_rate_limit_requeues_same_job_until_retry_after(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="ingestion-rate-limit-retry-after",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="ingestion-rate-limit-worker",
+        now=now,
+    )
+    assert leased
+
+    def fail_stage(_worker_conn, **_kwargs) -> None:
+        raise main.IngestRateLimitedError(
+            "The process-wide YouTube limiter is saturated.",
+            retry_after_sec=5.0,
+            detail="youtube concurrency limit",
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", fail_stage)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        requeued = generation_jobs.get_job(conn, job["id"])
+        assert requeued and requeued["status"] == "queued"
+        assert requeued["phase"] == "retrying"
+        assert requeued["terminal_error_code"] is None
+        retry_at = datetime.fromisoformat(requeued["retry_not_before_at"])
+        checked_at = datetime.now(timezone.utc)
+        assert 4.0 <= (retry_at - checked_at).total_seconds() <= 5.0
+        usage = json.loads(str(requeued["usage_json"] or "{}"))
+        assert usage["retry_errors"][-1] == {
+            "code": "provider_rate_limited",
+            "message": "The process-wide YouTube limiter is saturated.",
+            "provider": "ingestion",
+            "operation": "platform_rate_limit",
+            "retryable": True,
+            "status_code": 429,
+            "retry_after_sec": 5.0,
+            "detail": "youtube concurrency limit",
+        }
+        assert generation_jobs.replay_events(conn, job_id=job["id"]) == []
+        assert generation_jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="ingestion-rate-limit-too-early",
+            now=checked_at,
+        ) is None
+        second = generation_jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="ingestion-rate-limit-worker-2",
+            now=retry_at,
+        )
+        assert second and second["attempt_count"] == 2
+    finally:
+        conn.close()
+
+
+def test_provider_failure_yields_and_wakes_when_lease_expires_during_call(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="provider-failure-expired-lease",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="provider-expiring-lease-worker",
+        now=now,
+    )
+    assert leased
+    wake = mock.Mock()
+
+    def expire_then_fail(worker_conn, **_kwargs) -> None:
+        worker_conn.execute(
+            "UPDATE reel_generation_jobs SET lease_expires_at = ? WHERE id = ?",
+            ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), job["id"]),
+        )
+        raise ProviderTransientError(
+            "Provider failed as the worker lease expired.",
+            provider="gemini",
+            operation="segmentation",
+            status_code=503,
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", expire_then_fail)
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        yielded = generation_jobs.get_job(conn, job["id"])
+        assert yielded and yielded["status"] == "running"
+        assert yielded["attempt_count"] == 1
+        wake.assert_called_once_with()
+        recovered = generation_jobs.lease_next_job(
+            conn,
+            lease_owner="provider-expired-lease-recovery-worker",
+            now=datetime.now(timezone.utc),
+        )
+        assert recovered and recovered["id"] == job["id"]
+        assert recovered["attempt_count"] == 2
     finally:
         conn.close()
 
@@ -5736,6 +6585,189 @@ def test_generate_implicit_retry_carries_failed_source_attempts_and_stops_at_bou
         assert conn.execute(
             "SELECT COUNT(*) FROM reel_generation_jobs"
         ).fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_global_provider_failure_allows_explicit_root_but_suppresses_feed_retry(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    wake = mock.Mock()
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    monkeypatch.setattr(main, "_ranked_request_reels", lambda *_args, **_kwargs: [])
+    direct_payload = ReelsGenerateRequest(
+        material_id="m1",
+        concept_id="c1",
+        num_reels=3,
+    )
+    try:
+        first_direct = asyncio.run(main.generate_reels(object(), direct_payload))
+        direct_job_id = json.loads(first_direct.body)["job_id"]
+        direct_job = generation_jobs.get_job(conn, direct_job_id)
+        assert direct_job
+        direct_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=str(direct_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=direct_job_id,
+            status="failed",
+            result_generation_id=direct_generation_id,
+            error_code="provider_quota_exhausted",
+            usage={
+                "counters": {"provider_cursor_open": 1},
+                "consumed_video_ids": [],
+                "failed_source_attempts": {"AAAAAAAAAAA": 1},
+            },
+        )
+        direct_terminal = generation_jobs.get_job(conn, direct_job_id)
+        assert direct_terminal
+        assert main._generation_job_has_retryable_source_work(
+            conn,
+            direct_terminal,
+        ) is False
+
+        cross_request_lookup = mock.Mock(return_value="must-not-link")
+        monkeypatch.setattr(
+            main,
+            "_verified_cross_request_source_generation",
+            cross_request_lookup,
+        )
+        direct_retry = asyncio.run(main.generate_reels(object(), direct_payload))
+        assert direct_retry.status_code == 202
+        direct_retry_job_id = json.loads(direct_retry.body)["job_id"]
+        assert direct_retry_job_id != direct_job_id
+        direct_retry_job = generation_jobs.get_job(conn, direct_retry_job_id)
+        assert direct_retry_job
+        assert not direct_retry_job["source_generation_id"]
+        assert cross_request_lookup.call_count == 0
+
+        repeated_direct_retry = asyncio.run(
+            main.generate_reels(object(), direct_payload)
+        )
+        assert json.loads(repeated_direct_retry.body)["job_id"] == direct_retry_job_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs WHERE concept_id = 'c1'"
+        ).fetchone()[0] == 2
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=direct_retry_job_id,
+            status="failed",
+            error_code="generation_failed",
+            error_message="test recovery released the active queue slot",
+        )
+
+        cross_request_lookup.return_value = None
+        first_feed = main.feed(object(), material_id="m1", autofill=True)
+        feed_job_id = str(first_feed["generation_job_id"] or "")
+        assert feed_job_id
+        feed_job = generation_jobs.get_job(conn, feed_job_id)
+        assert feed_job
+        feed_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id=None,
+            request_key=str(feed_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=feed_job_id,
+            status="failed",
+            result_generation_id=feed_generation_id,
+            error_code="provider_quota_exhausted",
+            usage={
+                "counters": {"provider_cursor_open": 1},
+                "consumed_video_ids": [],
+            },
+        )
+
+        cross_request_lookup.reset_mock()
+        wake_before_repeat = wake.call_count
+        repeated_feed = main.feed(object(), material_id="m1", autofill=True)
+        repeated_feed_again = main.feed(object(), material_id="m1", autofill=True)
+        assert repeated_feed["generation_job_id"] == feed_job_id
+        assert repeated_feed["generation_job_status"] == "failed"
+        assert repeated_feed_again["generation_job_id"] == feed_job_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs WHERE concept_id IS NULL"
+        ).fetchone()[0] == 1
+        assert cross_request_lookup.call_count == 0
+        assert wake.call_count == wake_before_repeat
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "terminal_error_code",
+    ["provider_rate_limited", "provider_transient"],
+)
+def test_feed_suppresses_terminal_provider_failure_without_source_work(
+    monkeypatch,
+    terminal_error_code: str,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    wake = mock.Mock()
+    cross_request_lookup = mock.Mock(return_value=None)
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    monkeypatch.setattr(main, "_ranked_request_reels", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        main,
+        "_verified_cross_request_source_generation",
+        cross_request_lookup,
+    )
+    try:
+        first_feed = main.feed(object(), material_id="m1", autofill=True)
+        job_id = str(first_feed["generation_job_id"] or "")
+        job = generation_jobs.get_job(conn, job_id)
+        assert job
+        generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id=None,
+            request_key=str(job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        conn.execute(
+            "UPDATE reel_generation_jobs SET attempt_count = max_attempts WHERE id = ?",
+            (job_id,),
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=job_id,
+            status="failed",
+            result_generation_id=generation_id,
+            error_code=terminal_error_code,
+            usage={
+                "counters": {"provider_cursor_open": 0},
+                "consumed_video_ids": [],
+                "failed_source_attempts": {},
+            },
+        )
+
+        cross_request_lookup.reset_mock()
+        wake_before_repeat = wake.call_count
+        repeated = main.feed(object(), material_id="m1", autofill=True)
+        repeated_again = main.feed(object(), material_id="m1", autofill=True)
+
+        assert repeated["generation_job_id"] == job_id
+        assert repeated["generation_job_status"] == "failed"
+        assert repeated_again["generation_job_id"] == job_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs WHERE concept_id IS NULL"
+        ).fetchone()[0] == 1
+        assert cross_request_lookup.call_count == 0
+        assert wake.call_count == wake_before_repeat
     finally:
         conn.close()
 

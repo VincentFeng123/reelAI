@@ -112,6 +112,7 @@ from ..clip_engine.provider_runtime import GenerationContext
 from ..clip_engine.errors import (
     CancellationError as _ClipCancellationError,
     ClipError as _ClipError,
+    JOB_GLOBAL_PROVIDER_ERROR_CODES as _JOB_GLOBAL_PROVIDER_ERROR_CODES,
     ProviderError as _ClipProviderError,
     TranscriptError as _ClipTranscriptError,
     TranscriptUnavailableError as _TranscriptUnavailableError,
@@ -6211,8 +6212,30 @@ class IngestionPipeline:
             for index in range(len(videos))
             for reel in reels_by_video.get(index, [])
         ]
-        if not completed_results and provider_errors:
-            raise provider_errors[0]
+        if not reels and provider_errors:
+            job_global_error = next(
+                (
+                    error
+                    for error in provider_errors
+                    if error.code in _JOB_GLOBAL_PROVIDER_ERROR_CODES
+                    and not error.retryable
+                ),
+                None,
+            )
+            retryable_global_error = max(
+                (
+                    error
+                    for error in provider_errors
+                    if error.code in _JOB_GLOBAL_PROVIDER_ERROR_CODES
+                    and error.retryable
+                ),
+                key=lambda error: float(error.retry_after_sec or 0.0),
+                default=None,
+            )
+            raise job_global_error or retryable_global_error or next(
+                (error for error in provider_errors if error.retryable),
+                provider_errors[0],
+            )
         return reels, resolved_video_ids
 
     def _clip_and_filter(

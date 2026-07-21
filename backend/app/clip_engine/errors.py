@@ -3,6 +3,16 @@ from __future__ import annotations
 from typing import Any
 
 
+JOB_GLOBAL_PROVIDER_ERROR_CODES = frozenset({
+    "model_unavailable",
+    "provider_authentication",
+    "provider_budget_exceeded",
+    "provider_configuration",
+    "provider_quota_exhausted",
+    "provider_rate_limited",
+})
+
+
 class EngineError(Exception):
     """Base error for the clip engine."""
 

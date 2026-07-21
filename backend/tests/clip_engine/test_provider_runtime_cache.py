@@ -378,6 +378,75 @@ def test_current_cost_diagnostics_do_not_report_lifetime_reservations_as_spend()
     assert summary["cost_limit_usd"] == pytest.approx(1.50)
 
 
+def test_durable_retry_restores_cost_exposure_but_reopens_selector_slots() -> None:
+    first = GenerationContext("slow", generation_id="job-budget-attempt-1")
+    for _ in range(3):
+        reservation = first.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
+            max_physical_attempts=1,
+        )
+        first.record_gemini(
+            attempt=1,
+            model_used="gemini-3.1-pro-preview",
+            quality_degraded=False,
+            stage="selection",
+            usage={
+                **reservation,
+                "prompt_tokens": 100,
+                "candidate_tokens": 10,
+                "total_tokens": 110,
+                "dispatched": True,
+            },
+        )
+
+    persisted = first.budget.snapshot()
+    assert persisted["gemini"]["selector_calls"] == 3
+
+    retry = GenerationContext("slow", generation_id="job-budget-attempt-2")
+    retry.budget.restore_gemini_retry_exposure(persisted)
+    restored = retry.budget.snapshot()["gemini"]
+    assert restored["committed_cost_usd"] == pytest.approx(
+        persisted["gemini"]["cost_exposure_usd"]
+    )
+    assert restored["selector_calls"] == 0
+    retry.reserve_gemini_call(
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=1_000,
+        max_output_tokens=100,
+        max_physical_attempts=1,
+    )
+    assert retry.budget.snapshot()["gemini"]["selector_calls"] == 1
+
+
+def test_durable_retry_counts_unsettled_prior_reservation_against_cost_ceiling() -> None:
+    retry = GenerationContext("fast", generation_id="job-budget-unsettled-retry")
+    retry.budget.restore_gemini_retry_exposure({
+        "mode": "fast",
+        "gemini": {
+            "committed_cost_usd": 0.1,
+            "cost_exposure_usd": 0.9,
+            "inflight_reserved_cost_usd": 0.8,
+            "billing_unknown_cost_exposure_usd": 0.02,
+        },
+    })
+
+    restored = retry.budget.snapshot()["gemini"]
+    assert restored["committed_cost_usd"] == pytest.approx(0.9)
+    assert restored["billing_unknown_cost_exposure_usd"] == pytest.approx(0.82)
+    with pytest.raises(ProviderBudgetExceededError, match="cost budget"):
+        retry.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=100_000,
+            max_output_tokens=6_000,
+            max_physical_attempts=1,
+        )
+
+
 @pytest.mark.parametrize(
     ("mode", "selector_count"),
     [("fast", 2), ("slow", 3)],

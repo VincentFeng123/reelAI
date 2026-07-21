@@ -242,8 +242,9 @@ CREATE TABLE IF NOT EXISTS reel_generation_jobs (
     lease_owner TEXT,
     lease_expires_at TEXT,
     heartbeat_at TEXT,
+    retry_not_before_at TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
-    max_attempts INTEGER NOT NULL DEFAULT 2,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
     deadline_at TEXT,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
     cancel_requested_at TEXT,
@@ -1257,8 +1258,9 @@ _DURABLE_JOB_SQLITE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("lease_owner", "TEXT"),
     ("lease_expires_at", "TEXT"),
     ("heartbeat_at", "TEXT"),
+    ("retry_not_before_at", "TEXT"),
     ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
-    ("max_attempts", "INTEGER NOT NULL DEFAULT 2"),
+    ("max_attempts", "INTEGER NOT NULL DEFAULT 3"),
     ("deadline_at", "TEXT"),
     ("cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
     ("cancel_requested_at", "TEXT"),
@@ -1569,6 +1571,10 @@ def _migrate_durable_generation_foundation_sqlite(conn: sqlite3.Connection) -> N
 
     timestamp = now_iso()
     conn.execute(
+        "UPDATE reel_generation_jobs SET max_attempts = 3 "
+        "WHERE status IN ('queued', 'running') AND max_attempts < 3"
+    )
+    conn.execute(
         """
         UPDATE reel_generation_jobs
         SET status = 'cancelled',
@@ -1660,6 +1666,11 @@ def _migrate_durable_generation_foundation_postgres(conn: Any) -> None:
         for name, declaration in _DURABLE_REEL_SQLITE_COLUMNS:
             cur.execute(f"ALTER TABLE reels ADD COLUMN IF NOT EXISTS {name} {declaration}")
         cur.execute("ALTER TABLE reel_generation_jobs ALTER COLUMN source_generation_id SET DEFAULT ''")
+        cur.execute("ALTER TABLE reel_generation_jobs ALTER COLUMN max_attempts SET DEFAULT 3")
+        cur.execute(
+            "UPDATE reel_generation_jobs SET max_attempts = 3 "
+            "WHERE status IN ('queued', 'running') AND max_attempts < 3"
+        )
         cur.execute(
             """
             UPDATE reel_generation_jobs

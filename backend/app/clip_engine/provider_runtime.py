@@ -1,6 +1,7 @@
 """Shared provider budgets, retry parsing, and per-generation usage accounting."""
 from __future__ import annotations
 
+import json
 import logging
 import math
 import threading
@@ -8,7 +9,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Callable, Literal, Mapping
+from typing import Any, Callable, Iterable, Literal, Mapping
 
 from .errors import ProviderBudgetExceededError
 
@@ -129,7 +130,7 @@ class _GeminiCostReservation:
 
 
 class GenerationBudget:
-    """Atomic, job-wide provider ceilings plus acquisition-pass controls."""
+    """Per-attempt call ceilings plus a durable job-wide Gemini cost ceiling."""
 
     _LIMITS: dict[GenerationMode, dict[BudgetedProviderOperation, int]] = {
         # Search/transcript reservations count logical requests. Each logical
@@ -197,6 +198,67 @@ class GenerationBudget:
     @classmethod
     def for_mode(cls, mode: str) -> "GenerationBudget":
         return cls("fast" if str(mode).strip().lower() == "fast" else "slow")
+
+    def restore_gemini_retry_exposure(
+        self,
+        snapshot: Mapping[str, Any] | None,
+    ) -> None:
+        """Restore billed or still-possibly-billed cost for a durable retry."""
+        if not isinstance(snapshot, Mapping):
+            return
+        persisted_mode = str(snapshot.get("mode") or "").strip().lower()
+        if persisted_mode and persisted_mode != self.mode:
+            return
+        gemini = snapshot.get("gemini")
+        if not isinstance(gemini, Mapping):
+            return
+
+        def nonnegative_float(name: str, *aliases: str) -> float:
+            raw_value: Any = None
+            for candidate in (name, *aliases):
+                if candidate in gemini:
+                    raw_value = gemini[candidate]
+                    break
+            try:
+                value = float(raw_value or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
+            if math.isnan(value):
+                return 0.0
+            if math.isinf(value):
+                return self._GEMINI_COST_LIMIT_USD[self.mode] if value > 0 else 0.0
+            return max(0.0, value)
+
+        with self._gemini_condition:
+            committed = nonnegative_float(
+                "committed_cost_usd",
+                "settled_cost_exposure_usd",
+            )
+            exposure = max(
+                committed,
+                nonnegative_float("cost_exposure_usd"),
+                committed + nonnegative_float("inflight_reserved_cost_usd"),
+            )
+            unknown = min(
+                exposure,
+                nonnegative_float("billing_unknown_cost_exposure_usd")
+                + max(0.0, exposure - committed),
+            )
+            self._gemini_committed_cost_usd = max(
+                self._gemini_committed_cost_usd,
+                exposure,
+            )
+            self._gemini_billing_unknown_cost_usd = max(
+                self._gemini_billing_unknown_cost_usd,
+                unknown,
+            )
+            self._gemini_reserved_cost_usd = max(
+                self._gemini_reserved_cost_usd,
+                nonnegative_float(
+                    "lifetime_reserved_worst_case_cost_usd",
+                    "reserved_cost_usd",
+                ),
+            )
 
     def reserve(self, operation: BudgetedProviderOperation, count: int = 1) -> int:
         count = max(1, int(count))
@@ -1401,3 +1463,74 @@ class GenerationContext:
             "provider_calls": records,
             "counters": counters,
         }
+
+
+def gemini_usage_records_exposure(
+    records: Iterable[Mapping[str, Any]],
+) -> dict[str, float]:
+    """Reconstruct billed exposure from the durable per-call Gemini ledger."""
+    known_cost = 0.0
+    unknown_cost = 0.0
+    lifetime_reserved_cost = 0.0
+    seen_records: set[str] = set()
+    for record in records:
+        if str(record.get("provider") or "").casefold() != "gemini":
+            continue
+        raw_metadata = record.get("metadata")
+        metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+        envelope: dict[str, Any] = {}
+        for field_name in (
+            "attempt",
+            "timestamp",
+            "status_code",
+            "quality_degraded",
+            "error_code",
+        ):
+            envelope[field_name] = (
+                record.get(field_name)
+                if record.get(field_name) is not None
+                else metadata.get(field_name)
+            )
+            metadata.pop(field_name, None)
+        record_key = json.dumps(
+            {
+                "provider": "gemini",
+                "operation": str(record.get("operation") or ""),
+                "model_used": str(record.get("model_used") or ""),
+                "billable_requests": int(record.get("billable_requests") or 0),
+                "input_tokens": int(record.get("input_tokens") or 0),
+                "output_tokens": int(record.get("output_tokens") or 0),
+                "total_tokens": int(record.get("total_tokens") or 0),
+                "envelope": envelope,
+                "metadata": metadata,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        if record_key in seen_records:
+            continue
+        seen_records.add(record_key)
+        known_cost += GenerationContext._gemini_cost(record)
+        unknown_cost += _gemini_record_unknown_billing_cost(record)
+        try:
+            lifetime_reserved_cost += max(
+                0.0,
+                float(
+                    metadata.get("admitted_cost_usd")
+                    or metadata.get("reserved_cost_usd")
+                    or 0.0
+                ),
+            )
+        except (TypeError, ValueError, OverflowError):
+            continue
+    exposure = max(0.0, known_cost + unknown_cost)
+    return {
+        "committed_cost_usd": exposure,
+        "cost_exposure_usd": exposure,
+        "billing_unknown_cost_exposure_usd": max(0.0, unknown_cost),
+        "lifetime_reserved_worst_case_cost_usd": max(
+            0.0,
+            lifetime_reserved_cost,
+        ),
+    }
