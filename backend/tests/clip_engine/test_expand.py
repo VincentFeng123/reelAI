@@ -93,9 +93,9 @@ def test_unicode_normalization_prevents_duplicate_queries() -> None:
 
 
 def test_intent_tokens_preserve_attached_language_punctuation_only() -> None:
-    assert expand._intent_tokens("C C++ C#") == ["c", "c++", "c#"]
+    assert expand._intent_tokens("C C++ C#") == ["C", "c++", "c#"]
     assert expand._intent_tokens("C + + memory # topic") == [
-        "c",
+        "C",
         "memory",
         "topic",
     ]

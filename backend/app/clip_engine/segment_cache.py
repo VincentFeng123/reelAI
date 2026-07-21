@@ -12,6 +12,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ... import config as pipeline_config
+from ...intent_obligations import (
+    INTENT_OBLIGATION_CONTRACT_VERSION,
+    normalize_intent_obligations,
+)
 from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 
 
@@ -109,11 +113,17 @@ def _relevant_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
 def _segmenter_source_signature() -> str | None:
     """Invalidate cache entries whenever the active prompt or validators change."""
     try:
-        from ... import gemini_client
+        from ... import gemini_client, intent_obligations
         from ...pipeline import discourse, gemini_segment, sentences
 
         digest = hashlib.sha256()
-        for module in (gemini_segment, discourse, sentences, gemini_client):
+        for module in (
+            gemini_segment,
+            discourse,
+            sentences,
+            gemini_client,
+            intent_obligations,
+        ):
             source_path = Path(str(module.__file__ or ""))
             digest.update(source_path.name.encode("utf-8"))
             digest.update(b"\0")
@@ -248,6 +258,22 @@ def _valid_clips(
             or concept_aliases != []
         ):
             return None
+        obligation_version = str(
+            raw.get("intent_obligation_contract_version") or ""
+        ).strip()
+        raw_obligations = raw.get("intent_obligations")
+        if obligation_version or raw_obligations is not None:
+            normalized_obligations = normalize_intent_obligations(
+                raw_obligations,
+                require_evidence=True,
+            )
+            if (
+                not gemini_authoritative
+                or obligation_version != INTENT_OBLIGATION_CONTRACT_VERSION
+                or not isinstance(raw_obligations, list)
+                or normalized_obligations != raw_obligations
+            ):
+                return None
         score_values = (
             raw.get("informativeness"),
             raw.get("topic_relevance"),

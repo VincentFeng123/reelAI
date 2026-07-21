@@ -17,6 +17,7 @@ from .errors import (
     ProviderBudgetExceededError,
     ProviderError,
     ProviderRequestError,
+    ProviderResponseValidationError,
     ProviderTransientError,
     TranscriptError,
     UnsupportedURLError,
@@ -25,6 +26,45 @@ from .metadata import extract_video_id
 from .provider_runtime import GenerationContext
 
 _TRANSCRIPT_PHASE_TIMEOUT_S = 75.0
+_SELECTOR_RESPONSE_VALIDATION_ERROR_TYPES = frozenset({
+    "GeminiSelectorContractError",
+    "GeminiSelectorSchemaError",
+    "_SchemaResponseError",
+})
+
+
+def _selector_response_validation_detail(
+    telemetry: dict,
+    error_type: str,
+) -> str:
+    """Return bounded internal reason codes without provider/user content."""
+    reasons: list[str] = []
+    for field_name in (
+        "selector_contract_rejection_reasons",
+        "schema_rejection_reasons",
+    ):
+        raw_reasons = telemetry.get(field_name)
+        if not isinstance(raw_reasons, list):
+            continue
+        for raw_reason in raw_reasons:
+            reason = str(raw_reason or "").strip()
+            if (
+                not reason
+                or len(reason) > 160
+                or any(
+                    not character.isascii()
+                    or not (character.isalnum() or character in "._:-")
+                    for character in reason
+                )
+            ):
+                continue
+            if reason not in reasons:
+                reasons.append(reason)
+            if len(reasons) >= 8:
+                break
+        if len(reasons) >= 8:
+            break
+    return ":".join([error_type, *reasons])[:500]
 
 
 def is_valid_timestamped_supadata_transcript(transcript: dict) -> bool:
@@ -299,6 +339,24 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
                     provider="gemini",
                     operation="segmentation",
                     detail=error_type,
+                ) from exc
+            if error_type in _SELECTOR_RESPONSE_VALIDATION_ERROR_TYPES:
+                contract_failure = error_type == "GeminiSelectorContractError"
+                raise ProviderResponseValidationError(
+                    (
+                        "Gemini responded, but its clip plan did not satisfy "
+                        "the learning-request contract."
+                        if contract_failure
+                        else "Gemini responded, but its clip plan did not match "
+                        "the required response schema."
+                    ),
+                    provider="gemini",
+                    operation="segmentation",
+                    status_code=200,
+                    detail=_selector_response_validation_detail(
+                        telemetry,
+                        error_type,
+                    ),
                 ) from exc
             if isinstance(raw_retryable, bool):
                 transient = raw_retryable

@@ -11,6 +11,7 @@ from backend.app.clip_engine.errors import (
     ProviderBudgetExceededError,
     ProviderQuotaError,
     ProviderRequestError,
+    ProviderResponseValidationError,
     ProviderTransientError,
     UnsupportedURLError,
 )
@@ -542,7 +543,11 @@ def test_failed_selector_result_is_not_cached(monkeypatch):
     assert stored == []
 
 
-def test_selector_outage_preserves_transcript_success_and_typed_failure(monkeypatch):
+@pytest.mark.parametrize("provider_status", [429, 503])
+def test_selector_outage_preserves_transcript_success_and_typed_failure(
+    monkeypatch,
+    provider_status,
+):
     transcript = {
         "segments": [{
             "cue_id": "outage-cue",
@@ -561,7 +566,7 @@ def test_selector_outage_preserves_transcript_success_and_typed_failure(monkeypa
     failure.telemetry = {
         "error_type": "GeminiTransportError",
         "provider_error_type": "ServerError",
-        "provider_status_code": 503,
+        "provider_status_code": provider_status,
         "retryable": True,
     }
     monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
@@ -578,9 +583,79 @@ def test_selector_outage_preserves_transcript_success_and_typed_failure(monkeypa
             settings={"generation_context": context},
         )
 
-    assert exc_info.value.status_code == 503
+    assert exc_info.value.status_code == provider_status
     assert exc_info.value.operation == "segmentation"
+    assert str(exc_info.value) == "Gemini is temporarily unavailable."
     assert context.counters()["usable_transcripts"] == 1
+
+
+@pytest.mark.parametrize(
+    ("error_type", "reason_field", "reason", "message_fragment"),
+    [
+        (
+            "GeminiSelectorContractError",
+            "selector_contract_rejection_reasons",
+            "intent_contract_incomplete_joint_structure",
+            "learning-request contract",
+        ),
+        (
+            "GeminiSelectorSchemaError",
+            "schema_rejection_reasons",
+            "proposal_0:schema_invalid:family:missing",
+            "required response schema",
+        ),
+        (
+            "_SchemaResponseError",
+            "schema_rejection_reasons",
+            "structured_response_invalid",
+            "required response schema",
+        ),
+    ],
+)
+def test_selector_response_validation_is_retryable_without_claiming_outage(
+    monkeypatch,
+    error_type,
+    reason_field,
+    reason,
+    message_fragment,
+):
+    transcript = {
+        "segments": [{
+            "cue_id": "response-validation-cue",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "A complete educational explanation.",
+        }],
+        "words": [],
+        "duration": 5.0,
+        "source": "supadata",
+        "artifact_key": "supadata-transcript:v2:response-validation",
+        "native_mode": False,
+    }
+    failure = RuntimeError("segmentation provider call failed")
+    failure.telemetry = {
+        "error_type": error_type,
+        "retryable": True,
+        reason_field: [reason, "unsafe reason with spaces"],
+    }
+    monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(
+        run.gemini_segment,
+        "segment_clips",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(ProviderResponseValidationError) as exc_info:
+        run.clip("https://youtu.be/dQw4w9WgXcQ", "topic")
+
+    error = exc_info.value
+    assert error.code == "provider_response_invalid"
+    assert error.retryable is True
+    assert error.status_code == 200
+    assert message_fragment in str(error)
+    assert "unavailable" not in str(error).casefold()
+    assert error.detail == f"{error_type}:{reason}"
+    assert "unsafe reason" not in error.detail
 
 
 def test_internal_selector_budget_is_not_reported_as_gemini_rejection(monkeypatch):

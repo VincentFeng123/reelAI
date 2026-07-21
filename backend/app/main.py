@@ -32,6 +32,7 @@ from backend.concept_families import (
     has_incompatible_gemini_concept_family_contract,
 )
 from backend.concept_tokens import semantic_key, semantic_tokens
+from backend.intent_obligations import intent_obligation_keys
 
 from .config import get_settings
 from .db import (
@@ -2981,7 +2982,18 @@ def _stored_generation_lesson_order_metadata(
 ) -> dict[str, Any] | None:
     """Return persisted metadata, None for legacy, or {} for corruption."""
     row = _fetch_generation_row(conn, generation_id)
-    raw = (row or {}).get("lesson_order_json")
+    return _parse_generation_lesson_order_metadata(
+        (row or {}).get("lesson_order_json"),
+        generation_id=generation_id,
+    )
+
+
+def _parse_generation_lesson_order_metadata(
+    raw: object,
+    *,
+    generation_id: str | None,
+) -> dict[str, Any] | None:
+    """Parse already-loaded lesson metadata with legacy/corruption semantics."""
     if raw is None:
         return None
     try:
@@ -3015,6 +3027,41 @@ def _stored_generation_lesson_order_ids(
         logger.warning("Rejecting invalid lesson order generation_id=%s", generation_id)
         return []
     return ordered_ids
+
+
+def _surviving_terminal_summary_start_reel_id(
+    *,
+    ordered_reel_ids: Iterable[str],
+    terminal_summary_start_reel_id: object,
+    surviving_reel_ids: Iterable[str],
+) -> str | None:
+    """Project an organizer recap suffix marker onto the surviving release."""
+    marker = (
+        terminal_summary_start_reel_id.strip()
+        if isinstance(terminal_summary_start_reel_id, str)
+        else ""
+    )
+    ordered_ids = [
+        reel_id.strip()
+        for reel_id in ordered_reel_ids
+        if isinstance(reel_id, str) and reel_id.strip()
+    ]
+    if not marker or marker not in ordered_ids:
+        return None
+    surviving_ids = {
+        reel_id.strip()
+        for reel_id in surviving_reel_ids
+        if isinstance(reel_id, str) and reel_id.strip()
+    }
+    marker_index = ordered_ids.index(marker)
+    return next(
+        (
+            reel_id
+            for reel_id in ordered_ids[marker_index:]
+            if reel_id in surviving_ids
+        ),
+        None,
+    )
 
 
 def _apply_generation_lesson_order(
@@ -3250,6 +3297,7 @@ _LESSON_ORDER_SELECTION_FIELDS = frozenset({
     "_selection_concept",
     "_selection_concept_family",
     "_selection_concept_aliases",
+    "_selection_intent_obligations",
 })
 
 
@@ -3412,6 +3460,204 @@ def _response_generation_ids(conn, generation_id: str | None) -> list[str]:
     return ordered
 
 
+def _generation_chain_rows_snapshot(
+    conn,
+    generation_ids: Iterable[str | None],
+) -> dict[str, dict[str, Any]]:
+    """Load multiple generation ancestry chains in one cycle-safe query."""
+    anchors = list(dict.fromkeys(
+        str(generation_id or "").strip()
+        for generation_id in generation_ids
+        if str(generation_id or "").strip()
+    ))
+    if not anchors:
+        return {}
+    placeholders = ", ".join("?" for _generation_id in anchors)
+    rows = fetch_all(
+        conn,
+        f"""
+        WITH RECURSIVE generation_chain(
+            id, source_generation_id, lesson_order_json
+        ) AS (
+            SELECT id, source_generation_id, lesson_order_json
+            FROM reel_generations
+            WHERE id IN ({placeholders})
+            UNION
+            SELECT parent.id, parent.source_generation_id,
+                   parent.lesson_order_json
+            FROM reel_generations AS parent
+            JOIN generation_chain AS child
+              ON parent.id = child.source_generation_id
+        )
+        SELECT id, source_generation_id, lesson_order_json
+        FROM generation_chain
+        """,
+        tuple(anchors),
+    )
+    return {
+        str(row.get("id") or "").strip(): row
+        for row in rows
+        if str(row.get("id") or "").strip()
+    }
+
+
+def _snapshot_generation_ids(
+    rows_by_id: dict[str, dict[str, Any]],
+    generation_id: str | None,
+) -> list[str]:
+    """Rebuild the existing oldest-to-newest ancestry semantics in memory."""
+    current = str(generation_id or "").strip()
+    if not current:
+        return []
+    newest_to_oldest: list[str] = []
+    seen: set[str] = set()
+    while current and current not in seen:
+        seen.add(current)
+        newest_to_oldest.append(current)
+        row = rows_by_id.get(current)
+        if row is None:
+            break
+        current = str(row.get("source_generation_id") or "").strip()
+    return list(reversed(newest_to_oldest))
+
+
+def _authoritative_generation_releases_snapshot(
+    conn,
+    generation_ids: list[str],
+) -> dict[str, list[str]]:
+    """Load each generation's latest authoritative terminal release at once."""
+    if not generation_ids:
+        return {}
+    placeholders = ", ".join("?" for _generation_id in generation_ids)
+    rows = fetch_all(
+        conn,
+        f"""
+        WITH ranked_jobs AS (
+            SELECT id, result_generation_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY result_generation_id
+                       ORDER BY completed_at DESC, updated_at DESC,
+                                created_at DESC, id DESC
+                   ) AS job_rank
+            FROM reel_generation_jobs
+            WHERE result_generation_id IN ({placeholders})
+              AND status IN ('completed', 'partial', 'exhausted')
+        ), ranked_events AS (
+            SELECT jobs.result_generation_id, jobs.id AS job_id,
+                   jobs.job_rank, events.seq, events.event_type,
+                   events.payload_json,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY events.job_id ORDER BY events.seq
+                   ) AS event_rank
+            FROM ranked_jobs AS jobs
+            JOIN generation_job_events AS events ON events.job_id = jobs.id
+            WHERE jobs.job_rank <= 20 AND events.seq > 0
+        )
+        SELECT result_generation_id, job_id, job_rank, seq,
+               event_type, payload_json
+        FROM ranked_events
+        WHERE event_rank <= 500
+        ORDER BY result_generation_id, job_rank, seq
+        """,
+        tuple(generation_ids),
+    )
+    events_by_job: dict[str, list[dict[str, Any]]] = {}
+    job_order_by_generation: dict[str, list[str]] = {}
+    for row in rows:
+        generation_id = str(row.get("result_generation_id") or "").strip()
+        job_id = str(row.get("job_id") or "").strip()
+        if not generation_id or not job_id:
+            continue
+        job_order = job_order_by_generation.setdefault(generation_id, [])
+        if job_id not in events_by_job:
+            events_by_job[job_id] = []
+            job_order.append(job_id)
+        events_by_job[job_id].append(row)
+
+    releases: dict[str, list[str]] = {}
+    for generation_id in generation_ids:
+        for job_id in job_order_by_generation.get(generation_id, ()):
+            authoritative_payload: dict[str, Any] | None = None
+            for event in reversed(events_by_job.get(job_id, ())):
+                if str(event.get("event_type") or "") != "final":
+                    continue
+                raw_payload = event.get("payload_json")
+                try:
+                    payload = (
+                        raw_payload
+                        if isinstance(raw_payload, dict)
+                        else json.loads(str(raw_payload or "{}"))
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+                if isinstance(payload, dict) and payload.get("authoritative") is True:
+                    authoritative_payload = payload
+                    break
+            if authoritative_payload is None:
+                continue
+            ordered_ids: list[str] = []
+            seen_ids: set[str] = set()
+            raw_reels = authoritative_payload.get("reels")
+            if isinstance(raw_reels, list):
+                for reel in raw_reels:
+                    if not isinstance(reel, dict):
+                        continue
+                    reel_id = str(reel.get("reel_id") or "").strip()
+                    if not reel_id or reel_id in seen_ids:
+                        continue
+                    seen_ids.add(reel_id)
+                    ordered_ids.append(reel_id)
+            releases[generation_id] = ordered_ids
+            break
+    return releases
+
+
+def _authoritative_release_ids_from_snapshot(
+    *,
+    generation_ids: list[str],
+    generation_rows: dict[str, dict[str, Any]],
+    releases_by_generation: dict[str, list[str]],
+) -> list[str] | None:
+    """Compose teaching then recap suffixes from already-loaded chain state."""
+    teaching_ids: list[str] = []
+    terminal_summary_ids: list[str] = []
+    found_authoritative_release = False
+    for generation_id in generation_ids:
+        if generation_id not in releases_by_generation:
+            continue
+        found_authoritative_release = True
+        released_ids = releases_by_generation[generation_id]
+        lesson_order_metadata = (
+            _parse_generation_lesson_order_metadata(
+                (generation_rows.get(generation_id) or {}).get(
+                    "lesson_order_json"
+                ),
+                generation_id=generation_id,
+            )
+            or {}
+        )
+        stored_order = lesson_order_metadata.get("ordered_reel_ids")
+        marker_order = stored_order if isinstance(stored_order, list) else released_ids
+        terminal_summary_start_reel_id = (
+            _surviving_terminal_summary_start_reel_id(
+                ordered_reel_ids=marker_order,
+                terminal_summary_start_reel_id=lesson_order_metadata.get(
+                    "terminal_summary_start_reel_id"
+                ),
+                surviving_reel_ids=released_ids,
+            )
+        )
+        if terminal_summary_start_reel_id is None:
+            teaching_ids.extend(released_ids)
+            continue
+        marker_index = released_ids.index(terminal_summary_start_reel_id)
+        teaching_ids.extend(released_ids[:marker_index])
+        terminal_summary_ids.extend(released_ids[marker_index:])
+    if not found_authoritative_release:
+        return None
+    return list(dict.fromkeys([*teaching_ids, *terminal_summary_ids]))
+
+
 def _authoritative_generation_release_reel_ids(
     conn,
     generation_id: str,
@@ -3506,14 +3752,79 @@ def _remove_authoritative_release_temporal_overlaps(
     return filtered_ids
 
 
+def _filter_continuation_release_temporal_overlaps(
+    conn,
+    *,
+    source_generation_id: str | None,
+    generation_id: str,
+    reels: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove child clips already covered by an authoritative source release."""
+    if not source_generation_id or not reels:
+        return reels
+    generation_rows = _generation_chain_rows_snapshot(
+        conn,
+        (source_generation_id, generation_id),
+    )
+    source_generation_ids = _snapshot_generation_ids(
+        generation_rows,
+        source_generation_id,
+    )
+    current_generation_ids = _snapshot_generation_ids(
+        generation_rows,
+        generation_id,
+    )
+    releases_by_generation = _authoritative_generation_releases_snapshot(
+        conn,
+        source_generation_ids,
+    )
+    prior_reel_ids = _authoritative_release_ids_from_snapshot(
+        generation_ids=source_generation_ids,
+        generation_rows=generation_rows,
+        releases_by_generation=releases_by_generation,
+    )
+    if not prior_reel_ids:
+        return reels
+    prior_reel_id_set = set(prior_reel_ids)
+    current_by_id = {
+        reel_id: reel
+        for reel in reels
+        if (reel_id := str(reel.get("reel_id") or "").strip())
+    }
+    if not current_by_id:
+        return reels
+    current_by_id = {
+        reel_id: reel
+        for reel_id, reel in current_by_id.items()
+        if reel_id not in prior_reel_id_set
+    }
+    if not current_by_id:
+        return []
+    current_ids = list(current_by_id)
+    ordered_ids = list(dict.fromkeys([*prior_reel_ids, *current_ids]))
+    kept_ids = set(_remove_authoritative_release_temporal_overlaps(
+        conn,
+        generation_ids=list(dict.fromkeys([
+            *source_generation_ids,
+            *current_generation_ids,
+        ])),
+        ordered_reel_ids=ordered_ids,
+    ))
+    return [
+        current_by_id[reel_id]
+        for reel_id in current_ids
+        if reel_id in kept_ids
+    ]
+
+
 def _authoritative_release_reel_ids(
     conn,
     generation_id: str | None,
 ) -> list[str] | None:
-    """Return the exact released chain order, or None for wholly legacy data."""
+    """Return released teaching before recap suffixes across the whole chain."""
     generation_ids = _response_generation_ids(conn, generation_id)
-    ordered_ids: list[str] = []
-    seen_ids: set[str] = set()
+    teaching_ids: list[str] = []
+    terminal_summary_ids: list[str] = []
     found_authoritative_release = False
     for current_generation_id in generation_ids:
         released_ids = _authoritative_generation_release_reel_ids(
@@ -3523,13 +3834,40 @@ def _authoritative_release_reel_ids(
         if released_ids is None:
             continue
         found_authoritative_release = True
-        for reel_id in released_ids:
-            if reel_id in seen_ids:
-                continue
-            seen_ids.add(reel_id)
-            ordered_ids.append(reel_id)
+        lesson_order_metadata = (
+            _stored_generation_lesson_order_metadata(conn, current_generation_id)
+            or {}
+        )
+        stored_order = lesson_order_metadata.get("ordered_reel_ids")
+        marker_order = (
+            stored_order
+            if isinstance(stored_order, list)
+            else released_ids
+        )
+        terminal_summary_start_reel_id = (
+            _surviving_terminal_summary_start_reel_id(
+                ordered_reel_ids=marker_order,
+                terminal_summary_start_reel_id=lesson_order_metadata.get(
+                    "terminal_summary_start_reel_id"
+                ),
+                surviving_reel_ids=released_ids,
+            )
+        )
+        if terminal_summary_start_reel_id is None:
+            teaching_ids.extend(released_ids)
+            continue
+        marker_index = released_ids.index(terminal_summary_start_reel_id)
+        teaching_ids.extend(released_ids[:marker_index])
+        terminal_summary_ids.extend(released_ids[marker_index:])
     if not found_authoritative_release:
         return None
+    ordered_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for reel_id in [*teaching_ids, *terminal_summary_ids]:
+        if reel_id in seen_ids:
+            continue
+        seen_ids.add(reel_id)
+        ordered_ids.append(reel_id)
     return _remove_authoritative_release_temporal_overlaps(
         conn,
         generation_ids=generation_ids,
@@ -4695,29 +5033,25 @@ def _continuation_delivered_reel_ids(
     continuation_token: str | None,
 ) -> list[str]:
     """Return authoritative reel ids already delivered by prior batches."""
-    delivered: set[str] = set()
-    visited_jobs: set[str] = set()
-    current_job_id = str(continuation_token or "").strip()
-    while current_job_id and current_job_id not in visited_jobs:
-        visited_jobs.add(current_job_id)
-        job_row = get_generation_job(conn, current_job_id)
-        if not job_row:
-            break
-        for event in replay_generation_events(conn, job_id=current_job_id):
-            if str(event.get("type") or "") != "final":
-                continue
-            payload = event.get("payload") or {}
-            reels = payload.get("reels") if isinstance(payload, dict) else []
-            for reel in reels if isinstance(reels, list) else []:
-                if not isinstance(reel, dict):
-                    continue
-                reel_id = str(reel.get("reel_id") or "").strip()
-                if reel_id:
-                    delivered.add(reel_id)
-        current_job_id = str(
-            _job_request_params(job_row).get("continuation_token") or ""
-        ).strip()
-    return sorted(delivered)
+    job_id = str(continuation_token or "").strip()
+    if not job_id:
+        return []
+    job_row = get_generation_job(conn, job_id)
+    generation_id = str((job_row or {}).get("result_generation_id") or "").strip()
+    if not generation_id:
+        return []
+    generation_rows = _generation_chain_rows_snapshot(conn, (generation_id,))
+    generation_ids = _snapshot_generation_ids(generation_rows, generation_id)
+    releases = _authoritative_generation_releases_snapshot(
+        conn,
+        generation_ids,
+    )
+    delivered = _authoritative_release_ids_from_snapshot(
+        generation_ids=generation_ids,
+        generation_rows=generation_rows,
+        releases_by_generation=releases,
+    )
+    return sorted(set(delivered or ()))
 
 
 def _currently_surfaceable_generation_reel_ids(
@@ -5099,14 +5433,21 @@ def _learner_concept_signals(
     *,
     material_id: str,
     learner_id: str,
-    propagate_concept_families: bool = True,
+    propagate_concept_families: bool = False,
+    remediation_concept_ids_out: list[str] | None = None,
 ) -> dict[str, dict[str, float]]:
+    exact_remediation_ids = (
+        [] if remediation_concept_ids_out is not None else None
+    )
     coverage, adjustments, _, _ = reel_service._learner_adaptation_context(
         conn,
         material_id,
         learner_id,
         propagate_concept_families=propagate_concept_families,
+        remediation_concept_ids_out=exact_remediation_ids,
     )
+    if remediation_concept_ids_out is not None:
+        remediation_concept_ids_out.extend(exact_remediation_ids or [])
     return {
         concept_key: {
             "helpful": float(
@@ -5132,22 +5473,26 @@ def _lesson_prior_concept_coverage(
         str(reel_id or "").strip()
         for reel_id in reel_ids
         if str(reel_id or "").strip()
-    })[:200]
+    })
     if not clean_ids:
         return []
-    placeholders = ", ".join("?" for _reel_id in clean_ids)
-    rows = fetch_all(
-        conn,
-        f"""
-        SELECT reels.concept_id, reels.search_context_json, reels.t_start,
-               reels.t_end, concepts.title AS concept_title
-        FROM reels
-        LEFT JOIN concepts ON concepts.id = reels.concept_id
-        WHERE reels.material_id = ?
-          AND reels.id IN ({placeholders})
-        """,
-        (material_id, *clean_ids),
-    )
+    rows: list[dict[str, Any]] = []
+    # Chunk only for database parameter limits; never truncate semantic history.
+    for offset in range(0, len(clean_ids), 400):
+        reel_id_chunk = clean_ids[offset:offset + 400]
+        placeholders = ", ".join("?" for _reel_id in reel_id_chunk)
+        rows.extend(fetch_all(
+            conn,
+            f"""
+            SELECT reels.concept_id, reels.search_context_json, reels.t_start,
+                   reels.t_end, concepts.title AS concept_title
+            FROM reels
+            LEFT JOIN concepts ON concepts.id = reels.concept_id
+            WHERE reels.material_id = ?
+              AND reels.id IN ({placeholders})
+            """,
+            (material_id, *reel_id_chunk),
+        ))
     coverage: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
         if has_incompatible_gemini_concept_family_contract(
@@ -5167,9 +5512,9 @@ def _lesson_prior_concept_coverage(
             str(row.get("concept_title") or "").split()
         )[:240]
         identity = (
-            ("family", concept_family.casefold())
-            if concept_family
-            else ("concept", concept_id)
+            ("concept", concept_id)
+            if concept_id
+            else ("family", concept_family.casefold())
         )
         if not identity[1]:
             continue
@@ -5183,6 +5528,14 @@ def _lesson_prior_concept_coverage(
             },
         )
         item["delivered_count"] = int(item["delivered_count"]) + 1
+        obligation_keys = intent_obligation_keys(
+            metadata.get("_selection_intent_obligations") or ()
+        )
+        if obligation_keys:
+            item["intent_obligation_keys"] = sorted({
+                *item.get("intent_obligation_keys", ()),
+                *obligation_keys,
+            })
     return [coverage[key] for key in sorted(coverage)]
 
 
@@ -5872,8 +6225,10 @@ def _run_leased_generation_job(
             ordering_degraded = False
             recall_preparation: dict[str, int] | None = None
             activate_generation = False
+            candidate_final_reels: list[dict[str, Any]] = []
+            stored_order_ids: list[str] | None = None
             if cumulative_count or has_verified_reservoir or rankable_fallback:
-                final_reels = rankable_fallback or _generation_job_reels(
+                candidate_final_reels = rankable_fallback or _generation_job_reels(
                     conn,
                     refreshed_job,
                     organizer_candidate_limit=lesson_candidate_limit,
@@ -5884,10 +6239,29 @@ def _run_leased_generation_job(
                     generation_id,
                 )
                 if stored_order_ids is None:
+                    candidate_final_reels = (
+                        _filter_continuation_release_temporal_overlaps(
+                            conn,
+                            source_generation_id=source_generation_id,
+                            generation_id=generation_id,
+                            reels=candidate_final_reels,
+                        )
+                    )
+            if candidate_final_reels:
+                final_reels = candidate_final_reels
+                if stored_order_ids is None:
+                    surfaceable_candidate_ids = {
+                        str(reel.get("reel_id") or "")
+                        for reel in final_reels
+                        if str(reel.get("reel_id") or "")
+                    }
+                    remediation_concept_ids: list[str] = []
                     concept_signals = _learner_concept_signals(
                         conn,
                         material_id=material_id,
                         learner_id=learner_id,
+                        propagate_concept_families=False,
+                        remediation_concept_ids_out=remediation_concept_ids,
                     )
                     prior_reel_ids = set(_continuation_delivered_reel_ids(
                         conn,
@@ -5902,6 +6276,7 @@ def _run_leased_generation_job(
                         ),
                         learner_level=str(params.get("knowledge_level") or "beginner"),
                         concept_signals=concept_signals,
+                        remediation_concept_ids=remediation_concept_ids,
                         # The request count controls acquisition/stream cadence,
                         # not Gemini's editorial subset. Every already-verified
                         # candidate in this bounded pool may be included or
@@ -5915,18 +6290,60 @@ def _run_leased_generation_job(
                         should_cancel=should_cancel,
                         generation_context=context,
                     )
-                    final_reels = ordering.reels
+                    final_reels = [
+                        reel
+                        for reel in ordering.reels
+                        if str(reel.get("reel_id") or "")
+                        in surfaceable_candidate_ids
+                    ]
+                    released_ordered_ids = [
+                        str(reel.get("reel_id") or "") for reel in final_reels
+                    ]
+                    organizer_ordered_ids = getattr(
+                        ordering,
+                        "ordered_reel_ids",
+                        None,
+                    )
+                    if not isinstance(organizer_ordered_ids, list):
+                        organizer_ordered_ids = [
+                            str(reel.get("reel_id") or "")
+                            for reel in ordering.reels
+                        ]
+                    terminal_summary_start_reel_id = (
+                        _surviving_terminal_summary_start_reel_id(
+                            ordered_reel_ids=organizer_ordered_ids,
+                            terminal_summary_start_reel_id=getattr(
+                                ordering,
+                                "terminal_summary_start_reel_id",
+                                None,
+                            ),
+                            surviving_reel_ids=released_ordered_ids,
+                        )
+                    )
+                    released_id_set = set(released_ordered_ids)
+                    released_checkpoint_ids = (
+                        [
+                            reel_id
+                            for reel_id in ordering.assessment_checkpoint_reel_ids
+                            if reel_id in released_id_set
+                        ]
+                        if ordering.assessment_checkpoint_reel_ids is not None
+                        else None
+                    )
                     ordering_degraded = ordering.degraded
                     checkpoint_ids = assessment_checkpoint_reel_ids(
-                        ordering.ordered_reel_ids,
-                        ordering.assessment_checkpoint_reel_ids,
+                        released_ordered_ids,
+                        released_checkpoint_ids,
                         degraded=ordering.degraded,
                     )
                     lesson_order_metadata = {
                         "version": 2,
                         "prompt_version": LESSON_ORDER_PROMPT_VERSION,
-                        "ordered_reel_ids": ordering.ordered_reel_ids,
+                        "ordered_reel_ids": released_ordered_ids,
                         "assessment_checkpoint_reel_ids": checkpoint_ids,
+                        "terminal_summary_start_reel_id": (
+                            terminal_summary_start_reel_id
+                        ),
                         "model_used": ordering.model_used,
                         "created_at": now_iso(),
                         "degraded": ordering.degraded,
@@ -5952,6 +6369,12 @@ def _run_leased_generation_job(
                     )
                     final_reels = _apply_generation_lesson_order(
                         conn,
+                        generation_id=generation_id,
+                        reels=final_reels,
+                    )
+                    final_reels = _filter_continuation_release_temporal_overlaps(
+                        conn,
+                        source_generation_id=source_generation_id,
                         generation_id=generation_id,
                         reels=final_reels,
                     )
@@ -6032,6 +6455,12 @@ def _run_leased_generation_job(
                             len(checkpoint_reel_ids),
                             int((recall_preparation or {}).get("prepared") or 0),
                         )
+                activate_generation = True
+            elif has_verified_reservoir:
+                # A fresh generation may contain only verified clips deferred
+                # for another learner level. Keep that reusable reservoir active
+                # without persisting an empty release order.
+                final_reels = []
                 activate_generation = True
             elif provider_cursor_open:
                 _complete_generation(

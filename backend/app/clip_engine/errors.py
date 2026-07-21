@@ -100,6 +100,13 @@ class ProviderTransientError(ProviderError):
     retryable = True
 
 
+class ProviderResponseValidationError(ProviderError):
+    """The provider responded, but local response validation rejected it."""
+
+    code = "provider_response_invalid"
+    retryable = True
+
+
 class ProviderRequestError(ProviderError):
     code = "provider_request_rejected"
 

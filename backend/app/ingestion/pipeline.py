@@ -47,6 +47,10 @@ from ...concept_families import (
     concept_family_identity_key as shared_concept_family_identity_key,
     validate_concept_family_contract,
 )
+from ...intent_obligations import (
+    INTENT_OBLIGATION_CONTRACT_VERSION,
+    normalize_intent_obligations,
+)
 from ..db import (
     DatabaseIntegrityError,
     dumps_json,
@@ -92,7 +96,6 @@ from .persistence import (
     load_existing_reel,
     load_reel_by_selection_candidate,
     normalize_clip_concept,
-    normalize_clip_concept_family,
     resolve_material_concept,
     store_ingest_metadata_blob,
     update_reel_boundary_state,
@@ -564,6 +567,32 @@ def _concept_family_search_context(clip: dict[str, Any]) -> dict[str, Any]:
         "selection_authority": "gemini",
         "concept_family": family,
         "concept_aliases": aliases,
+    }
+
+
+def _intent_obligation_search_context(
+    clip: dict[str, Any],
+) -> dict[str, Any]:
+    """Return only versioned, Gemini-grounded request obligations."""
+    if (
+        not _gemini_selection_is_authoritative(clip)
+        or str(
+            clip.get("intent_obligation_contract_version") or ""
+        ).strip()
+        != INTENT_OBLIGATION_CONTRACT_VERSION
+    ):
+        return {}
+    obligations = normalize_intent_obligations(
+        clip.get("intent_obligations"),
+        require_evidence=True,
+    )
+    if not obligations:
+        return {}
+    return {
+        "intent_obligation_contract_version": (
+            INTENT_OBLIGATION_CONTRACT_VERSION
+        ),
+        "intent_obligations": obligations,
     }
 
 
@@ -3778,6 +3807,7 @@ def _verified_direct_adapter_clips(
             search_context.pop("surface_reason", None)
         search_context.update(
             **_concept_family_search_context(clip),
+            **_intent_obligation_search_context(clip),
             selection_contract_version="quality_silence_v39",
             **(
                 {"selection_authority": "gemini"}
@@ -6513,6 +6543,7 @@ class IngestionPipeline:
                 clip["chain_id"] = chain_id
                 search_context.update(
                     selection_contract_version="quality_silence_v39",
+                    **_intent_obligation_search_context(clip),
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,
@@ -6977,16 +7008,6 @@ class IngestionPipeline:
         clip_concept_raw, clip_concept_key = normalize_clip_concept(
             details.get("concept")
         )
-        clip_concept_family = (
-            str(selection_context.get("concept_family") or "").strip()
-            if selection_context.get("concept_family_contract_version")
-            == CONCEPT_FAMILY_CONTRACT_VERSION
-            and str(selection_context.get("selection_authority") or "")
-            .strip()
-            .casefold()
-            == "gemini"
-            else ""
-        )
         raise_if_cancelled(should_cancel)
 
         with get_conn(transactional=True) as conn:
@@ -7015,7 +7036,6 @@ class IngestionPipeline:
                     conn,
                     material_id=effective_material_id,
                     title=clip_concept_raw,
-                    semantic_identity=clip_concept_family or None,
                 )
                 selection_context.update(
                     {

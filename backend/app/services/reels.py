@@ -29,6 +29,10 @@ from ...concept_ordinals import (
     concept_identifier_indexes,
 )
 from ...concept_tokens import concept_semantic_key
+from ...intent_obligations import (
+    INTENT_OBLIGATION_CONTRACT_VERSION,
+    normalize_intent_obligations,
+)
 from ..config import get_settings
 from ..db import (
     LEGACY_LEARNER_ID,
@@ -5590,30 +5594,7 @@ class ReelService:
             }
             for concept_id, totals in feedback_totals.items()
         }
-        material_concepts = fetch_all(
-            conn,
-            "SELECT id, title FROM concepts WHERE material_id = ?",
-            (material_id,),
-        )
-        family_ids = self._concept_family_ids(
-            material_concepts,
-            self._persisted_concept_family_profiles(conn, material_id),
-        )
-        concept_feedback: dict[str, dict[str, float]] = {}
-        for target_id, member_ids in family_ids.items():
-            exact_target = exact_concept_feedback.get(target_id, {})
-            concept_feedback[target_id] = {
-                "helpful": sum(
-                    exact_concept_feedback.get(member_id, {}).get("helpful", 0.0)
-                    for member_id in member_ids
-                ),
-                "confusing": sum(
-                    exact_concept_feedback.get(member_id, {}).get("confusing", 0.0)
-                    for member_id in member_ids
-                ),
-                # Ratings describe one clip, not the whole semantic family.
-                "avg_rating": float(exact_target.get("avg_rating", 3.0)),
-            }
+        concept_feedback = exact_concept_feedback
         try:
             exact_assessment_adjustments: dict[str, float] = defaultdict(float)
             for row in fetch_all(
@@ -5640,13 +5621,7 @@ class ReelService:
             if "no such table: assessment_concept_outcomes" not in str(exc):
                 raise
             exact_assessment_adjustments = {}
-        assessment_adjustments = {
-            target_id: sum(
-                exact_assessment_adjustments.get(member_id, 0.0)
-                for member_id in member_ids
-            )
-            for target_id, member_ids in family_ids.items()
-        }
+        assessment_adjustments = dict(exact_assessment_adjustments)
 
         def concept_key(concept: dict[str, Any]) -> tuple[float, int, str]:
             feedback = concept_feedback.get(concept["id"], {"helpful": 0.0, "confusing": 0.0, "avg_rating": 3.0})
@@ -5808,7 +5783,8 @@ class ReelService:
         material_id: str,
         learner_id: str,
         *,
-        propagate_concept_families: bool = True,
+        propagate_concept_families: bool = False,
+        remediation_concept_ids_out: list[str] | None = None,
     ) -> tuple[dict[str, dict[str, float]], dict[str, float], dict[str, Any] | None, float]:
         progress = self.learner_progress(conn, material_id, learner_id)
         reset_at = str(progress.get("difficulty_reset_at") or "")
@@ -5925,8 +5901,8 @@ class ReelService:
             }
             mastery_rows.append(mastery_row)
             post_reset_assessment_rows.append(mastery_row)
+        exact_coverage = coverage
         if propagate_concept_families:
-            exact_coverage = coverage
             coverage = {}
             for target_id, member_ids in family_ids.items():
                 helpful = sum(
@@ -5977,6 +5953,34 @@ class ReelService:
                     -self.CONCEPT_ADJUSTMENT_BOUND,
                     min(self.CONCEPT_ADJUSTMENT_BOUND, combined),
                 )
+        if remediation_concept_ids_out is not None:
+            exact_remediation: list[tuple[float, str]] = []
+            for concept_id in (
+                set(exact_coverage) | set(post_reset) | set(assessment_adjustments)
+            ):
+                helpful = float(
+                    exact_coverage.get(concept_id, {}).get("helpful", 0.0)
+                )
+                confusing = float(
+                    exact_coverage.get(concept_id, {}).get("confusing", 0.0)
+                )
+                exact_adjustment = (
+                    self.GOT_IT_CONCEPT_STEP
+                    * post_reset.get(concept_id, [0.0, 0.0])[0]
+                    - self.NEED_HELP_CONCEPT_STEP
+                    * post_reset.get(concept_id, [0.0, 0.0])[1]
+                    + assessment_adjustments.get(concept_id, 0.0)
+                )
+                unresolved = confusing - helpful + max(0.0, -exact_adjustment)
+                if unresolved > 0.0:
+                    exact_remediation.append((unresolved, concept_id))
+            remediation_concept_ids_out.extend(
+                concept_id
+                for _strength, concept_id in sorted(
+                    exact_remediation,
+                    key=lambda item: (-item[0], item[1]),
+                )
+            )
         latest = max(
             mastery_rows,
             key=lambda row: (
@@ -6263,6 +6267,19 @@ class ReelService:
                 parsed.get("intent_coverage"), 1.0
             ),
         }
+        if (
+            selection_authority == "gemini"
+            and str(
+                parsed.get("intent_obligation_contract_version") or ""
+            ).strip()
+            == INTENT_OBLIGATION_CONTRACT_VERSION
+        ):
+            intent_obligations = normalize_intent_obligations(
+                parsed.get("intent_obligations"),
+                require_evidence=True,
+            )
+            if intent_obligations:
+                metadata["_selection_intent_obligations"] = intent_obligations
         raw_aliases = parsed.get("concept_aliases")
         family_text = " ".join(
             str(parsed.get("concept_family") or "").split()

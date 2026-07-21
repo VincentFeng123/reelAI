@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from backend.app.clip_engine import segment_cache
+from backend.intent_obligations import intent_obligation
 
 
 VIDEO_ID = "dQw4w9WgXcQ"
@@ -148,7 +149,7 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
 
 
 def test_segmenter_source_signature_includes_imported_validators(monkeypatch) -> None:
-    from backend import gemini_client
+    from backend import gemini_client, intent_obligations
     from backend.pipeline import discourse, sentences
 
     real_read_bytes = segment_cache.Path.read_bytes
@@ -156,7 +157,7 @@ def test_segmenter_source_signature_includes_imported_validators(monkeypatch) ->
     baseline = segment_cache._segmenter_source_signature()
     assert baseline is not None
 
-    for module in (discourse, sentences, gemini_client):
+    for module in (discourse, sentences, gemini_client, intent_obligations):
         target_name = segment_cache.Path(module.__file__).name
 
         def changed_validator(path, *, expected_name=target_name):
@@ -295,6 +296,46 @@ def test_segment_cache_requires_canonical_only_gemini_metadata() -> None:
     assert segment_cache._valid_clips(
         [outside_media], transcript=transcript, settings={}
     ) is None
+
+
+def test_segment_cache_revalidates_gemini_intent_obligations() -> None:
+    transcript = _transcript()
+    obligation = intent_obligation(
+        kind="subject",
+        source_phrase="forces",
+        requirement="Explain how forces change motion",
+        evidence_quote="forces change an object's motion",
+    )
+    assert obligation is not None
+    authoritative = _clip()
+    authoritative.update({
+        "selection_authority": "gemini",
+        "concept_family": "Newtonian force and motion",
+        "concept_aliases": [],
+        "intent_obligation_contract_version": "intent_obligation_v1",
+        "intent_obligations": [obligation],
+    })
+    assert segment_cache._valid_clips(
+        [authoritative], transcript=transcript, settings={}
+    ) == [authoritative]
+
+    for invalid in (
+        {
+            **authoritative,
+            "intent_obligation_contract_version": "intent_obligation_v0",
+        },
+        {
+            **authoritative,
+            "intent_obligations": [{**obligation, "key": "io:forged"}],
+        },
+        {
+            **authoritative,
+            "selection_authority": "local",
+        },
+    ):
+        assert segment_cache._valid_clips(
+            [invalid], transcript=transcript, settings={}
+        ) is None
 
 
 def test_segment_cache_keeps_distinct_facets_inside_one_coarse_cue() -> None:

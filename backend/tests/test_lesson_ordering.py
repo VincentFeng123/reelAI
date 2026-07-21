@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -12,6 +14,7 @@ from backend import gemini_client
 from backend.app.clip_engine import config
 from backend.app.clip_engine.errors import CancellationError
 from backend.app.services import lesson_ordering
+from backend.intent_obligations import intent_obligation
 
 
 @pytest.fixture(autouse=True)
@@ -57,12 +60,16 @@ def _generation_result(
     checkpoint_ids: list[str] | None = None,
     *,
     model: str | None = None,
+    terminal_summary_start_reel_id: str | None = None,
 ) -> gemini_client.GenerationResult:
     return gemini_client.GenerationResult(
         text=json.dumps(
             {
                 "ordered_reel_ids": ordered_ids,
                 "assessment_checkpoint_reel_ids": checkpoint_ids or [],
+                "terminal_summary_start_reel_id": (
+                    terminal_summary_start_reel_id
+                ),
             }
         ),
         telemetry=gemini_client.GeminiCallTelemetry(
@@ -79,6 +86,22 @@ def _generation_result(
             total_tokens=140,
         ),
     )
+
+
+def _obligation(
+    source_phrase: str,
+    requirement: str,
+    *,
+    kind: str = "scope",
+) -> dict[str, str]:
+    item = intent_obligation(
+        kind=kind,
+        source_phrase=source_phrase,
+        requirement=requirement,
+        evidence_quote=f"This clip teaches {source_phrase}.",
+    )
+    assert item is not None
+    return item
 
 
 def test_orders_every_clip_and_returns_organizer_checkpoints(monkeypatch) -> None:
@@ -143,7 +166,7 @@ def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_
 
     assert payload["concept_title"] == "How force and mass change acceleration"
     assert payload["concept_family"] == "force-mass-acceleration proportionality"
-    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v8"
+    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v9"
     assert "semantic restatements" in lesson_ordering._SYSTEM_PROMPT
     assert "concept, then explanation, then application or worked example" in (
         lesson_ordering._SYSTEM_PROMPT
@@ -188,12 +211,13 @@ def test_compact_clip_columns_reconstruct_every_organizer_value_without_shift() 
     columns = compact["columns"]
     [row] = compact["clips"]
 
-    assert len(columns) == len(set(columns)) == len(row) == 18
+    assert len(columns) == len(set(columns)) == len(row) == 19
     decoded = dict(zip(columns, row, strict=True))
     assert decoded["chain_position"] == 2
     assert decoded["prerequisite_candidate_refs"] == [1]
     assert decoded["concept_title"] == "net force vector sum"
     assert decoded["concept_family"] == "net force vector sum"
+    assert decoded["intent_obligation_refs"] == []
     assert decoded["learner_signal_hca"] == [1.0, 2.0, -0.08]
     assert decoded["summary_excerpt"] == "Explains how force vectors combine"
     assert decoded["takeaways_excerpt"] == "Add force vectors | Use direction signs"
@@ -215,6 +239,8 @@ def test_small_batch_keeps_the_full_object_prompt_byte_for_byte() -> None:
         "learner_level": "beginner",
         "release_limit": 2,
         "prior_concept_coverage": [],
+        "available_intent_obligations": [],
+        "prior_intent_obligation_keys": [],
     }
     clip_payload = {
         "clips": [lesson_ordering._clip_payload(reel) for reel in reels]
@@ -227,7 +253,8 @@ def test_small_batch_keeps_the_full_object_prompt_byte_for_byte() -> None:
         + json.dumps(clip_payload, ensure_ascii=False, separators=(",", ":"))
         + "\n\nFinal request: Return at most 2 clips as a coherent feedback-aware "
         "subset, preserve prerequisites and same-source chronology, and return only "
-        "{\"ordered_reel_ids\":[...],\"assessment_checkpoint_reel_ids\":[...]} "
+        "{\"ordered_reel_ids\":[...],\"assessment_checkpoint_reel_ids\":[...],"
+        "\"terminal_summary_start_reel_id\":null} "
         "with no other text or fields."
     )
 
@@ -244,6 +271,13 @@ def test_max_candidate_prompt_keeps_every_clip_under_fixed_input_budget() -> Non
         head = f"{prefix}-{index:03d}-"
         return (head + ('"\\\\' * length))[:length]
 
+    obligations = [
+        _obligation(
+            max_field("requested-facet", index, 160),
+            max_field("teach-requested-facet", index, 240),
+        )
+        for index in range(16)
+    ]
     reels: list[dict[str, Any]] = []
     for index in range(128):
         reels.append(_reel(
@@ -275,6 +309,7 @@ def test_max_candidate_prompt_keeps_every_clip_under_fixed_input_budget() -> Non
             transcript_snippet=max_field("transcript", index, 1_000),
             topic_relevance=0.91,
             informativeness=0.92,
+            _selection_intent_obligations=obligations,
         ))
 
     prompt = lesson_ordering._user_prompt(
@@ -288,6 +323,9 @@ def test_max_candidate_prompt_keeps_every_clip_under_fixed_input_budget() -> Non
                 "concept_family": max_field("prior-family", index, 96),
                 "concept_title": max_field("prior-title", index, 240),
                 "delivered_count": 100,
+                "intent_obligation_keys": [
+                    obligations[index % len(obligations)]["key"]
+                ],
             }
             for index in range(40)
         ],
@@ -313,12 +351,20 @@ def test_max_candidate_prompt_keeps_every_clip_under_fixed_input_budget() -> Non
         for position, column in enumerate(prior_payload["columns"])
     }
     prior_rows = prior_payload["rows"]
+    obligation_payload = learning_payload["available_intent_obligations"]
+    obligation_columns = {
+        column: position
+        for position, column in enumerate(obligation_payload["columns"])
+    }
 
     assert len(prompt) <= lesson_ordering.LESSON_ORDER_MAX_USER_PROMPT_CHARS
     assert clips_payload["format"] == "compact_rows_v1"
     assert len(rows) == 128
     assert prior_payload["format"] == "compact_rows_v1"
     assert len(prior_rows) == 40
+    assert obligation_payload["format"] == "compact_rows_v1"
+    assert len(obligation_payload["rows"]) == 16
+    assert len(learning_payload["prior_intent_obligation_refs"]) == 16
     assert (
         "concept_ref values share the CLIPS_JSON concept-ref namespace."
         in lesson_ordering._SYSTEM_PROMPT
@@ -350,6 +396,11 @@ def test_max_candidate_prompt_keeps_every_clip_under_fixed_input_budget() -> Non
     assert all(
         len(row[columns["prerequisite_candidate_refs"]]) == 16
         for row in rows
+    )
+    assert all(len(row[columns["intent_obligation_refs"]]) == 16 for row in rows)
+    assert all(
+        row[obligation_columns["requirement"]]
+        for row in obligation_payload["rows"]
     )
     for field in (
         "concept_title",
@@ -405,6 +456,7 @@ def test_max_candidate_subset_dispatches_once_with_sufficient_output_budget(
         {
             "ordered_reel_ids": reel_ids,
             "assessment_checkpoint_reel_ids": reel_ids,
+            "terminal_summary_start_reel_id": reel_ids[-1],
         },
         separators=(",", ":"),
     ).encode("ascii")
@@ -566,6 +618,1240 @@ def test_feedback_signals_can_select_a_lower_candidate_in_one_call(monkeypatch) 
     assert clips[4]["learner_signal"]["confusing"] == 2.0
 
 
+def test_organizer_cannot_omit_easiest_exact_remediation_with_prerequisite(
+    monkeypatch,
+) -> None:
+    glycolysis = _reel(
+        "glycolysis",
+        video_id="glycolysis-video",
+        start=0,
+        concept="glycolysis",
+        concept_id="glycolysis",
+        difficulty=0.2,
+    )
+    prerequisite = _reel(
+        "etc-foundation",
+        video_id="foundation-video",
+        start=0,
+        concept="proton gradient",
+        concept_id="proton-gradient",
+        selection_candidate_id="foundation-candidate",
+        difficulty=0.25,
+    )
+    easiest_exact = _reel(
+        "etc-easy",
+        video_id="etc-easy-video",
+        start=0,
+        concept="electron transport chain",
+        concept_id="electron-transport-chain",
+        prerequisite_ids=["foundation-candidate"],
+        difficulty=0.35,
+    )
+    harder_exact = _reel(
+        "etc-hard",
+        video_id="etc-hard-video",
+        start=0,
+        concept="electron transport chain advanced example",
+        concept_id="electron-transport-chain",
+        difficulty=0.6,
+    )
+    propagated_family_sibling = _reel(
+        "respiration-family-easy",
+        video_id="respiration-family-video",
+        start=0,
+        concept="cellular respiration",
+        concept_id="cellular-respiration",
+        difficulty=0.1,
+    )
+    reels = [
+        glycolysis,
+        prerequisite,
+        easiest_exact,
+        harder_exact,
+        propagated_family_sibling,
+    ]
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result(["glycolysis"])
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="glycolysis then the electron transport chain",
+        release_limit=3,
+        concept_signals={
+            "electron-transport-chain": {
+                "helpful": 0.0,
+                "confusing": 1.0,
+                "adjustment": -0.12,
+            },
+            "cellular-respiration": {
+                "helpful": 0.0,
+                "confusing": 1.0,
+                "adjustment": -0.12,
+            },
+        },
+        remediation_concept_ids=["electron-transport-chain"],
+    )
+
+    assert calls == 1
+    assert set(result.ordered_reel_ids) == {
+        "glycolysis",
+        "etc-foundation",
+        "etc-easy",
+    }
+    assert result.ordered_reel_ids.index("etc-foundation") < (
+        result.ordered_reel_ids.index("etc-easy")
+    )
+    assert easiest_exact in result.reels
+    assert "etc-hard" not in result.ordered_reel_ids
+    assert "respiration-family-easy" not in result.ordered_reel_ids
+    assert result.degraded is False
+
+
+def test_grounded_request_facet_omitted_by_organizer_is_forced_before_recap(
+    monkeypatch,
+) -> None:
+    completing_square = _obligation(
+        "completing the square",
+        "Teach the completing-the-square method",
+    )
+    reels = [
+        _reel("intro", video_id="intro", start=0, concept="quadratic overview"),
+        _reel("recap", video_id="recap", start=0, concept="quadratic recap"),
+        _reel(
+            "complete-square",
+            video_id="complete-square",
+            start=0,
+            concept="completing the square",
+            _selection_intent_obligations=[completing_square],
+        ),
+    ]
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result(
+            ["intro", "recap"],
+            terminal_summary_start_reel_id="recap",
+        )
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="factoring, completing the square, then the quadratic formula",
+        release_limit=3,
+    )
+
+    assert calls == 1
+    assert result.ordered_reel_ids == ["intro", "complete-square", "recap"]
+    assert result.terminal_summary_start_reel_id == "recap"
+
+
+def test_terminal_recap_is_dropped_when_hard_chronology_blocks_suffix(
+    monkeypatch,
+) -> None:
+    facet = _obligation("worked application", "Teach the worked application")
+    reels = [
+        {
+            **_reel("recap", video_id="same", start=10, concept="recap"),
+            "t_end": 20.0,
+        },
+        {
+            **_reel("teaching", video_id="same", start=30, concept="application"),
+            "t_end": 50.0,
+            "_selection_intent_obligations": [facet],
+        },
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(
+            ["recap"],
+            terminal_summary_start_reel_id="recap",
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="worked application",
+        release_limit=2,
+    )
+
+    assert result.ordered_reel_ids == ["teaching"]
+    assert result.terminal_summary_start_reel_id is None
+
+
+def test_prior_grounded_facet_coverage_does_not_force_repetition(
+    monkeypatch,
+) -> None:
+    completing_square = _obligation(
+        "completing the square",
+        "Teach the completing-the-square method",
+    )
+    reels = [
+        _reel("intro", video_id="intro", start=0, concept="quadratic overview"),
+        _reel("recap", video_id="recap", start=0, concept="quadratic recap"),
+        _reel(
+            "complete-square",
+            video_id="complete-square",
+            start=0,
+            concept="completing the square",
+            _selection_intent_obligations=[completing_square],
+        ),
+    ]
+    captured_prompt = ""
+
+    def fake_generate(_system_prompt, user_prompt, **_kwargs):
+        nonlocal captured_prompt
+        captured_prompt = user_prompt
+        return _generation_result(
+            ["intro", "recap"],
+            terminal_summary_start_reel_id="recap",
+        )
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="quadratic methods",
+        release_limit=3,
+        prior_concept_coverage=[{
+            "concept_id": "completing-square",
+            "intent_obligation_keys": [completing_square["key"]],
+        }],
+    )
+
+    request = json.loads(
+        captured_prompt.split("LEARNING_REQUEST_JSON:\n", 1)[1].split(
+            "\n\nCLIPS_JSON:\n", 1
+        )[0]
+    )
+    clips = json.loads(
+        captured_prompt.split("CLIPS_JSON:\n", 1)[1].split(
+            "\n\nFinal request:", 1
+        )[0]
+    )["clips"]
+    assert result.ordered_reel_ids == ["intro", "recap"]
+    assert request["available_intent_obligations"] == [completing_square]
+    assert request["prior_intent_obligation_keys"] == [
+        completing_square["key"]
+    ]
+    complete_square_clip = next(
+        clip for clip in clips if clip["reel_id"] == "complete-square"
+    )
+    assert complete_square_clip["intent_obligations"] == [completing_square]
+
+
+def test_one_candidate_can_satisfy_multiple_grounded_request_facets(
+    monkeypatch,
+) -> None:
+    time = _obligation("time complexity", "Compare time complexity")
+    space = _obligation("space complexity", "Compare space complexity")
+    reels = [
+        _reel(
+            "time-only",
+            video_id="time",
+            start=0,
+            concept="time complexity",
+            _selection_intent_obligations=[time],
+        ),
+        _reel(
+            "both",
+            video_id="both",
+            start=0,
+            concept="time and space comparison",
+            _selection_intent_obligations=[time, space],
+        ),
+        _reel(
+            "space-only",
+            video_id="space",
+            start=0,
+            concept="space complexity",
+            _selection_intent_obligations=[space],
+        ),
+        _reel("recap", video_id="recap", start=0, concept="sorting recap"),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(
+            ["recap"],
+            terminal_summary_start_reel_id="recap",
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="compare sorting time and space complexity",
+        release_limit=2,
+    )
+
+    assert result.ordered_reel_ids == ["both", "recap"]
+
+
+def test_obligation_search_finds_complete_nongreedy_release(monkeypatch) -> None:
+    obligations = {
+        key: _obligation(key, f"Teach facet {key}")
+        for key in "abcdef"
+    }
+    reels = [
+        _reel(
+            "x",
+            video_id="x",
+            start=0,
+            concept="facets a b c d",
+            _selection_intent_obligations=[
+                obligations[key] for key in "abcd"
+            ],
+        ),
+        _reel(
+            "y",
+            video_id="y",
+            start=0,
+            concept="facets a b e",
+            _selection_intent_obligations=[
+                obligations[key] for key in "abe"
+            ],
+        ),
+        _reel(
+            "z",
+            video_id="z",
+            start=0,
+            concept="facets c d f",
+            _selection_intent_obligations=[
+                obligations[key] for key in "cdf"
+            ],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["x"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="teach facets a through f",
+        release_limit=2,
+    )
+
+    assert result.ordered_reel_ids == ["y", "z"]
+
+
+def test_complete_cover_minimizes_dependency_closure_before_root_count(
+    monkeypatch,
+) -> None:
+    facet_a = _obligation("facet a", "Teach facet a")
+    facet_b = _obligation("facet b", "Teach facet b")
+    reels = [
+        _reel("intro", video_id="intro", start=0, concept="lesson introduction"),
+        _reel(
+            "setup-one",
+            video_id="combo",
+            start=0,
+            concept="first setup",
+            selection_candidate_id="setup-one-candidate",
+        ),
+        _reel(
+            "setup-two",
+            video_id="combo",
+            start=20,
+            concept="second setup",
+            selection_candidate_id="setup-two-candidate",
+        ),
+        _reel(
+            "combo",
+            video_id="combo",
+            start=40,
+            concept="facets a and b together",
+            prerequisite_ids=[
+                "setup-one-candidate",
+                "setup-two-candidate",
+            ],
+            _selection_intent_obligations=[facet_a, facet_b],
+        ),
+        _reel(
+            "a",
+            video_id="a",
+            start=0,
+            concept="facet a",
+            _selection_intent_obligations=[facet_a],
+        ),
+        _reel(
+            "b",
+            video_id="b",
+            start=0,
+            concept="facet b",
+            _selection_intent_obligations=[facet_b],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["intro"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="teach facets a and b",
+        release_limit=3,
+    )
+
+    assert result.ordered_reel_ids == ["intro", "a", "b"]
+
+
+def test_same_coverage_state_keeps_easier_exact_remediation(
+    monkeypatch,
+) -> None:
+    obligations = [
+        _obligation(f"facet {index}", f"Teach facet {index}")
+        for index in range(4)
+    ]
+    harder_complete = _reel(
+        "harder-complete",
+        video_id="harder",
+        start=0,
+        concept="all facets at advanced difficulty",
+        concept_id="adaptive-topic",
+        difficulty=0.7,
+        _selection_intent_obligations=obligations,
+    )
+    easier_exact = _reel(
+        "easier-exact",
+        video_id="easier",
+        start=0,
+        concept="two facets at remedial difficulty",
+        concept_id="adaptive-topic",
+        difficulty=0.2,
+        _selection_intent_obligations=[obligations[0], obligations[3]],
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["harder-complete"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [harder_complete, easier_exact],
+        topic="teach all four facets",
+        remediation_concept_ids=["adaptive-topic"],
+        release_limit=2,
+    )
+
+    assert set(result.ordered_reel_ids) == {
+        "harder-complete",
+        "easier-exact",
+    }
+
+
+def test_complete_cover_prefers_organizer_selected_tie(
+    monkeypatch,
+) -> None:
+    facets = [
+        _obligation(f"facet {index}", f"Teach facet {index}")
+        for index in range(5)
+    ]
+    reels = [
+        _reel(
+            "r0",
+            video_id="r0",
+            start=0,
+            concept="organizer completion",
+            concept_id="c0",
+            difficulty=0.2,
+            selection_candidate_id="a0",
+            _selection_intent_obligations=facets[2:5],
+        ),
+        _reel(
+            "r1",
+            video_id="r1",
+            start=0,
+            concept="non-organizer completion",
+            concept_id="adaptive",
+            difficulty=0.2,
+            selection_candidate_id="a1",
+            _selection_intent_obligations=facets[3:5],
+        ),
+        _reel(
+            "r2",
+            video_id="r2",
+            start=0,
+            concept="exact core",
+            concept_id="adaptive",
+            difficulty=0.2,
+            selection_candidate_id="a2",
+            _selection_intent_obligations=facets[:4],
+        ),
+        _reel(
+            "r3",
+            video_id="r3",
+            start=0,
+            concept="alternate exact completion",
+            concept_id="adaptive",
+            difficulty=0.2,
+            selection_candidate_id="a3",
+            _selection_intent_obligations=[
+                facets[0],
+                facets[3],
+                facets[4],
+            ],
+        ),
+        _reel(
+            "r4",
+            video_id="r4",
+            start=0,
+            concept="single facet",
+            concept_id="c4",
+            difficulty=0.1,
+            selection_candidate_id="a4",
+            _selection_intent_obligations=[facets[1]],
+        ),
+        _reel(
+            "r5",
+            video_id="r5",
+            start=0,
+            concept="ineligible organizer choice",
+            concept_id="c5",
+            difficulty=0.2,
+            selection_candidate_id="a5",
+            prerequisite_ids=["a2", "a4", "a3"],
+            _selection_intent_obligations=[facets[4]],
+        ),
+        _reel(
+            "r6",
+            video_id="r6",
+            start=0,
+            concept="organizer partial",
+            concept_id="c6",
+            difficulty=0.1,
+            selection_candidate_id="a6",
+            _selection_intent_obligations=facets[2:4],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["r0", "r5", "r6"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="teach all five facets",
+        remediation_concept_ids=["adaptive"],
+        release_limit=2,
+    )
+
+    assert set(result.ordered_reel_ids) == {"r0", "r2"}
+
+
+def test_complete_cover_prefers_organizer_selected_exact_tie(
+    monkeypatch,
+) -> None:
+    facets = [
+        _obligation(f"facet {index}", f"Teach facet {index}")
+        for index in range(5)
+    ]
+    reel_specs = [
+        ("r0", "c0", 0.2, [], [facets[1], facets[3]]),
+        ("r1", "c1", 0.2, [], [facets[1]]),
+        ("r2", "c2", 0.3, [], facets),
+        ("r3", "adaptive", 0.2, [], [facets[2]]),
+        ("r4", "c4", 0.3, ["a0", "a1", "a2"], facets[3:5]),
+        ("r5", "c5", 0.2, ["a4"], []),
+        ("r6", "adaptive", 0.2, [], facets[:2]),
+    ]
+    reels = [
+        _reel(
+            reel_id,
+            video_id=reel_id,
+            start=0,
+            concept=f"lesson {reel_id}",
+            concept_id=concept_id,
+            difficulty=difficulty,
+            selection_candidate_id=f"a{index}",
+            prerequisite_ids=prerequisite_ids,
+            _selection_intent_obligations=obligations,
+        )
+        for index, (
+            reel_id,
+            concept_id,
+            difficulty,
+            prerequisite_ids,
+            obligations,
+        ) in enumerate(reel_specs)
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(
+            ["r1", "r2", "r3", "r4", "r5"]
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="teach all five facets",
+        remediation_concept_ids=["adaptive"],
+        release_limit=5,
+    )
+
+    assert "r3" in result.ordered_reel_ids
+    assert "r6" not in result.ordered_reel_ids
+
+
+def test_complete_cover_compression_preserves_organizer_exact_option(
+    monkeypatch,
+) -> None:
+    facets = [
+        _obligation(f"facet {index}", f"Teach facet {index}")
+        for index in range(3)
+    ]
+    obligations = [
+        [facets[0]],
+        [facets[1]],
+        facets[1:3],
+        facets[:2],
+        facets[1:3],
+        [facets[1]],
+        [facets[0]],
+        [facets[0], facets[2]],
+    ]
+    prerequisites = [
+        [],
+        ["a0"],
+        [],
+        [],
+        [],
+        ["a3"],
+        ["a0"],
+        ["a0", "a1", "a3"],
+    ]
+    exact_ids = {"r0", "r2", "r4", "r6"}
+    difficulties = [0.1, 0.1, 0.1, 0.1, 0.2, 0.1, 0.2, 0.2]
+    reels = [
+        _reel(
+            f"r{index}",
+            video_id=f"r{index}",
+            start=0,
+            concept=f"lesson r{index}",
+            concept_id=(
+                "adaptive" if f"r{index}" in exact_ids else f"c{index}"
+            ),
+            difficulty=difficulties[index],
+            selection_candidate_id=f"a{index}",
+            prerequisite_ids=prerequisites[index],
+            _selection_intent_obligations=obligations[index],
+        )
+        for index in range(8)
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["r4", "r5"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="teach all three facets",
+        remediation_concept_ids=["adaptive"],
+        release_limit=2,
+    )
+
+    assert "r4" in result.ordered_reel_ids
+    assert "r2" not in result.ordered_reel_ids
+
+
+def test_partial_cover_prefers_organizer_selected_tie(
+    monkeypatch,
+) -> None:
+    facets = [
+        _obligation(f"facet {index}", f"Teach facet {index}")
+        for index in range(3)
+    ]
+    reels = [
+        _reel(
+            "r0",
+            video_id="r0",
+            start=0,
+            concept="facet one",
+            concept_id="c0",
+            difficulty=0.1,
+            _selection_intent_obligations=[facets[1]],
+        ),
+        _reel(
+            "r1",
+            video_id="r1",
+            start=0,
+            concept="organizer facet two",
+            concept_id="c1",
+            difficulty=0.3,
+            _selection_intent_obligations=[facets[2]],
+        ),
+        _reel(
+            "r2",
+            video_id="r2",
+            start=0,
+            concept="non-organizer exact facet one",
+            concept_id="adaptive",
+            difficulty=0.2,
+            _selection_intent_obligations=[facets[1]],
+        ),
+        _reel(
+            "r3",
+            video_id="r3",
+            start=0,
+            concept="organizer exact facet zero",
+            concept_id="adaptive",
+            difficulty=0.2,
+            _selection_intent_obligations=[facets[0]],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["r1", "r3"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="teach all three facets",
+        remediation_concept_ids=["adaptive"],
+        release_limit=2,
+    )
+
+    assert set(result.ordered_reel_ids) == {"r1", "r3"}
+
+
+def test_partial_dependency_state_keeps_easier_smaller_remediation(
+    monkeypatch,
+) -> None:
+    facets = [
+        _obligation(f"facet {index}", f"Teach facet {index}")
+        for index in range(3)
+    ]
+    reels = [
+        _reel("intro", video_id="intro", start=0, concept="intro"),
+        _reel(
+            "easy",
+            video_id="easy",
+            start=0,
+            concept="easy exact",
+            concept_id="adaptive",
+            difficulty=0.1,
+        ),
+        _reel(
+            "joint",
+            video_id="joint",
+            start=0,
+            concept="facets a and b exact",
+            concept_id="adaptive",
+            difficulty=0.4,
+            selection_candidate_id="joint-candidate",
+            _selection_intent_obligations=facets[:2],
+        ),
+        _reel(
+            "wrapper",
+            video_id="wrapper",
+            start=0,
+            concept="wrapper exact",
+            concept_id="adaptive",
+            difficulty=0.3,
+            prerequisite_ids=["joint-candidate"],
+        ),
+        *[
+            _reel(
+                f"p{index}",
+                video_id=f"p{index}",
+                start=0,
+                concept=f"prerequisite {index}",
+                selection_candidate_id=f"p{index}-candidate",
+            )
+            for index in range(3)
+        ],
+        _reel(
+            "impossible-c",
+            video_id="c",
+            start=0,
+            concept="facet c",
+            prerequisite_ids=[
+                f"p{index}-candidate" for index in range(3)
+            ],
+            _selection_intent_obligations=[facets[2]],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["intro"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="teach all three facets",
+        remediation_concept_ids=["adaptive"],
+        release_limit=3,
+    )
+
+    assert result.ordered_reel_ids == ["intro", "easy", "joint"]
+
+
+def test_ineligible_exact_closure_releases_available_obligation(
+    monkeypatch,
+) -> None:
+    facet = _obligation("available facet", "Teach the available facet")
+    prerequisite = _reel(
+        "prerequisite",
+        video_id="prerequisite",
+        start=0,
+        concept="prerequisite",
+        selection_candidate_id="prerequisite-candidate",
+    )
+    exact = _reel(
+        "exact",
+        video_id="exact",
+        start=0,
+        concept="exact remediation",
+        concept_id="adaptive",
+        difficulty=0.1,
+        prerequisite_ids=["prerequisite-candidate"],
+    )
+    available = _reel(
+        "available",
+        video_id="available",
+        start=0,
+        concept="available facet",
+        _selection_intent_obligations=[facet],
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["available"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [prerequisite, exact, available],
+        topic="teach the available facet",
+        remediation_concept_ids=["adaptive"],
+        release_limit=1,
+    )
+
+    assert result.ordered_reel_ids == ["available"]
+
+
+def test_maximum_obligation_matrix_stays_below_release_latency_guard(
+    monkeypatch,
+) -> None:
+    obligations = [
+        _obligation(f"facet-{index}", f"Teach facet {index}")
+        for index in range(16)
+    ]
+    combinations = list(itertools.islice(
+        itertools.combinations(range(16), 4),
+        128,
+    ))
+    reels = [
+        _reel(
+            f"matrix-{index}",
+            video_id=f"matrix-{index}",
+            start=0,
+            concept=f"facets {' '.join(str(item) for item in combination)}",
+            _selection_intent_obligations=[
+                obligations[item] for item in combination
+            ],
+        )
+        for index, combination in enumerate(combinations)
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["matrix-0"]),
+    )
+
+    started = time.process_time()
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="teach all sixteen facets",
+        release_limit=9,
+    )
+    elapsed = time.process_time() - started
+
+    covered_keys = {
+        obligation["key"]
+        for reel in result.reels
+        for obligation in reel.get("_selection_intent_obligations", ())
+    }
+    assert covered_keys == {obligation["key"] for obligation in obligations}
+    assert len(result.ordered_reel_ids) <= 9
+    assert elapsed < 1.0
+
+
+def test_maximum_exact_dependency_matrix_stays_below_release_latency_guard(
+    monkeypatch,
+) -> None:
+    obligations = [
+        _obligation(f"facet-{index}", f"Teach facet {index}")
+        for index in range(16)
+    ]
+    prerequisites = [
+        _reel(
+            f"p{index}",
+            video_id=f"p{index}",
+            start=0,
+            concept=f"prerequisite {index}",
+            selection_candidate_id=f"p{index}-candidate",
+        )
+        for index in range(7)
+    ]
+    prerequisite_subsets = list(itertools.islice(
+        itertools.chain.from_iterable(
+            itertools.combinations(range(7), size)
+            for size in range(1, 8)
+        ),
+        34,
+    ))
+    exact_candidates = [
+        _reel(
+            f"exact-{index}",
+            video_id=f"exact-{index}",
+            start=0,
+            concept=f"adaptive explanation {index}",
+            concept_id="adaptive",
+            difficulty=(index + 1) / 100,
+            prerequisite_ids=[
+                f"p{item}-candidate" for item in subset
+            ],
+        )
+        for index, subset in enumerate(prerequisite_subsets)
+    ]
+    pair_candidates = [
+        _reel(
+            f"pair-{index}",
+            video_id=f"pair-{index}",
+            start=0,
+            concept=f"facets {left} and {right}",
+            _selection_intent_obligations=[
+                obligations[left],
+                obligations[right],
+            ],
+        )
+        for index, (left, right) in enumerate(
+            itertools.islice(itertools.combinations(range(16), 2), 85)
+        )
+    ]
+    reels = [
+        _reel("intro", video_id="intro", start=0, concept="intro"),
+        *prerequisites,
+        *exact_candidates,
+        _reel(
+            "hard-exact",
+            video_id="hard-exact",
+            start=0,
+            concept="standalone adaptive explanation",
+            concept_id="adaptive",
+            difficulty=0.99,
+        ),
+        *pair_candidates,
+    ]
+    assert len(reels) == 128
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["intro"]),
+    )
+
+    started = time.process_time()
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="teach all sixteen facets",
+        remediation_concept_ids=["adaptive"],
+        release_limit=9,
+    )
+    elapsed = time.process_time() - started
+
+    covered_keys = {
+        obligation["key"]
+        for reel in result.reels
+        for obligation in reel.get("_selection_intent_obligations", ())
+    }
+    assert covered_keys == {obligation["key"] for obligation in obligations}
+    assert "hard-exact" in result.ordered_reel_ids
+    assert len(result.ordered_reel_ids) == 9
+    assert elapsed < 1.0
+
+
+def test_unavailable_dependency_matrix_stays_below_release_latency_guard(
+    monkeypatch,
+) -> None:
+    obligations = [
+        _obligation(f"facet-{index}", f"Teach facet {index}")
+        for index in range(16)
+    ]
+    prerequisites = [
+        _reel(
+            f"p{index}",
+            video_id=f"p{index}",
+            start=0,
+            concept=f"prerequisite {index}",
+            selection_candidate_id=f"p{index}-candidate",
+        )
+        for index in range(9)
+    ]
+    witnesses = [
+        _reel(
+            f"witness-{index}",
+            video_id=f"witness-{index}",
+            start=0,
+            concept=f"facets {' '.join(str(item) for item in combination)}",
+            _selection_intent_obligations=[
+                obligations[item] for item in combination
+            ],
+        )
+        for index, combination in enumerate(
+            itertools.islice(itertools.combinations(range(15), 4), 40)
+        )
+    ]
+    reels = [
+        _reel("intro", video_id="intro", start=0, concept="intro"),
+        _reel(
+            "easy-exact",
+            video_id="easy-exact",
+            start=0,
+            concept="easy exact remediation",
+            concept_id="adaptive",
+            difficulty=0.1,
+        ),
+        *prerequisites,
+        _reel(
+            "unavailable-facet",
+            video_id="unavailable-facet",
+            start=0,
+            concept="facet fifteen",
+            prerequisite_ids=[
+                f"p{index}-candidate" for index in range(9)
+            ],
+            _selection_intent_obligations=[obligations[15]],
+        ),
+        _reel(
+            "dependency-witness",
+            video_id="dependency-witness",
+            start=0,
+            concept="facet zero dependency witness",
+            prerequisite_ids=["p0-candidate"],
+            _selection_intent_obligations=[obligations[0]],
+        ),
+        *witnesses,
+    ]
+    assert len(reels) == 53
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["intro"]),
+    )
+
+    started = time.process_time()
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="teach all sixteen facets",
+        remediation_concept_ids=["adaptive"],
+        release_limit=9,
+    )
+    elapsed = time.process_time() - started
+
+    covered_keys = {
+        obligation["key"]
+        for reel in result.reels
+        for obligation in reel.get("_selection_intent_obligations", ())
+    }
+    assert len(covered_keys) == 14
+    assert "easy-exact" in result.ordered_reel_ids
+    assert len(result.ordered_reel_ids) <= 9
+    assert elapsed < 1.0
+
+
+def test_exact_remediation_and_grounded_facet_share_mandatory_release_slots(
+    monkeypatch,
+) -> None:
+    comparison = _obligation(
+        "comparative negligence",
+        "Teach comparative negligence",
+    )
+    reels = [
+        _reel("intro", video_id="intro", start=0, concept="negligence overview"),
+        _reel(
+            "remediation",
+            video_id="remediation",
+            start=0,
+            concept="remoteness",
+            concept_id="remoteness-law",
+            difficulty=0.2,
+        ),
+        _reel(
+            "comparison",
+            video_id="comparison",
+            start=0,
+            concept="comparative negligence",
+            _selection_intent_obligations=[comparison],
+        ),
+    ]
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result(["intro"])
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="negligence and comparative negligence",
+        remediation_concept_ids=["remoteness-law"],
+        release_limit=3,
+    )
+
+    assert calls == 1
+    assert set(result.ordered_reel_ids) == {
+        "intro",
+        "remediation",
+        "comparison",
+    }
+
+
+@pytest.mark.parametrize("release_limit", [1, 2])
+def test_joint_witness_satisfies_exact_remediation_without_near_duplicate(
+    monkeypatch,
+    release_limit: int,
+) -> None:
+    etc = _obligation(
+        "electron transport chain",
+        "Teach the electron transport chain",
+    )
+    easy_exact = {
+        **_reel(
+            "easy-exact",
+            video_id="same-source",
+            start=10,
+            concept="electron transport chain overview",
+            concept_id="etc",
+            difficulty=0.1,
+        ),
+        "t_end": 110.0,
+    }
+    joint_witness = {
+        **_reel(
+            "joint-witness",
+            video_id="same-source",
+            start=12,
+            concept="electron transport chain mechanism",
+            concept_id="etc",
+            difficulty=0.2,
+            _selection_intent_obligations=[etc],
+        ),
+        "t_end": 107.0,
+    }
+    obligation_alternatives = [
+        _reel(
+            f"obligation-{suffix}",
+            video_id=f"obligation-{suffix}",
+            start=0,
+            concept="electron transport chain detail",
+            _selection_intent_obligations=[etc],
+        )
+        for suffix in ("a", "b")
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["easy-exact"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [easy_exact, joint_witness, *obligation_alternatives],
+        topic="electron transport chain",
+        remediation_concept_ids=["etc"],
+        release_limit=release_limit,
+    )
+
+    assert result.ordered_reel_ids == ["joint-witness"]
+    assert result.reels == [joint_witness]
+
+
+def test_cached_selection_still_runs_grounded_facet_postcondition(
+    monkeypatch,
+) -> None:
+    facet = _obligation("duty of care", "Teach duty of care")
+    recap = _reel("recap", video_id="recap", start=0, concept="recap")
+    teaching = _reel(
+        "duty",
+        video_id="duty",
+        start=0,
+        concept="duty of care",
+        _selection_intent_obligations=[facet],
+    )
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_read_cached_lesson_order",
+        lambda *_args, **_kwargs: lesson_ordering.LessonOrderResult(
+            reels=[recap],
+            ordered_reel_ids=["recap"],
+            model_used=config.LESSON_ORDER_MODEL,
+            degraded=False,
+            fallback_reason=None,
+            provider_called=False,
+            assessment_checkpoint_reel_ids=[],
+            terminal_summary_start_reel_id="recap",
+        ),
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: pytest.fail("cache hit must not call provider"),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [recap, teaching],
+        topic="duty of care",
+        release_limit=2,
+    )
+
+    assert result.ordered_reel_ids == ["duty", "recap"]
+    assert result.terminal_summary_start_reel_id == "recap"
+
+
+def test_provider_fallback_prioritizes_available_grounded_facet(monkeypatch) -> None:
+    facet = _obligation("causation", "Teach causation")
+    recap = _reel("recap", video_id="recap", start=0, concept="recap")
+    teaching = _reel(
+        "causation",
+        video_id="causation",
+        start=0,
+        concept="causation",
+        _selection_intent_obligations=[facet],
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [recap, teaching],
+        topic="causation",
+        release_limit=1,
+    )
+
+    assert result.degraded is True
+    assert result.ordered_reel_ids == ["causation"]
+
+
 def test_release_limit_fallback_keeps_a_dependency_safe_prefix(monkeypatch) -> None:
     prerequisite = _reel(
         "prerequisite",
@@ -612,6 +1898,8 @@ def test_prior_concept_coverage_is_bounded_curriculum_state(monkeypatch) -> None
         video_id="next-video",
         start=0,
         concept="Newton's third law",
+        concept_id="new-first-law-id",
+        concept_family="Newton's first law of motion",
     )
 
     def fake_generate(system_prompt, user_prompt, **_kwargs):
@@ -625,11 +1913,25 @@ def test_prior_concept_coverage_is_bounded_curriculum_state(monkeypatch) -> None
         topic="Newton's laws in order",
         release_limit=1,
         prior_concept_coverage=[
-            *({} for _index in range(40)),
+            *(
+                {
+                    "concept_id": f"quiet-{index:02d}",
+                    "concept_family": f"Quiet concept {index:02d}",
+                    "delivered_count": 1,
+                }
+                for index in range(40)
+            ),
             {
                 "concept_id": "first-law",
                 "concept_family": "Newton's first law of motion",
+                "concept_title": "Newton's first law",
                 "delivered_count": 3,
+            },
+            {
+                "concept_id": "new-first-law-id",
+                "concept_family": "Newton's first law of motion",
+                "concept_title": "New candidate identity",
+                "delivered_count": 1,
             },
         ],
         concept_signals={
@@ -646,16 +1948,24 @@ def test_prior_concept_coverage_is_bounded_curriculum_state(monkeypatch) -> None
             "\n\nCLIPS_JSON:\n", 1
         )[0]
     )
-    assert request["prior_concept_coverage"] == [{
+    assert len(request["prior_concept_coverage"]) == 40
+    assert request["prior_concept_coverage"][0] == {
         "concept_id": "first-law",
         "concept_family": "Newton's first law of motion",
+        "concept_title": "Newton's first law",
         "delivered_count": 3,
         "learner_signal": {
             "helpful": 2.0,
             "confusing": 0.0,
             "adjustment": 0.08,
         },
-    }]
+    }
+    assert request["prior_concept_coverage"][1]["concept_id"] == (
+        "new-first-law-id"
+    )
+    assert {"quiet-38", "quiet-39"}.isdisjoint({
+        item["concept_id"] for item in request["prior_concept_coverage"]
+    })
     assert "previously released coverage" in captured["system"].casefold()
 
 
@@ -1098,6 +2408,36 @@ def test_organizer_first_choice_wins_same_source_overlap_and_checkpoint_is_filte
     assert result.ordered_reel_ids == ["balanced-ball", "later"]
     assert result.reels == [shorter, later]
     assert result.assessment_checkpoint_reel_ids == ["balanced-ball", "later"]
+    assert result.degraded is False
+
+
+def test_same_source_overlap_keeps_later_clip_with_novel_grounded_facet(
+    monkeypatch,
+) -> None:
+    definition = _obligation("definition", "Teach the definition")
+    application = _obligation("application", "Teach the application")
+    first = {
+        **_reel("first", video_id="same", start=10, concept="definition"),
+        "t_end": 100.0,
+        "_selection_intent_obligations": [definition],
+    }
+    second = {
+        **_reel("second", video_id="same", start=10, concept="application"),
+        "t_end": 90.0,
+        "_selection_intent_obligations": [application],
+    }
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["first", "second"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [first, second],
+        topic="definition and application",
+    )
+
+    assert result.ordered_reel_ids == ["first", "second"]
     assert result.degraded is False
 
 

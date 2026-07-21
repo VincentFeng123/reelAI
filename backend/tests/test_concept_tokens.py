@@ -75,6 +75,14 @@ def test_unicode_math_and_scientific_notation_retain_identity() -> None:
 
 
 def test_structural_case_is_preserved_without_case_sensitizing_prose() -> None:
+    assert semantic_key("C") != semantic_key("c")
+    assert semantic_key("X") != semantic_key("x")
+    assert semantic_key("Δ") != semantic_key("δ")
+    assert semantic_tokens("Δ δ") == ("Δ", "δ")
+    assert semantic_key("A") == semantic_key("a")
+    assert semantic_key("I") == semantic_key("i")
+    assert is_structural_case_token("C")
+    assert not is_structural_case_token("c")
     assert semantic_key("Co oxidation") != semantic_key("CO oxidation")
     assert semantic_token_case_key("Co") == "Co"
     assert semantic_token_case_key("CO") == "CO"
@@ -89,8 +97,8 @@ def test_structural_case_is_preserved_without_case_sensitizing_prose() -> None:
 
 
 def test_attached_language_suffixes_do_not_consume_the_next_token() -> None:
-    assert semantic_tokens("C C++ C#") == ("c", "c++", "c#")
-    assert semantic_tokens("C + + memory # topic") == ("c", "memory", "topic")
+    assert semantic_tokens("C C++ C#") == ("C", "c++", "c#")
+    assert semantic_tokens("C + + memory # topic") == ("C", "memory", "topic")
 
 
 def test_terminal_suffix_requires_explicit_preservation() -> None:

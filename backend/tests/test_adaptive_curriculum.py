@@ -160,7 +160,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         )[1]
         self.assertAlmostEqual(adjustments["c1"], 0.04)
 
-    def test_semantic_concept_family_propagates_both_thumb_directions(self) -> None:
+    def test_semantic_family_does_not_propagate_exact_thumb_signals(self) -> None:
         family = {
             "action": "action-reaction pairs",
             "identify": "identifying action-reaction pairs",
@@ -215,9 +215,12 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         coverage, adjustments, _, _ = self.svc._learner_adaptation_context(
             self.conn, self.MATERIAL, self.LEARNER
         )
-        for concept_id in family:
-            self.assertEqual(coverage[concept_id], {"helpful": 1.0, "confusing": 0.0})
-            self.assertAlmostEqual(adjustments[concept_id], 0.04)
+        self.assertEqual(
+            coverage,
+            {"action": {"helpful": 1.0, "confusing": 0.0}},
+        )
+        self.assertEqual(set(adjustments), {"action"})
+        self.assertAlmostEqual(adjustments["action"], 0.04)
 
         helpful_order = self.svc.adaptive_curriculum_order(
             self.conn,
@@ -228,7 +231,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                 self._item("different", "c2", "vc", 10, 1, 0.3),
             ],
         )
-        self.assertEqual(helpful_order[0]["reel_id"], "different")
+        self.assertEqual(helpful_order[0]["reel_id"], "family-repeat")
 
         self.svc.record_feedback(
             self.conn,
@@ -242,9 +245,12 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         coverage, adjustments, _, _ = self.svc._learner_adaptation_context(
             self.conn, self.MATERIAL, self.LEARNER
         )
-        for concept_id in family:
-            self.assertEqual(coverage[concept_id], {"helpful": 0.0, "confusing": 1.0})
-            self.assertAlmostEqual(adjustments[concept_id], -0.06)
+        self.assertEqual(
+            coverage,
+            {"action": {"helpful": 0.0, "confusing": 1.0}},
+        )
+        self.assertEqual(set(adjustments), {"action"})
+        self.assertAlmostEqual(adjustments["action"], -0.06)
 
         confusing_order = self.svc.adaptive_curriculum_order(
             self.conn,
@@ -255,7 +261,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                 self._item("different", "c2", "vc", 10, 10, 0.3),
             ],
         )
-        self.assertEqual(confusing_order[0]["reel_id"], "family-remediation")
+        self.assertEqual(confusing_order[0]["reel_id"], "different")
 
     def test_ai_canonical_family_profiles_do_not_merge_untrusted_titles(self) -> None:
         self.assertEqual(
@@ -817,6 +823,150 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         self.assertAlmostEqual(adjustments[newton_id], 0.04)
         self.assertNotIn(thermo_id, adjustments)
 
+    def test_case_sensitive_single_letter_concepts_isolate_thumb_and_quiz_signals(
+        self,
+    ) -> None:
+        uppercase_id, uppercase_title, uppercase_key = ensure_clip_concept(
+            self.conn,
+            material_id=self.MATERIAL,
+            title="C",
+        )
+        lowercase_id, lowercase_title, lowercase_key = ensure_clip_concept(
+            self.conn,
+            material_id=self.MATERIAL,
+            title="c",
+        )
+        self.assertNotEqual(uppercase_id, lowercase_id)
+        self.assertEqual((uppercase_title, uppercase_key), ("C", "C"))
+        self.assertEqual((lowercase_title, lowercase_key), ("c", "c"))
+
+        self._insert_reel("uppercase-C", uppercase_id, "va", 1, 0.4)
+        self._insert_reel("lowercase-c", lowercase_id, "vb", 31, 0.4)
+        self.svc.record_feedback(
+            self.conn,
+            "uppercase-C",
+            helpful=True,
+            confusing=False,
+            rating=None,
+            saved=False,
+            learner_id=self.LEARNER,
+        )
+        self.svc.record_feedback(
+            self.conn,
+            "lowercase-c",
+            helpful=False,
+            confusing=True,
+            rating=None,
+            saved=False,
+            learner_id=self.LEARNER,
+        )
+        coverage, adjustments, _, _ = self.svc._learner_adaptation_context(
+            self.conn,
+            self.MATERIAL,
+            self.LEARNER,
+        )
+        self.assertEqual(
+            coverage,
+            {
+                uppercase_id: {"helpful": 1.0, "confusing": 0.0},
+                lowercase_id: {"helpful": 0.0, "confusing": 1.0},
+            },
+        )
+        self.assertAlmostEqual(adjustments[uppercase_id], 0.04)
+        self.assertAlmostEqual(adjustments[lowercase_id], -0.06)
+
+        self.conn.execute(
+            "UPDATE learner_material_progress SET difficulty_reset_at = '' "
+            "WHERE learner_id = ? AND material_id = ?",
+            (self.LEARNER, self.MATERIAL),
+        )
+        self._insert_assessment_outcome(
+            session_id="lowercase-c-wrong-quiz",
+            concept_id=lowercase_id,
+            adjustment=-0.12,
+            video_id="vb",
+            difficulty=0.4,
+        )
+        _, combined, _, _ = self.svc._learner_adaptation_context(
+            self.conn,
+            self.MATERIAL,
+            self.LEARNER,
+        )
+        self.assertAlmostEqual(combined[uppercase_id], 0.04)
+        self.assertAlmostEqual(combined[lowercase_id], -0.18)
+
+    def test_unicode_case_sensitive_symbols_isolate_persistence_and_adaptation(
+        self,
+    ) -> None:
+        uppercase_id, uppercase_title, uppercase_key = ensure_clip_concept(
+            self.conn,
+            material_id=self.MATERIAL,
+            title="Δ",
+        )
+        lowercase_id, lowercase_title, lowercase_key = ensure_clip_concept(
+            self.conn,
+            material_id=self.MATERIAL,
+            title="δ",
+        )
+        self.assertNotEqual(uppercase_id, lowercase_id)
+        self.assertEqual((uppercase_title, uppercase_key), ("Δ", "Δ"))
+        self.assertEqual((lowercase_title, lowercase_key), ("δ", "δ"))
+
+        self._insert_reel("uppercase-delta", uppercase_id, "va", 1, 0.4)
+        self._insert_reel("lowercase-delta", lowercase_id, "vb", 31, 0.4)
+        self.svc.record_feedback(
+            self.conn,
+            "uppercase-delta",
+            helpful=True,
+            confusing=False,
+            rating=None,
+            saved=False,
+            learner_id=self.LEARNER,
+        )
+        self.svc.record_feedback(
+            self.conn,
+            "lowercase-delta",
+            helpful=False,
+            confusing=True,
+            rating=None,
+            saved=False,
+            learner_id=self.LEARNER,
+        )
+        coverage, adjustments, _, _ = self.svc._learner_adaptation_context(
+            self.conn,
+            self.MATERIAL,
+            self.LEARNER,
+        )
+        self.assertEqual(
+            coverage,
+            {
+                uppercase_id: {"helpful": 1.0, "confusing": 0.0},
+                lowercase_id: {"helpful": 0.0, "confusing": 1.0},
+            },
+        )
+        self.assertAlmostEqual(adjustments[uppercase_id], 0.04)
+        self.assertAlmostEqual(adjustments[lowercase_id], -0.06)
+
+        self.conn.execute(
+            "UPDATE learner_material_progress SET difficulty_reset_at = '' "
+            "WHERE learner_id = ? AND material_id = ?",
+            (self.LEARNER, self.MATERIAL),
+        )
+        self._insert_assessment_outcome(
+            session_id="lowercase-delta-wrong-quiz",
+            concept_id=lowercase_id,
+            adjustment=-0.12,
+            video_id="vb",
+            difficulty=0.4,
+        )
+        _, combined, _, _ = self.svc._learner_adaptation_context(
+            self.conn,
+            self.MATERIAL,
+            self.LEARNER,
+        )
+        self.assertAlmostEqual(combined[uppercase_id], 0.04)
+        self.assertAlmostEqual(combined[lowercase_id], -0.18)
+
     def test_narrow_physics_families_keep_feedback_and_quiz_signals_isolated(
         self,
     ) -> None:
@@ -1171,7 +1321,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
 
         self.assertEqual([row["id"] for row in ordered], ["c2", "c1"])
 
-    def test_quiz_signals_propagate_to_related_acquisition_and_remediation(self) -> None:
+    def test_quiz_signals_target_only_the_exact_adaptive_concept(self) -> None:
         for concept_id, title in (
             ("action", "action-reaction pairs"),
             ("identify", "identifying action-reaction pairs"),
@@ -1227,8 +1377,8 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         )
         positions = {row["id"]: index for index, row in enumerate(ordered)}
         self.assertLess(positions["c2"], positions["action"])
-        self.assertLess(positions["c2"], positions["identify"])
-        self.assertLess(positions["c2"], positions["misconception"])
+        self.assertLess(positions["identify"], positions["action"])
+        self.assertLess(positions["misconception"], positions["action"])
 
         self._insert_assessment_outcome(
             session_id="quiz-wrong",
@@ -1239,9 +1389,13 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         coverage, adjustments, latest, _ = self.svc._learner_adaptation_context(
             self.conn, self.MATERIAL, self.LEARNER
         )
-        self.assertEqual(coverage["identify"], {"helpful": 1.0, "confusing": 1.0})
-        self.assertAlmostEqual(adjustments["identify"], -0.04)
-        self.assertIn("misconception", latest["concept_family_ids"])
+        self.assertEqual(
+            coverage,
+            {"action": {"helpful": 1.0, "confusing": 1.0}},
+        )
+        self.assertEqual(set(adjustments), {"action"})
+        self.assertAlmostEqual(adjustments["action"], -0.04)
+        self.assertEqual(latest["concept_family_ids"], ["action"])
 
         remediation = self.svc.adaptive_curriculum_order(
             self.conn,
@@ -1252,7 +1406,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                 self._item("different", "c2", "vc", 10, 10, 0.3),
             ],
         )
-        self.assertEqual(remediation[0]["reel_id"], "related-easier")
+        self.assertEqual(remediation[0]["reel_id"], "different")
 
     def test_incorrect_assessment_prefers_easier_alternative_source(self) -> None:
         self.conn.execute(

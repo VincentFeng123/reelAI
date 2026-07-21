@@ -310,7 +310,7 @@ def test_boundary_prompt_demands_whole_unit_without_duration_cap() -> None:
     assert "duration must be the consequence of the exact semantic scope" in prompt
 
 
-def test_joint_request_subject_matching_handles_plural_query_and_singular_evidence() -> None:
+def test_joint_request_graph_does_not_use_local_number_matching() -> None:
     request = "hypothesis tests and p-values"
     plan = G._CompactBoundaryPlan(
         request_intent={
@@ -335,17 +335,21 @@ def test_joint_request_subject_matching_handles_plural_query_and_singular_eviden
                     "requirement": "Teach p-values",
                 },
             ],
+            "joint_structures": [{
+                "member_constraint_ids": ["tests", "pvalues"],
+                "relation_constraint_id": "join",
+            }],
         },
         topics=[],
     )
     constraints, error = G._validated_intent_constraints(plan, request)
 
     assert error is None
-    assert G._joint_subject_evidence_matches(
-        constraints["pvalues"],
-        "A p-value measures how surprising the observed result would be",
+    assert G._joint_intent_contract_error(
+        request,
         constraints,
-    )
+        plan.request_intent.joint_structures,
+    ) is None
 
 
 def test_bare_next_step_action_is_removed_as_low_density_framing() -> None:
@@ -451,6 +455,10 @@ def test_course_scope_does_not_require_spoken_evidence_for_a_joint_unit() -> Non
                     "requirement": "Teach p-values",
                 },
             ],
+            "joint_structures": [{
+                "member_constraint_ids": ["tests", "pvalues"],
+                "relation_constraint_id": "join",
+            }],
         },
         topics=[G._CompactBoundaryTopic(
             candidate_id="joint-scope-unit",
@@ -476,11 +484,15 @@ def test_course_scope_does_not_require_spoken_evidence_for_a_joint_unit() -> Non
                     "constraint_id": "tests",
                     "evidence_quote": "the null hypothesis in a hypothesis test were true",
                 },
-                {
-                    "constraint_id": "pvalues",
-                    "evidence_quote": "A p-value measures how surprising sample evidence would be",
-                },
-            ],
+                    {
+                        "constraint_id": "pvalues",
+                        "evidence_quote": "A p-value measures how surprising sample evidence would be",
+                    },
+                    {
+                        "constraint_id": "join",
+                        "evidence_quote": "if the null hypothesis in a hypothesis test were true",
+                    },
+                ],
         )],
     )
 

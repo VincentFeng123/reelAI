@@ -1607,6 +1607,10 @@ def test_compact_comparison_uses_relationship_evidence_and_stops_at_third_unit()
                     "requirement": "Teach the chain rule side",
                 },
             ],
+            "joint_structures": [{
+                "member_constraint_ids": ["power", "chain"],
+                "relation_constraint_id": "versus",
+            }],
         },
         topics=[
             gemini_segment._CompactBoundaryTopic(

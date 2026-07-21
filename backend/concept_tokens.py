@@ -35,7 +35,7 @@ _ATTACHABLE_SUFFIX_SYMBOLS = frozenset({"•"})
 _STRUCTURAL_MATH_LETTERS = frozenset({"ℂ", "ℍ", "ℕ", "ℙ", "ℚ", "ℝ", "ℤ"})
 _CASE_INSENSITIVE_SHORT_WORDS = frozenset({
     "a", "an", "and", "as", "at", "be", "by", "do", "for", "from", "go",
-    "he", "if", "in", "is", "it", "law", "no", "of", "on", "or", "rule",
+    "he", "i", "if", "in", "is", "it", "law", "no", "of", "on", "or", "rule",
     "set", "so", "step", "the", "to", "type", "up", "us", "war", "we",
     "zero", "one", "two", "four", "five", "nine", "ten",
 })
@@ -65,6 +65,12 @@ def is_structural_case_token(token: object) -> bool:
     if any(character in _STRUCTURAL_MATH_LETTERS for character in core):
         return True
     letters = [character for character in core if character.isalpha()]
+    if len(letters) == 1:
+        return bool(
+            raw == core
+            and core.isupper()
+            and core.casefold() not in _CASE_INSENSITIVE_SHORT_WORDS
+        )
     if len(letters) < 2 or core.casefold() in _CASE_INSENSITIVE_SHORT_WORDS:
         return False
     if (

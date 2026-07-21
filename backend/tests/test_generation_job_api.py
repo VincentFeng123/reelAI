@@ -20,6 +20,7 @@ from backend.app.clip_engine import silence as clip_engine_silence
 from backend.app.clip_engine.errors import (
     ProviderQuotaError,
     ProviderRateLimitError,
+    ProviderResponseValidationError,
     ProviderTransientError,
 )
 from backend.app.clip_engine.provider_runtime import ProviderUsageRecord
@@ -41,6 +42,10 @@ from backend.app.models import (
 )
 from backend.app.services import generation_jobs, lesson_ordering
 from backend.app.services.reels import ReelService
+from backend.intent_obligations import (
+    INTENT_OBLIGATION_CONTRACT_VERSION,
+    intent_obligation,
+)
 
 
 EMPTY_ADAPTATION_FINGERPRINT = hashlib.sha256(b"{}").hexdigest()
@@ -138,6 +143,53 @@ def test_public_generation_reel_keeps_legacy_relevance_semantics() -> None:
     assert public["relevance_score"] == 0.13
     assert public["topic_relevance"] == 0.93
     assert not any(key.startswith("_selection_") for key in public)
+
+
+def test_intent_obligations_reach_organizer_only_from_trusted_gemini_metadata() -> None:
+    obligation = intent_obligation(
+        kind="scope",
+        source_phrase="time and space complexity",
+        requirement="Compare time and space complexity.",
+        evidence_quote="Merge sort uses additional linear space.",
+    )
+    assert obligation is not None
+    trusted = {
+        "selection_contract_version": "quality_silence_v39",
+        "selection_authority": "gemini",
+        "intent_obligation_contract_version": (
+            INTENT_OBLIGATION_CONTRACT_VERSION
+        ),
+        "intent_obligations": [obligation],
+    }
+
+    metadata = ReelService._selection_metadata(trusted)
+    assert metadata["_selection_intent_obligations"] == [obligation]
+    organizer_reel = main._public_generation_reel(
+        {"reel_id": "trusted", **metadata},
+        preserve_lesson_order_metadata=True,
+    )
+    assert organizer_reel["_selection_intent_obligations"] == [obligation]
+    assert "_selection_intent_obligations" not in main._public_generation_reel(
+        {"reel_id": "trusted", **metadata}
+    )
+
+    for untrusted in (
+        {**trusted, "selection_authority": "local"},
+        {**trusted, "intent_obligation_contract_version": "intent_obligation_v0"},
+        {
+            **trusted,
+            "intent_obligations": [{**obligation, "key": "io:forged"}],
+        },
+        {
+            **trusted,
+            "intent_obligations": [
+                {key: value for key, value in obligation.items() if key != "evidence_quote"}
+            ],
+        },
+    ):
+        assert "_selection_intent_obligations" not in (
+            ReelService._selection_metadata(untrusted)
+        )
 
 
 def _conn() -> sqlite3.Connection:
@@ -675,7 +727,7 @@ def test_ambiguous_final_release_commit_is_not_replayed_or_duplicated(
         conn.close()
 
 
-def test_semantic_family_expands_organizer_signals_without_staling_active_job() -> None:
+def test_semantic_family_metadata_does_not_expand_exact_organizer_signals() -> None:
     conn = _conn()
     learner_id = "owner:semantic-family"
     try:
@@ -745,11 +797,8 @@ def test_semantic_family_expands_organizer_signals_without_staling_active_job() 
         signals = main._learner_concept_signals(
             conn, material_id="m1", learner_id=learner_id
         )
-        assert signals[related_id] == {
-            "helpful": 1.0,
-            "confusing": 0.0,
-            "adjustment": 0.04,
-        }
+        assert signals["c1"]["helpful"] == 1.0
+        assert related_id not in signals
         ranked = main.reel_service.ranked_feed(
             conn,
             material_id="m1",
@@ -783,7 +832,31 @@ def test_semantic_family_expands_organizer_signals_without_staling_active_job() 
         assert organizer_clip["concept_title"] == "inertia resists changes in motion"
         assert organizer_clip["concept_family"] == "Newton's first law"
         assert organizer_clip["concept_aliases"] == []
-        assert organizer_clip["learner_signal"] == signals[related_id]
+        assert organizer_clip["learner_signal"] == {
+            "helpful": 0.0,
+            "confusing": 0.0,
+            "adjustment": 0.0,
+        }
+
+        main.reel_service.record_feedback(
+            conn,
+            "family-reel",
+            helpful=False,
+            confusing=True,
+            rating=None,
+            saved=False,
+            learner_id=learner_id,
+        )
+        remediation_concept_ids: list[str] = []
+        confusing_signals = main._learner_concept_signals(
+            conn,
+            material_id="m1",
+            learner_id=learner_id,
+            remediation_concept_ids_out=remediation_concept_ids,
+        )
+        assert confusing_signals["c1"]["confusing"] == 1.0
+        assert related_id not in confusing_signals
+        assert remediation_concept_ids == ["c1"]
     finally:
         conn.close()
 
@@ -880,6 +953,222 @@ def test_organizer_adaptation_ignores_explicit_stale_family_provenance() -> None
             reel_ids=["stale-reel", "current-reel", "legacy-reel"],
         )
         assert sum(int(row["delivered_count"]) for row in prior) == 2
+    finally:
+        conn.close()
+
+
+def test_lesson_prior_coverage_unions_trusted_intent_obligation_keys() -> None:
+    conn = _conn()
+    obligations = [
+        intent_obligation(
+            kind="subject",
+            source_phrase=source_phrase,
+            requirement=requirement,
+            evidence_quote=evidence,
+        )
+        for source_phrase, requirement, evidence in (
+            ("bubble sort", "Teach bubble sort.", "Bubble sort swaps adjacent values."),
+            ("merge sort", "Teach merge sort.", "Merge sort combines sorted halves."),
+            ("quick sort", "Teach quick sort.", "Quick sort partitions around a pivot."),
+            ("heap sort", "Teach heap sort.", "Heap sort repeatedly extracts a maximum."),
+        )
+    ]
+    assert all(obligations)
+    trusted_batches = [
+        [obligations[0], obligations[1]],
+        [obligations[1], obligations[2]],
+    ]
+    try:
+        for index, batch in enumerate(trusted_batches):
+            reel_id = f"trusted-obligation-{index}"
+            video_id = f"trusted-obligation-video-{index}"
+            conn.execute(
+                "INSERT INTO videos (id, title, channel_title, duration_sec, "
+                "created_at) VALUES (?, ?, 'Test', 120, "
+                "'2026-07-20T00:00:00+00:00')",
+                (video_id, video_id),
+            )
+            conn.execute(
+                "INSERT INTO reels (id, material_id, concept_id, video_id, "
+                "video_url, t_start, t_end, transcript_snippet, takeaways_json, "
+                "base_score, difficulty, search_context_json, created_at) "
+                "VALUES (?, 'm1', 'c1', ?, '', 0, 30, 'Sorting explanation', "
+                "'[]', 1, 0.1, ?, '2026-07-20T00:00:00+00:00')",
+                (
+                    reel_id,
+                    video_id,
+                    json.dumps({
+                        "selection_contract_version": "quality_silence_v39",
+                        "selection_authority": "gemini",
+                        "intent_obligation_contract_version": (
+                            INTENT_OBLIGATION_CONTRACT_VERSION
+                        ),
+                        "intent_obligations": batch,
+                    }),
+                ),
+            )
+
+        untrusted_video_id = "untrusted-obligation-video"
+        conn.execute(
+            "INSERT INTO videos (id, title, channel_title, duration_sec, "
+            "created_at) VALUES (?, ?, 'Test', 120, "
+            "'2026-07-20T00:00:00+00:00')",
+            (untrusted_video_id, untrusted_video_id),
+        )
+        conn.execute(
+            "INSERT INTO reels (id, material_id, concept_id, video_id, video_url, "
+            "t_start, t_end, transcript_snippet, takeaways_json, base_score, "
+            "difficulty, search_context_json, created_at) VALUES "
+            "('untrusted-obligation', 'm1', 'c1', ?, '', 0, 30, "
+            "'Sorting explanation', '[]', 1, 0.1, ?, "
+            "'2026-07-20T00:00:00+00:00')",
+            (
+                untrusted_video_id,
+                json.dumps({
+                    "selection_contract_version": "quality_silence_v39",
+                    "selection_authority": "local",
+                    "intent_obligation_contract_version": (
+                        INTENT_OBLIGATION_CONTRACT_VERSION
+                    ),
+                    "intent_obligations": [obligations[3]],
+                }),
+            ),
+        )
+
+        prior = main._lesson_prior_concept_coverage(
+            conn,
+            material_id="m1",
+            reel_ids=[
+                "trusted-obligation-0",
+                "trusted-obligation-1",
+                "untrusted-obligation",
+            ],
+        )
+
+        assert len(prior) == 1
+        assert prior[0]["delivered_count"] == 3
+        assert prior[0]["intent_obligation_keys"] == sorted({
+            obligations[0]["key"],
+            obligations[1]["key"],
+            obligations[2]["key"],
+        })
+        assert obligations[3]["key"] not in prior[0]["intent_obligation_keys"]
+    finally:
+        conn.close()
+
+
+def test_lesson_prior_coverage_does_not_truncate_late_obligation_witness() -> None:
+    conn = _conn()
+    obligation = intent_obligation(
+        kind="scope",
+        source_phrase="late requested facet",
+        requirement="Teach the late requested facet",
+        evidence_quote="This clip teaches the late requested facet clearly",
+    )
+    assert obligation is not None
+    try:
+        conn.execute(
+            "INSERT INTO videos (id, title, channel_title, duration_sec, created_at) "
+            "VALUES ('history-video', 'History', 'Test', 120, "
+            "'2026-07-20T00:00:00+00:00')"
+        )
+        ordinary_context = json.dumps({
+            "selection_contract_version": "quality_silence_v39",
+            "selection_authority": "gemini",
+        })
+        reel_ids = [f"aa-history-{index:03d}" for index in range(204)]
+        reel_ids.append("zz-late-obligation-witness")
+        for reel_id in reel_ids[:-1]:
+            conn.execute(
+                "INSERT INTO reels (id, material_id, concept_id, video_id, "
+                "video_url, t_start, t_end, transcript_snippet, takeaways_json, "
+                "base_score, difficulty, search_context_json, created_at) VALUES "
+                "(?, 'm1', 'c1', 'history-video', '', 0, 20, 'History', '[]', "
+                "1, 0.1, ?, '2026-07-20T00:00:00+00:00')",
+                (reel_id, ordinary_context),
+            )
+        conn.execute(
+            "INSERT INTO reels (id, material_id, concept_id, video_id, video_url, "
+            "t_start, t_end, transcript_snippet, takeaways_json, base_score, "
+            "difficulty, search_context_json, created_at) VALUES "
+            "('zz-late-obligation-witness', 'm1', 'c1', 'history-video', '', "
+            "20, 40, 'Late facet', '[]', 1, 0.1, ?, "
+            "'2026-07-20T00:00:00+00:00')",
+            (json.dumps({
+                "selection_contract_version": "quality_silence_v39",
+                "selection_authority": "gemini",
+                "intent_obligation_contract_version": (
+                    INTENT_OBLIGATION_CONTRACT_VERSION
+                ),
+                "intent_obligations": [obligation],
+            }),),
+        )
+
+        prior = main._lesson_prior_concept_coverage(
+            conn,
+            material_id="m1",
+            reel_ids=reel_ids,
+        )
+
+        assert len(prior) == 1
+        assert prior[0]["delivered_count"] == 205
+        assert prior[0]["intent_obligation_keys"] == [obligation["key"]]
+    finally:
+        conn.close()
+
+
+def test_lesson_prior_coverage_keeps_narrow_concepts_in_one_family_separate() -> None:
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO concepts (id, material_id, title, keywords_json, summary, "
+            "created_at) VALUES ('c2', 'm1', 'Mass and required force', '[]', '', "
+            "'2026-07-20T00:00:00+00:00')"
+        )
+        context = json.dumps({
+            "selection_contract_version": "quality_silence_v39",
+            "selection_authority": "gemini",
+            "concept_family_contract_version": "concept_family_v3",
+            "concept_family": "Newton's second law of motion",
+            "concept_aliases": [],
+        })
+        for index, concept_id in enumerate(("c1", "c2")):
+            video_id = f"narrow-family-video-{index}"
+            reel_id = f"narrow-family-reel-{index}"
+            conn.execute(
+                "INSERT INTO videos (id, title, channel_title, duration_sec, "
+                "created_at) VALUES (?, ?, 'Test', 120, "
+                "'2026-07-20T00:00:00+00:00')",
+                (video_id, video_id),
+            )
+            conn.execute(
+                "INSERT INTO reels (id, material_id, concept_id, video_id, "
+                "video_url, t_start, t_end, transcript_snippet, takeaways_json, "
+                "base_score, difficulty, search_context_json, created_at) VALUES "
+                "(?, 'm1', ?, ?, '', ?, ?, 'Narrow teaching', '[]', 1, 0.2, ?, "
+                "'2026-07-20T00:00:00+00:00')",
+                (
+                    reel_id,
+                    concept_id,
+                    video_id,
+                    index * 30,
+                    index * 30 + 20,
+                    context,
+                ),
+            )
+
+        prior = main._lesson_prior_concept_coverage(
+            conn,
+            material_id="m1",
+            reel_ids=["narrow-family-reel-0", "narrow-family-reel-1"],
+        )
+
+        assert len(prior) == 2
+        assert {item["concept_id"] for item in prior} == {"c1", "c2"}
+        assert all(item["delivered_count"] == 1 for item in prior)
+        assert {item["concept_family"] for item in prior} == {
+            "Newton's second law of motion"
+        }
     finally:
         conn.close()
 
@@ -1049,6 +1338,7 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
             reels=ordered,
             ordered_reel_ids=[reel["reel_id"] for reel in ordered],
             assessment_checkpoint_reel_ids=checkpoint_ids,
+            terminal_summary_start_reel_id="release-reel-1",
             model_used="gemini-test",
             degraded=False,
             fallback_reason=None,
@@ -1117,6 +1407,7 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
         assert metadata["assessment_checkpoint_reel_ids"] == (
             checkpoint_ids if preparation_complete else None
         )
+        assert metadata["terminal_summary_start_reel_id"] == "release-reel-1"
         assert metadata["degraded"] is (not preparation_complete)
         if not preparation_complete:
             assert metadata["fallback_reason"] == "recall_preparation_unavailable"
@@ -1196,6 +1487,14 @@ def test_generation_organizer_can_select_any_subset_from_a_larger_candidate_wind
         now=now,
     )
     assert leased
+    overlap_filter_calls: list[list[str]] = []
+    original_overlap_filter = main._filter_continuation_release_temporal_overlaps
+
+    def filter_before_final(worker_conn, **kwargs):
+        overlap_filter_calls.append([
+            str(reel.get("reel_id") or "") for reel in kwargs["reels"]
+        ])
+        return original_overlap_filter(worker_conn, **kwargs)
 
     def order_batch(reels, **kwargs):
         assert [reel["reel_id"] for reel in reels] == [
@@ -1235,8 +1534,17 @@ def test_generation_organizer_can_select_any_subset_from_a_larger_candidate_wind
         lambda *_args, **_kwargs: list(candidate_rows[3:]),
     )
     monkeypatch.setattr(main, "order_lesson_batch", order_batch)
+    monkeypatch.setattr(
+        main,
+        "_filter_continuation_release_temporal_overlaps",
+        filter_before_final,
+    )
     try:
         main._run_leased_generation_job(leased, threading.Event())
+
+        assert overlap_filter_calls == [[
+            f"window-reel-{index}" for index in range(3, 9)
+        ]]
 
         final = next(
             event
@@ -1270,6 +1578,249 @@ def test_generation_organizer_can_select_any_subset_from_a_larger_candidate_wind
         assert [
             reel["reel_id"] for reel in sanitized_final["payload"]["reels"]
         ] == expected_ids
+    finally:
+        conn.close()
+
+
+def test_continuation_prefilters_prior_overlap_before_capacity_limited_ordering(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="prefilter-overlap-source",
+        generation_mode="fast",
+        retrieval_profile="unified",
+    )
+    parent = _insert_generation_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel_id="released-parent",
+        video_id="shared-video",
+        created_at=now.isoformat(),
+    )
+    overlap = _insert_generation_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel_id="overlapping-child",
+        video_id="temporary-overlap-video",
+        created_at=(now + timedelta(seconds=1)).isoformat(),
+    )
+    conn.execute(
+        "UPDATE reels SET video_id = 'shared-video', t_start = 5, t_end = 25 "
+        "WHERE id = 'overlapping-child'"
+    )
+    overlap.update(video_id="shared-video", t_start=5.0, t_end=25.0)
+    alternative = _insert_generation_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel_id="novel-mandatory-alternative",
+        video_id="novel-video",
+        created_at=(now + timedelta(seconds=2)).isoformat(),
+    )
+    prior_job = _terminal_job_for_generation(
+        conn,
+        request_key="prefilter-overlap-prior",
+        generation_id=source_generation_id,
+        completed_at=(now - timedelta(seconds=1)).isoformat(),
+        content_fingerprint="fingerprint",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+    )
+    _append_authoritative_release(
+        conn,
+        job_id=str(prior_job["id"]),
+        reel_ids=[parent["reel_id"]],
+    )
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="prefilter-overlap-child",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={
+            "generation_mode": "fast",
+            "num_reels": 1,
+            "knowledge_level": "beginner",
+            "continuation_token": prior_job["id"],
+            "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
+        },
+        source_generation_id=source_generation_id,
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="prefilter-overlap-worker",
+        now=now,
+    )
+    assert leased
+
+    def order_one(reels, **kwargs):
+        assert [reel["reel_id"] for reel in reels] == [
+            "novel-mandatory-alternative"
+        ]
+        assert kwargs["release_limit"] == 1
+        selected = list(reels[:1])
+        return mock.Mock(
+            reels=selected,
+            ordered_reel_ids=[reel["reel_id"] for reel in selected],
+            assessment_checkpoint_reel_ids=[],
+            terminal_summary_start_reel_id=None,
+            model_used="gemini-test",
+            degraded=False,
+            fallback_reason=None,
+            provider_called=True,
+        )
+
+    monkeypatch.setattr(
+        main.reel_service,
+        "generate_reels",
+        mock.Mock(side_effect=AssertionError("cached reservoir must not retrieve")),
+    )
+    monkeypatch.setattr(
+        main,
+        "_current_level_reusable_generation_reel_count",
+        lambda *_args, **_kwargs: 1,
+    )
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: [overlap, alternative],
+    )
+    monkeypatch.setattr(main, "order_lesson_batch", order_one)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        final = next(
+            event
+            for event in generation_jobs.replay_events(conn, job_id=job["id"])
+            if event["type"] == "final"
+        )
+        assert [reel["reel_id"] for reel in final["payload"]["reels"]] == [
+            "novel-mandatory-alternative"
+        ]
+    finally:
+        conn.close()
+
+
+def test_continuation_with_only_prior_overlaps_does_not_activate_empty_order(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="all-overlap-source",
+        generation_mode="fast",
+        retrieval_profile="unified",
+    )
+    parent = _insert_generation_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel_id="all-overlap-parent",
+        video_id="all-overlap-video",
+        created_at=now.isoformat(),
+    )
+    overlap = _insert_generation_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel_id="all-overlap-child",
+        video_id="temporary-all-overlap-video",
+        created_at=(now + timedelta(seconds=1)).isoformat(),
+    )
+    conn.execute(
+        "UPDATE reels SET video_id = 'all-overlap-video', t_start = 5, t_end = 25 "
+        "WHERE id = 'all-overlap-child'"
+    )
+    overlap.update(video_id="all-overlap-video", t_start=5.0, t_end=25.0)
+    prior_job = _terminal_job_for_generation(
+        conn,
+        request_key="all-overlap-prior",
+        generation_id=source_generation_id,
+        completed_at=(now - timedelta(seconds=1)).isoformat(),
+        content_fingerprint="fingerprint",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+    )
+    _append_authoritative_release(
+        conn,
+        job_id=str(prior_job["id"]),
+        reel_ids=[parent["reel_id"]],
+    )
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="all-overlap-continuation",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={
+            "generation_mode": "fast",
+            "num_reels": 1,
+            "knowledge_level": "beginner",
+            "continuation_token": prior_job["id"],
+            "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
+        },
+        source_generation_id=source_generation_id,
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="all-overlap-worker",
+        now=now,
+    )
+    assert leased
+    activate = mock.Mock()
+    monkeypatch.setattr(
+        main.reel_service,
+        "generate_reels",
+        mock.Mock(side_effect=AssertionError("cached reservoir must not retrieve")),
+    )
+    monkeypatch.setattr(
+        main,
+        "_current_level_reusable_generation_reel_count",
+        lambda *_args, **_kwargs: 1,
+    )
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: [overlap],
+    )
+    monkeypatch.setattr(
+        main,
+        "order_lesson_batch",
+        mock.Mock(side_effect=AssertionError("empty pool must not be ordered")),
+    )
+    monkeypatch.setattr(main, "_activate_generation", activate)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        completed = generation_jobs.get_job(conn, job["id"])
+        assert completed is not None
+        assert completed["status"] == "exhausted"
+        final = next(
+            event
+            for event in generation_jobs.replay_events(conn, job_id=job["id"])
+            if event["type"] == "final"
+        )
+        assert final["payload"]["reels"] == []
+        assert final["payload"]["generation_id"] is None
+        child_row = conn.execute(
+            "SELECT status, activated_at, lesson_order_json FROM reel_generations "
+            "WHERE source_generation_id = ? ORDER BY created_at DESC LIMIT 1",
+            (source_generation_id,),
+        ).fetchone()
+        assert child_row is not None
+        assert tuple(child_row) == ("failed", None, None)
+        activate.assert_not_called()
     finally:
         conn.close()
 
@@ -1593,9 +2144,9 @@ def test_raw_parent_inventory_prevents_top_up_after_smaller_selected_subset(
     def order_batch(reels, **kwargs):
         organizer_calls.append([str(reel["reel_id"]) for reel in reels])
         assert set(organizer_calls[0]) == {
-            f"raw-parent-reel-{index}" for index in range(120)
+            f"raw-parent-reel-{index}" for index in range(8, 120)
         }
-        assert kwargs["release_limit"] == 120
+        assert kwargs["release_limit"] == 112
         selected = list(reels[:9])
         return mock.Mock(
             reels=selected,
@@ -2483,6 +3034,88 @@ def test_generation_worker_terminalizes_once_after_three_transient_failures(
         conn.close()
 
 
+def test_generation_worker_retries_response_validation_three_times_with_precise_error(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_transactional_worker_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="provider-response-validation-retry-exhausted",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    attempts = 0
+    detail = (
+        "GeminiSelectorContractError:"
+        "intent_contract_incomplete_joint_structure"
+    )
+
+    def fail_stage(_worker_conn, **_kwargs) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise ProviderResponseValidationError(
+            "Gemini responded, but its clip plan did not satisfy "
+            "the learning-request contract.",
+            provider="gemini",
+            operation="segmentation",
+            status_code=200,
+            detail=detail,
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", fail_stage)
+    try:
+        for attempt in (1, 2, 3):
+            leased = generation_jobs.lease_job(
+                conn,
+                job_id=str(job["id"]),
+                lease_owner=f"response-validation-worker-{attempt}",
+                now=now + timedelta(seconds=attempt - 1),
+            )
+            assert leased and leased["attempt_count"] == attempt
+            main._run_leased_generation_job(leased, threading.Event())
+
+            current = generation_jobs.get_job(conn, str(job["id"]))
+            assert current is not None
+            assert current["status"] == (
+                "queued" if attempt < 3 else "failed"
+            )
+            usage = json.loads(str(current["usage_json"] or "{}"))
+            assert len(usage["retry_errors"]) == attempt
+            assert usage["retry_errors"][-1] == {
+                "code": "provider_response_invalid",
+                "message": (
+                    "Gemini responded, but its clip plan did not satisfy "
+                    "the learning-request contract."
+                ),
+                "provider": "gemini",
+                "operation": "segmentation",
+                "retryable": True,
+                "status_code": 200,
+                "detail": detail,
+            }
+
+        failed = generation_jobs.get_job(conn, str(job["id"]))
+        assert failed is not None
+        assert failed["attempt_count"] == failed["max_attempts"] == 3
+        assert failed["terminal_error_code"] == "provider_response_invalid"
+        assert "unavailable" not in str(
+            failed["terminal_error_message"]
+        ).casefold()
+        status = main._generation_job_status_payload(conn, failed)
+        assert status["error"]["code"] == "provider_response_invalid"
+        assert status["error"]["detail"]["detail"] == detail
+        assert status["error"]["detail"]["status_code"] == 200
+        assert attempts == 3
+    finally:
+        conn.close()
+
+
 def test_reclaimed_lease_restores_gemini_exposure_from_durable_usage_ledger(
     monkeypatch,
 ) -> None:
@@ -3173,6 +3806,72 @@ def test_released_feed_reconstructs_exact_batch_order_and_hides_raw_reservoir(
         conn.close()
 
 
+def test_terminal_summary_marker_projects_to_first_surviving_recap() -> None:
+    assert main._surviving_terminal_summary_start_reel_id(
+        ordered_reel_ids=["teaching", "removed-recap", "surviving-recap"],
+        terminal_summary_start_reel_id="removed-recap",
+        surviving_reel_ids=["teaching", "surviving-recap"],
+    ) == "surviving-recap"
+    assert main._surviving_terminal_summary_start_reel_id(
+        ordered_reel_ids=["teaching", "removed-recap"],
+        terminal_summary_start_reel_id="removed-recap",
+        surviving_reel_ids=["teaching"],
+    ) is None
+
+
+def test_authoritative_chain_places_later_teaching_before_earlier_recap(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    child_generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [
+            (["first-teaching", "first-recap"], ["first-teaching", "first-recap"]),
+            (["later-teaching", "later-recap"], ["later-teaching", "later-recap"]),
+        ],
+    )
+    source_generation_id = next(iter(rows))
+    try:
+        main._persist_generation_lesson_order(
+            conn,
+            generation_id=source_generation_id,
+            metadata={
+                "version": 2,
+                "ordered_reel_ids": ["first-teaching", "first-recap"],
+                "terminal_summary_start_reel_id": "first-recap",
+            },
+        )
+        main._persist_generation_lesson_order(
+            conn,
+            generation_id=child_generation_id,
+            metadata={
+                "version": 2,
+                "ordered_reel_ids": ["later-teaching", "later-recap"],
+                "terminal_summary_start_reel_id": "later-recap",
+            },
+        )
+
+        assert main._authoritative_release_reel_ids(
+            conn,
+            child_generation_id,
+        ) == [
+            "first-teaching",
+            "later-teaching",
+            "first-recap",
+            "later-recap",
+        ]
+        _patch_released_ranked_feed(monkeypatch, rows)
+        ranked = _rank_released_feed(conn, generation_id=child_generation_id)
+        assert [reel["reel_id"] for reel in ranked] == [
+            "first-teaching",
+            "later-teaching",
+            "first-recap",
+            "later-recap",
+        ]
+    finally:
+        conn.close()
+
+
 def test_released_feed_drops_child_span_containing_prior_release(monkeypatch) -> None:
     conn = _conn()
     child_generation_id, rows, _jobs = _released_generation_chain(
@@ -3207,6 +3906,12 @@ def test_released_feed_drops_child_span_containing_prior_release(monkeypatch) ->
         generation_id=child_generation_id,
         metadata={"version": 2, "ordered_reel_ids": ["child-overlap"]},
     )
+    assert main._filter_continuation_release_temporal_overlaps(
+        conn,
+        source_generation_id=source_generation_id,
+        generation_id=child_generation_id,
+        reels=[child],
+    ) == []
     _patch_released_ranked_feed(monkeypatch, rows)
     try:
         ranked = _rank_released_feed(conn, generation_id=child_generation_id)
@@ -3219,6 +3924,108 @@ def test_released_feed_drops_child_span_containing_prior_release(monkeypatch) ->
         )
         assert _rank_released_feed(conn, generation_id=child_generation_id) == []
     finally:
+        conn.close()
+
+
+def test_continuation_filter_drops_exact_parent_reel_id() -> None:
+    conn = _conn()
+    child_generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [
+            (["same-reel"], ["same-reel"]),
+            (["same-reel"], ["same-reel"]),
+        ],
+    )
+    source_generation_id = next(iter(rows))
+    parent = rows[source_generation_id][0]
+    child = rows[child_generation_id][0]
+    _persist_released_feed_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel=parent,
+    )
+    try:
+        assert main._filter_continuation_release_temporal_overlaps(
+            conn,
+            source_generation_id=source_generation_id,
+            generation_id=child_generation_id,
+            reels=[child],
+        ) == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("chain_length", [2, 40])
+def test_continuation_history_queries_stay_bounded_as_chain_grows(
+    chain_length: int,
+) -> None:
+    conn = _conn()
+    source_generation_id, rows, jobs = _released_generation_chain(
+        conn,
+        [
+            ([f"history-{index}"], [f"history-{index}"])
+            for index in range(chain_length)
+        ],
+    )
+    for generation_id, generation_reels in rows.items():
+        for reel in generation_reels:
+            _persist_released_feed_reel(
+                conn,
+                generation_id=generation_id,
+                reel=reel,
+            )
+    current_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key=f"bounded-current-{chain_length}",
+        generation_mode="slow",
+        retrieval_profile="unified",
+        source_generation_id=source_generation_id,
+    )
+    current = _released_feed_reel("current-non-overlap", chain_length + 10)
+    _persist_released_feed_reel(
+        conn,
+        generation_id=current_generation_id,
+        reel=current,
+    )
+    try:
+        filter_statements: list[str] = []
+        conn.set_trace_callback(filter_statements.append)
+        filtered = main._filter_continuation_release_temporal_overlaps(
+            conn,
+            source_generation_id=source_generation_id,
+            generation_id=current_generation_id,
+            reels=[current],
+        )
+        conn.set_trace_callback(None)
+        filter_reads = [
+            statement
+            for statement in filter_statements
+            if statement.lstrip().upper().startswith(("SELECT", "WITH"))
+        ]
+
+        delivered_statements: list[str] = []
+        conn.set_trace_callback(delivered_statements.append)
+        delivered = main._continuation_delivered_reel_ids(
+            conn,
+            str(jobs[-1]["id"]),
+        )
+        conn.set_trace_callback(None)
+        delivered_reads = [
+            statement
+            for statement in delivered_statements
+            if statement.lstrip().upper().startswith(("SELECT", "WITH"))
+        ]
+
+        assert filtered == [current]
+        assert len(filter_reads) <= 3
+        assert delivered == sorted(
+            f"history-{index}" for index in range(chain_length)
+        )
+        assert len(delivered_reads) <= 3
+    finally:
+        conn.set_trace_callback(None)
         conn.close()
 
 
@@ -3745,16 +4552,27 @@ def test_generation_job_reels_reuses_unseen_source_inventory_without_redelivery(
         "get_generation_job",
         lambda _conn, job_id: {
             "id": job_id,
+            "result_generation_id": "previous-generation",
             "request_params_json": "{}",
         } if job_id == "previous-job" else None,
     )
     monkeypatch.setattr(
         main,
-        "replay_generation_events",
-        lambda *_args, **_kwargs: [{
-            "type": "final",
-            "payload": {"reels": [{"reel_id": "already-delivered"}]},
-        }],
+        "_generation_chain_rows_snapshot",
+        lambda *_args, **_kwargs: {
+            "previous-generation": {
+                "id": "previous-generation",
+                "source_generation_id": None,
+                "lesson_order_json": None,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "_authoritative_generation_releases_snapshot",
+        lambda *_args, **_kwargs: {
+            "previous-generation": ["already-delivered"],
+        },
     )
     try:
         reels = main._generation_job_reels(

@@ -30,6 +30,7 @@ from backend.app.ingestion.models import (  # noqa: E402
     IngestTranscriptCue,
     YouTubeSourceRef,
 )
+from backend.intent_obligations import intent_obligation  # noqa: E402
 from backend.pipeline import gemini_segment  # noqa: E402
 
 
@@ -238,6 +239,54 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "concept_aliases": [],
             })
             self.assertEqual(context["concept_family"], family)
+
+    def test_intent_obligation_context_requires_versioned_gemini_evidence(
+        self,
+    ) -> None:
+        obligation = intent_obligation(
+            kind="scope",
+            source_phrase="merge sort",
+            requirement="Explain merge sort",
+            evidence_quote="Merge sort recursively divides and merges the array",
+        )
+        self.assertIsNotNone(obligation)
+        authoritative = {
+            "selection_authority": "gemini",
+            "intent_obligation_contract_version": "intent_obligation_v1",
+            "intent_obligations": [obligation],
+        }
+        self.assertEqual(
+            pipeline_module._intent_obligation_search_context(authoritative),
+            {
+                "intent_obligation_contract_version": "intent_obligation_v1",
+                "intent_obligations": [obligation],
+            },
+        )
+        for changed in (
+            {**authoritative, "selection_authority": "local"},
+            {
+                **authoritative,
+                "intent_obligation_contract_version": "intent_obligation_v0",
+            },
+            {
+                **authoritative,
+                "intent_obligations": [{**obligation, "key": "io:tampered"}],
+            },
+            {
+                **authoritative,
+                "intent_obligations": [
+                    {
+                        key: value
+                        for key, value in obligation.items()
+                        if key != "evidence_quote"
+                    }
+                ],
+            },
+        ):
+            self.assertEqual(
+                pipeline_module._intent_obligation_search_context(changed),
+                {},
+            )
 
     @staticmethod
     def _seed_identity(conn, material_id: str, concept_id: str) -> None:
@@ -543,7 +592,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
         self.assertEqual(stored["intent_role"], "supporting")
         self.assertEqual(stored["intent_coverage"], 0.5)
 
-    def test_gemini_clip_concept_is_normalized_reused_and_persisted(self) -> None:
+    def test_gemini_clip_concepts_keep_narrow_identity_and_reuse_aliases(self) -> None:
         pipeline, adapter, metadata = self._boundary_persistence_fixture()
         first_clip = gemini_segment._public_clips(
             [{
@@ -558,11 +607,22 @@ class PersistenceIntegrityTests(unittest.TestCase):
         )[0]
         second_clip = gemini_segment._public_clips(
             [{
-                "facet": "net-force / acceleration",
+                "facet": "  net   force—ACCELERATION  ",
                 "concept_family": "net-force-acceleration relationship",
                 "concept_aliases": ["F=ma"],
                 "learning_objective": "Explain Newton's second law as F=ma",
                 "topic_evidence_quote": "Acceleration follows from the applied net force",
+                "selection_authority": "gemini",
+                "_private": "discard",
+            }]
+        )[0]
+        third_clip = gemini_segment._public_clips(
+            [{
+                "facet": "Mass and required force",
+                "concept_family": "net-force-acceleration relationship",
+                "concept_aliases": ["F=ma"],
+                "learning_objective": "Calculate force from a known mass",
+                "topic_evidence_quote": "A larger mass requires more net force",
                 "selection_authority": "gemini",
                 "_private": "discard",
             }]
@@ -640,32 +700,70 @@ class PersistenceIntegrityTests(unittest.TestCase):
             },
         )
 
+        third_context = _strict_boundary_context(
+            "video-a::net-force-3",
+            start=18.0,
+            end=24.0,
+            surface=True,
+        )
+        third = pipeline._persist_ingest(
+            adapter_result=adapter,
+            metadata=metadata,
+            cues=[
+                IngestTranscriptCue(
+                    cue_id="cue-3",
+                    start=18.0,
+                    end=24.0,
+                    text="A larger mass requires more force.",
+                )
+            ],
+            chosen=IngestSegment(
+                t_start=18.0,
+                t_end=24.0,
+                text="A larger mass requires more force.",
+            ),
+            snippet="A larger mass requires more force.",
+            material_id="material-a",
+            concept_id="concept-a",
+            clip_window=(18.0, 24.0),
+            target_max=0,
+            generation_id="generation-a",
+            clip_title="Mass and required force",
+            clip_details={
+                **third_clip,
+                "cue_ids": ["cue-3"],
+                "search_context": third_context,
+            },
+        )
+
         self.assertEqual(first_clip["concept"], "Net Force—Acceleration")
-        self.assertEqual(second_clip["concept"], "net-force / acceleration")
+        self.assertEqual(second_clip["concept"], "net force—ACCELERATION")
         self.assertEqual(
             first_clip["concept_family"],
             "net-force-acceleration relationship",
         )
         self.assertEqual(first_clip["concept_aliases"], [])
         self.assertEqual(first.concept_id, second.concept_id)
+        self.assertNotEqual(first.concept_id, third.concept_id)
         self.assertNotEqual(first.concept_id, "concept-a")
         self.assertEqual(
             first.concept_id,
             str(
                 uuid.uuid5(
                     uuid.NAMESPACE_URL,
-                    "reelai:clip-concept-family-v1:material-a:net force acceleration relationship",
+                    "reelai:clip-concept:material-a:net force acceleration",
                 )
             ),
         )
         self.assertEqual(
             first.concept_title,
-            "net-force-acceleration relationship",
+            "Net Force—Acceleration",
         )
         self.assertEqual(
             second.concept_title,
-            "net-force-acceleration relationship",
+            "Net Force—Acceleration",
         )
+        self.assertEqual(third.concept_title, "Mass and required force")
 
         with db_module.get_conn() as conn:
             concept_rows = db_module.fetch_all(
@@ -676,33 +774,50 @@ class PersistenceIntegrityTests(unittest.TestCase):
             reel_rows = db_module.fetch_all(
                 conn,
                 "SELECT concept_id, search_context_json FROM reels "
-                "WHERE id IN (?, ?) ORDER BY t_start",
-                (first.reel_id, second.reel_id),
+                "WHERE id IN (?, ?, ?) ORDER BY t_start",
+                (first.reel_id, second.reel_id, third.reel_id),
             )
 
         self.assertCountEqual(
             [row["title"] for row in concept_rows],
-            ["net-force-acceleration relationship", "Test concept"],
+            ["Net Force—Acceleration", "Mass and required force", "Test concept"],
         )
         self.assertEqual(
             [row["concept_id"] for row in reel_rows],
-            [first.concept_id, first.concept_id],
+            [first.concept_id, first.concept_id, third.concept_id],
         )
         first_provenance = json.loads(reel_rows[0]["search_context_json"])
         second_provenance = json.loads(reel_rows[1]["search_context_json"])
-        for provenance, raw_concept in (
-            (first_provenance, "Net Force—Acceleration"),
-            (second_provenance, "net-force / acceleration"),
+        third_provenance = json.loads(reel_rows[2]["search_context_json"])
+        for provenance, raw_concept, concept_id, concept_title, concept_key in (
+            (
+                first_provenance,
+                "Net Force—Acceleration",
+                first.concept_id,
+                "Net Force—Acceleration",
+                "net force acceleration",
+            ),
+            (
+                second_provenance,
+                "net force—ACCELERATION",
+                first.concept_id,
+                "Net Force—Acceleration",
+                "net force acceleration",
+            ),
+            (
+                third_provenance,
+                "Mass and required force",
+                third.concept_id,
+                "Mass and required force",
+                "mass and required force",
+            ),
         ):
             self.assertEqual(provenance["acquisition_concept_id"], "concept-a")
             self.assertEqual(provenance["acquisition_concept_title"], "Test concept")
             self.assertEqual(provenance["clip_concept_raw"], raw_concept)
-            self.assertEqual(provenance["clip_concept_key"], "net force acceleration")
-            self.assertEqual(provenance["clip_concept_id"], first.concept_id)
-            self.assertEqual(
-                provenance["clip_concept_title"],
-                "net-force-acceleration relationship",
-            )
+            self.assertEqual(provenance["clip_concept_key"], concept_key)
+            self.assertEqual(provenance["clip_concept_id"], concept_id)
+            self.assertEqual(provenance["clip_concept_title"], concept_title)
             self.assertEqual(
                 provenance["concept_family_contract_version"],
                 "concept_family_v3",

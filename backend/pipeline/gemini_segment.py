@@ -45,6 +45,11 @@ from ..concept_families import (
     validate_concept_family_contract,
 )
 from ..concept_tokens import semantic_tokens
+from ..intent_obligations import (
+    INTENT_OBLIGATION_CONTRACT_VERSION,
+    intent_obligation,
+    normalize_intent_obligations,
+)
 
 ProgressCb = Optional[Callable[[float, str], None]]
 CancelledCb = Optional[Callable[[], bool]]
@@ -1735,7 +1740,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v3"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v19"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v22"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -1785,7 +1790,7 @@ _SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
 _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
-_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v8"
+_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v9"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
 
 _PRICING_VERSION = "gemini-standard-2026-07-11"
@@ -1834,7 +1839,24 @@ class _IntentRole(str, Enum):
     SUPPORTING = "supporting"
 
 
+def _require_intent_source_occurrence_schema(schema: dict[str, object]) -> None:
+    """Require positioned source identity in live Gemini responses."""
+    required = schema.setdefault("required", [])
+    if isinstance(required, list) and "source_occurrence" not in required:
+        required.append("source_occurrence")
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        field_schema = properties.get("source_occurrence")
+        if isinstance(field_schema, dict):
+            field_schema.pop("default", None)
+
+
 class _IntentConstraint(_StrictModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra=_require_intent_source_occurrence_schema,
+    )
+
     constraint_id: _IntentConstraintId
     kind: _IntentConstraintKind
     source_phrase: _NonBlank = Field(
@@ -1842,6 +1864,15 @@ class _IntentConstraint(_StrictModel):
             "Exact consecutive words copied from the user's request that introduce "
             "this atomic constraint."
         )
+    )
+    source_occurrence: int = Field(
+        default=0,
+        ge=0,
+        strict=True,
+        description=(
+            "Zero-based occurrence of source_phrase in the exact user request. "
+            "Use 0 unless the identical phrase appears more than once."
+        ),
     )
     requirement: _NonBlank = Field(
         description=(
@@ -1854,15 +1885,63 @@ class _IntentConstraint(_StrictModel):
     )
 
 
+class _IntentJointStructure(_StrictModel):
+    member_constraint_ids: list[_IntentConstraintId] = Field(
+        min_length=2,
+        max_length=16,
+    )
+    relation_constraint_id: _IntentConstraintId
+
+    @model_validator(mode="after")
+    def _unique_members(self):
+        if len(self.member_constraint_ids) != len(set(self.member_constraint_ids)):
+            raise ValueError("joint member constraint ids must be unique")
+        if self.relation_constraint_id in self.member_constraint_ids:
+            raise ValueError("joint relation id cannot also be a member id")
+        return self
+
+
 class _RequestIntent(_StrictModel):
     exact_request: _NonBlank
     constraints: list[_IntentConstraint] = Field(min_length=1, max_length=16)
+    joint_structures: list[_IntentJointStructure] = Field(
+        default_factory=list,
+        max_length=8,
+    )
 
     @model_validator(mode="after")
     def _unique_constraint_ids(self):
         ids = [constraint.constraint_id for constraint in self.constraints]
         if len(ids) != len(set(ids)):
             raise ValueError("intent constraint ids must be unique")
+        id_set = set(ids)
+        if any(
+            structure.relation_constraint_id not in id_set
+            or any(
+                member_id not in id_set
+                for member_id in structure.member_constraint_ids
+            )
+            for structure in self.joint_structures
+        ):
+            raise ValueError(
+                "joint structures must reference declared constraint ids"
+            )
+        structure_keys = [
+            (
+                tuple(structure.member_constraint_ids),
+                structure.relation_constraint_id,
+            )
+            for structure in self.joint_structures
+        ]
+        if len(structure_keys) != len(set(structure_keys)):
+            raise ValueError("joint structures must be unique")
+        source_error = _intent_constraint_source_contract_error(
+            self.exact_request,
+            self.constraints,
+            allow_ungrounded=True,
+        )
+        if source_error is not None:
+            raise ValueError(source_error)
         return self
 
 
@@ -2020,6 +2099,9 @@ class _CompactIntentEvidence(_StrictModel):
             "atomic teaching objective as sq, eq, cq, title, obj, and facet; never cite an "
             "earlier completed prerequisite or a later adjacent lesson. The proposition "
             "containing the quote must actually teach the context-complete requirement; "
+            "for a teach or explain obligation, a title, agenda, list, or passing mention "
+            "does not count. The speech must substantively teach that exact item's meaning, "
+            "mechanism, rule, relationship, or application. "
             "using one requested word as an operand, symbol, unit, or example label does "
             "not ground it."
         ),
@@ -2184,6 +2266,7 @@ class _ProAuditDecision(str, Enum):
     KEEP = "keep"
     REJECT_UNRELATED = "reject_unrelated"
     REJECT_FILLER_DOMINATED = "reject_filler_dominated"
+    REJECT_FACTUALLY_INCORRECT = "reject_factually_incorrect"
 
 
 def _require_pro_audit_semantic_schema(schema: dict[str, object]) -> None:
@@ -2422,6 +2505,13 @@ _POLICY_AND_EXAMPLES = """Policy:
   not a teaching unit and not valid evidence. Return the substantive atomic units it names as
   separate candidates. Keep two concepts together only when their spoken relationship or
   comparison is itself the single teaching objective requested by the user.
+- For a request to teach or explain named items, merely naming an item in a title, agenda,
+  outline, list, transition, or passing mention does not fulfill that item and cannot be its
+  intent evidence. Require substantive speech that teaches the exact item's meaning,
+  mechanism, rule, relationship, or application. One enumeration sentence cannot prove that
+  every enumerated item was taught. For example, "This lesson covers bubble sort, merge sort,
+  and quicksort" teaches none of their mechanisms, and "The elements are duty, breach,
+  causation, and damages" teaches none of those elements.
 - Never combine the ending of one objective with the opening of another. At an explicit
   topic transition, end the old unit before the transition and start the new unit after it.
 - A shared broad subject is not permission to bundle sequential lessons. When the
@@ -2794,7 +2884,11 @@ def _compact_output_guide() -> str:
   literally; if q teaches a different law, equation, relationship, object, or use of a shared
   variable, it cannot ground that constraint. Every ie q must teach the same atomic objective
   as sq, eq, cq, title, obj, and facet; never use evidence from an earlier completed
-  prerequisite or later adjacent lesson. Generic
+  prerequisite or later adjacent lesson. When the request says teach or explain, an item's
+  appearance in a title, agenda, outline, list, transition, or passing mention is not
+  fulfillment: q must ground substantive teaching of that exact item's meaning, mechanism,
+  rule, relationship, or application. Never reuse one enumeration sentence as proof that its
+  separately named members were each taught. Generic
   task, format, or outcome evidence alone is insufficient. Never use supporting ie to falsely
   claim a mismatched object or outcome. Do not output a role; the
   backend mechanically derives primary
@@ -2833,7 +2927,7 @@ Example transcript:
 [19] 02:15 provides stronger evidence against the null hypothesis. Next, confidence intervals measure uncertainty.
 Example exact user request: Explain p-values
 Example output:
-{"request_intent":{"exact_request":"Explain p-values","constraints":[{"constraint_id":"subject","kind":"subject","source_phrase":"p-values","requirement":"Explain p-values"}]},"topics":[{"id":"small-p-value-evidence","s":18,"e":19,"sq":"A small p value","eq":"against the null hypothesis.","cq":"small p value provides stronger evidence against the null hypothesis","title":"What a Small P-Value Means","obj":"Explain how a small p-value bears on the null hypothesis","facet":"small p-values","family":"statistical p-value interpretation","aliases":[],"info":0.95,"rel":0.99,"imp":0.93,"diff":0.42,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"subject","q":"small p value provides stronger evidence against the null hypothesis"}]}]}
+{"request_intent":{"exact_request":"Explain p-values","constraints":[{"constraint_id":"subject","kind":"subject","source_phrase":"p-values","source_occurrence":0,"requirement":"Explain p-values"}],"joint_structures":[]},"topics":[{"id":"small-p-value-evidence","s":18,"e":19,"sq":"A small p value","eq":"against the null hypothesis.","cq":"small p value provides stronger evidence against the null hypothesis","title":"What a Small P-Value Means","obj":"Explain how a small p-value bears on the null hypothesis","facet":"small p-values","family":"statistical p-value interpretation","aliases":[],"info":0.95,"rel":0.99,"imp":0.93,"diff":0.42,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"subject","q":"small p value provides stronger evidence against the null hypothesis"}]}]}
 Why: s remains 18 even though sq starts after "Welcome back" inside line 18. e remains 19
 even though eq ends before "Next, confidence intervals" inside line 19. sq's first word "A"
 is the semantic start; eq's last word "hypothesis" is the semantic end; cq anchors the claim.
@@ -2905,7 +2999,7 @@ Example output boundaries: s=40, e=45, sq="So let's say if f of x is equal to x 
 eq="the derivative of x squared is two x". The topic's ie must evidence the named function,
 limit-definition task, algebra-step requirement, and final two-x outcome.
 Example compact output:
-{"request_intent":{"exact_request":"Use the limit definition to derive f of x equal x squared, include every algebra step, and finish at two x.","constraints":[{"constraint_id":"object","kind":"subject","source_phrase":"f of x equal x squared","requirement":"Derive f of x equal x squared"},{"constraint_id":"method","kind":"task","source_phrase":"Use the limit definition","requirement":"Use the limit definition"},{"constraint_id":"steps","kind":"format","source_phrase":"include every algebra step","requirement":"Include every spoken algebra step"},{"constraint_id":"result","kind":"outcome","source_phrase":"finish at two x","requirement":"Reach the final result two x"}]},"topics":[{"id":"x-squared-limit-derivation","s":40,"e":45,"sq":"So let's say if f of x is equal to x squared","eq":"the derivative of x squared is two x","cq":"Taking h to zero gives two x","title":"Derive x Squared from the Limit Definition","obj":"Derive the derivative of x squared through every algebra step","facet":"x-squared limit derivation","family":"derivative of x squared","aliases":[],"info":0.99,"rel":1.0,"imp":0.99,"diff":0.45,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"object","q":"f of x is equal to x squared"},{"id":"method","q":"Use the limit definition of the derivative"},{"id":"steps","q":"Expand the square to x squared plus two x h"},{"id":"result","q":"Taking h to zero gives two x"}]}]}
+{"request_intent":{"exact_request":"Use the limit definition to derive f of x equal x squared, include every algebra step, and finish at two x.","constraints":[{"constraint_id":"object","kind":"subject","source_phrase":"f of x equal x squared","source_occurrence":0,"requirement":"Derive f of x equal x squared"},{"constraint_id":"method","kind":"task","source_phrase":"Use the limit definition","source_occurrence":0,"requirement":"Use the limit definition"},{"constraint_id":"steps","kind":"format","source_phrase":"include every algebra step","source_occurrence":0,"requirement":"Include every spoken algebra step"},{"constraint_id":"result","kind":"outcome","source_phrase":"finish at two x","source_occurrence":0,"requirement":"Reach the final result two x"}],"joint_structures":[]},"topics":[{"id":"x-squared-limit-derivation","s":40,"e":45,"sq":"So let's say if f of x is equal to x squared","eq":"the derivative of x squared is two x","cq":"Taking h to zero gives two x","title":"Derive x Squared from the Limit Definition","obj":"Derive the derivative of x squared through every algebra step","facet":"x-squared limit derivation","family":"derivative of x squared","aliases":[],"info":0.99,"rel":1.0,"imp":0.99,"diff":0.45,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"object","q":"f of x is equal to x squared"},{"id":"method","q":"Use the limit definition of the derivative"},{"id":"steps","q":"Expand the square to x squared plus two x h"},{"id":"result","q":"Taking h to zero gives two x"}]}]}
 
 Same-source breadth for that original prompt:
 If the same transcript also completely derives five x minus four, one over x, square root of
@@ -3011,10 +3105,20 @@ def _boundary_prompts(
         "1. Interpret the exact request before selecting anything. Return request_intent with "
         "exact_request copied exactly from the Exact user request above and 1-16 atomic "
         "constraints. Give every constraint a unique constraint_id, its kind, a concise "
-        "requirement, and source_phrase copied as exact consecutive words from that request. "
+        "requirement, source_phrase copied as exact consecutive words from that request, "
+        "and source_occurrence equal to that phrase's zero-based occurrence in the request. "
+        "Use source_occurrence=0 normally and 1, 2, and so on only when the identical phrase "
+        "appears earlier. This position, not constraint array order, identifies the source. "
         "Together the source phrases must cover every content-bearing request term. Preserve "
         "named subjects, requested operations or tasks, relationships, scope qualifiers, "
-        "formats, and outcomes. Give every separately named member of a list its own atomic "
+        "formats, and outcomes. Return joint_structures=[] when no explicit comparison, "
+        "contrast, transition, or ordered relationship is requested. Otherwise return one "
+        "joint_structures item per requested relationship: member_constraint_ids names the "
+        "two or more atomic sides/stages and relation_constraint_id names the separate "
+        "constraint that states their comparison, transition, or ordering. These are ID "
+        "references, not positional enum slots: members may have any honest semantic kind, "
+        "and their order in constraints is irrelevant. Never bundle two separately named "
+        "members into one source phrase. Give every separately named member of a list its own atomic "
         "constraint, even when words such as including, through, each, or all introduce the "
         "list. Keep the governing named concept as SUBJECT and label its named components or "
         "facets as separate SCOPE constraints; never bundle the members into one constraint. "
@@ -3056,7 +3160,11 @@ def _boundary_prompts(
         "constraint and every member governed by words such as 'each', 'every', and 'all'. "
         "Scan the entire transcript separately for every checklist item. Return every "
         "distinct complete unit actually taught for each item; a candidate covering one "
-        "sibling item never covers the others. When the request asks to solve an equation "
+        "sibling item never covers the others. A title, agenda, outline, list, transition, "
+        "or passing mention cannot satisfy a teach/explain checklist item. Require speech "
+        "that substantively teaches that exact item's meaning, mechanism, rule, relationship, "
+        "or application; one enumeration sentence cannot prove its members were each taught. "
+        "When the request asks to solve an equation "
         "for each variable, separately look for every algebraic rearrangement and every "
         "worked example that performs it. For F=ma, solving for force F=ma, mass m=F/a, "
         "and acceleration a=F/m are three requested facets when taught. The same rule is "
@@ -3357,13 +3465,15 @@ def _pro_boundary_audit_prompts(
         "</full_transcript_cues>\n\n"
         + "\n\n".join(blocks)
         + "\n\nADMISSION — decide independently of timing and selector labels/scores:\n"
-          "First salvage the candidate's best related unit. If any substantive coherent "
-          "teaching unit related to the exact request can be isolated by repairing the "
-          "candidate's edges or including its nearby same-objective continuation, decision "
-          "MUST be keep and the returned boundaries must isolate that unit. A coarse cut that "
+          "First salvage the candidate's best academically sound related unit. If any "
+          "substantive coherent teaching unit related to the exact request and not explicitly "
+          "factually incorrect can be isolated by repairing the candidate's edges or including "
+          "its nearby same-objective continuation, decision MUST be keep and the returned "
+          "boundaries must isolate that unit. A coarse cut that "
           "also contains an unrelated neighbor or lots of filler is a boundary problem, never "
-          "a reason to reject the recoverable related unit. Use a reject decision only when no "
-          "related substantive unit remains after the best grounded repair.\n"
+          "a reason to reject the recoverable related unit. Use reject_unrelated or "
+          "reject_filler_dominated only when no related substantive unit remains after the "
+          "best grounded repair.\n"
           "- decision=keep for every substantive coherent teaching unit genuinely related "
           "to the exact original request. If the request explicitly asks for a named "
           "component, a unit teaching that component's meaning, role, or requested "
@@ -3380,6 +3490,17 @@ def _pro_boundary_audit_prompts(
           "edges cannot recover any coherent substantive teaching unit—practically, roughly "
           "90% or more is filler, administration, promotion, navigation, or transcript noise. "
           "Brief filler around real teaching must be kept.\n"
+          "- decision=reject_factually_incorrect ONLY when the literal speech explicitly "
+          "asserts a concrete, central academic claim that is definitively false, or explicitly "
+          "conflates distinct laws, concepts, mechanisms, identities, causes, or relationships. "
+          "Use established subject-matter knowledge only for this narrow check and only at high "
+          "confidence. First repair the edges to salvage any coherent academically sound related "
+          "unit. The 5-10-word evidence quote must itself contain the false or conflated "
+          "assertion; a topic label, omission, or outside inference is insufficient. NEVER use "
+          "this decision for ambiguity, approximation, an incomplete or disputed claim, a "
+          "speaker posing or correcting a misconception, rhetorical questions, missing visual "
+          "context, possible transcription error, or the auditor's own uncertainty. If factual "
+          "correctness is merely uncertain, decision MUST be keep.\n"
           "No other rejection reason exists. NEVER reject for a wrong/incomplete boundary, "
           "unresolved context, duration, visual dependence, factual uncertainty, duplication, "
           "repetition, self-contained/standalone status, any score, or learner difficulty. "
@@ -3387,7 +3508,10 @@ def _pro_boundary_audit_prompts(
           "Examples: For 'Newton's second law F=ma,' a same-force/larger-mass/smaller-"
           "acceleration explanation is KEEP, while a lesson whose actual objective is p=mv "
           "momentum or impulse-momentum is REJECT_UNRELATED even though it shares force, mass, "
-          "velocity, or units. For 'Bayes theorem,' Bayesian prior-likelihood-posterior "
+          "velocity, or units. A clip claiming Newton's second law is action and reaction, or "
+          "using a punch reaction pair as the law's definition, is "
+          "REJECT_FACTUALLY_INCORRECT; a speaker merely expressing uncertainty about an F=ma "
+          "approximation is KEEP. For 'Bayes theorem,' Bayesian prior-likelihood-posterior "
           "teaching is KEEP, while maximum-likelihood estimation with no Bayesian connection "
           "is REJECT_UNRELATED. For 'quicksort,' its partition mechanism is KEEP, while a "
           "mergesort-only explanation is REJECT_UNRELATED. A related clip that starts late, "
@@ -3397,10 +3521,10 @@ def _pro_boundary_audit_prompts(
           "several lessons, actual_objective is the narrowest complete teaching unit proved by "
           "the audit evidence_quote, not the video's umbrella agenda, a list "
           "of neighboring topics, or an earlier prerequisite. Evidence location and length "
-          "follow the compact ev rules below. For a rejection ev must "
-          "specifically ground the "
-          "unrelated objective or filler dominance. The quote itself must identify the "
-          "competing objective or unmistakable filler; if it is generic, depends on missing "
+          "follow the compact ev rules below. For a rejection ev must specifically ground the "
+          "unrelated objective, filler dominance, or explicit false/conflated assertion. The "
+          "quote itself must identify the competing objective, unmistakable filler, or "
+          "definitive factual error; if it is generic, depends on missing "
           "context, or supports both related and unrelated readings, decision MUST be keep.\n\n"
           "SEMANTIC METADATA — derive it afresh from literal speech, not selector labels or "
           "outside knowledge. title, obj, facet, family, aliases, direct, ie, and ev must all "
@@ -3473,17 +3597,24 @@ def _pro_boundary_audit_prompts(
           "distinguishes a neighboring concept. a=aliases must be []. The "
           "canonical family is the sole adaptive identity. For KEEP, correct title, facet, and "
           "family independently of selector hypotheses. For a rejection, name the literal "
-          "competing objective consistently.\n"
+          "rejected objective consistently.\n"
           "4. direct and ie are a fresh intent audit against the constraints above. Set "
           "direct=true only when the returned span fulfills every required non-scope "
           "constraint. ie uses {id,q}; each q is 5-16 exact consecutive words inside the "
           "returned span that logically grounds that exact constraint for this same objective. "
+          "For a teach or explain obligation, a title, agenda, outline, list, transition, or "
+          "passing mention does not ground the item. Require substantive speech teaching that "
+          "exact item's meaning, mechanism, rule, relationship, or application. Never reuse "
+          "one enumeration sentence to claim that each named member was taught. For example, "
+          "'This lesson covers bubble sort, merge sort, and quicksort' teaches none of their "
+          "mechanisms, and 'The elements are duty, breach, causation, and damages' teaches "
+          "none of those elements. "
           "A shared word, equal/opposite wording without the defining participants, or evidence "
           "for a different relationship cannot ground an id. KEEP requires at least one ie; "
           "a rejection returns direct=false and ie=[].\n"
           "5. ev=evidence_quote: copy 5-10 exact consecutive words proving obj. For KEEP it "
           "must be inside the returned repaired span and may come from its immediately nearby "
-          "contiguous continuation. For either rejection it must be inside the ORIGINAL "
+          "contiguous continuation. For any rejection it must be inside the ORIGINAL "
           "current sq-through-eq speech and ground that rejection.\n"
           "6. ds=direct_start_line and dq=direct_start_quote: independently locate the "
           "earliest complete sentence or independent clause that DIRECTLY begins teaching obj. "
@@ -3500,7 +3631,7 @@ def _pro_boundary_audit_prompts(
           "at only the nearest indispensable spoken setup. Repair eq independently through the "
           "complete same-objective conclusion.\n"
           "For a rejected candidate, boundary fields are non-semantic echo sentinels: set "
-          "obj to the literal competing objective or 'filler/navigation only'; set ds=current "
+          "obj to the literal rejected objective or 'filler/navigation only'; set ds=current "
           "s, dq to a shortest exact quote beginning at current sq, dc=true, and repeat current "
           "s/e with shortest exact sq/eq anchors at the same first/last semantic words. The "
           "auditor ignores rejected boundary fields.\n\n"
@@ -5307,6 +5438,121 @@ def _quote_character_spans(text: str, quote: str) -> list[tuple[int, int]]:
                 text_matches[index + len(quote_tokens) - 1].end(),
             ))
     return spans
+
+
+def _literal_grounded_phrase_spans(
+    text: str,
+    phrase: str,
+    *,
+    ignore_case: bool,
+) -> list[tuple[int, int]]:
+    """Find literal phrase occurrences aligned to the same grounded words."""
+    token_spans = set(_quote_character_spans(text, phrase))
+    if not token_spans or not phrase:
+        return []
+    flags = re.IGNORECASE if ignore_case else 0
+    spans: list[tuple[int, int]] = []
+    for match in re.finditer(re.escape(phrase), text, flags):
+        words = list(_WORD_RE.finditer(text, match.start(), match.end()))
+        if not words:
+            continue
+        word_span = (words[0].start(), words[-1].end())
+        if word_span not in token_spans:
+            continue
+        if _WORD_RE.search(text[match.start():word_span[0]]) or _WORD_RE.search(
+            text[word_span[1]:match.end()]
+        ):
+            continue
+        spans.append(match.span())
+    return list(dict.fromkeys(spans))
+
+
+def _intent_constraint_source_spans(
+    request: str,
+    phrase: str,
+) -> list[tuple[int, int]]:
+    """Resolve one copied phrase to its ordered, mechanically grounded spans."""
+    candidates = _literal_grounded_phrase_spans(
+        request,
+        phrase,
+        ignore_case=False,
+    )
+    if not candidates:
+        candidates = _literal_grounded_phrase_spans(
+            request,
+            phrase,
+            ignore_case=True,
+        )
+    if not candidates:
+        candidates = _quote_character_spans(request, phrase)
+    return list(dict.fromkeys(candidates))
+
+
+def _intent_constraint_source_span(
+    request: str,
+    constraint: _IntentConstraint,
+) -> tuple[int, int] | None:
+    candidates = _intent_constraint_source_spans(
+        request,
+        str(constraint.source_phrase or "").strip(),
+    )
+    occurrence = int(constraint.source_occurrence)
+    return candidates[occurrence] if occurrence < len(candidates) else None
+
+
+def _intent_constraint_source_contract_error(
+    request: str,
+    constraints: list[_IntentConstraint],
+    *,
+    allow_ungrounded: bool = False,
+) -> str | None:
+    """Validate stable phrase occurrence identities without semantic inference."""
+    exact_request = str(request or "").strip()
+    claimed_identities: set[tuple[tuple[str, ...], tuple[int, int]]] = set()
+    for constraint in constraints:
+        phrase = str(constraint.source_phrase or "").strip()
+        source_spans = _intent_constraint_source_spans(exact_request, phrase)
+        if not source_spans:
+            if allow_ungrounded:
+                continue
+            return "intent_contract_ungrounded_source_phrase"
+        if (
+            len(source_spans) > 1
+            and "source_occurrence" not in constraint.model_fields_set
+        ):
+            return "intent_contract_missing_source_occurrence"
+        occurrence = int(constraint.source_occurrence)
+        if occurrence >= len(source_spans):
+            return "intent_contract_invalid_source_occurrence"
+        identity = (tuple(_toks(phrase)), source_spans[occurrence])
+        if identity in claimed_identities:
+            return "intent_contract_duplicate_source_occurrence"
+        claimed_identities.add(identity)
+    return None
+
+
+def _canonical_intent_constraint_sources(
+    request: str,
+    constraints: list[_IntentConstraint],
+) -> dict[str, tuple[str, int]]:
+    """Anchor model phrase variants to exact, positioned user-request spans."""
+    exact_request = str(request or "").strip()
+    canonical: dict[str, tuple[str, int]] = {}
+    for constraint in constraints:
+        phrase = str(constraint.source_phrase or "").strip()
+        candidates = _intent_constraint_source_spans(exact_request, phrase)
+        if not candidates:
+            # The live contract rejects this before conversion. Retaining a
+            # deterministic fallback keeps isolated compatibility callers safe.
+            canonical[str(constraint.constraint_id)] = (phrase, 0)
+            continue
+        occurrence = int(constraint.source_occurrence)
+        span = candidates[occurrence] if occurrence < len(candidates) else candidates[0]
+        canonical[str(constraint.constraint_id)] = (
+            exact_request[span[0]:span[1]],
+            span[0],
+        )
+    return canonical
 
 
 def _quote_character_span(
@@ -11660,6 +11906,11 @@ def _normalized_request_text(value: object) -> str:
     )
 
 
+def _normalized_exact_request_text(value: object) -> tuple[str, ...]:
+    """Share concept identity rules so prose case cannot erase symbol case."""
+    return semantic_tokens(value)
+
+
 def _contract_has_explicit_slash_comparison(
     topic: str,
     constraints: dict[str, _IntentConstraint] | None,
@@ -11799,266 +12050,117 @@ def _joint_subject_anchor_tokens(
     return (own - peer_tokens) or own
 
 
-def _joint_subject_evidence_matches(
-    constraint: _IntentConstraint,
-    quote: str,
-    constraints: dict[str, _IntentConstraint],
+def _has_disjoint_span_assignment(
+    span_options: list[list[tuple[int, int]]],
 ) -> bool:
-    """Require evidence for a named side to actually name that distinct side."""
-    anchors = _joint_subject_anchor_tokens(constraint, constraints)
-    evidence = _content_tokens(quote) | {
-        token
-        for token in _toks(quote)
-        if token.isdecimal() or re.fullmatch(r"[ivxlcdm]+", token)
-    }
-    return bool(
-        anchors
-        and any(
-            anchor == token
-            or (
-                len(anchor) >= 6
-                and len(token) >= 6
-                and anchor[:6] == token[:6]
-            )
-            or (
-                min(len(anchor), len(token)) >= 4
-                and anchor.rstrip("e") == token.rstrip("e")
-            )
-            for anchor in anchors
-            for token in evidence
-        )
-    )
+    """Return whether one non-overlapping grounded span exists per member."""
+    ordered_options = sorted(span_options, key=len)
 
-
-def _joint_subject_evidence_window(
-    text: str,
-    constraint: _IntentConstraint,
-    constraints: dict[str, _IntentConstraint],
-) -> str:
-    """Find the shortest grounded window naming one distinct joint subject."""
-    words = list(_WORD_RE.finditer(str(text or "")))
-    for width in range(5, min(16, len(words)) + 1):
-        for offset in range(0, len(words) - width + 1):
-            quote = str(text or "")[
-                words[offset].start():words[offset + width - 1].end()
-            ]
-            if _joint_subject_evidence_matches(
-                constraint,
-                quote,
-                constraints,
-            ):
-                return quote
-    return ""
-
-
-def _joint_relationship_evidence_window(
-    text: str,
-    topic: str,
-    constraints: dict[str, _IntentConstraint],
-    subject_evidence: dict[str, str],
-) -> str:
-    """Infer only an explicitly spoken comparison/transition or a true conjunction."""
-    comparison_request = bool(
-        re.search(
-            r"\b(?:versus|vs\.?|compare(?:d|s|ing)?|comparison|contrast|"
-            r"difference\s+between)\b",
-            str(topic or ""),
-            re.IGNORECASE,
-        )
-    ) or _contract_has_explicit_slash_comparison(topic, constraints)
-    transition_request = bool(_EXPLICIT_TRANSITION_REQUEST_RE.search(topic))
-    path_request = bool(
-        not comparison_request
-        and not transition_request
-        and _contract_has_relational_path(topic, constraints)
-    )
-    if not comparison_request and not transition_request and not path_request:
-        return next(iter(subject_evidence.values()), "")
-
-    words = list(_WORD_RE.finditer(str(text or "")))
-    for width in range(5, min(16, len(words)) + 1):
-        for offset in range(0, len(words) - width + 1):
-            quote = str(text or "")[
-                words[offset].start():words[offset + width - 1].end()
-            ]
-            if _joint_relationship_evidence_matches(
-                quote,
-                topic,
-                constraints,
-            ):
-                return quote
-    return ""
-
-
-def _joint_relationship_evidence_matches(
-    quote: str,
-    topic: str,
-    constraints: dict[str, _IntentConstraint],
-) -> bool:
-    """Require a spoken relation between both named endpoints in one sentence."""
-    request = str(topic or "")
-    comparison_request = bool(
-        re.search(
-            r"\b(?:versus|vs\.?|compare(?:d|s|ing)?|comparison|contrast|"
-            r"difference\s+between)\b",
-            request,
-            re.IGNORECASE,
-        )
-    ) or _contract_has_explicit_slash_comparison(request, constraints)
-    transition_request = bool(_EXPLICIT_TRANSITION_REQUEST_RE.search(request))
-    path_request = bool(
-        not comparison_request
-        and not transition_request
-        and _contract_has_relational_path(request, constraints)
-    )
-    if not comparison_request and not transition_request and not path_request:
-        return True
-
-    endpoints = [
-        constraint
-        for constraint in constraints.values()
-        if constraint.kind in {
-            _IntentConstraintKind.SUBJECT,
-            _IntentConstraintKind.OUTCOME,
-        }
-    ]
-    if len(endpoints) < 2:
-        return False
-    source = str(quote or "")
-    sentences = [
-        source[left:right]
-        for left, right in _sentence_character_spans(source)
-        if _WORD_RE.search(source[left:right])
-    ] or [source]
-    for sentence in sentences:
-        endpoint_count = sum(
-            _joint_subject_evidence_matches(
-                constraint,
-                sentence,
-                constraints,
-            )
-            for constraint in endpoints
-        )
-        if endpoint_count < 2:
-            continue
-        if comparison_request:
-            relation_is_explicit = bool(
-                _EXPLICIT_COMPARISON_OBJECTIVE_RE.search(sentence)
-                or _DIRECT_COMPARISON_CLAUSE_RE.search(sentence)
-                or _SPOKEN_COMPARISON_RELATION_RE.search(sentence)
-                or (
-                    _COMPARISON_DISTINCTION_RE.search(sentence)
-                    and _COMPARISON_CONNECTOR_RE.search(sentence)
-                )
-            )
-        else:
-            relation_is_explicit = bool(
-                _EXPLICIT_TRANSITION_REQUEST_RE.search(sentence)
-                or _SPOKEN_PATH_RELATION_RE.search(sentence)
-            )
-        if relation_is_explicit:
+    def assign(index: int, chosen: list[tuple[int, int]]) -> bool:
+        if index >= len(ordered_options):
             return True
-    return False
+        for span in ordered_options[index]:
+            if any(
+                span[0] < prior[1] and prior[0] < span[1]
+                for prior in chosen
+            ):
+                continue
+            if assign(index + 1, [*chosen, span]):
+                return True
+        return False
+
+    return bool(ordered_options) and assign(0, [])
 
 
-def _pure_binary_comparison_parts(
+def _joint_structure_is_grounded(
     request: str,
-) -> tuple[str, str, str] | None:
-    """Parse an unambiguous whole-request binary comparison."""
-    match = re.fullmatch(
-        r"\s*(?P<left>.+?)\s+(?P<connector>versus|vs\.?)\s+(?P<right>.+?)\s*",
-        str(request or ""),
-        re.IGNORECASE,
+    *,
+    relation: _IntentConstraint,
+    members: list[_IntentConstraint],
+) -> bool:
+    """Validate referential IDs and span topology without classifying prose."""
+    relation_span = _intent_constraint_source_span(request, relation)
+    member_spans = [
+        _intent_constraint_source_span(request, member)
+        for member in members
+    ]
+    if relation_span is None or any(span is None for span in member_spans):
+        return False
+    grounded_member_spans = [
+        [span]
+        for span in member_spans
+        if span is not None
+    ]
+    before = [
+        [span for span in spans if span[1] <= relation_span[0]]
+        for spans in grounded_member_spans
+    ]
+    inside = [
+        [
+            span
+            for span in spans
+            if relation_span[0] <= span[0] and span[1] <= relation_span[1]
+        ]
+        for spans in grounded_member_spans
+    ]
+    after = [
+        [span for span in spans if span[0] >= relation_span[1]]
+        for spans in grounded_member_spans
+    ]
+    valid_topology = any(
+        all(options for options in placement)
+        and _has_disjoint_span_assignment(placement)
+        for placement in (before, inside, after)
     )
-    if match is None:
-        match = re.fullmatch(
-            r"\s*(?P<left>[^,;.!?]+?)\s+"
-            r"(?P<connector>compared\s+(?:to|with))\s+"
-            r"(?P<right>[^,;.!?]+?)\s*[.!?]?\s*",
-            str(request or ""),
-            re.IGNORECASE,
-        )
-    if match is None:
-        match = re.fullmatch(
-            r"\s*how\s+(?:do|does|did)\s+"
-            r"(?P<left>[^,;.!?]+?)\s+"
-            r"(?P<connector>compare\s+(?:to|with))\s+"
-            r"(?P<right>[^,;.!?]+?)\s*[.!?]?\s*",
-            str(request or ""),
-            re.IGNORECASE,
-        )
-    if match is None:
-        match = re.fullmatch(
-            r"\s*(?P<left>[^,;.!?]+?)\s+and\s+"
-            r"(?P<right>[^,;.!?]+?)\s+"
-            r"(?P<connector>comparison)\s*[.!?]?\s*",
-            str(request or ""),
-            re.IGNORECASE,
-        )
-    if match is None:
-        match = re.fullmatch(
-            r"\s*(?:a\s+|the\s+)?"
-            r"(?P<connector>comparison\s+(?:between|of)|"
-            r"(?:contrast|differences?)\s+between)\s+"
-            r"(?P<left>[^,;.!?]+?)\s+and\s+"
-            r"(?P<right>[^,;.!?]+?)\s*[.!?]?\s*",
-            str(request or ""),
-            re.IGNORECASE,
-        )
-    if match is None:
-        match = re.fullmatch(
-            r"\s*(?P<connector>compare|contrast)\s+"
-            r"(?P<left>[^,;.!?]+?)\s+(?:and|with|to)\s+"
-            r"(?P<right>[^,;.!?]+?)\s*[.!?]?\s*",
-            str(request or ""),
-            re.IGNORECASE,
-        )
-    if match is None:
-        return None
-    left = match.group("left").strip()
-    connector = match.group("connector").strip()
-    right = match.group("right").strip()
-    if not _content_tokens(left) or not _content_tokens(right):
-        return None
-    return left, connector, right
+    if valid_topology:
+        return True
+    around = [
+        [*before_options, *after_options]
+        for before_options, after_options in zip(before, after)
+    ]
+    return bool(
+        all(options for options in around)
+        and not all(options for options in before)
+        and not all(options for options in after)
+        and _has_disjoint_span_assignment(around)
+    )
 
 
-def _canonical_binary_comparison_constraints(
+def _joint_intent_contract_error(
     request: str,
     constraints: dict[str, _IntentConstraint],
-) -> dict[str, _IntentConstraint] | None:
-    """Repair an eligible malformed contract for a pure binary comparison."""
-    parts = _pure_binary_comparison_parts(request)
-    if parts is None or not all(
-        constraint.kind in {
-            _IntentConstraintKind.SUBJECT,
-            _IntentConstraintKind.RELATIONSHIP,
-        }
-        for constraint in constraints.values()
-    ):
+    structures: list[_IntentJointStructure],
+) -> str | None:
+    """Validate Gemini's explicit relationship graph by IDs and exact spans."""
+    if not structures:
         return None
-    left, connector, right = parts
-    canonical = [
-        _IntentConstraint(
-            constraint_id="joint_subject_1",
-            kind=_IntentConstraintKind.SUBJECT,
-            source_phrase=left,
-            requirement=f"Teach {left}",
-        ),
-        _IntentConstraint(
-            constraint_id="joint_relationship",
-            kind=_IntentConstraintKind.RELATIONSHIP,
-            source_phrase=connector,
-            requirement=f"Compare {left} with {right}",
-        ),
-        _IntentConstraint(
-            constraint_id="joint_subject_2",
-            kind=_IntentConstraintKind.SUBJECT,
-            source_phrase=right,
-            requirement=f"Teach {right}",
-        ),
-    ]
-    return {constraint.constraint_id: constraint for constraint in canonical}
+
+    relation_ids: set[str] = set()
+    for structure in structures:
+        relation_id = str(structure.relation_constraint_id)
+        member_ids = [str(value) for value in structure.member_constraint_ids]
+        if (
+            relation_id in relation_ids
+            or relation_id not in constraints
+            or any(member_id not in constraints for member_id in member_ids)
+        ):
+            return "intent_contract_incomplete_joint_structure"
+        relation_ids.add(relation_id)
+        relation = constraints[relation_id]
+        if relation.kind not in {
+            _IntentConstraintKind.RELATIONSHIP,
+            _IntentConstraintKind.TASK,
+            _IntentConstraintKind.OUTCOME,
+        }:
+            return "intent_contract_incomplete_joint_structure"
+        grounded = _joint_structure_is_grounded(
+            request,
+            relation=relation,
+            members=[constraints[member_id] for member_id in member_ids],
+        )
+        if not grounded:
+            return "intent_contract_incomplete_joint_structure"
+    return None
 
 
 def _validated_intent_constraints(
@@ -12075,9 +12177,9 @@ def _validated_intent_constraints(
     if not expected_request:
         return {}, None
     request_intent = plan.request_intent
-    if _normalized_request_text(request_intent.exact_request) != _normalized_request_text(
-        expected_request
-    ):
+    if _normalized_exact_request_text(
+        request_intent.exact_request
+    ) != _normalized_exact_request_text(expected_request):
         return {}, "intent_contract_request_mismatch"
     constraints = {
         constraint.constraint_id: constraint
@@ -12085,114 +12187,42 @@ def _validated_intent_constraints(
     }
     if len(constraints) != len(request_intent.constraints) or not constraints:
         return {}, "intent_contract_duplicate_or_empty_ids"
+    source_error = _intent_constraint_source_contract_error(
+        expected_request,
+        list(constraints.values()),
+    )
+    if source_error is not None:
+        return {}, source_error
+    canonical_sources = _canonical_intent_constraint_sources(
+        expected_request,
+        list(constraints.values()),
+    )
     semantic_keys = [
         (
             constraint.kind.value,
-            _normalized_request_text(constraint.source_phrase),
+            canonical_sources[str(constraint.constraint_id)][0],
+            canonical_sources[str(constraint.constraint_id)][1],
             _normalized_request_text(constraint.requirement),
         )
         for constraint in constraints.values()
     ]
     if len(set(semantic_keys)) != len(semantic_keys):
         return {}, "intent_contract_duplicate_semantics"
-    if any(
-        not _contains_quote(expected_request, constraint.source_phrase)
-        for constraint in constraints.values()
-    ):
-        return {}, "intent_contract_ungrounded_source_phrase"
-    if _request_requires_joint_intent_coverage(expected_request, constraints):
-        # A grounded multi-facet plan may encode a final comparison as TASK or
-        # OUTCOME. Keep that narrow structure, but otherwise require an explicit
-        # RELATIONSHIP for every comparison or transition request. The pure
-        # parser below is only a safe local-repair convenience, not the safety
-        # boundary for recognizing all relational wording.
-        relationship_constraint_count = sum(
-            constraint.kind is _IntentConstraintKind.RELATIONSHIP
-            for constraint in constraints.values()
-        )
-        comparison_request = bool(
-            re.search(
-                r"\b(?:versus|vs\.?|compare(?:d|s|ing)?|comparison|contrast|"
-                r"difference\s+between)\b",
-                expected_request,
-                re.IGNORECASE,
-            )
-        ) or _contract_has_explicit_slash_comparison(
-            expected_request,
-            constraints,
-        )
-        transition_request = bool(
-            _EXPLICIT_TRANSITION_REQUEST_RE.search(expected_request)
-        )
-        binary_comparison_request = (
-            _pure_binary_comparison_parts(expected_request) is not None
-        )
-        _request_head, request_list_separator, request_list_tail = (
-            expected_request.partition(":")
-        )
-        request_has_multi_facet_list = bool(
-            request_list_separator
-            and len(re.findall(r"[,;]", request_list_tail)) >= 2
-        )
-        grounded_multi_facet_plan = bool(
-            not binary_comparison_request
-            and request_has_multi_facet_list
-            and sum(
-                constraint.kind is _IntentConstraintKind.SCOPE
-                for constraint in constraints.values()
-            ) >= 3
-            and any(
-                constraint.kind is _IntentConstraintKind.SUBJECT
-                for constraint in constraints.values()
-            )
-            and any(
-                constraint.kind in {
-                    _IntentConstraintKind.TASK,
-                    _IntentConstraintKind.OUTCOME,
-                }
-                and (
-                    re.search(
-                        r"\b(?:versus|vs\.?|compare(?:d|s|ing)?|comparison|"
-                        r"contrast|difference\s+between)\b",
-                        constraint.source_phrase,
-                        re.IGNORECASE,
-                    )
-                    or _EXPLICIT_TRANSITION_REQUEST_RE.search(
-                        constraint.source_phrase
-                    )
-                )
-                for constraint in constraints.values()
-            )
-        )
-        missing_required_relationship = bool(
-            (comparison_request or transition_request)
-            and not relationship_constraint_count
-            and not grounded_multi_facet_plan
-        )
-        incomplete_relationship_structure = bool(
-            len(constraints) < 2
-            or missing_required_relationship
-            or (
-                relationship_constraint_count
-                and len(constraints) - relationship_constraint_count < 2
-            )
-        )
-        if incomplete_relationship_structure:
-            repaired = _canonical_binary_comparison_constraints(
-                expected_request,
-                constraints,
-            )
-            if repaired is None:
-                return {}, "intent_contract_incomplete_joint_structure"
-            constraints = repaired
+    joint_error = _joint_intent_contract_error(
+        expected_request,
+        constraints,
+        request_intent.joint_structures,
+    )
+    if joint_error is not None:
+        return {}, joint_error
     return constraints, None
 
 
 @dataclass(frozen=True)
 class _LiveSelectorContract:
     plan: _CompactBoundaryPlan
-    intent_signature: tuple[tuple[str, str, str], ...] | None
-    intent_ids_by_semantics: dict[tuple[str, str, str], str]
+    intent_signature: tuple[tuple[str, str, int, str], ...] | None
+    intent_ids_by_semantics: dict[tuple[str, str, int, str], str]
     intent_error: str | None
     candidate_rejections: tuple[str, ...]
 
@@ -12237,18 +12267,46 @@ def _validate_live_pro_selector_contract(
         if topic.strip()
         else plan.request_intent.constraints
     )
-    signature = tuple(sorted(
-        (
+    canonical_sources = _canonical_intent_constraint_sources(
+        topic or plan.request_intent.exact_request,
+        list(signature_constraints),
+    )
+    constraint_signatures = {
+        str(constraint.constraint_id): (
             constraint.kind.value,
-            _normalized_request_text(constraint.source_phrase),
+            _normalized_request_text(
+                canonical_sources[str(constraint.constraint_id)][0]
+            ),
+            canonical_sources[str(constraint.constraint_id)][1],
             _normalized_request_text(constraint.requirement),
         )
         for constraint in signature_constraints
-    ))
+    }
+    joint_signatures = [
+        (
+            "__joint__",
+            json.dumps(sorted(
+                constraint_signatures[str(member_id)]
+                for member_id in structure.member_constraint_ids
+            )),
+            -1,
+            json.dumps(
+                constraint_signatures[str(structure.relation_constraint_id)]
+            ),
+        )
+        for structure in plan.request_intent.joint_structures
+    ]
+    signature = tuple(sorted([
+        *constraint_signatures.values(),
+        *joint_signatures,
+    ]))
     ids_by_semantics = {
         (
             constraint.kind.value,
-            _normalized_request_text(constraint.source_phrase),
+            _normalized_request_text(
+                canonical_sources[str(constraint.constraint_id)][0]
+            ),
+            canonical_sources[str(constraint.constraint_id)][1],
             _normalized_request_text(constraint.requirement),
         ): str(constraint.constraint_id)
         for constraint in signature_constraints
@@ -16893,6 +16951,7 @@ def _trusted_authoritative_model_edges(
 def _trusted_universal_compact_plan_to_report(
     plan: _CompactBoundaryPlan,
     segments: list[dict],
+    topic: str = "",
 ) -> _Conversion:
     """Convert Gemini topics without executing local semantic repair code."""
     report = _Conversion(proposed_count=len(plan.topics))
@@ -16905,9 +16964,17 @@ def _trusted_universal_compact_plan_to_report(
         str(constraint.constraint_id)
         for constraint in plan.request_intent.constraints
     ]
-    constraint_kinds = {
-        str(constraint.constraint_id): constraint.kind
+    constraints_by_id = {
+        str(constraint.constraint_id): constraint
         for constraint in plan.request_intent.constraints
+    }
+    canonical_constraint_sources = _canonical_intent_constraint_sources(
+        topic or plan.request_intent.exact_request,
+        plan.request_intent.constraints,
+    )
+    constraint_kinds = {
+        constraint_id: constraint.kind
+        for constraint_id, constraint in constraints_by_id.items()
     }
     required_constraint_ids = {
         str(constraint.constraint_id)
@@ -17639,6 +17706,36 @@ def _trusted_universal_compact_plan_to_report(
             if str(item.constraint_id) in all_constraint_ids
             and _contains_quote(clip_text, str(item.evidence_quote))
         }
+        intent_obligations = normalize_intent_obligations(
+            [
+                obligation
+                for item in proposal.intent_evidence
+                if (
+                    str(item.constraint_id) in grounded_constraint_ids
+                    and (
+                        constraint := constraints_by_id.get(
+                            str(item.constraint_id)
+                        )
+                    )
+                    is not None
+                    and (
+                        obligation := intent_obligation(
+                            kind=constraint.kind.value,
+                            source_phrase=canonical_constraint_sources[
+                                str(constraint.constraint_id)
+                            ][0],
+                            source_start=canonical_constraint_sources[
+                                str(constraint.constraint_id)
+                            ][1],
+                            requirement=constraint.requirement,
+                            evidence_quote=item.evidence_quote,
+                        )
+                    )
+                    is not None
+                )
+            ],
+            require_evidence=True,
+        )
         if (
             proposal._pro_audit_start_authoritative
             and pro_audit_evidence_quote
@@ -17736,6 +17833,10 @@ def _trusted_universal_compact_plan_to_report(
             "boundary_confidence": 1.0 if not diagnostics else 0.75,
             "boundary_repair_mode": "exact" if not diagnostics else "best_effort",
             "selection_authority": "gemini",
+            "intent_obligation_contract_version": (
+                INTENT_OBLIGATION_CONTRACT_VERSION
+            ),
+            "intent_obligations": intent_obligations,
             "surface_eligible": True,
             "selection_candidate_id": candidate_id,
             "cue_ids": cue_ids,
@@ -17780,6 +17881,7 @@ def _trusted_compact_plan_to_report(
     plan: _CompactBoundaryPlan,
     segments: list[dict],
     settings: dict,
+    topic: str = "",
 ) -> _Conversion:
     """Pass every schema-valid Gemini topic; repair only structural boundaries."""
     report = _Conversion(proposed_count=len(plan.topics))
@@ -17792,9 +17894,17 @@ def _trusted_compact_plan_to_report(
         str(constraint.constraint_id)
         for constraint in plan.request_intent.constraints
     ]
-    constraint_kinds = {
-        str(constraint.constraint_id): constraint.kind
+    constraints_by_id = {
+        str(constraint.constraint_id): constraint
         for constraint in plan.request_intent.constraints
+    }
+    canonical_constraint_sources = _canonical_intent_constraint_sources(
+        topic or plan.request_intent.exact_request,
+        plan.request_intent.constraints,
+    )
+    constraint_kinds = {
+        constraint_id: constraint.kind
+        for constraint_id, constraint in constraints_by_id.items()
     }
     required_constraint_ids = {
         str(constraint.constraint_id)
@@ -18907,6 +19017,36 @@ def _trusted_compact_plan_to_report(
             if str(item.constraint_id) in all_constraint_ids
             and _contains_quote(clip_text, str(item.evidence_quote))
         }
+        intent_obligations = normalize_intent_obligations(
+            [
+                obligation
+                for item in proposal.intent_evidence
+                if (
+                    str(item.constraint_id) in grounded_constraint_ids
+                    and (
+                        constraint := constraints_by_id.get(
+                            str(item.constraint_id)
+                        )
+                    )
+                    is not None
+                    and (
+                        obligation := intent_obligation(
+                            kind=constraint.kind.value,
+                            source_phrase=canonical_constraint_sources[
+                                str(constraint.constraint_id)
+                            ][0],
+                            source_start=canonical_constraint_sources[
+                                str(constraint.constraint_id)
+                            ][1],
+                            requirement=constraint.requirement,
+                            evidence_quote=item.evidence_quote,
+                        )
+                    )
+                    is not None
+                )
+            ],
+            require_evidence=True,
+        )
         intent_coverage = (
             len(grounded_constraint_ids & required_constraint_ids)
             / len(required_constraint_ids)
@@ -18948,6 +19088,10 @@ def _trusted_compact_plan_to_report(
             "boundary_confidence": 1.0 if not diagnostics else 0.75,
             "boundary_repair_mode": "exact" if not diagnostics else "best_effort",
             "selection_authority": "gemini",
+            "intent_obligation_contract_version": (
+                INTENT_OBLIGATION_CONTRACT_VERSION
+            ),
+            "intent_obligations": intent_obligations,
             "surface_eligible": True,
             "selection_candidate_id": candidate_id,
             "cue_ids": cue_ids,
@@ -19004,8 +19148,12 @@ def _plan_to_report(
         and settings.get("_segment_trust_gemini_semantics") is True
     ):
         if settings.get("_segment_universal_boundaries") is True:
-            return _trusted_universal_compact_plan_to_report(plan, segments)
-        return _trusted_compact_plan_to_report(plan, segments, settings)
+            return _trusted_universal_compact_plan_to_report(
+                plan,
+                segments,
+                topic,
+            )
+        return _trusted_compact_plan_to_report(plan, segments, settings, topic)
 
     report = _Conversion(proposed_count=len(plan.topics))
     n = len(segments)
@@ -19021,20 +19169,40 @@ def _plan_to_report(
         report.rejected_reasons.append(intent_contract_error)
         return report
     intent_constraint_ids = set(intent_constraints)
+    joint_structures = tuple(
+        getattr(
+            getattr(plan, "request_intent", None),
+            "joint_structures",
+            (),
+        )
+        or ()
+    )
     joint_intent_required = bool(
         intent_constraints
-        and _request_requires_joint_intent_coverage(topic, intent_constraints)
+        and joint_structures
     )
+    joint_relation_members = {
+        str(structure.relation_constraint_id): tuple(
+            str(member_id)
+            for member_id in structure.member_constraint_ids
+        )
+        for structure in joint_structures
+    }
+    joint_member_ids = {
+        member_id
+        for member_ids in joint_relation_members.values()
+        for member_id in member_ids
+    }
     comparison_subject_anchors: tuple[frozenset[str], ...] = ()
-    if joint_intent_required and re.search(
-        r"\b(?:versus|vs\.?)\b",
-        str(topic or ""),
-        re.IGNORECASE,
-    ):
+    if joint_intent_required:
         comparison_subject_anchors = tuple(
             frozenset(_joint_subject_anchor_tokens(constraint, intent_constraints))
-            for constraint in intent_constraints.values()
-            if constraint.kind is _IntentConstraintKind.SUBJECT
+            for constraint_id, constraint in intent_constraints.items()
+            if constraint_id in joint_member_ids
+            and constraint.kind in {
+                _IntentConstraintKind.SUBJECT,
+                _IntentConstraintKind.OUTCOME,
+            }
         )
 
     ignore_caption_case = bool(settings.get("_segment_ignore_caption_case", True))
@@ -19286,19 +19454,23 @@ def _plan_to_report(
                 )
                 continue
         relationship_bridge_allowed: bool | None = (
-            bool(
-                _compact_evidence_explicitly_relates_sections(
-                    evidence_quote_for_section
-                )
-                and (
-                    _objective_explicitly_relates_sections(topic)
-                    or _objective_explicitly_relates_sections(
-                        objective_for_section
+            True
+            if joint_intent_required
+            else (
+                bool(
+                    _compact_evidence_explicitly_relates_sections(
+                        evidence_quote_for_section
+                    )
+                    and (
+                        _objective_explicitly_relates_sections(topic)
+                        or _objective_explicitly_relates_sections(
+                            objective_for_section
+                        )
                     )
                 )
+                if isinstance(proposal, _CompactBoundaryTopic)
+                else None
             )
-            if isinstance(proposal, _CompactBoundaryTopic)
-            else None
         )
         atomic_scope_text = " ".join(
             str(value or "")
@@ -19320,7 +19492,10 @@ def _plan_to_report(
                 scope_text=atomic_scope_text,
                 relationship_bridge_allowed=bool(relationship_bridge_allowed),
             )
-            if isinstance(proposal, _CompactBoundaryTopic)
+            if (
+                isinstance(proposal, _CompactBoundaryTopic)
+                and not joint_intent_required
+            )
             else []
         )
         instructional_preview_trim = _trim_initial_instructional_preview(
@@ -19405,7 +19580,10 @@ def _plan_to_report(
             evidence_quote=evidence_quote_for_section,
             learning_objective=objective_for_section,
             relationship_bridge_allowed=relationship_bridge_allowed,
-            atomic_claim_required=isinstance(proposal, _CompactBoundaryTopic),
+            atomic_claim_required=(
+                isinstance(proposal, _CompactBoundaryTopic)
+                and not joint_intent_required
+            ),
             atomic_scope_text=atomic_scope_text,
             comparison_subject_anchors=comparison_subject_anchors,
         )
@@ -19470,8 +19648,9 @@ def _plan_to_report(
                     evidence_quote=evidence_quote_for_section,
                     learning_objective=objective_for_section,
                     relationship_bridge_allowed=relationship_bridge_allowed,
-                    atomic_claim_required=isinstance(
-                        proposal, _CompactBoundaryTopic
+                    atomic_claim_required=(
+                        isinstance(proposal, _CompactBoundaryTopic)
+                        and not joint_intent_required
                     ),
                     atomic_scope_text=atomic_scope_text,
                     comparison_subject_anchors=comparison_subject_anchors,
@@ -20846,73 +21025,7 @@ def _plan_to_report(
                     quote,
                     evidence_span,
                 )
-                constraint = intent_constraints[constraint_id]
-                if (
-                    joint_intent_required
-                    and constraint.kind in {
-                        _IntentConstraintKind.SUBJECT,
-                        _IntentConstraintKind.OUTCOME,
-                    }
-                    and not _joint_subject_evidence_matches(
-                        constraint,
-                        literal_evidence,
-                        intent_constraints,
-                    )
-                ):
-                    continue
-                if (
-                    joint_intent_required
-                    and constraint.kind is _IntentConstraintKind.RELATIONSHIP
-                    and not _joint_relationship_evidence_matches(
-                        literal_evidence,
-                        topic,
-                        intent_constraints,
-                    )
-                ):
-                    continue
                 evidence_by_constraint[constraint_id] = literal_evidence
-            if joint_intent_required:
-                for constraint_id in required_intent_constraint_ids:
-                    constraint = intent_constraints[constraint_id]
-                    if (
-                        constraint_id in evidence_by_constraint
-                        or constraint.kind not in {
-                            _IntentConstraintKind.SUBJECT,
-                            _IntentConstraintKind.OUTCOME,
-                        }
-                    ):
-                        continue
-                    inferred = _joint_subject_evidence_window(
-                        clip_text,
-                        constraint,
-                        intent_constraints,
-                    )
-                    if inferred:
-                        evidence_by_constraint[constraint_id] = inferred
-                subject_evidence = {
-                    constraint_id: quote
-                    for constraint_id, quote in evidence_by_constraint.items()
-                    if intent_constraints[constraint_id].kind
-                    in {
-                        _IntentConstraintKind.SUBJECT,
-                        _IntentConstraintKind.OUTCOME,
-                    }
-                }
-                for constraint_id in required_intent_constraint_ids:
-                    constraint = intent_constraints[constraint_id]
-                    if (
-                        constraint_id in evidence_by_constraint
-                        or constraint.kind is not _IntentConstraintKind.RELATIONSHIP
-                    ):
-                        continue
-                    inferred = _joint_relationship_evidence_window(
-                        clip_text,
-                        topic,
-                        intent_constraints,
-                        subject_evidence,
-                    )
-                    if inferred:
-                        evidence_by_constraint[constraint_id] = inferred
             if invalid_intent_evidence or not evidence_by_constraint:
                 report.rejected_reasons.append(f"{prefix}:invalid_intent_evidence")
                 continue
@@ -22470,6 +22583,7 @@ def _audit_pro_boundaries(
         for decision in (
             _ProAuditDecision.REJECT_UNRELATED,
             _ProAuditDecision.REJECT_FILLER_DOMINATED,
+            _ProAuditDecision.REJECT_FACTUALLY_INCORRECT,
         )
     }
     _emit(
@@ -22496,6 +22610,9 @@ def _audit_pro_boundaries(
         ],
         rejected_filler_dominated_count=decision_counts[
             _ProAuditDecision.REJECT_FILLER_DOMINATED.value
+        ],
+        rejected_factually_incorrect_count=decision_counts[
+            _ProAuditDecision.REJECT_FACTUALLY_INCORRECT.value
         ],
     )
     return (

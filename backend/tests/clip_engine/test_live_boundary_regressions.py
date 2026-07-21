@@ -154,6 +154,10 @@ def test_live_economics_comparison_drops_prior_investment_and_next_movie_example
                     "requirement": "Compare opportunity cost with sunk cost",
                 },
             ],
+            "joint_structures": [{
+                "member_constraint_ids": ["opportunity", "sunk"],
+                "relation_constraint_id": "comparison",
+            }],
         },
         topics=[G._CompactBoundaryTopic(
         candidate_id="live-economics-comparison",
@@ -174,10 +178,24 @@ def test_live_economics_comparison_drops_prior_investment_and_next_movie_example
         factually_grounded=True,
         self_contained=True,
         is_standalone=True,
-        intent_evidence=[{
-            "constraint_id": "comparison",
-            "evidence_quote": comparison_evidence,
-        }],
+        intent_evidence=[
+            {
+                "constraint_id": "opportunity",
+                "evidence_quote": (
+                    "opportunity cost indicates the value of the next best alternative"
+                ),
+            },
+            {
+                "constraint_id": "sunk",
+                "evidence_quote": (
+                    "sunk cost refers to costs that have already been incurred"
+                ),
+            },
+            {
+                "constraint_id": "comparison",
+                "evidence_quote": comparison_evidence,
+            },
+        ],
     )],
     )
 
@@ -335,7 +353,7 @@ def test_context_expansion_trims_to_latest_topic_anchored_sentence() -> None:
     )
 
 
-def test_transition_request_requires_both_named_sides_and_the_relationship() -> None:
+def test_transition_evidence_semantics_are_not_reclassified_locally() -> None:
     request = "calculus limits transition to derivatives"
     evidence = "Limits describe what happens as a change approaches zero"
     segments = [_cue("transition", 0, 0.0, 8.0, evidence + ".")]
@@ -362,6 +380,10 @@ def test_transition_request_requires_both_named_sides_and_the_relationship() -> 
                     "requirement": "Teach derivatives",
                 },
             ],
+            "joint_structures": [{
+                "member_constraint_ids": ["limits", "derivatives"],
+                "relation_constraint_id": "transition",
+            }],
         },
         topics=[G._CompactBoundaryTopic(
             candidate_id="limits-only",
@@ -391,8 +413,8 @@ def test_transition_request_requires_both_named_sides_and_the_relationship() -> 
 
     report = _report(plan, segments, request)
 
-    assert report.clips == []
-    assert "proposal_0:incomplete_joint_request_coverage" in report.rejected_reasons
+    assert len(report.clips) == 1
+    assert report.rejected_reasons == []
 
 
 def test_dangling_article_and_same_sentence_preposition_are_incomplete_edges() -> None:
@@ -676,7 +698,14 @@ def test_binary_comparison_keeps_only_the_explicit_requested_relation() -> None:
         },
     ]
     plan = G._CompactBoundaryPlan(
-        request_intent={"exact_request": request, "constraints": constraints},
+        request_intent={
+            "exact_request": request,
+            "constraints": constraints,
+            "joint_structures": [{
+                "member_constraint_ids": ["alpha", "beta"],
+                "relation_constraint_id": "relation",
+            }],
+        },
         topics=[G._CompactBoundaryTopic(
             candidate_id="binary-comparison",
             start_line=0,
