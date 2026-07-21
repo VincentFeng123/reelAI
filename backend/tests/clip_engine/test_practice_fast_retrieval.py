@@ -2785,6 +2785,83 @@ def test_analysis_prefix_uses_a_different_channel_when_available():
     ]
 
 
+def test_ai_analysis_prefix_covers_an_unseen_query_family_before_repetition():
+    ranked = [
+        {
+            "id": "multi-facet-overview",
+            "channel": "Top Classroom",
+            "literal_match": False,
+            "matched_families": ["overview", "applications"],
+        },
+        {
+            "id": "repeated-overview",
+            "channel": "Second Classroom",
+            "literal_match": False,
+            "matched_families": ["overview"],
+        },
+        {
+            "id": "repeated-applications",
+            "channel": "Third Classroom",
+            "literal_match": False,
+            "matched_families": ["applications"],
+        },
+        {
+            "id": "another-overview",
+            "channel": "Fourth Classroom",
+            "literal_match": False,
+            "matched_families": ["overview"],
+        },
+        {
+            "id": "unseen-worked-examples",
+            "channel": "Worked Examples Lab",
+            "literal_match": False,
+            "matched_families": ["worked-examples"],
+        },
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=5,
+        excluded=set(),
+        analysis_prefix=3,
+    )
+
+    assert [video["id"] for video in selected[:3]] == [
+        "multi-facet-overview",
+        "unseen-worked-examples",
+        "repeated-overview",
+    ]
+
+
+def test_ai_family_diversity_does_not_reorder_the_unanalyzed_tail():
+    ranked = [
+        {
+            "id": f"candidate-{index}",
+            "channel": channel,
+            "literal_match": False,
+            "matched_families": [family],
+        }
+        for index, (channel, family) in enumerate((
+            ("Channel A", "family-a"),
+            ("Channel B", "family-b"),
+            ("Channel C", "family-c"),
+            ("Channel A", "family-a"),
+            ("Channel D", "family-a"),
+        ))
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=5,
+        excluded=set(),
+        analysis_prefix=3,
+    )
+
+    assert [video["id"] for video in selected] == [
+        f"candidate-{index}" for index in range(5)
+    ]
+
+
 def test_analysis_prefix_does_not_promote_a_distant_channel_result():
     ranked = [
         {

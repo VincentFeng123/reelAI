@@ -1190,6 +1190,207 @@ class IngestTopicProgressTests(unittest.TestCase):
         self.assertTrue(all(event.is_set() for event in cancelled))
         self.assertEqual(analyzed, set())
 
+    def test_attempt_tracking_only_includes_scheduled_sources(self) -> None:
+        pipeline = self._pipeline()
+        videos = [self._video(f"video-{index}") for index in range(4)]
+        attempted: set[str] = set()
+        analyzed: set[str] = set()
+        retrieved: set[str] = set()
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(
+                pipeline,
+                "_clip_and_filter",
+                side_effect=lambda video, *_args: (
+                    video,
+                    [{"title": video["id"], "score": 1.0}],
+                    {"transcript": {}},
+                ),
+            ),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (
+                    kwargs["v"]["id"],
+                    mock.sentinel.metadata,
+                ),
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=4,
+                max_reels=3,
+                attempted_video_ids=attempted,
+                analyzed_video_ids=analyzed,
+                retrieved_video_ids=retrieved,
+            )
+
+        self.assertEqual(reels, ["video-0", "video-1", "video-2"])
+        self.assertEqual(retrieved, {video["id"] for video in videos})
+        self.assertEqual(attempted, {"video-0", "video-1", "video-2"})
+        self.assertEqual(analyzed, attempted)
+
+    def test_bootstrap_capacity_defers_successful_unpersisted_sources(self) -> None:
+        pipeline = self._pipeline()
+        videos = [self._video(f"bootstrap-{index}") for index in range(3)]
+        attempted: set[str] = set()
+        analyzed: set[str] = set()
+        capacity_deferred: set[str] = set()
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(
+                pipeline,
+                "_clip_and_filter",
+                side_effect=lambda video, *_args: (
+                    video,
+                    [{"title": video["id"], "score": 1.0}],
+                    {"transcript": {}},
+                ),
+            ),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (
+                    kwargs["v"]["id"],
+                    mock.sentinel.metadata,
+                ),
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=3,
+                max_reels=1,
+                retrieval_profile="bootstrap",
+                attempted_video_ids=attempted,
+                analyzed_video_ids=analyzed,
+                capacity_deferred_video_ids=capacity_deferred,
+            )
+
+        self.assertEqual(reels, ["bootstrap-0"])
+        self.assertEqual(attempted, {video["id"] for video in videos})
+        self.assertEqual(analyzed, {"bootstrap-0"})
+        self.assertEqual(capacity_deferred, {"bootstrap-1", "bootstrap-2"})
+        self.assertEqual(attempted - analyzed - capacity_deferred, set())
+
+    def test_valid_empty_analysis_is_attempted_and_completed_without_persistence(self) -> None:
+        for retrieval_profile in ("deep", "bootstrap"):
+            with self.subTest(retrieval_profile=retrieval_profile):
+                pipeline = self._pipeline()
+                video = self._video(f"empty-{retrieval_profile}")
+                attempted: set[str] = set()
+                analyzed: set[str] = set()
+
+                with (
+                    mock.patch.object(
+                        pipeline_module,
+                        "_discover",
+                        return_value={
+                            "corrected": TOPIC,
+                            "videos": [video],
+                            "credits_used": 0,
+                            "warning": None,
+                        },
+                    ),
+                    mock.patch.object(
+                        pipeline,
+                        "_clip_and_filter",
+                        return_value=(video, [], {"transcript": {}}),
+                    ),
+                    mock.patch.object(
+                        pipeline,
+                        "_persist_engine_clip",
+                    ) as persist_engine_clip,
+                ):
+                    reels, _ = pipeline.ingest_topic(
+                        topic=TOPIC,
+                        material_id="material",
+                        concept_id="concept",
+                        max_videos=1,
+                        retrieval_profile=retrieval_profile,
+                        attempted_video_ids=attempted,
+                        analyzed_video_ids=analyzed,
+                    )
+
+                self.assertEqual(reels, [])
+                self.assertEqual(attempted, {video["id"]})
+                self.assertEqual(analyzed, {video["id"]})
+                persist_engine_clip.assert_not_called()
+
+    def test_persistence_failure_stays_attempted_but_not_completed(self) -> None:
+        for retrieval_profile in ("deep", "bootstrap"):
+            with self.subTest(retrieval_profile=retrieval_profile):
+                pipeline = self._pipeline()
+                video = self._video(f"persist-failure-{retrieval_profile}")
+                attempted: set[str] = set()
+                analyzed: set[str] = set()
+                capacity_deferred: set[str] = set()
+
+                with (
+                    mock.patch.object(
+                        pipeline_module,
+                        "_discover",
+                        return_value={
+                            "corrected": TOPIC,
+                            "videos": [video],
+                            "credits_used": 0,
+                            "warning": None,
+                        },
+                    ),
+                    mock.patch.object(
+                        pipeline,
+                        "_clip_and_filter",
+                        return_value=(
+                            video,
+                            [{"title": video["id"], "score": 1.0}],
+                            {"transcript": {}},
+                        ),
+                    ),
+                    mock.patch.object(
+                        pipeline,
+                        "_persist_engine_clip",
+                        side_effect=RuntimeError("database write failed"),
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "database write failed"):
+                        pipeline.ingest_topic(
+                            topic=TOPIC,
+                            material_id="material",
+                            concept_id="concept",
+                            max_videos=1,
+                            retrieval_profile=retrieval_profile,
+                            attempted_video_ids=attempted,
+                            analyzed_video_ids=analyzed,
+                            capacity_deferred_video_ids=capacity_deferred,
+                        )
+
+                self.assertEqual(attempted, {video["id"]})
+                self.assertEqual(analyzed, set())
+                self.assertEqual(capacity_deferred, set())
+
     def test_first_valid_clip_streams_without_cancelling_selected_source(self) -> None:
         pipeline = self._pipeline()
         videos = [self._video("slow-video"), self._video("fast-video")]

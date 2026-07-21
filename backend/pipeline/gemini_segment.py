@@ -11976,13 +11976,6 @@ def _validated_intent_constraints(
         for constraint in constraints.values()
     ):
         return {}, "intent_contract_ungrounded_source_phrase"
-    required_tokens = _content_tokens(expected_request)
-    covered_tokens = set().union(*(
-        _content_tokens(constraint.source_phrase)
-        for constraint in constraints.values()
-    ))
-    if required_tokens and not required_tokens.issubset(covered_tokens):
-        return {}, "intent_contract_incomplete_request_coverage"
     if _request_requires_joint_intent_coverage(expected_request, constraints):
         comparison_request = bool(
             re.search(
@@ -22598,6 +22591,17 @@ def _run_selection_profile(
                     "selector_contract_retry_exhausted": True,
                 })
             calls.append(retry_call)
+            if (
+                (first_schema_rejections or first_contract_rejections)
+                and not first_parsed.topics
+            ):
+                # The first response was not a semantic no-match: its selector
+                # schema or contract failed and left nothing safe to retain.
+                # Preserve both attempts and surface the retry's operational
+                # failure so the source remains eligible for a later bounded
+                # retry.
+                retry_exc.selection_attempt_calls = [first_call, retry_call]
+                raise
             parsed, call = first_parsed, first_call
         else:
             retry_call["video_grounded"] = video_grounded
@@ -22678,6 +22682,22 @@ def _run_selection_profile(
                     "selector_contract_retry_exhausted": not retry_recovered,
                 })
             calls.append(retry_call)
+            if retry_all_rejections and not parsed.topics:
+                selector_error_type = (
+                    "GeminiSelectorContractError"
+                    if first_contract_rejections or retry_contract_rejections
+                    else "GeminiSelectorSchemaError"
+                )
+                retry_call.update({
+                    "error_type": selector_error_type,
+                    "retryable": True,
+                })
+                contract_exc = _ModelCallError(
+                    "Gemini selector repair retry exhausted",
+                    retry_call,
+                )
+                contract_exc.selection_attempt_calls = [first_call, retry_call]
+                raise contract_exc
             if retry_recovered or first_selector_contract.intent_error is not None:
                 call = retry_call
             else:
@@ -22685,6 +22705,51 @@ def _run_selection_profile(
                 first_call["partial_schema_retry_retained"] = True
     else:
         calls.append(call)
+        if (
+            profile == PRO_BOUNDARY_PROFILE
+            and (first_schema_rejections or first_contract_rejections)
+            and not parsed.topics
+            and not _cancel_requested(cancelled)
+        ):
+            # A rejected schema or contract is an operational failure, not a
+            # semantic no-match. If the shared deadline cannot fit the bounded
+            # repair, keep the source eligible for a later acquisition attempt
+            # instead of caching and consuming a poisoned empty result.
+            selector_error_type = (
+                "GeminiSelectorContractError"
+                if first_contract_rejections
+                else "GeminiSelectorSchemaError"
+            )
+            call.update({
+                "partial_schema_retry_attempt": 1,
+                "partial_schema_retry_reason": (
+                    "selector_contract_rejection"
+                    if first_contract_rejections
+                    else "candidate_schema_rejection"
+                ),
+                "partial_schema_retry_exhausted": True,
+                "partial_schema_retry_skipped": "insufficient_deadline",
+                "error_type": selector_error_type,
+                "retryable": True,
+            })
+            if first_contract_rejections:
+                call.update({
+                    "selector_contract_retry_attempt": 1,
+                    "selector_contract_retry_reason": (
+                        first_selector_contract.intent_error
+                        if first_selector_contract is not None
+                        and first_selector_contract.intent_error is not None
+                        else "candidate_concept_family_contract"
+                    ),
+                    "selector_contract_retry_skipped": "insufficient_deadline",
+                    "selector_contract_retry_exhausted": True,
+                })
+            contract_exc = _ModelCallError(
+                "Gemini selector repair retry unavailable before deadline",
+                call,
+            )
+            contract_exc.selection_attempt_calls = [call]
+            raise contract_exc
     pro_audit_rejections: list[str] = []
     if profile == PRO_BOUNDARY_PROFILE and isinstance(parsed, _CompactBoundaryPlan):
         parsed, boundary_audit_calls, pro_audit_rejections = _audit_pro_boundaries(

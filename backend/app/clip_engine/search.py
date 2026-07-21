@@ -278,7 +278,18 @@ def _select_ranked_candidates(
         return selected[:limit]
 
     reserve = min(2, max(1, prefix_limit // 3))
-    selected = analysis_pool[: max(0, prefix_limit - reserve)]
+    has_literal_anchor = any(
+        bool(video.get("literal_match")) for video in analysis_pool
+    )
+    # AI-expanded branches are peer retrieval facets. Keep the strongest
+    # source, then spend the scarce analysis prefix on an uncovered branch
+    # before repeating an already represented one. Literal-anchor flows retain
+    # their established priority and bounded single AI-diversity slot.
+    selected = analysis_pool[: (
+        max(0, prefix_limit - reserve)
+        if has_literal_anchor
+        else min(1, prefix_limit)
+    )]
     selected_ids = {str(video.get("id") or "") for video in selected}
     selected_families = {
         str(family)
@@ -296,7 +307,31 @@ def _select_ranked_candidates(
     # channel when a comparably ranked teaching source is available. Bounding
     # the pool prevents diversity from promoting an arbitrarily weak result.
     diversity_pool = non_literal[: max(prefix_limit, prefix_limit * 2)]
+    if not has_literal_anchor:
+        for video in diversity_pool:
+            if len(selected) >= prefix_limit:
+                break
+            video_id = str(video.get("id") or "")
+            families = {
+                str(family)
+                for family in (video.get("matched_families") or [])
+                if str(family or "").strip()
+            }
+            if video_id in selected_ids or (
+                families and families.issubset(selected_families)
+            ):
+                continue
+            selected.append(video)
+            selected_ids.add(video_id)
+            selected_families.update(families)
+            channel = str(video.get("channel") or "").strip().casefold()
+            if channel:
+                selected_channels.add(channel)
+            if len(selected) >= prefix_limit:
+                break
     for video in diversity_pool:
+        if len(selected) >= prefix_limit:
+            break
         video_id = str(video.get("id") or "")
         channel = str(video.get("channel") or "").strip().casefold()
         if video_id in selected_ids or not channel or channel in selected_channels:
@@ -313,6 +348,8 @@ def _select_ranked_candidates(
         if len(selected) >= prefix_limit:
             break
     for video in non_literal:
+        if len(selected) >= prefix_limit:
+            break
         video_id = str(video.get("id") or "")
         families = {
             str(family)

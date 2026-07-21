@@ -1067,7 +1067,7 @@ def test_partial_retry_merges_equivalent_intent_after_constraint_id_rename(
     assert result.calls[1]["partial_schema_retry_recovered"] is True
 
 
-@pytest.mark.parametrize("failure", ["request_mismatch", "incomplete_coverage"])
+@pytest.mark.parametrize("failure", ["request_mismatch", "lexical_token_union_gap"])
 @pytest.mark.parametrize("retry_recovers", [True, False])
 def test_live_pro_selector_retries_invalid_intent_contract_and_fails_closed(
     monkeypatch,
@@ -1175,15 +1175,27 @@ def test_live_pro_selector_retries_invalid_intent_contract_and_fails_closed(
         topic="alpha lesson",
     )
 
-    expected_reason = (
-        "intent_contract_request_mismatch"
-        if failure == "request_mismatch"
-        else "intent_contract_incomplete_request_coverage"
-    )
+    if failure == "lexical_token_union_gap":
+        assert dispatches == 1
+        assert result.accepted_count == 1
+        assert result.classification == "green"
+        assert result.error is None
+        return
+
+    expected_reason = "intent_contract_request_mismatch"
     assert dispatches == 2
     assert result.accepted_count == (1 if retry_recovers else 0)
     assert result.classification == ("green" if retry_recovers else "invalid")
-    assert (expected_reason in result.rejection_reasons) is (not retry_recovers)
+    if retry_recovers:
+        assert expected_reason not in result.rejection_reasons
+        assert result.error is None
+    else:
+        assert result.rejection_reasons == [
+            "request_failure:GeminiSelectorContractError"
+        ]
+        assert result.error == (
+            "GeminiSelectorContractError: Gemini model call failed"
+        )
     assert result.calls[0]["selector_contract_retry_attempt"] == 1
     assert result.calls[1]["selector_contract_retry_attempt"] == 2
     assert result.calls[1]["selector_contract_retry_recovered"] is retry_recovers
@@ -1806,7 +1818,10 @@ def test_normal_flash_profile_makes_model_word_boundaries_authoritative(
     monkeypatch.setattr(
         G,
         "_call_model",
-        lambda *_args, **_kwargs: (_empty_plan(G._CompactBoundaryPlan), {}),
+        lambda *_args, **_kwargs: (
+            _empty_plan(G._CompactBoundaryPlan, topic="calculus"),
+            {},
+        ),
     )
 
     def convert(_plan, _segments, _words, settings, **_kwargs):

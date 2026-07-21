@@ -4726,6 +4726,8 @@ class IngestionPipeline:
         retrieval_profile: str = "deep",
         analyzed_video_ids: set[str] | None = None,
         retrieved_video_ids: set[str] | None = None,
+        attempted_video_ids: set[str] | None = None,
+        capacity_deferred_video_ids: set[str] | None = None,
     ) -> tuple[list[ReelOutWithAttribution], list[str]]:
         """
         Route ONE study concept through the clip engine and persist EVERY
@@ -4951,7 +4953,7 @@ class IngestionPipeline:
                     cancel_check=fetch_should_cancel,
                     language=language,
                 )
-            return executor.submit(
+            future = executor.submit(
                 self._clip_and_filter,
                 videos[index],
                 str(
@@ -4962,6 +4964,14 @@ class IngestionPipeline:
                 fetch_should_cancel,
                 generation_context,
             )
+            if attempted_video_ids is not None and analyzed_video_id:
+                attempted_video_ids.add(analyzed_video_id)
+            return future
+
+        def mark_analyzed(video: dict[str, Any]) -> None:
+            analyzed_video_id = str(video.get("id") or "").strip()
+            if analyzed_video_ids is not None and analyzed_video_id:
+                analyzed_video_ids.add(analyzed_video_id)
 
         def fetch_result(v: dict[str, Any], future: Any, timeout: float):
             completed = False
@@ -6006,6 +6016,7 @@ class IngestionPipeline:
                         source_result[2],
                     )
                     persisted = persist_result(one_clip_result, limit=1)
+                    mark_analyzed(source_result[0])
                     reels_by_video.setdefault(source_index, []).extend(persisted)
                     persisted_count += len(persisted)
                 if persisted_count >= inventory_cap:
@@ -6087,17 +6098,18 @@ class IngestionPipeline:
                         continue
                     if result is None:
                         continue
-                    analyzed_video_id = str(v.get("id") or "").strip()
-                    if analyzed_video_ids is not None and analyzed_video_id:
-                        analyzed_video_ids.add(analyzed_video_id)
                     completed_results[index] = result
-                    if retrieval_profile == "bootstrap":
+                    if not result[1]:
+                        mark_analyzed(v)
+                        reels_by_video[index] = []
+                    elif retrieval_profile == "bootstrap":
                         persist_bootstrap_sources()
                     else:
                         persisted = persist_result(
                             result,
                             limit=max(0, inventory_cap - persisted_count),
                         )
+                        mark_analyzed(v)
                         reels_by_video[index] = persisted
                         persisted_count += len(persisted)
                         if (
@@ -6172,6 +6184,25 @@ class IngestionPipeline:
                 persisted = persist_result(extra_result, limit=1)
                 reels_by_video.setdefault(source_index, []).extend(persisted)
                 persisted_count += len(persisted)
+
+        if (
+            retrieval_profile == "bootstrap"
+            and persisted_count >= inventory_cap
+            and capacity_deferred_video_ids is not None
+        ):
+            # These sources completed selection successfully, but their clips
+            # were never offered to persistence because a stronger source had
+            # already filled the bootstrap inventory. Keep them distinct from
+            # true provider/persistence failures so a continuation can use them.
+            for source_index, source_result in completed_results.items():
+                if (
+                    source_index in bootstrap_attempted_indices
+                    or not source_result[1]
+                ):
+                    continue
+                video_id = str(source_result[0].get("id") or "").strip()
+                if video_id:
+                    capacity_deferred_video_ids.add(video_id)
 
         # Progressive callbacks reflect availability; restore discover order in
         # the final result for deterministic downstream inventory.

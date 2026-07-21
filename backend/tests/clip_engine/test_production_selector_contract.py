@@ -14672,6 +14672,374 @@ def test_long_video_metadata_does_not_create_media_budget_or_block_dispatch(
     assert budget["inflight_reserved_cost_usd"] == 0.0
 
 
+def test_invalid_selector_contract_with_failed_retry_is_operational_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "photosynthesis"
+    valid_plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": request,
+                "requirement": f"Teach {request}",
+            }],
+        },
+        topics=[],
+    )
+    invalid_plan = valid_plan.model_copy(update={
+        "request_intent": valid_plan.request_intent.model_copy(update={
+            "exact_request": "an unrelated request",
+        }),
+    })
+    attempts = 0
+
+    def fail_contract_retry(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return invalid_plan, {
+                "model": "gemini-3.1-pro-preview",
+                "operation": "pro_authoritative",
+            }
+        raise gemini_segment._ModelCallError(
+            "provider unavailable",
+            {
+                "model": "gemini-3.1-pro-preview",
+                "operation": "pro_authoritative",
+                "error_type": "GeminiTransportError",
+                "provider_status_code": 503,
+                "retryable": True,
+            },
+        )
+
+    monkeypatch.setattr(gemini_segment, "_call_model", fail_contract_retry)
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "cue-0",
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Plants convert light into stored chemical energy.",
+            }],
+            "words": [],
+        },
+        {},
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic=request,
+    )
+
+    assert attempts == 2
+    assert result.clips == []
+    assert result.error == (
+        "GeminiTransportError: Gemini model call failed; status 503"
+    )
+    assert result.classification_reasons == [
+        "request_failure:GeminiTransportError"
+    ]
+    assert len(result.calls) == 2
+    assert result.calls[0]["selector_contract_retry_attempt"] == 1
+    assert result.calls[1]["selector_contract_retry_attempt"] == 2
+    assert result.calls[1]["selector_contract_retry_exhausted"] is True
+    assert result.calls[1]["retryable"] is True
+
+
+def test_invalid_selector_contract_without_retry_time_is_operational_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "photosynthesis"
+    invalid_plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": "an unrelated request",
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": "an unrelated request",
+                "requirement": "Teach an unrelated request",
+            }],
+        },
+        topics=[],
+    )
+    attempts = 0
+
+    def return_invalid_contract(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return invalid_plan, {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_authoritative",
+        }
+
+    monkeypatch.setattr(gemini_segment, "_call_model", return_invalid_contract)
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "cue-0",
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Plants convert light into stored chemical energy.",
+            }],
+            "words": [],
+        },
+        {},
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic=request,
+        deadline_monotonic=time.monotonic() + 4.9,
+    )
+
+    assert attempts == 1
+    assert result.clips == []
+    assert result.error == (
+        "GeminiSelectorContractError: Gemini model call failed"
+    )
+    assert result.classification_reasons == [
+        "request_failure:GeminiSelectorContractError"
+    ]
+    assert len(result.calls) == 1
+    assert result.calls[0]["selector_contract_retry_attempt"] == 1
+    assert (
+        result.calls[0]["selector_contract_retry_skipped"]
+        == "insufficient_deadline"
+    )
+    assert result.calls[0]["selector_contract_retry_exhausted"] is True
+    assert result.calls[0]["retryable"] is True
+
+
+def test_invalid_selector_schema_without_retry_time_is_operational_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "photosynthesis"
+    empty_plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": request,
+                "requirement": f"Teach {request}",
+            }],
+        },
+        topics=[],
+    )
+    attempts = 0
+
+    def return_rejected_schema(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return empty_plan, {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_authoritative",
+            "schema_rejection_reasons": [
+                "candidate_1:invalid_claim_quote",
+            ],
+        }
+
+    monkeypatch.setattr(gemini_segment, "_call_model", return_rejected_schema)
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "cue-0",
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Plants convert light into stored chemical energy.",
+            }],
+            "words": [],
+        },
+        {},
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic=request,
+        deadline_monotonic=time.monotonic() + 4.9,
+    )
+
+    assert attempts == 1
+    assert result.clips == []
+    assert result.error == (
+        "GeminiSelectorSchemaError: Gemini model call failed"
+    )
+    assert result.classification_reasons == [
+        "request_failure:GeminiSelectorSchemaError"
+    ]
+    assert len(result.calls) == 1
+    assert result.calls[0]["partial_schema_retry_attempt"] == 1
+    assert (
+        result.calls[0]["partial_schema_retry_skipped"]
+        == "insufficient_deadline"
+    )
+    assert result.calls[0]["partial_schema_retry_exhausted"] is True
+    assert result.calls[0]["retryable"] is True
+    assert "selector_contract_retry_attempt" not in result.calls[0]
+
+
+def test_valid_semantic_empty_without_retry_time_remains_successful(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "photosynthesis"
+    empty_plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": request,
+                "requirement": f"Teach {request}",
+            }],
+        },
+        topics=[],
+    )
+    attempts = 0
+
+    def return_semantic_empty(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return empty_plan, {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_authoritative",
+        }
+
+    monkeypatch.setattr(gemini_segment, "_call_model", return_semantic_empty)
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "cue-0",
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Plants convert light into stored chemical energy.",
+            }],
+            "words": [],
+        },
+        {},
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic=request,
+        deadline_monotonic=time.monotonic() + 4.9,
+    )
+
+    assert attempts == 1
+    assert result.clips == []
+    assert result.error is None
+    assert len(result.calls) == 1
+    assert "partial_schema_retry_attempt" not in result.calls[0]
+    assert "selector_contract_retry_attempt" not in result.calls[0]
+
+
+def test_repeated_invalid_selector_contract_is_operational_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "photosynthesis"
+    invalid_plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": "an unrelated request",
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": "an unrelated request",
+                "requirement": "Teach an unrelated request",
+            }],
+        },
+        topics=[],
+    )
+    attempts = 0
+
+    def return_invalid_contract(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return invalid_plan, {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_authoritative",
+        }
+
+    monkeypatch.setattr(gemini_segment, "_call_model", return_invalid_contract)
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "cue-0",
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Plants convert light into stored chemical energy.",
+            }],
+            "words": [],
+        },
+        {},
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic=request,
+    )
+
+    assert attempts == 2
+    assert result.clips == []
+    assert result.error == (
+        "GeminiSelectorContractError: Gemini model call failed"
+    )
+    assert result.classification_reasons == [
+        "request_failure:GeminiSelectorContractError"
+    ]
+    assert len(result.calls) == 2
+    assert result.calls[0]["selector_contract_retry_attempt"] == 1
+    assert result.calls[1]["selector_contract_retry_attempt"] == 2
+    assert result.calls[1]["selector_contract_retry_exhausted"] is True
+    assert result.calls[1]["retryable"] is True
+
+
+def test_repeated_invalid_selector_schema_is_operational_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "photosynthesis"
+    empty_plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": request,
+                "requirement": f"Teach {request}",
+            }],
+        },
+        topics=[],
+    )
+    attempts = 0
+
+    def return_rejected_schema(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return empty_plan, {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_authoritative",
+            "schema_rejection_reasons": [
+                "candidate_1:invalid_claim_quote",
+            ],
+        }
+
+    monkeypatch.setattr(gemini_segment, "_call_model", return_rejected_schema)
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "cue-0",
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Plants convert light into stored chemical energy.",
+            }],
+            "words": [],
+        },
+        {},
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic=request,
+    )
+
+    assert attempts == 2
+    assert result.clips == []
+    assert result.error == (
+        "GeminiSelectorSchemaError: Gemini model call failed"
+    )
+    assert result.classification_reasons == [
+        "request_failure:GeminiSelectorSchemaError"
+    ]
+    assert len(result.calls) == 2
+    assert result.calls[0]["partial_schema_retry_attempt"] == 1
+    assert result.calls[1]["partial_schema_retry_attempt"] == 2
+    assert result.calls[1]["partial_schema_retry_exhausted"] is True
+    assert result.calls[1]["retryable"] is True
+    assert "selector_contract_retry_attempt" not in result.calls[1]
+
+
 def test_contract_retry_reuses_logical_selector_slot_at_three_source_cap(
     monkeypatch,
 ) -> None:
@@ -17150,6 +17518,110 @@ def test_binary_comparison_contract_normalizes_merged_model_constraints(
     assert [
         constraint.source_phrase for constraint in constraints.values()
     ] == expected_phrases
+
+
+@pytest.mark.parametrize(
+    ("exact_request", "source_phrases"),
+    [
+        (
+            "Explain Newton's laws for beginners: start with inertia and balanced "
+            "forces, move to net force and F=ma, then free-body diagrams, third-law "
+            "action-reaction, ending with worked problems and misconceptions.",
+            (
+                "Newton's laws",
+                "inertia and balanced forces",
+                "net force and F=ma",
+                "free-body diagrams",
+                "third-law action-reaction",
+                "worked problems and misconceptions",
+            ),
+        ),
+        (
+            "Explain cellular respiration for beginners: start with glycolysis, "
+            "continue with the Krebs cycle, and end with oxidative phosphorylation "
+            "and ATP yield.",
+            (
+                "cellular respiration",
+                "glycolysis",
+                "Krebs cycle",
+                "oxidative phosphorylation and ATP yield",
+            ),
+        ),
+        (
+            "Teach quadratic equations progressively: start with factoring, continue "
+            "with completing the square, and finish with the quadratic formula and "
+            "worked problems.",
+            (
+                "quadratic equations",
+                "factoring",
+                "completing the square",
+                "quadratic formula and worked problems",
+            ),
+        ),
+        (
+            "Teach Python exception handling for beginners: begin with try and except, "
+            "then add else and finally, ending with custom exceptions and debugging "
+            "examples.",
+            (
+                "Python exception handling",
+                "try and except",
+                "else and finally",
+                "custom exceptions and debugging examples",
+            ),
+        ),
+        (
+            "Explain negligence for a beginner: start with duty and breach, move to "
+            "causation and damages, then apply the elements to worked hypotheticals "
+            "and common defenses.",
+            (
+                "negligence",
+                "duty and breach",
+                "causation and damages",
+                "worked hypotheticals and common defenses",
+            ),
+        ),
+    ],
+)
+def test_live_selector_accepts_ai_constraints_without_a_lexical_token_union(
+    exact_request: str,
+    source_phrases: tuple[str, ...],
+) -> None:
+    constraints_payload = [
+        {
+            "constraint_id": f"facet-{index}",
+            "kind": "subject" if index == 0 else "scope",
+            "source_phrase": source_phrase,
+            "requirement": f"Teach {source_phrase}",
+        }
+        for index, source_phrase in enumerate(source_phrases)
+    ]
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": exact_request,
+            "constraints": constraints_payload,
+        },
+        topics=[],
+    )
+
+    constraints, error = gemini_segment._validated_intent_constraints(
+        plan,
+        exact_request,
+    )
+    contract = gemini_segment._validate_live_pro_selector_contract(
+        plan,
+        exact_request,
+    )
+
+    covered_tokens = set().union(*(
+        gemini_segment._content_tokens(source_phrase)
+        for source_phrase in source_phrases
+    ))
+    assert gemini_segment._content_tokens(exact_request) - covered_tokens
+    assert list(constraints) == [
+        item["constraint_id"] for item in constraints_payload
+    ]
+    assert error is None
+    assert contract.intent_error is None
 
 
 def test_repaired_binary_comparison_is_regrounded_before_acceptance() -> None:

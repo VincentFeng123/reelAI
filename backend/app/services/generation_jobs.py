@@ -47,7 +47,7 @@ DEFAULT_LEASE_SECONDS = 90
 DEFAULT_DEADLINE_SECONDS = 60 * 60
 DEFAULT_QUEUE_TTL_SECONDS = 8 * 60
 # Request-key version doubles as a production inventory compatibility gate.
-REQUEST_SCHEMA_VERSION = "adaptive_clip_concepts_v2"
+REQUEST_SCHEMA_VERSION = "adaptive_clip_concepts_v3"
 EMPTY_ADAPTATION_FINGERPRINT = hashlib.sha256(b"{}").hexdigest()
 GENERATION_SUBMIT_ADVISORY_LOCK_ID = 0x5354554459524545
 

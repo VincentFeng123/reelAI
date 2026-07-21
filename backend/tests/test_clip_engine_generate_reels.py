@@ -1039,6 +1039,8 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
 
     def test_two_stage_cap_and_profile_reach_ingestion(self) -> None:
         analyzed: set[str] = set()
+        attempted: set[str] = set()
+        capacity_deferred: set[str] = set()
         retrieved: set[str] = set()
         consumed = ["AAAAAAAAAAA", "yt:BBBBBBBBBBB"]
         with mock.patch.object(
@@ -1057,6 +1059,8 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                     retrieval_profile="bootstrap",
                     max_new_reels=2,
                     analyzed_video_ids=analyzed,
+                    attempted_video_ids=attempted,
+                    capacity_deferred_video_ids=capacity_deferred,
                     retrieved_video_ids=retrieved,
                     consumed_video_ids=consumed,
                 )
@@ -1065,6 +1069,11 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertEqual(kwargs["max_reels"], 2)
         self.assertEqual(kwargs["retrieval_profile"], "bootstrap")
         self.assertIs(kwargs["analyzed_video_ids"], analyzed)
+        self.assertIs(kwargs["attempted_video_ids"], attempted)
+        self.assertIs(
+            kwargs["capacity_deferred_video_ids"],
+            capacity_deferred,
+        )
         self.assertIs(kwargs["retrieved_video_ids"], retrieved)
         self.assertEqual(
             kwargs["consumed_video_ids"],
@@ -1387,7 +1396,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
     def test_cache_version_includes_recall_and_stored_details(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 44)
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 45)
         self.assertEqual(
             main_module.reel_service.RANKED_FEED_CACHE_CONTRACT_VERSION,
             "quality_silence_v38",

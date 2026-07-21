@@ -1237,8 +1237,10 @@ class ReelService:
     # v41: require authoritative Flash word edges and outward-only silence refinement.
     # v42: retain Gemini-authoritative clips when boundary refinement is incomplete.
     # v43: join adaptive signals through versioned Gemini concept-family metadata.
+    # v44: retain trusted Gemini concept-family metadata in ranked response rows.
+    # v45: retain candidate, chain, position, and prerequisite organizer metadata.
     # The separate contract key below invalidates prior inventory under v38.
-    RANKED_FEED_CACHE_VERSION = 44
+    RANKED_FEED_CACHE_VERSION = 45
     RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v38"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
@@ -1669,6 +1671,8 @@ class ReelService:
         max_new_reels: int | None = None,
         analyzed_video_ids: set[str] | None = None,
         retrieved_video_ids: set[str] | None = None,
+        attempted_video_ids: set[str] | None = None,
+        capacity_deferred_video_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         def raise_if_cancelled() -> None:
             if should_cancel is None:
@@ -2016,6 +2020,8 @@ class ReelService:
                     retrieval_profile=retrieval_profile,
                     analyzed_video_ids=analyzed_ids,
                     retrieved_video_ids=retrieved_video_ids,
+                    attempted_video_ids=attempted_video_ids,
+                    capacity_deferred_video_ids=capacity_deferred_video_ids,
                 )
             except _ClipEngineCancellationError as exc:
                 raise GenerationCancelledError("Generation cancelled.") from exc
@@ -8358,6 +8364,33 @@ class ReelService:
             selection_source_rank = int(
                 clean_item.get("_selection_source_rank") or 0
             )
+            selection_candidate_id = str(
+                clean_item.get("_selection_candidate_id") or ""
+            ).strip()
+            selection_chain_id = str(
+                clean_item.get("_selection_chain_id") or ""
+            ).strip()
+            try:
+                selection_chain_position = float(
+                    clean_item.get("_selection_chain_position") or 0.0
+                )
+            except (TypeError, ValueError, OverflowError):
+                selection_chain_position = 0.0
+            if not math.isfinite(selection_chain_position):
+                selection_chain_position = 0.0
+            selection_chain_position = max(0.0, selection_chain_position)
+            raw_selection_prerequisite_ids = clean_item.get(
+                "_selection_prerequisite_ids"
+            )
+            selection_prerequisite_ids = (
+                [
+                    str(value).strip()
+                    for value in raw_selection_prerequisite_ids
+                    if str(value).strip()
+                ]
+                if isinstance(raw_selection_prerequisite_ids, list)
+                else []
+            )
             selection_concept_family = str(
                 clean_item.get("_selection_concept_family") or ""
             ).strip()
@@ -8399,6 +8432,17 @@ class ReelService:
                         selection_educational_importance
                     )
                 clean_item["_selection_source_rank"] = selection_source_rank
+                if selection_candidate_id:
+                    clean_item["_selection_candidate_id"] = selection_candidate_id
+                if selection_chain_id:
+                    clean_item["_selection_chain_id"] = selection_chain_id
+                    clean_item["_selection_chain_position"] = (
+                        selection_chain_position
+                    )
+                if selection_prerequisite_ids:
+                    clean_item["_selection_prerequisite_ids"] = (
+                        selection_prerequisite_ids
+                    )
                 if selection_concept_family:
                     clean_item["_selection_concept_family"] = (
                         selection_concept_family
