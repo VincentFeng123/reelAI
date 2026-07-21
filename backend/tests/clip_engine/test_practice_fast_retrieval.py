@@ -96,7 +96,7 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
 def test_practice_fast_expansion_requests_focused_sources() -> None:
     prompt = " ".join(expand._PRACTICE_FAST_SYSTEM.casefold().split())
 
-    assert expand.PRACTICE_FAST_EXPAND_CACHE_VERSION == 7
+    assert expand.PRACTICE_FAST_EXPAND_CACHE_VERSION == 8
     assert expand.PRACTICE_FAST_EXPAND_OUTPUT_TOKENS == 2_048
     assert "prefer focused teaching videos" in prompt
     assert "never query for a full course" in prompt
@@ -1996,8 +1996,140 @@ def test_rejected_provider_cursor_continues_through_another_query_branch(monkeyp
     assert calls == [None, ["bad-cursor"], ["good-cursor"]]
     assert [video["id"] for video in result["videos"]] == ["fresh-focused"]
     assert result["provider_exhausted"] is False
-    assert "continued with remaining search queries" in str(result["warning"])
+    assert "continued with another grounded search query" in str(result["warning"])
     assert context.budget.remaining("search") == 0
+
+
+def test_literal_only_rejected_cursor_retries_with_fresh_grounded_branch(
+    monkeypatch,
+):
+    topic = (
+        "Newton's laws: begin with first-law inertia and balanced forces, then "
+        "net force and F=ma, then free-body diagrams, then third-law "
+        "action-reaction pairs, and finish with worked problems and common "
+        "misconceptions."
+    )
+    context = GenerationContext("slow")
+    calls: list[tuple[list[str], list[str] | None]] = []
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda *_args, **_kwargs: {
+            "corrected": topic,
+            "queries": [topic],
+            "provider_used": "literal_fallback",
+        },
+    )
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        del filters
+        page_tokens = kwargs.get("page_tokens")
+        calls.append((list(queries), page_tokens))
+        if page_tokens == ["bad-cursor"]:
+            context.reserve("search")
+            raise ProviderRequestError(
+                "Supadata rejected the search request (400).",
+                provider="supadata",
+                operation="search",
+                status_code=400,
+                detail="Invalid or expired continuation token",
+            )
+        if queries == [topic]:
+            return {
+                "per_query": [{
+                    "query": topic,
+                    "videos": [{"id": "already-consumed"}],
+                    "next_page_token": "bad-cursor",
+                }],
+                "credits_used": 0,
+                "warning": None,
+            }
+        context.reserve("search")
+        return {
+            "per_query": [{
+                "query": queries[0],
+                "videos": [{"id": "fresh-recovery"}],
+                "next_page_token": None,
+            }],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        topic,
+        limit=1,
+        breadth=3,
+        consumed_video_ids=["already-consumed"],
+        retrieval_profile="deep",
+        context=context,
+    )
+
+    assert calls == [
+        ([topic], None),
+        ([topic], ["bad-cursor"]),
+        (["Newton's laws first-law inertia"], None),
+    ]
+    assert [video["id"] for video in result["videos"]] == ["fresh-recovery"]
+    assert "continued with another grounded search query" in str(result["warning"])
+    assert context.budget.remaining("search") == 3
+
+
+def test_cursor_recovery_components_remain_subject_grounded() -> None:
+    topic = (
+        "Newton's laws: begin with first-law inertia and balanced forces, then "
+        "net force and F=ma, then free-body diagrams"
+    )
+
+    assert search._grounded_cursor_recovery_queries(topic) == [
+        "Newton's laws first-law inertia",
+        "Newton's laws balanced forces",
+        "Newton's laws net force",
+        "Newton's laws F=ma",
+        "Newton's laws free-body diagrams",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("topic", "expected"),
+    [
+        (
+            "Teach cellular respiration, begin with glycolysis, then the Krebs "
+            "cycle, then oxidative phosphorylation and ATP yield",
+            [
+                "cellular respiration glycolysis",
+                "cellular respiration the Krebs cycle",
+                "cellular respiration oxidative phosphorylation",
+                "cellular respiration ATP yield",
+            ],
+        ),
+        (
+            "Explain Python generators; start with iterators, then generator "
+            "functions, then async generators",
+            [
+                "Python generators iterators",
+                "Python generators generator functions",
+                "Python generators async generators",
+            ],
+        ),
+        (
+            "Study negligence, begin with duty, then breach, then causation and damages",
+            [
+                "negligence duty",
+                "negligence breach",
+                "negligence causation",
+                "negligence damages",
+            ],
+        ),
+        ("photosynthesis", []),
+    ],
+)
+def test_cursor_recovery_subject_grounding_is_prompt_shape_independent(
+    topic,
+    expected,
+) -> None:
+    assert search._grounded_cursor_recovery_queries(topic) == expected
 
 
 @pytest.mark.parametrize(

@@ -18,6 +18,7 @@ from backend.app import main
 from backend.app.clip_engine import segment_cache
 from backend.app.clip_engine import silence as clip_engine_silence
 from backend.app.clip_engine.errors import ProviderQuotaError, ProviderTransientError
+from backend.app.clip_engine.provider_runtime import ProviderUsageRecord
 from backend.app.ingestion import pipeline as ingestion_pipeline
 from backend.app.ingestion.persistence import ensure_clip_concept
 from backend.app.ingestion.models import (
@@ -39,6 +40,12 @@ from backend.app.services.reels import ReelService
 
 
 EMPTY_ADAPTATION_FINGERPRINT = hashlib.sha256(b"{}").hexdigest()
+
+
+class _PostgresTransactionFailure(RuntimeError):
+    def __init__(self, sqlstate: str) -> None:
+        self.sqlstate = sqlstate
+        super().__init__(f"postgres transaction failure ({sqlstate})")
 
 
 def test_generate_request_supports_full_material_inventory() -> None:
@@ -143,6 +150,447 @@ def _conn() -> sqlite3.Connection:
     return conn
 
 
+def test_generation_db_transaction_retries_transient_body_on_fresh_checkout(
+    monkeypatch,
+) -> None:
+    checkouts = [object(), object()]
+    yielded: list[object] = []
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        assert transactional is True
+        current = checkouts[len(yielded)]
+        yielded.append(current)
+        yield current
+
+    calls: list[object] = []
+
+    def work(conn):
+        calls.append(conn)
+        if len(calls) == 1:
+            raise _PostgresTransactionFailure("40001")
+        return "stored"
+
+    monkeypatch.setattr(main, "get_conn", connection)
+
+    assert main._run_generation_db_transaction("test", work) == "stored"
+    assert calls == checkouts
+    assert yielded == checkouts
+
+
+def test_generation_db_transaction_retries_when_lease_check_is_transient(
+    monkeypatch,
+) -> None:
+    calls = 0
+    stop_checks = 0
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        assert transactional is True
+        yield object()
+
+    def work(_conn):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise _PostgresTransactionFailure("40001")
+        return "stored"
+
+    def retry_should_stop() -> bool:
+        nonlocal stop_checks
+        stop_checks += 1
+        raise _PostgresTransactionFailure("08006")
+
+    monkeypatch.setattr(main, "get_conn", connection)
+
+    assert main._run_generation_db_transaction(
+        "test",
+        work,
+        retry_should_stop=retry_should_stop,
+    ) == "stored"
+    assert calls == 2
+    assert stop_checks == 1
+
+
+def test_generation_db_transaction_propagates_permanent_lease_check_failure(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        assert transactional is True
+        yield object()
+
+    def work(_conn):
+        nonlocal calls
+        calls += 1
+        raise _PostgresTransactionFailure("40001")
+
+    def retry_should_stop() -> bool:
+        raise _PostgresTransactionFailure("23505")
+
+    monkeypatch.setattr(main, "get_conn", connection)
+
+    with pytest.raises(_PostgresTransactionFailure, match="23505"):
+        main._run_generation_db_transaction(
+            "test",
+            work,
+            retry_should_stop=retry_should_stop,
+        )
+    assert calls == 1
+
+
+def test_generation_db_transaction_retries_definite_commit_abort(
+    monkeypatch,
+) -> None:
+    exits = 0
+    calls = 0
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        nonlocal exits
+        assert transactional is True
+        yield object()
+        exits += 1
+        if exits == 1:
+            raise _PostgresTransactionFailure("40P01")
+
+    def work(_conn):
+        nonlocal calls
+        calls += 1
+        return "released"
+
+    monkeypatch.setattr(main, "get_conn", connection)
+
+    assert main._run_generation_db_transaction("test", work) == "released"
+    assert calls == 2
+    assert exits == 2
+
+
+def test_generation_db_transaction_does_not_retry_ambiguous_commit(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        assert transactional is True
+        yield object()
+        raise _PostgresTransactionFailure("08006")
+
+    def work(_conn):
+        nonlocal calls
+        calls += 1
+        return "possibly-committed"
+
+    monkeypatch.setattr(main, "get_conn", connection)
+
+    with pytest.raises(_PostgresTransactionFailure, match="08006"):
+        main._run_generation_db_transaction("test", work)
+    assert calls == 1
+
+
+def test_replay_safe_api_transaction_converges_after_lost_commit_ack(
+    monkeypatch,
+) -> None:
+    calls = 0
+    exits = 0
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        nonlocal exits
+        assert transactional is True
+        yield object()
+        exits += 1
+        if exits == 1:
+            raise _PostgresTransactionFailure("08006")
+
+    def work(_conn):
+        nonlocal calls
+        calls += 1
+        return "converged"
+
+    monkeypatch.setattr(main, "get_conn", connection)
+
+    assert main._run_generation_db_transaction(
+        "api-test",
+        work,
+        replay_after_unknown_commit=True,
+    ) == "converged"
+    assert calls == 2
+    assert exits == 2
+
+
+def test_replay_safe_api_transaction_does_not_retry_permanent_failure(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        assert transactional is True
+        yield object()
+
+    def work(_conn):
+        nonlocal calls
+        calls += 1
+        raise _PostgresTransactionFailure("23505")
+
+    monkeypatch.setattr(main, "get_conn", connection)
+
+    with pytest.raises(_PostgresTransactionFailure, match="23505"):
+        main._run_generation_db_transaction(
+            "api-test",
+            work,
+            replay_after_unknown_commit=True,
+        )
+    assert calls == 1
+
+
+def test_generation_db_transaction_does_not_retry_permanent_failure(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        assert transactional is True
+        yield object()
+
+    def work(_conn):
+        nonlocal calls
+        calls += 1
+        raise _PostgresTransactionFailure("23505")
+
+    monkeypatch.setattr(main, "get_conn", connection)
+
+    with pytest.raises(_PostgresTransactionFailure, match="23505"):
+        main._run_generation_db_transaction("test", work)
+    assert calls == 1
+
+
+def test_generation_db_transaction_stops_before_retry_when_lease_is_stale(
+    monkeypatch,
+) -> None:
+    calls = 0
+    stop_checks = 0
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        assert transactional is True
+        yield object()
+
+    def work(_conn):
+        nonlocal calls
+        calls += 1
+        raise _PostgresTransactionFailure("40001")
+
+    def retry_should_stop() -> bool:
+        nonlocal stop_checks
+        stop_checks += 1
+        return True
+
+    monkeypatch.setattr(main, "get_conn", connection)
+
+    with pytest.raises(_PostgresTransactionFailure, match="40001"):
+        main._run_generation_db_transaction(
+            "test",
+            work,
+            retry_should_stop=retry_should_stop,
+        )
+    assert calls == 1
+    assert stop_checks == 1
+
+
+def test_generation_worker_retries_transient_job_lease_transaction(
+    monkeypatch,
+) -> None:
+    checkouts = [object(), object()]
+    lease_calls: list[object] = []
+    run_calls: list[dict] = []
+    stop = threading.Event()
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        assert transactional is True
+        yield checkouts[len(lease_calls)]
+
+    def transient_lease(conn, **_kwargs):
+        lease_calls.append(conn)
+        if len(lease_calls) == 1:
+            raise _PostgresTransactionFailure("40001")
+        return {"id": "leased-after-retry"}
+
+    def run_job(job, worker_stop):
+        run_calls.append(job)
+        assert worker_stop is stop
+        stop.set()
+
+    monkeypatch.setattr(main, "get_conn", connection)
+    monkeypatch.setattr(main, "lease_next_job", transient_lease)
+    monkeypatch.setattr(main, "_run_leased_generation_job", run_job)
+
+    main._generation_worker_loop("lease-retry-worker", stop)
+
+    assert lease_calls == checkouts
+    assert run_calls == [{"id": "leased-after-retry"}]
+
+
+def test_generation_provider_usage_retries_once_with_stable_identity(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="provider-usage-db-retry",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast"},
+    )
+    original_record = main.record_provider_usage
+    usage_ids: list[str] = []
+
+    def transient_then_store(worker_conn, **kwargs):
+        usage_ids.append(str(kwargs["usage_id"]))
+        if len(usage_ids) == 1:
+            raise _PostgresTransactionFailure("40001")
+        return original_record(worker_conn, **kwargs)
+
+    monkeypatch.setattr(main, "record_provider_usage", transient_then_store)
+    try:
+        main._persist_generation_provider_usage(
+            str(job["id"]),
+            ProviderUsageRecord(
+                provider="gemini",
+                operation="segmentation",
+                attempt=1,
+                timestamp="2026-07-20T00:00:00+00:00",
+                billable_requests=1,
+                model_used="gemini-test",
+            ),
+        )
+
+        assert len(usage_ids) == 2
+        assert usage_ids[0] == usage_ids[1]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM generation_provider_usage WHERE job_id = ?",
+            (job["id"],),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_ambiguous_final_release_commit_is_not_replayed_or_duplicated(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    now = datetime.now(timezone.utc)
+    generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="ambiguous-release",
+        generation_mode="fast",
+        retrieval_profile="unified",
+    )
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="ambiguous-release",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast"},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=str(job["id"]),
+        lease_owner="ambiguous-release-worker",
+        now=now,
+    )
+    assert leased
+    commit_reports = 0
+    release_calls = 0
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        nonlocal commit_reports
+        assert transactional is True
+        conn.execute("BEGIN")
+        try:
+            yield conn
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            commit_reports += 1
+            if commit_reports == 1:
+                raise _PostgresTransactionFailure("08006")
+
+    def release(worker_conn):
+        nonlocal release_calls
+        release_calls += 1
+        main._activate_generation(
+            worker_conn,
+            material_id="m1",
+            request_key="ambiguous-release",
+            generation_id=generation_id,
+            retrieval_profile="unified",
+        )
+        generation_jobs.append_event(
+            worker_conn,
+            job_id=str(job["id"]),
+            event_type="final",
+            payload={
+                "reels": [],
+                "generation_id": generation_id,
+                "authoritative": True,
+            },
+            lease_owner="ambiguous-release-worker",
+        )
+        generation_jobs.transition_terminal(
+            worker_conn,
+            job_id=str(job["id"]),
+            status="partial",
+            result_generation_id=generation_id,
+            lease_owner="ambiguous-release-worker",
+            usage={},
+        )
+
+    monkeypatch.setattr(main, "get_conn", connection)
+    try:
+        with pytest.raises(_PostgresTransactionFailure, match="08006"):
+            main._run_generation_db_transaction("final_release", release)
+
+        recovered = generation_jobs.transition_terminal(
+            conn,
+            job_id=str(job["id"]),
+            status="failed",
+            result_generation_id=generation_id,
+            lease_owner="ambiguous-release-worker",
+            usage={},
+        )
+        assert recovered is not None
+        assert recovered["status"] == "partial"
+        assert release_calls == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_heads WHERE active_generation_id = ?",
+            (generation_id,),
+        ).fetchone()[0] == 1
+        assert [
+            event["type"]
+            for event in generation_jobs.replay_events(conn, job_id=str(job["id"]))
+        ] == ["final", "terminal"]
+    finally:
+        conn.close()
+
+
 def test_semantic_family_expands_organizer_signals_without_staling_active_job() -> None:
     conn = _conn()
     learner_id = "owner:semantic-family"
@@ -152,9 +600,9 @@ def test_semantic_family_expands_organizer_signals_without_staling_active_job() 
         source_context = json.dumps({
             "selection_contract_version": "quality_silence_v38",
             "selection_authority": "gemini",
-            "concept_family_contract_version": "concept_family_v1",
+            "concept_family_contract_version": "concept_family_v2",
             "concept_family": "Newton's first law",
-            "concept_aliases": ["law of inertia"],
+            "concept_aliases": [],
         })
         conn.execute(
             "INSERT INTO videos (id, title, channel_title, duration_sec, created_at) "
@@ -192,9 +640,9 @@ def test_semantic_family_expands_organizer_signals_without_staling_active_job() 
         target_context = json.dumps({
             "selection_contract_version": "quality_silence_v38",
             "selection_authority": "gemini",
-            "concept_family_contract_version": "concept_family_v1",
-            "concept_family": "law of inertia",
-            "concept_aliases": ["Newton's first law"],
+            "concept_family_contract_version": "concept_family_v2",
+            "concept_family": "Newton's first law",
+            "concept_aliases": [],
         })
         conn.execute(
             "INSERT INTO reels "
@@ -242,8 +690,8 @@ def test_semantic_family_expands_organizer_signals_without_staling_active_job() 
             prompt.split("CLIPS_JSON:\n", 1)[1].split("\n\nFinal request:", 1)[0]
         )
         organizer_clip = prompt_payload["clips"][0]
-        assert organizer_clip["concept_family"] == "law of inertia"
-        assert organizer_clip["concept_aliases"] == ["Newton's first law"]
+        assert organizer_clip["concept_family"] == "Newton's first law"
+        assert organizer_clip["concept_aliases"] == []
         assert organizer_clip["learner_signal"] == signals[related_id]
     finally:
         conn.close()
@@ -521,6 +969,124 @@ def _patch_request_context(monkeypatch, conn: sqlite3.Connection) -> None:
     )
 
 
+def _patch_transactional_worker_context(
+    monkeypatch,
+    conn: sqlite3.Connection,
+) -> None:
+    _patch_request_context(monkeypatch, conn)
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        if transactional:
+            conn.execute("BEGIN")
+        try:
+            yield conn
+        except Exception:
+            if transactional:
+                conn.rollback()
+            raise
+        else:
+            if transactional:
+                conn.commit()
+
+    monkeypatch.setattr(main, "get_conn", connection)
+
+
+def test_generate_submission_retries_serialization_failure_once(monkeypatch) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    original_submit = main._submit_bounded_generation_job
+    submit_calls = 0
+
+    def flaky_submit(worker_conn, **kwargs):
+        nonlocal submit_calls
+        submit_calls += 1
+        if submit_calls == 1:
+            raise _PostgresTransactionFailure("40001")
+        return original_submit(worker_conn, **kwargs)
+
+    monkeypatch.setattr(main, "_submit_bounded_generation_job", flaky_submit)
+    try:
+        response = asyncio.run(
+            main.generate_reels(object(), ReelsGenerateRequest(material_id="m1"))
+        )
+        assert response.status_code == 202
+        assert submit_calls == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_generate_submission_lost_commit_ack_converges_on_one_job(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    wake = mock.Mock()
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    attempts = 0
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        nonlocal attempts
+        assert transactional is True
+        conn.execute("BEGIN")
+        try:
+            yield conn
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            attempts += 1
+            if attempts == 1:
+                raise _PostgresTransactionFailure("08006")
+
+    monkeypatch.setattr(main, "get_conn", connection)
+    try:
+        response = asyncio.run(
+            main.generate_reels(object(), ReelsGenerateRequest(material_id="m1"))
+        )
+        payload = json.loads(response.body)
+        assert response.status_code == 202
+        assert attempts == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs"
+        ).fetchone()[0] == 1
+        assert generation_jobs.get_job(conn, payload["job_id"])["status"] == "queued"
+        wake.assert_called_once_with()
+    finally:
+        conn.close()
+
+
+def test_feed_ranking_retries_serialization_failure_on_fresh_checkout(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    attempts = 0
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        nonlocal attempts
+        assert transactional is True
+        attempts += 1
+        if attempts == 1:
+            raise _PostgresTransactionFailure("40001")
+        yield conn
+
+    monkeypatch.setattr(main, "get_conn", connection)
+    try:
+        response = main.feed(object(), material_id="m1", autofill=False)
+        assert response["reels"] == []
+        assert attempts == 2
+    finally:
+        conn.close()
+
+
 def _insert_generation_reel(
     conn: sqlite3.Connection,
     *,
@@ -585,6 +1151,388 @@ def _insert_generation_reel(
         "t_end": 30.0,
         "selection_contract_version": "quality_silence_v38",
     }
+
+
+def test_generation_worker_retries_setup_and_release_transactions_without_replaying_work(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_transactional_worker_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="setup-release-db-retry",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=str(job["id"]),
+        lease_owner="setup-release-retry-worker",
+        now=now,
+    )
+    assert leased
+    generated: list[dict] = []
+    retrieval_calls = 0
+    setup_attempts = 0
+    release_attempts = 0
+    original_progress = main.update_generation_progress
+    original_terminal = main.transition_generation_terminal
+
+    def generate_stage(worker_conn, **kwargs) -> None:
+        nonlocal retrieval_calls
+        retrieval_calls += 1
+        generated.append(
+            _insert_generation_reel(
+                worker_conn,
+                generation_id=str(kwargs["generation_id"]),
+                reel_id="retry-release-reel",
+                video_id="retry-release-video",
+                created_at=now.isoformat(),
+            )
+        )
+
+    def transient_setup(worker_conn, **kwargs):
+        nonlocal setup_attempts
+        result = original_progress(worker_conn, **kwargs)
+        if kwargs.get("phase") == "retrieval":
+            setup_attempts += 1
+            if setup_attempts == 1:
+                raise _PostgresTransactionFailure("40001")
+        return result
+
+    def transient_release(worker_conn, **kwargs):
+        nonlocal release_attempts
+        if kwargs.get("status") == "completed":
+            release_attempts += 1
+            if release_attempts == 1:
+                raise _PostgresTransactionFailure("40P01")
+        return original_terminal(worker_conn, **kwargs)
+
+    def order_batch(reels, **_kwargs):
+        return mock.Mock(
+            reels=list(reels),
+            ordered_reel_ids=[reel["reel_id"] for reel in reels],
+            assessment_checkpoint_reel_ids=[],
+            model_used=None,
+            degraded=False,
+            fallback_reason=None,
+            provider_called=False,
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: list(generated),
+    )
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
+    monkeypatch.setattr(main, "update_generation_progress", transient_setup)
+    monkeypatch.setattr(main, "transition_generation_terminal", transient_release)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        completed = generation_jobs.get_job(conn, str(job["id"]))
+        assert completed is not None
+        assert completed["status"] == "completed"
+        assert setup_attempts == 2
+        assert release_attempts == 2
+        assert retrieval_calls == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generations WHERE request_key = ?",
+            ("setup-release-db-retry",),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_heads WHERE active_generation_id = ?",
+            (completed["result_generation_id"],),
+        ).fetchone()[0] == 1
+        assert [
+            event["type"]
+            for event in generation_jobs.replay_events(conn, job_id=str(job["id"]))
+        ] == ["final", "terminal"]
+    finally:
+        conn.close()
+
+
+def test_generation_worker_setup_lost_commit_ack_converges_before_provider_work(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="setup-lost-ack-retry",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=str(job["id"]),
+        lease_owner="setup-lost-ack-worker",
+        now=now,
+    )
+    assert leased
+    transaction_commits = 0
+    first_committed_generation_id = ""
+    retrieval_calls = 0
+    created_generation_ids: list[str] = []
+    original_create_generation = main._create_generation_row
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        nonlocal transaction_commits, first_committed_generation_id
+        if transactional:
+            conn.execute("BEGIN")
+        try:
+            yield conn
+        except Exception:
+            if transactional:
+                conn.rollback()
+            raise
+        else:
+            if transactional:
+                conn.commit()
+                transaction_commits += 1
+                if transaction_commits == 1:
+                    committed = generation_jobs.get_job(conn, str(job["id"])) or {}
+                    first_committed_generation_id = str(
+                        committed.get("result_generation_id") or ""
+                    )
+                    raise _PostgresTransactionFailure("08006")
+
+    def track_generation_create(worker_conn, **kwargs):
+        created_id = original_create_generation(worker_conn, **kwargs)
+        created_generation_ids.append(created_id)
+        return created_id
+
+    def fail_retrieval(_worker_conn, **_kwargs) -> None:
+        nonlocal retrieval_calls
+        retrieval_calls += 1
+        raise ProviderTransientError(
+            "stop after setup",
+            provider="supadata",
+            operation="search",
+        )
+
+    monkeypatch.setattr(main, "get_conn", connection)
+    monkeypatch.setattr(main, "_create_generation_row", track_generation_create)
+    monkeypatch.setattr(main.reel_service, "generate_reels", fail_retrieval)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        failed = generation_jobs.get_job(conn, str(job["id"]))
+        assert failed is not None
+        assert failed["status"] == "failed"
+        assert failed["terminal_error_code"] == "provider_transient"
+        assert retrieval_calls == 1
+        assert first_committed_generation_id
+        assert failed["result_generation_id"] == first_committed_generation_id
+        assert created_generation_ids == [first_committed_generation_id]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generations WHERE request_key = ?",
+            ("setup-lost-ack-retry",),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (
+            ProviderTransientError(
+                "provider unavailable",
+                provider="supadata",
+                operation="search",
+            ),
+            "provider_transient",
+        ),
+        (RuntimeError("unexpected generation failure"), "generation_failed"),
+    ],
+)
+def test_generation_worker_retries_failure_terminalization_once(
+    monkeypatch,
+    failure,
+    expected_code,
+) -> None:
+    conn = _conn()
+    _patch_transactional_worker_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key=f"terminal-db-retry-{expected_code}",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=str(job["id"]),
+        lease_owner=f"terminal-retry-{expected_code}",
+        now=now,
+    )
+    assert leased
+    retrieval_calls = 0
+    terminal_attempts = 0
+    original_terminal = main.transition_generation_terminal
+
+    def fail_retrieval(_worker_conn, **_kwargs) -> None:
+        nonlocal retrieval_calls
+        retrieval_calls += 1
+        raise failure
+
+    def transient_terminal(worker_conn, **kwargs):
+        nonlocal terminal_attempts
+        terminal_attempts += 1
+        if terminal_attempts == 1:
+            raise _PostgresTransactionFailure("40001")
+        return original_terminal(worker_conn, **kwargs)
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", fail_retrieval)
+    monkeypatch.setattr(main, "transition_generation_terminal", transient_terminal)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        failed = generation_jobs.get_job(conn, str(job["id"]))
+        assert failed is not None
+        assert failed["status"] == "failed"
+        assert failed["terminal_error_code"] == expected_code
+        assert retrieval_calls == 1
+        assert terminal_attempts == 2
+        assert [
+            event["type"]
+            for event in generation_jobs.replay_events(conn, job_id=str(job["id"]))
+        ] == ["terminal"]
+    finally:
+        conn.close()
+
+
+def test_generation_worker_retries_lesson_and_recall_writes_without_rerunning_organizer(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_transactional_worker_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="lesson-recall-db-retry",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=str(job["id"]),
+        lease_owner="lesson-recall-retry-worker",
+        now=now,
+    )
+    assert leased
+    generated: list[dict] = []
+    retrieval_calls = 0
+    organizer_calls = 0
+    lesson_write_attempts = 0
+    recall_attempts = 0
+    original_lesson_persist = main._persist_generation_lesson_order
+    original_prepare = main.assessment_service.prepare_reel_questions
+
+    def generate_stage(worker_conn, **kwargs) -> None:
+        nonlocal retrieval_calls
+        retrieval_calls += 1
+        generated.append(
+            _insert_generation_reel(
+                worker_conn,
+                generation_id=str(kwargs["generation_id"]),
+                reel_id="retry-checkpoint-reel",
+                video_id="retry-checkpoint-video",
+                created_at=now.isoformat(),
+            )
+        )
+
+    def order_batch(reels, **_kwargs):
+        nonlocal organizer_calls
+        organizer_calls += 1
+        return mock.Mock(
+            reels=list(reels),
+            ordered_reel_ids=["retry-checkpoint-reel"],
+            assessment_checkpoint_reel_ids=["retry-checkpoint-reel"],
+            model_used="gemini-test",
+            degraded=False,
+            fallback_reason=None,
+            provider_called=True,
+        )
+
+    def transient_lesson_write(worker_conn, **kwargs):
+        nonlocal lesson_write_attempts
+        lesson_write_attempts += 1
+        original_lesson_persist(worker_conn, **kwargs)
+        if lesson_write_attempts == 1:
+            raise _PostgresTransactionFailure("40001")
+
+    def transient_recall(worker_conn, **kwargs):
+        nonlocal recall_attempts
+        recall_attempts += 1
+        result = original_prepare(worker_conn, **kwargs)
+        if recall_attempts == 1:
+            raise _PostgresTransactionFailure("40P01")
+        return result
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: list(generated),
+    )
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
+    monkeypatch.setattr(
+        main,
+        "_persist_generation_lesson_order",
+        transient_lesson_write,
+    )
+    monkeypatch.setattr(
+        main.assessment_service,
+        "prepare_reel_questions",
+        transient_recall,
+    )
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        completed = generation_jobs.get_job(conn, str(job["id"]))
+        assert completed is not None
+        assert completed["status"] == "completed"
+        assert retrieval_calls == 1
+        assert organizer_calls == 1
+        assert lesson_write_attempts == 2
+        assert recall_attempts == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_assessment_questions "
+            "WHERE reel_id = 'retry-checkpoint-reel'"
+        ).fetchone()[0] == 1
+        generation_row = main._fetch_generation_row(
+            conn,
+            str(completed["result_generation_id"]),
+        )
+        metadata = json.loads(str(generation_row["lesson_order_json"]))
+        assert metadata["assessment_checkpoint_reel_ids"] == [
+            "retry-checkpoint-reel"
+        ]
+        assert metadata["degraded"] is False
+    finally:
+        conn.close()
 
 
 def _set_reel_boundary_state(
@@ -791,6 +1739,37 @@ def _released_feed_reel(reel_id: str, index: int) -> dict:
     }
 
 
+def _persist_released_feed_reel(
+    conn: sqlite3.Connection,
+    *,
+    generation_id: str,
+    reel: dict,
+) -> None:
+    video_id = str(reel["video_id"])
+    conn.execute(
+        "INSERT OR IGNORE INTO videos "
+        "(id, title, channel_title, duration_sec, created_at) "
+        "VALUES (?, ?, 'Test', 300, '2026-07-20T00:00:00+00:00')",
+        (video_id, video_id),
+    )
+    conn.execute(
+        "INSERT INTO reels "
+        "(id, material_id, concept_id, video_id, video_url, t_start, t_end, "
+        "transcript_snippet, takeaways_json, base_score, difficulty, generation_id, "
+        "search_context_json, created_at) "
+        "VALUES (?, 'm1', 'c1', ?, '', ?, ?, '', '[]', 1, 0.1, ?, ?, "
+        "'2026-07-20T00:00:00+00:00')",
+        (
+            str(reel["reel_id"]),
+            video_id,
+            float(reel["t_start"]),
+            float(reel["t_end"]),
+            generation_id,
+            json.dumps(reel.get("search_context") or {}),
+        ),
+    )
+
+
 def _released_generation_chain(
     conn: sqlite3.Connection,
     batches: list[tuple[list[str], list[str]]],
@@ -901,6 +1880,156 @@ def test_released_feed_reconstructs_exact_batch_order_and_hides_raw_reservoir(
 
         assert [reel["reel_id"] for reel in ranked] == [
             "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9",
+        ]
+    finally:
+        conn.close()
+
+
+def test_released_feed_drops_child_span_containing_prior_release(monkeypatch) -> None:
+    conn = _conn()
+    child_generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [
+            (["initial-clip"], ["initial-clip"]),
+            (["child-overlap"], ["child-overlap"]),
+        ],
+    )
+    source_generation_id = next(iter(rows))
+    initial = rows[source_generation_id][0]
+    initial.update(video_id="LQyFshgm-hU", t_start=38.5, t_end=60.4)
+    child = rows[child_generation_id][0]
+    child.update(video_id="LQyFshgm-hU", t_start=38.5, t_end=113.3)
+    _persist_released_feed_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel=initial,
+    )
+    _persist_released_feed_reel(
+        conn,
+        generation_id=child_generation_id,
+        reel=child,
+    )
+    main._persist_generation_lesson_order(
+        conn,
+        generation_id=source_generation_id,
+        metadata={"version": 2, "ordered_reel_ids": ["initial-clip"]},
+    )
+    main._persist_generation_lesson_order(
+        conn,
+        generation_id=child_generation_id,
+        metadata={"version": 2, "ordered_reel_ids": ["child-overlap"]},
+    )
+    _patch_released_ranked_feed(monkeypatch, rows)
+    try:
+        ranked = _rank_released_feed(conn, generation_id=child_generation_id)
+
+        assert [reel["reel_id"] for reel in ranked] == ["initial-clip"]
+        monkeypatch.setattr(
+            main,
+            "_learner_seen_reel_ids",
+            lambda *_args, **_kwargs: {"initial-clip"},
+        )
+        assert _rank_released_feed(conn, generation_id=child_generation_id) == []
+    finally:
+        conn.close()
+
+
+def test_released_feed_keeps_non_overlapping_same_source_child(monkeypatch) -> None:
+    conn = _conn()
+    child_generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [
+            (["prerequisite"], ["prerequisite"]),
+            (["dependent"], ["dependent"]),
+        ],
+    )
+    source_generation_id = next(iter(rows))
+    prerequisite = rows[source_generation_id][0]
+    prerequisite.update(video_id="shared-video", t_start=10.0, t_end=30.0)
+    dependent = rows[child_generation_id][0]
+    dependent.update(video_id="shared-video", t_start=30.0, t_end=55.0)
+    _persist_released_feed_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel=prerequisite,
+    )
+    _persist_released_feed_reel(
+        conn,
+        generation_id=child_generation_id,
+        reel=dependent,
+    )
+    main._persist_generation_lesson_order(
+        conn,
+        generation_id=source_generation_id,
+        metadata={"version": 2, "ordered_reel_ids": ["prerequisite"]},
+    )
+    main._persist_generation_lesson_order(
+        conn,
+        generation_id=child_generation_id,
+        metadata={"version": 2, "ordered_reel_ids": ["dependent"]},
+    )
+    _patch_released_ranked_feed(monkeypatch, rows)
+    try:
+        ranked = _rank_released_feed(conn, generation_id=child_generation_id)
+
+        assert [reel["reel_id"] for reel in ranked] == [
+            "prerequisite",
+            "dependent",
+        ]
+    finally:
+        conn.close()
+
+
+def test_released_feed_keeps_overlapping_declared_lesson_chain(monkeypatch) -> None:
+    conn = _conn()
+    child_generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [
+            (["prerequisite"], ["prerequisite"]),
+            (["dependent"], ["dependent"]),
+        ],
+    )
+    source_generation_id = next(iter(rows))
+    prerequisite = rows[source_generation_id][0]
+    prerequisite.update(
+        video_id="shared-video",
+        t_start=10.0,
+        t_end=30.0,
+        search_context={
+            "selection_contract_version": "quality_silence_v38",
+            "chain_id": "worked-example",
+            "selection_candidate_id": "prerequisite-candidate",
+        },
+    )
+    dependent = rows[child_generation_id][0]
+    dependent.update(
+        video_id="shared-video",
+        t_start=10.0,
+        t_end=50.0,
+        search_context={
+            "selection_contract_version": "quality_silence_v38",
+            "chain_id": "worked-example",
+            "selection_candidate_id": "dependent-candidate",
+            "prerequisite_ids": ["prerequisite-candidate"],
+        },
+    )
+    _persist_released_feed_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel=prerequisite,
+    )
+    _persist_released_feed_reel(
+        conn,
+        generation_id=child_generation_id,
+        reel=dependent,
+    )
+    _patch_released_ranked_feed(monkeypatch, rows)
+    try:
+        ranked = _rank_released_feed(conn, generation_id=child_generation_id)
+
+        assert [reel["reel_id"] for reel in ranked] == [
+            "prerequisite",
+            "dependent",
         ]
     finally:
         conn.close()

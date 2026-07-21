@@ -526,11 +526,11 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
         self.assertNotEqual(learner_a_revision_1, learner_b_revision_1)
         self.assertNotEqual(learner_a_revision_1, learner_a_revision_2)
 
-    def test_ranked_feed_cache_version_is_43(self) -> None:
+    def test_ranked_feed_cache_version_is_44(self) -> None:
         """Cache rows must include trusted Gemini concept-family metadata."""
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_VERSION,
-            43,
+            44,
             "Current feeds must not reuse rows missing concept-family metadata.",
         )
         self.assertEqual(

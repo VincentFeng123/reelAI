@@ -40,6 +40,11 @@ from pydantic import (
 from typing_extensions import Annotated
 
 from .. import config
+from ..concept_families import (
+    concept_family_identity_key as shared_concept_family_identity_key,
+    validate_concept_family_contract,
+)
+from ..concept_tokens import semantic_tokens
 
 ProgressCb = Optional[Callable[[float, str], None]]
 CancelledCb = Optional[Callable[[], bool]]
@@ -58,8 +63,14 @@ _selector_call_slots = BoundedSemaphore(_SELECTOR_CALL_LIMIT)
 
 log = logging.getLogger("clipper.segment")
 
-_WORD_RE = re.compile(r"[^\W_]+(?:['\u2018\u2019\u02bc][^\W_]+)*", re.UNICODE)
-_APOSTROPHES = str.maketrans({"\u2018": "'", "\u2019": "'", "\u02bc": "'"})
+_WORD_RE = re.compile(
+    r"[^\W_]+(?:['\u2018\u2019\u02bc][^\W_]+)*"
+    r"(?:(?:[+#*♯]+)|(?:[-−]+(?![^\W_])))?",
+    re.UNICODE,
+)
+_APOSTROPHES = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u02bc": "'", "♯": "#", "−": "-",
+})
 _CandidateId = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1)
 ]
@@ -1722,15 +1733,16 @@ _FLASH_ENRICH_TIMEOUT_S = 25.0
 _PRO_TIMEOUT_S = 90.0
 _PRO_FINAL_AUDIT_RESERVED_S = 60.0
 _SELECTION_OUTPUT_TOKENS = 24_576
-# Six thousand compact-schema tokens cover the exhaustive candidate payload.
-_BOUNDARY_OUTPUT_TOKENS = 6_000
+# Required per-clip concept metadata expanded the exhaustive forty-candidate
+# payload; 6,400 preserves the existing 1,024-token reasoning/safety margin.
+_BOUNDARY_OUTPUT_TOKENS = 6_400
 # Gemini Pro counts hidden thought tokens against max_output_tokens. Reserve a
 # separate allowance so medium reasoning cannot consume the structured payload;
 # provider runtime independently bounds the call count and total job exposure.
 _PRO_BOUNDARY_OUTPUT_TOKENS = 12_288
 # The final audit may return 40 decisions plus repaired edges, and high
 # thinking tokens count against the same provider output ceiling.
-_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS = 18_432
+_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS = 19_200
 # Calls cheap enough under a byte-per-token upper bound may use the local
 # estimate. Anything larger gets the provider's free exact count first, so two
 # Fast or three Slow selectors cannot collectively under-reserve past the job
@@ -1749,7 +1761,7 @@ _SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
 _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
-_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v6"
+_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v7"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
 
 _PRICING_VERSION = "gemini-standard-2026-07-11"
@@ -2078,8 +2090,9 @@ class _CompactBoundaryTopic(_StrictModel):
         default="",
         alias="family",
         description=(
-            "Canonical domain-qualified name for the exact underlying concept, law, "
-            "relationship, or system taught by this clip. Never use a bare ordinal such "
+            "Standard formal, domain-qualified name for the exact underlying concept, "
+            "law, relationship, or system taught by this clip, independent of nickname, "
+            "formula, abbreviation, or attached spelling. Never use a bare ordinal such "
             "as first law, and never merge different numbered laws."
         ),
     )
@@ -2088,9 +2101,8 @@ class _CompactBoundaryTopic(_StrictModel):
         alias="aliases",
         max_length=4,
         description=(
-            "Zero to four canonical names or formulas that denote exactly the same "
-            "underlying concept as family, never prerequisites, examples, broader topics, "
-            "or neighboring numbered laws."
+            "Reserved for compatibility. Return an empty list; family is the sole "
+            "canonical adaptive identity."
         ),
     )
     informativeness: float = Field(ge=0.0, le=1.0, strict=True, alias="info")
@@ -2149,12 +2161,66 @@ class _ProAuditDecision(str, Enum):
     REJECT_FILLER_DOMINATED = "reject_filler_dominated"
 
 
+def _require_pro_audit_semantic_schema(schema: dict[str, object]) -> None:
+    """Require semantic repair fields in live audit responses, not old fixtures."""
+    required = schema.setdefault("required", [])
+    if isinstance(required, list):
+        for field_name in (
+            "t",
+            "f",
+            "family",
+            "a",
+            "direct",
+            "ie",
+        ):
+            if field_name not in required:
+                required.append(field_name)
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        for field_name in (
+            "t",
+            "f",
+            "family",
+            "a",
+            "direct",
+            "ie",
+        ):
+            field_schema = properties.get(field_name)
+            if isinstance(field_schema, dict):
+                field_schema.pop("default", None)
+
+
 class _ProCandidateAuditItem(_StrictModel):
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        json_schema_extra=_require_pro_audit_semantic_schema,
+    )
 
     candidate_id: _ProAuditCandidateId = Field(alias="id")
     decision: _ProAuditDecision = Field(alias="d")
     actual_objective: _ProAuditObjective = Field(alias="obj")
+    title: _CompactTitle = Field(default="", alias="t")
+    facet: _CompactFacet = Field(default="", alias="f")
+    concept_family: _CompactFacet = Field(
+        default="",
+        alias="family",
+        description=(
+            "Fresh standard formal canonical name for the exact audited concept, "
+            "independent of nickname, formula, abbreviation, or attached spelling."
+        ),
+    )
+    concept_aliases: list[_CompactFacet] = Field(
+        default_factory=list,
+        alias="a",
+        max_length=4,
+    )
+    directly_teaches_topic: bool = Field(default=False, strict=True, alias="direct")
+    intent_evidence: list[_CompactIntentEvidence] = Field(
+        default_factory=list,
+        alias="ie",
+        max_length=16,
+    )
     evidence_quote: _ProAuditEvidenceQuote = Field(alias="ev")
     direct_start_line: int = Field(ge=0, strict=True, alias="ds")
     direct_start_quote: _ProAuditBoundaryQuote = Field(alias="dq")
@@ -2170,7 +2236,7 @@ class _ProCandidateAuditPlan(_StrictModel):
 
 
 def _proposal_concept_family_payload(proposal: object) -> dict[str, object]:
-    """Return the bounded public semantic-family fields from one selector item."""
+    """Return the AI-selected canonical family; aliases are never mastery edges."""
     if isinstance(proposal, dict):
         raw_family = proposal.get("concept_family")
         raw_aliases = proposal.get("concept_aliases")
@@ -2178,26 +2244,64 @@ def _proposal_concept_family_payload(proposal: object) -> dict[str, object]:
         raw_family = getattr(proposal, "concept_family", "")
         raw_aliases = getattr(proposal, "concept_aliases", [])
     family = " ".join(
-        unicodedata.normalize(
-            "NFKC", str(raw_family or "")
-        ).split()
+        unicodedata.normalize("NFC", str(raw_family or "")).split()
     ).strip()[:96]
     if not family or not isinstance(raw_aliases, list):
         return {}
-    aliases: list[str] = []
-    seen = {family.casefold()}
-    for value in raw_aliases:
-        alias = " ".join(
-            unicodedata.normalize("NFKC", str(value or "")).split()
-        ).strip()[:96]
-        key = alias.casefold()
-        if not alias or key in seen:
-            continue
-        seen.add(key)
-        aliases.append(alias)
-        if len(aliases) >= 4:
-            break
-    return {"concept_family": family, "concept_aliases": aliases}
+    return {"concept_family": family, "concept_aliases": []}
+
+
+def _concept_family_identity_key(value: object) -> str:
+    """Return a persistence-compatible, domain-qualified family identity."""
+    return shared_concept_family_identity_key(value)
+
+
+def _validated_proposal_concept_family_payload(
+    proposal: object,
+) -> tuple[dict[str, object], str | None]:
+    """Validate one selector/audit family before it can become adaptive metadata."""
+    payload = _proposal_concept_family_payload(proposal)
+    if not payload:
+        return {}, "missing_or_malformed"
+    family = str(payload["concept_family"])
+    if not _concept_family_identity_key(family):
+        return {}, "family_not_domain_qualified"
+
+    if isinstance(proposal, dict):
+        raw_aliases = proposal.get("concept_aliases")
+        title = proposal.get("title")
+        facet = proposal.get("facet")
+        objective = (
+            proposal.get("learning_objective")
+            or proposal.get("actual_objective")
+        )
+        evidence = proposal.get("claim_quote") or proposal.get("evidence_quote")
+    else:
+        raw_aliases = getattr(proposal, "concept_aliases", None)
+        title = getattr(proposal, "title", "")
+        facet = getattr(proposal, "facet", "")
+        objective = (
+            getattr(proposal, "learning_objective", "")
+            or getattr(proposal, "actual_objective", "")
+        )
+        evidence = (
+            getattr(proposal, "claim_quote", "")
+            or getattr(proposal, "evidence_quote", "")
+        )
+    if not isinstance(raw_aliases, list) or len(raw_aliases) > 4:
+        return {}, "aliases_not_bounded_list"
+
+    contract_error = validate_concept_family_contract(
+        family,
+        [],
+        title=title,
+        facet=facet,
+        objective=objective,
+        evidence=evidence,
+    )
+    if contract_error is not None:
+        return {}, contract_error
+    return payload, None
 
 
 class _EnrichmentItem(_StrictModel):
@@ -2348,6 +2452,13 @@ _POLICY_AND_EXAMPLES = """Policy:
   not enough: "force" does not ground "net force", and "units" does not ground the units of a
   named law. A different governing law, equation, theory, system, or domain is not supporting
   material merely because it uses the same algebra, variables, units, or vocabulary.
+- Never infer a defining relationship from surface resemblance or shared vocabulary. Every
+  required participant, object, quantity, direction, causal role, and defining connection in the named
+  relationship must be established by the selected speech. Similar attributes on one or more
+  entities do not prove a reciprocal, causal, comparative, equivalence, or sequence relation;
+  evidence about one entity cannot silently supply a distinct participant. Label title,
+  objective, facet, and canonical concept family from the exact relationship the speech
+  establishes; never import a familiar law, mechanism, or doctrine from outside the transcript.
 - Score informativeness, topic_relevance, and educational_importance honestly as metadata,
   never as numeric eligibility gates. Return every related, coherent, substantive teaching
   unit that satisfies the grounding, context, and filler rules above; omit it only under those
@@ -2523,7 +2634,8 @@ def _selection_fields(*, enriched: bool, compact: bool = False) -> str:
         "title (at most 12 words), "
         "learning_objective (at most 24 words), facet (at most 12 words), "
         "concept_family (a domain-qualified canonical name for the exact underlying "
-        "concept), concept_aliases (zero to four exact-equivalence names or formulas), "
+        "concept), concept_aliases (return an empty list; the canonical family is the "
+        "sole adaptive identity), "
         "informativeness, topic_relevance, "
         "educational_importance, difficulty, directly_teaches_topic, substantive, "
         "factually_grounded"
@@ -2546,7 +2658,7 @@ def _selection_fields(*, enriched: bool, compact: bool = False) -> str:
             "unanswered question; a sentence explicitly distinguishing two named sides is "
             "a substantive relationship claim, not an outline), obj=learning_objective, "
             "info=informativeness, rel=topic_relevance, imp=educational_importance, "
-            "family=concept_family, aliases=concept_aliases, "
+            "family=concept_family, aliases=concept_aliases (always []), "
             "diff=difficulty, direct=directly_teaches_topic, sub=substantive, "
             "fact=factually_grounded, self=self_contained, stand=is_standalone, "
             "ie=intent_evidence"
@@ -2608,14 +2720,22 @@ def _compact_output_guide() -> str:
   do not identify a spring oscillator, cart pair, circuit, dataset, or other specific setup.
 - family = concept_family: the canonical, domain-qualified name of the exact underlying
   principle, law, relationship, method, or system taught here. It is independent of teaching
-  role, example wording, or difficulty. Never return an ambiguous bare ordinal such as "first
-  law". Different numbered laws are different families: use "Newton's first law" and
-  "Newton's second law", not "Newton's laws" for both.
-- aliases = concept_aliases: zero to four canonical names, formulas, or standard terms that
-  denote exactly the same concept as family. Do not include a prerequisite, consequence,
-  application, broader/narrower topic, or neighboring law. Valid equivalences include
-  "law of inertia" for "Newton's first law" and "F=ma" for "Newton's second law"; the first
-  law of thermodynamics is never an alias for Newton's first law.
+  role, example wording, or difficulty. Never return an ambiguous bare ordinal or erase an
+  ordinal, numeral, symbol, version, named entity, or other qualifier that distinguishes the
+  exact taught item from neighboring items in the same series or domain. A broad umbrella is
+  valid only when the selected speech genuinely teaches multiple members together.
+  Use the same standard formal name regardless of whether the request or speech uses a
+  nickname, formula, abbreviation, translated word order, or attached spelling. Examples:
+  law of inertia -> Newton's first law of motion; F=ma -> Newton's second law of motion;
+  Apollo11 -> Apollo 11 mission; Python3.12 -> Python 3.12; HLAII -> HLA class II;
+  FactorV -> Factor V; C sharp -> C#.
+  A defining relation must be stated by the speech, not inferred from similar adjectives,
+  symbols, values, or neighboring concepts. When a relation requires distinct participants,
+  stages, directions, inputs, or outcomes, the speech must identify each one and explicitly
+  connect their roles. Shared properties alone do not establish reciprocity, causation,
+  equivalence, comparison, or sequence.
+- aliases = concept_aliases: return [] exactly. The audited canonical family is the sole
+  adaptive identity; do not propose synonym edges that could join separate mastery histories.
 - info = informativeness, 0.0-1.0: how much concrete, useful teaching the selected span contains.
 - rel = topic_relevance, 0.0-1.0: how strongly this exact unit serves the exact user request.
 - imp = educational_importance, 0.0-1.0: how valuable this unit is for learning that request.
@@ -2659,6 +2779,9 @@ def _compact_output_guide() -> str:
   When a fulfilled format constraint spans multiple transformations, q anchors that sequence;
   verify every requested transformation across the entire sq-through-eq span. One q never
   replaces the whole-span completeness check.
+  For any relationship id, q must name every required participant or stage and the defining
+  connection between them; shared values, adjectives, symbols, or directions alone cannot
+  ground the relationship.
 
 Subject-anchor counterexamples — apply the same rule in every domain:
 - For a biology request about PCR, a general DNA-replication unit does not qualify merely
@@ -2683,7 +2806,7 @@ Example transcript:
 [19] 02:15 provides stronger evidence against the null hypothesis. Next, confidence intervals measure uncertainty.
 Example exact user request: Explain p-values
 Example output:
-{"request_intent":{"exact_request":"Explain p-values","constraints":[{"constraint_id":"subject","kind":"subject","source_phrase":"p-values","requirement":"Explain p-values"}]},"topics":[{"id":"small-p-value-evidence","s":18,"e":19,"sq":"A small p value","eq":"against the null hypothesis.","cq":"small p value provides stronger evidence against the null hypothesis","title":"What a Small P-Value Means","obj":"Explain how a small p-value bears on the null hypothesis","facet":"small p-values","family":"statistical p-value interpretation","aliases":["p-value interpretation"],"info":0.95,"rel":0.99,"imp":0.93,"diff":0.42,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"subject","q":"small p value provides stronger evidence against the null hypothesis"}]}]}
+{"request_intent":{"exact_request":"Explain p-values","constraints":[{"constraint_id":"subject","kind":"subject","source_phrase":"p-values","requirement":"Explain p-values"}]},"topics":[{"id":"small-p-value-evidence","s":18,"e":19,"sq":"A small p value","eq":"against the null hypothesis.","cq":"small p value provides stronger evidence against the null hypothesis","title":"What a Small P-Value Means","obj":"Explain how a small p-value bears on the null hypothesis","facet":"small p-values","family":"statistical p-value interpretation","aliases":[],"info":0.95,"rel":0.99,"imp":0.93,"diff":0.42,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"subject","q":"small p value provides stronger evidence against the null hypothesis"}]}]}
 Why: s remains 18 even though sq starts after "Welcome back" inside line 18. e remains 19
 even though eq ends before "Next, confidence intervals" inside line 19. sq's first word "A"
 is the semantic start; eq's last word "hypothesis" is the semantic end; cq anchors the claim.
@@ -2755,7 +2878,7 @@ Example output boundaries: s=40, e=45, sq="So let's say if f of x is equal to x 
 eq="the derivative of x squared is two x". The topic's ie must evidence the named function,
 limit-definition task, algebra-step requirement, and final two-x outcome.
 Example compact output:
-{"request_intent":{"exact_request":"Use the limit definition to derive f of x equal x squared, include every algebra step, and finish at two x.","constraints":[{"constraint_id":"object","kind":"subject","source_phrase":"f of x equal x squared","requirement":"Derive f of x equal x squared"},{"constraint_id":"method","kind":"task","source_phrase":"Use the limit definition","requirement":"Use the limit definition"},{"constraint_id":"steps","kind":"format","source_phrase":"include every algebra step","requirement":"Include every spoken algebra step"},{"constraint_id":"result","kind":"outcome","source_phrase":"finish at two x","requirement":"Reach the final result two x"}]},"topics":[{"id":"x-squared-limit-derivation","s":40,"e":45,"sq":"So let's say if f of x is equal to x squared","eq":"the derivative of x squared is two x","cq":"Taking h to zero gives two x","title":"Derive x Squared from the Limit Definition","obj":"Derive the derivative of x squared through every algebra step","facet":"x-squared limit derivation","family":"derivative of x squared","aliases":["d/dx x squared","power rule for x squared"],"info":0.99,"rel":1.0,"imp":0.99,"diff":0.45,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"object","q":"f of x is equal to x squared"},{"id":"method","q":"Use the limit definition of the derivative"},{"id":"steps","q":"Expand the square to x squared plus two x h"},{"id":"result","q":"Taking h to zero gives two x"}]}]}
+{"request_intent":{"exact_request":"Use the limit definition to derive f of x equal x squared, include every algebra step, and finish at two x.","constraints":[{"constraint_id":"object","kind":"subject","source_phrase":"f of x equal x squared","requirement":"Derive f of x equal x squared"},{"constraint_id":"method","kind":"task","source_phrase":"Use the limit definition","requirement":"Use the limit definition"},{"constraint_id":"steps","kind":"format","source_phrase":"include every algebra step","requirement":"Include every spoken algebra step"},{"constraint_id":"result","kind":"outcome","source_phrase":"finish at two x","requirement":"Reach the final result two x"}]},"topics":[{"id":"x-squared-limit-derivation","s":40,"e":45,"sq":"So let's say if f of x is equal to x squared","eq":"the derivative of x squared is two x","cq":"Taking h to zero gives two x","title":"Derive x Squared from the Limit Definition","obj":"Derive the derivative of x squared through every algebra step","facet":"x-squared limit derivation","family":"derivative of x squared","aliases":[],"info":0.99,"rel":1.0,"imp":0.99,"diff":0.45,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"object","q":"f of x is equal to x squared"},{"id":"method","q":"Use the limit definition of the derivative"},{"id":"steps","q":"Expand the square to x squared plus two x h"},{"id":"result","q":"Taking h to zero gives two x"}]}]}
 
 Same-source breadth for that original prompt:
 If the same transcript also completely derives five x minus four, one over x, square root of
@@ -3161,6 +3284,9 @@ def _pro_boundary_audit_prompts(
             f"title: {candidate.title}\n"
             f"learning objective: {candidate.learning_objective}\n"
             f"facet: {candidate.facet}\n"
+            f"concept family: {candidate.concept_family}\n"
+            f"concept aliases: {candidate.concept_aliases}\n"
+            f"directly teaches topic: {candidate.directly_teaches_topic}\n"
             + "\n".join(evidence_lines)
             + "\n"
             "</untrusted_selector_hypotheses>\n"
@@ -3185,8 +3311,9 @@ def _pro_boundary_audit_prompts(
         "You are Gemini's final candidate auditor for educational clips. You receive only "
         "the exact user request and timestamped transcript text. No video, image, audio, "
         "URL, frame, thumbnail, file, or visual metadata is attached or available. Perform "
-        "two independent tasks for every candidate: decide semantic admission from its "
-        "literal speech, and choose context-complete word boundaries. A bad, early, late, "
+        "three independent tasks for every candidate: decide semantic admission from its "
+        "literal speech, correct its semantic metadata and evidence, and choose context-complete "
+        "word boundaries. A bad, early, late, "
         "incomplete, or uncertain cut can NEVER cause rejection; keep the related candidate "
         "and repair or retain its best grounded boundaries. Return exactly one item for every "
         "audit_id. Never add, merge, split, rank, or omit candidates. Do not provide hidden "
@@ -3248,6 +3375,18 @@ def _pro_boundary_audit_prompts(
           "unrelated objective or filler dominance. The quote itself must identify the "
           "competing objective or unmistakable filler; if it is generic, depends on missing "
           "context, or supports both related and unrelated readings, decision MUST be keep.\n\n"
+          "SEMANTIC METADATA — derive it afresh from literal speech, not selector labels or "
+          "outside knowledge. title, obj, facet, family, aliases, direct, ie, and ev must all "
+          "describe the same atomic relationship actually established by the returned span. "
+          "A defining relationship cannot be inferred merely because familiar adjectives, "
+          "symbols, quantities, or neighboring concepts appear. If a concept requires "
+          "multiple entities, roles, directions, stages, inputs, or outcomes, its metadata and "
+          "evidence must identify each required participant or stage and explicitly establish "
+          "the defining connection. "
+          "Observations about one entity, or similar properties shared by several entities, "
+          "do not prove a reciprocal, causal, comparative, equivalence, or sequence relation. "
+          "Reclassify a kept candidate to the narrow relationship its speech really teaches; "
+          "do not reject related teaching merely because the selector mislabeled it.\n\n"
           "BOUNDARIES — perform this separately; a failure here never changes KEEP to reject:\n"
           "Reread the literal current speech as a cold listener. The opening must include the "
           "candidate's own necessary setup and resolve every referent. Openings such as 'This "
@@ -3293,21 +3432,40 @@ def _pro_boundary_audit_prompts(
           "2. obj=actual_objective: concisely name the narrow, context-complete objective of "
           "the best salvageable unit. Never broaden it to fit an incorrect opening. For pure "
           "filler use the literal sentinel 'filler/navigation only'.\n"
-          "3. ev=evidence_quote: copy 5-10 exact consecutive words proving obj. For KEEP it "
+          "3. t=title is a concise viewer-facing title; f=facet is the narrow subtopic; family is "
+          "the standard formal, domain-qualified canonical concept actually taught. Choose "
+          "that same formal name regardless of whether the request or speech uses a nickname, "
+          "formula, translated word order, abbreviation, attached spelling, or paraphrase: for example law of "
+          "inertia -> Newton's first law of motion, and F=ma -> Newton's second law of motion. "
+          "Normalize Apollo11 -> Apollo 11 mission, Python3.12 -> Python 3.12, HLAII -> "
+          "HLA class II, FactorV -> Factor V, and C sharp -> C#. "
+          "Preserve every ordinal, version, symbol, named entity, or other qualifier that "
+          "distinguishes a neighboring concept. a=aliases must be []. The "
+          "canonical family is the sole adaptive identity. For KEEP, correct title, facet, and "
+          "family independently of selector hypotheses. For a rejection, name the literal "
+          "competing objective consistently.\n"
+          "4. direct and ie are a fresh intent audit against the constraints above. Set "
+          "direct=true only when the returned span fulfills every required non-scope "
+          "constraint. ie uses {id,q}; each q is 5-16 exact consecutive words inside the "
+          "returned span that logically grounds that exact constraint for this same objective. "
+          "A shared word, equal/opposite wording without the defining participants, or evidence "
+          "for a different relationship cannot ground an id. KEEP requires at least one ie; "
+          "a rejection returns direct=false and ie=[].\n"
+          "5. ev=evidence_quote: copy 5-10 exact consecutive words proving obj. For KEEP it "
           "must be inside the returned repaired span and may come from its immediately nearby "
           "contiguous continuation. For either rejection it must be inside the ORIGINAL "
           "current sq-through-eq speech and ground that rejection.\n"
-          "4. ds=direct_start_line and dq=direct_start_quote: independently locate the "
+          "6. ds=direct_start_line and dq=direct_start_quote: independently locate the "
           "earliest complete sentence or independent clause that DIRECTLY begins teaching obj. "
           "dq is a shortest unique 1-10-word exact quote beginning at that word. An agenda, "
           "preview, greeting, navigation, recap, completed prerequisite, or broad introduction "
           "that only mentions the target can never be dq. Do not reuse the supplied sq by "
           "default.\n"
-          "5. dc=direct_start_context_resolved: true only when a cold listener can begin at dq "
+          "7. dc=direct_start_context_resolved: true only when a cold listener can begin at dq "
           "and understand every referent, enumerated item, scenario object, given, comparison "
           "baseline, formula reference, and required prior result. A technical term explicitly "
           "named or defined at dq does not require an earlier standalone prerequisite.\n"
-          "6. s/e=start_line/end_line and sq/eq=start_quote/end_quote are the repaired final "
+          "8. s/e=start_line/end_line and sq/eq=start_quote/end_quote are the repaired final "
           "edges. If dc=true, sq MUST begin exactly at dq. If dc=false, sq MUST begin before dq "
           "at only the nearest indispensable spoken setup. Repair eq independently through the "
           "complete same-objective conclusion.\n"
@@ -11803,6 +11961,16 @@ def _validated_intent_constraints(
     }
     if len(constraints) != len(request_intent.constraints) or not constraints:
         return {}, "intent_contract_duplicate_or_empty_ids"
+    semantic_keys = [
+        (
+            constraint.kind.value,
+            _normalized_request_text(constraint.source_phrase),
+            _normalized_request_text(constraint.requirement),
+        )
+        for constraint in constraints.values()
+    ]
+    if len(set(semantic_keys)) != len(semantic_keys):
+        return {}, "intent_contract_duplicate_semantics"
     if any(
         not _contains_quote(expected_request, constraint.source_phrase)
         for constraint in constraints.values()
@@ -11857,6 +12025,156 @@ def _validated_intent_constraints(
                 return {}, "intent_contract_incomplete_joint_structure"
             constraints = repaired
     return constraints, None
+
+
+@dataclass(frozen=True)
+class _LiveSelectorContract:
+    plan: _CompactBoundaryPlan
+    intent_signature: tuple[tuple[str, str, str], ...] | None
+    intent_ids_by_semantics: dict[tuple[str, str, str], str]
+    intent_error: str | None
+    candidate_rejections: tuple[str, ...]
+
+    @property
+    def rejection_reasons(self) -> tuple[str, ...]:
+        return (
+            *((self.intent_error,) if self.intent_error else ()),
+            *self.candidate_rejections,
+        )
+
+
+def _validate_live_pro_selector_contract(
+    plan: _CompactBoundaryPlan,
+    topic: str,
+) -> _LiveSelectorContract:
+    """Fail closed on malformed intent and salvage family-valid siblings only."""
+    intent_constraints, intent_error = _validated_intent_constraints(plan, topic)
+    model_constraint_ids = tuple(
+        str(constraint.constraint_id)
+        for constraint in plan.request_intent.constraints
+    )
+    if (
+        intent_error is None
+        and topic.strip()
+        and tuple(intent_constraints) != model_constraint_ids
+    ):
+        # `_validated_intent_constraints` may locally repair an unambiguous X-vs-Y
+        # request for dormant paths. Live Pro must instead retry the model's
+        # incomplete same-call contract so its audit sees the exact same IDs.
+        intent_error = "intent_contract_incomplete_joint_structure"
+    if intent_error is not None:
+        return _LiveSelectorContract(
+            plan=plan.model_copy(update={"topics": []}),
+            intent_signature=None,
+            intent_ids_by_semantics={},
+            intent_error=intent_error,
+            candidate_rejections=(),
+        )
+
+    signature_constraints = (
+        intent_constraints.values()
+        if topic.strip()
+        else plan.request_intent.constraints
+    )
+    signature = tuple(sorted(
+        (
+            constraint.kind.value,
+            _normalized_request_text(constraint.source_phrase),
+            _normalized_request_text(constraint.requirement),
+        )
+        for constraint in signature_constraints
+    ))
+    ids_by_semantics = {
+        (
+            constraint.kind.value,
+            _normalized_request_text(constraint.source_phrase),
+            _normalized_request_text(constraint.requirement),
+        ): str(constraint.constraint_id)
+        for constraint in signature_constraints
+    }
+    valid_topics: list[_CompactBoundaryTopic] = []
+    candidate_rejections: list[str] = []
+    for proposal in plan.topics:
+        family_payload, family_error = _validated_proposal_concept_family_payload(
+            proposal
+        )
+        if family_error is not None:
+            candidate_rejections.append(
+                f"candidate_{proposal.candidate_id}:concept_family_contract:"
+                f"{family_error}"
+            )
+            continue
+        valid_topics.append(proposal.model_copy(update=family_payload))
+    return _LiveSelectorContract(
+        plan=plan.model_copy(update={"topics": valid_topics}),
+        intent_signature=signature,
+        intent_ids_by_semantics=ids_by_semantics,
+        intent_error=None,
+        candidate_rejections=tuple(candidate_rejections),
+    )
+
+
+def _annotate_live_selector_contract(
+    call: dict,
+    contract: _LiveSelectorContract,
+) -> None:
+    reasons = list(contract.rejection_reasons)
+    if not reasons:
+        return
+    call["selector_contract_rejection_reasons"] = reasons
+    call["selector_contract_rejected_count"] = len(reasons)
+    if contract.intent_error is not None:
+        call["selector_intent_contract_error"] = contract.intent_error
+
+
+def _merge_compact_boundary_plans(
+    first: _CompactBoundaryPlan,
+    retry: _CompactBoundaryPlan,
+) -> _CompactBoundaryPlan:
+    """Merge valid retry inventory by stable ID; retry wins duplicate IDs."""
+    merged_topics = list(first.topics[:_MAX_CLIPS])
+    positions = {
+        str(proposal.candidate_id): index
+        for index, proposal in enumerate(merged_topics)
+    }
+    for proposal in retry.topics:
+        candidate_id = str(proposal.candidate_id)
+        existing = positions.get(candidate_id)
+        if existing is not None:
+            merged_topics[existing] = proposal
+        elif len(merged_topics) < _MAX_CLIPS:
+            positions[candidate_id] = len(merged_topics)
+            merged_topics.append(proposal)
+    return first.model_copy(update={"topics": merged_topics})
+
+
+def _remap_compact_plan_intent_evidence(
+    plan: _CompactBoundaryPlan,
+    *,
+    source: _LiveSelectorContract,
+    target: _LiveSelectorContract,
+) -> _CompactBoundaryPlan:
+    """Translate retry-local evidence IDs onto the first attempt's semantics."""
+    id_map = {
+        source_id: target.intent_ids_by_semantics[semantic_key]
+        for semantic_key, source_id in source.intent_ids_by_semantics.items()
+        if semantic_key in target.intent_ids_by_semantics
+    }
+    remapped_topics = [
+        proposal.model_copy(update={
+            "intent_evidence": [
+                evidence.model_copy(update={
+                    "constraint_id": id_map.get(
+                        str(evidence.constraint_id),
+                        str(evidence.constraint_id),
+                    )
+                })
+                for evidence in proposal.intent_evidence
+            ]
+        })
+        for proposal in plan.topics
+    ]
+    return plan.model_copy(update={"topics": remapped_topics})
 
 
 def _learning_details(topic_obj: object, clip_text: str, topic: str) -> tuple[dict, list[str]]:
@@ -20656,13 +20974,13 @@ def _public_clips(clips: list[dict]) -> list[dict]:
             key: value for key, value in clip.items() if not key.startswith("_")
         }
         concept = " ".join(
-            unicodedata.normalize("NFKC", str(item.get("facet") or "")).split()
+            unicodedata.normalize("NFC", str(item.get("facet") or "")).split()
         ).strip()
         if concept:
             item["concept"] = concept
         family = " ".join(
             unicodedata.normalize(
-                "NFKC", str(item.get("concept_family") or "")
+                "NFC", str(item.get("concept_family") or "")
             ).split()
         ).strip()[:96]
         aliases = item.get("concept_aliases")
@@ -21069,6 +21387,7 @@ def _call_model(
     )
     try:
         reservation: dict[str, object] = {}
+        estimated_input_tokens: int | None = None
         if callable(budget_reserve):
             schema_bytes = len(json.dumps(
                 schema.model_json_schema(),
@@ -21100,6 +21419,8 @@ def _call_model(
                             timeout_s=min(10.0, remaining_s),
                             thinking_level=thinking_level,
                             max_output_tokens=max_output_tokens,
+                            deadline_monotonic=deadline_monotonic,
+                            cancelled=cancelled,
                         )
                     except Exception as exc:
                         # Raw UTF-8 bytes are not tokens. Treating them as such
@@ -21130,21 +21451,87 @@ def _call_model(
                         retryable=True,
                         status_code=None,
                     )
+            estimated_input_tokens = (
+                estimated_text_tokens
+                + estimate_buffer_tokens
+                + max(0, int(estimated_media_tokens))
+            )
+
+        logical_quota_reserved = False
+        physical_dispatches = 0
+        billing_unknown_attempts = 0
+        billing_unknown_reserved_cost_usd = 0.0
+        last_physical_telemetry: dict[str, object] = {}
+
+        def before_provider_dispatch(*, model: str, attempt: int) -> object:
+            del attempt
+            nonlocal logical_quota_reserved, reservation
+            if not callable(budget_reserve):
+                return None
             reserved = budget_reserve(
                 operation=operation,
                 model=model,
                 max_output_tokens=max_output_tokens,
                 prompt_text=prompt_text,
-                estimated_input_tokens=(
-                    estimated_text_tokens
-                    + estimate_buffer_tokens
-                    + max(0, int(estimated_media_tokens))
-                ),
+                estimated_input_tokens=estimated_input_tokens,
+                max_physical_attempts=1,
+                count_logical_call=not logical_quota_reserved,
                 deadline_monotonic=deadline_monotonic,
                 cancelled=cancelled,
             )
+            # Only a successful admission consumes the one logical selector or
+            # audit quota. Retry and failover tickets enforce cost only.
+            logical_quota_reserved = True
             if isinstance(reserved, dict):
                 reservation = dict(reserved)
+                return reservation
+            return reserved
+
+        def after_provider_dispatch(
+            ticket: object,
+            *,
+            model: str,
+            attempt: int,
+            telemetry: object,
+        ) -> None:
+            del attempt
+            nonlocal physical_dispatches
+            nonlocal billing_unknown_attempts
+            nonlocal billing_unknown_reserved_cost_usd
+            nonlocal last_physical_telemetry
+            physical_dispatches += 1
+            physical_usage = _telemetry_dict(telemetry)
+            last_physical_telemetry = dict(physical_usage)
+            ticket_fields = dict(ticket) if isinstance(ticket, dict) else {}
+            physical_usage.update(ticket_fields)
+            physical_usage.update({
+                "model": model,
+                # Each ticket represents exactly this physical attempt. Do not
+                # charge the attempt's logical retry history a second time.
+                "retries": 0,
+                "dispatched": True,
+            })
+            billing_known = bool(
+                (physical_usage.get("prompt_tokens") or 0) > 0
+                and physical_usage.get("candidate_tokens") is not None
+                and physical_usage.get("thought_tokens") is not None
+            )
+            if not billing_known:
+                billing_unknown_attempts += 1
+                billing_unknown_reserved_cost_usd += max(
+                    0.0,
+                    float(ticket_fields.get("reserved_cost_usd") or 0.0),
+                )
+            # Reconcile synchronously before generate_json_v3 may admit a
+            # retry. A reconciliation failure aborts the logical call with the
+            # ticket still fail-closed instead of dispatching unbudgeted work.
+            if callable(budget_reconcile):
+                budget_reconcile(
+                    model_used=model,
+                    usage=physical_usage,
+                    dispatched=True,
+                )
+
         call_started = time.perf_counter()
         successful_telemetry: dict | None = None
         failure_telemetry_override: dict | None = None
@@ -21165,11 +21552,13 @@ def _call_model(
                     retry_status_codes=retry_status_codes,
                     cancelled=cancelled,
                     media_resolution=media_resolution,
+                    before_dispatch=before_provider_dispatch,
+                    after_dispatch=after_provider_dispatch,
                 )
             except Exception as primary_exc:
                 primary_telemetry = _telemetry_dict(
                     getattr(primary_exc, "telemetry", None)
-                )
+                ) or dict(last_physical_telemetry)
                 failover_reason = _flash_failover_reason(
                     primary_telemetry,
                     primary_exception=primary_exc,
@@ -21181,6 +21570,7 @@ def _call_model(
                 )
                 if failover_reason is None:
                     raise
+                primary_dispatches = physical_dispatches
                 try:
                     result = generate_json_v3(
                         system,
@@ -21196,16 +21586,36 @@ def _call_model(
                         max_retries=0,
                         cancelled=cancelled,
                         media_resolution=media_resolution,
+                        before_dispatch=before_provider_dispatch,
+                        after_dispatch=after_provider_dispatch,
                     )
                 except Exception as failover_exc:
-                    failure_telemetry_override = _merge_failover_telemetry(
-                        primary_telemetry,
-                        _telemetry_dict(getattr(failover_exc, "telemetry", None)),
-                        primary_model=model,
-                        failover_model=str(failover_model),
-                        failover_reason=failover_reason,
-                        started=call_started,
+                    failover_telemetry = _telemetry_dict(
+                        getattr(failover_exc, "telemetry", None)
                     )
+                    if physical_dispatches == primary_dispatches:
+                        # Admission, cancellation, deadline, or client setup
+                        # failed before the fallback provider call. Preserve the
+                        # primary attempt as the last dispatched model and do
+                        # not synthesize a fallback retry in the ledger.
+                        failure_telemetry_override = {
+                            **primary_telemetry,
+                            "failover_from_model": str(model),
+                            "failover_model": str(failover_model),
+                            "failover_reason": failover_reason,
+                            "failover_pre_dispatch_error": type(
+                                failover_exc
+                            ).__name__,
+                        }
+                    else:
+                        failure_telemetry_override = _merge_failover_telemetry(
+                            primary_telemetry,
+                            failover_telemetry,
+                            primary_model=model,
+                            failover_model=str(failover_model),
+                            failover_reason=failover_reason,
+                            started=call_started,
+                        )
                     raise
                 successful_telemetry = _merge_failover_telemetry(
                     primary_telemetry,
@@ -21219,8 +21629,11 @@ def _call_model(
             provider_telemetry = (
                 failure_telemetry_override
                 or _telemetry_dict(getattr(exc, "telemetry", None))
+                or dict(last_physical_telemetry)
             )
-            provider_dispatched = provider_telemetry.get("dispatched", True)
+            provider_dispatched = provider_telemetry.get(
+                "dispatched", physical_dispatches > 0,
+            )
             dispatched = (
                 provider_dispatched
                 if isinstance(provider_dispatched, bool)
@@ -21235,16 +21648,12 @@ def _call_model(
                 **reservation,
                 "error_type": type(exc).__name__,
                 "dispatched": dispatched,
+                "physical_dispatches": physical_dispatches,
+                "billing_unknown_attempts": billing_unknown_attempts,
+                "billing_unknown_reserved_cost_usd": (
+                    billing_unknown_reserved_cost_usd
+                ),
             }
-            if callable(budget_reconcile):
-                try:
-                    budget_reconcile(
-                        model_used=str(failure_telemetry.get("model") or model),
-                        usage=failure_telemetry,
-                        dispatched=dispatched,
-                    )
-                except Exception:
-                    log.warning("Gemini budget reconciliation failed", exc_info=True)
             if _cancel_requested(cancelled):
                 raise
             raise _ModelCallError(
@@ -21255,15 +21664,11 @@ def _call_model(
         for key, value in reservation.items():
             telemetry.setdefault(key, value)
         telemetry.setdefault("dispatched", True)
-        if callable(budget_reconcile):
-            try:
-                budget_reconcile(
-                    model_used=str(telemetry.get("model") or model),
-                    usage=telemetry,
-                    dispatched=True,
-                )
-            except Exception:
-                log.warning("Gemini budget reconciliation failed", exc_info=True)
+        telemetry["physical_dispatches"] = physical_dispatches
+        telemetry["billing_unknown_attempts"] = billing_unknown_attempts
+        telemetry["billing_unknown_reserved_cost_usd"] = (
+            billing_unknown_reserved_cost_usd
+        )
         try:
             parsed, schema_rejections = _validate_model_response(
                 schema, result.text.strip(),
@@ -21475,37 +21880,67 @@ def _audit_pro_boundaries(
     *,
     deadline: float,
     cancelled: CancelledCb,
+    _retry_contract_once: bool = True,
 ) -> tuple[_CompactBoundaryPlan, list[dict], list[str]]:
     """Let Pro independently audit admission and word edges; all failures retain."""
     if not plan.topics or not segments:
         return plan, [], []
     system, user, allowed = _pro_boundary_audit_prompts(plan, segments, topic)
     sink = settings.get("_segment_telemetry")
+    calls: list[dict] = []
     try:
-        audit, call = _call_model(
-            system,
-            user,
-            _ProCandidateAuditPlan,
-            model=config.SEGMENT_PRO_MODEL,
-            thinking_level="high",
-            max_output_tokens=_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS,
-            timeout_s=_PRO_TIMEOUT_S,
-            deadline_monotonic=deadline,
-            operation="pro_boundary_audit",
-            prompt_version=_PRO_BOUNDARY_AUDIT_PROMPT_VERSION,
-            cancelled=cancelled,
-            budget_reserve=settings.get("_segment_budget_reserve"),
-            budget_reconcile=settings.get("_segment_budget_reconcile"),
-            max_retries=0,
-        )
-        call["video_grounded"] = False
-        calls = [call]
+        for structured_attempt in range(1, 3):
+            try:
+                audit, call = _call_model(
+                    system,
+                    user,
+                    _ProCandidateAuditPlan,
+                    model=config.SEGMENT_PRO_MODEL,
+                    thinking_level="high",
+                    max_output_tokens=_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS,
+                    timeout_s=_PRO_TIMEOUT_S,
+                    deadline_monotonic=deadline,
+                    operation="pro_boundary_audit",
+                    prompt_version=_PRO_BOUNDARY_AUDIT_PROMPT_VERSION,
+                    cancelled=cancelled,
+                    budget_reserve=settings.get("_segment_budget_reserve"),
+                    budget_reconcile=settings.get("_segment_budget_reconcile"),
+                    max_retries=1,
+                )
+            except _SchemaResponseError as exc:
+                call = _exception_telemetry(exc)
+                call.update({
+                    "error_type": type(exc).__name__,
+                    "video_grounded": False,
+                    "structured_retry_attempt": structured_attempt,
+                    "structured_retry_reason": "invalid_structured_response",
+                    "structured_retry_exhausted": structured_attempt == 2,
+                })
+                calls.append(call)
+                if (
+                    structured_attempt == 1
+                    and not _cancel_requested(cancelled)
+                    and deadline - time.monotonic() >= 5.0
+                ):
+                    continue
+                raise
+            call["video_grounded"] = False
+            if structured_attempt == 2:
+                call.update({
+                    "structured_retry_attempt": 2,
+                    "structured_retry_recovered": True,
+                })
+            calls.append(call)
+            break
     except Exception as exc:
         telemetry = _exception_telemetry(exc)
         if telemetry:
             telemetry.setdefault("error_type", type(exc).__name__)
             telemetry["video_grounded"] = False
-        calls = [telemetry] if telemetry else []
+        if telemetry and not (
+            calls and calls[-1].get("structured_retry_exhausted") is True
+        ):
+            calls.append(telemetry)
         _emit(
             sink,
             "boundary_audit",
@@ -21529,6 +21964,8 @@ def _audit_pro_boundaries(
     protected_boundary_failures = 0
     start_diagnostic_failures = 0
     audit_evidence_failures = 0
+    semantic_repair_applied = 0
+    semantic_repair_retained = 0
     for item in audit.items:
         audit_id = str(item.candidate_id)
         index = allowed.get(audit_id)
@@ -21700,15 +22137,150 @@ def _audit_pro_boundaries(
         ):
             protected_boundary_failures += 1
             continue
+        semantic_updates: dict[str, object] = {}
+        semantic_fields = {
+            "title",
+            "facet",
+            "concept_family",
+            "concept_aliases",
+            "directly_teaches_topic",
+            "intent_evidence",
+        }
+        if semantic_fields.issubset(item.model_fields_set):
+            known_constraint_ids = {
+                str(constraint.constraint_id)
+                for constraint in plan.request_intent.constraints
+            }
+            required_constraint_ids = {
+                str(constraint.constraint_id)
+                for constraint in plan.request_intent.constraints
+                if constraint.kind is not _IntentConstraintKind.SCOPE
+            }
+            grounded_audit_intent: list[_CompactIntentEvidence] = []
+            grounded_audit_ids: set[str] = set()
+            semantic_evidence_valid = bool(item.intent_evidence)
+            for evidence in item.intent_evidence:
+                constraint_id = str(evidence.constraint_id)
+                evidence_tokens = _toks(evidence.evidence_quote)
+                evidence_anchor = (
+                    _unique_boundary_anchor(
+                        segments,
+                        evidence.evidence_quote,
+                        item.start_line,
+                        item.end_line,
+                    )
+                    if (
+                        constraint_id in known_constraint_ids
+                        and constraint_id not in grounded_audit_ids
+                        and 5 <= len(evidence_tokens) <= 16
+                    )
+                    else None
+                )
+                if not (
+                    evidence_anchor is not None
+                    and start_anchor.first_word_position
+                    <= evidence_anchor.first_word_position
+                    and evidence_anchor.last_word_position
+                    <= end_anchor.last_word_position
+                ):
+                    semantic_evidence_valid = False
+                    break
+                grounded_audit_ids.add(constraint_id)
+                grounded_audit_intent.append(evidence)
+            if (
+                item.directly_teaches_topic
+                and not required_constraint_ids.issubset(grounded_audit_ids)
+            ):
+                semantic_evidence_valid = False
+            # The Pro audit is the semantic authority for this repaired unit.
+            # Code checks only its bounded/normalizable metadata and anchored
+            # evidence; it must not re-decide meaning with token heuristics.
+            family_payload, _family_error = (
+                _validated_proposal_concept_family_payload(item)
+            )
+            if semantic_evidence_valid and family_payload:
+                semantic_updates = {
+                    "claim_quote": str(item.evidence_quote),
+                    "title": str(item.title),
+                    "learning_objective": str(item.actual_objective),
+                    "facet": str(item.facet),
+                    **family_payload,
+                    "directly_teaches_topic": bool(item.directly_teaches_topic),
+                    "intent_evidence": grounded_audit_intent,
+                }
+                semantic_repair_applied += 1
+            else:
+                semantic_repair_retained += 1
+        else:
+            semantic_repair_retained += 1
         replacement = proposal.model_copy(update={
             "start_line": item.start_line,
             "end_line": item.end_line,
             "start_quote": item.start_quote,
             "end_quote": item.end_quote,
+            **semantic_updates,
         })
         replacement._pro_audit_start_authoritative = True
         replacement._pro_audit_evidence_quote = str(item.evidence_quote)
         replacements[index] = replacement
+
+    expected_ids = set(allowed)
+    resolved_indices = set(replacements) | set(rejected)
+    id_contract_invalid = bool(
+        len(audit.items) != len(expected_ids)
+        or set(id_counts) != expected_ids
+        or any(id_counts.get(audit_id) != 1 for audit_id in expected_ids)
+    )
+    contract_invalid = bool(
+        id_contract_invalid
+        or returned_ids != expected_ids
+        or len(resolved_indices) != len(plan.topics)
+        or semantic_repair_retained
+    )
+    if contract_invalid:
+        if calls:
+            calls[-1].update({
+                "contract_retry_reason": "invalid_audit_contract",
+                "contract_retry_exhausted": not _retry_contract_once,
+            })
+        if (
+            _retry_contract_once
+            and not _cancel_requested(cancelled)
+            and deadline - time.monotonic() >= 5.0
+        ):
+            if calls:
+                calls[-1]["contract_retry_attempt"] = 1
+            retried_plan, retry_calls, retry_rejections = _audit_pro_boundaries(
+                plan,
+                segments,
+                topic,
+                settings,
+                deadline=deadline,
+                cancelled=cancelled,
+                _retry_contract_once=False,
+            )
+            if retry_calls:
+                retry_calls[0].setdefault("contract_retry_attempt", 2)
+            return retried_plan, [*calls, *retry_calls], retry_rejections
+        _emit(
+            sink,
+            "candidate_audit",
+            attempted_count=len(plan.topics),
+            returned_count=len(returned_ids),
+            unexpected_id_count=len(set(id_counts) - expected_ids),
+            boundary_applied_count=0,
+            boundary_retained_count=len(plan.topics),
+            semantic_repair_applied_count=0,
+            semantic_repair_retained_count=max(
+                semantic_repair_retained,
+                len(plan.topics) - len(resolved_indices),
+            ),
+            rejected_count=0,
+            reason="invalid_audit_contract",
+        )
+        return plan, calls, []
+    if not _retry_contract_once and calls:
+        calls[-1]["contract_retry_recovered"] = True
 
     audited_topics = [
         replacements.get(index, topic_item)
@@ -21742,6 +22314,8 @@ def _audit_pro_boundaries(
         protected_boundary_retained_count=protected_boundary_failures,
         start_diagnostic_retained_count=start_diagnostic_failures,
         audit_evidence_retained_count=audit_evidence_failures,
+        semantic_repair_applied_count=semantic_repair_applied,
+        semantic_repair_retained_count=semantic_repair_retained,
         rejected_count=len(rejected),
         rejected_unrelated_count=decision_counts[
             _ProAuditDecision.REJECT_UNRELATED.value
@@ -21867,10 +22441,8 @@ def _run_selection_profile(
         and not video_grounded
         and settings.get("_segment_allow_flash_lite_failover") is not True
     )
-    retry_pro_capacity_once = bool(
-        video_grounded and profile == PRO_BOUNDARY_PROFILE
-    )
-    retry_capacity_once = retry_flash_capacity_once or retry_pro_capacity_once
+    retry_pro_transient_once = profile == PRO_BOUNDARY_PROFILE
+    retry_capacity_once = retry_flash_capacity_once or retry_pro_transient_once
     operation = str(settings.get("_segment_operation") or operation)
     selector_deadline = (
         deadline - _PRO_FINAL_AUDIT_RESERVED_S
@@ -21893,12 +22465,12 @@ def _run_selection_profile(
             cancelled=cancelled,
             budget_reserve=settings.get("_segment_budget_reserve"),
             budget_reconcile=settings.get("_segment_budget_reconcile"),
-            # A confirmed 503 may receive one bounded retry on the same model.
-            # This follows Gemini's transient-capacity guidance without changing
-            # model tiers or allowing an open-ended wait.
+            # The live Pro selector uses the full transient policy. The dormant
+            # latency-sensitive Flash path retains its existing 503-only retry
+            # or one Lite failover rather than multiplying both mechanisms.
             max_retries=1 if retry_capacity_once else 0,
             retry_status_codes=(
-                frozenset({503}) if retry_capacity_once else None
+                frozenset({503}) if retry_flash_capacity_once else None
             ),
             failover_model=(
                 config.SEGMENT_FLASH_FALLBACK_MODEL
@@ -21917,10 +22489,9 @@ def _run_selection_profile(
     try:
         parsed, call = invoke_selector()
     except _SchemaResponseError as first_exc:
-        # A provider-successful response can occasionally be malformed JSON. Give
-        # only the authoritative text-only Pro selector one separately budgeted
-        # retry with the identical transcript prompt; semantic results are never
-        # retried merely because they contain few or unexpected clips.
+        # A provider-successful response can occasionally be malformed JSON.
+        # Retry the same selector step once with a separate reservation and the
+        # identical transcript prompt; semantic no-result outcomes are not errors.
         first_call = _exception_telemetry(first_exc)
         first_call.update({
             "error_type": type(first_exc).__name__,
@@ -21954,7 +22525,151 @@ def _run_selection_profile(
             "schema_retry_recovered": True,
         })
     call["video_grounded"] = video_grounded
-    calls.append(call)
+    first_selector_contract: _LiveSelectorContract | None = None
+    if profile == PRO_BOUNDARY_PROFILE:
+        assert isinstance(parsed, _CompactBoundaryPlan)
+        first_selector_contract = _validate_live_pro_selector_contract(
+            parsed,
+            topic,
+        )
+        parsed = first_selector_contract.plan
+        _annotate_live_selector_contract(call, first_selector_contract)
+    first_schema_rejections = list(call.get("schema_rejection_reasons") or [])
+    first_contract_rejections = list(
+        call.get("selector_contract_rejection_reasons") or []
+    )
+    if (
+        profile == PRO_BOUNDARY_PROFILE
+        and (first_schema_rejections or first_contract_rejections)
+        and not _cancel_requested(cancelled)
+        and selector_deadline - time.monotonic() >= 5.0
+    ):
+        first_parsed = parsed
+        first_call = call
+        first_call.update({
+            "partial_schema_retry_attempt": 1,
+            "partial_schema_retry_reason": (
+                "candidate_schema_rejection"
+                if first_schema_rejections and not first_contract_rejections
+                else "selector_contract_rejection"
+            ),
+        })
+        if first_contract_rejections:
+            first_call.update({
+                "selector_contract_retry_attempt": 1,
+                "selector_contract_retry_reason": (
+                    first_selector_contract.intent_error
+                    if first_selector_contract is not None
+                    and first_selector_contract.intent_error is not None
+                    else "candidate_concept_family_contract"
+                ),
+            })
+        calls.append(first_call)
+        try:
+            retry_parsed, retry_call = invoke_selector()
+        except Exception as retry_exc:
+            if _cancel_requested(cancelled):
+                raise
+            retry_call = _exception_telemetry(retry_exc)
+            retry_call.setdefault("error_type", type(retry_exc).__name__)
+            retry_call.update({
+                "video_grounded": video_grounded,
+                "partial_schema_retry_attempt": 2,
+                "partial_schema_retry_exhausted": True,
+            })
+            if first_contract_rejections:
+                retry_call.update({
+                    "selector_contract_retry_attempt": 2,
+                    "selector_contract_retry_exhausted": True,
+                })
+            calls.append(retry_call)
+            parsed, call = first_parsed, first_call
+        else:
+            retry_call["video_grounded"] = video_grounded
+            assert isinstance(retry_parsed, _CompactBoundaryPlan)
+            retry_selector_contract = _validate_live_pro_selector_contract(
+                retry_parsed,
+                topic,
+            )
+            retry_parsed = retry_selector_contract.plan
+            _annotate_live_selector_contract(
+                retry_call,
+                retry_selector_contract,
+            )
+            assert first_selector_contract is not None
+            if (
+                first_selector_contract.intent_error is None
+                and retry_selector_contract.intent_error is None
+                and first_selector_contract.intent_signature
+                != retry_selector_contract.intent_signature
+            ):
+                mismatch = "intent_contract_retry_signature_mismatch"
+                retry_call.setdefault(
+                    "selector_contract_rejection_reasons",
+                    [],
+                ).append(mismatch)
+                retry_call["selector_contract_rejected_count"] = len(
+                    retry_call["selector_contract_rejection_reasons"]
+                )
+            retry_rejections = list(
+                retry_call.get("schema_rejection_reasons") or []
+            )
+            retry_contract_rejections = list(
+                retry_call.get("selector_contract_rejection_reasons") or []
+            )
+            retry_all_rejections = [
+                *retry_rejections,
+                *retry_contract_rejections,
+            ]
+            compatible_intent = bool(
+                first_selector_contract.intent_error is None
+                and retry_selector_contract.intent_error is None
+                and first_selector_contract.intent_signature
+                == retry_selector_contract.intent_signature
+            )
+            if compatible_intent:
+                retry_parsed = _remap_compact_plan_intent_evidence(
+                    retry_parsed,
+                    source=retry_selector_contract,
+                    target=first_selector_contract,
+                )
+                parsed = _merge_compact_boundary_plans(
+                    first_parsed,
+                    retry_parsed,
+                )
+            elif first_selector_contract.intent_error is None:
+                parsed = first_parsed
+            elif retry_selector_contract.intent_error is None:
+                parsed = retry_parsed
+            else:
+                parsed = retry_parsed.model_copy(update={"topics": []})
+            retry_recovered = bool(
+                not retry_all_rejections
+                and retry_selector_contract.intent_error is None
+                and (
+                    retry_parsed.topics
+                    or not first_parsed.topics
+                )
+            )
+            retry_call.update({
+                "partial_schema_retry_attempt": 2,
+                "partial_schema_retry_recovered": retry_recovered,
+                "partial_schema_retry_exhausted": not retry_recovered,
+            })
+            if first_contract_rejections:
+                retry_call.update({
+                    "selector_contract_retry_attempt": 2,
+                    "selector_contract_retry_recovered": retry_recovered,
+                    "selector_contract_retry_exhausted": not retry_recovered,
+                })
+            calls.append(retry_call)
+            if retry_recovered or first_selector_contract.intent_error is not None:
+                call = retry_call
+            else:
+                call = first_call
+                first_call["partial_schema_retry_retained"] = True
+    else:
+        calls.append(call)
     pro_audit_rejections: list[str] = []
     if profile == PRO_BOUNDARY_PROFILE and isinstance(parsed, _CompactBoundaryPlan):
         parsed, boundary_audit_calls, pro_audit_rejections = _audit_pro_boundaries(
@@ -22005,6 +22720,20 @@ def _run_selection_profile(
         ]
         report.proposed_count += len(clean_rejections)
         report.rejected_reasons = clean_rejections + report.rejected_reasons
+    selector_contract_rejections = call.get(
+        "selector_contract_rejection_reasons"
+    )
+    if isinstance(selector_contract_rejections, list):
+        clean_contract_rejections = [
+            str(reason)
+            for reason in selector_contract_rejections
+            if str(reason).strip()
+        ]
+        report.proposed_count += len(clean_contract_rejections)
+        report.rejected_reasons = [
+            *clean_contract_rejections,
+            *report.rejected_reasons,
+        ]
     if (
         profile in {FLASH_SPLIT_PROFILE, PRO_BOUNDARY_PROFILE}
         and not conversion_settings.get("_segment_trust_gemini_semantics")

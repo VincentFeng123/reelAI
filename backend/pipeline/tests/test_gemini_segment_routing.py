@@ -82,8 +82,31 @@ def test_direct_long_transcript_is_rejected_before_pro_dispatch(monkeypatch):
 
     def generate(*args, **kwargs):
         nonlocal dispatched
+        ticket = kwargs["before_dispatch"](
+            model=kwargs["model"], attempt=1,
+        )
         dispatched = True
-        raise AssertionError("Pro generation must not run over the local cost ceiling")
+        telemetry = {
+            "model": kwargs["model"],
+            "operation": kwargs["operation"],
+            "prompt_version": kwargs["prompt_version"],
+            "thinking_level": kwargs["thinking_level"],
+            "finish_reason": "STOP",
+            "prompt_tokens": 250_001,
+            "candidate_tokens": 10,
+            "thought_tokens": 0,
+            "total_tokens": 250_011,
+        }
+        kwargs["after_dispatch"](
+            ticket,
+            model=kwargs["model"],
+            attempt=1,
+            telemetry=telemetry,
+        )
+        return SimpleNamespace(
+            text=_empty_selector_response().text,
+            telemetry=telemetry,
+        )
 
     monkeypatch.setattr(GC, "count_request_tokens", count_tokens)
     monkeypatch.setattr(GC, "generate_json_v3", generate)
@@ -740,8 +763,13 @@ def test_schema_failure_preserves_successful_call_usage_telemetry(monkeypatch):
     assert G._exception_telemetry(exc_info.value)["dispatched"] is True
 
 
-def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
+@pytest.mark.parametrize(
+    "retry_outcome",
+    ["valid", "repeated_invalid", "empty", "complementary"],
+)
+def test_boundary_schema_retries_one_bad_topic_without_losing_valid_sibling(
     monkeypatch,
+    retry_outcome,
 ):
     valid = G._CompactBoundaryTopic(
         candidate_id="candidate-alpha",
@@ -769,12 +797,21 @@ def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
             "evidence_quote": "Alpha lesson defines the concept completely",
         }],
     ).model_dump(mode="json", by_alias=True)
+    complementary = {
+        **valid,
+        "id": "candidate-beta",
+        "title": "Beta lesson",
+        "obj": "Understand the complete beta lesson.",
+        "facet": "beta",
+        "family": "beta lesson concept",
+        "aliases": ["beta concept"],
+    }
     malformed = {**valid, "id": "candidate-bad", "rel": "high"}
     telemetry = GC.GeminiCallTelemetry(
-        model=G.config.SEGMENT_FLASH_MODEL,
-        operation="flash_boundary_selector",
-        prompt_version=G.FLASH_SPLIT_PROFILE,
-        thinking_level="low",
+        model=G.config.SEGMENT_PRO_MODEL,
+        operation="pro_fallback",
+        prompt_version=G.PRO_BOUNDARY_PROFILE,
+        thinking_level="medium",
         latency_ms=12.0,
         retries=0,
         finish_reason="STOP",
@@ -783,10 +820,19 @@ def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
         thought_tokens=0,
         total_tokens=200,
     )
-    monkeypatch.setattr(
-        GC,
-        "generate_json_v3",
-        lambda *args, **kwargs: GC.GenerationResult(
+    dispatches = 0
+
+    def repeated_partial(*_args, **_kwargs):
+        nonlocal dispatches
+        dispatches += 1
+        topics = [malformed, valid]
+        if dispatches == 2 and retry_outcome == "valid":
+            topics = [valid]
+        elif dispatches == 2 and retry_outcome == "empty":
+            topics = []
+        elif dispatches == 2 and retry_outcome == "complementary":
+            topics = [complementary]
+        return GC.GenerationResult(
             json.dumps({
                 "request_intent": {
                     "exact_request": "alpha lesson",
@@ -797,10 +843,20 @@ def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
                         "requirement": "Teach the alpha lesson",
                     }],
                 },
-                "topics": [malformed, valid],
+                "topics": topics,
             }),
             telemetry,
-        ),
+        )
+
+    monkeypatch.setattr(
+        GC,
+        "generate_json_v3",
+        repeated_partial,
+    )
+    monkeypatch.setattr(
+        G,
+        "_audit_pro_boundaries",
+        lambda plan, *_args, **_kwargs: (plan, [], []),
     )
 
     result = G.run_segment_profile(
@@ -817,24 +873,431 @@ def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
             "source": "supadata",
         },
         {},
-        G.FLASH_SPLIT_PROFILE,
+        G.PRO_BOUNDARY_PROFILE,
         topic="alpha lesson",
     )
 
-    assert result.accepted_count == 1
-    assert result.proposed_count == 2
+    expected_count = 2 if retry_outcome == "complementary" else 1
+    assert result.accepted_count == expected_count
+    retry_recovers = retry_outcome in {"valid", "complementary"}
+    assert result.proposed_count == (
+        expected_count if retry_recovers else 2
+    )
     assert result.classification == "green"
-    assert result.rejection_reasons == [
-        "proposal_0:schema_invalid:rel:float_type"
-    ]
+    assert result.rejection_reasons == (
+        []
+        if retry_recovers
+        else ["proposal_0:schema_invalid:rel:float_type"]
+    )
+    assert dispatches == 2
     assert result.calls[0]["schema_rejected_count"] == 1
+    assert result.calls[0]["partial_schema_retry_attempt"] == 1
+    assert result.calls[1]["partial_schema_retry_recovered"] is retry_recovers
+    assert result.calls[1]["partial_schema_retry_exhausted"] is (not retry_recovers)
+    assert result.calls[0].get("partial_schema_retry_retained") is (
+        None if retry_recovers else True
+    )
+
+
+def test_partial_retry_merge_is_stable_bounded_and_retry_wins_same_id():
+    def topic(candidate_id: str, title: str) -> G._CompactBoundaryTopic:
+        return G._CompactBoundaryTopic(
+            candidate_id=candidate_id,
+            start_line=0,
+            end_line=0,
+            start_quote="Alpha lesson defines the concept",
+            end_quote="closes with a clear conclusion",
+            claim_quote="Alpha lesson defines the concept completely",
+            title=title,
+            learning_objective="Understand the complete alpha lesson.",
+            facet="alpha",
+            concept_family="alpha lesson concept",
+            concept_aliases=["alpha concept"],
+            informativeness=0.9,
+            topic_relevance=0.9,
+            educational_importance=0.9,
+            difficulty=0.5,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[{
+                "id": "subject",
+                "q": "Alpha lesson defines the concept completely",
+            }],
+        )
+
+    intent = {
+        "exact_request": "alpha lesson",
+        "constraints": [{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "alpha lesson",
+            "requirement": "Teach the alpha lesson",
+        }],
+    }
+    first = G._CompactBoundaryPlan(
+        request_intent=intent,
+        topics=[topic(f"candidate-{index}", f"First {index}") for index in range(39)],
+    )
+    retry = G._CompactBoundaryPlan(
+        request_intent=intent,
+        topics=[
+            topic("candidate-0", "Retry replacement"),
+            topic("candidate-39", "Retry append"),
+            topic("candidate-40", "Over cap"),
+        ],
+    )
+
+    merged = G._merge_compact_boundary_plans(first, retry)
+
+    assert len(merged.topics) == 40
+    assert merged.topics[0].title == "Retry replacement"
+    assert merged.topics[-1].candidate_id == "candidate-39"
+    assert "candidate-40" not in {item.candidate_id for item in merged.topics}
+
+
+def test_partial_retry_merges_equivalent_intent_after_constraint_id_rename(
+    monkeypatch,
+):
+    def topic(
+        candidate_id: str,
+        line: int,
+        ordinal: str,
+        constraint_id: str,
+    ) -> G._CompactBoundaryTopic:
+        evidence = (
+            f"Alpha lesson teaches the {ordinal} concept completely and concludes clearly"
+        )
+        return G._CompactBoundaryTopic(
+            candidate_id=candidate_id,
+            start_line=line,
+            end_line=line,
+            start_quote=f"Alpha lesson teaches the {ordinal} concept",
+            end_quote="completely and concludes clearly",
+            claim_quote=evidence,
+            title=f"Alpha {ordinal} concept",
+            learning_objective=f"Understand the alpha lesson's {ordinal} concept.",
+            facet=f"alpha {ordinal} concept",
+            concept_family=f"alpha lesson {ordinal} concept",
+            concept_aliases=[],
+            informativeness=0.9,
+            topic_relevance=0.9,
+            educational_importance=0.9,
+            difficulty=0.5,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[{
+                "id": constraint_id,
+                "q": evidence,
+            }],
+        )
+
+    def intent(constraint_id: str) -> dict:
+        return {
+            "exact_request": "alpha lesson",
+            "constraints": [{
+                "constraint_id": constraint_id,
+                "kind": "subject",
+                "source_phrase": "alpha lesson",
+                "requirement": "Teach the alpha lesson",
+            }],
+        }
+
+    responses = iter([
+        (
+            G._CompactBoundaryPlan(
+                request_intent=intent("subject"),
+                topics=[topic("alpha-first", 0, "first", "subject")],
+            ),
+            {"schema_rejection_reasons": ["proposal_1:schema_invalid"]},
+        ),
+        (
+            G._CompactBoundaryPlan(
+                request_intent=intent("topic"),
+                topics=[topic("alpha-second", 1, "second", "topic")],
+            ),
+            {},
+        ),
+    ])
+    monkeypatch.setattr(G, "_call_model", lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr(
+        G,
+        "_audit_pro_boundaries",
+        lambda plan, *_args, **_kwargs: (plan, [], []),
+    )
+
+    result = G.run_segment_profile(
+        {
+            "segments": [
+                {
+                    "start": 0.0,
+                    "end": 8.0,
+                    "text": (
+                        "Alpha lesson teaches the first concept completely and "
+                        "concludes clearly."
+                    ),
+                },
+                {
+                    "start": 8.0,
+                    "end": 16.0,
+                    "text": (
+                        "Alpha lesson teaches the second concept completely and "
+                        "concludes clearly."
+                    ),
+                },
+            ],
+            "words": [],
+            "source": "supadata",
+        },
+        {},
+        G.PRO_BOUNDARY_PROFILE,
+        topic="alpha lesson",
+    )
+
+    assert result.accepted_count == 2
+    assert {clip["selection_candidate_id"] for clip in result.clips} == {
+        "alpha-first",
+        "alpha-second",
+    }
+    assert result.calls[1]["partial_schema_retry_recovered"] is True
+
+
+@pytest.mark.parametrize("failure", ["request_mismatch", "incomplete_coverage"])
+@pytest.mark.parametrize("retry_recovers", [True, False])
+def test_live_pro_selector_retries_invalid_intent_contract_and_fails_closed(
+    monkeypatch,
+    failure,
+    retry_recovers,
+):
+    topic_payload = G._CompactBoundaryTopic(
+        candidate_id="candidate-alpha",
+        start_line=0,
+        end_line=0,
+        start_quote="Alpha lesson defines the concept",
+        end_quote="closes with a clear conclusion",
+        claim_quote="Alpha lesson defines the concept completely",
+        title="Alpha lesson",
+        learning_objective="Understand the complete alpha lesson.",
+        facet="alpha lesson",
+        concept_family="alpha lesson concept",
+        concept_aliases=["alpha concept"],
+        informativeness=0.9,
+        topic_relevance=0.9,
+        educational_importance=0.9,
+        difficulty=0.5,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        self_contained=True,
+        is_standalone=True,
+        intent_evidence=[{
+            "id": "subject",
+            "q": "Alpha lesson defines the concept completely",
+        }],
+    ).model_dump(mode="json", by_alias=True)
+    valid_intent = {
+        "exact_request": "alpha lesson",
+        "constraints": [{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "alpha lesson",
+            "requirement": "Teach the alpha lesson",
+        }],
+    }
+    invalid_intent = (
+        {
+            "exact_request": "beta lesson",
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": "beta lesson",
+                "requirement": "Teach the beta lesson",
+            }],
+        }
+        if failure == "request_mismatch"
+        else {
+            "exact_request": "alpha lesson",
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": "alpha",
+                "requirement": "Teach alpha",
+            }],
+        }
+    )
+    telemetry = GC.GeminiCallTelemetry(
+        model=G.config.SEGMENT_PRO_MODEL,
+        operation="pro_fallback",
+        prompt_version=G.PRO_BOUNDARY_PROFILE,
+        thinking_level="medium",
+        latency_ms=1.0,
+        retries=0,
+        finish_reason="STOP",
+        prompt_tokens=100,
+        candidate_tokens=100,
+        thought_tokens=0,
+        total_tokens=200,
+    )
+    dispatches = 0
+
+    def invalid_then_optional_recovery(*_args, **_kwargs):
+        nonlocal dispatches
+        dispatches += 1
+        request_intent = (
+            valid_intent
+            if dispatches == 2 and retry_recovers
+            else invalid_intent
+        )
+        return GC.GenerationResult(
+            json.dumps({
+                "request_intent": request_intent,
+                "topics": [topic_payload],
+            }),
+            telemetry,
+        )
+
+    monkeypatch.setattr(GC, "generate_json_v3", invalid_then_optional_recovery)
+    monkeypatch.setattr(
+        G,
+        "_audit_pro_boundaries",
+        lambda plan, *_args, **_kwargs: (plan, [], []),
+    )
+
+    result = G.run_segment_profile(
+        _transcript(),
+        {},
+        G.PRO_BOUNDARY_PROFILE,
+        topic="alpha lesson",
+    )
+
+    expected_reason = (
+        "intent_contract_request_mismatch"
+        if failure == "request_mismatch"
+        else "intent_contract_incomplete_request_coverage"
+    )
+    assert dispatches == 2
+    assert result.accepted_count == (1 if retry_recovers else 0)
+    assert result.classification == ("green" if retry_recovers else "invalid")
+    assert (expected_reason in result.rejection_reasons) is (not retry_recovers)
+    assert result.calls[0]["selector_contract_retry_attempt"] == 1
+    assert result.calls[1]["selector_contract_retry_attempt"] == 2
+    assert result.calls[1]["selector_contract_retry_recovered"] is retry_recovers
+    assert result.calls[1]["selector_contract_retry_exhausted"] is (
+        not retry_recovers
+    )
+
+
+def test_live_pro_selector_uses_ai_family_and_drops_aliases_without_retry(monkeypatch):
+    request = "Newton's third law"
+    transcript = {
+        "segments": [{
+            "start": 0.0,
+            "end": 10.0,
+            "text": (
+                "Newton's third law says interacting objects exert reciprocal "
+                "forces on each other."
+            ),
+        }],
+        "words": [],
+        "source": "supadata",
+    }
+    base_topic = G._CompactBoundaryTopic(
+        candidate_id="third-law",
+        start_line=0,
+        end_line=0,
+        start_quote="Newton's third law says",
+        end_quote="forces on each other",
+        claim_quote=(
+            "Newton's third law says interacting objects exert reciprocal forces"
+        ),
+        title="Newton's Third Law",
+        learning_objective="Explain Newton's third law force pairs",
+        facet="third-law reciprocal forces",
+        concept_family="Newton's third law of motion",
+        concept_aliases=["action-reaction law"],
+        informativeness=0.9,
+        topic_relevance=1.0,
+        educational_importance=0.9,
+        difficulty=0.4,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        self_contained=True,
+        is_standalone=True,
+        intent_evidence=[{
+            "id": "subject",
+            "q": "Newton's third law says interacting objects exert reciprocal forces",
+        }],
+    )
+    intent = {
+        "exact_request": request,
+        "constraints": [{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": request,
+            "requirement": "Teach Newton's third law",
+        }],
+    }
+    response = G._CompactBoundaryPlan(request_intent=intent, topics=[base_topic])
+    dispatches = 0
+
+    def select_once(*_args, **_kwargs):
+        nonlocal dispatches
+        dispatches += 1
+        return response, {}
+
+    monkeypatch.setattr(
+        G,
+        "_call_model",
+        select_once,
+    )
+    monkeypatch.setattr(
+        G,
+        "_audit_pro_boundaries",
+        lambda plan, *_args, **_kwargs: (plan, [], []),
+    )
+
+    result = G.run_segment_profile(
+        transcript,
+        {},
+        G.PRO_BOUNDARY_PROFILE,
+        topic=request,
+    )
+
+    assert result.accepted_count == 1
+    assert result.clips[0]["concept_family"] == "Newton's third law of motion"
+    assert result.clips[0]["concept_aliases"] == []
+    assert dispatches == 1
+    assert "selector_contract_retry_attempt" not in result.calls[0]
 
 
 def test_dispatched_transport_failure_preserves_call_identity(monkeypatch):
+    def fail_after_dispatch(*_args, **kwargs):
+        ticket = kwargs["before_dispatch"](
+            model=kwargs["model"], attempt=1,
+        )
+        kwargs["after_dispatch"](
+            ticket,
+            model=kwargs["model"],
+            attempt=1,
+            telemetry={
+                "model": kwargs["model"],
+                "operation": kwargs["operation"],
+                "provider_error_type": "RuntimeError",
+                "retryable": True,
+            },
+        )
+        raise RuntimeError("transport down")
+
     monkeypatch.setattr(
         GC,
         "generate_json_v3",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("transport down")),
+        fail_after_dispatch,
     )
 
     with pytest.raises(G._ModelCallError) as exc_info:
@@ -858,7 +1321,7 @@ def test_dispatched_transport_failure_preserves_call_identity(monkeypatch):
     assert telemetry["model"] == G.config.SEGMENT_FLASH_MODEL
 
 
-def test_production_selector_fails_over_one_503_with_one_reservation(monkeypatch):
+def test_production_selector_failover_reserves_each_physical_dispatch(monkeypatch):
     monkeypatch.setattr(
         G.config,
         "SEGMENT_FLASH_FALLBACK_MODEL",
@@ -891,7 +1354,9 @@ def test_production_selector_fails_over_one_503_with_one_reservation(monkeypatch
         G.config.SEGMENT_FLASH_MODEL,
         G.config.SEGMENT_FLASH_FALLBACK_MODEL,
     ]
-    assert len(reservations) == 1
+    assert len(reservations) == 2
+    assert [item["max_physical_attempts"] for item in reservations] == [1, 1]
+    assert [item["count_logical_call"] for item in reservations] == [True, False]
     assert result.calls[0]["retries"] == 1
     assert result.calls[0]["error_history"] == ({
         "provider_error_type": "_HTTPStatusError",
@@ -901,6 +1366,9 @@ def test_production_selector_fails_over_one_503_with_one_reservation(monkeypatch
     assert result.calls[0]["failover_reason"] == "primary_transient_5xx_failover"
     assert result.calls[0]["dispatched"] is True
     assert result.calls[0]["reserved_cost_usd"] == 0.25
+    assert result.calls[0]["physical_dispatches"] == 2
+    assert result.calls[0]["billing_unknown_attempts"] == 1
+    assert result.calls[0]["billing_unknown_reserved_cost_usd"] == 0.25
     assert result.error is None
     assert result.classification_reasons == ["zero_valid_candidates"]
 
@@ -914,7 +1382,7 @@ def test_production_selector_fails_over_one_503_with_one_reservation(monkeypatch
         (504, "primary_transient_5xx_failover"),
     ],
 )
-def test_production_selector_failover_reuses_one_reservation(
+def test_production_selector_failover_settles_separate_model_priced_tickets(
     monkeypatch,
     primary_status,
     failover_reason,
@@ -957,9 +1425,14 @@ def test_production_selector_failover_reuses_one_reservation(
         G.config.SEGMENT_FLASH_MODEL,
         G.config.SEGMENT_FLASH_FALLBACK_MODEL,
     ]
-    assert len(reservations) == 1
-    assert len(reconciliations) == 1
-    assert reconciliations[0]["model_used"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
+    assert len(reservations) == 2
+    assert len(reconciliations) == 2
+    assert [item["max_physical_attempts"] for item in reservations] == [1, 1]
+    assert [item["count_logical_call"] for item in reservations] == [True, False]
+    assert [item["model_used"] for item in reconciliations] == [
+        G.config.SEGMENT_FLASH_MODEL,
+        G.config.SEGMENT_FLASH_FALLBACK_MODEL,
+    ]
     call = result.calls[0]
     assert call["model"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
     assert call["retries"] == 1
@@ -969,12 +1442,78 @@ def test_production_selector_failover_reuses_one_reservation(
     assert call["failover_model"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
     assert call["failover_reason"] == failover_reason
     assert call["quality_degraded"] is True
+    assert call["physical_dispatches"] == 2
+    assert call["billing_unknown_attempts"] == 1
     assert isinstance(call["gemini_reservation_id"], int)
     assert result.error is None
     budget = context.budget.snapshot()["gemini"]
     assert budget["flash_selector_calls"] == 1
     assert budget["inflight_reserved_cost_usd"] == 0.0
-    assert budget["committed_cost_usd"] == pytest.approx(0.000045)
+    primary_reserved_cost = reconciliations[0]["usage"]["reserved_cost_usd"]
+    assert budget["committed_cost_usd"] == pytest.approx(
+        primary_reserved_cost + 0.000045
+    )
+    assert budget["billing_unknown_cost_exposure_usd"] == pytest.approx(
+        primary_reserved_cost
+    )
+    assert call["billing_unknown_reserved_cost_usd"] == pytest.approx(
+        primary_reserved_cost
+    )
+
+
+def test_failover_admission_failure_does_not_claim_fallback_dispatch(monkeypatch):
+    monkeypatch.setattr(
+        G.config,
+        "SEGMENT_FLASH_FALLBACK_MODEL",
+        "gemini-3.1-flash-lite",
+    )
+    models = _install_model_sequence(
+        monkeypatch,
+        _HTTPStatusError(503),
+        _empty_selector_response(),
+    )
+    reservations = []
+    reconciliations = []
+
+    def reserve(**kwargs):
+        if reservations:
+            raise ProviderBudgetExceededError(
+                "fallback ticket unavailable",
+                provider="gemini",
+                operation=kwargs["operation"],
+            )
+        reservations.append(kwargs)
+        return {
+            "gemini_reservation_id": 1,
+            "reserved_cost_usd": 0.25,
+        }
+
+    result = G.run_segment_profile(
+        _transcript(),
+        {
+            "_segment_budget_reserve": reserve,
+            "_segment_budget_reconcile": lambda **kwargs: (
+                reconciliations.append(kwargs) or True
+            ),
+            "_segment_allow_flash_lite_failover": True,
+        },
+        G.PRODUCTION_FLASH_PROFILE,
+        topic="calculus",
+        deadline_monotonic=time.monotonic() + 10,
+    )
+
+    assert len(models.calls) == 1
+    assert len(reservations) == 1
+    assert len(reconciliations) == 1
+    assert result.error is not None
+    call = result.calls[0]
+    assert call["model"] == G.config.SEGMENT_FLASH_MODEL
+    assert call["physical_dispatches"] == 1
+    assert call["retries"] == 0
+    assert call["billing_unknown_attempts"] == 1
+    assert call["billing_unknown_reserved_cost_usd"] == 0.25
+    assert call["failover_model"] == G.config.SEGMENT_FLASH_FALLBACK_MODEL
+    assert call["failover_pre_dispatch_error"] == "ProviderBudgetExceededError"
 
 
 @pytest.mark.parametrize(
@@ -1211,9 +1750,9 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
     (G.FLASH_SINGLE_PROFILE,
          ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash", 0)),
     (G.FLASH_SPLIT_PROFILE,
-         ("low", 6_000, 45.0, "flash_boundary_selector", "gemini-3.5-flash", 1)),
+         ("low", 6_400, 45.0, "flash_boundary_selector", "gemini-3.5-flash", 1)),
     (G.PRO_BOUNDARY_PROFILE,
-         ("medium", 12_288, 90.0, "pro_fallback", "gemini-3.1-pro-preview", 0)),
+         ("medium", 12_288, 90.0, "pro_fallback", "gemini-3.1-pro-preview", 1)),
     ],
 )
 def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, expected):
@@ -1305,20 +1844,23 @@ def test_flash_boundary_profile_accepts_bootstrap_low_thinking_override(monkeypa
     )
 
     assert captured["thinking_level"] == "low"
-    assert captured["max_output_tokens"] == 6_000
+    assert captured["max_output_tokens"] == 6_400
 
 
 def test_boundary_profile_keeps_grounded_clip_with_bad_edge_quote(monkeypatch):
-    proposal = G._BoundaryTopic(
+    selector_dispatches = 0
+    proposal = G._CompactBoundaryTopic(
         candidate_id="candidate-bad-quote",
         start_line=0,
         end_line=0,
         start_quote="missing quote",
         end_quote="closes cleanly",
+        claim_quote="alpha lesson concept closes cleanly",
         title="Alpha",
         learning_objective="Understand alpha.",
         facet="alpha",
-        reason="Complete lesson.",
+        concept_family="alpha lesson concept",
+        concept_aliases=["alpha concept"],
         informativeness=0.9,
         topic_relevance=0.9,
         educational_importance=0.9,
@@ -1326,17 +1868,35 @@ def test_boundary_profile_keeps_grounded_clip_with_bad_edge_quote(monkeypatch):
         directly_teaches_topic=True,
         substantive=True,
         factually_grounded=True,
-        topic_evidence_quote="alpha lesson concept closes cleanly",
         self_contained=True,
         is_standalone=True,
-        prerequisite_candidate_ids=[],
-        uncertainty="low",
-        uncertainty_reasons=[],
+        intent_evidence=[{
+            "id": "subject",
+            "q": "alpha lesson concept closes cleanly",
+        }],
     )
+    plan = G._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": "all educational topics",
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": "all educational topics",
+                "requirement": "Teach all educational topics",
+            }],
+        },
+        topics=[proposal],
+    )
+    def healthy_selector(*_args, **_kwargs):
+        nonlocal selector_dispatches
+        selector_dispatches += 1
+        return plan, {}
+
+    monkeypatch.setattr(G, "_call_model", healthy_selector)
     monkeypatch.setattr(
         G,
-        "_call_model",
-        lambda *args, **kwargs: (G._BoundaryPlan(topics=[proposal]), {}),
+        "_audit_pro_boundaries",
+        lambda selected, *_args, **_kwargs: (selected, [], []),
     )
 
     result = G.run_segment_profile(
@@ -1349,6 +1909,10 @@ def test_boundary_profile_keeps_grounded_clip_with_bad_edge_quote(monkeypatch):
     assert result.classification == "green"
     assert result.accepted_count == 1
     assert result.rejection_reasons == []
+    assert selector_dispatches == 1
+    assert len(result.calls) == 1
+    assert "partial_schema_retry_attempt" not in result.calls[0]
+    assert "selector_contract_retry_attempt" not in result.calls[0]
 
 
 def test_production_boundary_selector_keeps_every_candidate_beyond_sixteen(monkeypatch):

@@ -83,6 +83,15 @@ def _manual_plan() -> SearchQueryPlan:
     )
 
 
+def test_search_coverage_normalizes_explicit_numbered_concept_notation() -> None:
+    assert search._search_coverage_tokens(
+        "Fifth Amendment"
+    ) == search._search_coverage_tokens("5th Amendment")
+    assert search._search_coverage_tokens(
+        "Phase II trial"
+    ) == search._search_coverage_tokens("Phase 2 trial")
+
+
 def _ai_json(**overrides) -> str:
     payload = {
         "search_summary": "",
@@ -96,6 +105,47 @@ def _ai_json(**overrides) -> str:
     }
     payload.update(overrides)
     return json.dumps(payload)
+
+
+def test_semantic_query_and_reel_keys_preserve_identity_without_prose_noise() -> None:
+    normalize = query_plan_module.normalize_query
+    cache_key = query_plan_module._cache_key
+    service = object.__new__(ReelService)
+
+    for unicode_value, ascii_value in (
+        ("C♯ generics", "C# generics"),
+        ("C∗-algebra", "C* algebra"),
+        ("A⋆ search", "A* search"),
+        ("Cl− ion", "Cl- ion"),
+    ):
+        assert normalize(unicode_value) == normalize(ascii_value)
+        assert cache_key(unicode_value) == cache_key(ascii_value)
+
+    for left, right in (
+        ("A search", "A* search"),
+        ("C algebra", "C* algebra"),
+        ("Cl ion", "Cl- ion"),
+        ("JavaScript &&", "JavaScript ||"),
+        ("JavaScript ||", "JavaScript ??"),
+    ):
+        assert normalize(left) != normalize(right)
+        assert cache_key(left) != cache_key(right)
+
+    for punctuated, plain in (
+        ("What is Photosynthesis?", "What is Photosynthesis"),
+        ("Explain Gravity!", "Explain Gravity"),
+        ("first-order kinetics", "first order kinetics"),
+        ("input/output", "input output"),
+    ):
+        assert normalize(punctuated) == normalize(plain)
+        assert service._normalize_query_key(punctuated) == service._normalize_query_key(plain)
+
+    assert service._normalize_query_key("Type II diabetes") == (
+        service._normalize_query_key("Type 2 diabetes")
+    )
+    assert service._normalize_query_key("World War II") == (
+        service._normalize_query_key("World War 2")
+    )
 
 
 def test_plan_runs_one_structured_expansion_and_caches_by_normalized_literal(monkeypatch) -> None:
@@ -150,7 +200,7 @@ def test_plan_runs_one_structured_expansion_and_caches_by_normalized_literal(mon
     assert any("exactly one normalized token" in reason for reason in first.rejection_reasons)
     assert any("low-value intent" in reason for reason in first.rejection_reasons)
     assert conn.execute(
-        "SELECT COUNT(*) FROM llm_cache WHERE cache_key LIKE 'search_query_plan:v4:%'"
+        "SELECT COUNT(*) FROM llm_cache WHERE cache_key LIKE 'search_query_plan:v5:%'"
     ).fetchone()[0] == 1
     conn.close()
 
@@ -217,7 +267,7 @@ def test_stale_last_good_plan_survives_transient_model_unavailability(monkeypatc
     good = build_search_query_plan(conn, literal_query="Calculus Basics")
     conn.execute(
         "UPDATE llm_cache SET created_at = '2020-01-01T00:00:00+00:00' "
-        "WHERE cache_key LIKE 'search_query_plan:v4:%'"
+        "WHERE cache_key LIKE 'search_query_plan:v5:%'"
     )
     monkeypatch.setattr(
         query_plan_module.llm_router,
@@ -250,7 +300,7 @@ def test_stale_last_good_plan_survives_invalid_structured_expansion(monkeypatch)
     good = build_search_query_plan(conn, literal_query="Calculus Basics")
     conn.execute(
         "UPDATE llm_cache SET created_at = '2020-01-01T00:00:00+00:00' "
-        "WHERE cache_key LIKE 'search_query_plan:v4:%'"
+        "WHERE cache_key LIKE 'search_query_plan:v5:%'"
     )
     monkeypatch.setattr(
         query_plan_module.llm_router,

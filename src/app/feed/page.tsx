@@ -9,6 +9,7 @@ import { FullscreenLoadingScreen } from "@/components/FullscreenLoadingScreen";
 import { RecallCheck, type RecallAnswerReveal } from "@/components/RecallCheck";
 import { ReelCard } from "@/components/ReelCard";
 import {
+  ApiError,
   COMMUNITY_AUTH_CHANGED_EVENT,
   answerAssessmentQuestion,
   askStudyChat,
@@ -35,6 +36,7 @@ import {
 import { applySearchFeedSettingsToParams, mergeSearchFeedQuerySettings, readSearchFeedQuerySettings } from "@/lib/feedQuery";
 import {
   HISTORY_STORAGE_KEY,
+  LEGACY_TOPIC_HISTORY_STORAGE_KEY,
   normalizeStoredHistoryItems as normalizeHistoryStorageItems,
   readScopedHistorySnapshot,
   type StoredRecallSummary,
@@ -92,6 +94,40 @@ function shouldRefillReadyBuffer(reelCount: number, activeIndex: number): boolea
     && safeIndex % REEL_BATCH_SIZE === 0
     && readyIncludingActive <= REEL_BATCH_SIZE;
 }
+
+function shouldRetryAdaptiveFeedRefresh(error: unknown, signal?: AbortSignal): boolean {
+  if (
+    signal?.aborted
+    || isRequestInterruptedError(error)
+    || (
+      typeof error === "object"
+      && error !== null
+      && "name" in error
+      && error.name === "AbortError"
+    )
+  ) {
+    return false;
+  }
+  if (isTransportError(error)) {
+    return true;
+  }
+  return error instanceof ApiError
+    && (error.status === 408 || error.status === 429 || (error.status >= 500 && error.status <= 599));
+}
+
+async function fetchAdaptiveFeedPageWithRetry(
+  request: Parameters<typeof fetchFeed>[0],
+): Promise<Awaited<ReturnType<typeof fetchFeed>>> {
+  try {
+    return await fetchFeed(request);
+  } catch (error) {
+    if (!shouldRetryAdaptiveFeedRefresh(error, request.signal)) {
+      throw error;
+    }
+  }
+  return fetchFeed(request);
+}
+
 const REEL_SNAP_DURATION_MS = 300;
 const POST_SNAP_COOLDOWN_MS = 30;
 const WHEEL_GESTURE_RELEASE_MS = 220;
@@ -678,6 +714,26 @@ function dropStoredMaterialSession(
     }
   } catch {
     // Do not replace unrelated history when its stored payload is malformed.
+  }
+
+  try {
+    const rawLegacyHistory = window.localStorage.getItem(LEGACY_TOPIC_HISTORY_STORAGE_KEY);
+    if (rawLegacyHistory) {
+      const legacyHistory = JSON.parse(rawLegacyHistory);
+      if (Array.isArray(legacyHistory)) {
+        const nextLegacyHistory = legacyHistory.filter((item) => (
+          !item
+          || typeof item !== "object"
+          || Array.isArray(item)
+          || String((item as Record<string, unknown>).materialId || "").trim() !== normalizedMaterialId
+        ));
+        if (nextLegacyHistory.length !== legacyHistory.length) {
+          safeLocalStorageSetItem(LEGACY_TOPIC_HISTORY_STORAGE_KEY, JSON.stringify(nextLegacyHistory));
+        }
+      }
+    }
+  } catch {
+    // Do not replace unrelated legacy history when its stored payload is malformed.
   }
 
   removeStoredMaterialMapEntry(FEED_SESSION_STORAGE_KEY, normalizedMaterialId);
@@ -4480,7 +4536,7 @@ function FeedPageInner() {
             if (!isSearchScopeActive(searchScope)) {
               return null;
             }
-            pages.push(await fetchFeed({
+            pages.push(await fetchAdaptiveFeedPageWithRetry({
               materialId: id,
               page: pageNumber,
               limit: 25,

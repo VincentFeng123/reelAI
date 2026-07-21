@@ -15,6 +15,18 @@ from typing import Any, Callable, Literal
 
 import numpy as np
 
+from ...concept_families import (
+    CONCEPT_FAMILY_NOISE_TOKENS as SHARED_CONCEPT_FAMILY_NOISE_TOKENS,
+    concept_family_identity_key as shared_concept_family_identity_key,
+    concept_family_identity_tokens as shared_concept_family_identity_tokens,
+    validate_concept_family_labels,
+)
+from ...concept_ordinals import (
+    NUMBERED_CONCEPT_KIND_TOKENS,
+    canonicalize_ordinal_tokens,
+    concept_identifier_indexes,
+)
+from ...concept_tokens import concept_semantic_key
 from ..config import get_settings
 from ..db import (
     LEGACY_LEARNER_ID,
@@ -61,6 +73,7 @@ from .knowledge_level import (
 )
 
 logger = logging.getLogger(__name__)
+
 
 
 def _importance_ranker_enabled() -> bool:
@@ -1225,7 +1238,7 @@ class ReelService:
     # v42: retain Gemini-authoritative clips when boundary refinement is incomplete.
     # v43: join adaptive signals through versioned Gemini concept-family metadata.
     # The separate contract key below invalidates prior inventory under v38.
-    RANKED_FEED_CACHE_VERSION = 43
+    RANKED_FEED_CACHE_VERSION = 44
     RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v38"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
@@ -1269,85 +1282,8 @@ class ReelService:
     NEED_HELP_CONCEPT_STEP = 0.06
     GLOBAL_FEEDBACK_WINDOW = 12
     GLOBAL_FEEDBACK_MIN_ROWS = 3
-    CONCEPT_FAMILY_NOISE_TOKENS = frozenset(
-        {
-            "a",
-            "an",
-            "and",
-            "application",
-            "applications",
-            "applying",
-            "basic",
-            "basics",
-            "common",
-            "definition",
-            "definitions",
-            "demonstration",
-            "derivation",
-            "example",
-            "examples",
-            "explained",
-            "explaining",
-            "explanation",
-            "for",
-            "from",
-            "fundamental",
-            "fundamentals",
-            "identification",
-            "identify",
-            "identifying",
-            "in",
-            "intro",
-            "introduction",
-            "intuition",
-            "intuitive",
-            "misconception",
-            "misconceptions",
-            "of",
-            "on",
-            "overview",
-            "pair",
-            "pairs",
-            "practice",
-            "problem",
-            "problems",
-            "recap",
-            "summary",
-            "the",
-            "to",
-            "using",
-            "via",
-            "with",
-            "worked",
-        }
-    )
-    CONCEPT_FAMILY_ORDINALS = (
-        frozenset({"first", "1st"}),
-        frozenset({"second", "2nd"}),
-        frozenset({"third", "3rd"}),
-        frozenset({"fourth", "4th"}),
-    )
-    CONCEPT_FAMILY_CONTRACT_VERSION = "concept_family_v1"
-    CONCEPT_FAMILY_GENERIC_TOKENS = frozenset(
-        {
-            "concept",
-            "effect",
-            "equation",
-            "formula",
-            "identity",
-            "law",
-            "method",
-            "model",
-            "principle",
-            "process",
-            "relationship",
-            "rule",
-            "system",
-            "theorem",
-            "theory",
-            "topic",
-        }
-    )
+    CONCEPT_FAMILY_NOISE_TOKENS = SHARED_CONCEPT_FAMILY_NOISE_TOKENS
+    CONCEPT_FAMILY_CONTRACT_VERSION = "concept_family_v2"
     def __init__(self, embedding_service, youtube_service=None, ingestion_pipeline=None) -> None:
         settings = get_settings()
         self.embedding_service = embedding_service
@@ -2762,9 +2698,7 @@ class ReelService:
         return " ".join(str(value or "").split()).strip()
 
     def _normalize_query_key(self, value: str) -> str:
-        cleaned = self._clean_query_text(value).lower()
-        tokens = re.findall(r"[a-z0-9\+#]+", cleaned)
-        return " ".join(tokens)
+        return concept_semantic_key(self._clean_query_text(value))
 
     def _concept_topic_query(
         self,
@@ -5406,11 +5340,10 @@ class ReelService:
     @classmethod
     def _concept_family_tokens(cls, title: object) -> tuple[str, ...]:
         """Keep a facet's subject words while discarding its teaching role."""
-        _clean_title, concept_key = normalize_clip_concept_family(title)
         tokens: list[str] = []
-        for raw_token in concept_key.split():
+        for raw_token in shared_concept_family_identity_tokens(title):
             token = raw_token[:-2] if raw_token.endswith("'s") else raw_token
-            if token in cls.CONCEPT_FAMILY_NOISE_TOKENS:
+            if token.casefold() in cls.CONCEPT_FAMILY_NOISE_TOKENS:
                 continue
             if token.endswith("ies") and len(token) > 4:
                 token = token[:-3] + "y"
@@ -5418,78 +5351,27 @@ class ReelService:
                 token = token[:-1]
             if token:
                 tokens.append(token)
-        return tuple(tokens)
-
-    @classmethod
-    def _same_concept_family(cls, left_title: object, right_title: object) -> bool:
-        """Match narrow Gemini facets without merging their persisted identities."""
-        left = cls._concept_family_tokens(left_title)
-        right = cls._concept_family_tokens(right_title)
-        if not left or not right:
-            return False
-        if (
-            not cls._concept_family_identity(left_title)
-            or not cls._concept_family_identity(right_title)
-        ):
-            return False
-        if left == right:
-            return True
-
-        left_tokens = set(left)
-        right_tokens = set(right)
-        left_ordinal = next(
-            (index for index, values in enumerate(cls.CONCEPT_FAMILY_ORDINALS) if left_tokens & values),
-            None,
+        return canonicalize_ordinal_tokens(
+            tokens,
+            numbered_kind_tokens=NUMBERED_CONCEPT_KIND_TOKENS,
         )
-        right_ordinal = next(
-            (index for index, values in enumerate(cls.CONCEPT_FAMILY_ORDINALS) if right_tokens & values),
-            None,
-        )
-        if left_ordinal != right_ordinal and (
-            left_ordinal is not None or right_ordinal is not None
-        ):
-            ordinal_tokens = set().union(*cls.CONCEPT_FAMILY_ORDINALS)
-            shared_subject = (left_tokens & right_tokens) - ordinal_tokens - {
-                "law",
-                "newton",
-            }
-            if len(shared_subject) < 2:
-                return False
-
-        smaller, larger = sorted(
-            (left_tokens, right_tokens), key=lambda values: (len(values), sorted(values))
-        )
-        return len(smaller) >= 2 and smaller.issubset(larger)
 
     @classmethod
     def _concept_family_identity(cls, value: object) -> str:
         """Normalize one model-supplied exact-equivalence label."""
-        tokens = cls._concept_family_tokens(value)
-        if not tokens:
-            return ""
-        token_set = set(tokens)
-        ordinal_tokens = set().union(*cls.CONCEPT_FAMILY_ORDINALS)
-        domain_tokens = (
-            token_set - ordinal_tokens - cls.CONCEPT_FAMILY_GENERIC_TOKENS
-        )
-        if not domain_tokens:
-            return ""
-        return " ".join(tokens)
+        return shared_concept_family_identity_key(value)
 
     @classmethod
     def _concept_family_ordinal_indexes(
         cls, values: list[object] | tuple[object, ...] | set[str]
     ) -> set[int]:
+        # These values are already canonical v2 profile keys. Parse their
+        # whitespace-delimited tokens directly so the internal ordinal_<n>
+        # sentinel survives; raw/model labels go through _concept_family_tokens.
         tokens = {
-            token
-            for value in values
-            for token in cls._concept_family_tokens(value)
+            token for value in values for token in str(value or "").split()
         }
-        return {
-            index
-            for index, ordinal_values in enumerate(cls.CONCEPT_FAMILY_ORDINALS)
-            if tokens & ordinal_values
-        }
+        return set(concept_identifier_indexes(tokens))
 
     @classmethod
     def _persisted_concept_family_profiles(
@@ -5520,19 +5402,16 @@ class ReelService:
             ):
                 continue
             aliases = context.get("concept_aliases")
-            if not isinstance(aliases, list) or len(aliases) > 4:
+            if aliases != []:
+                continue
+            if validate_concept_family_labels(
+                context.get("concept_family"), aliases
+            ) is not None:
                 continue
             family = cls._concept_family_identity(context.get("concept_family"))
             if not family:
                 continue
-            identities = {
-                identity
-                for identity in (
-                    family,
-                    *(cls._concept_family_identity(alias) for alias in aliases),
-                )
-                if identity
-            }
+            identities = {family}
             if len(cls._concept_family_ordinal_indexes(identities)) > 1:
                 continue
             profile_rows[concept_id].append(identities)
@@ -5584,12 +5463,17 @@ class ReelService:
                 return True
             left_profile = profiles.get(concept_id, set())
             right_profile = profiles.get(candidate_id, set())
-            left_ordinals = cls._concept_family_ordinal_indexes(
-                [title, *left_profile]
-            )
-            right_ordinals = cls._concept_family_ordinal_indexes(
-                [candidate_title, *right_profile]
-            )
+            if left_profile and right_profile:
+                # Two trusted v2 AI identities are authoritative. Untrusted
+                # viewer-facing titles may legitimately enumerate members of
+                # one broad concept and must not veto an exact family match.
+                return bool(left_profile & right_profile)
+            left_ordinals = set(concept_identifier_indexes(
+                cls._concept_family_tokens(title)
+            )) | cls._concept_family_ordinal_indexes(left_profile)
+            right_ordinals = set(concept_identifier_indexes(
+                cls._concept_family_tokens(candidate_title)
+            )) | cls._concept_family_ordinal_indexes(right_profile)
             if (
                 len(left_ordinals) > 1
                 or len(right_ordinals) > 1
@@ -5600,8 +5484,6 @@ class ReelService:
                 )
             ):
                 return False
-            if left_profile and right_profile:
-                return bool(left_profile & right_profile)
             left_identity = cls._concept_family_identity(title)
             right_identity = cls._concept_family_identity(candidate_title)
             if left_profile and right_identity in left_profile:
@@ -5610,7 +5492,10 @@ class ReelService:
                 return True
             if left_profile or right_profile:
                 return False
-            return cls._same_concept_family(title, candidate_title)
+            # Without a trusted v2 AI family, fail closed. Lexical subset
+            # matching cannot prove semantic equivalence (for example blood
+            # types A and B) and must never join feedback/mastery histories.
+            return False
 
         return {
             concept_id: {
@@ -6281,20 +6166,10 @@ class ReelService:
             parsed.get("concept_family_contract_version")
             == cls.CONCEPT_FAMILY_CONTRACT_VERSION
             and selection_authority == "gemini"
-            and cls._concept_family_identity(family_text)
-            and isinstance(raw_aliases, list)
-            and len(raw_aliases) <= 4
+            and raw_aliases == []
         ):
-            clean_aliases = [
-                " ".join(str(alias or "").split()).strip()[:96]
-                for alias in raw_aliases
-                if cls._concept_family_identity(alias)
-            ]
-            family_identities = {
-                cls._concept_family_identity(family_text),
-                *(cls._concept_family_identity(alias) for alias in clean_aliases),
-            }
-            if len(cls._concept_family_ordinal_indexes(family_identities)) <= 1:
+            clean_aliases: list[str] = []
+            if validate_concept_family_labels(family_text, clean_aliases) is None:
                 metadata["_selection_concept_family"] = family_text
                 metadata["_selection_concept_aliases"] = clean_aliases
         for source_key, metadata_key in (
@@ -7699,6 +7574,15 @@ class ReelService:
         )
         helpful_value = 1 if helpful else 0
         confusing_value = 1 if confusing else 0
+        saved_value = 1 if saved else 0
+        feedback_changed = existing is None or (
+            int(existing.get("helpful") or 0) != helpful_value
+            or int(existing.get("confusing") or 0) != confusing_value
+            or existing.get("rating") != rating
+            or int(existing.get("saved") or 0) != saved_value
+        )
+        if not feedback_changed:
+            return int(progress.get("feedback_revision") or 0)
         mastery_changed = (
             existing is None
             and (helpful_value > 0 or confusing_value > 0)
@@ -7720,7 +7604,7 @@ class ReelService:
                 "helpful": helpful_value,
                 "confusing": confusing_value,
                 "rating": rating,
-                "saved": 1 if saved else 0,
+                "saved": saved_value,
                 "mastery_updated_at": (
                     timestamp if mastery_changed else (existing or {}).get("mastery_updated_at")
                 ),

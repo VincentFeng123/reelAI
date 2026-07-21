@@ -504,6 +504,601 @@
 - Regression test: Stored `[a,b,c]` with current `[c,b]` now returns `[b,c]`; an empty set stays empty and a mixed unknown set remains unchanged. A production-shaped released feed shuffled as `[third,second,first]` with `first` seen returns `[second,third]`. A two-generation reused-sibling case proves source release `[a,b]`, child release `[c,d]`, and `a` seen returns `[b,c,d]` rather than dropping `c` or `b`. Additional controls prove a legacy source batch is not frozen by a child organizer, unknown stored IDs cannot authorize terminal projection, and a later authoritative empty release hides its raw inventory without disabling an earlier valid organizer order.
 - Exact retest: Pending after deployment on the same fresh-material reload sequence.
 
+### AF-035 — Clean production fallback reverses the user's explicit concept sequence
+
+- Status: Fixed locally; production retest pending
+- Severity: High — every released clip is individually relevant, but the lesson begins at the requested fourth concept and then moves backward to its prerequisites
+- Production reproduction (2026-07-20, after exact GitHub/Railway/Vercel revision verification and a fresh scoped Postgres/Redis clear):
+  1. Submit “Newton's laws: begin with first-law inertia and balanced forces, then net force and F=ma, then free-body diagrams, then third-law action-reaction pairs, and finish with worked problems and common misconceptions.”
+  2. Material `6d16c8bb-95ae-4804-890c-8d8cf49fc852` creates job `15584162-e4a5-4108-93e8-7bdfb9f3ec13` and generation `0253f774-2d2c-4bca-8821-afdd969209ec`.
+  3. Open or reload the released feed.
+- Evidence:
+  - The persisted seven-ID lesson order is three `Newton's third law of motion` clips followed by `Newton's first law`, another first-law example, `net force`, and a final first-law recap.
+  - Durable learner progress contains only the first third-law reel, so the browser did not silently consume or skip a prerequisite reel before displaying it.
+  - The validated inventory contains 13 concept-attributed clips, including first law, net force, second law/F=ma, free-body diagram, and third law. This is an organizer/fallback defect rather than absence of all requested concepts.
+  - Organizer metadata is `degraded=true`, `fallback_reason=invalid_model_order`, and `provider_called=true`; the one schema-valid but semantically invalid model result is immediately replaced by fallback without retrying the organizer step.
+- Expected: The organizer uses the learning request as trusted subject/progression intent while treating it as untrusted for policy or output-format instructions, retries a recoverable schema/semantic ordering failure once, and keeps the explicitly requested concept sequence in any deterministic fallback when the supplied clips support it.
+- Root cause: The organizer does receive the exact material text, but its system contract says to ignore any instruction in every `CLIPS_JSON` field including `topic`. Validation enforces IDs, checkpoints, source chronology, prerequisites, and chain positions, but no requested cross-concept sequence. When Gemini's first order fails that structural validation, `_fallback()` immediately topologically sorts only source/chain/prerequisite edges and uses discovery rank to break independent ties; the first discovered source happened to teach third law.
+- Fix: Organizer contract `lesson_order_v5` now separates `LEARNING_REQUEST_JSON` from untrusted `CLIPS_JSON`: the learning text may supply only subject/scope/emphasis/relative concept order and cannot change policy, IDs, or output rules. A schema or semantic model-order failure retries the same organizer step once with a fresh reservation. If both responses remain structurally invalid, fallback uses the explicit requested concept positions and the last schema-parsed known-ID preference as stable topological priorities while still enforcing source chronology, prerequisites, chains, and overlap filtering. Transient provider/reservation failures retry once; permanent configuration, blocked output, and ordinary `400/401/402/403/404/422` failures do not loop.
+- Regression test: A production-shaped third-law-first candidate batch fails model validation twice yet degrades to first law/inertia → net force → third law while retaining every safe clip and repairing same-source chronology. A first-invalid/second-valid case proves exactly two organizer calls; transient `503` succeeds on attempt two and permanent `400` stops after one. Prompt assertions prove the learner sequence is curriculum intent while injected policy/schema text remains powerless. All 26 lesson-ordering tests and 139 generation-job tests pass.
+- Exact retest: Pending locally, then on a newly cleared production material after deployment verification.
+
+### AF-036 — A balanced-force clip is mislabeled as a third-law action–reaction pair
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — the reel's generated concept and summary teach a common Newton's-third-law misconception as though it were correct
+- Production evidence (material `6d16c8bb-95ae-4804-890c-8d8cf49fc852`, reel `ingest-5313d41c12ec4edd`):
+  - The complete released transcript is: “As you sit in your chair right now, the force of gravity is pulling you down towards the center of the earth, but something called the normal force points straight up with the same magnitude, which is why you remain perfectly still.”
+  - Gemini persisted concept/family `Newton's third law of motion`, summary/match reason “Identify the action-reaction pair of gravity and normal force while sitting,” and takeaway “Action-Reaction Forces in a Chair.”
+  - Gravity and the chair's normal force both act on the seated person. They can balance, but they are not the equal-and-opposite forces on two interacting bodies required by Newton's third law. The selected span never states the claimed action–reaction relationship.
+  - The selector nevertheless marked `directly_teaches_topic=true`, `factually_grounded=true`, and used “normal force points straight up with the same magnitude” as third-law evidence.
+- Expected: Clip concept metadata, summary, and evidence describe only what the selected speech actually and correctly teaches. Equal magnitude/opposite direction alone cannot establish an action–reaction pair; if adjacent context corrects a misconception, the boundary must include that correction or the standalone clip must be omitted/reclassified as balanced forces.
+- Root cause: The selector contract required a literal claim quote but never required that a Newton's-third-law quote establish reciprocal forces between two interacting objects on different bodies. The final Pro audit could repair word boundaries but inherited the selector's concept family, aliases, title, and evidence, so the model's unsupported semantic label survived both validation stages.
+- Fix: The selector contract now explicitly distinguishes same-body balanced forces from two-body third-law pairs. The final Pro audit must independently return the corrected title, facet, family, aliases, directness, and constraint evidence, and those fields are validated against the selected speech before replacing the selector metadata. A malformed or semantically invalid audit response retries that audit step once; exhaustion safely retains the grounded selector result rather than partially applying an invalid repair.
+- Regression test: A production-shaped chair/gravity/normal-force transcript is reclassified as balanced forces/static equilibrium, while a skater pushing a wall remains a valid two-object third-law pair. Contract tests also cover missing/duplicate audit IDs, bad semantic evidence, first-invalid/second-valid recovery, and twice-invalid exhaustion. The consolidated selector, audit, Gemini, routing, and budget matrix passes all 861 tests.
+- Exact retest: Pending on a clean deployed feed against this transcript plus a valid two-object third-law control.
+
+### AF-037 — Continuation releases a clip that fully contains an earlier released clip
+
+- Status: Fixed locally; production retest pending
+- Severity: High — scarce subsequent-batch inventory repeats already released teaching instead of covering F=ma, free-body diagrams, problems, or misconceptions
+- Production evidence (material `6d16c8bb-95ae-4804-890c-8d8cf49fc852`):
+  - Initial generation `0253f774-2d2c-4bca-8821-afdd969209ec` releases reel `ingest-2e6567bea1d94dec` from YouTube source `LQyFshgm-hU` at `38.5–60.4`.
+  - Automatic continuation generation `88dc22f1-0677-4a94-a7cb-191ccf40cb96` releases reel `ingest-51075adacb8e452e` from the same source at `38.5–113.3`.
+  - The continuation span contains 100% of the earlier span. The cumulative feed reports eight ready reels even though the eighth substantially repeats the earlier first-law example.
+- Expected: Duplicate/overlap control applies across the complete released generation chain, including reused deferred inventory, so a continuation cannot append a same-source span that substantially contains an earlier released span.
+- Root cause: Organizer overlap filtering is generation-local. The one-clip continuation organizer cannot compare its reused clip with source-generation releases, and authoritative chain assembly concatenates generation release IDs without a cumulative temporal-overlap check.
+- Fix: Authoritative root-to-child release assembly now applies the existing 80%-of-shorter same-source overlap rule cumulatively. The first released span wins, watched filtering cannot resurrect its overlapping child, and persisted prerequisite/chain metadata protects genuine dependent lesson steps from deduplication.
+- Regression test: The exact `38.5–60.4` source span followed by the `38.5–113.3` child releases only the first; a later non-overlapping same-source clip and an explicitly protected overlapping chain both remain. The complete generation-job file passes 139 tests.
+- Exact retest: Pending with the exact nested spans and a non-overlapping same-source continuation control.
+
+### AF-038 — Rejected cursor recovery has no fresh branch after expansion fallback
+
+- Status: Fixed locally; production retest pending
+- Severity: High — the code catches the provider failure but still exhausts the curriculum without making a recovery search
+- Production evidence (continuation job `49551839-83b4-4641-99a6-abfc51cb5d0c`):
+  - The bounded Gemini expansion step is invoked twice, proving its new retry executes.
+  - Both attempts fail the focused-query contract and fall back to the single literal long Newton request.
+  - Supadata rejects that request's continuation token with `400`; Railway logs “continuing another query branch,” but provider usage contains exactly one Supadata search call and no later branch.
+  - The job ends `exhausted` with zero reels. Final visible coverage remains three third-law, four first-law, and one net-force reel, while F=ma, free-body-diagram, worked-problem, and misconception coverage is absent.
+- Expected: A recoverable discovery-branch failure causes a bounded step-level retry/recovery even when query expansion produced only the literal fallback. The failed opaque token is never replayed, while permanent request/auth/quota failures remain terminal.
+- Root cause: Invalid-cursor handling can advance only to an already-existing independent query. When expansion falls back literally, the queue is empty after isolating that cursor, so “continue another branch” performs no provider call and cannot recover.
+- Fix: A rejected opaque cursor may now enqueue bounded fresh, deterministic component queries only when the twice-attempted Gemini expansion fell back literally. Each recovery query is anchored to the literal colon-delimited governing subject, strips only sequencing words, never replays the rejected token, and runs one at a time under the existing provider budget. AI-validated independent branches retain priority; unrelated `400`s still propagate.
+- Regression test: The exact long Newton request with literal-only expansion, one consumed result, and one invalid cursor makes a fresh `Newton's laws first-law inertia` request without a token and returns unseen inventory. A companion assertion proves every extracted Newton component remains subject-grounded. All 78 practice-fast retrieval tests pass.
+- Exact retest: Pending with a literal-only expansion, rejected cursor, and recoverable fresh inventory on the fallback branch.
+
+### AF-039 — Recoverable clip-pipeline step failures are not retried consistently
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — a single transient provider/preflight/database failure can discard a relevant source, preserve a poorer boundary, or lose already-paid clip analysis
+- Code reproductions:
+  - The production Pro transcript selector passes `max_retries=0` while the Gemini SDK is also configured for one physical attempt, so a transient transport/408/429/5xx failure drops that source immediately.
+  - The final Pro boundary audit also passes `max_retries=0` and fail-opens to the unaudited cut after one recoverable outage.
+  - Gemini `countTokens` preflight makes one raw HTTP request; a transient preflight error prevents the selector dispatch.
+  - Supadata search/transcript HTTP loops contain correct bounded retries, but each physical attempt consumes the shared operation budget. Normal slow mode starts three transcripts with a budget of three, so one source's documented retry can be blocked before its second request.
+  - Per-clip Postgres persistence performs one whole transaction and has no retry for known transient connection/serialization/deadlock errors; the caller then skips the analyzed clip.
+- Expected: Every recoverable external step retries itself once or within its existing bounded policy, with cancellation/deadline checks and accurate physical-attempt telemetry. Permanent validation, configuration, authentication, quota, and ordinary 4xx errors do not loop. A logical operation reserves its capacity once even when that same operation performs a physical retry.
+- Root cause: Retry behavior was implemented independently per adapter, several active Pro call sites explicitly disabled it, Supadata charged physical attempts against logical-work capacity, and database mutations lacked a shared typed transient classifier plus replay-safe identities. Job `max_attempts=2` is lease recovery, not a substitute for retrying the failed provider or transaction step itself. Gemini retry telemetry also settled a logical reservation to only the successful final response, dropping the unknown billing exposure of earlier physical attempts.
+- Fix: The production code now retries the exact recoverable step once (or the adapter's existing bounded poll policy) with cancellation/deadline checks: Gemini CountTokens, Pro selection, partial/whole structured selection, final semantic/boundary audit, lesson ordering, Supadata search/transcript requests and malformed responses, per-clip persistence, generation worker writes, request-entry material/generate/feed transactions, adaptive feedback/progress/scroll/quiz transactions, and terminal status writes. Logical provider capacity is reserved once while every physical attempt is telemetered; unknown earlier Gemini attempts retain their worst-case billing exposure. Database retries use fresh transactions, stable material/chunk/job/usage/feedback/assessment identities, and convergence checks so they do not rerun extraction, embeddings, retrieval, Gemini, quota reservations, organizer work, or committed adaptive mutations. Permanent auth/configuration/validation/integrity failures, ordinary non-retryable 4xx responses, valid empty results, cancellation, and expired deadlines remain single-shot.
+- Regression test: Focused tests inject recoverable-first/permanent-first failures, malformed 2xx provider payloads, exhausted structured retries, definite PostgreSQL aborts, and lost commit acknowledgements. They prove recovery without duplicate clips, jobs, chunks, feedback revisions, quiz outcomes, provider usage, quota reservations, or model/retrieval calls. Final local results are `2549 passed, 1 skipped, 40 subtests passed` for the active backend collection and `654 passed` for the eligible pipeline collection.
+- Exact retest: Local regression is complete; exact deployed-revision verification, production state clear, and the clean live adaptive-feed matrix remain pending.
+
+### AF-040 — Legacy boundary-curation fixtures omit required concept families
+
+- Status: Fixed locally
+- Severity: Release blocker in verification — production concept enforcement is correct, but a separate pipeline collection cannot reach its boundary regressions
+- Reproduction: Run `backend/pipeline/tests/test_gemini_segment_curation.py` after concept-family enforcement. Eleven tests fail while converting their shared legacy proposal because it explicitly supplies `concept_family=""`; the boundary logic under test never runs.
+- Root cause: The shared `_topic()` fixture predates per-clip concept metadata. `_BoundaryTopic` retains an empty default only for non-live compatibility, but serializing that fixture turns the absent default into an explicitly invalid blank value when a stricter proposal model validates it.
+- Fix: The shared test builders now emit a nonblank family derived from each fixture's facet and an explicit alias list; the forty-candidate output-budget fixture supplies its own domain-qualified family. Production validation is unchanged and still rejects missing or blank live concept metadata.
+- Exact retest: Focused curation regressions pass, and the full eligible pipeline collection passes (`646 passed`). Two unrelated collections remain excluded because their optional runtime dependencies (`sse_starlette` and `faster_whisper`) are not installed.
+
+### AF-041 — Required concept metadata can exhaust the compact selector output cap
+
+- Status: Fixed locally
+- Severity: High — an exhaustive valid selector response can truncate before returning all relevant clips
+- Reproduction: Serialize the maximum forty realistic compact boundary candidates with the new required concept-family field. The response is approximately 5,349 tokens; adding the contract's existing 1,024-token hidden-reasoning/safety margin exceeds the old 6,000-token output cap.
+- Root cause: The live compact schema gained required per-clip family metadata, but its provider output ceiling remained sized for the older payload.
+- Fix: Raise only the compact boundary-selector ceiling from 6,000 to 6,400 tokens. The maximum candidate count, prompt, retry count, selection behavior, and separate Pro/audit ceilings are unchanged.
+- Exact retest: The forty-candidate serialization/cap assertion passes, and the consolidated Gemini/selector/provider group passes (`933 passed, 3 subtests passed`).
+
+### AF-042 — Retrying material persistence can publish the uploaded file twice
+
+- Status: Fixed locally
+- Severity: Medium — the database converges, but a transient failure after object publication can leave an orphaned duplicate upload
+- Reproduction: Submit an idempotency-keyed text file and inject PostgreSQL `40001` on the first `materials` upsert. Storage publication occurs before that upsert; the fresh transaction then calls UUID-keyed `save_bytes()` a second time.
+- Root cause: The retry closure kept `source_path` outside the transaction but did not check whether the first attempt had already populated it.
+- Fix: Publish only while `source_path` is unset and reuse that exact path on the fresh-transaction retry. The idempotency row lock still fences ownership, and provider extraction/embeddings remain outside the retry.
+- Exact retest: The file-upload fault injection passes inside the generation/assessment/material group (`185 passed`), proving two database attempts, one provider pass, one object publication, and one persisted material path.
+
+### AF-043 — A schema-clean retry can erase a valid salvaged clip
+
+- Status: Fixed locally
+- Severity: Critical — retrying malformed Gemini output can reduce a relevant nonempty result to no clips
+- Reproduction: First Pro selector response contains one malformed candidate and one valid sibling; the retry returns a schema-clean empty `topics` list. The old comparison scores fewer schema errors before valid-topic count, so `(0 errors, 0 clips)` replaces `(1 error, 1 clip)`.
+- Root cause: Partial-response retry quality was ordered by schema cleanliness first, even though the retry exists to recover candidates and must never discard already validated inventory.
+- Fix: Validate both attempts independently, merge surviving proposals by stable `candidate_id`, let a valid retry repair the same ID, append new retry-only candidates up to the existing forty-item cap, and retain first-attempt candidates omitted by a partial or empty retry. Incompatible request intent is never merged.
+- Exact retest: The consolidated Gemini/selector/provider group passes (`933 passed, 3 subtests passed`), including valid recovery, same-ID repair, retry-only append, repeated-malformed exhaustion, and clean-empty retry controls.
+
+### AF-044 — Empty or truncated Gemini success responses are not retried
+
+- Status: Fixed locally
+- Severity: High — a recoverable 2xx provider response can discard a source without rerunning the failed selection/audit step
+- Reproduction: Gemini returns `finish_reason=MAX_TOKENS` or blank response text while the caller allows one retry. The client immediately raises a typed error after one physical request; only transport exceptions use the retry loop.
+- Root cause: Response-contract validation occurred after the transport retry branch and raised directly instead of classifying malformed successful responses as recoverable.
+- Fix: Empty and truncated responses now consume the caller's same bounded retry allowance, preserve physical-attempt/error telemetry, and respect cancellation and the shared deadline. Safety, recitation, and blocklist finishes remain permanent and single-shot.
+- Exact retest: The consolidated Gemini/selector/provider group passes (`933 passed, 3 subtests passed`), including first-invalid/second-valid recovery, twice-invalid exhaustion, and permanent blocked-output controls.
+
+### AF-045 — Timestamped Supadata cues with no speech text bypass malformed-response retry
+
+- Status: Fixed locally
+- Severity: High — a malformed 2xx cue list becomes a terminal no-transcript result instead of retrying the transcript step
+- Reproduction: Supadata returns a cue with valid offset/duration but missing or whitespace-only `text`. Contract validation accepts it, normalization drops it, and the source ends as unavailable after one request.
+- Root cause: The provider contract validated cue shape and timing but not the spoken-text field.
+- Fix: A nonempty cue list now requires normalized nonblank text in every cue and uses the existing malformed-2xx retry path. A genuinely empty `content=[]` remains a valid no-speech result and is not retried.
+- Exact retest: The consolidated Gemini/selector/provider group passes (`933 passed, 3 subtests passed`), including blank-cue recovery and the existing valid-empty no-speech control.
+
+### AF-046 — A transient lease-check outage suppresses the database retry it guards
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — the worker abandons a recoverable transaction instead of making its promised fresh-connection attempt
+- Reproduction: The worker transaction fails with typed transient PostgreSQL error, then `retry_should_stop` checks lease state through the same unavailable database and raises another transient error. The wrapper propagates the guard failure before attempt two.
+- Expected: Local cancellation/stop state aborts immediately; a transient failure to refresh durable stop state must not consume the one bounded transaction retry.
+- Root cause: The retry guard is itself an unchecked database call.
+- Fix: The transaction wrapper now treats only a typed transient failure from the durable lease check as an unavailable observation and proceeds with its one remaining fresh-connection attempt. Local stop/cancellation and permanent guard failures still abort immediately.
+- Exact retest: Generation/assessment/material focused regression group passes (`185 passed`), including transient-guard recovery, permanent-guard failure, and local-stop controls.
+
+### AF-047 — An unrelated adaptation revision can make feedback retry drop this reel's signal
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — “Got it” or “Need help” can return success without applying the requested concept signal
+- Reproduction: First feedback transaction rolls back after obtaining its attempted global revision; before retry, a different feedback or quiz mutation increments `feedback_revision`. Retry sees `current_revision >= attempted_revision` and skips this reel write even though the exact payload never committed.
+- Root cause: Replay convergence uses a material-global revision rather than the exact reel/learner feedback identity.
+- Fix: A retry always replays the exact reel/learner feedback payload through the existing idempotent `record_feedback` path; it no longer infers that this write committed from a material-global revision.
+- Exact retest: Generation/assessment/material focused regression group passes (`185 passed`), including an unrelated intervening adaptation revision and exact duplicate replay.
+
+### AF-048 — Gemini retry accounting can exceed the advertised hard job-cost ceiling
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — truthful post-call accounting can report more provider exposure than the admission guard permits
+- Reproduction: Admit a roughly $0.90 selector reservation under a $1.00 job cap, then reconcile one earlier unknown physical attempt plus a successful final attempt. Committed exposure becomes roughly $1.80 because retry exposure was added only after dispatch.
+- Root cause: One-attempt worst-case cost is admitted before the call, while physical retry exposure is retained only during reconciliation.
+- Fix: Retry/failover-capable Gemini operations reserve the full bounded physical-attempt envelope before dispatch while consuming one logical selector slot. Settlement releases unused contingency on a healthy first attempt and retains worst-case exposure for earlier attempts whose token billing is unknown.
+- Exact retest: The consolidated Gemini/selector/provider group passes (`933 passed, 3 subtests passed`), including hard-cap admission, retry settlement, and a five-selector healthy cohort that admits without waiting.
+
+### AF-049 — Ambiguous setup commit can fail a generation before provider work begins
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — a lost PostgreSQL commit acknowledgement terminalizes a recoverable job as failed
+- Reproduction: The worker setup transaction creates/attaches a generation and commit raises typed `08xxx`. Conservative unknown-commit handling refuses replay; the outer handler then attempts `generation_failed` terminalization regardless of whether setup committed.
+- Root cause: Setup lacks a stable preallocated generation identity and convergence lookup, so it is treated unlike replay-safe API entry transactions.
+- Fix: Worker setup preallocates one stable generation ID and attaches that same ID idempotently, allowing the setup transaction alone to converge after an ambiguous commit acknowledgement.
+- Exact retest: Generation/assessment/material focused regression group passes (`185 passed`), including committed and rolled-back ambiguous-ack controls that assert one generation identity and no provider replay.
+
+### AF-050 — Final audit accepts extra unknown candidate decisions
+
+- Status: Fixed locally; production retest pending
+- Severity: High — a response violating the exact-one-decision-per-candidate contract is treated as authoritative
+- Reproduction: Audit returns one valid expected ID plus one valid unknown ID. Unknown items are ignored and validation compares only the resolved expected-ID set, so no contract retry occurs.
+- Root cause: Contract validation does not require exact item count, exact ID set, and one occurrence of every expected ID simultaneously.
+- Fix: Audit acceptance now requires an exact one-to-one candidate-ID set, exact item count, and one decision for every expected candidate. Any extra, missing, or duplicate ID gets one bounded contract retry; exhaustion retains the untouched selector plan.
+- Exact retest: The consolidated Gemini/selector/provider group passes (`933 passed, 3 subtests passed`), including extra-ID recovery and twice-invalid exhaustion controls.
+
+### AF-051 — Invalid or overbroad concept families fail only during persistence
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — paid selection/audit work can be discarded and numbered laws can be semantically merged
+- Reproduction: Selector/audit accepts a blank-domain family such as `first law`, conflicting aliases such as first-law family plus second-law alias, or a broad `Newton's laws of motion` family for speech about exactly one numbered law. Persistence later rejects some forms, while broad forms can collapse distinct laws.
+- Root cause: Gemini-boundary normalization checks nonblank syntax but does not apply persistence-compatible identity safety or same-ordinal cross-field consistency.
+- Fix: Selector and audit contracts now validate persistence-compatible, domain-qualified families and aliases before conversion, and require numbered-law ordinals to agree with the candidate's grounded semantic fields. A genuinely multi-law unit may retain a broad family; a single-law unit may not.
+- Exact retest: The consolidated Gemini/selector/provider group passes (`933 passed, 3 subtests passed`), including blank-domain, conflicting-ordinal, single-law broad-family, valid atomic-family, valid multi-law, and persistence controls.
+
+### AF-052 — Trusted live Pro selection bypasses request-intent validation
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — schema-valid clips can answer a different or incomplete learning request
+- Reproduction: Live Pro returns an `exact_request` different from user input or omits required request constraints. The trusted compact path proceeds directly to audit/report without invoking the existing intent-contract validator.
+- Root cause: `_validated_intent_constraints()` is wired for other conversion paths but not the live trusted Pro selector boundary.
+- Fix: The trusted live Pro path validates `exact_request`, grounded request coverage, joint/comparison structure, and retry-intent compatibility before audit. An invalid contract gets one bounded retry and fails closed to no candidates after repeated invalid intent.
+- Exact retest: The consolidated Gemini/selector/provider group passes (`933 passed, 3 subtests passed`), including wrong-request recovery, incomplete joint intent, incompatible retry intent, and twice-invalid fail-closed controls.
+
+### AF-053 — A factual-correction guard is phrased as Newton-specific production policy
+
+- Status: Fixed locally; production retest pending
+- Severity: High — the chair-force regression is covered, but a one-domain prompt patch does not protect analogous semantic-role errors in biology, chemistry, mathematics, law, or other subjects
+- Reproduction: Inspect the new selector/audit instructions and fallback token normalization. They explicitly name Newton, force pairs, and `motion`/`newton` tokens instead of expressing the underlying invariant: every defining relation, participant, direction, role, and domain identity must be entailed by the returned speech.
+- Root cause: The first correction encoded the observed physics example rather than the domain-independent semantic-entailment rule that the example violated.
+- Fix and exact retest: Production prompts now require every defining relation, participant, direction, role, and domain identity to be entailed by the returned speech. Newton remains only a regression example; biology, chemistry, mathematics, software, and law controls pass in the selector contract.
+
+### AF-054 — Numbered-concept isolation stops at fourth
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — selector validation, persistence admission, and adaptive normalization can merge a single higher- or lower-ordinal law into a broad family
+- Reproduction: A clip titled `Kepler's fifth law` with family `Kepler's laws` or `Asimov's zeroth law` with family `Asimov's laws of robotics` bypasses the first-through-fourth-only checks. Equivalent fixed maps exist in selection, persistence, adaptation, and ordering. Common variants also fragment: `5th`/`fifth`, `Type II`/`Type 2`, `Phase II`/`Phase 2`, and `law number two`/`second law`.
+- Root cause: Ordinal normalization was implemented as a four-entry case table instead of a bounded domain-independent ordinal parser shared in behavior across all three layers.
+- Fix and exact retest: One shared strong-grammar ordinal normalizer now handles zeroth, arbitrary numeric/word/compound ordinals, and context-bound cardinal/Roman labels across selector, persistence, adaptation, and ordering. Fifth/zeroth/21st/101st, Type/Phase/World-War forms, rate/count controls, and genuine multi-concept families pass.
+
+### AF-055 — Lesson ordering retries ordinary permanent 4xx responses
+
+- Status: Fixed locally; production retest pending
+- Severity: High — a permanent provider rejection consumes a second request and can lengthen a failed generation step without any chance of recovery
+- Reproduction: `_ordering_failure_is_retryable()` returns true for status 409 or 418 because it excludes only a short hand-picked 4xx set; ordering telemetry applies the same classification.
+- Root cause: The allowlist was expressed as selected permanent codes instead of the universal retry policy: statusless transport failures, 408/429, and 5xx only.
+- Fix and exact retest: Ordering now retries only statusless transport failures, 408/429, and 5xx responses. Permanent 409/418 errors stay single-dispatch, transient controls recover within the bounded retry, and the healthy ordering path remains one call.
+
+### AF-056 — Equivalent selector retries become incompatible when Gemini renames constraint IDs
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — a valid retry can repair or add clips for the same request yet be discarded because an arbitrary model-local identifier changed
+- Reproduction: First and second selector attempts return the same exact request, constraint kind, grounded source phrase, and requirement, but call the constraint `subject` and `topic` respectively. Both contracts validate independently; their signatures differ only by ID, so retry inventory is not merged.
+- Root cause: Retry compatibility treats model-authored constraint IDs as semantic identity even though the prompt requires uniqueness, not a deterministic naming scheme.
+- Fix and exact retest: Retry compatibility now compares canonical constraint content, constructs an unambiguous retry-to-first ID map, and remaps evidence before inventory merge. Equivalent renamed retries recover; genuinely changed or ambiguous intent remains rejected.
+
+### AF-057 — Lesson ordering retries permanently blocked Gemini finishes
+
+- Status: Fixed locally; production retest pending
+- Severity: High — safety, recitation, or blocklist output consumes a second provider request even though retry is forbidden and cannot make the same step valid
+- Reproduction: The ordering adapter records the finish reason but classifies blank blocked output as `GeminiEmptyResponseError`; the general response-contract retry path dispatches again.
+- Root cause: The hand-rolled ordering call does not convert permanent blocked finish reasons to `GeminiBlockedResponseError` before empty/truncated-response handling.
+- Fix and exact retest: Ordering classifies shared blocked finish reasons before empty/truncated handling. SAFETY, RECITATION, and BLOCKLIST controls remain single-dispatch, while genuinely empty or truncated responses retain one bounded recovery attempt.
+
+### AF-058 — Cursor recovery loses the subject for colonless natural requests
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — fresh recovery branches can search generic facet phrases in the wrong domain
+- Reproduction: `Teach cellular respiration, begin with glycolysis, then the Krebs cycle, then oxidative phosphorylation and ATP yield` produces recovery branches such as `the Krebs cycle`, `oxidative phosphorylation`, and `ATP yield` without the `cellular respiration` anchor. Existing controls cover only a `subject: ordered facets` prompt shape.
+- Root cause: Subject extraction recognizes only text before a colon; comma-separated and natural sequence phrasing are split directly into independent queries.
+- Fix and exact retest: Recovery derives a bounded subject anchor from natural teaching/sequence syntax and carries it into every facet branch without a domain keyword table. Biology, software, law, colon-delimited, and simple-query controls pass.
+
+### AF-059 — Retry-cost reservations serialize healthy selector-to-audit flow
+
+- Status: Fixed locally; production latency retest pending
+- Severity: Critical — the new accounting can delay a healthy audit behind unrelated in-flight selectors before any failure occurs, violating the no-streaming-regression requirement
+- Reproduction: Three Slow selectors reserve their two-attempt envelopes concurrently. After the first settles at ordinary usage, its audit's two-attempt envelope cannot fit under the $1.50 job cap until peer selectors settle, so the audit waits despite a completely healthy selector and provider.
+- Root cause: Reserving every operation's full retry envelope independently at dispatch protects the hard cap but ignores the interleaved selector→audit dependency graph; downstream healthy work competes with contingency held by unrelated upstream calls.
+- Fix and exact retest: Provider admission reserves one physical attempt at a time and admits retry/failover attempts only when they are actually needed, retaining unknown exposure while releasing healthy first-attempt capacity. The interleaved three-selector→first-audit test, one-attempt release, retry hard-cap, and accounting suites pass; live timing remains gated against the 115.312-second baseline.
+
+### AF-060 — Concept normalization erases meaning-bearing attached symbols
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — feedback or quiz mastery for one programming language can change the frequency/difficulty of another
+- Reproduction: Fresh persistence identities for `C memory management`, `C++ memory management`, and `C# memory management` collide; `A* search algorithm` collides with `A search algorithm`; and charged species such as `Cl−`/`Cl` or `e−`/`e` collide. Selector/order tokenization drops the same meaningful attached symbols.
+- Root cause: Concept token regexes preserve letters and apostrophes but discard language-, algorithm-, notation-, and charge-defining `+`, `#`/`♯`, `*`, and terminal `-`/`−` before deterministic persistence and adaptive-family matching.
+- Fix and exact retest: The shared semantic tokenizer preserves meaning-bearing attached suffixes, normalizes safe Unicode sharp/minus/star variants, and still treats prose hyphens/punctuation as separators. C/C++/C#/C♯, A*/A, and Cl−/Cl remain distinct and aligned across search, selector, persistence, serving, and ordering.
+
+### AF-061 — Adaptive frontend rerank silently stops after one transient fetch failure
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — accepted thumbs or quiz feedback may not change the visible/subsequent reel inventory even though the signal persisted
+- Reproduction: Make the rerank feed request return one transient 503. The callback catches the failure to `null`, performs one request, preserves the stale unseen tail, resolves without a UI error, and never retries. Feedback and completed-quiz flows both depend on this callback.
+- Root cause: The adaptive rerank caller has no bounded response-aware retry, while the shared fetch layer does not retry feed requests.
+- Fix and exact retest: Adaptive rerank retries the identical request once only for transport, 408, 429, or 5xx failures; aborts and permanent 4xx responses remain single-shot. Frontend controls prove recovery, a two-attempt ceiling, and one healthy request with no added delay.
+
+### AF-062 — Ordinal normalization mistakes rate units such as “per second” for numbered concepts
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — valid scientific concepts can be rejected or split because an ordinary time unit is interpreted as an ordinal identifier
+- Reproduction: A valid `radioactive decay law` proposal whose evidence says `probability per second` is flagged as a second-law mismatch. The proximity rule also turns ordinary counts such as `Asimov's 3 laws`, `top 10 principles`, and `systems of 3 equations` into third/tenth numbered concepts.
+- Root cause: Numbered-concept detection uses broad token proximity instead of local numbered-label grammar, so rate units and `value → plural kind` counts masquerade as identifiers.
+- Fix and exact retest: The shared parser recognizes only explicit ordinals and strong local numbered-label grammar, not rate units, later quantities, or value-before-plural counts. Second Law/law 2/2nd Amendment/Type II plus zeroth, fifth, compound, list, and rate-law controls pass across every consumer.
+
+### AF-063 — Concept normalization collapses operator concepts
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — thumbs/quiz signals for distinct programming or mathematical operators can share one concept identity
+- Reproduction: `JavaScript && operator`, `JavaScript || operator`, and `JavaScript ?? operator` normalize identically; so do `C bitwise &`/`C bitwise |` and `Swift String?`/`Swift String`.
+- Root cause: Concept lexers preserve selected terminal symbols but discard standalone operator tokens and attached nullability/operator markers before selector validation, deterministic persistence, and adaptive matching.
+- Fix and exact retest: One shared tokenizer preserves bounded operator runs and attached notation while query prose still drops sentence punctuation. `&&`/`||`/`??`, `&`/`|`, `String?`/`String`, arithmetic/comparison, and ordinary-punctuation controls remain distinct or equivalent as intended across all layers.
+
+### AF-064 — Search-plan and feed query cache keys erase symbol identity
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — a cached acquisition plan for one concept can be reused for a distinct symbol-bearing concept before clip selection begins
+- Reproduction: `A*`/`A`, `C*-algebra`/`C algebra`, and `Cl-`/`Cl` currently produce identical search-plan and reel-service query keys, while equivalent `C♯`/`C#` spellings split into different keys.
+- Root cause: Search-plan and feed-query cache normalization use separate alphanumeric-only tokenizers instead of the concept identity contract used downstream.
+- Fix and exact retest: Search-plan and feed cache identities now use the shared semantic-token normalizer without rewriting raw provider queries. Meaning-bearing symbols remain distinct and safe Unicode/ASCII notation variants converge in cache-key regressions.
+
+### AF-065 — Unicode star notation collapses into the plain concept
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — mathematically equivalent Unicode notation fragments while distinct plain concepts inherit its feedback/mastery
+- Reproduction: `C∗-algebra` and `C⋆-algebra` collapse to `C algebra`, and `A∗ search` collapses to `A search`, even though ASCII `C*`/`A*` remain distinct after the partial symbol fix.
+- Root cause: NFKC does not fold U+2217 or U+22C6 to ASCII `*`, and the mirrored tokenizers do not translate them explicitly.
+- Fix and exact retest: Common sharp, minus, and star glyphs are translated once in the shared contract. Unicode and ASCII spellings converge, remain distinct from symbol-free concepts, and pass across identity, persistence, cache, and adaptive consumers.
+
+### AF-066 — Roman normalization rejects valid higher numeral symbols after losing case evidence
+
+- Status: Fixed locally; production retest pending
+- Severity: High — common named concepts such as `Super Bowl LVIII` and `Chapter XL` fragment from numeric equivalents
+- Reproduction: The current Roman parser accepts only I/V/X characters to avoid interpreting ordinary lowercase words such as `div` and `mix`; consequently canonical uppercase `LVIII` and `XL` are never normalized.
+- Root cause: Callers case-fold tokens before Roman parsing, discarding the uppercase-form evidence that distinguishes conventional Roman labels from ordinary words and product letters.
+- Revised finding: Global uppercase-Roman conversion is unsafe: ordinary acronyms such as `Washington DC`, `CI pipeline`, `IV therapy`, and `MI treatment` look like valid numerals. Case alone cannot prove semantic identity.
+- Fix and exact retest: Roman/Arabic conversion now requires strong local numbered-label grammar; ambiguous bare acronyms and numerals remain lexical. Type I/II, World War II, Chapter XL, Type-C/100, Model-X/10, acronym, and mismatch controls pass without alias inference.
+
+### AF-067 — Non-ordinal numeric identities can merge across concepts
+
+- Status: Fixed locally under the canonical-only AI contract; production retest pending
+- Severity: Critical — adaptive signals can cross-contaminate named entities such as Apollo missions, software versions, formulas, or route numbers
+- Reproduction: Selector validation accepts family `Apollo 11 mission` with alias `Apollo 13 mission`; broad families also erase `Windows 11`, `Formula 1`, and `Highway 101` identifiers.
+- Root cause: Family safety compares only ordinal identifiers, so standalone numeric identifiers outside a finite numbered-kind vocabulary are neither retained nor compared.
+- Revised finding: Repetition in title/facet does not prove identity: valid worked units such as `x=5`, a derivative at `x=2`, and rolling a `6` repeat the result or input while correctly belonging to a broader concept family.
+- Fix and exact retest: Canonical AI labels retain raw numeric runs in their stable identity, aliases are empty, and deterministic code no longer guesses broad/narrow semantic equivalence. Apollo 11/13, Windows 10/11, Python 3.11/3.12, Highway 101/102, Formula 1/2, worked-value, probability, pH, level, and acronym controls pass.
+
+### AF-068 — Semantic operator identity changes with whitespace and drops common math symbols
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — equivalent mathematical requests fragment while distinct operators collapse before search, selection, persistence, ordering, and adaptation
+- Reproduction: `x+y` and `x + y` produce different keys; `x-y`, `x/y`, and `x y` can collapse; attached `*` and `->` also vary with spacing; Unicode relations/set operators such as `≥`, `∩`, and `∪` disappear.
+- Root cause: The shared lexer still models selected symbols as word suffixes and treats hyphen/slash as unconditional prose separators instead of scanning bounded operators with operand context.
+- Fix and exact retest: Operators are tokenized independently of spacing with safe Unicode equivalence and conservative operand context for hyphen/slash. Spaced/unspaced parity, cross-operator distinction, prose compounds, and every downstream consumer pass.
+
+### AF-069 — Inferred numeric lists and lowercase Roman words create false concept IDs
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — worked-example quantities and ordinary words can be persisted as ordinal families, while adaptive signals split or contaminate unrelated concepts
+- Reproduction: `solve 1 or 2 equations` and `top 1 and 2 principles` become first/second identifiers; lowercase `chapter mix` becomes Roman 1009; standalone inference also treats `Python 3.12` as identifiers 3 and 12.
+- Root cause: Prefix-list and standalone-number heuristics infer semantic identity from surface numbers, and Roman parsing ignores the strong uppercase-form evidence needed before numbered-label grammar.
+- Fix and exact retest: Numeric-before-plural and standalone-ID inference were removed; raw numbers remain lexical and Roman conversion requires strong label grammar. Explicit ordinals, kind→number/list, Type II, Chapter XL, World War II, count/value, and numeric distinction controls pass.
+
+### AF-070 — Case folding and compatibility normalization merge scientific identities
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — searches, persisted concepts, and learner signals can cross between chemically or mathematically distinct notation
+- Reproduction: `Co`/`CO`, `ℂ`/`C`, `ℝ`/`R`, and `ℤ`/`Z` collapse; `OH•` loses its radical marker; unary `-5` collapses into `5`.
+- Root cause: Blanket NFKC plus case folding erases compatibility symbols and structural case, while the semantic operator set omits radical/unary notation.
+- Fix and exact retest: Normalization now uses NFC plus explicit safe glyph translations, preserves structural formula/notation case, and retains radical/unary operators while prose remains case-insensitive. Co/CO, ℂ/C, ℝ/R, ℤ/Z, OH•/OH, negative/positive, title-case, cache, family, and adaptation controls pass.
+
+### AF-071 — The production reset is scoped but its surviving state was not made explicit
+
+- Status: Release-isolation blocker; destructive retest intentionally deferred until the exact new SHA is live
+- Severity: Critical to test validity — an apparently “clean” live matrix can inherit learner history, generation inventory, cache entries, or quota usage
+- Production reproduction (read-only, 2026-07-20): The linked production topology contains persistent Postgres, Redis, and `reelAI` service volumes plus object storage. Authoritative Postgres still contains the `Asplarity` account and five sessions, as well as 2 materials, 13 reels, learner progress, generation jobs/events/usage, provider/search/LLM/ranked-feed caches, quota reservations, and daily usage. Redis database 0 is empty. `Asplarity` has no billing-subscription row and is therefore not yet the requested Pro test account.
+- Root cause: Earlier notes accurately called the operation a *scoped* clear, but neither the preserved-table manifest nor zero-count postcondition was recorded. Authentication is not coming from a mystery Redis store: the API joins the surviving `community_sessions` and `community_accounts` rows in the same Postgres. Subsequent production probes then repopulated adaptive/feed tables.
+- Expected fix and retest: After the final SHA is identical on GitHub, Railway, and Vercel, execute one explicit reset manifest that preserves only the required test identity/authentication state, clears every in-scope learning/feed/generation/cache/quota table, empties Redis, assigns `Asplarity` Pro, and proves the intended zero/nonzero counts before creating the first fresh material. Record the manifest and sanitized connection fingerprints so a second database or stale deployment cannot be mistaken for the test target.
+
+### AF-072 — A syntactically valid concept family can describe a wholly unrelated subject
+
+- Status: Fixed locally under the canonical-only AI contract; live semantic retest pending
+- Severity: Critical — feedback and quiz outcomes can be persisted under an unrelated family and then steer future reels toward or away from the wrong topic
+- Reproduction: A photosynthesis clip with grounded title/facet/evidence is accepted when Gemini returns the otherwise well-formed family `quantum mechanics`; existing checks validate family shape and ordinal consistency but never require lexical grounding in the clip.
+- Root cause: Family validation treats domain qualification as a syntactic property rather than an evidence-backed identity contract, and selector/persistence/serving have separate generic-token rules.
+- Fix and exact retest: The independent high-thinking Pro audit is the semantic authority and must return an exact transcript-anchored evidence quote with its canonical family; aliases are prohibited. Shared code requires the evidence to exist but deliberately does not re-decide photosynthesis/quantum or synonym meaning with word overlap. Selector→ingestion→serving contract tests pass; cross-domain Gemini semantic accuracy remains an explicit live matrix item.
+
+### AF-073 — Topic expansion retries permanent client rejections
+
+- Status: Fixed locally; production retest pending
+- Severity: High — a permanent 409, 410, 418, or 422 consumes a duplicate Gemini dispatch and delays the search pipeline without a possible recovery
+- Reproduction: `_practice_fast_failure_is_retryable()` returns true for every status except a small 400–404 set, so permanent client failures outside that set are retried.
+- Root cause: Expansion uses a blacklist of selected permanent statuses instead of the shared bounded policy: statusless transport/local contract failures, 408/429, and 5xx only, with an explicit status taking precedence over stale retryable flags.
+- Fix and exact retest: Expansion now uses the universal retry classifier: 409/410/418/422 and blocked/configuration failures are single-dispatch; transport, 408/429, 5xx, and recoverable schema failures get at most one retry. The healthy path is one dispatch with no wait; all 108 retrieval/expansion tests pass.
+
+### AF-074 — Concept-family safety differs across selector, ingestion, and serving
+
+- Status: Fixed locally under the canonical-only AI contract; production retest pending
+- Severity: Critical — an alternate or stale authoritative path can persist a family the selector rejects, after which feedback can aggregate through a broad or conflicting identity
+- Reproduction: Selector rejects bare plural generics such as `laws`, `concepts`, and `equations`, while ingestion's singular-only generic set and ReelService's ad-hoc stemming accept some of them. A broad family with no identifier can also accept a narrower alias carrying an identifier (`Newton's laws` + `Newton's first law`, `Apollo missions` + `Apollo 11 mission`, `Python typing` + `Python 3 typing`).
+- Root cause: The three layers independently implement domain/generic and identifier-consistency checks, and ordinal/numeric conflicts are enforced only when the broad side already exposes an identifier.
+- Fix and exact retest: Selector, ingestion, persistence, ReelService, and adaptation now share one canonical identity helper and v2 trust contract; singular/plural generic-only labels reject identically and aliases are always empty. Physics, spaceflight, software, law, and generic matrices pass across all boundaries.
+
+### AF-075 — Compound magnitude ordinals collapse to their trailing unit ordinal
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — distinct named concepts can merge or a correct family can be rejected before persistence
+- Reproduction: `One Hundred First Airborne Division` reports identifier `{1}` and can match `First Airborne Division`, while the correct `101st Airborne Division` reports `{101}`; `hundredth` is not recognized.
+- Root cause: The ordinal parser recognizes only the terminal `first` in a number-word magnitude phrase instead of either parsing the bounded compound or treating unresolved compounds as opaque.
+- Fix and exact retest: The shared parser resolves bounded English magnitude ordinals as one value and fails unresolved phrases closed rather than emitting a trailing unit. 101st/first/hundredth, ordinary count, and rate-unit controls pass and round-trip through stored canonical keys.
+
+### AF-076 — Terminal punctuation has different identity semantics across layers
+
+- Status: Fixed locally by AF-097; production retest pending
+- Severity: Critical — a search/cache identity can differ from the persisted/adaptive identity for the same ordinary concept, while notation-bearing concepts may be collapsed accidentally
+- Reproduction: Search-plan normalization strips the question mark from `Bayes Theorem?`, while persistence and ReelService can retain it; conversely `Swift String?` requires an explicit notation signal to remain distinct from `Swift String`.
+- Root cause: Consumers choose different `preserve_terminal_suffix` behavior without separating ordinary sentence punctuation from an explicitly trusted notation-bearing label.
+- Fix and exact retest: Query/prose keys strip sentence punctuation, while the trusted AI canonical-family boundary preserves terminal notation exactly and carries it through persistence, serving, ordering, and adaptation. Ordinary questions/exclamations remain query-equivalent; Swift `String?`, factorial `n!`, and detached TypeScript `!` remain distinct in the AF-097 matrix.
+
+### AF-077 — Broad families can discard protected notation and named identifiers
+
+- Status: Fixed locally under the canonical-only AI contract; live semantic retest pending
+- Severity: Critical — mastery for a narrow programming, scientific, or named-entity concept can be stored under and propagated through a broader, non-equivalent family
+- Reproduction: Selector validation accepts broad families for clips explicitly about `C++`, `String?`, `Python 3.12`, `Apollo 11`, `HLA Class II`, or `Factor V`; the family can omit the exact notation/version/label even when those qualifiers are grounded in the clip.
+- Root cause: The family contract compares only a partial ordinal set and has no shared protected-qualifier signature covering operators/attached notation, strong numbered labels, and pairwise named numeric identifiers.
+- Fix and exact retest: Deterministic qualifier/signature inference was removed because it could both erase valid broad concepts and reject worked quantities. Pro must choose the exact canonical family for the audited semantic unit; code preserves that full label, prohibits aliases, and fails closed across differing canonical identities. Cross-domain exact/broad-family and protected-distinction tests pass locally; actual Gemini choices remain a live matrix requirement.
+
+### AF-078 — Public clip shaping compatibility-folds mathematical identity symbols
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — a correctly selected `ℂ`, `ℝ`, or `ℤ` concept becomes ordinary `C`, `R`, or `Z` before persistence and adaptive attribution
+- Reproduction: `_public_clips()` normalizes Gemini `facet` and `concept_family` with NFKC, so `ℂ vector space` is emitted as `C vector space` even though the shared identity tokenizer preserves the distinction.
+- Root cause: Two public-output normalization lines retained blanket compatibility normalization after the shared tokenizer moved to NFC plus explicit safe glyph translations.
+- Fix: Public concept/family shaping now uses NFC, and family/alias sanitization follows the shared identity contract without case-folding structural formulas.
+- Exact retest: A selector→public-output regression preserves `ℂ vector space` / `ℂ vector spaces`; the cross-layer operator/case/math matrix passes.
+
+### AF-079 — Search coverage compares equivalent numbered notation literally
+
+- Status: Fixed locally; production retest pending
+- Severity: High — recovery queries or bootstrap inventory can be rejected as missing the subject when only ordinal notation differs
+- Reproduction: Search coverage treats `Fifth Amendment` differently from `5th Amendment` and `Phase II` differently from `Phase 2`, while persistence already canonicalizes them.
+- Root cause: `_search_coverage_tokens()` consumes the generic semantic stream rather than the strong-grammar concept-identifier stream.
+- Fix: Coverage now canonicalizes explicit/strong-label ordinals before stopword filtering and stemming, while preserving structural case and operator/set distinctions.
+- Exact retest: Fifth/5th and Phase II/2 are equal; `∩`/`∪` and `Co`/`CO` remain distinct; the full search-plan suite passes.
+
+### AF-080 — ReelService legacy fallback drops protected numeric qualifiers
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — even safe persisted metadata can be bypassed by a legacy lexical path that merges `Apollo missions` with `Apollo 11 missions` or `Python typing` with `Python 3 typing`
+- Reproduction: After bare-number ordinal inference was removed, `_same_concept_family()` sees the broad token set as a subset of the narrow set and returns true.
+- Root cause: The legacy matcher checks only ordinal identifiers before lexical containment and does not consult the shared notation/numeric/case qualifier signature.
+- Fix: Legacy fallback now rejects unequal protected signatures before containment. A one-sided ordinal synonym remains possible only when the qualified form adds grounded domain language (for example action–reaction pairs ↔ Newton's third-law action–reaction pairs), while a qualifier-only extension fails closed.
+- Exact retest: Apollo/Python broad-narrow pairs reject; existing action–reaction and trusted-profile synonym propagation still pass in the adaptive curriculum suite.
+
+### AF-081 — Full family validation accepts metadata with no clip evidence
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — an alternate authoritative path can stamp any syntactically valid family onto a clip when all grounding fields are absent
+- Reproduction: `validate_concept_family_contract("quantum mechanics", [], title="", facet="", objective="", evidence="")` succeeds because lexical grounding is checked only when the aggregate evidence set is nonempty.
+- Root cause: Empty evidence is treated as “nothing contradicted the family” instead of failure to prove the identity.
+- Fix: The full selector/ingestion contract now fails closed when no grounding evidence exists; the label-only reader remains limited to checking already versioned metadata integrity.
+- Exact retest: Empty evidence and photosynthesis/quantum both reject; a grounded canonical family or grounded exact alias succeeds.
+
+### AF-082 — Decimal quantities protect only their trailing digits
+
+- Status: Fixed locally; production retest pending
+- Severity: High — a valid boundary repair can be discarded because an ordinary measured quantity is misread as a named concept identifier
+- Reproduction: Evidence `one pound-force is about 4.45 newtons` tokenizes the decimal into `4`, `45`; `4` is excluded by the quantity-context word `about`, but `45` is retained and conflicts with the `force units` family.
+- Root cause: Quantity-context exclusion is applied independently to each numeric token and is not propagated through the contiguous numeric components of one decimal.
+- Fix: Once a contextual numeric component is classified as a value/count, immediately adjacent numeric components inherit that classification. Named forms such as Python 3.12 remain protected because their first component is not context-excluded.
+- Exact retest: The exact pounds-force boundary extension succeeds; Python 3.12 broad-family rejection remains green.
+
+### AF-083 — Spoken formula names do not cover symbolic exact aliases
+
+- Status: Fixed locally; production retest pending
+- Severity: High — a valid exact alias such as `F=ma` can make a second-law clip fail family validation when the speech says “F equals ma”
+- Reproduction: The family carries ordinal 2 and alias signature carries `=`, while title/objective/evidence carry the words `F equals ma`; exact signature equality rejects the audit result and retains an incomplete original boundary.
+- Root cause: Protected-symbol validation compares notation literally without using the already grounded non-generic alias terms.
+- Fix: A different-category exact alias signature is considered semantically covered only when all of that alias's non-generic terms are grounded in the clip. A broad family still cannot acquire any protected alias, and conflicting same-category identifiers remain rejected.
+- Exact retest: Second law ↔ `F=ma` succeeds for both symbolic and spoken equality; Apollo 11/13, first/second law, Co/CO, and C++/C# conflicts remain rejected.
+
+### AF-084 — Canonically duplicate aliases are handled differently by selector and ingestion
+
+- Status: Fixed locally; production retest pending
+- Severity: High — metadata accepted by one authoritative boundary can disappear at another, changing the adaptive identity after paid selection
+- Reproduction: A family and alias that normalize to the same identity (for example fifth vs 5th spelling of the same complete label) is rejected by selector payload deduplication but accepted by ingestion/shared label validation.
+- Root cause: Alias duplicate sets were initialized differently across layers.
+- Fix: Selector, shared validation, and ingestion all seed alias deduplication with the canonical family key. Notation spellings already converge through normalization and no longer need a redundant alias.
+- Exact retest: Identical/duplicate aliases reject consistently, while a distinct exact descriptive alias with the same protected ordinal succeeds.
+
+### AF-085 — Healthy Pro audits retry when an exact alias is absent from the audit paraphrase
+
+- Status: Fixed locally under the canonical-only AI contract; production latency retest pending
+- Severity: Critical — a valid healthy-path audit makes a second paid provider dispatch, directly increasing reel-generation latency
+- Reproduction: The selector emits the validated family `Newton's second law of motion` with exact alias `F=ma`; the Pro audit keeps that family and alias but paraphrases its title, facet, objective, and evidence without repeating the symbolic alias. Audit-only family validation rejects the otherwise unchanged identity, marks the whole audit contract invalid, and retries once. Three healthy-path tests observe one extra audit call.
+- Root cause: Deterministic code was trying to prove the semantic equivalence of model aliases from lexical overlap. That cannot be reliable across formulas, synonyms, domains, and audit paraphrases, and it added a false retry to the healthy path.
+- Fix: The independent high-thinking Pro audit is now the sole semantic authority for one canonical family. `concept_aliases` is a reserved compatibility field that must be empty and is never a mastery edge. Code retains only schema bounds, stable identity normalization, and independently anchored evidence presence; it does not require a synonym or formula to be repeated.
+- Exact retest: Passed locally. The exact F=ma → `Newton's second law of motion` audit makes one dispatch, strips aliases, and records no contract retry; the selector equivalent is also one dispatch. Existing recoverable-failure tests retain one bounded retry.
+
+### AF-086 — Selector grounding contaminates changed-family audit repairs
+
+- Status: Fixed locally under the canonical-only AI contract; production retest pending
+- Severity: Critical — a correct Pro reclassification can be discarded and retried, retaining the selector's wrong concept and boundary metadata
+- Reproduction: A selector misclassifies balanced same-body forces as Newton's third law; the grounded audit correctly changes the family to static equilibrium. AF-085's unconditional selector/audit field union carries the old third-law ordinal into validation and rejects the new family. The same union also carries incidental structural evidence such as `SI` into an unchanged `force units` audit and rejects a valid payoff extension. Conversely, a blanket unchanged-identity shortcut can move the repaired range to a neighboring kinetic-energy lesson while retaining the stale second-law/`F=ma` family, because no audit semantic grounding is checked.
+- Root cause: Selector fields were reused as semantic evidence for a later audit decision, so stale model metadata could either veto a correct reclassification or bless a neighboring lesson.
+- Fix: The Pro audit must derive and return the canonical family for its repaired semantic unit. Audit validation uses that audited unit's independently anchored exact evidence; selector semantic fields are not unioned into it. No lexical rule re-decides whether a synonym, formula, or broad/narrow label has the same meaning.
+- Exact retest: Passed locally in the full 650-test production selector contract, including balanced-forces reclassification, Work–Energy/stale-family handling, force-unit payoff extension, and canonical synonym controls.
+
+### AF-087 — Ordinary acronyms and worked quantities become concept identifiers
+
+- Status: Fixed locally under the canonical-only AI contract; production retest pending
+- Severity: Critical — healthy clips across science, math, engineering, and software can fail family validation and trigger paid retries
+- Reproduction: `force units` with evidence mentioning `SI`, `photosynthesis` with `ATP`, or `cell respiration` with `NADH` acquires an unrelated structural-token requirement—even when the acronym appears in the title. Likewise, `Newton's second law` with `the force is 10 newtons`, `photosynthesis produces 2 ATP`, `Python lists have 3 elements`, `negligence has 4 elements`, or `Apollo had 11 crewed missions` treats worked values/counts as missing family identifiers. Direct noun-value phrasing such as `Force 10 newtons` is also misread as a named ID. Discourse ordering (`First explain...`, `the second stage...`) becomes a numbered concept, while objective-only notation such as `C++` can be lost. Named identities such as Apollo 11, Python 3.12, Windows 11, Highway 101, Newton's first law, HLA Class II, Factor V, and a second-order rate law must remain protected.
+- Root cause: Deterministic validation promoted incidental prose acronyms, quantities, ordinals, operators, and case into required semantic identity, then tried to infer broad/narrow meaning from adjacency rules.
+- Fix: Delete prose-derived semantic qualifier comparison. Gemini/Pro chooses the exact canonical family; code normalizes that label without interpreting incidental prose. Numeric version spelling (`Python version 3.12` versus `Python 3.12`) converges mechanically while the numeric run remains in the identity so 3.11 stays distinct.
+- Exact retest: Passed locally across SI/ATP/NADH, worked values/counts, discourse ordinals, Python versions, Apollo/Windows/Highway numbers, numbered laws, HLA/Factor labels, formulas/operators, C/C++/C#, Co/CO, and ℂ/C.
+
+### AF-088 — Trusted exact-equivalence profiles depend on family/alias orientation
+
+- Status: Fixed locally by the versioned canonical-only contract; live convergence retest pending
+- Severity: Critical — feedback or quiz mastery can fail to reach a semantically identical concept when Gemini reverses the canonical family and exact alias
+- Reproduction: One trusted reel stores family `Newton's first law` with alias `law of inertia`; another stores the same exact pair as family `law of inertia` with alias `Newton's first law`. The reader rejects the second profile, so its concept receives no helpful signal and the organizer sees no adaptation.
+- Root cause: Alias-based equivalence made mastery identity depend on which synonym Gemini placed in the `family` field and which it placed in `aliases`.
+- Fix: Contract `concept_family_v2` has exactly one AI-selected canonical family and no aliases. Selector output shaping, ingestion, persistence, serving, and adaptive profile readers all force or require `concept_aliases == []`; v1 alias profiles are not trusted by the v2 reader. The selector/audit prompt must choose the same formal canonical name across synonym wording.
+- Exact retest: Passed locally for prompt/schema enforcement, one-call F=ma canonicalization, v2 persistence/adaptive merging, and protected first/second-law separation. Actual Gemini convergence for input-wording variants remains a required live test.
+
+### AF-089 — Ungrounded aliases can join unrelated adaptive concepts
+
+- Status: Fixed locally by the versioned canonical-only contract; production retest pending
+- Severity: Critical — thumbs and quiz mastery can propagate between unrelated topics and directly distort future reel frequency/difficulty
+- Reproduction: Empty-signature pairs such as `photosynthesis` ↔ `cellular respiration` or `kinematics` ↔ `dynamics` pass when only the family is grounded. Protected-looking pairs can also escape through incomplete grammar, including hepatitis versus hepatitis C, blood type A versus B, or World wars versus World War II. A generic disjoint-word exception intended for `law of inertia` ↔ Newton's first law also accepts force units ↔ Apollo 11 and photosynthesis ↔ Newton's first law.
+- Root cause: The application treated model-proposed synonyms as authoritative graph edges even though lexical rules cannot prove exact equivalence.
+- Fix: Alias edges are removed from the adaptive contract. Public selector output, ingestion metadata, selection metadata, and v2 profile reads all force or require an empty alias list, so an unrelated proposed alias cannot join two mastery histories. Only the audited canonical family is persisted and supplied to the orchestrator with the clip's content and learner signals.
+- Exact retest: Passed locally: selector/public output and ingestion strip aliases, segment cache rejects nonempty aliases, v2 profile reader ignores a malicious alias row, organizer receives `[]`, and unrelated cross-domain identities remain separate.
+
+### AF-090 — Legacy lexical fallback can still join unrelated mastery histories
+
+- Status: Fixed locally; production adaptive retest pending
+- Severity: Critical — when trusted v2 family metadata is absent or rejected, thumbs and quiz mastery can propagate between unrelated concepts.
+- Reproduction: The legacy title matcher treats `blood type A` and `blood type B` as one family because uppercase `A` is discarded as an article/noise token and the remaining token sets satisfy subset matching.
+- Root cause: `_concept_family_ids()` falls back to lexical broad/narrow similarity when neither concept has an AI-audited canonical family. Token similarity cannot prove semantic equivalence and bypasses the new AI-authority boundary.
+- Fix: Without a trusted v2 canonical family, cross-concept matching now fails closed. Exact concept IDs still retain their own history; trusted canonical keys can still connect equivalent concepts, but the lexical heuristic can no longer join feedback or quiz state.
+- Exact retest: Passed locally. Blood types A/B and law-of-inertia/Newton-first titles remain self-only without a v2 profile; identical trusted v2 families propagate thumbs/quiz signals; disjoint numbered families remain separate.
+
+### AF-091 — Ranked-feed cache can replay alias-era adaptive ordering
+
+- Status: Fixed locally; production cache retest pending
+- Severity: Critical — a deployment can serve a cached ranking computed with v1 alias propagation even after the canonical-only code is live.
+- Reproduction: The ranked-feed cache version remains `43`, the same namespace used before `concept_family_v2`, so an otherwise valid cache row is not invalidated by the adaptive identity contract change.
+- Root cause: The concept-family contract version changed at persistence/profile boundaries but was not included directly in the ranked-feed cache namespace.
+- Fix: Bump the ranked-feed cache version to `44`. This invalidates only old derived rankings; it adds no healthy-path provider call or sleep, and a fresh ranking is cached normally.
+- Exact retest: Passed locally for cache-version assertions and stale-version rejection; the healthy v44 cache behavior remains covered by the ranked-feed cache suite.
+
+### AF-092 — Public Gemini evidence is read from the wrong persistence field
+
+- Status: Fixed locally; production selector-to-ingestion retest pending
+- Severity: Critical — every otherwise valid AI family can be discarded before persistence, leaving the orchestrator and adaptive scheduler without canonical concept metadata.
+- Reproduction: Public selector clips carry their grounded claim as `topic_evidence_quote` (and diagnostic `model_claim_quote`), while `_concept_family_search_context()` reads only `claim_quote`; a valid authoritative Work–Energy clip therefore returns an empty family context.
+- Root cause: The family contract was wired to the internal audit proposal field name rather than the public clip field produced by `_plan_to_report()`.
+- Fix: Persistence accepts the internal `claim_quote` when present and otherwise uses the public grounded `topic_evidence_quote`. It requires the audited evidence to exist and does not use diagnostic or selector-only prose; semantic family meaning remains the Pro audit's responsibility.
+- Exact retest: Passed locally through `_public_clips()` → `_concept_family_search_context()` → authoritative ingestion → persisted v2 context; the generation-job organizer test receives the canonical family, empty aliases, full clip content, and learner signal.
+
+### AF-093 — Untrusted title ordinals override an exact AI family match
+
+- Status: Fixed locally; production adaptive retest pending
+- Severity: Critical — equivalent broad concepts can split into separate mastery histories even when both carry the same trusted v2 canonical family.
+- Reproduction: Titles `Newton's first and second laws` and `Newton's laws comparison`, both profiled as `Newton's laws of motion`, fail to connect because title ordinal checks run before profile intersection; the same occurs for World War I/II comparison versus World Wars overview.
+- Root cause: Legacy title heuristics have higher precedence than two trusted canonical AI identities.
+- Fix: When both concepts have v2 profiles, exact canonical profile intersection is authoritative and evaluated first. Disjoint profiles remain separate; title-based migration checks are limited to the one-profile compatibility case.
+- Exact retest: Passed locally for Newton multi-law and World Wars broad-family profiles, plus disjoint first/second-law and Apollo 11/13 identities.
+
+### AF-094 — Persistence uses a different canonical key than adaptation
+
+- Status: Fixed locally; production persistence retest pending
+- Severity: Critical — equivalent AI canonical labels can create separate concepts, splitting frequency, feedback, and quiz mastery before the adaptive reader runs.
+- Reproduction: Shared identity normalizes `Python version 3.12 typing` and `Python 3.12 typing` to `python 3 12 typing`, but persistence previously produced `python version third twelfth typing` for the first spelling and therefore a different deterministic concept UUID.
+- Root cause: `normalize_clip_concept_family()` duplicated an older ordinal normalizer instead of using the shared canonical identity function.
+- Fix: Persistence now delegates to `concept_family_identity_key()` while preserving the readable title and existing UUID namespace. Obsolete ingestion ordinal helpers created by the superseded heuristic were removed.
+- Exact retest: Passed locally: both 3.12 spellings share one deterministic UUID, 3.11 is distinct, generation-job recognition remains aligned, and the adaptive profile matrix passes.
+
+### AF-095 — Canonical ordinal keys are not idempotent
+
+- Status: Fixed locally; production persistence retest pending
+- Severity: Critical — protected numbered concepts can lose their ordinal when a stored canonical key is read again, weakening separation of feedback and quiz histories.
+- Reproduction: `Twenty-first Amendment` and `21st Amendment` normalize to `ordinal_21 amendment`, but normalizing that stored key again yields `ordinal 21 amendment`; profile ordinal extraction then misses 21. The same occurs for 101st and other non-simple ordinals.
+- Root cause: The generic raw-label tokenizer was incorrectly reused for values that were already canonical profile keys, so it split the internal `ordinal_<n>` sentinel at its underscore.
+- Fix: Adaptive profile readers parse already-canonical whitespace-delimited keys directly, while raw/model labels continue through the normal tokenizer. This preserves 21st/101st without reserving or rewriting a literal software identifier such as `ordinal_21`.
+- Exact retest: Passed locally for 21st/101st profile extraction, literal `ordinal_21` separation, persistence/read parity, and distinct numbered-family profiles.
+
+### AF-096 — Possessives break explicit curriculum fallback matching
+
+- Status: Fixed locally; production lesson-order retest pending
+- Severity: High — when both organizer attempts are invalid, an explicit request such as `Newton's first law` may not match the canonical family and the fallback can start at a later concept.
+- Reproduction: `_sequence_tokens("Newton's first law")` produced `newton' first law`, while the non-possessive formal spelling produced `newton first law`.
+- Root cause: Fallback sequence tokenization applied plural stemming before the shared possessive normalization used by concept identities.
+- Fix: Strip straight or normalized curly possessive suffixes before plural stemming. Canonical families remain alias-free; the progression fixture uses request-grounded viewer-facing facets alongside the formal canonical family.
+- Exact retest: Passed locally: possessive and ordinal variants normalize, the twice-invalid organizer fallback follows the requested concept progression, same-source chronology remains intact, and the organizer payload contains canonical family plus learner signal with aliases empty.
+
+### AF-097 — Terminal concept notation is erased or rejected
+
+- Status: Fixed locally; production retest pending
+- Severity: Critical — valid programming and mathematical concepts can merge into one mastery history, while healthy Gemini audits can be rejected and retried
+- Reproduction: `Swift String?` normalizes to the same canonical key as `Swift String` and fails label validation as `family_ambiguous_terminal_suffix`. `factorial n!` normalizes to the same key as `factorial n`; a detached terminal `!` in `TypeScript non-null assertion !` is also discarded.
+- Root cause: The shared lexical layer always strips a terminal `!`, conditionally strips terminal `?`, and the family validator rejects the one preservation mode instead of retaining the AI-selected notation. That converts safe structural identity into a prose-punctuation guess.
+- Fix: Query/prose keys continue ignoring sentence punctuation, while canonical concept-family identity explicitly preserves attached or detached terminal notation. The AI-selected label therefore fails closed into a distinct identity instead of being merged or rejected. No language- or topic-specific synonym rule was added.
+- Exact retest: Passed locally. Swift `String?`/`String`, factorial `n!`/`n`, and detached TypeScript `!` remain distinct through shared identity, deterministic concept UUID persistence, adaptive profiles, and the 652-test production selector contract. The focused identity/adaptive/persistence/ordering matrix passed 94 tests plus 3 subtests.
+
+### AF-098 — Live retrieval cache contract test retained the previous version
+
+- Status: Fixed locally; production cache retest pending
+- Severity: Medium — the complete backend release gate fails even though the live retrieval implementation correctly invalidates the older expansion prompt cache
+- Reproduction: `test_practice_fast_expansion_requests_focused_sources` expects expansion cache version `7`, while the production retrieval function uses version `8` after its prompt/intent contract changed.
+- Root cause: The test expectation was not advanced with the production cache namespace. Despite the historical `practice_fast` name, `ingestion/pipeline.py` enables this exact retrieval path for generated reels, so this is part of the in-scope input-to-clips pipeline rather than the excluded practice feature.
+- Fix: Update only the stale assertion to the production version; do not change cache behavior, practice UI, or unrelated practice code.
+- Exact retest: Passed locally: the production retrieval/expansion group passed all 108 tests with the version-8 assertion, and the complete backend suite passed 4,038 tests plus 40 subtests with 1 skip.
+
+### Release constraint — healthy-path reel streaming latency
+
+- Requirement: These fixes must not increase time-to-first-ready or subsequent reel streaming cadence on successful requests.
+- Guardrail: Healthy provider/database paths remain one physical attempt with no added sleeps; retries run only after a recoverable failure inside the background worker, and already-ready reels remain visible while later work retries.
+- Pre-deployment baseline: On deployed revision `2774a76`, clean Newton job `15584162-e4a5-4108-93e8-7bdfb9f3ec13` was created at `19:11:49.668260Z` and emitted its seven-reel final event at `19:13:44.980606Z`: 115.312 seconds from job creation (115.254 seconds from worker start). This revision emits no earlier partial reel event for that job.
+- Verification: Pending the identical Newton request on the exact new deployed revision, comparing job creation/start to first reel-bearing event and terminal batch cadence.
+
 ## Verification Matrix
 
 | Requirement | Baseline | After fix | Evidence |
@@ -536,3 +1131,12 @@
 - Production Next.js build: passed.
 - `git diff --check`: passed after the final graph rebuild.
 - The only excluded backend test file was `backend/tests/test_labels_api.py`; collection imports the unrelated standalone `backend/main.py` and the local environment lacks `sse_starlette`. The active runtime under review is `backend.app.main`, and every active-backend/adaptive test collected and passed.
+- Canonical-only Gemini/Pro selector contract after AF-085 through AF-096: 652 passed in 3.84 seconds.
+- Canonical identity, persistence, adaptation, segment-cache, and organizer regression matrix: 372 passed, 3 subtests passed in 4.24 seconds.
+- Current complete backend collection: 4,037 passed, 1 skipped, 40 subtests passed; the sole failure is the explicitly out-of-scope practice-fast test's stale cache-version assertion (`7` versus current `8`). No production or non-practice failure remains.
+- Current non-practice backend collection: 3,956 passed, 1 skipped, 40 subtests passed in 51.00 seconds.
+- Healthy-path latency guards: Gemini dispatch performs one physical attempt with no retry sleep, and the exact F=ma Pro audit performs one audit dispatch with no contract retry (2 focused tests passed).
+- Current frontend suite: 189 passed; the adaptive refresh regression proves a successful request remains one call while only transient failures receive one identical retry.
+- Current TypeScript check: passed.
+- Current production Next.js build: passed.
+- Final complete backend suite after AF-097/AF-098: 4,038 passed, 1 skipped, 40 subtests passed in 46.66 seconds; no failure remains.

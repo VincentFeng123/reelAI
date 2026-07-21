@@ -38,6 +38,64 @@ INIT_DB_MAX_RETRIES = 10
 INIT_DB_INITIAL_BACKOFF_SEC = 1.0
 INIT_DB_MAX_BACKOFF_SEC = 15.0
 
+_TRANSIENT_POSTGRES_TRANSACTION_SQLSTATES = {
+    "40001",  # serialization_failure
+    "40P01",  # deadlock_detected
+    "57P01",  # admin_shutdown
+    "57P02",  # crash_shutdown
+    "57P03",  # cannot_connect_now
+}
+_TRANSIENT_POSTGRES_CONNECTION_MARKERS = (
+    "connection refused",
+    "connection reset",
+    "connection timed out",
+    "connection is closed",
+    "connection lost",
+    "could not connect to server",
+    "could not translate host name",
+    "temporary failure in name resolution",
+    "no route to host",
+    "server closed the connection unexpectedly",
+    "ssl connection has been closed unexpectedly",
+    "the database system is starting up",
+    "the database system is shutting down",
+)
+
+
+def is_transient_postgres_transaction_error(exc: BaseException) -> bool:
+    """Recognize only PostgreSQL failures safe for a whole-transaction retry."""
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        sqlstate = str(
+            getattr(current, "sqlstate", "")
+            or getattr(current, "pgcode", "")
+            or ""
+        ).strip().upper()
+        if (
+            sqlstate.startswith("08")
+            or sqlstate in _TRANSIENT_POSTGRES_TRANSACTION_SQLSTATES
+        ):
+            return True
+        error_type = current.__class__
+        if (
+            error_type.__module__.split(".", 1)[0] == "psycopg"
+            and error_type.__name__ == "OperationalError"
+            and any(
+                marker in str(current).casefold()
+                for marker in _TRANSIENT_POSTGRES_CONNECTION_MARKERS
+            )
+        ):
+            return True
+        for chained in (current.__cause__, current.__context__):
+            if isinstance(chained, BaseException):
+                pending.append(chained)
+    return False
+
 
 def _is_transient_postgres_startup_error(exc: BaseException) -> bool:
     """True when the error text indicates PG is still booting or unreachable.

@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 from google import genai
@@ -50,6 +50,10 @@ class GeminiCallTelemetry:
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+class _TokenCountResponseError(RuntimeError):
+    """A successful CountTokens response was malformed or incomplete."""
 
 
 @dataclass(frozen=True)
@@ -213,14 +217,21 @@ def count_request_tokens(
     timeout_s: float = 10.0,
     thinking_level: str = "",
     max_output_tokens: int | None = None,
+    deadline_monotonic: float | None = None,
+    cancelled=None,
 ) -> int:
-    """Count the exact structured GenerateContent request without generation."""
+    """Count the exact structured request with one bounded transient retry."""
     mdl = str(model or "").strip()
     timeout = float(timeout_s)
     if not _is_gemini3_model(mdl):
         raise ValueError("count_request_tokens requires an explicit Gemini 3 model")
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout_s must be positive")
+    if (
+        deadline_monotonic is not None
+        and not math.isfinite(float(deadline_monotonic))
+    ):
+        raise ValueError("deadline_monotonic must be finite")
     if not config.GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set")
     model_name = mdl.rsplit("/", 1)[-1]
@@ -249,24 +260,80 @@ def count_request_tokens(
             "generationConfig": generation_config,
         }
     }
-    response = httpx.post(
+    operation_deadline = min(
+        time.monotonic() + timeout,
         (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model_name}:countTokens"
+            float(deadline_monotonic)
+            if deadline_monotonic is not None
+            else math.inf
         ),
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": config.GEMINI_API_KEY,
-        },
-        json=request_body,
-        timeout=timeout,
     )
-    response.raise_for_status()
-    payload = response.json()
-    total = int(_field(payload, "totalTokens") or 0)
-    if total <= 0:
-        raise RuntimeError("Gemini token count was unavailable")
-    return total
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_name}:countTokens"
+    )
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": config.GEMINI_API_KEY,
+    }
+
+    for attempt in range(2):
+        if _cancel_requested(cancelled):
+            raise RuntimeError("Gemini token count cancelled")
+        remaining_s = operation_deadline - time.monotonic()
+        if remaining_s <= 0:
+            raise TimeoutError("Gemini token count deadline exceeded")
+        request_timeout_s = (
+            timeout
+            if attempt == 0 and deadline_monotonic is None
+            else min(timeout, remaining_s)
+        )
+        try:
+            response = httpx.post(
+                url,
+                headers=headers,
+                json=request_body,
+                timeout=request_timeout_s,
+            )
+            response.raise_for_status()
+            try:
+                payload = response.json()
+            except (TypeError, ValueError) as exc:
+                raise _TokenCountResponseError(
+                    "Gemini token count response was not valid JSON"
+                ) from exc
+            if not isinstance(payload, Mapping):
+                raise _TokenCountResponseError(
+                    "Gemini token count response was not an object"
+                )
+            try:
+                total = int(_field(payload, "totalTokens") or 0)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise _TokenCountResponseError(
+                    "Gemini token count response had an invalid total"
+                ) from exc
+            if total <= 0:
+                raise _TokenCountResponseError(
+                    "Gemini token count response omitted the total"
+                )
+            return total
+        except Exception as error:  # noqa: BLE001
+            if _cancel_requested(cancelled):
+                raise RuntimeError("Gemini token count cancelled") from error
+            if attempt > 0 or not _transient_token_count_error(error):
+                raise
+            wait_s = max(
+                random.uniform(0.25, 0.5),
+                _gemini_retry_after(error) or 0.0,
+            )
+            if operation_deadline - time.monotonic() <= wait_s:
+                raise TimeoutError(
+                    "Gemini token count deadline leaves no retry window"
+                ) from error
+            if not _sleep_before_retry(wait_s, cancelled):
+                raise RuntimeError("Gemini token count cancelled") from error
+
+    raise AssertionError("unreachable Gemini token-count retry state")
 
 
 def _finish_reason(response) -> Optional[str]:
@@ -357,6 +424,16 @@ def _transient_gemini_error(error: Exception) -> bool:
             "status 503", "status 504",
         )
     )
+
+
+def _transient_token_count_error(error: Exception) -> bool:
+    """Classify CountTokens transport failures without retrying ordinary 4xx."""
+    if isinstance(error, _TokenCountResponseError):
+        return True
+    status = _gemini_status_code(error)
+    if status is not None:
+        return status in {408, 429} or 500 <= status <= 599
+    return _transient_gemini_error(error)
 
 
 def _gemini_retry_after(error: Exception, *, maximum: float = 30.0) -> float | None:
@@ -466,6 +543,8 @@ def generate_json_v3(
     retry_status_codes: frozenset[int] | set[int] | None = None,
     cancelled=None,
     media_resolution=None,
+    before_dispatch: Callable[..., object] | None = None,
+    after_dispatch: Callable[..., object] | None = None,
 ) -> GenerationResult:
     """Run one Gemini 3 structured call with bounded transport behavior.
 
@@ -475,7 +554,9 @@ def generate_json_v3(
     policy. A second retry is permitted only after an HTTP 503; non-503 failures
     remain capped at one retry. ``deadline_monotonic`` is an absolute
     ``time.monotonic()`` deadline shared by the caller's complete workflow.
-    Cancellation is cooperative between in-flight HTTP requests.
+    Cancellation is cooperative between in-flight HTTP requests. Optional
+    dispatch hooks run once around every physical provider attempt, including
+    retries, so callers can admit and settle attempt-scoped resources.
     """
     _reject_video_content(user)
     mdl = str(model or "").strip()
@@ -559,9 +640,33 @@ def generate_json_v3(
         request_config = types.GenerateContentConfig(**config_kwargs)
         if client is None:
             client = get_client()
+        # Client construction can block on credential or transport setup. Do
+        # not acquire an attempt ticket if the call became ineligible before a
+        # provider dispatch was possible.
+        if _cancel_requested(cancelled):
+            telemetry = _call_telemetry(
+                model=mdl, operation=operation, prompt_version=prompt_version,
+                thinking_level=level, started=started,
+                retries=max(0, requests_started - 1),
+                error_history=error_history,
+            )
+            raise GeminiCancelledError("Gemini call cancelled", telemetry)
+        if time.monotonic() >= operation_deadline:
+            telemetry = last_failure_telemetry or _call_telemetry(
+                model=mdl, operation=operation, prompt_version=prompt_version,
+                thinking_level=level, started=started,
+                retries=max(0, requests_started - 1),
+                error_history=error_history,
+            )
+            raise GeminiDeadlineExceededError(
+                "Gemini call deadline exceeded", telemetry,
+            )
 
+        dispatch_ticket = None
+        if before_dispatch is not None:
+            dispatch_ticket = before_dispatch(model=mdl, attempt=attempt + 1)
+        requests_started += 1
         try:
-            requests_started += 1
             response = client.models.generate_content(
                 model=mdl, contents=user, config=request_config,
             )
@@ -581,6 +686,13 @@ def generate_json_v3(
                 error_history=error_history,
             )
             last_failure_telemetry = telemetry
+            if after_dispatch is not None:
+                after_dispatch(
+                    dispatch_ticket,
+                    model=mdl,
+                    attempt=attempt + 1,
+                    telemetry=telemetry,
+                )
             if _cancel_requested(cancelled):
                 raise GeminiCancelledError("Gemini call cancelled", telemetry) from error
             if time.monotonic() >= operation_deadline:
@@ -629,26 +741,66 @@ def generate_json_v3(
             retries=max(0, requests_started - 1), response=response,
             error_history=error_history,
         )
+        if after_dispatch is not None:
+            after_dispatch(
+                dispatch_ticket,
+                model=mdl,
+                attempt=attempt + 1,
+                telemetry=telemetry,
+            )
         if _cancel_requested(cancelled):
             raise GeminiCancelledError("Gemini call cancelled", telemetry)
         if time.monotonic() >= operation_deadline:
             raise GeminiDeadlineExceededError("Gemini call deadline exceeded", telemetry)
         finish_reason = (telemetry.finish_reason or "").upper()
+        response_error_type: type[GeminiCallError] | None = None
+        response_error_message = ""
         if finish_reason.endswith("MAX_TOKENS"):
-            raise GeminiTruncatedResponseError(
-                "Gemini response reached max_output_tokens", telemetry,
-            )
-        if finish_reason and not finish_reason.endswith("STOP"):
+            response_error_type = GeminiTruncatedResponseError
+            response_error_message = "Gemini response reached max_output_tokens"
+        elif finish_reason and not finish_reason.endswith("STOP"):
             raise GeminiBlockedResponseError(
                 f"Gemini response did not finish normally ({telemetry.finish_reason})",
                 telemetry,
             )
-        try:
-            text = response.text
-        except Exception:  # noqa: BLE001 - no usable text is an invalid response
-            text = None
-        if not text or not str(text).strip():
-            raise GeminiEmptyResponseError("empty response from Gemini", telemetry)
+        text = None
+        if response_error_type is None:
+            try:
+                text = response.text
+            except Exception:  # noqa: BLE001 - invalid provider response
+                text = None
+            if not text or not str(text).strip():
+                response_error_type = GeminiEmptyResponseError
+                response_error_message = "empty response from Gemini"
+        if response_error_type is not None:
+            error_history.append({
+                "provider_error_type": response_error_type.__name__,
+                "provider_status_code": None,
+                "retryable": True,
+            })
+            telemetry = _call_telemetry(
+                model=mdl,
+                operation=operation,
+                prompt_version=prompt_version,
+                thinking_level=level,
+                started=started,
+                retries=max(0, requests_started - 1),
+                response=response,
+                retryable=True,
+                error_history=error_history,
+            )
+            last_failure_telemetry = telemetry
+            if _cancel_requested(cancelled):
+                raise GeminiCancelledError("Gemini call cancelled", telemetry)
+            if attempt >= max_retries:
+                raise response_error_type(response_error_message, telemetry)
+            if operation_deadline - time.monotonic() < 5.0:
+                raise GeminiDeadlineExceededError(
+                    "Gemini call deadline leaves no useful retry window",
+                    telemetry,
+                )
+            continue
+        assert text is not None
         return GenerationResult(text=str(text), telemetry=telemetry)
 
     raise AssertionError("unreachable Gemini retry state")

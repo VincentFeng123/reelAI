@@ -175,6 +175,33 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                 (concept_id, self.MATERIAL, title),
             )
         self._insert_reel("watched-family", "action", "va", 1, 0.8)
+        for index, concept_id in enumerate(family):
+            reel_id = (
+                "watched-family"
+                if concept_id == "action"
+                else f"family-profile-{concept_id}"
+            )
+            if concept_id != "action":
+                self._insert_reel(
+                    reel_id,
+                    concept_id,
+                    ("vb", "vc", "vb")[index - 1],
+                    30 + index * 20,
+                    0.4,
+                )
+            self.conn.execute(
+                "UPDATE reels SET search_context_json = ? WHERE id = ?",
+                (
+                    json.dumps({
+                        "selection_contract_version": "quality_silence_v38",
+                        "selection_authority": "gemini",
+                        "concept_family_contract_version": "concept_family_v2",
+                        "concept_family": "Newton's third law of motion",
+                        "concept_aliases": [],
+                    }),
+                    reel_id,
+                ),
+            )
 
         self.svc.record_feedback(
             self.conn,
@@ -230,52 +257,22 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         )
         self.assertEqual(confusing_order[0]["reel_id"], "family-remediation")
 
-    def test_concept_family_match_does_not_merge_numbered_laws(self) -> None:
-        self.assertTrue(
-            self.svc._same_concept_family(
-                "action-reaction pairs",
-                "action-reaction acceleration misconception",
-            )
-        )
-        self.assertTrue(
-            self.svc._same_concept_family(
-                "action-reaction pairs",
-                "Newton's third law action-reaction pairs",
-            )
-        )
-        self.assertFalse(
-            self.svc._same_concept_family(
-                "Newton's first law",
-                "Newton's second law",
-            )
-        )
-        self.assertFalse(
-            self.svc._same_concept_family(
-                "velocity-time graphs",
-                "position-time graphs",
-            )
-        )
+    def test_ai_canonical_family_profiles_do_not_merge_untrusted_titles(self) -> None:
         self.assertEqual(
             self.svc._concept_family_identity("Newton's 1st law"),
             self.svc._concept_family_identity("Newton's first law"),
         )
-        self.assertTrue(
-            self.svc._same_concept_family(
-                "Newton's 1st law",
-                "Newton's first law",
-            )
+        self.assertEqual(
+            self.svc._concept_family_identity("Kepler's 5th law"),
+            self.svc._concept_family_identity("Kepler's fifth law"),
         )
-        self.assertFalse(
-            self.svc._same_concept_family(
-                "first law",
-                "Newton's first law",
-            )
+        self.assertEqual(
+            self.svc._concept_family_identity("Asimov's 0th law"),
+            self.svc._concept_family_identity("Asimov's zeroth law"),
         )
-        self.assertFalse(
-            self.svc._same_concept_family(
-                "first law",
-                "first law of thermodynamics",
-            )
+        self.assertEqual(
+            self.svc._concept_family_identity("Twenty-first Amendment"),
+            self.svc._concept_family_identity("21st Amendment"),
         )
 
         concepts = [
@@ -298,14 +295,11 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         families = self.svc._concept_family_ids(
             concepts,
             {
-                "first": profile("Newton's first law", "law of inertia"),
-                "inertia": profile("law of inertia", "Newton's first law"),
-                "second": profile("Newton's second law", "F=ma"),
-                "fma": profile("F=ma", "Newton's second law"),
-                "thermo": profile(
-                    "first law of thermodynamics",
-                    "thermodynamic energy conservation",
-                ),
+                "first": profile("Newton's first law"),
+                "inertia": profile("Newton's first law"),
+                "second": profile("Newton's second law"),
+                "fma": profile("Newton's second law"),
+                "thermo": profile("first law of thermodynamics"),
             },
         )
         self.assertIn("inertia", families["first"])
@@ -324,35 +318,82 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                 {"id": "new-inertia", "title": "law of inertia"},
             ],
             {
-                "new-inertia": profile(
-                    "law of inertia",
-                    "Newton's first law",
-                ),
+                "new-inertia": profile("Newton's first law"),
             },
         )
         self.assertIn("new-inertia", rollout_families["legacy-first"])
         self.assertIn("legacy-first", rollout_families["new-inertia"])
 
-        cooling_families = self.svc._concept_family_ids(
+        untrusted_families = self.svc._concept_family_ids(
             [
-                {"id": "profiled", "title": "Newton's law"},
-                {"id": "legacy-cooling", "title": "Newton's law of cooling"},
+                {"id": "blood-a", "title": "blood type A"},
+                {"id": "blood-b", "title": "blood type B"},
+                {"id": "inertia", "title": "law of inertia"},
+                {"id": "first", "title": "Newton's first law"},
+            ],
+            {},
+        )
+        self.assertEqual(untrusted_families["blood-a"], {"blood-a"})
+        self.assertEqual(untrusted_families["blood-b"], {"blood-b"})
+        self.assertEqual(untrusted_families["inertia"], {"inertia"})
+        self.assertEqual(untrusted_families["first"], {"first"})
+
+        broad_families = self.svc._concept_family_ids(
+            [
+                {"id": "newton-members", "title": "Newton's first and second laws"},
+                {"id": "newton-overview", "title": "Newton's laws comparison"},
+                {"id": "world-members", "title": "World War I and II comparison"},
+                {"id": "world-overview", "title": "World Wars overview"},
             ],
             {
-                "profiled": profile(
-                    "Newton's first law",
-                    "law of inertia",
-                ),
+                "newton-members": profile("Newton's laws of motion"),
+                "newton-overview": profile("Newton's laws of motion"),
+                "world-members": profile("World Wars"),
+                "world-overview": profile("World Wars"),
             },
         )
-        self.assertNotIn("legacy-cooling", cooling_families["profiled"])
-        self.assertNotIn("profiled", cooling_families["legacy-cooling"])
+        self.assertIn("newton-overview", broad_families["newton-members"])
+        self.assertIn("newton-members", broad_families["newton-overview"])
+        self.assertIn("world-overview", broad_families["world-members"])
+        self.assertIn("world-members", broad_families["world-overview"])
 
-    def test_connected_family_profile_evidence_preserves_optional_aliases(self) -> None:
+        terminal_notation_families = self.svc._concept_family_ids(
+            [
+                {"id": "swift-nullable", "title": "Swift String?"},
+                {"id": "swift-plain", "title": "Swift String"},
+                {"id": "factorial", "title": "factorial n!"},
+                {"id": "plain-n", "title": "factorial n"},
+                {
+                    "id": "typescript-bang",
+                    "title": "TypeScript non-null assertion !",
+                },
+                {
+                    "id": "typescript-plain",
+                    "title": "TypeScript non-null assertion",
+                },
+            ],
+            {
+                "swift-nullable": profile("Swift String?"),
+                "swift-plain": profile("Swift String"),
+                "factorial": profile("factorial n!"),
+                "plain-n": profile("factorial n"),
+                "typescript-bang": profile("TypeScript non-null assertion !"),
+                "typescript-plain": profile("TypeScript non-null assertion"),
+            },
+        )
+        for marked, plain in (
+            ("swift-nullable", "swift-plain"),
+            ("factorial", "plain-n"),
+            ("typescript-bang", "typescript-plain"),
+        ):
+            self.assertNotIn(plain, terminal_notation_families[marked])
+            self.assertNotIn(marked, terminal_notation_families[plain])
+
+    def test_connected_family_profile_uses_one_canonical_ai_identity(self) -> None:
         contexts = (
-            ("Newton's first law", ["law of inertia"]),
             ("Newton's first law", []),
-            ("law of inertia", []),
+            ("Newton's first law", []),
+            ("Newton's first law", []),
         )
         for index, ((family, aliases), video_id) in enumerate(
             zip(contexts, ("va", "vb", "vc"))
@@ -365,7 +406,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                     json.dumps({
                         "selection_contract_version": "quality_silence_v38",
                         "selection_authority": "gemini",
-                        "concept_family_contract_version": "concept_family_v1",
+                        "concept_family_contract_version": "concept_family_v2",
                         "concept_family": family,
                         "concept_aliases": aliases,
                     }),
@@ -379,11 +420,28 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         )
         self.assertEqual(
             profiles["c1"],
-            {
-                self.svc._concept_family_identity("Newton's first law"),
-                self.svc._concept_family_identity("law of inertia"),
-            },
+            {self.svc._concept_family_identity("Newton's first law")},
         )
+
+        self._insert_reel("corrupt-alias-profile", "c2", "va", 120, 0.4)
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = ?",
+            (
+                json.dumps({
+                    "selection_contract_version": "quality_silence_v38",
+                    "selection_authority": "gemini",
+                    "concept_family_contract_version": "concept_family_v2",
+                    "concept_family": "Newton's first law",
+                    "concept_aliases": ["photosynthesis"],
+                }),
+                "corrupt-alias-profile",
+            ),
+        )
+        profiles = self.svc._persisted_concept_family_profiles(
+            self.conn,
+            self.MATERIAL,
+        )
+        self.assertNotIn("c2", profiles)
 
     def test_persisted_family_profiles_reject_conflicting_shared_facet(self) -> None:
         self.conn.execute("UPDATE concepts SET title = 'Newton laws' WHERE id = 'c1'")
@@ -391,16 +449,16 @@ class AdaptiveCurriculumTests(unittest.TestCase):
             {
                 "selection_contract_version": "quality_silence_v38",
                 "selection_authority": "gemini",
-                "concept_family_contract_version": "concept_family_v1",
+                "concept_family_contract_version": "concept_family_v2",
                 "concept_family": "Newton's first law",
-                "concept_aliases": ["law of inertia"],
+                "concept_aliases": [],
             },
             {
                 "selection_contract_version": "quality_silence_v38",
                 "selection_authority": "gemini",
-                "concept_family_contract_version": "concept_family_v1",
+                "concept_family_contract_version": "concept_family_v2",
                 "concept_family": "Newton's second law",
-                "concept_aliases": ["F=ma"],
+                "concept_aliases": [],
             },
         )
         for index, (video_id, context) in enumerate(zip(("va", "vb"), contexts)):
@@ -439,12 +497,75 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         self.assertEqual(newton_id, ordinal_variant_id)
         self.assertNotEqual(newton_id, thermo_id)
 
-        for index, (concept_id, family, aliases, video_id) in enumerate((
-            (newton_id, "Newton's first law", ["law of inertia"], "va"),
+        python_version_id = ensure_clip_concept(
+            self.conn,
+            material_id=self.MATERIAL,
+            title="Python version 3.12 typing",
+            semantic_identity="Python version 3.12 typing",
+        )[0]
+        python_decimal_id = ensure_clip_concept(
+            self.conn,
+            material_id=self.MATERIAL,
+            title="Python 3.12 typing",
+            semantic_identity="Python 3.12 typing",
+        )[0]
+        python_previous_id = ensure_clip_concept(
+            self.conn,
+            material_id=self.MATERIAL,
+            title="Python 3.11 typing",
+            semantic_identity="Python 3.11 typing",
+        )[0]
+        self.assertEqual(python_version_id, python_decimal_id)
+        self.assertNotEqual(python_version_id, python_previous_id)
+
+        language_ids = {
+            language: ensure_clip_concept(
+                self.conn,
+                material_id=self.MATERIAL,
+                title=f"{language} memory management",
+                semantic_identity=f"{language} memory management",
+            )[0]
+            for language in ("C", "C++", "C#")
+        }
+        self.assertEqual(len(set(language_ids.values())), 3)
+        operator_ids = {
+            operator: ensure_clip_concept(
+                self.conn,
+                material_id=self.MATERIAL,
+                title=f"JavaScript {operator} operator",
+                semantic_identity=f"JavaScript {operator} operator",
+            )[0]
+            for operator in ("&&", "||", "??")
+        }
+        self.assertEqual(len(set(operator_ids.values())), 3)
+        terminal_notation_pairs = (
+            ("Swift nullable type String?", "Swift nullable type String"),
+            ("factorial operation n!", "factorial operation n"),
+            (
+                "TypeScript non-null assertion !",
+                "TypeScript non-null assertion",
+            ),
+        )
+        for marked, plain in terminal_notation_pairs:
+            marked_id = ensure_clip_concept(
+                self.conn,
+                material_id=self.MATERIAL,
+                title=marked,
+                semantic_identity=marked,
+            )[0]
+            plain_id = ensure_clip_concept(
+                self.conn,
+                material_id=self.MATERIAL,
+                title=plain,
+                semantic_identity=plain,
+            )[0]
+            self.assertNotEqual(marked_id, plain_id)
+
+        for index, (concept_id, family, video_id) in enumerate((
+            (newton_id, "Newton's first law", "va"),
             (
                 thermo_id,
                 "first law of thermodynamics",
-                ["thermodynamic energy conservation"],
                 "vb",
             ),
         )):
@@ -456,9 +577,9 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                     json.dumps({
                         "selection_contract_version": "quality_silence_v38",
                         "selection_authority": "gemini",
-                        "concept_family_contract_version": "concept_family_v1",
+                        "concept_family_contract_version": "concept_family_v2",
                         "concept_family": family,
-                        "concept_aliases": aliases,
+                        "concept_aliases": [],
                     }),
                     reel_id,
                 ),
@@ -731,6 +852,28 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                 "(id, material_id, title, keywords_json, summary, embedding_json, created_at) "
                 "VALUES (?, ?, ?, '[]', '', NULL, '2026-07-09T00:00:01+00:00')",
                 (concept_id, self.MATERIAL, title),
+            )
+        for index, concept_id in enumerate(("action", "identify", "misconception")):
+            reel_id = f"quiz-family-profile-{concept_id}"
+            self._insert_reel(
+                reel_id,
+                concept_id,
+                ("va", "vb", "vc")[index],
+                1 + index * 30,
+                0.4,
+            )
+            self.conn.execute(
+                "UPDATE reels SET search_context_json = ? WHERE id = ?",
+                (
+                    json.dumps({
+                        "selection_contract_version": "quality_silence_v38",
+                        "selection_authority": "gemini",
+                        "concept_family_contract_version": "concept_family_v2",
+                        "concept_family": "Newton's third law of motion",
+                        "concept_aliases": [],
+                    }),
+                    reel_id,
+                ),
             )
         self.conn.execute(
             "UPDATE learner_material_progress SET difficulty_reset_at = '' "

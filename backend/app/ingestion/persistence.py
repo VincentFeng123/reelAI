@@ -31,6 +31,8 @@ import unicodedata
 import uuid
 from typing import Any
 
+from ...concept_families import concept_family_identity_key
+from ...concept_tokens import semantic_tokens
 from .. import db as db_module
 from ..db import (
     DatabaseIntegrityError,
@@ -52,21 +54,6 @@ from .models import IngestMetadata
 logger: logging.Logger = get_ingest_logger(__name__)
 
 _INGEST_META_PREFIX = "ingest_meta:"
-_CLIP_CONCEPT_TOKEN_RE = re.compile(
-    r"[^\W_]+(?:['\u2018\u2019\u02bc][^\W_]+)*",
-    re.UNICODE,
-)
-_CLIP_CONCEPT_APOSTROPHES = str.maketrans(
-    {"\u2018": "'", "\u2019": "'", "\u02bc": "'"}
-)
-_CLIP_CONCEPT_ORDINAL_CANONICAL = {
-    "1st": "first",
-    "2nd": "second",
-    "3rd": "third",
-    "4th": "fourth",
-}
-
-
 # --------------------------------------------------------------------- #
 # Sentinel materials / concepts
 # --------------------------------------------------------------------- #
@@ -206,21 +193,16 @@ def resolve_material_concept(
 
 def normalize_clip_concept(value: object) -> tuple[str, str]:
     """Return a readable label and stable identity key for one Gemini facet."""
-    title = " ".join(unicodedata.normalize("NFKC", str(value or "")).split()).strip()
+    title = " ".join(unicodedata.normalize("NFC", str(value or "")).split()).strip()
     title = title[:240]
-    normalized = title.casefold().translate(_CLIP_CONCEPT_APOSTROPHES)
-    key = " ".join(match.group(0) for match in _CLIP_CONCEPT_TOKEN_RE.finditer(normalized))
+    key = " ".join(semantic_tokens(title))
     return title, key
 
 
 def normalize_clip_concept_family(value: object) -> tuple[str, str]:
     """Return a family key with possessives and ordinal spellings canonicalized."""
-    title, key = normalize_clip_concept(value)
-    canonical_tokens: list[str] = []
-    for raw_token in key.split():
-        token = raw_token[:-2] if raw_token.endswith("'s") else raw_token
-        canonical_tokens.append(_CLIP_CONCEPT_ORDINAL_CANONICAL.get(token, token))
-    return title, " ".join(canonical_tokens)
+    title, _key = normalize_clip_concept(value)
+    return title, concept_family_identity_key(title)
 
 
 def ensure_clip_concept(

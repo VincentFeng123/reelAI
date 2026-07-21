@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -30,6 +31,12 @@ from backend.app.ingestion.models import (  # noqa: E402
     YouTubeSourceRef,
 )
 from backend.pipeline import gemini_segment  # noqa: E402
+
+
+class _PostgresFailure(Exception):
+    def __init__(self, sqlstate: str, message: str = "postgres failure") -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
 
 
 def _strict_boundary_context(
@@ -108,12 +115,22 @@ class PersistenceIntegrityTests(unittest.TestCase):
         db_module._db_ready = False
         get_settings.cache_clear()
 
-    def test_concept_family_context_rejects_ambiguous_or_conflicting_laws(self) -> None:
+    def test_concept_family_context_requires_authority_identity_and_evidence(self) -> None:
         self.assertEqual(
             pipeline_module._concept_family_search_context({
                 "selection_authority": "gemini",
                 "concept_family": "first law",
                 "concept_aliases": [],
+                "topic_evidence_quote": "This is the first law",
+            }),
+            {},
+        )
+        self.assertEqual(
+            pipeline_module._concept_family_search_context({
+                "selection_authority": "local",
+                "concept_family": "Newton's first law",
+                "concept_aliases": [],
+                "topic_evidence_quote": "Objects remain at rest without net force",
             }),
             {},
         )
@@ -121,23 +138,106 @@ class PersistenceIntegrityTests(unittest.TestCase):
             pipeline_module._concept_family_search_context({
                 "selection_authority": "gemini",
                 "concept_family": "Newton's first law",
-                "concept_aliases": ["Newton's second law"],
+                "concept_aliases": [],
             }),
             {},
         )
+
         self.assertEqual(
             pipeline_module._concept_family_search_context({
                 "selection_authority": "gemini",
-                "concept_family": "Newton's first law",
-                "concept_aliases": ["law of inertia", "first law"],
+                "title": "Radioactive Decay Law",
+                "learning_objective": "Explain decay probability per second",
+                "facet": "radioactive decay rate law",
+                "concept_family": "radioactive decay law",
+                "concept_aliases": ["exponential decay law"],
+                "topic_evidence_quote": "Decay has a constant probability per second",
             }),
             {
-                "concept_family_contract_version": "concept_family_v1",
+                "concept_family_contract_version": "concept_family_v2",
                 "selection_authority": "gemini",
-                "concept_family": "Newton's first law",
-                "concept_aliases": ["law of inertia"],
+                "concept_family": "radioactive decay law",
+                "concept_aliases": [],
             },
         )
+
+    def test_concept_family_context_trusts_ai_family_and_drops_aliases(
+        self,
+    ) -> None:
+        for title, family in (
+            ("Kepler's Fifth Law", "Kepler's laws of planetary motion"),
+            ("Asimov's Zeroth Law", "Asimov's laws of robotics"),
+            ("Beethoven's Fifth Symphony", "Beethoven symphonies"),
+            ("The First Crusade", "the Crusades"),
+            ("The Fifth Cranial Nerve", "cranial nerves"),
+        ):
+            context = pipeline_module._concept_family_search_context({
+                "selection_authority": "gemini",
+                "title": title,
+                "learning_objective": f"Explain {title}",
+                "facet": title,
+                "concept_family": family,
+                "concept_aliases": [],
+                "topic_evidence_quote": f"This lesson explains {title}",
+            })
+            self.assertEqual(context["concept_family"], family)
+            self.assertEqual(context["concept_aliases"], [])
+            self.assertEqual(
+                context["concept_family_contract_version"],
+                "concept_family_v2",
+            )
+
+        self.assertEqual(
+            pipeline_module._concept_family_search_context({
+                "selection_authority": "gemini",
+                "title": "Kepler's Fifth Law",
+                "learning_objective": "Explain Kepler's fifth law",
+                "facet": "Kepler's fifth law",
+                "concept_family": "Kepler's fifth law of planetary motion",
+                "concept_aliases": ["planetary motion fifth law"],
+                "topic_evidence_quote": "Kepler's fifth law governs planetary motion",
+            }),
+            {
+                "concept_family_contract_version": "concept_family_v2",
+                "selection_authority": "gemini",
+                "concept_family": "Kepler's fifth law of planetary motion",
+                "concept_aliases": [],
+            },
+        )
+
+        self.assertEqual(
+            pipeline_module._concept_family_search_context({
+                "selection_authority": "gemini",
+                "title": "Apollo 11 Lunar Mission",
+                "learning_objective": "Explain the Apollo 11 lunar mission",
+                "facet": "Apollo 11 lunar mission",
+                "concept_family": "Apollo 11 mission",
+                "concept_aliases": ["Apollo 13 mission"],
+                "topic_evidence_quote": "Apollo 11 carried astronauts to the Moon",
+            }),
+            {
+                "concept_family_contract_version": "concept_family_v2",
+                "selection_authority": "gemini",
+                "concept_family": "Apollo 11 mission",
+                "concept_aliases": [],
+            },
+        )
+
+        for title, family in (
+            ("Solving a linear equation x = 5", "linear equations"),
+            ("Derivative at x = 2", "derivatives at a point"),
+            ("Probability of rolling a 6", "die roll probability"),
+        ):
+            context = pipeline_module._concept_family_search_context({
+                "selection_authority": "gemini",
+                "title": title,
+                "learning_objective": f"Explain {title}",
+                "facet": title,
+                "claim_quote": f"A complete worked explanation of {title}",
+                "concept_family": family,
+                "concept_aliases": [],
+            })
+            self.assertEqual(context["concept_family"], family)
 
     @staticmethod
     def _seed_identity(conn, material_id: str, concept_id: str) -> None:
@@ -201,6 +301,8 @@ class PersistenceIntegrityTests(unittest.TestCase):
         context: dict,
         cue_id: str = "cue-1",
         details_extra: dict | None = None,
+        on_persistence_result=None,
+        should_cancel=None,
     ):
         return pipeline._persist_ingest(
             adapter_result=adapter,
@@ -226,7 +328,158 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "search_context": context,
                 **(details_extra or {}),
             },
+            on_persistence_result=on_persistence_result,
+            should_cancel=should_cancel,
         )
+
+    def test_clip_persistence_retries_with_a_fresh_transaction(self) -> None:
+        pipeline, adapter, metadata = self._boundary_persistence_fixture()
+        real_get_conn = pipeline_module.get_conn
+        transaction_attempts: list[object] = []
+
+        @contextmanager
+        def flaky_get_conn(*, transactional=False):
+            transaction_attempts.append(object())
+            if len(transaction_attempts) == 1:
+                raise _PostgresFailure("40001", "serialization failure")
+            with real_get_conn(transactional=transactional) as conn:
+                yield conn
+
+        callback_results: list[bool] = []
+        with mock.patch.object(pipeline_module, "get_conn", flaky_get_conn):
+            reel = self._persist_boundary_candidate(
+                pipeline=pipeline,
+                adapter=adapter,
+                metadata=metadata,
+                start=10.0,
+                end=20.0,
+                context=_transcript_boundary_context(
+                    "video-a::retryable-transaction",
+                    start=10.0,
+                    end=20.0,
+                    surface=True,
+                ),
+                on_persistence_result=callback_results.append,
+            )
+
+        self.assertTrue(reel.reel_id)
+        self.assertEqual(len(transaction_attempts), 2)
+        self.assertEqual(callback_results, [True])
+        with real_get_conn() as conn:
+            rows = db_module.fetch_all(
+                conn,
+                "SELECT id FROM reels WHERE material_id = ?",
+                ("material-a",),
+            )
+        self.assertEqual([row["id"] for row in rows], [reel.reel_id])
+
+    def test_clip_persistence_retries_only_known_transient_postgres_states(self) -> None:
+        pipeline, adapter, metadata = self._boundary_persistence_fixture()
+        sentinel = object()
+        context = _transcript_boundary_context(
+            "video-a::retry-classification",
+            start=10.0,
+            end=20.0,
+            surface=True,
+        )
+
+        for sqlstate in ("40001", "40P01", "08006"):
+            with self.subTest(sqlstate=sqlstate):
+                attempts = 0
+
+                def transient_then_success(**_kwargs):
+                    nonlocal attempts
+                    attempts += 1
+                    if attempts == 1:
+                        raise _PostgresFailure(sqlstate)
+                    return sentinel
+
+                with mock.patch.object(
+                    pipeline,
+                    "_persist_ingest_once",
+                    side_effect=transient_then_success,
+                ):
+                    result = self._persist_boundary_candidate(
+                        pipeline=pipeline,
+                        adapter=adapter,
+                        metadata=metadata,
+                        start=10.0,
+                        end=20.0,
+                        context=context,
+                    )
+                self.assertIs(result, sentinel)
+                self.assertEqual(attempts, 2)
+
+        permanent = _PostgresFailure("23505", "unique violation")
+        with mock.patch.object(
+            pipeline,
+            "_persist_ingest_once",
+            side_effect=permanent,
+        ) as persist_once:
+            with self.assertRaises(_PostgresFailure) as raised:
+                self._persist_boundary_candidate(
+                    pipeline=pipeline,
+                    adapter=adapter,
+                    metadata=metadata,
+                    start=10.0,
+                    end=20.0,
+                    context=context,
+                )
+        self.assertIs(raised.exception, permanent)
+        self.assertEqual(persist_once.call_count, 1)
+
+    def test_clip_persistence_does_not_retry_after_commit_or_cancellation(self) -> None:
+        pipeline, adapter, metadata = self._boundary_persistence_fixture()
+        context = _transcript_boundary_context(
+            "video-a::retry-boundary",
+            start=10.0,
+            end=20.0,
+            surface=True,
+        )
+
+        def fail_after_commit(**kwargs):
+            kwargs["_transaction_state"]["committed"] = True
+            raise _PostgresFailure("08006", "connection failure after commit")
+
+        with mock.patch.object(
+            pipeline,
+            "_persist_ingest_once",
+            side_effect=fail_after_commit,
+        ) as persist_once:
+            with self.assertRaises(_PostgresFailure):
+                self._persist_boundary_candidate(
+                    pipeline=pipeline,
+                    adapter=adapter,
+                    metadata=metadata,
+                    start=10.0,
+                    end=20.0,
+                    context=context,
+                )
+        self.assertEqual(persist_once.call_count, 1)
+
+        cancelled = False
+
+        def fail_then_cancel(**_kwargs):
+            nonlocal cancelled
+            cancelled = True
+            raise _PostgresFailure("40P01", "deadlock detected")
+
+        with mock.patch.object(
+            pipeline,
+            "_persist_ingest_once",
+            side_effect=fail_then_cancel,
+        ) as persist_once:
+            with self.assertRaises(pipeline_module._ClipCancellationError):
+                self._persist_boundary_candidate(
+                    pipeline=pipeline,
+                    adapter=adapter,
+                    metadata=metadata,
+                    start=10.0,
+                    end=20.0,
+                    context=context,
+                    should_cancel=lambda: cancelled,
+                )
+        self.assertEqual(persist_once.call_count, 1)
 
     def test_authoritative_persistence_rejects_ambiguous_concept_family(self) -> None:
         pipeline, adapter, metadata = self._boundary_persistence_fixture()
@@ -297,6 +550,8 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "facet": "  Net   Force—Acceleration  ",
                 "concept_family": "Newton's second law",
                 "concept_aliases": ["F=ma", "net force equation"],
+                "learning_objective": "Explain Newton's second law as F=ma",
+                "topic_evidence_quote": "Net force produces acceleration in this system",
                 "selection_authority": "gemini",
                 "_private": "discard",
             }]
@@ -306,6 +561,8 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "facet": "net-force / acceleration",
                 "concept_family": "Newton's second law",
                 "concept_aliases": ["F=ma"],
+                "learning_objective": "Explain Newton's second law as F=ma",
+                "topic_evidence_quote": "Acceleration follows from the applied net force",
                 "selection_authority": "gemini",
                 "_private": "discard",
             }]
@@ -386,7 +643,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
         self.assertEqual(first_clip["concept"], "Net Force—Acceleration")
         self.assertEqual(second_clip["concept"], "net-force / acceleration")
         self.assertEqual(first_clip["concept_family"], "Newton's second law")
-        self.assertEqual(first_clip["concept_aliases"], ["F=ma", "net force equation"])
+        self.assertEqual(first_clip["concept_aliases"], [])
         self.assertEqual(first.concept_id, second.concept_id)
         self.assertNotEqual(first.concept_id, "concept-a")
         self.assertEqual(
@@ -438,10 +695,10 @@ class PersistenceIntegrityTests(unittest.TestCase):
             )
             self.assertEqual(
                 provenance["concept_family_contract_version"],
-                "concept_family_v1",
+                "concept_family_v2",
             )
             self.assertEqual(provenance["concept_family"], "Newton's second law")
-            self.assertIn("F=ma", provenance["concept_aliases"])
+            self.assertEqual(provenance["concept_aliases"], [])
 
     def test_scratch_concepts_are_scoped_to_their_material(self) -> None:
         with db_module.get_conn(transactional=True) as conn:

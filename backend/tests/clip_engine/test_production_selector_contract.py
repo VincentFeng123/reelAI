@@ -13,6 +13,18 @@ from backend.app.clip_engine.provider_runtime import GenerationContext
 from backend.pipeline import gemini_segment
 
 
+def _settle_mock_dispatch(kwargs: dict, telemetry: object) -> None:
+    ticket = kwargs["before_dispatch"](
+        model=kwargs["model"], attempt=1,
+    )
+    kwargs["after_dispatch"](
+        ticket,
+        model=kwargs["model"],
+        attempt=1,
+        telemetry=telemetry,
+    )
+
+
 def _proposal(*, end_line: int = 0) -> gemini_segment._BoundaryTopic:
     return gemini_segment._BoundaryTopic(
         candidate_id="photosynthesis-core",
@@ -113,6 +125,8 @@ def _compact_custom_plan(
             title="Grounded statistics lesson",
             learning_objective=f"Explain {request}",
             facet=request,
+            concept_family=request,
+            concept_aliases=[],
             informativeness=0.9,
             topic_relevance=0.9,
             educational_importance=0.9,
@@ -1939,15 +1953,37 @@ def test_pro_profile_preserves_audited_split_copula_repair(
         claim_quote=claim,
     )
     plan = plan.model_copy(update={
+        "request_intent": plan.request_intent.model_copy(update={
+            "constraints": [
+                gemini_segment._IntentConstraint(
+                    constraint_id="second-law",
+                    kind="subject",
+                    source_phrase="Newton's second law",
+                    requirement="Explain Newton's second law",
+                ),
+                gemini_segment._IntentConstraint(
+                    constraint_id="net-force",
+                    kind="subject",
+                    source_phrase="net force",
+                    requirement="Define net force",
+                ),
+            ],
+        }),
         "topics": [plan.topics[0].model_copy(update={
             "start_line": 2,
             "end_line": 3,
             "title": "Understanding Net Force",
             "learning_objective": "Define net force as the sum of forces.",
             "facet": "net force",
+            "directly_teaches_topic": False,
+            "intent_evidence": [gemini_segment._CompactIntentEvidence(
+                id="net-force",
+                q=claim,
+            )],
         })],
     })
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
+        **_pro_audit_semantic_defaults(plan),
         "candidate_id": "candidate-1",
         "decision": "keep",
         "actual_objective": "Define net force as the sum of forces",
@@ -4048,16 +4084,16 @@ def test_pro_boundary_route_preserves_model_start_when_claim_is_unanchored(
             "exact_request": "Explain acceleration and its units",
             "constraints": [
                 {
-                    "constraint_id": "acceleration",
-                    "kind": "subject",
-                    "source_phrase": "acceleration",
-                    "requirement": "Explain acceleration",
+                        "constraint_id": "acceleration",
+                        "kind": "subject",
+                        "source_phrase": "Explain acceleration",
+                        "requirement": "Explain acceleration",
                 },
                 {
-                    "constraint_id": "units",
-                    "kind": "outcome",
-                    "source_phrase": "units",
-                    "requirement": "Give its units",
+                        "constraint_id": "units",
+                        "kind": "outcome",
+                        "source_phrase": "its units",
+                        "requirement": "Give its units",
                 },
             ],
         },
@@ -12028,6 +12064,43 @@ def test_compact_schema_and_final_audit_require_context_complete_evidence_and_ed
     assert "never omit it solely for boundary uncertainty" in normalized
 
 
+def test_selector_and_audit_require_one_formal_canonical_family_across_wording() -> None:
+    plan = _compact_custom_plan(
+        request="Explain the law of inertia and F=ma",
+        start_quote="Objects resist changes in motion",
+        end_quote="unless a net force acts",
+        claim_quote="Objects resist changes in motion unless a net force acts",
+    )
+    segments = [{
+        "cue_id": "cue-0",
+        "start": 0.0,
+        "end": 8.0,
+        "text": "Objects resist changes in motion unless a net force acts.",
+    }]
+    selector_system, selector_user = gemini_segment._boundary_prompts(
+        "[0] 00:00 Objects resist changes in motion unless a net force acts.",
+        1,
+        "Explain the law of inertia and F=ma",
+    )
+    audit_system, audit_user, _allowed = gemini_segment._pro_boundary_audit_prompts(
+        plan,
+        segments,
+        "Explain the law of inertia and F=ma",
+    )
+    for prompt in (
+        f"{selector_system}\n{selector_user}",
+        f"{audit_system}\n{audit_user}",
+    ):
+        normalized = " ".join(prompt.split()).casefold()
+        assert "standard formal" in normalized
+        assert "law of inertia -> newton's first law of motion" in normalized
+        assert "f=ma -> newton's second law of motion" in normalized
+        assert "apollo11 -> apollo 11 mission" in normalized
+        assert "python3.12 -> python 3.12" in normalized
+        assert "hlaii -> hla class ii" in normalized
+        assert "factorv -> factor v" in normalized
+
+
 def test_pro_schema_represents_sixteen_atomic_request_facets() -> None:
     compact_schema = gemini_segment._CompactBoundaryPlan.model_json_schema()
     compact_definitions = compact_schema["$defs"]
@@ -12063,6 +12136,31 @@ def test_pro_schema_represents_sixteen_atomic_request_facets() -> None:
     assert "never bundle the members into one constraint" in user
 
 
+def _pro_audit_semantic_defaults(
+    plan: gemini_segment._CompactBoundaryPlan,
+    *,
+    evidence_quote: str = "",
+) -> dict:
+    proposal = plan.topics[0]
+    intent_evidence = [
+        evidence.model_dump(mode="json", by_alias=True)
+        for evidence in proposal.intent_evidence
+    ]
+    if evidence_quote and plan.request_intent.constraints:
+        intent_evidence = [{
+            "id": str(plan.request_intent.constraints[0].constraint_id),
+            "q": evidence_quote,
+        }]
+    return {
+        "t": proposal.title,
+        "f": proposal.facet,
+        "family": proposal.concept_family or f"{proposal.title} concept",
+        "a": list(proposal.concept_aliases),
+        "direct": proposal.directly_teaches_topic,
+        "ie": intent_evidence,
+    }
+
+
 def _run_stubbed_pro_candidate_audit(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -12070,7 +12168,24 @@ def _run_stubbed_pro_candidate_audit(
     segments: list[dict],
     item: dict,
 ) -> tuple[gemini_segment._CompactBoundaryPlan, list[dict], list[str]]:
-    audit = gemini_segment._ProCandidateAuditPlan(items=[item])
+    prepared_item = dict(item)
+    for key, value in _pro_audit_semantic_defaults(
+        plan,
+        evidence_quote=str(
+            prepared_item.get("evidence_quote") or prepared_item.get("ev") or ""
+        ),
+    ).items():
+        canonical = {
+            "t": "title",
+            "f": "facet",
+            "family": "concept_family",
+            "a": "concept_aliases",
+            "direct": "directly_teaches_topic",
+            "ie": "intent_evidence",
+        }[key]
+        if key not in prepared_item and canonical not in prepared_item:
+            prepared_item[key] = value
+    audit = gemini_segment._ProCandidateAuditPlan(items=[prepared_item])
     monkeypatch.setattr(
         gemini_segment,
         "_call_model",
@@ -12087,6 +12202,252 @@ def _run_stubbed_pro_candidate_audit(
         deadline=time.monotonic() + 10.0,
         cancelled=None,
     )
+
+
+def test_pro_candidate_audit_reclassifies_same_body_balanced_forces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = (
+        "Newton's laws: begin with first-law inertia and balanced forces, then "
+        "third-law action-reaction pairs"
+    )
+    transcript = (
+        "As you sit in your chair right now, the force of gravity is pulling you "
+        "down towards the center of the earth, but something called the normal "
+        "force points straight up with the same magnitude, which is why you remain "
+        "perfectly still."
+    )
+    segments = [{
+        "cue_id": "ingest-5313d41c12ec4edd:cue:0",
+        "start": 0.0,
+        "end": 18.0,
+        "text": transcript,
+    }]
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": [
+                {
+                    "constraint_id": "balanced",
+                    "kind": "relationship",
+                    "source_phrase": "balanced forces",
+                    "requirement": "Explain balanced forces",
+                },
+                {
+                    "constraint_id": "third-law",
+                    "kind": "relationship",
+                    "source_phrase": "third-law action-reaction pairs",
+                    "requirement": "Explain Newton's third-law action-reaction pairs",
+                },
+            ],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="chair-action-reaction",
+            start_line=0,
+            end_line=0,
+            start_quote="As you sit in your chair right now",
+            end_quote="which is why you remain perfectly still",
+            claim_quote="normal force points straight up with the same magnitude",
+            title="Action-Reaction Forces in a Chair",
+            learning_objective=(
+                "Identify the action-reaction pair of gravity and normal force while sitting"
+            ),
+            facet="third-law action-reaction pair",
+            concept_family="Newton's third law of motion",
+            concept_aliases=["action-reaction law"],
+            informativeness=0.9,
+            topic_relevance=0.95,
+            educational_importance=0.9,
+            difficulty=0.2,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[{
+                "id": "third-law",
+                "q": "normal force points straight up with the same magnitude",
+            }],
+        )],
+    )
+
+    selector_system, selector_user = gemini_segment._boundary_prompts(
+        f"[0] 00:00 {transcript}",
+        1,
+        request,
+    )
+    audit_system, audit_user, _allowed = gemini_segment._pro_boundary_audit_prompts(
+        plan,
+        segments,
+        request,
+    )
+    selector_contract = " ".join(
+        f"{selector_system}\n{selector_user}".split()
+    ).casefold()
+    audit_contract = " ".join(f"{audit_system}\n{audit_user}".split()).casefold()
+    for contract in (selector_contract, audit_contract):
+        assert "required participant" in contract
+        assert "defining connection" in contract
+        assert "reciprocal" in contract
+        assert "causal" in contract
+        assert "sequence relation" in contract
+    assert "similar properties" in audit_contract
+    assert "reclassify a kept candidate" in audit_contract
+
+    audited, _calls, rejections = _run_stubbed_pro_candidate_audit(
+        monkeypatch,
+        plan=plan,
+        segments=segments,
+        item={
+            "id": "candidate-1",
+            "d": "keep",
+            "obj": "Explain how gravity and normal force balance on a seated person",
+            "title": "Balanced Forces While Sitting",
+            "facet": "balanced vertical forces",
+            "family": "static equilibrium under balanced forces",
+            "a": ["mechanical equilibrium"],
+            "direct": False,
+            "ie": [{
+                "id": "balanced",
+                "q": "normal force points straight up with the same magnitude",
+            }],
+            "ev": "normal force points straight up with the same magnitude",
+            "ds": 0,
+            "dq": "As you sit in your chair right now",
+            "dc": True,
+            "s": 0,
+            "e": 0,
+            "sq": "As you sit in your chair right now",
+            "eq": "which is why you remain perfectly still",
+        },
+    )
+
+    assert rejections == []
+    [proposal] = audited.topics
+    assert proposal.title == "Balanced Forces While Sitting"
+    assert proposal.learning_objective == (
+        "Explain how gravity and normal force balance on a seated person"
+    )
+    assert proposal.facet == "balanced vertical forces"
+    assert proposal.concept_family == "static equilibrium under balanced forces"
+    assert proposal.concept_aliases == []
+    assert proposal.directly_teaches_topic is False
+    assert [item.constraint_id for item in proposal.intent_evidence] == ["balanced"]
+    assert proposal.claim_quote == (
+        "normal force points straight up with the same magnitude"
+    )
+
+    report = gemini_segment._plan_to_report(
+        audited,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=request,
+    )
+    [clip] = report.clips
+    assert clip["concept_family"] == "static equilibrium under balanced forces"
+    assert clip["topic_evidence_quote"] == (
+        "normal force points straight up with the same magnitude"
+    )
+    assert clip["directly_teaches_topic"] is False
+    assert "third law" not in clip["title"].casefold()
+    _enrichment_system, enrichment_user = gemini_segment._card_enrichment_prompts(
+        [{
+            "clip_id": clip["_clip_id"],
+            "title": clip["title"],
+            "learning_objective": clip["learning_objective"],
+            "text": clip["_clip_text"],
+        }],
+        request,
+    )
+    assert "Balanced Forces While Sitting" in enrichment_user
+    assert "action-reaction pair of gravity and normal force" not in enrichment_user
+
+
+def test_pro_candidate_audit_keeps_spoken_two_object_third_law_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain Newton's third-law action-reaction pairs"
+    transcript = (
+        "The skater pushes the wall, and the wall pushes the skater back with "
+        "equal force in the opposite direction."
+    )
+    evidence = "skater pushes the wall, and the wall pushes the skater"
+    segments = [{
+        "cue_id": "cue-valid-third-law",
+        "start": 0.0,
+        "end": 8.0,
+        "text": transcript,
+    }]
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": [{
+                "constraint_id": "third-law",
+                "kind": "relationship",
+                "source_phrase": "third-law action-reaction pairs",
+                "requirement": "Explain Newton's third-law action-reaction pairs",
+            }],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="skater-wall-pair",
+            start_line=0,
+            end_line=0,
+            start_quote="The skater pushes the wall",
+            end_quote="equal force in the opposite direction",
+            claim_quote=evidence,
+            title="Skater and Wall Force Pair",
+            learning_objective="Identify reciprocal forces between a skater and wall",
+            facet="two-object reciprocal forces",
+            concept_family="Newton's third law of motion",
+            concept_aliases=["action-reaction law"],
+            informativeness=0.9,
+            topic_relevance=1.0,
+            educational_importance=0.9,
+            difficulty=0.2,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[{"id": "third-law", "q": evidence}],
+        )],
+    )
+
+    audited, _calls, rejections = _run_stubbed_pro_candidate_audit(
+        monkeypatch,
+        plan=plan,
+        segments=segments,
+        item={
+            "id": "candidate-1",
+            "d": "keep",
+            "obj": "Identify reciprocal forces between a skater and wall",
+            "title": "Skater and Wall Force Pair",
+            "facet": "two-object reciprocal forces",
+            "family": "Newton's third law of motion",
+            "a": ["action-reaction law"],
+            "direct": True,
+            "ie": [{"id": "third-law", "q": evidence}],
+            "ev": evidence,
+            "ds": 0,
+            "dq": "The skater pushes the wall",
+            "dc": True,
+            "s": 0,
+            "e": 0,
+            "sq": "The skater pushes the wall",
+            "eq": "equal force in the opposite direction",
+        },
+    )
+
+    assert rejections == []
+    [proposal] = audited.topics
+    assert proposal.concept_family == "Newton's third law of motion"
+    assert proposal.concept_aliases == []
+    assert proposal.directly_teaches_topic is True
+    assert proposal.claim_quote == evidence
 
 
 def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
@@ -12228,6 +12589,12 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
         "id",
         "d",
         "obj",
+        "t",
+        "f",
+        "family",
+        "a",
+        "direct",
+        "ie",
         "ev",
         "ds",
         "dq",
@@ -12238,10 +12605,11 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
         "eq",
     } <= audit_required
     assert gemini_segment._PRO_BOUNDARY_AUDIT_PROMPT_VERSION == (
-        "pro_candidate_audit_v6"
+        "pro_candidate_audit_v7"
     )
 
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
+        **_pro_audit_semantic_defaults(plan),
         "candidate_id": "candidate-1",
         "decision": "keep",
         "actual_objective": "Explain why more mass means less acceleration for one force",
@@ -12754,9 +13122,11 @@ def test_pro_candidate_audit_expands_formula_pronoun_to_nearest_naming(
         "topics": [plan.topics[0].model_copy(update={
             "start_line": 1,
             "end_line": 2,
-            "title": "Quantitative F=ma calculations",
-            "learning_objective": "Use F=ma to solve for acceleration",
-            "facet": "solving F=ma",
+                "title": "Newton's second law quantitative F=ma calculations",
+                "learning_objective": "Use Newton's second law F=ma to solve for acceleration",
+                "facet": "Newton's second law F=ma calculations",
+                "concept_family": "Newton's second law",
+                "concept_aliases": ["F=ma"],
         })],
     })
 
@@ -12839,9 +13209,11 @@ def test_pro_candidate_audit_finishes_dangling_same_objective_contrast(
         "topics": [plan.topics[0].model_copy(update={
             "start_line": 0,
             "end_line": 1,
-            "title": "Force units",
-            "learning_objective": "Explain newtons and an alternative force unit",
-            "facet": "force units",
+                "title": "Force units",
+                "learning_objective": "Explain newtons and an alternative force unit",
+                "facet": "force units",
+                "concept_family": "force units",
+                "concept_aliases": [],
         })],
     })
 
@@ -13100,8 +13472,10 @@ def test_pro_candidate_audit_untrusted_selector_claim_does_not_block_repair(
     assert audited.topics[0].start_quote == "The target equation explains"
 
 
-def test_pro_boundary_audit_schema_failure_is_not_retried(
+@pytest.mark.parametrize("retry_recovers", [True, False])
+def test_pro_boundary_audit_retries_one_schema_failure(
     monkeypatch: pytest.MonkeyPatch,
+    retry_recovers: bool,
 ) -> None:
     plan = _compact_custom_plan(
         request="Bayes' theorem",
@@ -13123,20 +13497,46 @@ def test_pro_boundary_audit_schema_failure_is_not_retried(
     }]
     attempted = 0
 
-    def fail_audit(*_args, **kwargs):
+    def fail_then_recover(*_args, **kwargs):
         nonlocal attempted
         attempted += 1
         assert kwargs["operation"] == "pro_boundary_audit"
-        raise gemini_segment._SchemaResponseError(
-            "invalid boundary audit response",
-            {
-                "model": "gemini-3.1-pro-preview",
-                "operation": "pro_boundary_audit",
-                "prompt_tokens": 500,
-            },
-        )
+        assert kwargs["max_retries"] == 1
+        assert kwargs.get("retry_status_codes") is None
+        telemetry = {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_boundary_audit",
+            "prompt_tokens": 500,
+        }
+        if attempted == 1 or not retry_recovers:
+            raise gemini_segment._SchemaResponseError(
+                "invalid boundary audit response",
+                telemetry,
+            )
+        return gemini_segment._ProCandidateAuditPlan(items=[{
+            "id": "candidate-1",
+            "d": "keep",
+            "obj": "Explain how Bayes' theorem updates a prior probability",
+            "t": "Bayes' Theorem Update",
+            "f": "prior updated by observed evidence",
+            "family": "Bayes' theorem",
+            "a": ["Bayes' rule"],
+            "direct": True,
+            "ie": [{
+                "id": "subject",
+                "q": "Bayes' theorem updates a prior probability using the likelihood",
+            }],
+            "ev": "Bayes' theorem updates a prior probability using the likelihood",
+            "ds": 0,
+            "dq": "Bayes' theorem updates a prior probability",
+            "dc": True,
+            "s": 0,
+            "e": 0,
+            "sq": "Bayes' theorem updates a prior probability",
+            "eq": "using the likelihood of the observed evidence",
+        }]), telemetry
 
-    monkeypatch.setattr(gemini_segment, "_call_model", fail_audit)
+    monkeypatch.setattr(gemini_segment, "_call_model", fail_then_recover)
     retained, calls, rejections = gemini_segment._audit_pro_boundaries(
         plan,
         segments,
@@ -13146,12 +13546,21 @@ def test_pro_boundary_audit_schema_failure_is_not_retried(
         cancelled=None,
     )
 
-    assert attempted == 1
-    assert retained == plan
-    assert len(calls) == 1
+    assert attempted == 2
+    assert retained.topics[0].concept_family == (
+        "Bayes' theorem" if retry_recovers else plan.topics[0].concept_family
+    )
+    assert len(calls) == 2
     assert calls[0]["operation"] == "pro_boundary_audit"
     assert calls[0]["error_type"] == "_SchemaResponseError"
     assert calls[0]["video_grounded"] is False
+    assert calls[0]["structured_retry_attempt"] == 1
+    assert calls[1].get("structured_retry_recovered") is (
+        True if retry_recovers else None
+    )
+    assert calls[1].get("structured_retry_exhausted") is (
+        None if retry_recovers else True
+    )
     assert rejections == []
 
 
@@ -13182,6 +13591,7 @@ def test_pro_boundary_audit_can_repair_beyond_two_coarse_cues(
         claim_quote="Bayesian updating begins with a prior probability and then",
     )
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
+        **_pro_audit_semantic_defaults(plan),
         "candidate_id": "candidate-1",
         "decision": "keep",
         "actual_objective": "Explain how evidence produces a Bayesian posterior",
@@ -13250,6 +13660,7 @@ def test_pro_candidate_audit_can_reject_only_grounded_unrelated_or_filler(
             claim_quote=evidence,
         )
         audit = gemini_segment._ProCandidateAuditPlan(items=[{
+            **_pro_audit_semantic_defaults(plan),
             "candidate_id": "candidate-1",
             "decision": decision,
             "actual_objective": (
@@ -13339,7 +13750,7 @@ def test_pro_candidate_audit_invalid_or_duplicate_rejection_retains_original(
                 {"model": "gemini-3.1-pro-preview", "operation": "pro_boundary_audit"},
             ),
         )
-        retained, _calls, rejections = gemini_segment._audit_pro_boundaries(
+        retained, calls, rejections = gemini_segment._audit_pro_boundaries(
             plan,
             segments,
             request,
@@ -13350,6 +13761,492 @@ def test_pro_candidate_audit_invalid_or_duplicate_rejection_retains_original(
 
         assert retained == plan
         assert rejections == []
+        assert len(calls) == 2
+        assert calls[0]["contract_retry_attempt"] == 1
+        assert calls[1]["contract_retry_exhausted"] is True
+
+
+def test_pro_candidate_audit_contract_retry_recovers_valid_second_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain Newton's second law F=ma"
+    text = "Newton's second law says net force equals mass times acceleration."
+    segments = [{"cue_id": "cue-0", "start": 0.0, "end": 8.0, "text": text}]
+    claim = "net force equals mass times acceleration"
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="Newton's second law says",
+        end_quote="mass times acceleration",
+        claim_quote=claim,
+    )
+    missing = gemini_segment._ProCandidateAuditPlan(items=[])
+    valid = gemini_segment._ProCandidateAuditPlan(items=[{
+        **_pro_audit_semantic_defaults(plan, evidence_quote=claim),
+        "id": "candidate-1",
+        "d": "keep",
+        "obj": "Explain Newton's second law as F=ma",
+        "ev": claim,
+        "ds": 0,
+        "dq": "Newton's second law says",
+        "dc": True,
+        "s": 0,
+        "e": 0,
+        "sq": "Newton's second law says",
+        "eq": "mass times acceleration",
+    }])
+    responses = iter([missing, valid])
+    attempts = 0
+
+    def next_audit(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return next(responses), {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_boundary_audit",
+        }
+
+    monkeypatch.setattr(gemini_segment, "_call_model", next_audit)
+    audited, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert attempts == 2
+    assert rejections == []
+    assert audited.topics[0].learning_objective == (
+        "Explain Newton's second law as F=ma"
+    )
+    assert calls[0]["contract_retry_attempt"] == 1
+    assert calls[1]["contract_retry_recovered"] is True
+
+
+def test_pro_candidate_audit_retries_extra_unknown_id_then_exhausts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain Newton's second law F=ma"
+    text = "Newton's second law says net force equals mass times acceleration."
+    segments = [{"cue_id": "cue-0", "start": 0.0, "end": 8.0, "text": text}]
+    claim = "net force equals mass times acceleration"
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="Newton's second law says",
+        end_quote="mass times acceleration",
+        claim_quote=claim,
+    )
+    item = {
+        **_pro_audit_semantic_defaults(plan, evidence_quote=claim),
+        "id": "candidate-1",
+        "d": "keep",
+        "obj": "Explain Newton's second law as F=ma",
+        "ev": claim,
+        "ds": 0,
+        "dq": "Newton's second law says",
+        "dc": True,
+        "s": 0,
+        "e": 0,
+        "sq": "Newton's second law says",
+        "eq": "mass times acceleration",
+    }
+    audit = gemini_segment._ProCandidateAuditPlan(items=[
+        item,
+        {**item, "id": "extra-1"},
+    ])
+    attempts = 0
+
+    def extra_id_audit(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return audit, {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_boundary_audit",
+        }
+
+    monkeypatch.setattr(gemini_segment, "_call_model", extra_id_audit)
+    retained, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert attempts == 2
+    assert retained == plan
+    assert rejections == []
+    assert calls[0]["contract_retry_attempt"] == 1
+    assert calls[1]["contract_retry_attempt"] == 2
+    assert calls[1]["contract_retry_exhausted"] is True
+
+
+def test_pro_candidate_audit_uses_ai_family_without_semantic_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Newton's third law"
+    text = (
+        "Newton's third law says interacting objects exert reciprocal forces "
+        "on each other."
+    )
+    claim = "third law says interacting objects exert reciprocal forces"
+    segments = [{"cue_id": "cue-0", "start": 0.0, "end": 8.0, "text": text}]
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="Newton's third law says",
+        end_quote="forces on each other",
+        claim_quote=claim,
+    )
+    base = {
+        **_pro_audit_semantic_defaults(plan, evidence_quote=claim),
+        "id": "candidate-1",
+        "d": "keep",
+        "obj": "Explain Newton's third law reciprocal force pair",
+        "t": "Newton's Third Law",
+        "f": "third-law reciprocal forces",
+        "ev": claim,
+        "ds": 0,
+        "dq": "Newton's third law says",
+        "dc": True,
+        "s": 0,
+        "e": 0,
+        "sq": "Newton's third law says",
+        "eq": "forces on each other",
+    }
+    response = gemini_segment._ProCandidateAuditPlan(items=[{
+            **base,
+            "family": "Newton's third law of motion",
+            "a": ["action-reaction law"],
+        }])
+
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        lambda *_args, **_kwargs: (
+            response,
+            {
+                "model": "gemini-3.1-pro-preview",
+                "operation": "pro_boundary_audit",
+            },
+        ),
+    )
+    audited, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert rejections == []
+    assert audited.topics[0].concept_family == "Newton's third law of motion"
+    assert audited.topics[0].concept_aliases == []
+    assert len(calls) == 1
+    assert "contract_retry_attempt" not in calls[0]
+
+
+def test_pro_candidate_audit_canonicalizes_fma_in_one_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain F=ma"
+    text = "Net force equals mass times acceleration and determines acceleration."
+    claim = "Net force equals mass times acceleration"
+    segments = [{"cue_id": "cue-0", "start": 0.0, "end": 8.0, "text": text}]
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="Net force equals mass times acceleration",
+        end_quote="determines acceleration",
+        claim_quote=claim,
+    )
+    audit = gemini_segment._ProCandidateAuditPlan(items=[{
+        **_pro_audit_semantic_defaults(plan, evidence_quote=claim),
+        "id": "candidate-1",
+        "d": "keep",
+        "obj": "Explain how net force, mass, and acceleration relate",
+        "t": "Newton's Second Law of Motion",
+        "f": "net force, mass, and acceleration",
+        "family": "Newton's second law of motion",
+        "a": ["F=ma"],
+        "direct": True,
+        "ie": [{"id": "subject", "q": claim}],
+        "ev": claim,
+        "ds": 0,
+        "dq": "Net force equals mass times acceleration",
+        "dc": True,
+        "s": 0,
+        "e": 0,
+        "sq": "Net force equals mass times acceleration",
+        "eq": "determines acceleration",
+    }])
+    dispatches = 0
+
+    def audit_once(*_args, **_kwargs):
+        nonlocal dispatches
+        dispatches += 1
+        return audit, {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_boundary_audit",
+        }
+
+    monkeypatch.setattr(gemini_segment, "_call_model", audit_once)
+    audited, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert rejections == []
+    assert audited.topics[0].concept_family == "Newton's second law of motion"
+    assert audited.topics[0].concept_aliases == []
+    assert dispatches == len(calls) == 1
+    assert "contract_retry_attempt" not in calls[0]
+
+
+def test_concept_family_contract_keeps_ai_family_and_drops_aliases():
+    base = _compact_custom_plan(
+        request="Newton's third law",
+        start_quote="Newton's third law says",
+        end_quote="forces on each other",
+        claim_quote="third law says interacting objects exert reciprocal forces",
+    ).topics[0].model_copy(update={
+        "title": "Newton's Third Law",
+        "learning_objective": "Explain Newton's third law force pairs",
+        "facet": "third-law reciprocal forces",
+        "concept_family": "Newton's third law of motion",
+        "concept_aliases": ["action-reaction law"],
+    })
+
+    _payload, error = gemini_segment._validated_proposal_concept_family_payload(
+        base.model_copy(update={"concept_family": "third law"})
+    )
+    assert error == "family_not_domain_qualified"
+
+    payload, error = gemini_segment._validated_proposal_concept_family_payload(
+        base.model_copy(update={
+            "concept_aliases": ["Newton's first law of motion"],
+        })
+    )
+    assert error is None
+    assert payload["concept_aliases"] == []
+
+    payload, error = gemini_segment._validated_proposal_concept_family_payload(
+        base.model_copy(update={"concept_family": "Newton's laws of motion"})
+    )
+    assert error is None
+    assert payload["concept_family"] == "Newton's laws of motion"
+
+    broad = base.model_copy(update={
+        "title": "Newton's First and Second Laws",
+        "learning_objective": "Compare Newton's first law with Newton's second law",
+        "facet": "first-law and second-law comparison",
+        "concept_family": "Newton's laws of motion",
+        "concept_aliases": [],
+    })
+    payload, error = gemini_segment._validated_proposal_concept_family_payload(
+        broad
+    )
+    assert error is None
+    assert payload["concept_family"] == "Newton's laws of motion"
+
+
+def test_ai_family_contract_does_not_apply_numbered_semantic_heuristics():
+    base = _compact_custom_plan(
+        request="numbered concept",
+        start_quote="This numbered concept explains",
+        end_quote="the complete relationship clearly",
+        claim_quote="This numbered concept explains the complete relationship clearly",
+    ).topics[0]
+
+    for title, family in (
+        ("Kepler's Fifth Law", "Kepler's laws of planetary motion"),
+        ("Asimov's Zeroth Law", "Asimov's laws of robotics"),
+        ("Beethoven's Fifth Symphony", "Beethoven symphonies"),
+        ("The First Crusade", "the Crusades"),
+        ("The Fifth Cranial Nerve", "cranial nerves"),
+    ):
+        payload, error = gemini_segment._validated_proposal_concept_family_payload(
+            base.model_copy(update={
+                "title": title,
+                "learning_objective": f"Explain {title}",
+                "facet": title,
+                "concept_family": family,
+                "concept_aliases": [],
+            })
+        )
+        assert error is None
+        assert payload["concept_family"] == family
+
+    valid, error = gemini_segment._validated_proposal_concept_family_payload(
+        base.model_copy(update={
+            "title": "Kepler's Fifth Law",
+            "learning_objective": "Explain Kepler's fifth law",
+            "facet": "Kepler's fifth law",
+            "concept_family": "Kepler's fifth law of planetary motion",
+            "concept_aliases": ["planetary motion fifth law"],
+        })
+    )
+    assert error is None
+    assert valid["concept_family"] == "Kepler's fifth law of planetary motion"
+    assert valid["concept_aliases"] == []
+
+    payload, error = gemini_segment._validated_proposal_concept_family_payload(
+        base.model_copy(update={
+            "title": "Kepler's Fifth Law",
+            "learning_objective": "Explain Kepler's fifth law",
+            "facet": "Kepler's fifth law",
+            "concept_family": "Kepler's fifth law of planetary motion",
+            "concept_aliases": ["Kepler's sixth law of planetary motion"],
+        })
+    )
+    assert error is None
+    assert payload["concept_family"] == "Kepler's fifth law of planetary motion"
+    assert payload["concept_aliases"] == []
+
+    broad, error = gemini_segment._validated_proposal_concept_family_payload(
+        base.model_copy(update={
+            "title": "Maxwell's First and Second Equations",
+            "learning_objective": "Compare Maxwell's first and second equations",
+            "facet": "Maxwell's first and second equations",
+            "concept_family": "Maxwell's equations of electromagnetism",
+            "concept_aliases": [],
+        })
+    )
+    assert error is None
+    assert broad["concept_family"] == "Maxwell's equations of electromagnetism"
+
+
+def test_numbered_concept_contract_does_not_treat_rate_units_as_ordinals():
+    proposal = _compact_custom_plan(
+        request="radioactive decay law",
+        start_quote="The radioactive decay law gives",
+        end_quote="a probability per second",
+        claim_quote="radioactive decay law gives a probability per second",
+    ).topics[0].model_copy(update={
+        "title": "Radioactive Decay Law",
+        "learning_objective": "Explain decay probability per second",
+        "facet": "radioactive decay rate law",
+        "concept_family": "radioactive decay law",
+        "concept_aliases": ["exponential decay law"],
+    })
+
+    payload, error = gemini_segment._validated_proposal_concept_family_payload(
+        proposal
+    )
+
+    assert error is None
+    assert payload["concept_family"] == "radioactive decay law"
+    assert payload["concept_aliases"] == []
+
+
+def test_concept_family_identity_preserves_attached_language_punctuation():
+    identities = {
+        gemini_segment._concept_family_identity_key(f"{language} memory management")
+        for language in ("C", "C++", "C#")
+    }
+    assert len(identities) == 3
+    assert "c++ memory management" in identities
+    assert "c# memory management" in identities
+    # Standalone punctuation remains noise and cannot manufacture a family.
+    assert gemini_segment._concept_family_identity_key("+ #") == ""
+
+
+def test_concept_family_identity_preserves_operators_and_unicode_notation():
+    operator_identities = {
+        gemini_segment._concept_family_identity_key(value)
+        for value in (
+            "JavaScript && operator",
+            "JavaScript || operator",
+            "JavaScript ?? operator",
+        )
+    }
+    assert len(operator_identities) == 3
+    assert gemini_segment._concept_family_identity_key(
+        "C bitwise &"
+    ) != gemini_segment._concept_family_identity_key("C bitwise |")
+    assert gemini_segment._concept_family_identity_key(
+        "Swift String? nullable type"
+    ) != gemini_segment._concept_family_identity_key(
+        "Swift String nullable type"
+    )
+    assert gemini_segment._concept_family_identity_key(
+        "Swift nullable type String?"
+    ) != gemini_segment._concept_family_identity_key(
+        "Swift nullable type String"
+    )
+    assert gemini_segment._concept_family_identity_key(
+        "factorial operation n!"
+    ) != gemini_segment._concept_family_identity_key("factorial operation n")
+    assert gemini_segment._concept_family_identity_key(
+        "TypeScript non-null assertion !"
+    ) != gemini_segment._concept_family_identity_key(
+        "TypeScript non-null assertion"
+    )
+    assert gemini_segment._concept_family_identity_key(
+        "C∗-algebra"
+    ) == gemini_segment._concept_family_identity_key("C* algebra")
+    assert gemini_segment._concept_family_identity_key(
+        "C∗-algebra"
+    ) != gemini_segment._concept_family_identity_key("C algebra")
+
+
+def test_public_clip_identity_preserves_mathematical_letter_symbols():
+    clip = gemini_segment._public_clips([{
+        "facet": "ℂ vector space",
+        "concept_family": "ℂ vector spaces",
+        "concept_aliases": ["complex vector spaces"],
+    }])[0]
+
+    assert clip["concept"] == "ℂ vector space"
+    assert clip["concept_family"] == "ℂ vector spaces"
+    assert clip["concept_aliases"] == []
+
+
+def test_numeric_prose_is_ignored_and_aliases_are_dropped():
+    base = _compact_custom_plan(
+        request="linear equations",
+        start_quote="Solve x equals five by isolating x",
+        end_quote="so x equals five",
+        claim_quote="Solve x equals five by isolating x",
+    ).topics[0]
+    for title, facet, family in (
+        (
+            "Solving a linear equation x = 5",
+            "Solving a linear equation x = 5",
+            "linear equations",
+        ),
+        ("Derivative at x = 2", "Derivative at x = 2", "derivatives at a point"),
+        ("Probability of rolling a 6", "Probability of rolling a 6", "die roll probability"),
+    ):
+        payload, error = gemini_segment._validated_proposal_concept_family_payload(
+            base.model_copy(update={
+                "title": title,
+                "learning_objective": f"Explain {title}",
+                "facet": facet,
+                "concept_family": family,
+                "concept_aliases": [],
+            })
+        )
+        assert error is None
+        assert payload["concept_family"] == family
+
+    payload, error = gemini_segment._validated_proposal_concept_family_payload(
+        base.model_copy(update={
+            "title": "Apollo 11 Lunar Mission",
+            "learning_objective": "Explain the Apollo 11 lunar mission",
+            "facet": "Apollo 11 lunar mission",
+            "concept_family": "Apollo 11 mission",
+            "concept_aliases": ["Apollo 13 mission"],
+        })
+    )
+    assert error is None
+    assert payload["concept_family"] == "Apollo 11 mission"
+    assert payload["concept_aliases"] == []
 
 
 def test_pro_candidate_audit_cannot_reject_from_unrelated_coarse_cue_tail(
@@ -13373,6 +14270,7 @@ def test_pro_candidate_audit_cannot_reject_from_unrelated_coarse_cue_tail(
         claim_quote=claim,
     )
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
+        **_pro_audit_semantic_defaults(plan),
         "candidate_id": "candidate-1",
         "decision": "reject_unrelated",
         "actual_objective": "Define momentum as mass times velocity",
@@ -13456,6 +14354,12 @@ def test_pro_candidate_audit_may_drop_untrusted_selector_context_evidence(
         )],
     )
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
+        **_pro_audit_semantic_defaults(
+            plan,
+            evidence_quote=(
+                "Posterior probability combines prior evidence with likelihood"
+            ),
+        ),
         "candidate_id": "candidate-1",
         "decision": "keep",
         "actual_objective": "Explain how evidence updates a Bayesian posterior",
@@ -13553,6 +14457,14 @@ def test_boundary_selector_never_attaches_video_even_when_requested(
 
     def fake_generate(system, user, schema, **kwargs):
         calls.append({"system": system, "user": user, "schema": schema, **kwargs})
+        telemetry = {
+            "model": kwargs["model"],
+            "prompt_tokens": 100,
+            "candidate_tokens": 10,
+            "thought_tokens": 0,
+            "total_tokens": 110,
+        }
+        _settle_mock_dispatch(kwargs, telemetry)
         return SimpleNamespace(
             text=(
                 '{"request_intent":{"exact_request":"photosynthesis",'
@@ -13560,12 +14472,7 @@ def test_boundary_selector_never_attaches_video_even_when_requested(
                 '"source_phrase":"photosynthesis","requirement":'
                 '"Teach photosynthesis"}]},"topics":[]}'
             ),
-            telemetry={
-                "model": kwargs["model"],
-                "prompt_tokens": 100,
-                "candidate_tokens": 10,
-                "total_tokens": 110,
-            },
+            telemetry=telemetry,
         )
 
     monkeypatch.setattr(gemini_client, "generate_json_v3", fake_generate)
@@ -13620,12 +14527,12 @@ def test_boundary_selector_never_attaches_video_even_when_requested(
     assert "youtube.com" not in contents
     assert call["media_resolution"] is None
     assert call.get("estimated_media_tokens", 0) == 0
-    if profile == gemini_segment.FLASH_SPLIT_PROFILE:
-        assert call["max_retries"] == 1
-        assert call["retry_status_codes"] == frozenset({503})
-    else:
-        assert call["max_retries"] == 0
-        assert call["retry_status_codes"] is None
+    assert call["max_retries"] == 1
+    assert call["retry_status_codes"] == (
+        frozenset({503})
+        if profile == gemini_segment.FLASH_SPLIT_PROFILE
+        else None
+    )
     [reservation] = reservations
     prompt_text = f"{call['system']}\n\n{contents}"
     schema_bytes = len(json.dumps(
@@ -13699,26 +14606,31 @@ def test_long_video_metadata_does_not_create_media_budget_or_block_dispatch(
 ) -> None:
     context = GenerationContext("slow", generation_id="selector-long-context")
     calls: list[object] = []
+
+    def fake_generate(*_args, **kwargs):
+        calls.append(kwargs)
+        telemetry = {
+            "model": kwargs["model"],
+            "prompt_tokens": 100,
+            "candidate_tokens": 10,
+            "thought_tokens": 0,
+            "total_tokens": 110,
+        }
+        _settle_mock_dispatch(kwargs, telemetry)
+        return SimpleNamespace(
+            text=(
+                '{"request_intent":{"exact_request":"photosynthesis",'
+                '"constraints":[{"constraint_id":"subject","kind":"subject",'
+                '"source_phrase":"photosynthesis","requirement":'
+                '"Teach photosynthesis"}]},"topics":[]}'
+            ),
+            telemetry=telemetry,
+        )
+
     monkeypatch.setattr(
         gemini_client,
         "generate_json_v3",
-        lambda *_args, **_kwargs: (
-            calls.append(_kwargs)
-            or SimpleNamespace(
-                text=(
-                    '{"request_intent":{"exact_request":"photosynthesis",'
-                    '"constraints":[{"constraint_id":"subject","kind":"subject",'
-                    '"source_phrase":"photosynthesis","requirement":'
-                    '"Teach photosynthesis"}]},"topics":[]}'
-                ),
-                telemetry={
-                    "model": _kwargs["model"],
-                    "prompt_tokens": 100,
-                    "candidate_tokens": 10,
-                    "total_tokens": 110,
-                },
-            )
-        ),
+        fake_generate,
     )
     monkeypatch.setattr(
         gemini_client,
@@ -13768,6 +14680,14 @@ def test_long_preferred_video_url_dispatches_one_pro_transcript_only_call(
 
     def fake_generate(_system, user, _schema, **kwargs):
         calls.append({"user": user, **kwargs})
+        telemetry = {
+            "model": kwargs["model"],
+            "prompt_tokens": 40_000,
+            "candidate_tokens": 200,
+            "thought_tokens": 100,
+            "total_tokens": 40_300,
+        }
+        _settle_mock_dispatch(kwargs, telemetry)
         return SimpleNamespace(
             text=(
                 '{"request_intent":{"exact_request":"photosynthesis",'
@@ -13775,13 +14695,7 @@ def test_long_preferred_video_url_dispatches_one_pro_transcript_only_call(
                 '"source_phrase":"photosynthesis","requirement":'
                 '"Teach photosynthesis"}]},"topics":[]}'
             ),
-            telemetry={
-                "model": kwargs["model"],
-                "prompt_tokens": 40_000,
-                "candidate_tokens": 200,
-                "thought_tokens": 100,
-                "total_tokens": 40_300,
-            },
+            telemetry=telemetry,
         )
 
     monkeypatch.setattr(gemini_client, "generate_json_v3", fake_generate)
@@ -13916,14 +14830,17 @@ def test_exact_token_preflight_admits_affordable_long_unicode_text(
 
     def generate(_system, _user, _schema, **kwargs):
         calls.append(kwargs)
+        telemetry = {
+            "model": kwargs["model"],
+            "prompt_tokens": 60_000,
+            "candidate_tokens": 10,
+            "thought_tokens": 0,
+            "total_tokens": 60_010,
+        }
+        _settle_mock_dispatch(kwargs, telemetry)
         return SimpleNamespace(
             text='{"topics": []}',
-            telemetry={
-                "model": kwargs["model"],
-                "prompt_tokens": 60_000,
-                "candidate_tokens": 10,
-                "total_tokens": 60_010,
-            },
+            telemetry=telemetry,
         )
 
     monkeypatch.setattr(gemini_client, "count_request_tokens", count_tokens)
@@ -13969,15 +14886,17 @@ def test_exact_token_preflight_keeps_affordable_tier_through_its_exact_boundary(
 
     def generate(_system, _user, _schema, **kwargs):
         calls.append(kwargs)
+        telemetry = {
+            "model": kwargs["model"],
+            "prompt_tokens": exact_tokens,
+            "candidate_tokens": 10,
+            "thought_tokens": 10,
+            "total_tokens": exact_tokens + 20,
+        }
+        _settle_mock_dispatch(kwargs, telemetry)
         return SimpleNamespace(
             text='{"topics": []}',
-            telemetry={
-                "model": kwargs["model"],
-                "prompt_tokens": exact_tokens,
-                "candidate_tokens": 10,
-                "thought_tokens": 10,
-                "total_tokens": exact_tokens + 20,
-            },
+            telemetry=telemetry,
         )
 
     monkeypatch.setattr(gemini_client, "generate_json_v3", generate)
@@ -14020,13 +14939,23 @@ def test_exact_preflight_prevents_high_entropy_text_from_exceeding_fast_ceiling(
         "count_request_tokens",
         lambda *_args, **_kwargs: 250_001,
     )
+
+    def generate(*_args, **kwargs):
+        # Admission must fail before this fake reaches its provider-dispatch
+        # marker.
+        kwargs["before_dispatch"](
+            model=kwargs["model"], attempt=1,
+        )
+        generated.append(True)
+        raise AssertionError("over-budget request dispatched")
+
     monkeypatch.setattr(
         gemini_client,
         "generate_json_v3",
-        lambda *_args, **_kwargs: generated.append(True),
+        generate,
     )
 
-    with pytest.raises(ProviderBudgetExceededError):
+    with pytest.raises(gemini_segment._ModelCallError) as exc_info:
         gemini_segment._call_model(
             "system",
             "x" * 70_000,
@@ -14045,6 +14974,11 @@ def test_exact_preflight_prevents_high_entropy_text_from_exceeding_fast_ceiling(
         )
 
     assert generated == []
+    assert isinstance(exc_info.value.__cause__, ProviderBudgetExceededError)
+    failure = gemini_segment._exception_telemetry(exc_info.value)
+    assert failure["error_type"] == "ProviderBudgetExceededError"
+    assert failure["dispatched"] is False
+    assert failure["physical_dispatches"] == 0
     budget = context.budget.snapshot()["gemini"]
     assert budget["selector_calls"] == 0
     assert budget["cost_exposure_usd"] == 0.0
@@ -14057,25 +14991,35 @@ def test_preferred_video_url_failure_never_dispatches_a_media_retry(
     calls: list[dict] = []
 
     def fail_generate(*_args, **kwargs):
+        telemetry = gemini_client.GeminiCallTelemetry(
+            model=str(kwargs["model"]),
+            operation="pro_authoritative",
+            prompt_version=gemini_segment.PRO_BOUNDARY_PROFILE,
+            thinking_level="medium",
+            latency_ms=10.0,
+            retries=0,
+            finish_reason=None,
+            prompt_tokens=None,
+            candidate_tokens=None,
+            thought_tokens=None,
+            total_tokens=None,
+            provider_error_type="ServerError",
+            provider_status_code=504,
+            retryable=True,
+        )
+        ticket = kwargs["before_dispatch"](
+            model=kwargs["model"], attempt=1,
+        )
         calls.append(kwargs)
+        kwargs["after_dispatch"](
+            ticket,
+            model=kwargs["model"],
+            attempt=1,
+            telemetry=telemetry,
+        )
         raise gemini_client.GeminiTransportError(
             "provider timed out",
-            gemini_client.GeminiCallTelemetry(
-                model=str(kwargs["model"]),
-                operation="pro_authoritative",
-                prompt_version=gemini_segment.PRO_BOUNDARY_PROFILE,
-                thinking_level="medium",
-                latency_ms=10.0,
-                retries=0,
-                finish_reason=None,
-                prompt_tokens=None,
-                candidate_tokens=None,
-                thought_tokens=None,
-                total_tokens=None,
-                provider_error_type="ServerError",
-                provider_status_code=504,
-                retryable=True,
-            ),
+            telemetry,
         )
 
     monkeypatch.setattr(gemini_client, "generate_json_v3", fail_generate)
@@ -14112,7 +15056,7 @@ def test_preferred_video_url_failure_never_dispatches_a_media_retry(
     assert result.error is not None
     assert len(calls) == 1
     assert calls[0]["model"] == "gemini-3.1-pro-preview"
-    assert calls[0]["max_retries"] == 0
+    assert calls[0]["max_retries"] == 1
     assert calls[0]["media_resolution"] is None
     assert "video_grounding_fallback_reason" not in result.calls[0]
     assert "skipped_media_tokens" not in result.calls[0]
@@ -14185,24 +15129,30 @@ def test_selector_reconciles_actual_usage_before_conversion(
     monkeypatch,
 ) -> None:
     context = GenerationContext("fast", generation_id="selector-reconcile")
-    monkeypatch.setattr(
-        gemini_client,
-        "generate_json_v3",
-        lambda *_args, **_kwargs: SimpleNamespace(
+
+    def generate(*_args, **kwargs):
+        telemetry = {
+            "model": "gemini-3.5-flash",
+            "prompt_tokens": 2_000,
+            "candidate_tokens": 20,
+            "thought_tokens": 10,
+            "total_tokens": 2_030,
+        }
+        _settle_mock_dispatch(kwargs, telemetry)
+        return SimpleNamespace(
             text=(
                 '{"request_intent":{"exact_request":"test topic","constraints":['
                 '{"constraint_id":"subject","kind":"subject",'
                 '"source_phrase":"test topic","requirement":"Teach the test topic"}]},'
                 '"topics":[]}'
             ),
-            telemetry={
-                "model": "gemini-3.5-flash",
-                "prompt_tokens": 2_000,
-                "candidate_tokens": 20,
-                "thought_tokens": 10,
-                "total_tokens": 2_030,
-            },
-        ),
+            telemetry=telemetry,
+        )
+
+    monkeypatch.setattr(
+        gemini_client,
+        "generate_json_v3",
+        generate,
     )
 
     parsed, telemetry = gemini_segment._call_model(

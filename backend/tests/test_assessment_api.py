@@ -6,6 +6,7 @@ import hashlib
 import os
 import tempfile
 import threading
+from contextlib import contextmanager
 from unittest import mock
 
 from fastapi.testclient import TestClient
@@ -21,6 +22,103 @@ OWNER_HEADER = "x-studyreels-owner-key"
 OWNER_A = "assessment-owner-a-abcdefghijklmnopqrstuvwxyz"
 OWNER_B = "assessment-owner-b-abcdefghijklmnopqrstuvwxyz"
 MATERIAL = "assessment-api-material"
+
+
+class _PostgresFailure(Exception):
+    def __init__(self, sqlstate: str, message: str = "postgres failure") -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+def _fail_first_commit_acknowledgement(real_get_conn):
+    transaction_attempts: list[int] = []
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        with real_get_conn(transactional=transactional) as conn:
+            yield conn
+        if transactional:
+            transaction_attempts.append(1)
+            if len(transaction_attempts) == 1:
+                raise _PostgresFailure("08006", "connection lost after commit")
+
+    return connection, transaction_attempts
+
+
+def test_adaptive_mutation_retry_declines_permanent_postgres_error(
+    monkeypatch,
+) -> None:
+    attempts = 0
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        nonlocal attempts
+        assert transactional is True
+        attempts += 1
+        raise _PostgresFailure("23505", "unique violation")
+        yield None
+
+    monkeypatch.setattr(main_module, "get_conn", connection)
+    with pytest.raises(_PostgresFailure, match="unique violation"):
+        main_module._run_adaptive_mutation_transaction(lambda _conn: None)
+    assert attempts == 1
+
+
+def test_adaptive_mutation_retry_checks_cancellation_before_second_attempt(
+    monkeypatch,
+) -> None:
+    work_calls = 0
+    cancelled = False
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        assert transactional is True
+        yield object()
+
+    def work(_conn) -> None:
+        nonlocal work_calls, cancelled
+        work_calls += 1
+        cancelled = True
+        raise _PostgresFailure("40001", "serialization failure")
+
+    monkeypatch.setattr(main_module, "get_conn", connection)
+    with pytest.raises(main_module.AssessmentCancelledError):
+        main_module._run_adaptive_mutation_transaction(
+            work,
+            should_cancel=lambda: cancelled,
+        )
+    assert work_calls == 1
+
+
+@pytest.mark.parametrize(
+    "semantic_error",
+    [
+        ValueError("invalid adaptive input"),
+        main_module.DatabaseIntegrityError("integrity failure"),
+        main_module.HTTPException(status_code=409, detail="conflict"),
+    ],
+)
+def test_adaptive_mutation_retry_never_replays_semantic_errors(
+    monkeypatch,
+    semantic_error: Exception,
+) -> None:
+    work_calls = 0
+    semantic_error.__cause__ = _PostgresFailure("40001", "serialization failure")
+
+    @contextmanager
+    def connection(*, transactional: bool = False):
+        assert transactional is True
+        yield object()
+
+    def work(_conn) -> None:
+        nonlocal work_calls
+        work_calls += 1
+        raise semantic_error
+
+    monkeypatch.setattr(main_module, "get_conn", connection)
+    with pytest.raises(semantic_error.__class__):
+        main_module._run_adaptive_mutation_transaction(work)
+    assert work_calls == 1
 
 
 class TestAssessmentApi:
@@ -189,6 +287,242 @@ class TestAssessmentApi:
             )
         assert progress is not None
         assert float(progress["global_adjustment"]) == 0.2
+
+    def test_feedback_retry_after_lost_commit_ack_does_not_double_revision(
+        self,
+    ) -> None:
+        flaky_conn, attempts = _fail_first_commit_acknowledgement(
+            main_module.get_conn
+        )
+        with (
+            mock.patch.object(main_module, "get_conn", flaky_conn),
+            mock.patch.object(
+                main_module.reel_service,
+                "update_level_adjustment",
+                wraps=main_module.reel_service.update_level_adjustment,
+            ) as update_mastery,
+        ):
+            response = self.client.post(
+                "/api/reels/feedback",
+                headers=self.headers_a,
+                json={
+                    "reel_id": "api-reel-0",
+                    "helpful": True,
+                    "confusing": False,
+                    "saved": False,
+                },
+            )
+
+        assert response.status_code == 200
+        assert len(attempts) == 2
+        assert update_mastery.call_count == 1
+        with db_module.get_conn() as conn:
+            progress = db_module.fetch_one(
+                conn,
+                "SELECT feedback_revision FROM learner_material_progress "
+                "WHERE material_id = ?",
+                (MATERIAL,),
+            )
+            feedback_count = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS count FROM reel_feedback "
+                "WHERE reel_id = 'api-reel-0'",
+            )
+        assert progress is not None
+        assert int(progress["feedback_revision"]) == 1
+        assert int((feedback_count or {})["count"]) == 1
+
+    def test_feedback_retry_preserves_signal_after_unrelated_revision_advance(
+        self,
+    ) -> None:
+        learner_id = "owner:" + hashlib.sha256(OWNER_A.encode("utf-8")).hexdigest()
+        real_get_conn = main_module.get_conn
+        with real_get_conn(transactional=True) as conn:
+            main_module.reel_service.learner_progress(conn, MATERIAL, learner_id)
+
+        transaction_attempts = 0
+
+        @contextmanager
+        def connection(*, transactional: bool = False):
+            nonlocal transaction_attempts
+            if not transactional:
+                with real_get_conn() as conn:
+                    yield conn
+                return
+            transaction_attempts += 1
+            try:
+                with real_get_conn(transactional=True) as conn:
+                    yield conn
+                    if transaction_attempts == 1:
+                        raise _PostgresFailure("40001", "serialization failure")
+            except _PostgresFailure:
+                if transaction_attempts == 1:
+                    with real_get_conn(transactional=True) as concurrent_conn:
+                        main_module.reel_service.record_feedback(
+                            concurrent_conn,
+                            reel_id="api-reel-1",
+                            helpful=False,
+                            confusing=True,
+                            rating=None,
+                            saved=False,
+                            learner_id=learner_id,
+                        )
+                raise
+
+        with mock.patch.object(main_module, "get_conn", connection):
+            response = self.client.post(
+                "/api/reels/feedback",
+                headers=self.headers_a,
+                json={
+                    "reel_id": "api-reel-0",
+                    "helpful": True,
+                    "confusing": False,
+                    "saved": False,
+                },
+            )
+
+        assert response.status_code == 200
+        assert transaction_attempts == 2
+        with real_get_conn() as conn:
+            progress = db_module.fetch_one(
+                conn,
+                "SELECT feedback_revision FROM learner_material_progress "
+                "WHERE learner_id = ? AND material_id = ?",
+                (learner_id, MATERIAL),
+            )
+            feedback = db_module.fetch_one(
+                conn,
+                "SELECT helpful, confusing FROM reel_feedback "
+                "WHERE learner_id = ? AND reel_id = 'api-reel-0'",
+                (learner_id,),
+            )
+        assert progress is not None
+        assert int(progress["feedback_revision"]) == 2
+        assert feedback is not None
+        assert int(feedback["helpful"]) == 1
+        assert int(feedback["confusing"]) == 0
+
+    def test_progress_and_scroll_retries_keep_one_monotonic_row(self) -> None:
+        flaky_progress_conn, progress_attempts = _fail_first_commit_acknowledgement(
+            main_module.get_conn
+        )
+        with mock.patch.object(main_module, "get_conn", flaky_progress_conn):
+            progress_response = self.client.post(
+                "/api/reels/api-reel-0/progress",
+                headers=self.headers_a,
+                json={"max_fraction": 1.0},
+            )
+        assert progress_response.status_code == 200
+        assert len(progress_attempts) == 2
+
+        flaky_scroll_conn, scroll_attempts = _fail_first_commit_acknowledgement(
+            main_module.get_conn
+        )
+        with mock.patch.object(main_module, "get_conn", flaky_scroll_conn):
+            scroll_response = self.client.post(
+                "/api/reels/api-reel-0/scroll",
+                headers=self.headers_a,
+            )
+        assert scroll_response.status_code == 200
+        assert len(scroll_attempts) == 2
+
+        with db_module.get_conn() as conn:
+            rows = db_module.fetch_all(
+                conn,
+                "SELECT max_fraction, scrolled_at, completed_at "
+                "FROM learner_reel_progress WHERE reel_id = 'api-reel-0'",
+            )
+        assert len(rows) == 1
+        assert float(rows[0]["max_fraction"]) == 1.0
+        assert rows[0]["completed_at"]
+        assert rows[0]["scrolled_at"]
+
+    def test_session_and_final_answer_retries_do_not_duplicate_quiz_state(
+        self,
+    ) -> None:
+        ready = False
+        for index in range(5):
+            response = self.client.post(
+                f"/api/reels/api-reel-{index}/scroll",
+                headers=self.headers_a,
+            )
+            assert response.status_code == 200
+            ready = bool(response.json()["assessment_ready"])
+            if ready:
+                break
+        assert ready
+
+        flaky_session_conn, session_attempts = _fail_first_commit_acknowledgement(
+            main_module.get_conn
+        )
+        with mock.patch.object(main_module, "get_conn", flaky_session_conn):
+            created_response = self.client.post(
+                "/api/assessments/next",
+                headers=self.headers_a,
+                json={"material_id": MATERIAL},
+            )
+        assert created_response.status_code == 200
+        assert len(session_attempts) == 2
+        session = created_response.json()["session"]
+        assert session is not None
+
+        for question in session["questions"][:-1]:
+            answer = self.client.post(
+                f"/api/assessments/{session['id']}/answer",
+                headers=self.headers_a,
+                json={"question_id": question["id"], "choice_index": 0},
+            )
+            assert answer.status_code == 200
+
+        final_question = session["questions"][-1]
+        flaky_answer_conn, answer_attempts = _fail_first_commit_acknowledgement(
+            main_module.get_conn
+        )
+        with mock.patch.object(main_module, "get_conn", flaky_answer_conn):
+            final_response = self.client.post(
+                f"/api/assessments/{session['id']}/answer",
+                headers=self.headers_a,
+                json={"question_id": final_question["id"], "choice_index": 0},
+            )
+        assert final_response.status_code == 200
+        assert len(answer_attempts) == 2
+        assert final_response.json()["session"]["status"] == "completed"
+
+        with db_module.get_conn() as conn:
+            session_count = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS count FROM assessment_sessions",
+            )
+            question_count = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS count FROM assessment_session_questions "
+                "WHERE session_id = ?",
+                (session["id"],),
+            )
+            attempt_count = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS count FROM assessment_attempts "
+                "WHERE session_id = ?",
+                (session["id"],),
+            )
+            outcome_count = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS count FROM assessment_concept_outcomes "
+                "WHERE session_id = ?",
+                (session["id"],),
+            )
+            progress = db_module.fetch_one(
+                conn,
+                "SELECT feedback_revision FROM learner_material_progress "
+                "WHERE material_id = ?",
+                (MATERIAL,),
+            )
+        expected_questions = int(session["question_count"])
+        assert int((session_count or {})["count"]) == 1
+        assert int((question_count or {})["count"]) == expected_questions
+        assert int((attempt_count or {})["count"]) == expected_questions
+        assert int((outcome_count or {})["count"]) == expected_questions
+        assert int((progress or {})["feedback_revision"]) == 1
 
     def test_other_learner_cannot_resume_or_answer_session(self) -> None:
         ready = False

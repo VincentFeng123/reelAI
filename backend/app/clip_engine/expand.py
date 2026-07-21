@@ -11,7 +11,6 @@ import hashlib
 import json
 import logging
 import re
-import unicodedata
 from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -19,9 +18,10 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ...concept_tokens import semantic_key, semantic_tokens
 from . import config
 from .cancellation import raise_if_cancelled, run_cancellable
-from .errors import CancellationError, ProviderError
+from .errors import CancellationError, ProviderConfigurationError
 from .segment_cache import SEGMENT_CACHE_TTL_SEC
 from .singleflight import singleflight
 from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
@@ -31,7 +31,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_INTENT_TOKEN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
 _INTENT_STOPWORDS = frozenset({
     "a", "an", "and", "are", "as", "at", "be", "by", "do", "does", "for",
     "from", "how", "i", "in", "is", "it", "me", "my", "of", "on", "or",
@@ -44,7 +43,7 @@ PRACTICE_FAST_EXPAND_MODEL = "gemini-3.1-flash-lite"
 PRACTICE_FAST_EXPAND_TIMEOUT_MS = 10_000
 PRACTICE_FAST_EXPAND_OUTPUT_TOKENS = 2_048
 PRACTICE_FAST_EXPAND_ATTEMPTS = 2
-PRACTICE_FAST_EXPAND_CACHE_VERSION = 7
+PRACTICE_FAST_EXPAND_CACHE_VERSION = 8
 # An expansion can be nearly one segment-cache lifetime old when it discovers a
 # newly analyzed source. Keeping it for two lifetimes guarantees that source's
 # subsequent valid segment-cache lifetime never triggers another expansion call.
@@ -232,7 +231,7 @@ def _write_cached_expansion(cache_key: str, result: dict) -> None:
 
 
 def _key(value: object) -> str:
-    return " ".join(unicodedata.normalize("NFKC", str(value or "")).casefold().split())
+    return semantic_key(value)
 
 
 def _normalize(queries: list[str], n: int) -> list[str]:
@@ -251,8 +250,7 @@ def _normalize(queries: list[str], n: int) -> list[str]:
 
 
 def _intent_tokens(value: object) -> list[str]:
-    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
-    return [match.group(0) for match in _INTENT_TOKEN_RE.finditer(normalized)]
+    return list(semantic_tokens(value, preserve_terminal_suffix=True))
 
 
 def _contains_token_phrase(text: object, phrase: object) -> bool:
@@ -619,17 +617,49 @@ def _practice_fast_gemini_raw(
 
 
 def _practice_fast_failure_is_retryable(exc: Exception) -> bool:
-    if isinstance(exc, ProviderError):
-        return bool(exc.retryable)
-    raw_status = getattr(exc, "status_code", None)
-    if raw_status is None:
-        raw_status = getattr(exc, "code", None)
-    raw_status = getattr(raw_status, "value", raw_status)
-    try:
-        status = int(raw_status) if raw_status is not None else None
-    except (TypeError, ValueError):
-        status = None
-    return status not in {400, 401, 402, 403, 404}
+    """Retry only transport/local-contract failures, 408/429, and 5xx."""
+    error_types = {base.__name__ for base in type(exc).__mro__}
+    if (
+        isinstance(exc, (CancellationError, ProviderConfigurationError))
+        or "GeminiCancelledError" in error_types
+        or "GeminiBlockedResponseError" in error_types
+    ):
+        return False
+
+    telemetry = getattr(exc, "telemetry", None)
+    response = getattr(exc, "response", None)
+    raw_statuses = (
+        getattr(exc, "status_code", None),
+        getattr(exc, "code", None),
+        getattr(response, "status_code", None),
+        (
+            telemetry.get("provider_status_code")
+            if isinstance(telemetry, dict)
+            else getattr(telemetry, "provider_status_code", None)
+        ),
+    )
+    status = None
+    for raw_status in raw_statuses:
+        raw_status = getattr(raw_status, "value", raw_status)
+        try:
+            status = int(raw_status) if raw_status is not None else None
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if status is not None:
+            break
+    if status is not None:
+        return status in {408, 429} or 500 <= status <= 599
+
+    retryable = getattr(exc, "retryable", None)
+    if retryable is None and telemetry is not None:
+        retryable = (
+            telemetry.get("retryable")
+            if isinstance(telemetry, dict)
+            else getattr(telemetry, "retryable", None)
+        )
+    # Statusless transport and local response-contract failures are safe to
+    # retry once. Typed permanent provider failures expose retryable=False.
+    return True if retryable is None else bool(retryable)
 
 
 def expand_query_practice_fast(

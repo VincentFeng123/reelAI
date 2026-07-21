@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -25,6 +26,12 @@ from backend.app import db as db_module  # noqa: E402
 from backend.app.config import get_settings  # noqa: E402
 import backend.app.main as main_module  # noqa: E402
 from backend.app.main import app, COMMUNITY_OWNER_HEADER  # noqa: E402
+
+
+class _PostgresFailure(RuntimeError):
+    def __init__(self, sqlstate: str) -> None:
+        self.sqlstate = sqlstate
+        super().__init__(f"postgres transaction failure ({sqlstate})")
 
 
 def _fake_concepts(conn, text: str, subject_tag=None, max_concepts: int = 12):
@@ -105,6 +112,128 @@ class KnowledgeLevelApiTests(unittest.TestCase):
         bad = self.client.post("/api/material",
                                data={"subject_tag": "physics", "knowledge_level": "expert"})
         self.assertEqual(bad.status_code, 422)
+
+    def test_create_material_persistence_retry_does_not_replay_provider(self) -> None:
+        real_upsert = main_module.upsert
+        material_upserts = 0
+        provider = mock.Mock(side_effect=_fake_concepts)
+
+        def flaky_upsert(conn, table, data, *args, **kwargs):
+            nonlocal material_upserts
+            if table == "materials":
+                material_upserts += 1
+                if material_upserts == 1:
+                    raise _PostgresFailure("40001")
+            return real_upsert(conn, table, data, *args, **kwargs)
+
+        with mock.patch.object(
+            main_module.material_intelligence_service,
+            "extract_concepts_and_objectives",
+            provider,
+        ), mock.patch.object(main_module, "upsert", side_effect=flaky_upsert):
+            response = self.client.post(
+                "/api/material",
+                data={"subject_tag": "transaction retries"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(material_upserts, 2)
+        self.assertEqual(provider.call_count, 1)
+
+    def test_create_material_lost_commit_ack_converges_without_duplicates(self) -> None:
+        real_get_conn = main_module.get_conn
+        transaction_exits = 0
+        provider = mock.Mock(side_effect=_fake_concepts)
+
+        @contextmanager
+        def connection(*, transactional: bool = False):
+            nonlocal transaction_exits
+            with real_get_conn(transactional=transactional) as conn:
+                yield conn
+            if transactional:
+                transaction_exits += 1
+                if transaction_exits == 3:
+                    raise _PostgresFailure("08006")
+
+        with mock.patch.object(main_module, "get_conn", connection), mock.patch.object(
+            main_module.material_intelligence_service,
+            "extract_concepts_and_objectives",
+            provider,
+        ):
+            response = self.client.post(
+                "/api/material",
+                data={"subject_tag": "commit acknowledgement"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        material_id = response.json()["material_id"]
+        self.assertEqual(transaction_exits, 4)
+        self.assertEqual(provider.call_count, 1)
+        with real_get_conn() as conn:
+            material_count = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS count FROM materials WHERE id = ?",
+                (material_id,),
+            )["count"]
+            concept_count = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS count FROM concepts WHERE material_id = ?",
+                (material_id,),
+            )["count"]
+            chunk_count = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS count FROM material_chunks WHERE material_id = ?",
+                (material_id,),
+            )["count"]
+        self.assertEqual((material_count, concept_count, chunk_count), (1, 1, 1))
+
+    def test_create_file_material_retry_reuses_one_published_object(self) -> None:
+        real_upsert = main_module.upsert
+        material_upserts = 0
+        save_bytes = mock.Mock(return_value="s3://test/uploads/stable-notes.txt")
+
+        def fail_after_publication(conn, table, data, *args, **kwargs):
+            nonlocal material_upserts
+            if table == "materials":
+                material_upserts += 1
+                if material_upserts == 1:
+                    raise _PostgresFailure("40001")
+            return real_upsert(conn, table, data, *args, **kwargs)
+
+        with mock.patch.object(
+            main_module.storage,
+            "save_bytes",
+            save_bytes,
+        ), mock.patch.object(
+            main_module,
+            "upsert",
+            side_effect=fail_after_publication,
+        ), mock.patch.object(main_module, "_enforce_rate_limit"):
+            response = self.client.post(
+                "/api/material",
+                headers={"Idempotency-Key": "file-publication-db-retry"},
+                files={
+                    "file": (
+                        "notes.txt",
+                        b"Newton's laws and balanced forces",
+                        "text/plain",
+                    )
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(material_upserts, 2)
+        save_bytes.assert_called_once_with(
+            b"Newton's laws and balanced forces",
+            "notes.txt",
+        )
+        with db_module.get_conn() as conn:
+            row = db_module.fetch_one(
+                conn,
+                "SELECT source_path FROM materials WHERE id = ?",
+                (response.json()["material_id"],),
+            )
+        self.assertEqual(row["source_path"], "s3://test/uploads/stable-notes.txt")
 
     def test_patch_level_updates_and_resets_adjustment(self) -> None:
         headers = {COMMUNITY_OWNER_HEADER: self.OWNER}

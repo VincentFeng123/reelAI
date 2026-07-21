@@ -392,11 +392,10 @@ def test_all_planned_source_selectors_fit_concurrently_at_production_cap(
         return context.reserve_gemini_call(
             operation="pro_authoritative",
             model="gemini-3.1-pro-preview",
-            estimated_input_tokens=(
-                10_500
-                + 600 * gemini_segment._LOW_RESOLUTION_VIDEO_TOKENS_PER_SECOND
-            ),
-            max_output_tokens=6_000,
+            # Production selectors are transcript-only; media grounding is
+            # disabled by _boundary_selector_content.
+            estimated_input_tokens=10_500,
+            max_output_tokens=gemini_segment._PRO_BOUNDARY_OUTPUT_TOKENS,
             deadline_monotonic=time.monotonic() + 2.0,
         )
 
@@ -405,6 +404,20 @@ def test_all_planned_source_selectors_fit_concurrently_at_production_cap(
             future.result(timeout=0.5)
             for future in [executor.submit(reserve) for _ in range(selector_count)]
         ]
+
+    assert all(
+        reservation["admitted_physical_attempts"] == 1
+        for reservation in reservations
+    )
+    inflight_budget = context.budget.snapshot()["gemini"]
+    assert inflight_budget["pro_selector_calls"] == selector_count
+    assert inflight_budget["inflight_reserved_cost_usd"] == pytest.approx(
+        sum(reservation["admitted_cost_usd"] for reservation in reservations)
+    )
+    assert (
+        inflight_budget["cost_exposure_usd"]
+        <= inflight_budget["cost_limit_usd"]
+    )
 
     for reservation in reservations:
         context.record_gemini(
@@ -428,6 +441,269 @@ def test_all_planned_source_selectors_fit_concurrently_at_production_cap(
         selector_count * 0.142
     )
     assert budget["cost_exposure_usd"] <= budget["cost_limit_usd"]
+    summary = context.usage_payload()["summary"]
+    assert summary["gemini_calls"] == selector_count
+    assert summary["gemini_attempts"] == selector_count
+    assert summary["billing_unknown_attempts"] == 0
+
+
+def test_three_inflight_selector_first_attempts_do_not_block_first_audit() -> None:
+    context = GenerationContext("slow", generation_id="job-selector-audit-admit")
+    selector_tickets = [
+        context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=30_000,
+            max_output_tokens=gemini_segment._PRO_BOUNDARY_OUTPUT_TOKENS,
+            max_physical_attempts=1,
+        )
+        for _ in range(3)
+    ]
+
+    started = time.perf_counter()
+    audit_ticket = context.reserve_gemini_call(
+        operation="pro_boundary_audit",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=30_000,
+        max_output_tokens=gemini_segment._PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS,
+        max_physical_attempts=1,
+        deadline_monotonic=time.monotonic() + 1.0,
+    )
+    admission_s = time.perf_counter() - started
+
+    budget = context.budget.snapshot()["gemini"]
+    assert admission_s < 0.02
+    assert budget["pro_selector_calls"] == 3
+    assert budget["boundary_audit_calls"] == 1
+    assert budget["cost_exposure_usd"] == pytest.approx(
+        sum(ticket["admitted_cost_usd"] for ticket in selector_tickets)
+        + audit_ticket["admitted_cost_usd"]
+    )
+    assert budget["cost_exposure_usd"] <= budget["cost_limit_usd"]
+
+
+def test_single_physical_ticket_does_not_reserve_unused_retry_contingency() -> None:
+    context = GenerationContext("fast", generation_id="job-retry-hard-ceiling")
+
+    reservation = context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=594_000,
+        max_output_tokens=1_000,
+    )
+
+    budget = context.budget.snapshot()["gemini"]
+    assert reservation["admitted_physical_attempts"] == 1
+    assert reservation["admitted_cost_usd"] == pytest.approx(
+        reservation["reserved_cost_usd"]
+    )
+    assert budget["selector_calls"] == 1
+    assert budget["cost_exposure_usd"] == pytest.approx(
+        reservation["reserved_cost_usd"]
+    )
+    assert budget["cost_exposure_usd"] <= budget["cost_limit_usd"]
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "boundary_selection",
+        "flash_boundary_repair",
+        "flash_boundary_selector",
+        "flash_grounded_enrichment",
+        "flash_single_candidate",
+        "pro_authoritative",
+        "pro_boundary_audit",
+    ],
+)
+def test_operations_reserve_one_physical_attempt_by_default(
+    operation: str,
+) -> None:
+    context = GenerationContext("fast", generation_id=f"job-retry-{operation}")
+    reservation = context.reserve_gemini_call(
+        operation=operation,
+        model=(
+            "gemini-3.1-pro-preview"
+            if operation.startswith("pro_")
+            else "gemini-3.5-flash"
+        ),
+        estimated_input_tokens=1_000,
+        max_output_tokens=100,
+    )
+
+    assert reservation["admitted_physical_attempts"] == 1
+    assert reservation["admitted_cost_usd"] == pytest.approx(
+        reservation["reserved_cost_usd"]
+    )
+    assert context.budget.snapshot()["gemini"]["cost_exposure_usd"] <= 1.0
+
+
+def test_statusless_retry_success_retains_unknown_attempt_exposure() -> None:
+    context = GenerationContext("fast", generation_id="job-statusless-retry")
+    first_ticket = context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=294_000,
+        max_output_tokens=1_000,
+    )
+    assert context.reconcile_gemini_call(
+        model_used="gemini-3.5-flash",
+        usage={**first_ticket, "retries": 0, "dispatched": True},
+        dispatched=True,
+    ) is True
+    second_ticket = context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=294_000,
+        max_output_tokens=1_000,
+        count_logical_call=False,
+    )
+    final_usage = {
+        **second_ticket,
+        "retries": 1,
+        "physical_dispatches": 2,
+        "billing_unknown_attempts": 1,
+        "billing_unknown_reserved_cost_usd": first_ticket["reserved_cost_usd"],
+        "error_history": [{
+            "provider_error_type": "ReadError",
+            "provider_status_code": None,
+            "retryable": True,
+        }],
+        "prompt_tokens": 294_000,
+        "candidate_tokens": 1_000,
+        "thought_tokens": 0,
+        "total_tokens": 295_000,
+        "dispatched": True,
+    }
+    assert context.reconcile_gemini_call(
+        model_used="gemini-3.5-flash",
+        usage={**final_usage, "retries": 0},
+        dispatched=True,
+    ) is True
+    # Production records the logical telemetry after each physical ticket is
+    # already settled. The reservation id therefore reconciles as a no-op.
+    context.record_gemini(
+        attempt=2,
+        model_used="gemini-3.5-flash",
+        quality_degraded=False,
+        stage="selection",
+        usage=final_usage,
+    )
+
+    final_attempt_cost = (294_000 * 1.5 + 1_000 * 9.0) / 1_000_000.0
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["selector_calls"] == 1
+    assert first_ticket["admitted_physical_attempts"] == 1
+    assert second_ticket["admitted_physical_attempts"] == 1
+    assert budget["committed_cost_usd"] == pytest.approx(
+        first_ticket["reserved_cost_usd"] + final_attempt_cost
+    )
+    assert budget["billing_unknown_cost_exposure_usd"] == pytest.approx(
+        first_ticket["reserved_cost_usd"]
+    )
+    assert budget["cost_exposure_usd"] <= budget["cost_limit_usd"]
+
+    payload = context.usage_payload()
+    assert payload["summary"]["gemini_calls"] == 1
+    assert payload["summary"]["gemini_attempts"] == 2
+    assert payload["summary"]["known_billed_cost_usd"] == pytest.approx(
+        final_attempt_cost
+    )
+    assert payload["summary"]["billing_unknown_calls"] == 1
+    assert payload["summary"]["billing_unknown_attempts"] == 1
+    assert payload["summary"][
+        "billing_unknown_reserved_cost_usd"
+    ] == pytest.approx(first_ticket["reserved_cost_usd"])
+
+    # The retained retry exposure closes the job ceiling even though the
+    # second logical selector slot itself is still available.
+    with pytest.raises(ProviderBudgetExceededError, match="cost budget"):
+        context.reserve_gemini_call(
+            operation="flash_boundary_selector",
+            model="gemini-3.5-flash",
+            estimated_input_tokens=560_000,
+            max_output_tokens=1_000,
+        )
+    assert context.budget.snapshot()["gemini"]["selector_calls"] == 1
+
+
+def test_failover_retains_primary_exposure_and_prices_final_model() -> None:
+    context = GenerationContext("fast", generation_id="job-model-failover")
+    primary_ticket = context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=294_000,
+        max_output_tokens=1_000,
+    )
+    context.reconcile_gemini_call(
+        model_used="gemini-3.5-flash",
+        usage={**primary_ticket, "retries": 0, "dispatched": True},
+        dispatched=True,
+    )
+    failover_ticket = context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.1-flash-lite",
+        estimated_input_tokens=294_000,
+        max_output_tokens=1_000,
+        count_logical_call=False,
+    )
+    final_usage = {
+        **failover_ticket,
+        "model": "gemini-3.1-flash-lite",
+        "retries": 1,
+        "physical_dispatches": 2,
+        "billing_unknown_attempts": 1,
+        "billing_unknown_reserved_cost_usd": primary_ticket["reserved_cost_usd"],
+        "error_history": [{
+            "provider_error_type": "ServerError",
+            "provider_status_code": 503,
+            "retryable": True,
+        }],
+        "failover_from_model": "gemini-3.5-flash",
+        "failover_model": "gemini-3.1-flash-lite",
+        "failover_reason": "primary_transient_5xx_failover",
+        "prompt_tokens": 294_000,
+        "candidate_tokens": 1_000,
+        "thought_tokens": 0,
+        "total_tokens": 295_000,
+        "dispatched": True,
+    }
+    context.reconcile_gemini_call(
+        model_used="gemini-3.1-flash-lite",
+        usage={**final_usage, "retries": 0},
+        dispatched=True,
+    )
+
+    context.record_gemini(
+        attempt=2,
+        model_used="gemini-3.1-flash-lite",
+        quality_degraded=True,
+        stage="selection",
+        usage=final_usage,
+    )
+
+    final_attempt_cost = (294_000 * 0.25 + 1_000 * 1.5) / 1_000_000.0
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["selector_calls"] == 1
+    assert primary_ticket["admitted_physical_attempts"] == 1
+    assert failover_ticket["admitted_physical_attempts"] == 1
+    assert budget["committed_cost_usd"] == pytest.approx(
+        primary_ticket["reserved_cost_usd"] + final_attempt_cost
+    )
+    assert budget["billing_unknown_cost_exposure_usd"] == pytest.approx(
+        primary_ticket["reserved_cost_usd"]
+    )
+    assert budget["cost_exposure_usd"] <= budget["cost_limit_usd"]
+
+    payload = context.usage_payload()
+    assert payload["summary"]["known_billed_cost_usd"] == pytest.approx(
+        final_attempt_cost
+    )
+    assert payload["summary"]["billing_unknown_attempts"] == 1
+    assert payload["by_stage"]["selection"]["billing_unknown_attempts"] == 1
+    assert payload["summary"][
+        "billing_unknown_reserved_cost_usd"
+    ] == pytest.approx(primary_ticket["reserved_cost_usd"])
 
 
 def test_unknown_dispatched_usage_keeps_full_reservation_fail_closed() -> None:
@@ -435,7 +711,7 @@ def test_unknown_dispatched_usage_keeps_full_reservation_fail_closed() -> None:
     reservation = context.reserve_gemini_call(
         operation="flash_boundary_selector",
         model="gemini-3.5-flash",
-        estimated_input_tokens=300_000,
+        estimated_input_tokens=200_000,
         max_output_tokens=8_192,
     )
     context.record_gemini(
@@ -465,7 +741,7 @@ def test_unknown_dispatched_usage_keeps_full_reservation_fail_closed() -> None:
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
             model="gemini-3.5-flash",
-            estimated_input_tokens=300_000,
+            estimated_input_tokens=400_000,
             max_output_tokens=8_192,
         )
 
@@ -619,7 +895,7 @@ def test_non_dispatched_reservation_releases_capacity_idempotently() -> None:
     assert budget["flash_selector_calls"] == 2
     assert budget["committed_cost_usd"] == 0.0
     assert budget["inflight_reserved_cost_usd"] == pytest.approx(
-        replacement["reserved_cost_usd"]
+        replacement["admitted_cost_usd"]
     )
 
 
@@ -637,7 +913,7 @@ def test_blocked_cost_reservation_is_bounded_by_deadline_and_cancellation() -> N
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
             model="gemini-3.5-flash",
-            estimated_input_tokens=580_000,
+            estimated_input_tokens=560_000,
             max_output_tokens=8_192,
             deadline_monotonic=time.monotonic() + 0.05,
         )
@@ -648,7 +924,7 @@ def test_blocked_cost_reservation_is_bounded_by_deadline_and_cancellation() -> N
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
             model="gemini-3.5-flash",
-            estimated_input_tokens=580_000,
+            estimated_input_tokens=560_000,
             max_output_tokens=8_192,
             deadline_monotonic=time.monotonic() + 1.0,
             cancelled=lambda: True,
@@ -862,7 +1138,9 @@ def test_generation_usage_counts_selector_retries_as_physical_attempts_once() ->
     assert payload["summary"]["estimated_cost_usd"] == pytest.approx(
         (100 * 0.5 + 30 * 3.0) / 1_000_000.0
     )
-    assert payload["summary"]["billing_unknown_calls"] == 0
+    assert payload["summary"]["billing_unknown_calls"] == 1
+    assert payload["summary"]["billing_unknown_attempts"] == 2
+    assert payload["by_stage"]["selection"]["billing_unknown_attempts"] == 2
 
 
 def test_failed_retries_add_attempts_without_inventing_token_billing() -> None:
@@ -889,6 +1167,10 @@ def test_failed_retries_add_attempts_without_inventing_token_billing() -> None:
     assert payload["summary"]["output_tokens"] == 0
     assert payload["summary"]["estimated_cost_usd"] == 0.0
     assert payload["summary"]["billing_unknown_calls"] == 1
+    assert payload["summary"]["billing_unknown_attempts"] == 3
+    assert payload["summary"]["billing_unknown_reserved_cost_usd"] == pytest.approx(
+        0.15
+    )
     assert payload["by_stage"]["selection"]["billing_unknown_calls"] == 1
 
 

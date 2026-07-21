@@ -50,6 +50,8 @@ def _topic(start_line: int, end_line: int, **overrides) -> G._Topic:
         "start_quote": f"line {start_line}",
         "end_quote": f"end {end_line}",
         "facet": "lesson",
+        "concept_family": "lesson",
+        "concept_aliases": [],
         "reason": "This is a complete lesson.",
         "informativeness": 0.9,
         "topic_relevance": 0.9,
@@ -75,6 +77,8 @@ def _topic(start_line: int, end_line: int, **overrides) -> G._Topic:
         "assessment": _assessment(start_line),
     }
     data.update(overrides)
+    if "concept_family" not in overrides:
+        data["concept_family"] = str(data.get("facet") or "lesson")
     return G._Topic(**data)
 
 
@@ -96,6 +100,8 @@ def _boundary_topic(start_line: int, end_line: int, **overrides) -> G._BoundaryT
         if key in G._BoundaryTopic.model_fields
     }
     data.update(overrides)
+    if "concept_family" not in overrides:
+        data["concept_family"] = str(data.get("facet") or "lesson")
     return G._BoundaryTopic.model_validate(data)
 
 
@@ -279,6 +285,7 @@ def test_forty_realistic_boundary_candidates_fit_bounded_output_reservation():
                 f"Explain the complete mechanism and educational conclusion for facet {index}."
             ),
             facet=f"facet-{index}",
+            concept_family=f"informational mechanism {index}",
             start_quote=f"line {index} explains the mechanism",
             end_quote=f"and reaches conclusion {index}",
             intent_evidence=[{

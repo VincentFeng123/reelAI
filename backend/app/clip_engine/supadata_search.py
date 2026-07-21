@@ -89,6 +89,8 @@ def _failure(response: httpx.Response, *, retry_after: float | None = None) -> P
         return ProviderRateLimitError(
             "Supadata search is rate limited.", retry_after_sec=retry_after, **kwargs
         )
+    if status == 408:
+        return ProviderTransientError("Supadata search timed out.", **kwargs)
     if 500 <= status <= 599:
         return ProviderTransientError("Supadata search is temporarily unavailable.", **kwargs)
     return ProviderRequestError(f"Supadata rejected the search request ({status}).", **kwargs)
@@ -157,7 +159,7 @@ async def _search_one_async(
             raise_if_cancelled(should_cancel)
             request_timeout = _request_timeout(deadline_monotonic)
             attempt = retry_index + 1
-            if context is not None:
+            if context is not None and retry_index == 0:
                 context.reserve("search")
             try:
                 response = await client.get(
@@ -195,12 +197,31 @@ async def _search_one_async(
                 billed = 0
             billed_total += billed
             status = int(response.status_code)
+            data: dict[str, Any] | None = None
+            payload_error: Exception | None = None
+            if 200 <= status < 300:
+                try:
+                    decoded = response.json()
+                except Exception as exc:
+                    payload_error = exc
+                else:
+                    if isinstance(decoded, dict):
+                        if isinstance(decoded.get("results"), list):
+                            data = decoded
+                        else:
+                            payload_error = TypeError(
+                                "Supadata search response results are not a list."
+                            )
+                    else:
+                        payload_error = TypeError(
+                            "Supadata search response body is not an object."
+                        )
             error_code = ""
             if status == 429:
                 error_code = "provider_rate_limited"
-            elif status >= 500:
+            elif status == 408 or status >= 500 or payload_error is not None:
                 error_code = "provider_transient"
-            elif status >= 400:
+            elif status >= 300:
                 error_code = _failure(response).code
             if context is not None:
                 context.record_http(
@@ -212,7 +233,7 @@ async def _search_one_async(
                     error_code=error_code,
                 )
 
-            if status == 429 or 500 <= status <= 599:
+            if status in (408, 429) or 500 <= status <= 599:
                 retry_after = bounded_retry_after(response.headers)
                 if retry_index < MAX_PROVIDER_RETRIES:
                     await _sleep_before_retry(
@@ -222,20 +243,26 @@ async def _search_one_async(
                     )
                     continue
                 raise _failure(response, retry_after=retry_after)
-            if status >= 400:
+            if status >= 300:
                 raise _failure(response)
-
-            try:
-                data = response.json()
-            except Exception as exc:
+            if payload_error is not None:
+                if retry_index < MAX_PROVIDER_RETRIES:
+                    await _sleep_before_retry(
+                        min(30.0, 1.2 * attempt),
+                        should_cancel=should_cancel,
+                        deadline_monotonic=deadline_monotonic,
+                    )
+                    continue
                 raise ProviderRequestError(
-                    "Supadata returned invalid search JSON.",
+                    "Supadata returned an invalid search response body.",
                     provider="supadata",
                     operation="search",
                     status_code=status,
-                ) from exc
-            results = data.get("results") if isinstance(data, dict) else None
-            results = results if isinstance(results, list) else []
+                    detail=str(payload_error),
+                ) from payload_error
+            assert data is not None
+            results = data.get("results")
+            assert isinstance(results, list)
             videos = [
                 item for item in results
                 if isinstance(item, dict) and (item.get("type") in (None, "video"))

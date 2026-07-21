@@ -2793,7 +2793,7 @@ def test_dirty_edges_use_only_the_one_low_thinking_selector_call(monkeypatch):
     assert schema is G._CompactBoundaryPlan
     assert kwargs["model"] == G.config.SEGMENT_FLASH_MODEL
     assert kwargs["thinking_level"] == "low"
-    assert kwargs["max_output_tokens"] == 6_000
+    assert kwargs["max_output_tokens"] == 6_400
     assert kwargs["timeout_s"] == 45.0
     assert kwargs["max_retries"] == 1
     assert kwargs["retry_status_codes"] == frozenset({503})

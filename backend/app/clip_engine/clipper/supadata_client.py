@@ -129,9 +129,69 @@ def _failure(
             retry_after_sec=retry_after,
             **kwargs,
         )
+    if status == 408:
+        return ProviderTransientError(
+            "Supadata transcript retrieval timed out.", **kwargs
+        )
     if 500 <= status <= 599:
         return ProviderTransientError("Supadata transcript retrieval is unavailable.", **kwargs)
     return ProviderRequestError(f"Supadata rejected the transcript request ({status}).", **kwargs)
+
+
+def _content_contract_error(content: object) -> str | None:
+    if not isinstance(content, list):
+        return "transcript content is not a list"
+    previous_offset = -1.0
+    for raw in content:
+        if not isinstance(raw, dict):
+            return "transcript cue is not an object"
+        if not _normalized_caption_text(raw.get("text")):
+            return "transcript cue text is blank"
+        try:
+            offset_ms = float(raw.get("offset"))
+            duration_ms = float(raw.get("duration"))
+        except (TypeError, ValueError, OverflowError):
+            return "transcript cue timing is invalid"
+        if (
+            not math.isfinite(offset_ms)
+            or not math.isfinite(duration_ms)
+            or offset_ms < 0.0
+            or duration_ms <= 0.0
+            or offset_ms < previous_offset
+        ):
+            return "transcript cue timing is invalid"
+        previous_offset = offset_ms
+    return None
+
+
+def _initial_payload_contract_error(_status: int, data: dict[str, Any]) -> str | None:
+    if "content" in data:
+        return _content_contract_error(data.get("content"))
+    if str(data.get("jobId") or "").strip():
+        return None
+    return "transcript response omitted content and jobId"
+
+
+def _poll_payload_contract_error(_status: int, data: dict[str, Any]) -> str | None:
+    state = str(data.get("status") or data.get("state") or "").strip().casefold()
+    result = data.get("result")
+    completed = result if isinstance(result, dict) else data
+    if "content" in completed:
+        return _content_contract_error(completed.get("content"))
+    if str(data.get("jobId") or "").strip() and _status == 202:
+        return None
+    if state in {
+        "accepted",
+        "cancelled",
+        "error",
+        "failed",
+        "pending",
+        "processing",
+        "queued",
+        "running",
+    }:
+        return None
+    return "transcript poll response omitted status or completed content"
 
 
 async def _request(
@@ -144,12 +204,13 @@ async def _request(
     context: GenerationContext | None,
     reserve_budget: bool,
     deadline_monotonic: float,
+    payload_validator: Callable[[int, dict[str, Any]], str | None] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     for retry_index in range(MAX_PROVIDER_RETRIES + 1):
         raise_if_cancelled(should_cancel)
         _raise_if_deadline_exceeded(deadline_monotonic)
         attempt = retry_index + 1
-        if reserve_budget and context is not None:
+        if reserve_budget and context is not None and retry_index == 0:
             context.reserve("transcript")
         try:
             response = await client.get(
@@ -183,12 +244,34 @@ async def _request(
             ) from exc
 
         status = int(response.status_code)
+        data: dict[str, Any] | None = None
+        payload_error: Exception | None = None
+        if 200 <= status < 300:
+            try:
+                decoded = response.json()
+            except Exception as exc:
+                payload_error = exc
+            else:
+                if isinstance(decoded, dict):
+                    contract_error = (
+                        payload_validator(status, decoded)
+                        if payload_validator is not None
+                        else None
+                    )
+                    if contract_error:
+                        payload_error = ValueError(contract_error)
+                    else:
+                        data = decoded
+                else:
+                    payload_error = TypeError(
+                        "Supadata transcript response body is not an object."
+                    )
         error_code = ""
         if status == 429:
             error_code = "provider_rate_limited"
-        elif status >= 500:
+        elif status == 408 or status >= 500 or payload_error is not None:
             error_code = "provider_transient"
-        elif status >= 400:
+        elif status >= 300:
             error_code = _failure(response).code
         if context is not None:
             context.record_http(
@@ -200,7 +283,7 @@ async def _request(
                 error_code=error_code,
                 metadata={"poll": not reserve_budget},
             )
-        if status == 429 or 500 <= status <= 599:
+        if status in (408, 429) or 500 <= status <= 599:
             retry_after = bounded_retry_after(response.headers)
             if retry_index < MAX_PROVIDER_RETRIES:
                 await _sleep_before_retry(
@@ -210,24 +293,24 @@ async def _request(
                 )
                 continue
             raise _failure(response, retry_after=retry_after)
-        if status >= 400:
+        if status >= 300:
             raise _failure(response)
-        try:
-            data = response.json()
-        except Exception as exc:
+        if payload_error is not None:
+            if retry_index < MAX_PROVIDER_RETRIES:
+                await _sleep_before_retry(
+                    min(30.0, 1.2 * attempt),
+                    should_cancel=should_cancel,
+                    deadline_monotonic=deadline_monotonic,
+                )
+                continue
             raise ProviderRequestError(
-                "Supadata returned invalid transcript JSON.",
+                "Supadata returned an invalid transcript response body.",
                 provider="supadata",
                 operation="transcript",
                 status_code=status,
-            ) from exc
-        if not isinstance(data, dict):
-            raise ProviderRequestError(
-                "Supadata returned an invalid transcript payload.",
-                provider="supadata",
-                operation="transcript",
-                status_code=status,
-            )
+                detail=str(payload_error),
+            ) from payload_error
+        assert data is not None
         return status, data
     raise AssertionError("unreachable")
 
@@ -339,6 +422,7 @@ async def _fetch_transcript_artifact_async(
             context=context,
             reserve_budget=True,
             deadline_monotonic=effective_deadline,
+            payload_validator=_initial_payload_contract_error,
         )
         if status == 202 or (data.get("jobId") and "content" not in data):
             job_id = str(data.get("jobId") or "").strip()
@@ -363,6 +447,7 @@ async def _fetch_transcript_artifact_async(
                     context=context,
                     reserve_budget=False,
                     deadline_monotonic=effective_deadline,
+                    payload_validator=_poll_payload_contract_error,
                 )
                 state = str(polled.get("status") or polled.get("state") or "").lower()
                 result_payload = polled.get("result")

@@ -162,6 +162,178 @@ def test_count_request_tokens_uses_generate_content_request_not_plain_contents(
     assert request["generationConfig"]["responseMimeType"] == "application/json"
 
 
+def test_count_request_tokens_retries_one_transient_failure_and_honors_retry_after(
+    monkeypatch,
+):
+    calls = []
+    sleeps = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"totalTokens": 456}
+
+    def post(_url, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise _HTTPError(503, retry_after="0.6")
+        return Response()
+
+    monkeypatch.setattr(gc.config, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(gc.httpx, "post", post)
+    monkeypatch.setattr(gc.random, "uniform", lambda _lo, _hi: 0.25)
+    monkeypatch.setattr(gc.time, "sleep", sleeps.append)
+
+    assert gc.count_request_tokens(
+        "system",
+        "long transcript",
+        _Schema,
+        model="gemini-3.1-pro-preview",
+        timeout_s=4.0,
+    ) == 456
+    assert len(calls) == 2
+    assert sleeps == [0.6]
+    assert calls[0]["timeout"] == 4.0
+    assert 0 < calls[1]["timeout"] <= 4.0
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [ValueError("invalid JSON"), ["not", "an", "object"], {}, {"totalTokens": 0}],
+    ids=["invalid-json", "non-object", "missing-total", "zero-total"],
+)
+def test_count_request_tokens_retries_malformed_success_response(
+    monkeypatch,
+    malformed,
+):
+    calls = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            if isinstance(self.payload, Exception):
+                raise self.payload
+            return self.payload
+
+    def post(_url, **kwargs):
+        calls.append(kwargs)
+        return Response(malformed if len(calls) == 1 else {"totalTokens": 456})
+
+    monkeypatch.setattr(gc.config, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(gc.httpx, "post", post)
+    monkeypatch.setattr(gc.random, "uniform", lambda _lo, _hi: 0.0)
+    monkeypatch.setattr(gc.time, "sleep", lambda _seconds: None)
+
+    assert gc.count_request_tokens(
+        "system",
+        "long transcript",
+        _Schema,
+        model="gemini-3.1-pro-preview",
+        timeout_s=4.0,
+    ) == 456
+    assert len(calls) == 2
+
+
+def test_count_request_tokens_does_not_retry_permanent_400(monkeypatch):
+    calls = []
+    sleeps = []
+
+    def post(_url, **kwargs):
+        calls.append(kwargs)
+        raise _HTTPError(400)
+
+    monkeypatch.setattr(gc.config, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(gc.httpx, "post", post)
+    monkeypatch.setattr(gc.time, "sleep", sleeps.append)
+
+    with pytest.raises(_HTTPError) as exc_info:
+        gc.count_request_tokens(
+            "system",
+            "long transcript",
+            _Schema,
+            model="gemini-3.1-pro-preview",
+            timeout_s=4.0,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_count_request_tokens_cancellation_during_backoff_prevents_retry(
+    monkeypatch,
+):
+    calls = []
+    sleeps = []
+    state = {"cancelled": False}
+
+    def post(_url, **kwargs):
+        calls.append(kwargs)
+        raise _HTTPError(503, retry_after="2")
+
+    def cancel_during_sleep(seconds):
+        sleeps.append(seconds)
+        state["cancelled"] = True
+
+    monkeypatch.setattr(gc.config, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(gc.httpx, "post", post)
+    monkeypatch.setattr(gc.random, "uniform", lambda _lo, _hi: 0.25)
+    monkeypatch.setattr(gc.time, "sleep", cancel_during_sleep)
+
+    with pytest.raises(RuntimeError, match="token count cancelled"):
+        gc.count_request_tokens(
+            "system",
+            "long transcript",
+            _Schema,
+            model="gemini-3.1-pro-preview",
+            timeout_s=4.0,
+            cancelled=lambda: state["cancelled"],
+        )
+
+    assert len(calls) == 1
+    assert sleeps == [0.05]
+
+
+def test_count_request_tokens_deadline_prevents_retry_without_useful_window(
+    monkeypatch,
+):
+    calls = []
+    sleeps = []
+    clock = {"now": 0.0}
+
+    def post(_url, **kwargs):
+        calls.append(kwargs)
+        clock["now"] = 0.9
+        raise _HTTPError(503)
+
+    monkeypatch.setattr(gc.config, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(gc.httpx, "post", post)
+    monkeypatch.setattr(gc.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(gc.time, "sleep", sleeps.append)
+    monkeypatch.setattr(gc.random, "uniform", lambda _lo, _hi: 0.25)
+
+    with pytest.raises(TimeoutError, match="no retry window"):
+        gc.count_request_tokens(
+            "system",
+            "long transcript",
+            _Schema,
+            model="gemini-3.1-pro-preview",
+            timeout_s=4.0,
+            deadline_monotonic=1.0,
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["timeout"] == 1.0
+    assert sleeps == []
+
+
 @pytest.mark.parametrize(
     "operation,level,cap,timeout_s,model",
     [
@@ -661,18 +833,210 @@ def test_gemini3_expired_deadline_and_cancellation_make_no_request(monkeypatch):
     assert fake.models.calls == []
 
 
-def test_gemini3_truncation_and_empty_text_are_typed_and_not_retried(monkeypatch):
+def test_gemini3_truncation_and_empty_text_retry_once_and_recover(monkeypatch):
     truncated = _FakeClient(_FakeResponse("partial", finish_reason="MAX_TOKENS"), _FakeResponse())
-    with pytest.raises(gc.GeminiTruncatedResponseError) as trunc_info:
-        _call_v3(monkeypatch, truncated, max_retries=1)
-    assert len(truncated.models.calls) == 1
-    assert trunc_info.value.telemetry.finish_reason == "MAX_TOKENS"
+    truncated_result = _call_v3(monkeypatch, truncated, max_retries=1)
+    assert len(truncated.models.calls) == 2
+    assert truncated_result.telemetry.retries == 1
+    assert truncated_result.telemetry.error_history[0]["provider_error_type"] == (
+        "GeminiTruncatedResponseError"
+    )
 
     empty = _FakeClient(_FakeResponse("   "), _FakeResponse())
-    with pytest.raises(gc.GeminiEmptyResponseError) as empty_info:
-        _call_v3(monkeypatch, empty, max_retries=1)
-    assert len(empty.models.calls) == 1
-    assert empty_info.value.telemetry.total_tokens == 23
+    empty_result = _call_v3(monkeypatch, empty, max_retries=1)
+    assert len(empty.models.calls) == 2
+    assert empty_result.telemetry.retries == 1
+    assert empty_result.telemetry.error_history[0]["provider_error_type"] == (
+        "GeminiEmptyResponseError"
+    )
+
+
+@pytest.mark.parametrize(
+    "first_outcome",
+    [
+        _HTTPError(503),
+        _FakeResponse("partial", finish_reason="MAX_TOKENS"),
+        _FakeResponse("   "),
+    ],
+    ids=["transport", "truncated", "empty"],
+)
+def test_gemini3_dispatch_hooks_wrap_every_physical_attempt(
+    monkeypatch,
+    first_outcome,
+):
+    fake = _FakeClient(first_outcome, _FakeResponse())
+    events = []
+    sleeps = []
+
+    def before_dispatch(*, model, attempt):
+        ticket = f"ticket-{attempt}"
+        events.append(("before", model, attempt, ticket))
+        return ticket
+
+    def after_dispatch(ticket, *, model, attempt, telemetry):
+        events.append((
+            "after",
+            model,
+            attempt,
+            ticket,
+            telemetry.prompt_tokens,
+        ))
+
+    monkeypatch.setattr(gc, "_sleep_before_retry", lambda seconds, _cancelled: (
+        sleeps.append(seconds) or True
+    ))
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        max_retries=1,
+        before_dispatch=before_dispatch,
+        after_dispatch=after_dispatch,
+    )
+
+    assert result.telemetry.retries == 1
+    assert len(fake.models.calls) == 2
+    assert [event[:4] for event in events] == [
+        ("before", "gemini-3.5-flash", 1, "ticket-1"),
+        ("after", "gemini-3.5-flash", 1, "ticket-1"),
+        ("before", "gemini-3.5-flash", 2, "ticket-2"),
+        ("after", "gemini-3.5-flash", 2, "ticket-2"),
+    ]
+    if isinstance(first_outcome, _HTTPError):
+        assert events[1][4] is None
+        assert len(sleeps) == 1
+    else:
+        assert events[1][4] == 11
+        assert sleeps == []
+
+
+def test_gemini3_retry_admission_failure_prevents_second_dispatch(monkeypatch):
+    fake = _FakeClient(_HTTPError(503), _FakeResponse())
+    settled = []
+
+    def before_dispatch(*, model, attempt):
+        del model
+        if attempt == 2:
+            raise RuntimeError("retry budget unavailable")
+        return "first-ticket"
+
+    def after_dispatch(ticket, **_kwargs):
+        settled.append(ticket)
+
+    monkeypatch.setattr(gc, "_sleep_before_retry", lambda *_args: True)
+
+    with pytest.raises(RuntimeError, match="retry budget unavailable"):
+        _call_v3(
+            monkeypatch,
+            fake,
+            max_retries=1,
+            before_dispatch=before_dispatch,
+            after_dispatch=after_dispatch,
+        )
+
+    assert len(fake.models.calls) == 1
+    assert settled == ["first-ticket"]
+
+
+def test_gemini3_healthy_dispatch_hooks_do_not_sleep_or_retry(monkeypatch):
+    fake = _FakeClient(_FakeResponse())
+    events = []
+    sleeps = []
+    monkeypatch.setattr(
+        gc,
+        "_sleep_before_retry",
+        lambda *args: sleeps.append(args) or True,
+    )
+
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        before_dispatch=lambda **kwargs: events.append(("before", kwargs)) or 7,
+        after_dispatch=lambda ticket, **kwargs: events.append(
+            ("after", ticket, kwargs["attempt"])
+        ),
+    )
+
+    assert result.text == '{"ok": true}'
+    assert len(fake.models.calls) == 1
+    assert events == [
+        ("before", {"model": "gemini-3.5-flash", "attempt": 1}),
+        ("after", 7, 1),
+    ]
+    assert sleeps == []
+
+
+def test_gemini3_cancellation_or_client_failure_before_dispatch_has_no_ticket(
+    monkeypatch,
+):
+    fake = _FakeClient(_FakeResponse())
+    tickets = []
+    state = {"cancelled": False}
+
+    def cancelling_client():
+        state["cancelled"] = True
+        return fake
+
+    monkeypatch.setattr(gc, "get_client", cancelling_client)
+    with pytest.raises(gc.GeminiCancelledError):
+        gc.generate_json_v3(
+            "system",
+            "user",
+            _Schema,
+            model="gemini-3.5-flash",
+            thinking_level="medium",
+            max_output_tokens=100,
+            timeout_s=45,
+            operation="flash_single",
+            prompt_version="v1",
+            deadline_monotonic=None,
+            cancelled=lambda: state["cancelled"],
+            before_dispatch=lambda **kwargs: tickets.append(kwargs),
+        )
+    assert tickets == []
+    assert fake.models.calls == []
+
+    state["cancelled"] = False
+    monkeypatch.setattr(
+        gc,
+        "get_client",
+        lambda: (_ for _ in ()).throw(RuntimeError("client unavailable")),
+    )
+    with pytest.raises(RuntimeError, match="client unavailable"):
+        gc.generate_json_v3(
+            "system",
+            "user",
+            _Schema,
+            model="gemini-3.5-flash",
+            thinking_level="medium",
+            max_output_tokens=100,
+            timeout_s=45,
+            operation="flash_single",
+            prompt_version="v1",
+            deadline_monotonic=None,
+            before_dispatch=lambda **kwargs: tickets.append(kwargs),
+        )
+    assert tickets == []
+
+
+@pytest.mark.parametrize(
+    ("response", "error_type"),
+    [
+        (
+            _FakeResponse("partial", finish_reason="MAX_TOKENS"),
+            gc.GeminiTruncatedResponseError,
+        ),
+        (_FakeResponse("   "), gc.GeminiEmptyResponseError),
+    ],
+)
+def test_gemini3_invalid_success_exhausts_one_retry(monkeypatch, response, error_type):
+    fake = _FakeClient(response, response)
+
+    with pytest.raises(error_type) as exc_info:
+        _call_v3(monkeypatch, fake, max_retries=1)
+
+    assert len(fake.models.calls) == 2
+    assert exc_info.value.telemetry.retries == 1
+    assert len(exc_info.value.telemetry.error_history) == 2
 
 
 @pytest.mark.parametrize("finish_reason", ["SAFETY", "RECITATION", "BLOCKLIST"])

@@ -725,7 +725,7 @@ def test_production_flash_is_compact_exhaustive_boundary_first():
         "do not omit an otherwise good, complete, relevant unit solely because coarse captions"
         in prompt
     )
-    assert G._BOUNDARY_OUTPUT_TOKENS == 6_000
+    assert G._BOUNDARY_OUTPUT_TOKENS == 6_400
     assert "scan the whole transcript from first to last" in prompt
     assert "every distinct" in prompt
     assert "every distinct qualifying primary and supporting moment" in prompt
@@ -809,9 +809,19 @@ def test_budget_is_reserved_once_and_default_call_allows_one_transient_retry(mon
         payload.update(kwargs)
 
     def generate(*args, **kwargs):
+        ticket = kwargs["before_dispatch"](
+            model=kwargs["model"], attempt=1,
+        )
         order.append("dispatch")
         assert kwargs["max_retries"] == 1
-        return SimpleNamespace(text='{"topics": []}', telemetry={})
+        telemetry = {}
+        kwargs["after_dispatch"](
+            ticket,
+            model=kwargs["model"],
+            attempt=1,
+            telemetry=telemetry,
+        )
+        return SimpleNamespace(text='{"topics": []}', telemetry=telemetry)
 
     monkeypatch.setattr("backend.gemini_client.generate_json_v3", generate)
     parsed, _ = G._call_model(
@@ -850,6 +860,8 @@ def test_budget_is_reserved_once_and_default_call_allows_one_transient_retry(mon
             ) / 3)
             + 1_000
         ),
+        "max_physical_attempts": 1,
+        "count_logical_call": True,
         "cancelled": None,
     }
 

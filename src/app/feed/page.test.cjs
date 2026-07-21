@@ -1943,6 +1943,10 @@ test("missing material expiry removes only that stored session and progress", ()
       { materialId: "expired", title: "Expired" },
       { materialId: "keep", title: "Keep" },
     ])],
+    ["legacy-history", JSON.stringify([
+      { materialId: "expired", topic: "Expired legacy topic" },
+      { materialId: "keep", topic: "Keep legacy topic" },
+    ])],
     ["sessions", JSON.stringify({
       expired: { reels: ["stale"] },
       keep: { reels: ["current"] },
@@ -1977,6 +1981,8 @@ test("missing material expiry removes only that stored session and progress", ()
       values.set("history", raw);
     },
     removeStoredMaterialMapEntry,
+    safeLocalStorageSetItem,
+    LEGACY_TOPIC_HISTORY_STORAGE_KEY: "legacy-history",
     FEED_SESSION_STORAGE_KEY: "sessions",
     FEED_PROGRESS_STORAGE_KEY: "progress",
   });
@@ -1985,6 +1991,7 @@ test("missing material expiry removes only that stored session and progress", ()
 
   assert.equal(writtenAccountId, "account-a");
   assert.deepEqual(nextHistory.map((item) => item.materialId), ["keep"]);
+  assert.deepEqual(JSON.parse(values.get("legacy-history")).map((item) => item.materialId), ["keep"]);
   assert.deepEqual(Object.keys(JSON.parse(values.get("sessions"))), ["keep", "legacy"]);
   assert.deepEqual(Object.keys(JSON.parse(values.get("progress"))), ["keep"]);
 });
@@ -2812,6 +2819,132 @@ test("initial feed loads retain a level baseline for every grouped material", ()
   assert.match(callbackText, /knowledgeLevelByMaterialRef\.current\.get\(feedMaterialIds\[0\]\)/);
 });
 
+test("adaptive feed refresh retries one identical request only for transient failures", async () => {
+  class TestApiError extends Error {
+    constructor(status) {
+      super(`HTTP ${status}`);
+      this.status = status;
+    }
+  }
+  class TestTransportError extends Error {}
+  const shouldRetryAdaptiveFeedRefresh = compileFunctionDeclaration(
+    "shouldRetryAdaptiveFeedRefresh",
+    {
+      ApiError: TestApiError,
+      isRequestInterruptedError: (error) => error?.message === "Request was interrupted.",
+      isTransportError: (error) => error instanceof TestTransportError,
+    },
+  );
+
+  let healthyCalls = 0;
+  const healthyRequest = { materialId: "healthy", signal: new AbortController().signal };
+  const healthyFetch = compileFunctionDeclaration("fetchAdaptiveFeedPageWithRetry", {
+    shouldRetryAdaptiveFeedRefresh,
+    fetchFeed: async (request) => {
+      healthyCalls += 1;
+      assert.strictEqual(request, healthyRequest);
+      return { ok: true };
+    },
+  });
+  assert.deepEqual(await healthyFetch(healthyRequest), { ok: true });
+  assert.equal(healthyCalls, 1, "the healthy path must not issue a second request");
+
+  const transientErrors = [
+    new TestTransportError("network unavailable"),
+    new TestApiError(408),
+    new TestApiError(429),
+    new TestApiError(503),
+  ];
+  for (const firstError of transientErrors) {
+    const request = { materialId: `retry-${firstError.message}`, signal: new AbortController().signal };
+    const requests = [];
+    const fetchWithRetry = compileFunctionDeclaration("fetchAdaptiveFeedPageWithRetry", {
+      shouldRetryAdaptiveFeedRefresh,
+      fetchFeed: async (received) => {
+        requests.push(received);
+        if (requests.length === 1) {
+          throw firstError;
+        }
+        return { ok: true };
+      },
+    });
+
+    assert.deepEqual(await fetchWithRetry(request), { ok: true });
+    assert.equal(requests.length, 2);
+    assert.strictEqual(requests[0], request);
+    assert.strictEqual(requests[1], request, "the retry must reuse the identical request");
+  }
+
+  let failedCalls = 0;
+  const repeatedTransient = new TestApiError(503);
+  const boundedFetch = compileFunctionDeclaration("fetchAdaptiveFeedPageWithRetry", {
+    shouldRetryAdaptiveFeedRefresh,
+    fetchFeed: async () => {
+      failedCalls += 1;
+      throw repeatedTransient;
+    },
+  });
+  await assert.rejects(
+    boundedFetch({ materialId: "bounded", signal: new AbortController().signal }),
+    (error) => error === repeatedTransient,
+  );
+  assert.equal(failedCalls, 2, "a second transient failure must not trigger a third call");
+});
+
+test("adaptive feed refresh does not retry permanent HTTP or aborted requests", async () => {
+  class TestApiError extends Error {
+    constructor(status) {
+      super(`HTTP ${status}`);
+      this.status = status;
+    }
+  }
+  const shouldRetryAdaptiveFeedRefresh = compileFunctionDeclaration(
+    "shouldRetryAdaptiveFeedRefresh",
+    {
+      ApiError: TestApiError,
+      isRequestInterruptedError: (error) => error?.message === "Request was interrupted.",
+      isTransportError: (error) => error?.name === "TransportError",
+    },
+  );
+  const abortError = new Error("aborted");
+  abortError.name = "AbortError";
+
+  for (const firstError of [new TestApiError(400), new TestApiError(404), abortError]) {
+    let calls = 0;
+    const fetchWithRetry = compileFunctionDeclaration("fetchAdaptiveFeedPageWithRetry", {
+      shouldRetryAdaptiveFeedRefresh,
+      fetchFeed: async () => {
+        calls += 1;
+        throw firstError;
+      },
+    });
+
+    await assert.rejects(
+      fetchWithRetry({ materialId: "no-retry", signal: new AbortController().signal }),
+      (error) => error === firstError,
+    );
+    assert.equal(calls, 1);
+  }
+
+  const controller = new AbortController();
+  controller.abort();
+  const transportError = new Error("network unavailable");
+  transportError.name = "TransportError";
+  let abortedCalls = 0;
+  const abortedFetch = compileFunctionDeclaration("fetchAdaptiveFeedPageWithRetry", {
+    shouldRetryAdaptiveFeedRefresh,
+    fetchFeed: async () => {
+      abortedCalls += 1;
+      throw transportError;
+    },
+  });
+  await assert.rejects(
+    abortedFetch({ materialId: "aborted", signal: controller.signal }),
+    (error) => error === transportError,
+  );
+  assert.equal(abortedCalls, 1, "an aborted signal must suppress the retry");
+});
+
 test("every adaptive rerank invalidates old generation before changing inventory", async () => {
   const rerankStart = source.indexOf("const rerankUnseenTail = useCallback(async () => {");
   const rerankEnd = source.indexOf("const reportActiveReelProgress", rerankStart);
@@ -2862,7 +2995,7 @@ test("every adaptive rerank invalidates old generation before changing inventory
       creativeCommonsOnly: false,
       preferredVideoDuration: "any",
     }),
-    fetchFeed: async ({ signal, excludeVideoIds }) => {
+    fetchAdaptiveFeedPageWithRetry: async ({ signal, excludeVideoIds }) => {
       assert.equal(signal, activeSearchScopeRef.current.controller.signal);
       assert.deepEqual(excludeVideoIds, ["dQw4w9WgXcQ"]);
       events.push(`fetch:${activeSearchScopeRef.current.seq}`);

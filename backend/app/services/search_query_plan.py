@@ -10,19 +10,19 @@ import difflib
 import hashlib
 import json
 import re
-import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from ...concept_tokens import concept_semantic_key, semantic_key
 from ..clip_engine.cancellation import raise_if_cancelled
 from ..db import dumps_json, fetch_one, now_iso, upsert
 from . import llm_router
 from .embeddings import EmbeddingService
 
 
-PLAN_VERSION = 4
+PLAN_VERSION = 5
 PLAN_TTL_SEC = 24 * 60 * 60
 FALLBACK_PLAN_TTL_SEC = 15 * 60
 
@@ -45,9 +45,7 @@ _LOW_VALUE_INTENT_PATTERNS = (
 
 
 def normalize_query(value: object) -> str:
-    text = unicodedata.normalize("NFKC", str(value or "")).casefold().replace("_", " ")
-    text = re.sub(r"[^\w\+# ]+", " ", text, flags=re.UNICODE)
-    return " ".join(text.split())
+    return semantic_key(value)
 
 
 def _clean(value: object, *, max_length: int = 160) -> str:
@@ -131,7 +129,7 @@ class SearchQueryPlan(BaseModel):
 
 
 def _cache_key(literal_query: str) -> str:
-    digest = hashlib.sha256(normalize_query(literal_query).encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(concept_semantic_key(literal_query).encode("utf-8")).hexdigest()
     return f"search_query_plan:v{PLAN_VERSION}:{digest}"
 
 
@@ -162,7 +160,10 @@ def _read_cached_plan(conn: Any, literal_query: str) -> tuple[SearchQueryPlan | 
         plan = SearchQueryPlan.model_validate_json(str(row.get("response_json") or "{}"))
     except (ValidationError, ValueError):
         return None, float("inf")
-    if plan.version != PLAN_VERSION or normalize_query(plan.literal_query) != normalize_query(literal_query):
+    if (
+        plan.version != PLAN_VERSION
+        or concept_semantic_key(plan.literal_query) != concept_semantic_key(literal_query)
+    ):
         return None, float("inf")
     return plan, _age_seconds(row.get("created_at"))
 

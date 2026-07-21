@@ -33,6 +33,7 @@ from youtube_transcript_api._errors import (
     VideoUnavailable,
 )
 
+from ...concept_tokens import semantic_key, semantic_tokens
 from ..config import get_settings
 from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 
@@ -2206,15 +2207,17 @@ class YouTubeService:
         return " ".join(str(value or "").split()).strip()
 
     def _normalize_query_key(self, value: str) -> str:
-        cleaned = self._clean_query_text(value).lower()
-        tokens = re.findall(r"[a-z0-9\+#]+", cleaned)
-        return " ".join(tokens)
+        return semantic_key(self._clean_query_text(value))
 
     def _search_query_tokens(self, query: str) -> list[str]:
         tokens = []
         seen: set[str] = set()
-        for token in re.findall(r"[A-Za-z0-9\+#]+", self._clean_query_text(query).lower()):
-            if len(token) < 3 or token in self.SEARCH_QUERY_NOISE_TOKENS or token in seen:
+        for token in semantic_tokens(self._clean_query_text(query)):
+            if (
+                (len(token) < 3 and token.isalnum())
+                or token in self.SEARCH_QUERY_NOISE_TOKENS
+                or token in seen
+            ):
                 continue
             seen.add(token)
             tokens.append(token)
@@ -2745,7 +2748,7 @@ class YouTubeService:
     def _query_token_overlap(self, text: str, query_tokens: list[str]) -> float:
         if not query_tokens:
             return 0.0
-        text_tokens = set(re.findall(r"[a-z0-9\+#]+", self._normalize_query_key(text)))
+        text_tokens = set(semantic_tokens(text))
         if not text_tokens:
             return 0.0
         hits = sum(1 for token in query_tokens if token in text_tokens)

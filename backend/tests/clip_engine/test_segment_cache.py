@@ -255,7 +255,7 @@ def test_segment_cache_revalidates_public_clip_contract() -> None:
     ) is None
 
 
-def test_segment_cache_gemini_authority_bypasses_only_semantic_rejection() -> None:
+def test_segment_cache_requires_canonical_only_gemini_metadata() -> None:
     transcript = _transcript()
     authoritative = _clip()
     authoritative.update({
@@ -280,6 +280,12 @@ def test_segment_cache_gemini_authority_bypasses_only_semantic_rejection() -> No
     duplicate = deepcopy(authoritative)
     duplicate["sequence_index"] = 2
 
+    assert segment_cache._valid_clips(
+        [authoritative, duplicate], transcript=transcript, settings={}
+    ) is None
+
+    authoritative["concept_aliases"] = []
+    duplicate["concept_aliases"] = []
     assert segment_cache._valid_clips(
         [authoritative, duplicate], transcript=transcript, settings={}
     ) == [authoritative, duplicate]

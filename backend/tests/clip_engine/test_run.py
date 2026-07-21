@@ -17,6 +17,18 @@ from backend.app.clip_engine.errors import (
 from backend.app.clip_engine.provider_runtime import GenerationContext
 
 
+def _settle_mock_dispatch(kwargs: dict, telemetry: object) -> None:
+    ticket = kwargs["before_dispatch"](
+        model=kwargs["model"], attempt=1,
+    )
+    kwargs["after_dispatch"](
+        ticket,
+        model=kwargs["model"],
+        attempt=1,
+        telemetry=telemetry,
+    )
+
+
 @pytest.fixture(autouse=True)
 def disable_persistent_segment_cache(monkeypatch):
     monkeypatch.setattr(run.segment_cache, "load_segment_result", lambda *_args, **_kwargs: None)
@@ -114,6 +126,14 @@ def test_standalone_pro_boundary_fallback_dispatches_with_bounded_selector(monke
 
     def fake_generate(_system, _user, _schema, **kwargs):
         provider_calls.append(kwargs)
+        telemetry = {
+            "model": kwargs["model"],
+            "prompt_tokens": 1_200,
+            "candidate_tokens": 30,
+            "thought_tokens": 20,
+            "total_tokens": 1_250,
+        }
+        _settle_mock_dispatch(kwargs, telemetry)
         return SimpleNamespace(
             text=(
                 '{"request_intent":{"exact_request":"calculus",'
@@ -121,13 +141,7 @@ def test_standalone_pro_boundary_fallback_dispatches_with_bounded_selector(monke
                 '"source_phrase":"calculus","requirement":"Teach calculus"}]},'
                 '"topics":[]}'
             ),
-            telemetry={
-                "model": kwargs["model"],
-                "prompt_tokens": 1_200,
-                "candidate_tokens": 30,
-                "thought_tokens": 20,
-                "total_tokens": 1_250,
-            },
+            telemetry=telemetry,
         )
 
     monkeypatch.setattr(run, "GenerationContext", context_factory)
@@ -172,6 +186,14 @@ def test_production_url_records_one_text_only_pro_selector_call(monkeypatch):
 
     def fake_generate(_system, user, _schema, **kwargs):
         provider_calls.append({"user": user, **kwargs})
+        telemetry = {
+            "model": kwargs["model"],
+            "prompt_tokens": 1_200,
+            "candidate_tokens": 30,
+            "thought_tokens": 20,
+            "total_tokens": 1_250,
+        }
+        _settle_mock_dispatch(kwargs, telemetry)
         return SimpleNamespace(
             text=(
                 '{"request_intent":{"exact_request":"photosynthesis",'
@@ -179,13 +201,7 @@ def test_production_url_records_one_text_only_pro_selector_call(monkeypatch):
                 '"source_phrase":"photosynthesis","requirement":'
                 '"Teach photosynthesis"}]},"topics":[]}'
             ),
-            telemetry={
-                "model": kwargs["model"],
-                "prompt_tokens": 1_200,
-                "candidate_tokens": 30,
-                "thought_tokens": 20,
-                "total_tokens": 1_250,
-            },
+            telemetry=telemetry,
         )
 
     context = GenerationContext("slow", generation_id="production-text-only-pro")

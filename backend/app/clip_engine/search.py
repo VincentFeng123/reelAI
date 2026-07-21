@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
+from ...concept_tokens import concept_semantic_tokens, semantic_tokens
 from . import expand, rank, supadata_search
 from .cancellation import raise_if_cancelled
 from .errors import ProviderBudgetExceededError, ProviderRequestError, SearchError
@@ -32,14 +33,23 @@ _DIFFICULTY_QUALIFIERS = {
 }
 
 _NICHE_SEARCH_INTENT_SUFFIX = re.compile(r"(?:^|\s)identification\s*$", re.IGNORECASE)
-_SEARCH_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 _SEARCH_STOPWORDS = {"a", "an", "and", "for", "in", "of", "on", "the", "to", "with"}
 _LONG_TOPIC_LEAD = re.compile(
-    r"^(?:how|why|explain|describe|understand|learn)\s+",
+    r"^(?:(?:please\s+)?(?:teach|explain|describe|understand|learn|cover|study|review)"
+    r"(?:\s+me)?(?:\s+about)?|how|why)\s+",
     re.IGNORECASE,
 )
 _LONG_TOPIC_RELATION = re.compile(
     r"\b(?:work together|interact|combine|to maintain|to preserve|to pass|across)\b",
+    re.IGNORECASE,
+)
+_RECOVERY_SEQUENCE_LEAD = re.compile(
+    r"^(?:(?:and\s+)?(?:begin|start|finish|end)(?:\s+with)?|then|next)\s+",
+    re.IGNORECASE,
+)
+_RECOVERY_SUBJECT_BREAK = re.compile(
+    r"\s*[,;]\s*(?=(?:(?:and\s+)?(?:begin|start|finish|end)(?:\s+with)?|"
+    r"then|next|before|after|followed\s+by)\b)",
     re.IGNORECASE,
 )
 _INVALID_PROVIDER_CURSOR = re.compile(
@@ -78,7 +88,12 @@ def _niche_bootstrap_backoff_query(topic: str) -> str | None:
     return shortened
 
 
-def _long_topic_component_queries(topic: str, *, limit: int = 6) -> list[str]:
+def _long_topic_component_queries(
+    topic: str,
+    *,
+    limit: int = 6,
+    min_coverage_tokens: int = 2,
+) -> list[str]:
     """Extract bounded literal subtopics when a sentence is too broad for search.
 
     The complete user text remains the transcript-selection identity. These
@@ -86,7 +101,11 @@ def _long_topic_component_queries(topic: str, *, limit: int = 6) -> list[str]:
     literal is a long list or paragraph.
     """
     literal = " ".join(str(topic or "").split())
-    if len(_SEARCH_TOKEN_RE.findall(literal)) <= 12 and len(literal) <= 120:
+    if (
+        len(semantic_tokens(literal)) <= 12
+        and len(literal) <= 120
+        and not re.search(r"[,;]", literal)
+    ):
         return []
     stripped = _LONG_TOPIC_LEAD.sub("", literal).strip(" ,:;-?.")
     parts = re.split(r"\s*[,;]\s*|\s+\b(?:and|or)\b\s+", stripped, flags=re.IGNORECASE)
@@ -100,7 +119,11 @@ def _long_topic_component_queries(topic: str, *, limit: int = 6) -> list[str]:
             words = words[:8]
         candidate = " ".join(words).strip()
         key = " ".join(candidate.casefold().split())
-        if len(_search_coverage_tokens(candidate)) < 2 or key in seen:
+        if (
+            len(_search_coverage_tokens(candidate))
+            < max(1, int(min_coverage_tokens))
+            or key in seen
+        ):
             continue
         seen.add(key)
         components.append(candidate)
@@ -109,12 +132,58 @@ def _long_topic_component_queries(topic: str, *, limit: int = 6) -> list[str]:
     return components
 
 
+def _grounded_cursor_recovery_queries(topic: str, *, limit: int = 6) -> list[str]:
+    """Build literal, subject-anchored branches after one opaque cursor fails."""
+    literal = " ".join(str(topic or "").split())
+    raw_subject, separator, raw_body = literal.partition(":")
+    if not separator:
+        subject_break = _RECOVERY_SUBJECT_BREAK.search(literal)
+        if subject_break is not None:
+            raw_subject = literal[: subject_break.start()]
+            raw_body = literal[subject_break.end() :]
+            separator = ","
+    subject = (
+        _LONG_TOPIC_LEAD.sub("", raw_subject).strip(" ,:;-?.")
+        if separator
+        else ""
+    )
+    if not 1 <= len(_search_coverage_tokens(subject)) <= 6:
+        subject = ""
+    components = _long_topic_component_queries(
+        raw_body if separator else literal,
+        limit=max(1, int(limit)),
+        min_coverage_tokens=1 if subject else 2,
+    )
+    recovery: list[str] = []
+    seen = {literal.casefold()}
+    subject_tokens = _search_coverage_tokens(subject)
+    for component in components:
+        focused = _RECOVERY_SEQUENCE_LEAD.sub("", component).strip(" ,:;-?.")
+        if not focused:
+            continue
+        if subject and not subject_tokens.issubset(_search_coverage_tokens(focused)):
+            focused = f"{subject} {focused}"
+        key = " ".join(focused.casefold().split())
+        if not key or key in seen or len(_search_coverage_tokens(focused)) < 2:
+            continue
+        seen.add(key)
+        recovery.append(focused)
+        if len(recovery) >= max(1, int(limit)):
+            break
+    return recovery
+
+
 def _search_coverage_tokens(text: object) -> set[str]:
     tokens: set[str] = set()
-    for raw in _SEARCH_TOKEN_RE.findall(str(text or "").casefold()):
-        if raw in _SEARCH_STOPWORDS:
+    for raw in concept_semantic_tokens(text):
+        folded = raw.casefold()
+        if folded in _SEARCH_STOPWORDS:
             continue
-        token = raw[:-1] if len(raw) > 4 and raw.endswith("s") and not raw.endswith("ss") else raw
+        token = (
+            raw[:-1]
+            if len(raw) > 4 and folded.endswith("s") and not folded.endswith("ss")
+            else raw
+        )
         tokens.add(token)
     return tokens
 
@@ -323,6 +392,7 @@ def _continue_provider_pages(
     search_runtime: dict[str, object],
     enough: Callable[[], bool],
     annotate: Callable[[list[dict]], None],
+    recovery_queries: Sequence[str] = (),
 ) -> tuple[int, str | None, bool]:
     """Replay cached cursors and fetch only until useful unseen inventory exists.
 
@@ -338,15 +408,27 @@ def _continue_provider_pages(
     )
     credits_used = 0
     warning: str | None = None
+    existing_queries = {
+        " ".join(str(result_set.get("query") or "").split()).casefold()
+        for result_set in result_sets
+    }
+    pending_recovery = [
+        query
+        for raw_query in recovery_queries
+        if (query := " ".join(str(raw_query or "").split()))
+        and query.casefold() not in existing_queries
+    ]
+    recovery_enqueued = False
     while frontier and not enough():
         query, token, entry_filters = frontier.pop(0)
         try:
+            request_options: dict[str, object] = {
+                "request_filters": [entry_filters],
+            }
+            if token:
+                request_options["page_tokens"] = [token]
             page_result = supadata_search.search_all(
-                [query],
-                filters,
-                page_tokens=[token],
-                request_filters=[entry_filters],
-                **search_runtime,
+                [query], filters, **request_options, **search_runtime
             )
         except ProviderBudgetExceededError:
             frontier.insert(0, (query, token, entry_filters))
@@ -365,8 +447,14 @@ def _continue_provider_pages(
             warning = (
                 warning
                 or "A provider continuation cursor was rejected; continued with "
-                "remaining search queries."
+                "another grounded search query."
             )
+            if pending_recovery and not recovery_enqueued:
+                frontier.extend(
+                    (recovery_query, "", filters)
+                    for recovery_query in pending_recovery
+                )
+                recovery_enqueued = True
             continue
 
         page_sets = list(page_result.get("per_query") or [])
@@ -832,6 +920,12 @@ def discover_practice_fast(
             search_runtime=search_runtime,
             enough=enough_ranked_videos,
             annotate=annotate,
+            recovery_queries=(
+                _grounded_cursor_recovery_queries(literal_query)
+                if str(expansion.get("provider_used") or "")
+                == "literal_fallback"
+                else ()
+            ),
         )
     )
     initial_ranked = rank.merge_and_rank(

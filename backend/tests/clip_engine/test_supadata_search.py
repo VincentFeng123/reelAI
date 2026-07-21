@@ -6,6 +6,7 @@ import pytest
 from backend.app.clip_engine import supadata_search as ss
 from backend.app.clip_engine.errors import (
     ProviderBudgetExceededError,
+    ProviderError,
     ProviderQuotaError,
     ProviderRateLimitError,
     ProviderTransientError,
@@ -23,6 +24,11 @@ class _Resp:
 
     def json(self):
         return self._payload
+
+
+class _InvalidJSONResp(_Resp):
+    def json(self):
+        raise ValueError("invalid json")
 
 
 @pytest.fixture(autouse=True)
@@ -225,7 +231,7 @@ def test_search_all_returns_primary_result_when_optional_query_exhausts_budget(m
     assert result["warning"] == "Search budget exhausted after partial results."
 
 
-def test_search_all_raises_when_budget_exhausts_before_primary_succeeds(monkeypatch):
+def test_search_all_transient_primary_keeps_logical_query_headroom(monkeypatch):
     monkeypatch.setattr(
         ss.httpx,
         "get",
@@ -236,14 +242,17 @@ def test_search_all_raises_when_budget_exhausts_before_primary_succeeds(monkeypa
     context.reserve("search")
     context.reserve("search")
 
-    with pytest.raises(ProviderBudgetExceededError):
+    with pytest.raises(ProviderTransientError):
         ss.search_all(["primary", "optional"], context=context)
+    assert context.budget.remaining("search") == 1
+    assert len(context.usage()) == 3
 
 
-def test_search_all_keeps_primary_when_optional_retries_consume_budget(monkeypatch):
+def test_search_all_does_not_count_optional_transport_retries_as_queries(monkeypatch):
     responses = iter(
         [
             _Resp(200, {"results": [{"id": "primary", "type": "video"}]}),
+            _Resp(503, {"message": "try again"}),
             _Resp(503, {"message": "try again"}),
             _Resp(503, {"message": "try again"}),
         ]
@@ -253,18 +262,18 @@ def test_search_all_keeps_primary_when_optional_retries_consume_budget(monkeypat
     context.reserve("search")
     context.reserve("search")
 
-    result = ss.search_all(["primary", "optional"], context=context)
+    with pytest.raises(ProviderTransientError):
+        ss.search_all(["primary", "optional"], context=context)
+    assert context.budget.remaining("search") == 1
+    assert len(context.usage()) == 4
 
-    assert [item["query"] for item in result["per_query"]] == ["primary"]
-    assert context.budget.remaining("search") == 0
-    assert result["warning"] == "Search budget exhausted after partial results."
 
-
-def test_three_query_fast_prefix_keeps_retry_headroom_for_transient_primary(
+def test_three_query_fast_prefix_keeps_logical_headroom_through_transient_retries(
     monkeypatch,
 ):
     calls: dict[str, int] = {}
     calls_lock = threading.Lock()
+    first_attempts = threading.Barrier(3)
 
     def fake_get(url, headers=None, params=None, timeout=None):
         del url, headers, timeout
@@ -272,7 +281,8 @@ def test_three_query_fast_prefix_keeps_retry_headroom_for_transient_primary(
         with calls_lock:
             calls[query] = calls.get(query, 0) + 1
             attempt = calls[query]
-        if query == "primary" and attempt == 1:
+        if attempt == 1:
+            first_attempts.wait(timeout=5)
             return _Resp(503, {"message": "try again"})
         return _Resp(200, {"results": [{"id": query, "type": "video"}]})
 
@@ -290,8 +300,9 @@ def test_three_query_fast_prefix_keeps_retry_headroom_for_transient_primary(
         "facet-one",
         "facet-two",
     ]
-    assert calls == {"primary": 2, "facet-one": 1, "facet-two": 1}
-    assert context.budget.remaining("search") == 1
+    assert calls == {"primary": 2, "facet-one": 2, "facet-two": 2}
+    assert context.budget.remaining("search") == 2
+    assert len(context.usage()) == 6
     assert result["warning"] is None
 
 
@@ -317,14 +328,79 @@ def test_search_page_token_keeps_required_query_without_filters(monkeypatch):
 
 
 def test_quota_is_typed_and_not_converted_to_empty_success(monkeypatch):
-    monkeypatch.setattr(
-        ss.httpx,
-        "get",
-        lambda *a, **k: _Resp(402, {"message": "out of credits"}),
-    )
+    calls = 0
+
+    def quota_failure(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _Resp(402, {"message": "out of credits"})
+
+    monkeypatch.setattr(ss.httpx, "get", quota_failure)
     with pytest.raises(ProviderQuotaError) as exc_info:
         ss.search_all(["a", "b"], cache_store=MemoryProviderCache())
     assert exc_info.value.status_code == 402
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "first_response",
+    [
+        _Resp(408, {"message": "timed out"}),
+        _InvalidJSONResp(200, "not-json"),
+        _Resp(200, ["not", "an", "object"]),
+        _Resp(200, {}),
+        _Resp(200, {"results": {"id": "not-a-list"}}),
+    ],
+    ids=[
+        "http-408",
+        "invalid-json",
+        "non-object-json",
+        "missing-results",
+        "non-list-results",
+    ],
+)
+def test_recoverable_search_response_retries_inside_logical_request(
+    monkeypatch,
+    first_response,
+):
+    responses = iter(
+        [
+            first_response,
+            _Resp(200, {"results": [{"id": "recovered", "type": "video"}]}),
+        ]
+    )
+    calls = 0
+
+    def recover_on_second_attempt(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return next(responses)
+
+    monkeypatch.setattr(ss.httpx, "get", recover_on_second_attempt)
+    context = GenerationContext("slow", cache_store=MemoryProviderCache())
+
+    result = ss.search_one("recoverable", context=context)
+
+    assert [video["id"] for video in result["videos"]] == ["recovered"]
+    assert calls == 2
+    assert context.budget.snapshot()["used"]["search"] == 1
+    assert len(context.usage()) == 2
+    assert context.usage()[0]["error_code"] == "provider_transient"
+
+
+@pytest.mark.parametrize("status", [400, 401, 402, 403, 404])
+def test_permanent_search_response_is_not_retried(monkeypatch, status):
+    calls = 0
+
+    def permanent_failure(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _Resp(status, {"message": "permanent"})
+
+    monkeypatch.setattr(ss.httpx, "get", permanent_failure)
+    with pytest.raises(ProviderError):
+        ss.search_one("permanent", cache_store=MemoryProviderCache())
+    assert calls == 1
 
 
 def test_network_errors_retry_at_most_twice_then_surface(monkeypatch):
@@ -352,5 +428,6 @@ def test_rate_limit_respects_bounded_retry_and_records_each_response(monkeypatch
     with pytest.raises(ProviderRateLimitError) as exc_info:
         ss.search_one("rate limited", context=context)
     assert exc_info.value.retry_after_sec == 30.0
+    assert context.budget.snapshot()["used"]["search"] == 1
     assert len(context.usage()) == 3
     assert sum(row["billable_requests"] for row in context.usage()) == 3

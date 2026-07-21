@@ -118,15 +118,27 @@ class ProviderUsageRecord:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class _GeminiCostReservation:
+    attempt_cost_usd: float
+    max_physical_attempts: int
+
+    @property
+    def admitted_cost_usd(self) -> float:
+        return self.attempt_cost_usd * self.max_physical_attempts
+
+
 class GenerationBudget:
     """Atomic, job-wide provider ceilings plus acquisition-pass controls."""
 
     _LIMITS: dict[GenerationMode, dict[BudgetedProviderOperation, int]] = {
-        # Reservations count provider attempts, including retries.
+        # Search/transcript reservations count logical requests. Each logical
+        # request owns its bounded transport retries; every physical attempt is
+        # still recorded in provider usage telemetry.
         # Three complementary initial queries can cover a broad request plus
-        # distinct named facets. Keep two additional reservations so a rejected
-        # provider cursor can be isolated and discovery can retry through one
-        # independent query branch without exceeding the bounded request cap.
+        # distinct named facets. Keep two additional logical reservations so a
+        # rejected provider cursor can be isolated and discovery can continue
+        # through one independent query branch.
         "fast": {"search": 5, "transcript": 2, "segmentation": 2},
         "slow": {"search": 5, "transcript": 3, "segmentation": 3},
     }
@@ -171,7 +183,8 @@ class GenerationBudget:
         # actual committed spend plus only the calls that are still in flight.
         self._gemini_reserved_cost_usd = 0.0
         self._gemini_committed_cost_usd = 0.0
-        self._gemini_inflight: dict[int, float] = {}
+        self._gemini_billing_unknown_cost_usd = 0.0
+        self._gemini_inflight: dict[int, _GeminiCostReservation] = {}
         self._next_gemini_reservation_id = 1
         self._selector_calls = 0
         self._flash_selector_calls = 0
@@ -227,10 +240,12 @@ class GenerationBudget:
         model: str,
         operation: str,
         estimated_cost_usd: float,
+        max_physical_attempts: int = 1,
+        count_logical_call: bool = True,
         deadline_monotonic: float | None = None,
         cancelled: Callable[[], bool] | object | None = None,
     ) -> int:
-        """Reserve a real Gemini dispatch, including nested selector fallbacks."""
+        """Reserve one Gemini dispatch, optionally claiming its logical quota."""
         normalized_model = str(model or "").casefold()
         normalized_operation = str(operation or "").casefold()
         is_pro = "pro" in normalized_model or normalized_operation.startswith("pro_")
@@ -252,7 +267,11 @@ class GenerationBudget:
         is_allowed_pro_operation = (
             is_pro_selector or is_pro_boundary_audit or is_pro_fallback
         )
-        reservation = max(0.0, float(estimated_cost_usd))
+        reservation = _GeminiCostReservation(
+            attempt_cost_usd=max(0.0, float(estimated_cost_usd)),
+            max_physical_attempts=max(1, int(max_physical_attempts)),
+        )
+        admitted_cost = reservation.admitted_cost_usd
         cost_limit = self._GEMINI_COST_LIMIT_USD[self.mode]
 
         def cancellation_requested() -> bool:
@@ -290,7 +309,8 @@ class GenerationBudget:
                         operation=operation,
                     )
                 if (
-                    is_pro_fallback
+                    count_logical_call
+                    and is_pro_fallback
                     and self._pro_fallback_calls >= self._PRO_FALLBACK_CALL_LIMIT
                 ):
                     raise ProviderBudgetExceededError(
@@ -299,7 +319,8 @@ class GenerationBudget:
                         operation=operation,
                     )
                 if (
-                    is_selector
+                    count_logical_call
+                    and is_selector
                     and self._selector_calls
                     >= self._SELECTOR_CALL_LIMIT[self.mode]
                 ):
@@ -310,7 +331,8 @@ class GenerationBudget:
                         operation=operation,
                     )
                 if (
-                    is_pro_boundary_audit
+                    count_logical_call
+                    and is_pro_boundary_audit
                     and self._boundary_audit_calls
                     >= self._BOUNDARY_AUDIT_CALL_LIMIT[self.mode]
                 ):
@@ -320,35 +342,41 @@ class GenerationBudget:
                         provider="gemini",
                         operation=operation,
                     )
-                inflight_cost = sum(self._gemini_inflight.values())
+                inflight_cost = sum(
+                    item.admitted_cost_usd for item in self._gemini_inflight.values()
+                )
                 exposure = self._gemini_committed_cost_usd + inflight_cost
-                if exposure + reservation <= cost_limit + 1e-9:
+                if exposure + admitted_cost <= cost_limit + 1e-9:
                     reservation_id = self._next_gemini_reservation_id
                     self._next_gemini_reservation_id += 1
                     self._gemini_inflight[reservation_id] = reservation
-                    self._gemini_reserved_cost_usd += reservation
-                    if is_pro_fallback:
+                    self._gemini_reserved_cost_usd += admitted_cost
+                    if count_logical_call and is_pro_fallback:
                         self._pro_fallback_calls += 1
-                    if is_selector:
+                    if count_logical_call and is_selector:
                         self._selector_calls += 1
-                    if is_flash_selector:
+                    if count_logical_call and is_flash_selector:
                         self._flash_selector_calls += 1
-                    if is_pro_selector:
+                    if count_logical_call and is_pro_selector:
                         self._pro_selector_calls += 1
-                    if is_pro_boundary_audit:
+                    if count_logical_call and is_pro_boundary_audit:
                         self._boundary_audit_calls += 1
                     return reservation_id
 
                 # Settling in-flight work cannot reduce already committed
                 # spend, so this request can never fit within the job ceiling.
-                if self._gemini_committed_cost_usd + reservation > cost_limit + 1e-9:
+                if (
+                    self._gemini_committed_cost_usd + admitted_cost
+                    > cost_limit + 1e-9
+                ):
                     raise ProviderBudgetExceededError(
                         f"Gemini job cost budget exhausted (${cost_limit:.2f} maximum).",
                         provider="gemini",
                         operation=operation,
                         detail=(
                             f"committed=${self._gemini_committed_cost_usd:.6f}, "
-                            f"inflight=${inflight_cost:.6f}, requested=${reservation:.6f}"
+                            f"inflight=${inflight_cost:.6f}, "
+                            f"requested=${admitted_cost:.6f}"
                         ),
                     )
                 if not self._gemini_inflight or deadline_monotonic is None:
@@ -358,7 +386,8 @@ class GenerationBudget:
                         operation=operation,
                         detail=(
                             f"committed=${self._gemini_committed_cost_usd:.6f}, "
-                            f"inflight=${inflight_cost:.6f}, requested=${reservation:.6f}"
+                            f"inflight=${inflight_cost:.6f}, "
+                            f"requested=${admitted_cost:.6f}"
                         ),
                     )
                 remaining = float(deadline_monotonic) - time.monotonic()
@@ -371,8 +400,9 @@ class GenerationBudget:
         reservation_id: int | None,
         *,
         actual_cost_usd: float | None,
+        unknown_prior_attempts: int = 0,
     ) -> bool:
-        """Replace one in-flight worst case with actual cost; unknown billing keeps it."""
+        """Settle one logical call without dropping unknown retry exposure."""
         with self._gemini_condition:
             if reservation_id is None:
                 if actual_cost_usd is not None:
@@ -380,20 +410,33 @@ class GenerationBudget:
                         0.0, float(actual_cost_usd)
                     )
                 return False
-            reserved = self._gemini_inflight.pop(int(reservation_id), None)
-            if reserved is None:
+            reservation = self._gemini_inflight.pop(int(reservation_id), None)
+            if reservation is None:
                 return False
-            committed = (
+            reserved = reservation.attempt_cost_usd
+            final_attempt_cost = (
                 reserved
                 if actual_cost_usd is None
                 else max(0.0, float(actual_cost_usd))
             )
+            unknown_retry_cost = reserved * max(0, int(unknown_prior_attempts))
+            committed = final_attempt_cost + unknown_retry_cost
             self._gemini_committed_cost_usd += committed
-            if committed > reserved + 1e-9:
+            self._gemini_billing_unknown_cost_usd += unknown_retry_cost
+            if actual_cost_usd is None:
+                self._gemini_billing_unknown_cost_usd += reserved
+            if final_attempt_cost > reserved + 1e-9:
                 logger.warning(
                     "Gemini actual cost exceeded reservation: actual=$%.6f reserved=$%.6f",
-                    committed,
+                    final_attempt_cost,
                     reserved,
+                )
+            if unknown_prior_attempts >= reservation.max_physical_attempts:
+                logger.error(
+                    "Gemini physical attempts exceeded admitted retry exposure: "
+                    "observed=%d admitted=%d",
+                    max(1, int(unknown_prior_attempts) + 1),
+                    reservation.max_physical_attempts,
                 )
             self._gemini_condition.notify_all()
             return True
@@ -425,12 +468,22 @@ class GenerationBudget:
                         self._gemini_committed_cost_usd, 8
                     ),
                     "committed_cost_usd": round(self._gemini_committed_cost_usd, 8),
+                    "billing_unknown_cost_exposure_usd": round(
+                        self._gemini_billing_unknown_cost_usd, 8
+                    ),
                     "inflight_reserved_cost_usd": round(
-                        sum(self._gemini_inflight.values()), 8
+                        sum(
+                            item.admitted_cost_usd
+                            for item in self._gemini_inflight.values()
+                        ),
+                        8,
                     ),
                     "cost_exposure_usd": round(
                         self._gemini_committed_cost_usd
-                        + sum(self._gemini_inflight.values()),
+                        + sum(
+                            item.admitted_cost_usd
+                            for item in self._gemini_inflight.values()
+                        ),
                         8,
                     ),
                     "selector_calls": self._selector_calls,
@@ -519,11 +572,60 @@ def _gemini_record_billing_known(record: Mapping[str, Any]) -> bool:
     )
 
 
-def _gemini_record_billing_unknown(record: Mapping[str, Any]) -> bool:
+def _gemini_retry_attempts(usage: Any) -> int:
+    """Return earlier physical attempts represented by one logical call."""
+    raw_retries = _usage_field(usage, "retries")
+    try:
+        return max(0, int(raw_retries or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _gemini_unknown_billing_attempts(
+    usage: Any,
+    *,
+    dispatched: bool,
+    usage_known: bool,
+) -> int:
+    """Count dispatched attempts whose billable tokens remain unknown."""
+    if not dispatched:
+        return 0
+    # Retry/failover error telemetry has no token split for the earlier
+    # physical attempts. A missing split for the final attempt is unknown too.
+    return _gemini_retry_attempts(usage) + (0 if usage_known else 1)
+
+
+def _gemini_record_unknown_billing_attempts(record: Mapping[str, Any]) -> int:
     metadata = record.get("metadata") or {}
-    return bool(metadata.get("dispatched")) and not _gemini_record_billing_known(
-        record
+    explicit = metadata.get("billing_unknown_attempts")
+    if explicit is not None:
+        try:
+            return max(0, int(explicit or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+    return _gemini_unknown_billing_attempts(
+        metadata,
+        dispatched=bool(metadata.get("dispatched")),
+        usage_known=_gemini_record_billing_known(record),
     )
+
+
+def _gemini_record_unknown_billing_cost(record: Mapping[str, Any]) -> float:
+    metadata = record.get("metadata") or {}
+    explicit = metadata.get("billing_unknown_reserved_cost_usd")
+    if explicit is not None:
+        try:
+            return max(0.0, float(explicit or 0.0))
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+    return (
+        _gemini_record_unknown_billing_attempts(record)
+        * max(0.0, float(metadata.get("reserved_cost_usd") or 0.0))
+    )
+
+
+def _gemini_record_billing_unknown(record: Mapping[str, Any]) -> bool:
+    return _gemini_record_unknown_billing_attempts(record) > 0
 
 
 def _gemini_token_rates(
@@ -546,7 +648,14 @@ def _gemini_token_rates(
 
 def _gemini_physical_attempts(record: Mapping[str, Any]) -> int:
     """Count a logical call's transport attempts without inventing token usage."""
-    retries = (record.get("metadata") or {}).get("retries")
+    metadata = record.get("metadata") or {}
+    physical_dispatches = metadata.get("physical_dispatches")
+    if physical_dispatches is not None:
+        try:
+            return max(0, int(physical_dispatches))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+    retries = metadata.get("retries")
     if retries is None:
         return 1
     try:
@@ -597,6 +706,8 @@ class GenerationContext:
         max_output_tokens: int,
         prompt_text: str = "",
         estimated_input_tokens: int | None = None,
+        max_physical_attempts: int | None = None,
+        count_logical_call: bool = True,
         deadline_monotonic: float | None = None,
         cancelled: Callable[[], bool] | object | None = None,
     ) -> dict[str, int | float]:
@@ -614,10 +725,17 @@ class GenerationContext:
         estimated_cost = (
             prompt_tokens * input_rate + output_tokens * output_rate
         ) / 1_000_000.0
+        admitted_attempts = (
+            1
+            if max_physical_attempts is None
+            else max(1, int(max_physical_attempts))
+        )
         reservation_id = self.budget.reserve_gemini(
             model=model,
             operation=operation,
             estimated_cost_usd=estimated_cost,
+            max_physical_attempts=admitted_attempts,
+            count_logical_call=count_logical_call,
             deadline_monotonic=deadline_monotonic,
             cancelled=cancelled,
         )
@@ -626,6 +744,8 @@ class GenerationContext:
             "reserved_input_tokens": prompt_tokens,
             "reserved_output_tokens": output_tokens,
             "reserved_cost_usd": estimated_cost,
+            "admitted_physical_attempts": admitted_attempts,
+            "admitted_cost_usd": estimated_cost * admitted_attempts,
         }
 
     def reconcile_gemini_call(
@@ -705,6 +825,13 @@ class GenerationContext:
         return self.budget.reconcile_gemini(
             reservation_id,
             actual_cost_usd=actual_cost,
+            # Successful final-attempt usage cannot price an earlier transport
+            # attempt that disconnected or failed over. Keep one full logical
+            # reservation for each such physical attempt instead of silently
+            # settling the whole call to only the final response.
+            unknown_prior_attempts=(
+                _gemini_retry_attempts(usage) if dispatched_value else 0
+            ),
         )
 
     def configure_pro_fallback_gate(self, expected_initial_results: int) -> None:
@@ -984,12 +1111,46 @@ class GenerationContext:
             else _usage_value(usage, "output_tokens")
         )
         total_tokens = _usage_value(usage, "total_token_count", "totalTokenCount", "total_tokens")
+        usage_known = _gemini_billing_usage_known(usage)
+        raw_dispatched = _usage_field(usage, "dispatched")
+        dispatched_value = (
+            bool(raw_dispatched) if raw_dispatched is not None else status_code is not None
+        )
+        raw_unknown_attempts = _usage_field(usage, "billing_unknown_attempts")
+        if raw_unknown_attempts is None:
+            unknown_billing_attempts = _gemini_unknown_billing_attempts(
+                usage,
+                dispatched=dispatched_value,
+                usage_known=usage_known,
+            )
+        else:
+            try:
+                unknown_billing_attempts = max(0, int(raw_unknown_attempts or 0))
+            except (TypeError, ValueError, OverflowError):
+                unknown_billing_attempts = 0
+        reserved_cost = max(
+            0.0,
+            float(_usage_field(usage, "reserved_cost_usd") or 0.0),
+        )
+        raw_unknown_cost = _usage_field(
+            usage, "billing_unknown_reserved_cost_usd",
+        )
+        if raw_unknown_cost is None:
+            unknown_billing_reserved_cost = unknown_billing_attempts * reserved_cost
+        else:
+            try:
+                unknown_billing_reserved_cost = max(0.0, float(raw_unknown_cost or 0.0))
+            except (TypeError, ValueError, OverflowError):
+                unknown_billing_reserved_cost = 0.0
         record_metadata: dict[str, Any] = {
             "provider_call": True,
             "candidate_tokens": candidate_tokens,
             "thought_tokens": thought_tokens,
             "cached_tokens": cached_tokens,
-            "billing_usage_known": _gemini_billing_usage_known(usage),
+            "billing_usage_known": usage_known,
+            "billing_unknown_attempts": unknown_billing_attempts,
+            "billing_unknown_reserved_cost_usd": unknown_billing_reserved_cost,
+            "dispatched": dispatched_value,
         }
         if stage:
             record_metadata["stage"] = str(stage)
@@ -1005,7 +1166,9 @@ class GenerationContext:
             "reserved_input_tokens",
             "reserved_output_tokens",
             "reserved_cost_usd",
-            "dispatched",
+            "admitted_physical_attempts",
+            "admitted_cost_usd",
+            "physical_dispatches",
             "error_type",
             "provider_error_type",
             "provider_status_code",
@@ -1015,6 +1178,7 @@ class GenerationContext:
             "failover_from_model",
             "failover_model",
             "failover_reason",
+            "failover_pre_dispatch_error",
         ):
             value = _usage_field(usage, field_name)
             if value is not None:
@@ -1043,11 +1207,7 @@ class GenerationContext:
             # normalized ledger intentionally stores zeros for aggregation,
             # but those synthesized zeros are not billing evidence.
             usage=usage,
-            dispatched=(
-                bool(record_metadata.get("dispatched"))
-                if "dispatched" in record_metadata
-                else status_code is not None
-            ),
+            dispatched=dispatched_value,
         )
         self.record(record)
 
@@ -1103,6 +1263,7 @@ class GenerationContext:
                     "telemetry_priced_cost_usd": 0.0,
                     "reserved_cost_usd": 0.0,
                     "billing_unknown_calls": 0,
+                    "billing_unknown_attempts": 0,
                     "billing_unknown_reserved_cost_usd": 0.0,
                 },
             )
@@ -1135,9 +1296,12 @@ class GenerationContext:
                 bucket["billing_unknown_calls"] = int(
                     bucket["billing_unknown_calls"]
                 ) + 1
+                bucket["billing_unknown_attempts"] = int(
+                    bucket["billing_unknown_attempts"]
+                ) + _gemini_record_unknown_billing_attempts(row)
                 bucket["billing_unknown_reserved_cost_usd"] = float(
                     bucket["billing_unknown_reserved_cost_usd"]
-                ) + float(metadata.get("reserved_cost_usd") or 0.0)
+                ) + _gemini_record_unknown_billing_cost(row)
         for bucket in by_stage.values():
             for cost_field in (
                 "estimated_cost_usd",
@@ -1153,8 +1317,12 @@ class GenerationContext:
             row for row in gemini_calls if _gemini_record_billing_unknown(row)
         ]
         billing_unknown_count = len(billing_unknown_rows)
+        billing_unknown_attempts = sum(
+            _gemini_record_unknown_billing_attempts(row)
+            for row in billing_unknown_rows
+        )
         billing_unknown_reserved_cost = sum(
-            float((row.get("metadata") or {}).get("reserved_cost_usd") or 0.0)
+            _gemini_record_unknown_billing_cost(row)
             for row in billing_unknown_rows
         )
         accepted = int(counters.get("persisted_clips") or 0)
@@ -1211,6 +1379,7 @@ class GenerationContext:
                 "lifetime_reserved_worst_case_cost_usd"
             ],
             "billing_unknown_calls": billing_unknown_count,
+            "billing_unknown_attempts": billing_unknown_attempts,
             "billing_unknown_reserved_cost_usd": round(
                 billing_unknown_reserved_cost, 8
             ),

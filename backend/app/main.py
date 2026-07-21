@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 
 from backend import config as pipeline_config
+from backend.concept_tokens import semantic_key, semantic_tokens
 
 from .config import get_settings
 from .db import (
@@ -43,6 +44,7 @@ from .db import (
     get_conn,
     init_db,
     insert,
+    is_transient_postgres_transaction_error,
     now_iso,
     upsert,
 )
@@ -143,7 +145,11 @@ from .services.billing_providers import (
     lock_billing_account,
     process_stripe_event,
 )
-from .services.lesson_ordering import LESSON_ORDER_PROMPT_VERSION, order_lesson_batch
+from .services.lesson_ordering import (
+    LESSON_ORDER_PROMPT_VERSION,
+    _filter_same_source_overlaps,
+    order_lesson_batch,
+)
 from .services.idempotency import (
     IdempotencyConflictError,
     complete_idempotency_key,
@@ -237,6 +243,7 @@ GENERATION_WORKER_POLL_SEC = max(
 # process worker so a stale Railway environment override cannot multiply CPU,
 # RAM, or Gemini spend on the Hobby deployment.
 GENERATION_WORKER_COUNT = 1
+GENERATION_DB_TRANSACTION_MAX_ATTEMPTS = 2
 _generation_worker_ids = tuple(
     f"worker-{uuid.uuid4()}" for _index in range(GENERATION_WORKER_COUNT)
 )
@@ -2258,10 +2265,10 @@ def _request_reel_text(reel: dict[str, Any]) -> str:
 
 
 def _request_text_has_anchor(text: str, terms: list[str]) -> bool:
-    lowered = f" {text.lower()} "
-    text_tokens = set(re.findall(r"[a-z0-9\+#]+", text.lower()))
+    lowered = f" {semantic_key(text)} "
+    text_tokens = set(semantic_tokens(text))
     for raw_term in terms:
-        normalized = " ".join(re.findall(r"[a-z0-9\+#]+", str(raw_term or "").lower()))
+        normalized = semantic_key(raw_term)
         if not normalized:
             continue
         if f" {normalized} " in lowered:
@@ -2273,13 +2280,13 @@ def _request_text_has_anchor(text: str, terms: list[str]) -> bool:
 
 
 def _request_matched_anchor_terms(text: str, terms: list[str]) -> list[str]:
-    lowered = f" {text.lower()} "
-    text_tokens = set(re.findall(r"[a-z0-9\+#]+", text.lower()))
+    lowered = f" {semantic_key(text)} "
+    text_tokens = set(semantic_tokens(text))
     matches: list[str] = []
     seen: set[str] = set()
     for raw_term in terms:
         candidate = str(raw_term or "").strip()
-        normalized = " ".join(re.findall(r"[a-z0-9\+#]+", candidate.lower()))
+        normalized = semantic_key(candidate)
         if not candidate or not normalized or normalized in seen:
             continue
         if f" {normalized} " in lowered:
@@ -2311,8 +2318,8 @@ def _request_similarity_profile(subject_tag: str | None) -> dict[str, float]:
 def _request_reel_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
     left_text = _request_reel_text(left)
     right_text = _request_reel_text(right)
-    left_tokens = set(re.findall(r"[a-z0-9\+#]+", left_text))
-    right_tokens = set(re.findall(r"[a-z0-9\+#]+", right_text))
+    left_tokens = set(semantic_tokens(left_text))
+    right_tokens = set(semantic_tokens(right_text))
     if not left_tokens or not right_tokens:
         return 0.0
     overlap = len(left_tokens.intersection(right_tokens))
@@ -3086,13 +3093,14 @@ def _create_generation_row(
     generation_mode: Literal["slow", "fast"],
     retrieval_profile: str,
     source_generation_id: str | None = None,
+    generation_id: str | None = None,
 ) -> str:
-    generation_id = str(uuid.uuid4())
+    resolved_generation_id = str(generation_id or uuid.uuid4())
     upsert(
         conn,
         "reel_generations",
         {
-            "id": generation_id,
+            "id": resolved_generation_id,
             "material_id": material_id,
             "concept_id": concept_id,
             "request_key": request_key,
@@ -3107,7 +3115,7 @@ def _create_generation_row(
             "error_text": None,
         },
     )
-    return generation_id
+    return resolved_generation_id
 
 
 def _complete_generation(
@@ -3421,15 +3429,62 @@ def _authoritative_generation_release_reel_ids(
     return None
 
 
+def _remove_authoritative_release_temporal_overlaps(
+    conn,
+    *,
+    generation_ids: list[str],
+    ordered_reel_ids: list[str],
+) -> list[str]:
+    """Keep the earliest release when same-source spans substantially overlap."""
+    if len(ordered_reel_ids) < 2 or not generation_ids:
+        return ordered_reel_ids
+
+    placeholders = ", ".join("?" for _generation_id in generation_ids)
+    rows = fetch_all(
+        conn,
+        f"SELECT id, video_id, video_url, t_start, t_end, search_context_json FROM reels "
+        f"WHERE generation_id IN ({placeholders})",
+        tuple(generation_ids),
+    )
+    rows_by_id = {
+        str(row.get("id") or "").strip(): row
+        for row in rows
+        if str(row.get("id") or "").strip()
+    }
+    reels_by_id: dict[str, dict[str, Any]] = {}
+    for reel_id in ordered_reel_ids:
+        row = rows_by_id.get(reel_id)
+        if row is None:
+            reels_by_id[reel_id] = {"reel_id": reel_id}
+            continue
+        metadata = reel_service._selection_metadata(
+            row.get("search_context_json"),
+            t_start=row.get("t_start"),
+            t_end=row.get("t_end"),
+        )
+        reels_by_id[reel_id] = {
+            **row,
+            **metadata,
+            "video_id": _bare_video_id(_reel_source_video_id(row)),
+        }
+    filtered_ids, _checkpoint_ids = _filter_same_source_overlaps(
+        ordered_reel_ids,
+        (),
+        reels_by_id,
+    )
+    return filtered_ids
+
+
 def _authoritative_release_reel_ids(
     conn,
     generation_id: str | None,
 ) -> list[str] | None:
     """Return the exact released chain order, or None for wholly legacy data."""
+    generation_ids = _response_generation_ids(conn, generation_id)
     ordered_ids: list[str] = []
     seen_ids: set[str] = set()
     found_authoritative_release = False
-    for current_generation_id in _response_generation_ids(conn, generation_id):
+    for current_generation_id in generation_ids:
         released_ids = _authoritative_generation_release_reel_ids(
             conn,
             current_generation_id,
@@ -3442,7 +3497,13 @@ def _authoritative_release_reel_ids(
                 continue
             seen_ids.add(reel_id)
             ordered_ids.append(reel_id)
-    return ordered_ids if found_authoritative_release else None
+    if not found_authoritative_release:
+        return None
+    return _remove_authoritative_release_temporal_overlaps(
+        conn,
+        generation_ids=generation_ids,
+        ordered_reel_ids=ordered_ids,
+    )
 
 
 def _verified_reusable_generation_chain(
@@ -4283,9 +4344,113 @@ def _parse_excluded_reel_ids_param(raw_value: str | None) -> list[str]:
     return normalized[:200]
 
 
-def _persist_generation_provider_usage(job_id: str, record: ProviderUsageRecord) -> None:
+def _generation_db_transaction_definitely_aborted(exc: BaseException) -> bool:
+    """Return whether PostgreSQL guarantees that a failed transaction rolled back."""
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        sqlstate = str(
+            getattr(current, "sqlstate", "")
+            or getattr(current, "pgcode", "")
+            or ""
+        ).strip().upper()
+        if sqlstate in {"40001", "40P01"}:
+            return True
+        for chained in (current.__cause__, current.__context__):
+            if isinstance(chained, BaseException):
+                pending.append(chained)
+    return False
+
+
+def _run_generation_db_transaction(
+    step: str,
+    work: Callable[[Any], Any],
+    *,
+    retry_should_stop: Callable[[], bool] | None = None,
+    replay_after_unknown_commit: bool = False,
+) -> Any:
+    """Retry one failed PostgreSQL transaction on a fresh connection.
+
+    The conservative default avoids replaying an unknown commit. Callers may opt
+    in only when every write has stable identities that converge on replay.
+    """
+    for attempt in range(1, GENERATION_DB_TRANSACTION_MAX_ATTEMPTS + 1):
+        body_completed = False
+        try:
+            with get_conn(transactional=True) as conn:
+                result = work(conn)
+                body_completed = True
+            return result
+        except Exception as exc:
+            if (
+                attempt >= GENERATION_DB_TRANSACTION_MAX_ATTEMPTS
+                or isinstance(
+                    exc,
+                    (DatabaseIntegrityError, HTTPException, ValueError),
+                )
+                or not is_transient_postgres_transaction_error(exc)
+                or (
+                    body_completed
+                    and not _generation_db_transaction_definitely_aborted(exc)
+                    and not replay_after_unknown_commit
+                )
+            ):
+                raise
+            if retry_should_stop is not None:
+                try:
+                    retry_stopped = retry_should_stop()
+                except Exception as stop_exc:
+                    # Python implicitly links an exception raised by the guard
+                    # to the transaction exception currently being handled.
+                    # Do not let that outer transient context make a permanent
+                    # guard failure look retryable.
+                    stop_context = stop_exc.__context__
+                    if stop_context is exc:
+                        stop_exc.__context__ = None
+                    try:
+                        stop_check_is_transient = (
+                            is_transient_postgres_transaction_error(stop_exc)
+                        )
+                    finally:
+                        stop_exc.__context__ = stop_context
+                    if not stop_check_is_transient:
+                        raise
+                    logger.warning(
+                        "generation retry lease check failed transiently; "
+                        "continuing bounded retry step=%s error=%s",
+                        step,
+                        (str(stop_exc).splitlines() or [stop_exc.__class__.__name__])[0][
+                            :180
+                        ],
+                    )
+                else:
+                    if retry_stopped:
+                        raise
+            logger.warning(
+                "retrying generation database step after transient PostgreSQL "
+                "failure step=%s attempt=%d/%d error=%s",
+                step,
+                attempt,
+                GENERATION_DB_TRANSACTION_MAX_ATTEMPTS,
+                (str(exc).splitlines() or [exc.__class__.__name__])[0][:180],
+            )
+    raise AssertionError("unreachable")
+
+
+def _persist_generation_provider_usage(
+    job_id: str,
+    record: ProviderUsageRecord,
+    *,
+    retry_should_stop: Callable[[], bool] | None = None,
+) -> None:
     """Store every provider response instead of treating one rate-limit hit as a generation."""
-    with get_conn(transactional=True) as conn:
+    usage_id = str(uuid.uuid4())
+
+    def persist(conn: Any) -> None:
         record_provider_usage(
             conn,
             job_id=job_id,
@@ -4304,7 +4469,14 @@ def _persist_generation_provider_usage(job_id: str, record: ProviderUsageRecord)
                 "error_code": record.error_code,
                 "timestamp": record.timestamp,
             },
+            usage_id=usage_id,
         )
+
+    _run_generation_db_transaction(
+        "provider_usage",
+        persist,
+        retry_should_stop=retry_should_stop,
+    )
 
 
 def _job_request_params(job_row: dict[str, Any]) -> dict[str, Any]:
@@ -4841,14 +5013,28 @@ def _run_leased_generation_job(
             cached_cancelled = _generation_job_db_should_stop(job_id, lease_owner)
         return cached_cancelled
 
+    def db_retry_should_stop() -> bool:
+        return bool(
+            local_stop.is_set()
+            or active_worker_stop.is_set()
+            or _generation_job_db_should_stop(job_id, lease_owner)
+        )
+
     context = GenerationContext(
         mode,
         generation_id=job_id,
-        usage_sink=lambda record: _persist_generation_provider_usage(job_id, record),
+        usage_sink=lambda record: _persist_generation_provider_usage(
+            job_id,
+            record,
+            retry_should_stop=db_retry_should_stop,
+        ),
         cache_store=DatabaseProviderCache(),
         require_acoustic_boundaries=True,
     )
     generation_id = ""
+    setup_generation_candidate_id = (
+        str(job_row.get("result_generation_id") or "").strip() or str(uuid.uuid4())
+    )
     completed_source_ids: set[str] = set()
     retrieved_video_ids: set[str] = set()
 
@@ -4899,7 +5085,7 @@ def _run_leased_generation_job(
         return True
 
     try:
-        with get_conn(transactional=True) as setup_conn:
+        def setup_generation(setup_conn: Any) -> str | None:
             if not update_generation_progress(
                 setup_conn,
                 job_id=job_id,
@@ -4911,13 +5097,13 @@ def _run_leased_generation_job(
                     f"generation job lease is no longer active: {job_id}"
                 )
             if cancel_if_adaptation_stale(setup_conn):
-                return
-            generation_id = str(job_row.get("result_generation_id") or "").strip()
-            if not _fetch_generation_row(setup_conn, generation_id):
+                return None
+            setup_generation_id = setup_generation_candidate_id
+            if not _fetch_generation_row(setup_conn, setup_generation_id):
                 source_generation_id = (
                     str(job_row.get("source_generation_id") or "").strip() or None
                 )
-                generation_id = _create_generation_row(
+                setup_generation_id = _create_generation_row(
                     setup_conn,
                     material_id=material_id,
                     concept_id=concept_id,
@@ -4925,27 +5111,42 @@ def _run_leased_generation_job(
                     generation_mode=mode,
                     retrieval_profile="unified",
                     source_generation_id=source_generation_id,
+                    generation_id=setup_generation_id,
                 )
-                attached_at = now_iso()
-                attached = execute_modify(
-                    setup_conn,
-                    "UPDATE reel_generation_jobs SET result_generation_id = ?, updated_at = ? "
-                    "WHERE id = ? AND status = 'running' AND lease_owner = ? "
-                    "AND cancel_requested = 0 AND lease_expires_at > ? "
-                    "AND (deadline_at IS NULL OR deadline_at > ?)",
-                    (
-                        generation_id,
-                        attached_at,
-                        job_id,
-                        lease_owner,
-                        attached_at,
-                        attached_at,
-                    ),
+            attached_at = now_iso()
+            attached = execute_modify(
+                setup_conn,
+                "UPDATE reel_generation_jobs SET result_generation_id = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'running' AND lease_owner = ? "
+                "AND cancel_requested = 0 AND lease_expires_at > ? "
+                "AND (deadline_at IS NULL OR deadline_at > ?) "
+                "AND (result_generation_id IS NULL OR TRIM(result_generation_id) = '' "
+                "OR result_generation_id = ?)",
+                (
+                    setup_generation_id,
+                    attached_at,
+                    job_id,
+                    lease_owner,
+                    attached_at,
+                    attached_at,
+                    setup_generation_id,
+                ),
+            )
+            if not attached:
+                raise JobLeaseLostError(
+                    f"generation job lease is no longer active: {job_id}"
                 )
-                if not attached:
-                    raise JobLeaseLostError(
-                        f"generation job lease is no longer active: {job_id}"
-                    )
+            return setup_generation_id
+
+        setup_generation_id = _run_generation_db_transaction(
+            "setup",
+            setup_generation,
+            retry_should_stop=db_retry_should_stop,
+            replay_after_unknown_commit=True,
+        )
+        if setup_generation_id is None:
+            return
+        generation_id = setup_generation_id
 
         with get_conn() as conn:
             source_generation_id = (
@@ -5152,20 +5353,25 @@ def _run_leased_generation_job(
                         ordering.assessment_checkpoint_reel_ids,
                         degraded=ordering.degraded,
                     )
-                    _persist_generation_lesson_order(
-                        conn,
-                        generation_id=generation_id,
-                        metadata={
-                            "version": 2,
-                            "prompt_version": LESSON_ORDER_PROMPT_VERSION,
-                            "ordered_reel_ids": ordering.ordered_reel_ids,
-                            "assessment_checkpoint_reel_ids": checkpoint_ids,
-                            "model_used": ordering.model_used,
-                            "created_at": now_iso(),
-                            "degraded": ordering.degraded,
-                            "fallback_reason": ordering.fallback_reason,
-                            "provider_called": ordering.provider_called,
-                        },
+                    lesson_order_metadata = {
+                        "version": 2,
+                        "prompt_version": LESSON_ORDER_PROMPT_VERSION,
+                        "ordered_reel_ids": ordering.ordered_reel_ids,
+                        "assessment_checkpoint_reel_ids": checkpoint_ids,
+                        "model_used": ordering.model_used,
+                        "created_at": now_iso(),
+                        "degraded": ordering.degraded,
+                        "fallback_reason": ordering.fallback_reason,
+                        "provider_called": ordering.provider_called,
+                    }
+                    _run_generation_db_transaction(
+                        "lesson_order_metadata",
+                        lambda lesson_conn: _persist_generation_lesson_order(
+                            lesson_conn,
+                            generation_id=generation_id,
+                            metadata=lesson_order_metadata,
+                        ),
+                        retry_should_stop=db_retry_should_stop,
                     )
                 else:
                     stored_metadata = (
@@ -5206,11 +5412,15 @@ def _run_leased_generation_job(
                 ]
                 if checkpoint_reel_ids:
                     try:
-                        recall_preparation = assessment_service.prepare_reel_questions(
-                            conn,
-                            reel_ids=checkpoint_reel_ids,
-                            should_cancel=should_cancel,
-                            use_model=False,
+                        recall_preparation = _run_generation_db_transaction(
+                            "recall_preparation",
+                            lambda recall_conn: assessment_service.prepare_reel_questions(
+                                recall_conn,
+                                reel_ids=checkpoint_reel_ids,
+                                should_cancel=should_cancel,
+                                use_model=False,
+                            ),
+                            retry_should_stop=db_retry_should_stop,
                         )
                     except AssessmentCancelledError as exc:
                         raise GenerationCancelledError(str(exc)) from exc
@@ -5236,10 +5446,14 @@ def _run_leased_generation_job(
                                 "recall_available": False,
                             }
                         )
-                        _persist_generation_lesson_order(
-                            conn,
-                            generation_id=generation_id,
-                            metadata=degraded_metadata,
+                        _run_generation_db_transaction(
+                            "lesson_order_recall_degradation",
+                            lambda lesson_conn: _persist_generation_lesson_order(
+                                lesson_conn,
+                                generation_id=generation_id,
+                                metadata=degraded_metadata,
+                            ),
+                            retry_should_stop=db_retry_should_stop,
                         )
                         ordering_degraded = True
                         logger.warning(
@@ -5290,14 +5504,14 @@ def _run_leased_generation_job(
                 if has_terminal_result
                 else "exhausted"
             )
-            with get_conn(transactional=True) as release_conn:
+            def release_generation(release_conn: Any) -> bool:
                 _lock_learner_adaptation(
                     release_conn,
                     material_id=material_id,
                     learner_id=learner_id,
                 )
                 if cancel_if_adaptation_stale(release_conn):
-                    return
+                    return False
                 if activate_generation:
                     _activate_generation(
                         release_conn,
@@ -5344,6 +5558,15 @@ def _run_leased_generation_job(
                         else None
                     ),
                 )
+                return True
+
+            released = _run_generation_db_transaction(
+                "final_release",
+                release_generation,
+                retry_should_stop=db_retry_should_stop,
+            )
+            if not released:
+                return
             if recall_preparation is not None:
                 logger.info(
                     "recall preparation job_id=%s requested=%d prepared=%d fallback=%d",
@@ -5362,9 +5585,10 @@ def _run_leased_generation_job(
                 logger.info("generation worker yielded lease job_id=%s", job_id)
     except ClipEngineProviderError as exc:
         logger.warning("generation provider failure job_id=%s error=%s", job_id, exc.as_dict())
-        with get_conn(transactional=True) as conn:
-            transition_generation_terminal(
-                conn,
+        _run_generation_db_transaction(
+            "provider_failure_terminalization",
+            lambda terminal_conn: transition_generation_terminal(
+                terminal_conn,
                 job_id=job_id,
                 status="failed",
                 result_generation_id=generation_id or None,
@@ -5373,14 +5597,17 @@ def _run_leased_generation_job(
                 error_code=exc.code,
                 error_message=str(exc),
                 error_detail={**exc.as_dict(), "counters": context.counters()},
-            )
+            ),
+            retry_should_stop=db_retry_should_stop,
+        )
     except JobLeaseLostError:
         logger.info("generation worker lost lease job_id=%s", job_id)
     except Exception as exc:
         logger.exception("generation job failed job_id=%s", job_id)
-        with get_conn(transactional=True) as conn:
-            transition_generation_terminal(
-                conn,
+        _run_generation_db_transaction(
+            "failure_terminalization",
+            lambda terminal_conn: transition_generation_terminal(
+                terminal_conn,
                 job_id=job_id,
                 status="failed",
                 result_generation_id=generation_id or None,
@@ -5389,7 +5616,9 @@ def _run_leased_generation_job(
                 error_code="generation_failed",
                 error_message=str(exc),
                 error_detail={"counters": context.counters()},
-            )
+            ),
+            retry_should_stop=db_retry_should_stop,
+        )
     finally:
         local_stop.set()
         heartbeat_thread.join(timeout=1.0)
@@ -5405,12 +5634,15 @@ def _generation_worker_loop(
         # leaves the Event set, so the following wait returns immediately.
         _generation_worker_wake.clear()
         try:
-            with get_conn(transactional=True) as conn:
-                job_row = lease_next_job(
-                    conn,
+            job_row = _run_generation_db_transaction(
+                "job_lease",
+                lambda lease_conn: lease_next_job(
+                    lease_conn,
                     lease_owner=worker_id,
                     lease_seconds=GENERATION_LEASE_SEC,
-                )
+                ),
+                retry_should_stop=stop_event.is_set,
+            )
             if job_row:
                 _run_leased_generation_job(job_row, stop_event)
                 continue
@@ -6532,15 +6764,21 @@ async def create_material(
         normalized_level = normalize_knowledge_level(knowledge_level)
     except ValueError:
         raise HTTPException(status_code=422, detail="knowledge_level must be beginner, intermediate, or advanced")
-    quota_account_id: str | None = None
-    with get_conn(transactional=True) as identity_conn:
+    def resolve_material_identity(identity_conn: Any) -> tuple[str, str]:
         provider_account = _require_verified_provider_account(identity_conn, request)
-        quota_account_id = str(provider_account["id"])
-        learner_id = _resolve_learner_identity(
+        account_id = str(provider_account["id"])
+        resolved_learner_id = _resolve_learner_identity(
             identity_conn,
             request,
             required=False,
-        ) or f"account:{quota_account_id}"
+        ) or f"account:{account_id}"
+        return account_id, resolved_learner_id
+
+    quota_account_id, learner_id = _run_generation_db_transaction(
+        "material_identity",
+        resolve_material_identity,
+        replay_after_unknown_commit=True,
+    )
     try:
         idempotency_key = normalize_idempotency_key(
             request.headers.get("Idempotency-Key")
@@ -6601,6 +6839,7 @@ async def create_material(
     reservation_owned = False
     reservation_attempt_token = ""
     reservation_reclaimed = False
+    fingerprint = ""
     if idempotency_key:
         fingerprint = build_idempotency_fingerprint(
             {
@@ -6617,9 +6856,11 @@ async def create_material(
                 ),
             }
         )
-        try:
-            with get_conn(transactional=True) as idempotency_conn:
-                reservation = reserve_idempotency_key(
+        owned_reservation: Any | None = None
+
+        def reserve_material_idempotency(idempotency_conn: Any) -> Any:
+            nonlocal owned_reservation
+            reservation = reserve_idempotency_key(
                     idempotency_conn,
                     scope="material",
                     learner_id=idempotency_learner,
@@ -6628,6 +6869,25 @@ async def create_material(
                     resource_id=material_id,
                     stale_after_seconds=30 * 60,
                 )
+            if reservation.owner:
+                owned_reservation = reservation
+            elif (
+                owned_reservation is not None
+                and reservation.status == "in_progress"
+                and reservation.resource_id == owned_reservation.resource_id
+            ):
+                # The first transaction committed but its acknowledgement was
+                # lost.  Continue with the attempt token created by that exact
+                # request instead of treating our own replay as a competitor.
+                return owned_reservation
+            return reservation
+
+        try:
+            reservation = _run_generation_db_transaction(
+                "material_idempotency_reserve",
+                reserve_material_idempotency,
+                replay_after_unknown_commit=True,
+            )
         except IdempotencyConflictError as exc:
             raise HTTPException(
                 status_code=409,
@@ -6655,25 +6915,31 @@ async def create_material(
     quota_operation_key = f"material:{material_id}"
     if quota_account_id:
         try:
-            with get_conn(transactional=True) as quota_conn:
-                _reserve_search_or_http(
+            _run_generation_db_transaction(
+                "material_quota_reserve",
+                lambda quota_conn: _reserve_search_or_http(
                     quota_conn,
                     account_id=quota_account_id,
                     operation_key=quota_operation_key,
                     surface="material",
                     material_id=material_id,
-                )
+                ),
+                replay_after_unknown_commit=True,
+            )
         except Exception:
             if idempotency_key and reservation_owned:
-                with get_conn(transactional=True) as idempotency_conn:
-                    release_idempotency_key(
+                _run_generation_db_transaction(
+                    "material_idempotency_release_after_quota_failure",
+                    lambda idempotency_conn: release_idempotency_key(
                         idempotency_conn,
                         scope="material",
                         learner_id=idempotency_learner,
                         raw_key=idempotency_key,
                         resource_id=material_id,
                         attempt_token=reservation_attempt_token,
-                    )
+                    ),
+                    replay_after_unknown_commit=True,
+                )
             raise
 
     try:
@@ -6709,13 +6975,49 @@ async def create_material(
                 embedding_service.embed_texts(provider_conn, chunks) if chunks else []
             )
 
+        chunk_records = [
+            {
+                "id": str(uuid.uuid4()),
+                "chunk_index": index,
+                "text": chunk,
+                "embedding_json": dumps_json(embedding.tolist()),
+            }
+            for index, (chunk, embedding) in enumerate(zip(chunks, chunk_embeddings))
+        ]
         if file_content is not None and not reservation_owned:
             source_path = storage.save_bytes(file_content, file_name)
         response_payload = {
             "material_id": material_id,
             "extracted_concepts": concepts,
         }
-        with get_conn(transactional=True) as persist_conn:
+        publication_body_completed = False
+
+        def persist_material(persist_conn: Any) -> dict[str, Any]:
+            nonlocal publication_body_completed, source_path
+            if publication_body_completed:
+                existing_material = fetch_one(
+                    persist_conn,
+                    "SELECT id FROM materials WHERE id = ?",
+                    (material_id,),
+                )
+                if existing_material and idempotency_key:
+                    replay = reserve_idempotency_key(
+                        persist_conn,
+                        scope="material",
+                        learner_id=idempotency_learner,
+                        raw_key=idempotency_key,
+                        fingerprint=fingerprint,
+                        resource_id=material_id,
+                    )
+                    if (
+                        replay.status == "completed"
+                        and replay.resource_id == material_id
+                        and replay.response == response_payload
+                    ):
+                        return response_payload
+                elif existing_material:
+                    return response_payload
+
             if idempotency_key and reservation_owned:
                 if not lock_idempotency_attempt(
                     persist_conn,
@@ -6726,10 +7028,12 @@ async def create_material(
                     attempt_token=reservation_attempt_token,
                 ):
                     raise RuntimeError("material idempotency reservation was lost")
-                if file_content is not None:
+                if file_content is not None and source_path is None:
                     # Hold the exact-key row lock through storage publication so
                     # an owner fenced out during provider work cannot orphan a
-                    # duplicate upload object.
+                    # duplicate upload object. Retain the published path across
+                    # a fresh-transaction retry so the same request does not
+                    # publish a second UUID-keyed object.
                     source_path = storage.save_bytes(file_content, file_name)
                 if reservation_reclaimed:
                     # Cleanup and replacement are protected by the same row lock
@@ -6774,16 +7078,16 @@ async def create_material(
                     },
                 )
 
-            for i, (chunk, emb) in enumerate(zip(chunks, chunk_embeddings)):
+            for chunk_record in chunk_records:
                 upsert(
                     persist_conn,
                     "material_chunks",
                     {
-                        "id": str(uuid.uuid4()),
+                        "id": chunk_record["id"],
                         "material_id": material_id,
-                        "chunk_index": i,
-                        "text": chunk,
-                        "embedding_json": dumps_json(emb.tolist()),
+                        "chunk_index": chunk_record["chunk_index"],
+                        "text": chunk_record["text"],
+                        "embedding_json": chunk_record["embedding_json"],
                         "created_at": created_at,
                     },
                 )
@@ -6813,46 +7117,66 @@ async def create_material(
                     response=response_payload,
                 ):
                     raise RuntimeError("material idempotency reservation was lost")
+            publication_body_completed = True
+            return response_payload
+
+        _run_generation_db_transaction(
+            "material_final_persistence",
+            persist_material,
+            replay_after_unknown_commit=True,
+        )
         return response_payload
     except asyncio.CancelledError:
         if quota_account_id:
-            with get_conn(transactional=True) as quota_conn:
-                settle_operation(
+            _run_generation_db_transaction(
+                "material_quota_cancel",
+                lambda quota_conn: settle_operation(
                     quota_conn,
                     account_id=quota_account_id,
                     operation_key=quota_operation_key,
                     usable_result=False,
-                )
+                ),
+                replay_after_unknown_commit=True,
+            )
         if idempotency_key and reservation_owned:
-            with get_conn(transactional=True) as idempotency_conn:
-                release_idempotency_key(
+            _run_generation_db_transaction(
+                "material_idempotency_cancel",
+                lambda idempotency_conn: release_idempotency_key(
                     idempotency_conn,
                     scope="material",
                     learner_id=idempotency_learner,
                     raw_key=idempotency_key,
                     resource_id=material_id,
                     attempt_token=reservation_attempt_token,
-                )
+                ),
+                replay_after_unknown_commit=True,
+            )
         raise
     except Exception:
         if quota_account_id:
-            with get_conn(transactional=True) as quota_conn:
-                settle_operation(
+            _run_generation_db_transaction(
+                "material_quota_failure",
+                lambda quota_conn: settle_operation(
                     quota_conn,
                     account_id=quota_account_id,
                     operation_key=quota_operation_key,
                     usable_result=False,
-                )
+                ),
+                replay_after_unknown_commit=True,
+            )
         if idempotency_key and reservation_owned:
-            with get_conn(transactional=True) as idempotency_conn:
-                release_idempotency_key(
+            _run_generation_db_transaction(
+                "material_idempotency_failure",
+                lambda idempotency_conn: release_idempotency_key(
                     idempotency_conn,
                     scope="material",
                     learner_id=idempotency_learner,
                     raw_key=idempotency_key,
                     resource_id=material_id,
                     attempt_token=reservation_attempt_token,
-                )
+                ),
+                replay_after_unknown_commit=True,
+            )
         raise
 
 
@@ -6914,7 +7238,11 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             int(payload.num_reels),
         ),
     )
-    with get_conn(transactional=True) as conn:
+    submission_job_id = str(uuid.uuid4())
+    generation_submit_rate_checked = False
+
+    def submit_generation(conn: Any) -> tuple[str, dict[str, Any]]:
+        nonlocal generation_submit_rate_checked
         material = fetch_one(
             conn,
             "SELECT id FROM materials WHERE id = ?",
@@ -6923,6 +7251,16 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
         if not material:
             raise HTTPException(status_code=404, detail="material_id not found")
         learner_id = _resolve_learner_identity(conn, request)
+        committed_submission = get_generation_job(conn, submission_job_id)
+        if committed_submission is not None:
+            if (
+                str(committed_submission.get("material_id") or "")
+                != payload.material_id
+                or str(committed_submission.get("learner_id") or "")
+                != learner_id
+            ):
+                raise RuntimeError("generation submission identity collision")
+            return "job", committed_submission
         _lock_learner_adaptation(
             conn,
             material_id=payload.material_id,
@@ -7019,7 +7357,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                     },
                 )
             if continuation_status == "exhausted":
-                return {
+                return "response", {
                     "reels": [],
                     "generation_id": None,
                     "response_profile": "unified",
@@ -7048,7 +7386,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 completed_job,
                 requested_override=requested_num_reels,
             )
-            return {
+            return "response", {
                 "reels": cached_reels,
                 "generation_id": str(completed_job.get("result_generation_id") or "") or None,
                 "response_profile": "unified",
@@ -7080,11 +7418,14 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
         quota_operation_key = f"material:{payload.material_id}"
 
         def before_generation_create() -> None:
-            _enforce_rate_limit(
-                request,
-                "generation-submit",
-                limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW,
-            )
+            nonlocal generation_submit_rate_checked
+            if not generation_submit_rate_checked:
+                _enforce_rate_limit(
+                    request,
+                    "generation-submit",
+                    limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW,
+                )
+                generation_submit_rate_checked = True
             account = _require_verified_provider_account(conn, request)
             account_id = str(account["id"])
             quota_account["id"] = account_id
@@ -7098,6 +7439,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             learner_id=learner_id,
             request_params=request_params,
             source_generation_id=source_generation_id,
+            job_id=submission_job_id,
             before_create=before_generation_create,
         )
         if created and quota_account.get("id"):
@@ -7108,6 +7450,16 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 generation_job_id=str(job_row["id"]),
                 material_id=payload.material_id,
             )
+        return "job", job_row
+
+    submission_kind, submission = _run_generation_db_transaction(
+        "api_generate_submit",
+        submit_generation,
+        replay_after_unknown_commit=True,
+    )
+    if submission_kind == "response":
+        return submission
+    job_row = submission
     _wake_generation_worker()
     job_id = str(job_row.get("id") or "")
     status = str(job_row.get("status") or "queued")
@@ -7288,6 +7640,44 @@ async def _run_disconnect_cancellable(
     except asyncio.CancelledError:
         cancel_event.set()
         raise
+
+
+def _run_adaptive_mutation_transaction(
+    work: Callable[[Any], Any],
+    *,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Any:
+    """Run one adaptive mutation with one fresh-transaction PostgreSQL retry."""
+    for attempt in range(2):
+        if should_cancel is not None and should_cancel():
+            raise AssessmentCancelledError("Assessment request cancelled.")
+        try:
+            with get_conn(transactional=True) as conn:
+                return work(conn)
+        except Exception as exc:
+            if (
+                isinstance(
+                    exc,
+                    (
+                        AssessmentCancelledError,
+                        DatabaseIntegrityError,
+                        HTTPException,
+                        ValueError,
+                    ),
+                )
+                or attempt > 0
+                or not is_transient_postgres_transaction_error(exc)
+            ):
+                raise
+            if should_cancel is not None and should_cancel():
+                raise AssessmentCancelledError(
+                    "Assessment request cancelled."
+                ) from exc
+            logger.warning(
+                "adaptive mutation transaction failed transiently; retrying once: %s",
+                str(exc).splitlines()[0][:180],
+            )
+    raise RuntimeError("adaptive mutation retry loop exhausted")
 
 
 def _canonical_youtube_source_or_422(
@@ -7940,12 +8330,25 @@ def feed(
     safe_relevance = _normalize_min_relevance(min_relevance)
     excluded_videos = _parse_excluded_video_ids_param(exclude_video_ids)
     excluded_reels = _parse_excluded_reel_ids_param(exclude_reel_ids)
-    job_submitted = False
-    with get_conn(transactional=True) as conn:
+    feed_submission_job_id = str(uuid.uuid4())
+    feed_submit_rate_checked = False
+    committed_feed_result: tuple[dict[str, Any], bool] | None = None
+
+    def load_feed(conn: Any) -> tuple[dict[str, Any], bool]:
+        nonlocal committed_feed_result, feed_submit_rate_checked
+        job_submitted = False
         material = fetch_one(conn, "SELECT id FROM materials WHERE id = ?", (material_id,))
         if not material:
             raise HTTPException(status_code=404, detail="material_id not found")
         learner_id = _resolve_learner_identity(conn, request)
+        if committed_feed_result is not None and committed_feed_result[1]:
+            committed_job = get_generation_job(conn, feed_submission_job_id)
+            if (
+                committed_job is not None
+                and str(committed_job.get("material_id") or "") == material_id
+                and str(committed_job.get("learner_id") or "") == learner_id
+            ):
+                return committed_feed_result
         _lock_learner_adaptation(
             conn,
             material_id=material_id,
@@ -8118,11 +8521,14 @@ def feed(
                 quota_operation_key = f"material:{material_id}"
 
                 def before_feed_generation_create() -> None:
-                    _enforce_rate_limit(
-                        request,
-                        "generation-submit",
-                        limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW,
-                    )
+                    nonlocal feed_submit_rate_checked
+                    if not feed_submit_rate_checked:
+                        _enforce_rate_limit(
+                            request,
+                            "generation-submit",
+                            limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW,
+                        )
+                        feed_submit_rate_checked = True
                     account = _require_verified_provider_account(conn, request)
                     account_id = str(account["id"])
                     quota_account["id"] = account_id
@@ -8140,6 +8546,7 @@ def feed(
                         "fresh_source_budget": fresh_cross_request_budget,
                     },
                     source_generation_id=generation_id,
+                    job_id=feed_submission_job_id,
                     before_create=before_feed_generation_create,
                 )
                 if created and quota_account.get("id"):
@@ -8181,6 +8588,14 @@ def feed(
             "knowledge_level": knowledge_level,
             "effective_level_target": effective_level,
         }
+        committed_feed_result = (response, job_submitted)
+        return committed_feed_result
+
+    response, job_submitted = _run_generation_db_transaction(
+        "api_feed_rank_and_submit",
+        load_feed,
+        replay_after_unknown_commit=True,
+    )
     if job_submitted:
         _wake_generation_worker()
     return response
@@ -8227,7 +8642,8 @@ def feedback(request: Request, payload: FeedbackRequest):
     clean_reel_id = str(payload.reel_id or "").strip()
     if not clean_reel_id or len(clean_reel_id) > 128:
         raise HTTPException(status_code=400, detail="Invalid reel_id.")
-    with get_conn(transactional=True) as conn:
+
+    def write_feedback(conn: Any) -> None:
         learner_id = _resolve_learner_identity(conn, request)
         # Existence check + write under a single transaction so a concurrent
         # delete of the reel can't race us into writing an orphan feedback row.
@@ -8264,6 +8680,7 @@ def feedback(request: Request, payload: FeedbackRequest):
             ),
         )
 
+    _run_adaptive_mutation_transaction(write_feedback)
     return {"status": "ok", "reel_id": clean_reel_id}
 
 
@@ -8276,11 +8693,9 @@ async def record_reel_progress(request: Request, reel_id: str, payload: ReelProg
     if not clean_reel_id or len(clean_reel_id) > 160:
         raise HTTPException(status_code=400, detail="Invalid reel_id.")
     try:
-        with get_conn() as conn:
-            learner_id = _resolve_learner_identity(conn, request)
         def work(should_cancel: Callable[[], bool]):
-            # Keep the monotonic watch-analytics write on a short connection.
-            with get_conn() as conn:
+            def write_progress(conn: Any):
+                learner_id = _resolve_learner_identity(conn, request)
                 return assessment_service.record_progress(
                     conn,
                     learner_id=learner_id,
@@ -8288,6 +8703,12 @@ async def record_reel_progress(request: Request, reel_id: str, payload: ReelProg
                     max_fraction=payload.max_fraction,
                     should_cancel=should_cancel,
                 )
+
+            return _run_adaptive_mutation_transaction(
+                write_progress,
+                should_cancel=should_cancel,
+            )
+
         return await _run_disconnect_cancellable(request, work)
     except AssessmentCancelledError as exc:
         raise HTTPException(status_code=499, detail=str(exc)) from exc
@@ -8304,17 +8725,20 @@ async def record_reel_scroll(request: Request, reel_id: str):
     if not clean_reel_id or len(clean_reel_id) > 160:
         raise HTTPException(status_code=400, detail="Invalid reel_id.")
     try:
-        with get_conn() as conn:
-            learner_id = _resolve_learner_identity(conn, request)
-
         def work(should_cancel: Callable[[], bool]):
-            with get_conn() as conn:
+            def write_scroll(conn: Any):
+                learner_id = _resolve_learner_identity(conn, request)
                 return assessment_service.record_scroll(
                     conn,
                     learner_id=learner_id,
                     reel_id=clean_reel_id,
                     should_cancel=should_cancel,
                 )
+
+            return _run_adaptive_mutation_transaction(
+                write_scroll,
+                should_cancel=should_cancel,
+            )
 
         return await _run_disconnect_cancellable(request, work)
     except AssessmentCancelledError as exc:
@@ -8346,18 +8770,27 @@ async def next_assessment(request: Request, payload: AssessmentNextRequest):
         request, "assessment-next", limit=ASSESSMENT_ACTION_RATE_LIMIT_PER_WINDOW
     )
     try:
-        with get_conn() as conn:
-            if not fetch_one(conn, "SELECT id FROM materials WHERE id = ?", (payload.material_id,)):
-                raise HTTPException(status_code=404, detail="material_id not found")
-            learner_id = _resolve_learner_identity(conn, request)
         def work(should_cancel: Callable[[], bool]):
-            with get_conn() as conn:
+            def write_session(conn: Any):
+                if not fetch_one(
+                    conn,
+                    "SELECT id FROM materials WHERE id = ?",
+                    (payload.material_id,),
+                ):
+                    raise HTTPException(status_code=404, detail="material_id not found")
+                learner_id = _resolve_learner_identity(conn, request)
                 return assessment_service.next_session(
                     conn,
                     learner_id=learner_id,
                     material_id=payload.material_id,
                     should_cancel=should_cancel,
                 )
+
+            return _run_adaptive_mutation_transaction(
+                write_session,
+                should_cancel=should_cancel,
+            )
+
         return await _run_disconnect_cancellable(request, work)
     except AssessmentCancelledError as exc:
         raise HTTPException(status_code=499, detail=str(exc)) from exc
@@ -8374,7 +8807,7 @@ def answer_assessment(
         request, "assessment-answer", limit=ASSESSMENT_ACTION_RATE_LIMIT_PER_WINDOW
     )
     try:
-        with get_conn(transactional=True) as conn:
+        def write_answer(conn: Any) -> dict[str, Any]:
             learner_id = _resolve_learner_identity(conn, request)
             clean_session_id = str(session_id or "").strip()
             session_scope = fetch_one(
@@ -8413,6 +8846,8 @@ def answer_assessment(
                     ),
                 )
             return result
+
+        return _run_adaptive_mutation_transaction(write_answer)
     except ValueError as exc:
         detail = str(exc)
         status = 409 if "not pending" in detail or "answered in order" in detail else 404

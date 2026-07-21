@@ -245,13 +245,7 @@ def _valid_clips(
         if gemini_authoritative and (
             not concept_family
             or len(concept_family) > 96
-            or not isinstance(concept_aliases, list)
-            or len(concept_aliases) > 4
-            or any(
-                not " ".join(str(alias or "").split()).strip()
-                or len(" ".join(str(alias or "").split()).strip()) > 96
-                for alias in (concept_aliases or [])
-            )
+            or concept_aliases != []
         ):
             return None
         score_values = (

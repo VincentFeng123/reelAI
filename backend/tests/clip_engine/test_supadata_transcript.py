@@ -1,5 +1,7 @@
 import asyncio
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import pytest
@@ -8,6 +10,7 @@ from backend.app.clip_engine.clipper import supadata_client
 from backend.app.clip_engine.clipper.pipeline.transcribe import transcribe_supadata
 from backend.app.clip_engine.errors import (
     CancellationError,
+    ProviderError,
     ProviderRequestError,
     ProviderTransientError,
     TranscriptUnavailableError,
@@ -33,6 +36,11 @@ class _Response:
 
     def json(self):
         return self._payload
+
+
+class _InvalidJSONResponse(_Response):
+    def json(self):
+        raise ValueError("invalid json")
 
 
 def _install_client(monkeypatch, responder):
@@ -211,23 +219,148 @@ def test_transcription_adapter_rejects_wrong_returned_language(monkeypatch) -> N
 
 
 def test_unavailable_timestamped_transcript_is_typed_per_video(monkeypatch) -> None:
-    _install_client(monkeypatch, lambda *args: _Response(404, {"message": "not found"}))
+    calls = 0
+
+    def unavailable(*_args):
+        nonlocal calls
+        calls += 1
+        return _Response(404, {"message": "not found"})
+
+    _install_client(monkeypatch, unavailable)
     with pytest.raises(TranscriptUnavailableError):
         supadata_client.fetch_transcript_artifact(
             VIDEO_URL, cache_store=MemoryProviderCache()
         )
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "first_response",
+    [
+        _Response(408, {"message": "timed out"}),
+        _InvalidJSONResponse(200, "not-json"),
+        _Response(200, ["not", "an", "object"]),
+        _Response(200, {}),
+        _Response(200, {"content": {"offset": 0}}),
+        _Response(200, {"content": ["not-a-cue"]}),
+        _Response(200, {
+            "content": [{"offset": "later", "duration": 2_000, "text": "bad"}],
+        }),
+    ],
+    ids=[
+        "http-408",
+        "invalid-json",
+        "non-object-json",
+        "missing-content",
+        "non-list-content",
+        "non-object-cue",
+        "invalid-cue-time",
+    ],
+)
+def test_recoverable_transcript_response_retries_inside_logical_request(
+    monkeypatch,
+    first_response,
+) -> None:
+    responses = iter(
+        [
+            first_response,
+            _Response(
+                200,
+                {
+                    "lang": "en",
+                    "content": [
+                        {
+                            "id": "recovered-cue",
+                            "offset": 0,
+                            "duration": 2_000,
+                            "text": "A complete recovered explanation.",
+                        }
+                    ],
+                },
+            ),
+        ]
+    )
+    calls = 0
+
+    def recover_on_second_attempt(*_args):
+        nonlocal calls
+        calls += 1
+        return next(responses)
+
+    _install_client(monkeypatch, recover_on_second_attempt)
+    context = GenerationContext("slow", cache_store=MemoryProviderCache())
+
+    artifact = supadata_client.fetch_transcript_artifact(
+        VIDEO_URL,
+        context=context,
+    )
+
+    assert artifact.segments[0]["text"] == "A complete recovered explanation."
+    assert calls == 2
+    assert context.budget.snapshot()["used"]["transcript"] == 1
+    assert len(context.usage()) == 2
+    assert context.usage()[0]["error_code"] == "provider_transient"
+
+
+@pytest.mark.parametrize("status", [400, 401, 402, 403, 404])
+def test_permanent_transcript_response_is_not_retried(monkeypatch, status) -> None:
+    calls = 0
+
+    def permanent_failure(*_args):
+        nonlocal calls
+        calls += 1
+        return _Response(status, {"message": "permanent"})
+
+    _install_client(monkeypatch, permanent_failure)
+    with pytest.raises(ProviderError):
+        supadata_client.fetch_transcript_artifact(
+            VIDEO_URL,
+            cache_store=MemoryProviderCache(),
+        )
+    assert calls == 1
 
 
 def test_successful_transcription_with_no_speech_is_unavailable(monkeypatch) -> None:
-    _install_client(monkeypatch, lambda *args: _Response(200, {
-        "lang": "en",
-        "content": [],
-    }))
+    calls = 0
+
+    def no_speech(*_args):
+        nonlocal calls
+        calls += 1
+        return _Response(200, {"lang": "en", "content": []})
+
+    _install_client(monkeypatch, no_speech)
 
     with pytest.raises(TranscriptUnavailableError, match="no usable"):
         supadata_client.fetch_transcript_artifact(
             VIDEO_URL, cache_store=MemoryProviderCache()
         )
+    assert calls == 1
+
+
+def test_blank_transcript_cue_retries_and_recovers(monkeypatch) -> None:
+    calls = 0
+
+    def blank_then_valid(*_args):
+        nonlocal calls
+        calls += 1
+        text = "   " if calls == 1 else "Recovered spoken explanation."
+        return _Response(200, {
+            "lang": "en",
+            "content": [{
+                "offset": 0,
+                "duration": 2_000,
+                "text": text,
+            }],
+        })
+
+    _install_client(monkeypatch, blank_then_valid)
+    artifact = supadata_client.fetch_transcript_artifact(
+        VIDEO_URL,
+        cache_store=MemoryProviderCache(),
+    )
+
+    assert calls == 2
+    assert artifact.segments[0]["text"] == "Recovered spoken explanation."
 
 
 def test_existing_native_artifact_is_preferred_before_auto_provider_call(monkeypatch) -> None:
@@ -299,6 +432,46 @@ def test_async_generated_transcript_job_is_polled_and_cached(monkeypatch) -> Non
         native_mode=False,
         schema_version=TRANSCRIPT_SCHEMA_VERSION,
     ) == artifact
+
+
+def test_malformed_completed_poll_retries_poll_without_resubmitting_job(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    def responder(url, _params, _headers):
+        calls.append(url)
+        if url.endswith("/transcript"):
+            return _Response(202, {"jobId": "job-1"})
+        if calls.count(url) == 1:
+            return _Response(200, {
+                "status": "completed",
+                "result": {"lang": "en", "content": {"bad": "shape"}},
+            })
+        return _Response(200, {
+            "status": "completed",
+            "result": {
+                "lang": "en",
+                "content": [{
+                    "offset": 500,
+                    "duration": 1_500,
+                    "text": "recovered poll cue",
+                }],
+            },
+        })
+
+    _install_client(monkeypatch, responder)
+    artifact = supadata_client.fetch_transcript_artifact(
+        VIDEO_URL,
+        cache_store=MemoryProviderCache(),
+        deadline_monotonic=time.monotonic() + 5,
+    )
+
+    initial_calls = [url for url in calls if url.endswith("/transcript")]
+    poll_calls = [url for url in calls if url.endswith("/transcript/job-1")]
+    assert len(initial_calls) == 1
+    assert len(poll_calls) == 2
+    assert artifact.segments[0]["text"] == "recovered poll cue"
 
 
 def test_expired_generation_deadline_stops_before_provider_call(monkeypatch) -> None:
@@ -391,8 +564,66 @@ def test_slow_network_retry_ceiling_is_two_retries(monkeypatch) -> None:
     with pytest.raises(ProviderTransientError):
         supadata_client.fetch_transcript_artifact(VIDEO_URL, context=context)
     assert calls == 3
-    assert context.budget.snapshot()["used"]["transcript"] == 3
+    assert context.budget.snapshot()["used"]["transcript"] == 1
     assert len(context.usage()) == 3
+
+
+def test_three_slow_transcripts_share_budget_and_each_retry_transient_once(
+    monkeypatch,
+) -> None:
+    video_ids = ["dQw4w9WgXcQ", "9bZkp7q19f0", "J---aiyznGQ"]
+    attempts: dict[str, int] = {}
+    attempts_lock = threading.Lock()
+    first_attempts = threading.Barrier(3)
+
+    def responder(_url, params, _headers):
+        video_id = str(params["url"]).rsplit("=", 1)[-1]
+        with attempts_lock:
+            attempts[video_id] = attempts.get(video_id, 0) + 1
+            attempt = attempts[video_id]
+        if attempt == 1:
+            first_attempts.wait(timeout=5)
+            return _Response(503, {"message": "try again"})
+        return _Response(
+            200,
+            {
+                "lang": "en",
+                "content": [
+                    {
+                        "id": f"{video_id}-cue",
+                        "offset": 0,
+                        "duration": 2_000,
+                        "text": f"A complete explanation from {video_id}.",
+                    }
+                ],
+            },
+        )
+
+    _install_client(monkeypatch, responder)
+    context = GenerationContext("slow", cache_store=MemoryProviderCache())
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        artifacts = list(
+            executor.map(
+                lambda video_id: supadata_client.fetch_transcript_artifact(
+                    f"https://www.youtube.com/watch?v={video_id}",
+                    context=context,
+                ),
+                video_ids,
+            )
+        )
+
+    assert [artifact.video_id for artifact in artifacts] == video_ids
+    assert attempts == {video_id: 2 for video_id in video_ids}
+    assert context.budget.snapshot()["used"]["transcript"] == 3
+    assert len(context.usage()) == 6
+    assert sorted(row["status_code"] for row in context.usage()) == [
+        200,
+        200,
+        200,
+        503,
+        503,
+        503,
+    ]
 
 
 def test_tombstone_blocks_transcript_before_provider_call(monkeypatch) -> None:

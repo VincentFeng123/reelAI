@@ -42,7 +42,19 @@ from concurrent.futures import (
 from pathlib import Path
 from typing import Any, Callable
 
-from ..db import DatabaseIntegrityError, dumps_json, fetch_one, get_conn, now_iso, upsert
+from ...concept_families import (
+    concept_family_identity_key as shared_concept_family_identity_key,
+    validate_concept_family_contract,
+)
+from ..db import (
+    DatabaseIntegrityError,
+    dumps_json,
+    fetch_one,
+    get_conn,
+    is_transient_postgres_transaction_error,
+    now_iso,
+    upsert,
+)
 from . import TERMS_NOTICE
 from .errors import (
     BlockedVideoError,
@@ -128,6 +140,7 @@ INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC = float(
 )
 PARTIAL_CUE_MATERIALITY_SEC = 0.05
 SPEECH_OWNERSHIP_EPSILON_SEC = 0.001
+CLIP_PERSISTENCE_MAX_ATTEMPTS = 2
 MAX_PLAUSIBLE_CAPTION_WORDS_PER_SEC = 8.0
 CAPTION_PROJECTION_START_PREROLL_SEC = 0.15
 PROJECTED_END_COVERAGE_SEC = 0.002
@@ -136,18 +149,7 @@ GROQ_BOUNDARY_END_POSTROLL_SEC = 0.02
 GROQ_BOUNDARY_NEIGHBOR_GUARD_SEC = 0.01
 GROQ_BOUNDARY_WINDOW_SEC = 12.0
 GROQ_BOUNDARY_WINDOW_MARGIN_SEC = 2.0
-CONCEPT_FAMILY_CONTRACT_VERSION = "concept_family_v1"
-_CONCEPT_FAMILY_ORDINALS = (
-    frozenset({"first", "1st"}),
-    frozenset({"second", "2nd"}),
-    frozenset({"third", "3rd"}),
-    frozenset({"fourth", "4th"}),
-)
-_CONCEPT_FAMILY_NON_DOMAIN_TOKENS = frozenset({
-    "a", "an", "and", "concept", "equation", "formula", "identity", "law",
-    "method", "model", "of", "principle", "process", "relationship", "rule",
-    "system", "the", "theorem", "theory", "topic",
-})
+CONCEPT_FAMILY_CONTRACT_VERSION = "concept_family_v2"
 # Live boundary windows regularly need 9-12 seconds including local WAV decode
 # and the provider round trip. Keep the request bounded while leaving enough
 # headroom for a healthy short-window transcription to finish.
@@ -523,19 +525,7 @@ def _gemini_selection_is_authoritative(clip: dict[str, Any]) -> bool:
 
 def _concept_family_identity_key(value: object) -> str:
     """Return a domain-qualified family key, rejecting ambiguous bare ordinals."""
-    _title, key = normalize_clip_concept_family(value)
-    tokens = set(key.split())
-    ordinal_tokens = set().union(*_CONCEPT_FAMILY_ORDINALS)
-    if not tokens or len({
-        index
-        for index, values in enumerate(_CONCEPT_FAMILY_ORDINALS)
-        if tokens & values
-    }) > 1:
-        return ""
-    domain_tokens = (
-        tokens - ordinal_tokens - _CONCEPT_FAMILY_NON_DOMAIN_TOKENS
-    )
-    return key if domain_tokens else ""
+    return shared_concept_family_identity_key(value)
 
 
 def _concept_family_search_context(clip: dict[str, Any]) -> dict[str, Any]:
@@ -543,9 +533,7 @@ def _concept_family_search_context(clip: dict[str, Any]) -> dict[str, Any]:
     if not _gemini_selection_is_authoritative(clip):
         return {}
     family = " ".join(
-        unicodedata.normalize(
-            "NFKC", str(clip.get("concept_family") or "")
-        ).split()
+        unicodedata.normalize("NFC", str(clip.get("concept_family") or "")).split()
     ).strip()[:96]
     raw_aliases = clip.get("concept_aliases")
     if (
@@ -556,25 +544,19 @@ def _concept_family_search_context(clip: dict[str, Any]) -> dict[str, Any]:
     ):
         return {}
     aliases: list[str] = []
-    seen = {family.casefold()}
-    for value in raw_aliases:
-        alias = " ".join(
-            unicodedata.normalize("NFKC", str(value or "")).split()
-        ).strip()[:96]
-        key = alias.casefold()
-        if not alias or not _concept_family_identity_key(alias) or key in seen:
-            continue
-        seen.add(key)
-        aliases.append(alias)
-    ordinal_indexes = {
-        index
-        for index, values in enumerate(_CONCEPT_FAMILY_ORDINALS)
-        if any(
-            set(_concept_family_identity_key(value).split()) & values
-            for value in (family, *aliases)
-        )
-    }
-    if len(ordinal_indexes) > 1:
+    title = clip.get("title") or clip.get("concept_title")
+    facet = clip.get("facet")
+    if validate_concept_family_contract(
+        family,
+        aliases,
+        title=title,
+        facet=facet,
+        objective=clip.get("learning_objective"),
+        evidence=(
+            clip.get("claim_quote")
+            or clip.get("topic_evidence_quote")
+        ),
+    ) is not None:
         return {}
     return {
         "concept_family_contract_version": CONCEPT_FAMILY_CONTRACT_VERSION,
@@ -6742,6 +6724,67 @@ class IngestionPipeline:
         on_persistence_result: Callable[[bool], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> ReelOutWithAttribution:
+        """Persist one clip, retrying only a failed PostgreSQL transaction once."""
+        for attempt in range(1, CLIP_PERSISTENCE_MAX_ATTEMPTS + 1):
+            raise_if_cancelled(should_cancel)
+            transaction_state = {"committed": False}
+            try:
+                return self._persist_ingest_once(
+                    adapter_result=adapter_result,
+                    metadata=metadata,
+                    cues=cues,
+                    chosen=chosen,
+                    snippet=snippet,
+                    material_id=material_id,
+                    concept_id=concept_id,
+                    clip_window=clip_window,
+                    target_max=target_max,
+                    generation_id=generation_id,
+                    clip_title=clip_title,
+                    clip_difficulty=clip_difficulty,
+                    clip_details=clip_details,
+                    on_persistence_result=on_persistence_result,
+                    should_cancel=should_cancel,
+                    _transaction_state=transaction_state,
+                )
+            except Exception as exc:
+                if (
+                    transaction_state["committed"]
+                    or attempt >= CLIP_PERSISTENCE_MAX_ATTEMPTS
+                    or not is_transient_postgres_transaction_error(exc)
+                ):
+                    raise
+                raise_if_cancelled(should_cancel)
+                logger.warning(
+                    "retrying whole clip persistence transaction after transient "
+                    "PostgreSQL failure source_id=%s attempt=%d/%d error=%s",
+                    str(adapter_result.source_id or ""),
+                    attempt,
+                    CLIP_PERSISTENCE_MAX_ATTEMPTS,
+                    (str(exc).splitlines() or [exc.__class__.__name__])[0][:180],
+                )
+        raise AssertionError("unreachable")
+
+    def _persist_ingest_once(
+        self,
+        *,
+        adapter_result: YouTubeSourceRef,
+        metadata: IngestMetadata,
+        cues: list[IngestTranscriptCue],
+        chosen: IngestSegment,
+        snippet: str,
+        material_id: str | None,
+        concept_id: str | None,
+        clip_window: tuple[float, float],
+        target_max: int,
+        generation_id: str | None = None,
+        clip_title: str = "",
+        clip_difficulty: float | None = None,
+        clip_details: dict[str, Any] | None = None,
+        on_persistence_result: Callable[[bool], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        _transaction_state: dict[str, bool] | None = None,
+    ) -> ReelOutWithAttribution:
         raise_if_cancelled(should_cancel)
         clip_start = round(float(clip_window[0]), 3)
         clip_end = round(float(clip_window[1]), 3)
@@ -7111,6 +7154,8 @@ class IngestionPipeline:
             store_ingest_metadata_blob(conn, reel_id=reel_id, metadata=metadata)
             raise_if_cancelled(should_cancel)
 
+        if _transaction_state is not None:
+            _transaction_state["committed"] = True
         clip_duration = max(0.0, clip_end - clip_start)
 
         # Window the whole-video cues to this clip's [start, end] and rebase to
