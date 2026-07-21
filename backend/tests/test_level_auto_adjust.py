@@ -1,4 +1,5 @@
 """Learner-scoped global difficulty adjustment semantics."""
+import json
 import os
 import sys
 import tempfile
@@ -115,6 +116,132 @@ class LevelAutoAdjustTests(unittest.TestCase):
         ]
         self._feedback([("c1", True, False), *latest])
         self.assertAlmostEqual(self._adj(), -0.12)
+
+    def test_paged_scan_reaches_compatible_signals_behind_stale_history(self) -> None:
+        from unittest.mock import patch
+
+        from backend.app.services import reels as reels_module
+
+        stale_context = json.dumps({
+            "selection_authority": "gemini",
+            "concept_family_contract_version": "concept_family_v2",
+        })
+        with self.db.get_conn(transactional=True) as conn:
+            for index in range(30):
+                reel_id = f"stale-{index}"
+                timestamp = f"2026-07-10T00:{index:02d}:00+00:00"
+                conn.execute(
+                    "INSERT INTO reels (id, material_id, concept_id, video_id, "
+                    "video_url, t_start, t_end, transcript_snippet, takeaways_json, "
+                    "base_score, search_context_json, created_at) VALUES (?, 'm1', "
+                    "'c1', 'yt:v1', 'u', ?, ?, 's', '[]', 1.0, ?, ?)",
+                    (reel_id, index * 30, index * 30 + 20, stale_context, timestamp),
+                )
+                conn.execute(
+                    "INSERT INTO reel_feedback (id, learner_id, reel_id, helpful, "
+                    "confusing, rating, saved, mastery_updated_at, updated_at, created_at) "
+                    "VALUES (?, ?, ?, 0, 1, NULL, 0, ?, ?, ?)",
+                    (
+                        str(uuid.uuid4()),
+                        self.LEARNER,
+                        reel_id,
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            for index, concept_id in enumerate(("c1", "c2", "c1"), start=1):
+                reel_id = f"compatible-{index}"
+                video_id = "yt:v1" if concept_id == "c1" else "yt:v2"
+                timestamp = f"2026-07-09T00:0{index}:00+00:00"
+                conn.execute(
+                    "INSERT INTO reels (id, material_id, concept_id, video_id, "
+                    "video_url, t_start, t_end, transcript_snippet, takeaways_json, "
+                    "base_score, created_at) VALUES (?, 'm1', ?, ?, 'u', ?, ?, "
+                    "'s', '[]', 1.0, ?)",
+                    (reel_id, concept_id, video_id, 1000 + index * 30,
+                     1020 + index * 30, timestamp),
+                )
+                conn.execute(
+                    "INSERT INTO reel_feedback (id, learner_id, reel_id, helpful, "
+                    "confusing, rating, saved, mastery_updated_at, updated_at, created_at) "
+                    "VALUES (?, ?, ?, 1, 0, NULL, 0, ?, ?, ?)",
+                    (
+                        str(uuid.uuid4()),
+                        self.LEARNER,
+                        reel_id,
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+
+            original_fetch_all = reels_module.fetch_all
+            page_limits: list[int] = []
+
+            def tracking_fetch_all(conn_arg, query, params=()):
+                if "LIMIT ? OFFSET ?" in query:
+                    page_limits.append(int(tuple(params)[-2]))
+                return original_fetch_all(conn_arg, query, params)
+
+            with patch.object(reels_module, "fetch_all", tracking_fetch_all):
+                adjustment = self.svc.update_level_adjustment(
+                    conn,
+                    "m1",
+                    self.LEARNER,
+                )
+
+        self.assertAlmostEqual(adjustment, 0.12)
+        self.assertGreaterEqual(len(page_limits), 2)
+        self.assertEqual(set(page_limits), {self.svc.GLOBAL_SIGNAL_SCAN_PAGE_SIZE})
+
+    def test_paged_scan_caps_an_all_stale_history(self) -> None:
+        from unittest.mock import patch
+
+        from backend.app.services import reels as reels_module
+
+        original_fetch_all = reels_module.fetch_all
+        feedback_page_calls = 0
+        stale_context = json.dumps({
+            "selection_authority": "gemini",
+            "concept_family_contract_version": "concept_family_v2",
+        })
+
+        def stale_history_fetch_all(conn_arg, query, params=()):
+            nonlocal feedback_page_calls
+            if "FROM reel_feedback f" in query and "LIMIT ? OFFSET ?" in query:
+                feedback_page_calls += 1
+                page_size = int(tuple(params)[-2])
+                return [
+                    {
+                        "helpful": 0,
+                        "confusing": 1,
+                        "concept_id": "c1",
+                        "event_at": "2099-01-01T00:00:00+00:00",
+                        "search_context_json": stale_context,
+                    }
+                    for _ in range(page_size)
+                ]
+            return original_fetch_all(conn_arg, query, params)
+
+        with self.db.get_conn(transactional=True) as conn:
+            with patch.object(
+                reels_module,
+                "fetch_all",
+                stale_history_fetch_all,
+            ):
+                adjustment = self.svc.update_level_adjustment(
+                    conn,
+                    "m1",
+                    self.LEARNER,
+                )
+
+        self.assertEqual(adjustment, 0.0)
+        self.assertEqual(
+            feedback_page_calls,
+            self.svc.GLOBAL_SIGNAL_SCAN_MAX_ROWS
+            // self.svc.GLOBAL_SIGNAL_SCAN_PAGE_SIZE,
+        )
 
     def test_clamps_global_drift_to_positive_point_two(self) -> None:
         self._feedback(

@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-LESSON_ORDER_PROMPT_VERSION = "lesson_order_v7"
+LESSON_ORDER_PROMPT_VERSION = "lesson_order_v8"
 LESSON_ORDER_TIMEOUT_S = 10.0
 # A legal 128-UUID order plus 128 checkpoints is 10,041 ASCII bytes and measured
 # 8,593-8,761 Gemini tokens across 100 deterministic UUID samples. Actual
@@ -99,6 +99,10 @@ Use each clip's narrow concept and learner_signal when deciding inclusion:
   near-duplicate repetition.
 - A zero signal is neutral. Never omit an essential prerequisite solely due to mastery.
 
+Omit semantic restatements even when they come from different sources or use different
+titles. Keep multiple clips about one concept only when each contributes a genuinely new
+explanation, reasoning step, application, misconception, or worked-example step.
+
 Use previously released coverage in LEARNING_REQUEST_JSON.prior_concept_coverage as
 curriculum history, not as a mastery score.
 Prefer advancing to the next requested concept before adding another neutral repeat of a
@@ -113,6 +117,9 @@ Build a teaching progression when the available clips support it:
 4. Put a concrete or worked example after the concept it demonstrates.
 5. Then place nuance, comparison, common mistakes, edge cases, or deeper detail.
 6. End with synthesis, application, or recap when such a clip exists.
+
+For one concept, prefer concept, then explanation, then application or worked example;
+never put an application before the explanation it needs.
 
 Choose the best coherent progression from the clips actually supplied. Do not invent a
 missing introduction, concept, example, or recap. Prefer prerequisite-before-dependent
@@ -310,7 +317,12 @@ def _clip_payload(
         "starts_at_seconds": _finite_number(reel.get("t_start")),
         "ends_at_seconds": _finite_number(reel.get("t_end")),
         "concept_id": concept_id,
-        "concept_title": _clean_text(reel.get("concept_title"), 240),
+        "concept_title": _clean_text(
+            reel.get("_selection_concept")
+            or reel.get("adaptive_concept_title")
+            or reel.get("concept_title"),
+            240,
+        ),
         "concept_family": _clean_text(
             reel.get("concept_family")
             or reel.get("_selection_concept_family"),
@@ -663,6 +675,7 @@ def _lesson_order_cache_key(system_prompt: str, user_prompt: str) -> str:
         "cache_version": LESSON_ORDER_CACHE_VERSION,
         "prompt_version": LESSON_ORDER_PROMPT_VERSION,
         "model": config.LESSON_ORDER_MODEL,
+        "fallback_model": config.LESSON_ORDER_FALLBACK_MODEL,
         "system_prompt": system_prompt,
         "user_prompt": user_prompt,
         "response_schema": _LessonOrderResponse.model_json_schema(),
@@ -759,6 +772,7 @@ async def _generate_lesson_order_async(
     system_prompt: str,
     user_prompt: str,
     *,
+    model: str,
     should_cancel: Callable[[], bool] | None,
     dispatch_state: _DispatchState,
 ) -> gemini_client.GenerationResult:
@@ -785,7 +799,7 @@ async def _generate_lesson_order_async(
             raise_if_cancelled(should_cancel)
             dispatch_state.dispatched = True
             response = await client.aio.models.generate_content(
-                model=config.LESSON_ORDER_MODEL,
+                model=model,
                 contents=user_prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
@@ -800,7 +814,7 @@ async def _generate_lesson_order_async(
         except Exception as exc:
             status_code = _status_code(exc)
             telemetry = gemini_client.GeminiCallTelemetry(
-                model=config.LESSON_ORDER_MODEL,
+                model=model,
                 operation="ordering",
                 prompt_version=LESSON_ORDER_PROMPT_VERSION,
                 thinking_level="disabled",
@@ -824,7 +838,7 @@ async def _generate_lesson_order_async(
         telemetry = gemini_client.GeminiCallTelemetry(
             model=str(
                 getattr(response, "model_version", "")
-                or config.LESSON_ORDER_MODEL
+                or model
             ),
             operation="ordering",
             prompt_version=LESSON_ORDER_PROMPT_VERSION,
@@ -874,6 +888,7 @@ def _generate_lesson_order(
     system_prompt: str,
     user_prompt: str,
     *,
+    model: str,
     should_cancel: Callable[[], bool] | None,
     dispatch_state: _DispatchState | None = None,
 ) -> gemini_client.GenerationResult:
@@ -882,6 +897,7 @@ def _generate_lesson_order(
         lambda: _generate_lesson_order_async(
             system_prompt,
             user_prompt,
+            model=model,
             should_cancel=should_cancel,
             dispatch_state=state,
         ),
@@ -1572,6 +1588,11 @@ def _order_lesson_batch(
     provider_called = False
 
     for attempt in range(1, LESSON_ORDER_ATTEMPTS + 1):
+        attempt_model = (
+            config.LESSON_ORDER_MODEL
+            if attempt == 1
+            else config.LESSON_ORDER_FALLBACK_MODEL
+        )
         reservation: dict[str, Any] = {}
         if generation_context is not None:
             reserve = getattr(generation_context, "reserve_gemini_call", None)
@@ -1579,7 +1600,7 @@ def _order_lesson_batch(
                 try:
                     reserved = reserve(
                         operation="ordering",
-                        model=config.LESSON_ORDER_MODEL,
+                        model=attempt_model,
                         prompt_text=f"{system_prompt}\n\n{user_prompt}",
                         max_output_tokens=LESSON_ORDER_MAX_OUTPUT_TOKENS,
                         deadline_monotonic=time.monotonic() + LESSON_ORDER_TIMEOUT_S,
@@ -1650,6 +1671,7 @@ def _order_lesson_batch(
             generated = _generate_lesson_order(
                 system_prompt,
                 user_prompt,
+                model=attempt_model,
                 should_cancel=should_cancel,
                 dispatch_state=dispatch_state,
             )
@@ -1695,7 +1717,7 @@ def _order_lesson_batch(
             provider_called = provider_called or dispatch_state.dispatched
             last_reason = "provider_call_failed"
             last_telemetry = exc.telemetry
-            last_model_used = exc.telemetry.model or config.LESSON_ORDER_MODEL
+            last_model_used = exc.telemetry.model or attempt_model
             _record_gemini(
                 generation_context,
                 attempt=attempt,
@@ -1736,7 +1758,7 @@ def _order_lesson_batch(
 
         provider_called = provider_called or dispatch_state.dispatched
         last_telemetry = generated.telemetry
-        last_model_used = generated.telemetry.model or config.LESSON_ORDER_MODEL
+        last_model_used = generated.telemetry.model or attempt_model
         try:
             raise_if_cancelled(should_cancel)
         except CancellationError:

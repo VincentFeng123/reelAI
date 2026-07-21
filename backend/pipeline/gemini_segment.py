@@ -562,6 +562,30 @@ _TERMINAL_COORDINATING_CONJUNCTION_RE = re.compile(
     r"\s*[.!?]?[\"')\]]*$",
     re.IGNORECASE,
 )
+_TERMINAL_SO_EDGE_RE = re.compile(
+    r"\bso\s*[.!?]?[\"')\]]*$",
+    re.IGNORECASE,
+)
+_TERMINAL_COMPLETE_SO_PROFORM_RE = re.compile(
+    r"\b(?:"
+    r"if|even|or|how|more|less|not|perhaps|maybe|probably|possibly|"
+    r"certainly|presumably|apparently|likely|exactly|quite|just|"
+    r"(?:why\s+)?(?:is|are|was|were)\s+(?:that|this|it)|"
+    r"(?:why\s+)?(?:that|this|it)\s+(?:is|was|"
+    r"(?:can|could|may|might|must|shall|should|will|would)\s+be|"
+    r"(?:has|had)\s+been)|"
+    r"(?:set|arrange|place|position|orient|adjust)\s+"
+    r"(?:it|this|that|them)\s+just|"
+    r"(?:can|could|may|might|must|shall|should|will|would)\s+(?:not\s+)?do|"
+    r"(?:believe|believes|believed|believing|did|do|does|doing|done|"
+    r"expect|expects|expected|expecting|guess|guesses|guessed|guessing|"
+    r"hope|hopes|hoped|hoping|imagine|imagines|imagined|imagining|"
+    r"say|says|said|saying|seem|seems|seemed|seeming|"
+    r"suppose|supposes|supposed|supposing|suspect|suspects|suspected|"
+    r"suspecting|think|thinks|thinking|thought)"
+    r")\s+so\s*[.!?]?[\"')\]]*$",
+    re.IGNORECASE,
+)
 _TERMINAL_REQUIRED_COMPLEMENT_RE = re.compile(
     r"(?:\b(?:depends?|relies?)\s+(?:on|upon)|"
     r"\b(?:evidence|support)\s+(?:against|for)|"
@@ -709,7 +733,7 @@ _COMPARISON_SETUP_REFERENCE_RE = re.compile(
     re.IGNORECASE,
 )
 _EXPLICIT_CONJUNCTIVE_REQUEST_RE = re.compile(
-    r"\b(?:and|alongside|together\s+with)\b|(?<=\w)\s*/\s*(?=\w)",
+    r"\b(?:and|alongside|together\s+with)\b",
     re.IGNORECASE,
 )
 _EXPLICIT_TRANSITION_REQUEST_RE = re.compile(
@@ -1761,7 +1785,7 @@ _SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
 _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
-_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v7"
+_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v8"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
 
 _PRICING_VERSION = "gemini-standard-2026-07-11"
@@ -2090,10 +2114,11 @@ class _CompactBoundaryTopic(_StrictModel):
         default="",
         alias="family",
         description=(
-            "Standard formal, domain-qualified name for the exact underlying concept, "
-            "law, relationship, or system taught by this clip, independent of nickname, "
-            "formula, abbreviation, or attached spelling. Never use a bare ordinal such "
-            "as first law, and never merge different numbered laws."
+            "Standard formal, domain-qualified name for the smallest reusable taught "
+            "subtopic. Do not collapse a narrow unit into a broad umbrella law, field, "
+            "system, or course topic. Normalize only genuine paraphrases of that same "
+            "narrow subtopic, independent of teaching role, nickname, formula, "
+            "abbreviation, or attached spelling."
         ),
     )
     concept_aliases: list[_CompactFacet] = Field(
@@ -2206,8 +2231,9 @@ class _ProCandidateAuditItem(_StrictModel):
         default="",
         alias="family",
         description=(
-            "Fresh standard formal canonical name for the exact audited concept, "
-            "independent of nickname, formula, abbreviation, or attached spelling."
+            "Fresh standard formal canonical name for the smallest reusable taught "
+            "subtopic. Never collapse a narrow audited unit into a broad umbrella; "
+            "normalize only genuine paraphrases of the same narrow subtopic."
         ),
     )
     concept_aliases: list[_CompactFacet] = Field(
@@ -2458,7 +2484,8 @@ _POLICY_AND_EXAMPLES = """Policy:
   entities do not prove a reciprocal, causal, comparative, equivalence, or sequence relation;
   evidence about one entity cannot silently supply a distinct participant. Label title,
   objective, facet, and canonical concept family from the exact relationship the speech
-  establishes; never import a familiar law, mechanism, or doctrine from outside the transcript.
+  establishes. The family is the smallest reusable taught subtopic, never a broad umbrella;
+  never import a familiar law, mechanism, or doctrine from outside the transcript.
 - Score informativeness, topic_relevance, and educational_importance honestly as metadata,
   never as numeric eligibility gates. Return every related, coherent, substantive teaching
   unit that satisfies the grounding, context, and filler rules above; omit it only under those
@@ -2514,7 +2541,7 @@ def _topic_rule(topic: str) -> str:
     if not topic:
         return "No topic filter was supplied; return every substantive educational unit."
     if re.search(
-        r"\b(?:versus|vs\.?|compare(?:d|s|ing)?|comparison|contrast|difference between)\b|/",
+        r"\b(?:versus|vs\.?|compare(?:d|s|ing)?|comparison|contrast|difference between)\b",
         topic,
         flags=re.IGNORECASE,
     ):
@@ -2633,9 +2660,9 @@ def _selection_fields(*, enriched: bool, compact: bool = False) -> str:
         "crosses directly adjacent caption lines; never pad, paraphrase, skip, stitch, or reorder), "
         "title (at most 12 words), "
         "learning_objective (at most 24 words), facet (at most 12 words), "
-        "concept_family (a domain-qualified canonical name for the exact underlying "
-        "concept), concept_aliases (return an empty list; the canonical family is the "
-        "sole adaptive identity), "
+        "concept_family (the domain-qualified canonical name for the smallest reusable "
+        "taught subtopic, never a broad umbrella), concept_aliases (return an empty list; "
+        "the canonical family is the sole adaptive identity), "
         "informativeness, topic_relevance, "
         "educational_importance, difficulty, directly_teaches_topic, substantive, "
         "factually_grounded"
@@ -2718,17 +2745,17 @@ def _compact_output_guide() -> str:
   When context depends on a concrete actor, object, system, scenario, or referent, name that
   concrete subject in title, obj, or facet; generic labels such as "force and acceleration"
   do not identify a spring oscillator, cart pair, circuit, dataset, or other specific setup.
-- family = concept_family: the canonical, domain-qualified name of the exact underlying
-  principle, law, relationship, method, or system taught here. It is independent of teaching
-  role, example wording, or difficulty. Never return an ambiguous bare ordinal or erase an
-  ordinal, numeral, symbol, version, named entity, or other qualifier that distinguishes the
-  exact taught item from neighboring items in the same series or domain. A broad umbrella is
-  valid only when the selected speech genuinely teaches multiple members together.
+- family = concept_family: the canonical, domain-qualified name of the smallest reusable
+  taught subtopic. It is independent of teaching role, example wording, or difficulty. Never
+  collapse a narrow unit into a broad umbrella law, field, system, or course topic. For
+  example, keep force units, force-mass-acceleration proportionality, net force, and a friction
+  application as distinct families instead of collapsing them into Newton's second law.
+  Never return an ambiguous bare ordinal or erase an ordinal, numeral, symbol, version, named
+  entity, or other qualifier that distinguishes the exact taught item from neighboring items.
   Use the same standard formal name regardless of whether the request or speech uses a
   nickname, formula, abbreviation, translated word order, or attached spelling. Examples:
-  law of inertia -> Newton's first law of motion; F=ma -> Newton's second law of motion;
-  Apollo11 -> Apollo 11 mission; Python3.12 -> Python 3.12; HLAII -> HLA class II;
-  FactorV -> Factor V; C sharp -> C#.
+  law of inertia -> Newton's first law of motion; Apollo11 -> Apollo 11 mission;
+  Python3.12 -> Python 3.12; HLAII -> HLA class II; FactorV -> Factor V; C sharp -> C#.
   A defining relation must be stated by the speech, not inferred from similar adjectives,
   symbols, values, or neighboring concepts. When a relation requires distinct participants,
   stages, directions, inputs, or outcomes, the speech must identify each one and explicitly
@@ -3433,10 +3460,13 @@ def _pro_boundary_audit_prompts(
           "the best salvageable unit. Never broaden it to fit an incorrect opening. For pure "
           "filler use the literal sentinel 'filler/navigation only'.\n"
           "3. t=title is a concise viewer-facing title; f=facet is the narrow subtopic; family is "
-          "the standard formal, domain-qualified canonical concept actually taught. Choose "
-          "that same formal name regardless of whether the request or speech uses a nickname, "
-          "formula, translated word order, abbreviation, attached spelling, or paraphrase: for example law of "
-          "inertia -> Newton's first law of motion, and F=ma -> Newton's second law of motion. "
+          "the standard formal, domain-qualified name for the smallest reusable taught "
+          "subtopic, never a broad umbrella. Keep force units, force-mass-acceleration "
+          "proportionality, net force, and a friction application separate instead of "
+          "collapsing them into Newton's second law. Choose the same formal name only for "
+          "genuine paraphrases of that narrow subtopic, regardless of nickname, formula, "
+          "translated word order, abbreviation, attached spelling, or paraphrase: for example "
+          "law of inertia -> Newton's first law of motion. "
           "Normalize Apollo11 -> Apollo 11 mission, Python3.12 -> Python 3.12, HLAII -> "
           "HLA class II, FactorV -> Factor V, and C sharp -> C#. "
           "Preserve every ordinal, version, symbol, named entity, or other qualifier that "
@@ -4530,6 +4560,7 @@ def _cue_has_explicit_dangling_end(text: str, next_text: str) -> bool:
         or _TERMINAL_DANGLING_TRANSITION_RE.search(raw_text)
         or _TERMINAL_DANGLING_EXAMPLE_INTRO_RE.search(raw_text)
         or _TERMINAL_EXPLICIT_INCOMPLETE_CLAUSE_RE.search(raw_text)
+        or _terminal_so_is_dangling_connective(raw_text)
         or _TERMINAL_INCOMPLETE_SUBJECT_RE.search(raw_text)
         or _TERMINAL_BARE_SUBJECT_RE.search(raw_text)
         or nominal_subject_continues
@@ -4554,6 +4585,15 @@ def _cue_has_explicit_dangling_end(text: str, next_text: str) -> bool:
         or ambiguous_degree_continues
         or _has_unfinished_exemplification_tail(raw_text)
         or re.search(r"[,;:\-—][\"')\]]*$", raw_text)
+    )
+
+
+def _terminal_so_is_dangling_connective(text: str) -> bool:
+    """Distinguish a result-clause lead-in from a complete ``so`` proform."""
+    raw_text = str(text or "").strip()
+    return bool(
+        _TERMINAL_SO_EDGE_RE.search(raw_text)
+        and not _TERMINAL_COMPLETE_SO_PROFORM_RE.search(raw_text)
     )
 
 
@@ -4614,6 +4654,7 @@ def _terminal_content_is_explicitly_incomplete(text: str) -> bool:
         or _has_unfinished_exemplification_tail(raw_text)
         or _TERMINAL_DANGLING_EXAMPLE_INTRO_RE.search(raw_text)
         or _TERMINAL_EXPLICIT_INCOMPLETE_CLAUSE_RE.search(raw_text)
+        or _terminal_so_is_dangling_connective(raw_text)
         or _TERMINAL_INCOMPLETE_SUBJECT_RE.search(raw_text)
         or _TERMINAL_COORDINATING_CONJUNCTION_RE.search(raw_text)
         or _TERMINAL_DANGLING_ARTICLE_RE.search(raw_text)
@@ -11619,6 +11660,32 @@ def _normalized_request_text(value: object) -> str:
     )
 
 
+def _contract_has_explicit_slash_comparison(
+    topic: str,
+    constraints: dict[str, _IntentConstraint] | None,
+) -> bool:
+    """Treat slash notation as relational only when Gemini explicitly structures it."""
+    if not constraints:
+        return False
+    endpoints = [
+        constraint
+        for constraint in constraints.values()
+        if constraint.kind in {
+            _IntentConstraintKind.SUBJECT,
+            _IntentConstraintKind.OUTCOME,
+        }
+        and _contains_quote(topic, constraint.source_phrase)
+    ]
+    if len(endpoints) < 2:
+        return False
+    return any(
+        constraint.kind is _IntentConstraintKind.RELATIONSHIP
+        and "/" in constraint.source_phrase
+        and _contains_quote(topic, constraint.source_phrase)
+        for constraint in constraints.values()
+    )
+
+
 def _contract_has_relational_path(
     topic: str,
     constraints: dict[str, _IntentConstraint],
@@ -11685,11 +11752,14 @@ def _request_requires_joint_intent_coverage(
     request = " ".join(str(topic or "").split())
     comparison_request = re.search(
         r"\b(?:versus|vs\.?|compare(?:d|s|ing)?|comparison|contrast|"
-        r"difference\s+between)\b|/",
+        r"difference\s+between)\b",
         request,
         re.IGNORECASE,
     )
-    if comparison_request is not None:
+    if comparison_request is not None or _contract_has_explicit_slash_comparison(
+        request,
+        constraints,
+    ):
         return True
     if _EXPLICIT_TRANSITION_REQUEST_RE.search(request) is not None:
         return True
@@ -11791,11 +11861,11 @@ def _joint_relationship_evidence_window(
     comparison_request = bool(
         re.search(
             r"\b(?:versus|vs\.?|compare(?:d|s|ing)?|comparison|contrast|"
-            r"difference\s+between)\b|/",
+            r"difference\s+between)\b",
             str(topic or ""),
             re.IGNORECASE,
         )
-    )
+    ) or _contract_has_explicit_slash_comparison(topic, constraints)
     transition_request = bool(_EXPLICIT_TRANSITION_REQUEST_RE.search(topic))
     path_request = bool(
         not comparison_request
@@ -11830,11 +11900,11 @@ def _joint_relationship_evidence_matches(
     comparison_request = bool(
         re.search(
             r"\b(?:versus|vs\.?|compare(?:d|s|ing)?|comparison|contrast|"
-            r"difference\s+between)\b|/",
+            r"difference\s+between)\b",
             request,
             re.IGNORECASE,
         )
-    )
+    ) or _contract_has_explicit_slash_comparison(request, constraints)
     transition_request = bool(_EXPLICIT_TRANSITION_REQUEST_RE.search(request))
     path_request = bool(
         not comparison_request
@@ -11891,17 +11961,75 @@ def _joint_relationship_evidence_matches(
     return False
 
 
-def _canonical_binary_comparison_constraints(
+def _pure_binary_comparison_parts(
     request: str,
-    constraints: dict[str, _IntentConstraint],
-) -> dict[str, _IntentConstraint] | None:
-    """Repair a malformed model contract for an unambiguous ``X vs Y`` request."""
+) -> tuple[str, str, str] | None:
+    """Parse an unambiguous whole-request binary comparison."""
     match = re.fullmatch(
         r"\s*(?P<left>.+?)\s+(?P<connector>versus|vs\.?)\s+(?P<right>.+?)\s*",
         str(request or ""),
         re.IGNORECASE,
     )
-    if match is None or not all(
+    if match is None:
+        match = re.fullmatch(
+            r"\s*(?P<left>[^,;.!?]+?)\s+"
+            r"(?P<connector>compared\s+(?:to|with))\s+"
+            r"(?P<right>[^,;.!?]+?)\s*[.!?]?\s*",
+            str(request or ""),
+            re.IGNORECASE,
+        )
+    if match is None:
+        match = re.fullmatch(
+            r"\s*how\s+(?:do|does|did)\s+"
+            r"(?P<left>[^,;.!?]+?)\s+"
+            r"(?P<connector>compare\s+(?:to|with))\s+"
+            r"(?P<right>[^,;.!?]+?)\s*[.!?]?\s*",
+            str(request or ""),
+            re.IGNORECASE,
+        )
+    if match is None:
+        match = re.fullmatch(
+            r"\s*(?P<left>[^,;.!?]+?)\s+and\s+"
+            r"(?P<right>[^,;.!?]+?)\s+"
+            r"(?P<connector>comparison)\s*[.!?]?\s*",
+            str(request or ""),
+            re.IGNORECASE,
+        )
+    if match is None:
+        match = re.fullmatch(
+            r"\s*(?:a\s+|the\s+)?"
+            r"(?P<connector>comparison\s+(?:between|of)|"
+            r"(?:contrast|differences?)\s+between)\s+"
+            r"(?P<left>[^,;.!?]+?)\s+and\s+"
+            r"(?P<right>[^,;.!?]+?)\s*[.!?]?\s*",
+            str(request or ""),
+            re.IGNORECASE,
+        )
+    if match is None:
+        match = re.fullmatch(
+            r"\s*(?P<connector>compare|contrast)\s+"
+            r"(?P<left>[^,;.!?]+?)\s+(?:and|with|to)\s+"
+            r"(?P<right>[^,;.!?]+?)\s*[.!?]?\s*",
+            str(request or ""),
+            re.IGNORECASE,
+        )
+    if match is None:
+        return None
+    left = match.group("left").strip()
+    connector = match.group("connector").strip()
+    right = match.group("right").strip()
+    if not _content_tokens(left) or not _content_tokens(right):
+        return None
+    return left, connector, right
+
+
+def _canonical_binary_comparison_constraints(
+    request: str,
+    constraints: dict[str, _IntentConstraint],
+) -> dict[str, _IntentConstraint] | None:
+    """Repair an eligible malformed contract for a pure binary comparison."""
+    parts = _pure_binary_comparison_parts(request)
+    if parts is None or not all(
         constraint.kind in {
             _IntentConstraintKind.SUBJECT,
             _IntentConstraintKind.RELATIONSHIP,
@@ -11909,11 +12037,7 @@ def _canonical_binary_comparison_constraints(
         for constraint in constraints.values()
     ):
         return None
-    left = match.group("left").strip()
-    connector = match.group("connector").strip()
-    right = match.group("right").strip()
-    if not _content_tokens(left) or not _content_tokens(right):
-        return None
+    left, connector, right = parts
     canonical = [
         _IntentConstraint(
             constraint_id="joint_subject_1",
@@ -11977,36 +12101,80 @@ def _validated_intent_constraints(
     ):
         return {}, "intent_contract_ungrounded_source_phrase"
     if _request_requires_joint_intent_coverage(expected_request, constraints):
+        # A grounded multi-facet plan may encode a final comparison as TASK or
+        # OUTCOME. Keep that narrow structure, but otherwise require an explicit
+        # RELATIONSHIP for every comparison or transition request. The pure
+        # parser below is only a safe local-repair convenience, not the safety
+        # boundary for recognizing all relational wording.
+        relationship_constraint_count = sum(
+            constraint.kind is _IntentConstraintKind.RELATIONSHIP
+            for constraint in constraints.values()
+        )
         comparison_request = bool(
             re.search(
                 r"\b(?:versus|vs\.?|compare(?:d|s|ing)?|comparison|contrast|"
-                r"difference\s+between)\b|/",
+                r"difference\s+between)\b",
                 expected_request,
                 re.IGNORECASE,
             )
+        ) or _contract_has_explicit_slash_comparison(
+            expected_request,
+            constraints,
         )
-        relationship_request = bool(
-            comparison_request
-            or _EXPLICIT_TRANSITION_REQUEST_RE.search(expected_request)
-            or any(
-                constraint.kind is _IntentConstraintKind.RELATIONSHIP
+        transition_request = bool(
+            _EXPLICIT_TRANSITION_REQUEST_RE.search(expected_request)
+        )
+        binary_comparison_request = (
+            _pure_binary_comparison_parts(expected_request) is not None
+        )
+        _request_head, request_list_separator, request_list_tail = (
+            expected_request.partition(":")
+        )
+        request_has_multi_facet_list = bool(
+            request_list_separator
+            and len(re.findall(r"[,;]", request_list_tail)) >= 2
+        )
+        grounded_multi_facet_plan = bool(
+            not binary_comparison_request
+            and request_has_multi_facet_list
+            and sum(
+                constraint.kind is _IntentConstraintKind.SCOPE
+                for constraint in constraints.values()
+            ) >= 3
+            and any(
+                constraint.kind is _IntentConstraintKind.SUBJECT
+                for constraint in constraints.values()
+            )
+            and any(
+                constraint.kind in {
+                    _IntentConstraintKind.TASK,
+                    _IntentConstraintKind.OUTCOME,
+                }
+                and (
+                    re.search(
+                        r"\b(?:versus|vs\.?|compare(?:d|s|ing)?|comparison|"
+                        r"contrast|difference\s+between)\b",
+                        constraint.source_phrase,
+                        re.IGNORECASE,
+                    )
+                    or _EXPLICIT_TRANSITION_REQUEST_RE.search(
+                        constraint.source_phrase
+                    )
+                )
                 for constraint in constraints.values()
             )
         )
+        missing_required_relationship = bool(
+            (comparison_request or transition_request)
+            and not relationship_constraint_count
+            and not grounded_multi_facet_plan
+        )
         incomplete_relationship_structure = bool(
             len(constraints) < 2
+            or missing_required_relationship
             or (
-                relationship_request
-                and (
-                    not any(
-                        constraint.kind is _IntentConstraintKind.RELATIONSHIP
-                        for constraint in constraints.values()
-                    )
-                    or sum(
-                        constraint.kind is not _IntentConstraintKind.RELATIONSHIP
-                        for constraint in constraints.values()
-                    ) < 2
-                )
+                relationship_constraint_count
+                and len(constraints) - relationship_constraint_count < 2
             )
         )
         if incomplete_relationship_structure:
@@ -17330,6 +17498,7 @@ def _trusted_universal_compact_plan_to_report(
         )
         split_postpositive_qualifier = bool(
             not re.search(r"[.!?]+[\"'’”)]*\s*$", clip_text)
+            and re.match(r"^\s*[.!?]", same_cue_following) is None
             and postpositive_qualifier
             and (
                 postpositive_qualifier.group("qualifier").casefold()
@@ -17431,7 +17600,10 @@ def _trusted_universal_compact_plan_to_report(
                     b, end_span, _completed_quote = completed_end
                     diagnostics.append("completed_unfinished_spoken_unit")
                 else:
-                    diagnostics.append("unresolved_dangling_end")
+                    report.rejected_reasons.append(
+                        f"proposal_{index}:unresolved_dangling_end"
+                    )
+                    continue
             clip_text, semantic_spans_by_cue = _semantic_clip_slice(
                 segments,
                 a,
@@ -23032,6 +23204,22 @@ def run_segment_profile(
             calls = [call] if call else []
         error_type = str(call.get("error_type") or type(exc).__name__)
         failure_reason = f"request_failure:{error_type}"
+        contract_rejection_reasons: list[str] = []
+        for attempt_call in calls:
+            for field_name in (
+                "selector_contract_rejection_reasons",
+                "schema_rejection_reasons",
+            ):
+                raw_reasons = attempt_call.get(field_name)
+                if isinstance(raw_reasons, list):
+                    contract_rejection_reasons.extend(
+                        str(reason).strip()
+                        for reason in raw_reasons
+                        if str(reason).strip()
+                    )
+        contract_rejection_reasons = list(dict.fromkeys(
+            contract_rejection_reasons
+        ))
         status_code = call.get("provider_status_code")
         safe_error = f"{error_type}: Gemini model call failed"
         if isinstance(status_code, int):
@@ -23044,7 +23232,7 @@ def run_segment_profile(
             [failure_reason],
             calls=calls,
             error=safe_error,
-            rejection_reasons=[failure_reason],
+            rejection_reasons=[failure_reason, *contract_rejection_reasons],
         )
 
 

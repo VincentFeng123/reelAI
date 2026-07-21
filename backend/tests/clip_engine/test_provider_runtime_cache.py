@@ -157,6 +157,53 @@ def test_generation_context_maps_live_gemini_telemetry_and_cache_hits() -> None:
     assert context.counters()["segmentation_cache_hits"] == 1
 
 
+def test_generation_context_preserves_selector_retry_diagnostics() -> None:
+    context = GenerationContext("slow", generation_id="job-selector-diagnostics")
+    diagnostics = {
+        "schema_rejected_count": 1,
+        "schema_rejection_reasons": ["candidate_1:invalid_claim_quote"],
+        "schema_retry_attempt": 2,
+        "schema_retry_reason": "invalid_structured_response",
+        "schema_retry_recovered": True,
+        "schema_retry_exhausted": False,
+        "partial_schema_retry_attempt": 2,
+        "partial_schema_retry_reason": "selector_contract_rejection",
+        "partial_schema_retry_recovered": False,
+        "partial_schema_retry_exhausted": True,
+        "partial_schema_retry_skipped": "insufficient_deadline",
+        "partial_schema_retry_retained": True,
+        "selector_contract_rejected_count": 1,
+        "selector_contract_rejection_reasons": [
+            "intent_contract_incomplete_joint_structure",
+        ],
+        "selector_intent_contract_error": (
+            "intent_contract_incomplete_joint_structure"
+        ),
+        "selector_contract_retry_attempt": 2,
+        "selector_contract_retry_reason": (
+            "intent_contract_incomplete_joint_structure"
+        ),
+        "selector_contract_retry_recovered": False,
+        "selector_contract_retry_exhausted": True,
+        "selector_contract_retry_skipped": "insufficient_deadline",
+    }
+    context.record_gemini(
+        attempt=2,
+        model_used="gemini-3.1-pro-preview",
+        quality_degraded=False,
+        usage={
+            "prompt_tokens": 100,
+            "candidate_tokens": 20,
+            "thought_tokens": 0,
+            "total_tokens": 120,
+            **diagnostics,
+        },
+    )
+
+    metadata = context.usage_payload()["provider_calls"][0]["metadata"]
+    assert {name: metadata[name] for name in diagnostics} == diagnostics
+
+
 def test_generation_context_enforces_actual_gemini_call_and_cost_budgets() -> None:
     context = GenerationContext("fast", generation_id="job-budget")
     for _ in range(2):

@@ -28,6 +28,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 
 from backend import config as pipeline_config
+from backend.concept_families import (
+    has_incompatible_gemini_concept_family_contract,
+)
 from backend.concept_tokens import semantic_key, semantic_tokens
 
 from .config import get_settings
@@ -431,7 +434,7 @@ LESSON_ORDER_CANDIDATE_LIMITS = {
     for mode, source_budget in GENERATION_SOURCE_BUDGETS.items()
 }
 SOURCE_ANALYSIS_MAX_ATTEMPTS = 2
-SELECTION_CONTRACT_VERSION = "quality_silence_v38"
+SELECTION_CONTRACT_VERSION = "quality_silence_v39"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -3244,6 +3247,7 @@ _LESSON_ORDER_SELECTION_FIELDS = frozenset({
     "_selection_prerequisite_ids",
     "_selection_topic_relevance",
     "_selection_informativeness",
+    "_selection_concept",
     "_selection_concept_family",
     "_selection_concept_aliases",
 })
@@ -5146,6 +5150,10 @@ def _lesson_prior_concept_coverage(
     )
     coverage: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
+        if has_incompatible_gemini_concept_family_contract(
+            row.get("search_context_json")
+        ):
+            continue
         metadata = reel_service._selection_metadata(
             row.get("search_context_json"),
             t_start=row.get("t_start"),

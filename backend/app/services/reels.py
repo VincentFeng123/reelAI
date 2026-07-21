@@ -16,9 +16,11 @@ from typing import Any, Callable, Literal
 import numpy as np
 
 from ...concept_families import (
+    CONCEPT_FAMILY_CONTRACT_VERSION as SHARED_CONCEPT_FAMILY_CONTRACT_VERSION,
     CONCEPT_FAMILY_NOISE_TOKENS as SHARED_CONCEPT_FAMILY_NOISE_TOKENS,
     concept_family_identity_key as shared_concept_family_identity_key,
     concept_family_identity_tokens as shared_concept_family_identity_tokens,
+    has_incompatible_gemini_concept_family_contract,
     validate_concept_family_labels,
 )
 from ...concept_ordinals import (
@@ -1239,9 +1241,10 @@ class ReelService:
     # v43: join adaptive signals through versioned Gemini concept-family metadata.
     # v44: retain trusted Gemini concept-family metadata in ranked response rows.
     # v45: retain candidate, chain, position, and prerequisite organizer metadata.
-    # The separate contract key below invalidates prior inventory under v38.
-    RANKED_FEED_CACHE_VERSION = 45
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v38"
+    # v46: retain the trusted narrow clip concept for organizer input.
+    # The separate contract key below invalidates prior inventory under v39.
+    RANKED_FEED_CACHE_VERSION = 46
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v39"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
         "quality_silence_v4",
@@ -1278,14 +1281,20 @@ class ReelService:
         "quality_silence_v36",
         "quality_silence_v37",
         "quality_silence_v38",
+        "quality_silence_v39",
     })
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
     NEED_HELP_CONCEPT_STEP = 0.06
     GLOBAL_FEEDBACK_WINDOW = 12
     GLOBAL_FEEDBACK_MIN_ROWS = 3
+    GLOBAL_SIGNAL_SCAN_PAGE_SIZE = 24
+    # Current-contract events are newer than the retired family contract. Cap
+    # compatibility scanning so corrupted/all-stale history cannot turn one
+    # feedback write into an unbounded database walk.
+    GLOBAL_SIGNAL_SCAN_MAX_ROWS = GLOBAL_FEEDBACK_WINDOW * 8
     CONCEPT_FAMILY_NOISE_TOKENS = SHARED_CONCEPT_FAMILY_NOISE_TOKENS
-    CONCEPT_FAMILY_CONTRACT_VERSION = "concept_family_v2"
+    CONCEPT_FAMILY_CONTRACT_VERSION = SHARED_CONCEPT_FAMILY_CONTRACT_VERSION
     def __init__(self, embedding_service, youtube_service=None, ingestion_pipeline=None) -> None:
         settings = get_settings()
         self.embedding_service = embedding_service
@@ -2545,6 +2554,7 @@ class ReelService:
                 "quality_silence_v36",
                 "quality_silence_v37",
                 "quality_silence_v38",
+                "quality_silence_v39",
             }
             for reel in generated
         ):
@@ -5470,9 +5480,9 @@ class ReelService:
             left_profile = profiles.get(concept_id, set())
             right_profile = profiles.get(candidate_id, set())
             if left_profile and right_profile:
-                # Two trusted v2 AI identities are authoritative. Untrusted
-                # viewer-facing titles may legitimately enumerate members of
-                # one broad concept and must not veto an exact family match.
+                # Two trusted v3 AI identities are authoritative. Untrusted
+                # viewer-facing titles may phrase the same narrow subtopic
+                # differently and must not veto an exact family match.
                 return bool(left_profile & right_profile)
             left_ordinals = set(concept_identifier_indexes(
                 cls._concept_family_tokens(title)
@@ -5498,7 +5508,7 @@ class ReelService:
                 return True
             if left_profile or right_profile:
                 return False
-            # Without a trusted v2 AI family, fail closed. Lexical subset
+            # Without a trusted v3 AI family, fail closed. Lexical subset
             # matching cannot prove semantic equivalence (for example blood
             # types A and B) and must never join feedback/mastery histories.
             return False
@@ -5524,37 +5534,61 @@ class ReelService:
         concepts: list[dict[str, Any]],
         learner_id: str = LEGACY_LEARNER_ID,
     ) -> list[dict[str, Any]]:
-        concept_counts = {
-            row["concept_id"]: int(row["reel_count"])
-            for row in fetch_all(
-                conn,
-                "SELECT concept_id, COUNT(*) AS reel_count FROM reels WHERE material_id = ? GROUP BY concept_id",
-                (material_id,),
-            )
-        }
+        concept_counts: dict[str, int] = defaultdict(int)
+        for row in fetch_all(
+            conn,
+            """
+            SELECT concept_id, search_context_json, COUNT(*) AS reel_count
+            FROM reels
+            WHERE material_id = ?
+            GROUP BY concept_id, search_context_json
+            """,
+            (material_id,),
+        ):
+            if has_incompatible_gemini_concept_family_contract(
+                row.get("search_context_json")
+            ):
+                continue
+            concept_counts[str(row["concept_id"])] += int(row["reel_count"])
+
+        feedback_totals: dict[str, list[float]] = defaultdict(
+            lambda: [0.0, 0.0, 0.0, 0.0]
+        )
+        for row in fetch_all(
+            conn,
+            """
+            SELECT
+                r.concept_id,
+                r.search_context_json,
+                COALESCE(SUM(f.helpful), 0) AS helpful_votes,
+                COALESCE(SUM(f.confusing), 0) AS confusing_votes,
+                COALESCE(SUM(f.rating), 0.0) AS rating_total,
+                COUNT(f.rating) AS rating_count
+            FROM reels r
+            LEFT JOIN reel_feedback f
+              ON f.reel_id = r.id
+             AND f.learner_id = ?
+            WHERE r.material_id = ?
+            GROUP BY r.concept_id, r.search_context_json
+            """,
+            (str(learner_id or LEGACY_LEARNER_ID), material_id),
+        ):
+            if has_incompatible_gemini_concept_family_contract(
+                row.get("search_context_json")
+            ):
+                continue
+            totals = feedback_totals[str(row["concept_id"])]
+            totals[0] += float(row["helpful_votes"])
+            totals[1] += float(row["confusing_votes"])
+            totals[2] += float(row["rating_total"])
+            totals[3] += float(row["rating_count"])
         exact_concept_feedback = {
-            row["concept_id"]: {
-                "helpful": float(row["helpful_votes"]),
-                "confusing": float(row["confusing_votes"]),
-                "avg_rating": float(row["avg_rating"] or 3.0),
+            concept_id: {
+                "helpful": totals[0],
+                "confusing": totals[1],
+                "avg_rating": totals[2] / totals[3] if totals[3] else 3.0,
             }
-            for row in fetch_all(
-                conn,
-                """
-                SELECT
-                    r.concept_id,
-                    COALESCE(SUM(f.helpful), 0) AS helpful_votes,
-                    COALESCE(SUM(f.confusing), 0) AS confusing_votes,
-                    COALESCE(AVG(f.rating), 3.0) AS avg_rating
-                FROM reels r
-                LEFT JOIN reel_feedback f
-                  ON f.reel_id = r.id
-                 AND f.learner_id = ?
-                WHERE r.material_id = ?
-                GROUP BY r.concept_id
-                """,
-                (str(learner_id or LEGACY_LEARNER_ID), material_id),
-            )
+            for concept_id, totals in feedback_totals.items()
         }
         material_concepts = fetch_all(
             conn,
@@ -5581,19 +5615,27 @@ class ReelService:
                 "avg_rating": float(exact_target.get("avg_rating", 3.0)),
             }
         try:
-            exact_assessment_adjustments = {
-                str(row["concept_id"]): float(row["adjustment"] or 0.0)
-                for row in fetch_all(
-                    conn,
-                    """
-                    SELECT concept_id, COALESCE(SUM(adjustment), 0.0) AS adjustment
-                    FROM assessment_concept_outcomes
-                    WHERE learner_id = ? AND material_id = ?
-                    GROUP BY concept_id
-                    """,
-                    (str(learner_id or LEGACY_LEARNER_ID), material_id),
+            exact_assessment_adjustments: dict[str, float] = defaultdict(float)
+            for row in fetch_all(
+                conn,
+                """
+                SELECT o.concept_id,
+                       source_reel.search_context_json AS source_search_context_json,
+                       COALESCE(SUM(o.adjustment), 0.0) AS adjustment
+                FROM assessment_concept_outcomes o
+                LEFT JOIN reels source_reel ON source_reel.id = o.source_reel_id
+                WHERE o.learner_id = ? AND o.material_id = ?
+                GROUP BY o.concept_id, source_reel.search_context_json
+                """,
+                (str(learner_id or LEGACY_LEARNER_ID), material_id),
+            ):
+                if has_incompatible_gemini_concept_family_contract(
+                    row.get("source_search_context_json")
+                ):
+                    continue
+                exact_assessment_adjustments[str(row["concept_id"])] += float(
+                    row["adjustment"] or 0.0
                 )
-            }
         except sqlite3.OperationalError as exc:
             if "no such table: assessment_concept_outcomes" not in str(exc):
                 raise
@@ -5630,11 +5672,50 @@ class ReelService:
 
         progress = self.learner_progress(conn, material_id, learner_id)
         reset_at = str(progress.get("difficulty_reset_at") or "")
-        feedback_rows = fetch_all(
-            conn,
+
+        def compatible_pages(
+            query: str,
+            params: tuple[Any, ...],
+            *,
+            context_key: str,
+        ) -> list[dict[str, Any]]:
+            compatible: list[dict[str, Any]] = []
+            offset = 0
+            while (
+                len(compatible) < self.GLOBAL_FEEDBACK_WINDOW
+                and offset < self.GLOBAL_SIGNAL_SCAN_MAX_ROWS
+            ):
+                page_size = min(
+                    self.GLOBAL_SIGNAL_SCAN_PAGE_SIZE,
+                    self.GLOBAL_SIGNAL_SCAN_MAX_ROWS - offset,
+                )
+                page = fetch_all(
+                    conn,
+                    query + "\nLIMIT ? OFFSET ?",
+                    (
+                        *params,
+                        page_size,
+                        offset,
+                    ),
+                )
+                if not page:
+                    break
+                offset += len(page)
+                compatible.extend(
+                    row
+                    for row in page
+                    if not has_incompatible_gemini_concept_family_contract(
+                        row.get(context_key)
+                    )
+                )
+                if len(page) < page_size:
+                    break
+            return compatible[: self.GLOBAL_FEEDBACK_WINDOW]
+
+        feedback_rows = compatible_pages(
             """
             SELECT f.helpful, f.confusing, r.concept_id,
-                   f.mastery_updated_at AS event_at
+                   f.mastery_updated_at AS event_at, r.search_context_json
             FROM reel_feedback f
             JOIN reels r ON r.id = f.reel_id
             WHERE f.learner_id = ?
@@ -5642,24 +5723,25 @@ class ReelService:
               AND f.mastery_updated_at IS NOT NULL
               AND f.mastery_updated_at > ?
               AND (f.helpful <> 0 OR f.confusing <> 0)
-            ORDER BY f.mastery_updated_at DESC
-            LIMIT ?
+            ORDER BY f.mastery_updated_at DESC, f.id DESC
             """,
-            (learner_id, material_id, reset_at, self.GLOBAL_FEEDBACK_WINDOW),
+            (learner_id, material_id, reset_at),
+            context_key="search_context_json",
         )
         try:
-            assessment_rows = fetch_all(
-                conn,
+            assessment_rows = compatible_pages(
                 """
-                SELECT concept_id, adjustment, created_at AS event_at
-                FROM assessment_concept_outcomes
-                WHERE learner_id = ?
-                  AND material_id = ?
-                  AND created_at > ?
-                ORDER BY created_at DESC
-                LIMIT ?
+                SELECT o.concept_id, o.adjustment, o.created_at AS event_at,
+                       source_reel.search_context_json AS source_search_context_json
+                FROM assessment_concept_outcomes o
+                LEFT JOIN reels source_reel ON source_reel.id = o.source_reel_id
+                WHERE o.learner_id = ?
+                  AND o.material_id = ?
+                  AND o.created_at > ?
+                ORDER BY o.created_at DESC, o.session_id DESC, o.concept_id ASC
                 """,
-                (learner_id, material_id, reset_at, self.GLOBAL_FEEDBACK_WINDOW),
+                (learner_id, material_id, reset_at),
+                context_key="source_search_context_json",
             )
         except sqlite3.OperationalError as exc:
             if "no such table: assessment_concept_outcomes" not in str(exc):
@@ -5730,29 +5812,46 @@ class ReelService:
     ) -> tuple[dict[str, dict[str, float]], dict[str, float], dict[str, Any] | None, float]:
         progress = self.learner_progress(conn, material_id, learner_id)
         reset_at = str(progress.get("difficulty_reset_at") or "")
-        rows = fetch_all(
-            conn,
-            """
-            SELECT f.reel_id, f.helpful, f.confusing, f.mastery_updated_at,
-                   r.concept_id, r.video_id, r.difficulty
-            FROM reel_feedback f
-            JOIN reels r ON r.id = f.reel_id
-            WHERE f.learner_id = ? AND r.material_id = ?
-            """,
-            (learner_id, material_id),
-        )
-        try:
-            assessment_rows = fetch_all(
+        rows = [
+            row
+            for row in fetch_all(
                 conn,
                 """
-                SELECT session_id, concept_id, adjustment, source_reel_id AS reel_id,
-                       source_video_id AS video_id, source_difficulty AS difficulty,
-                       created_at AS mastery_updated_at
-                FROM assessment_concept_outcomes
-                WHERE learner_id = ? AND material_id = ?
+                SELECT f.reel_id, f.helpful, f.confusing, f.mastery_updated_at,
+                       r.concept_id, r.video_id, r.difficulty,
+                       r.search_context_json
+                FROM reel_feedback f
+                JOIN reels r ON r.id = f.reel_id
+                WHERE f.learner_id = ? AND r.material_id = ?
                 """,
                 (learner_id, material_id),
             )
+            if not has_incompatible_gemini_concept_family_contract(
+                row.get("search_context_json")
+            )
+        ]
+        try:
+            assessment_rows = [
+                row
+                for row in fetch_all(
+                    conn,
+                    """
+                    SELECT o.session_id, o.concept_id, o.adjustment,
+                           o.source_reel_id AS reel_id,
+                           o.source_video_id AS video_id,
+                           o.source_difficulty AS difficulty,
+                           o.created_at AS mastery_updated_at,
+                           source_reel.search_context_json AS source_search_context_json
+                    FROM assessment_concept_outcomes o
+                    LEFT JOIN reels source_reel ON source_reel.id = o.source_reel_id
+                    WHERE o.learner_id = ? AND o.material_id = ?
+                    """,
+                    (learner_id, material_id),
+                )
+                if not has_incompatible_gemini_concept_family_contract(
+                    row.get("source_search_context_json")
+                )
+            ]
         except sqlite3.OperationalError as exc:
             if "no such table: assessment_concept_outcomes" not in str(exc):
                 raise
@@ -6178,6 +6277,11 @@ class ReelService:
             if validate_concept_family_labels(family_text, clean_aliases) is None:
                 metadata["_selection_concept_family"] = family_text
                 metadata["_selection_concept_aliases"] = clean_aliases
+                narrow_concept = " ".join(
+                    str(parsed.get("clip_concept_raw") or "").split()
+                ).strip()[:240]
+                if narrow_concept:
+                    metadata["_selection_concept"] = narrow_concept
         for source_key, metadata_key in (
             ("quality_floor", "_selection_quality_floor"),
             ("quality_mean", "_selection_quality_mean"),
@@ -6244,6 +6348,7 @@ class ReelService:
                 "quality_silence_v36",
                 "quality_silence_v37",
                 "quality_silence_v38",
+                "quality_silence_v39",
             },
         )
         metadata["_selection_substantive"] = selection_bool(
@@ -6284,6 +6389,7 @@ class ReelService:
                 "quality_silence_v36",
                 "quality_silence_v37",
                 "quality_silence_v38",
+                "quality_silence_v39",
             },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
@@ -7895,6 +8001,7 @@ class ReelService:
                     "quality_silence_v36",
                     "quality_silence_v37",
                     "quality_silence_v38",
+                    "quality_silence_v39",
                 }
                 else legacy_difficulty_matches_level
             )
@@ -7972,6 +8079,7 @@ class ReelService:
                             "quality_silence_v36",
                             "quality_silence_v37",
                             "quality_silence_v38",
+                            "quality_silence_v39",
                         }
                         and selection_metadata.get(
                             "_selection_speech_corridor_verified"
@@ -8021,6 +8129,7 @@ class ReelService:
                     "quality_silence_v36",
                     "quality_silence_v37",
                     "quality_silence_v38",
+                    "quality_silence_v39",
                 } and (
                     (
                         min(
@@ -8068,6 +8177,7 @@ class ReelService:
                             "quality_silence_v36",
                             "quality_silence_v37",
                             "quality_silence_v38",
+                            "quality_silence_v39",
                         }
                         else self._selection_number(
                             selection_metadata.get("_selection_topic_relevance"), 0.0
@@ -8394,6 +8504,9 @@ class ReelService:
             selection_concept_family = str(
                 clean_item.get("_selection_concept_family") or ""
             ).strip()
+            selection_concept = str(
+                clean_item.get("_selection_concept") or ""
+            ).strip()
             raw_selection_concept_aliases = clean_item.get(
                 "_selection_concept_aliases"
             )
@@ -8450,6 +8563,8 @@ class ReelService:
                     clean_item["_selection_concept_aliases"] = (
                         selection_concept_aliases
                     )
+                if selection_concept:
+                    clean_item["_selection_concept"] = selection_concept
             # Keep video_id on the response row so downstream filters (notably
             # main._ranked_request_reels's exclude_video_ids filter) can match
             # on it. Stripping it here silently defeated client pagination.
@@ -8490,6 +8605,7 @@ class ReelService:
                 "quality_silence_v36",
                 "quality_silence_v37",
                 "quality_silence_v38",
+                "quality_silence_v39",
             }:
                 # V5+ captions must be immutable selection-time evidence. A
                 # provider artifact key identifies a retrieval profile and may
@@ -8541,6 +8657,7 @@ class ReelService:
                         "quality_silence_v36",
                         "quality_silence_v37",
                         "quality_silence_v38",
+                        "quality_silence_v39",
                     }
                     or transcript_artifact_key
                     else str(clean_item.get("transcript_snippet") or "")

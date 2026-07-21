@@ -131,7 +131,7 @@ def _newton_audit_plan() -> gemini_segment._ProCandidateAuditPlan:
     }])
 
 
-def test_v7_audit_budget_fits_forty_items_plus_observed_high_thinking() -> None:
+def test_v8_audit_budget_fits_forty_items_plus_observed_high_thinking() -> None:
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
         "id": f"candidate-{index}",
         "d": "reject_filler_dominated",
@@ -395,7 +395,7 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     assert result.calls[0]["reserved_output_tokens"] == call["max_output_tokens"]
     assert audit_call["schema"] is gemini_segment._ProCandidateAuditPlan
     assert audit_call["operation"] == "pro_boundary_audit"
-    assert audit_call["prompt_version"] == "pro_candidate_audit_v7"
+    assert audit_call["prompt_version"] == "pro_candidate_audit_v8"
     assert audit_call["thinking_level"] == "high"
     assert audit_call["media_resolution"] is None
     assert gemini_segment._PRO_FINAL_AUDIT_RESERVED_S >= 60.0

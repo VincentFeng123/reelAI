@@ -1,7 +1,8 @@
 """Shared safety contract for trusted adaptive concept-family metadata."""
 from __future__ import annotations
 
-from typing import Sequence
+import json
+from collections.abc import Mapping, Sequence
 
 from .concept_ordinals import (
     NUMBERED_CONCEPT_KIND_TOKENS,
@@ -12,6 +13,7 @@ from .concept_ordinals import (
 from .concept_tokens import semantic_tokens
 
 
+CONCEPT_FAMILY_CONTRACT_VERSION = "concept_family_v3"
 CONCEPT_FAMILY_GENERIC_TOKENS = frozenset({
     "concept", "concepts", "effect", "effects", "equation", "equations",
     "formula", "formulas", "identity", "identities", "law", "laws",
@@ -31,6 +33,33 @@ CONCEPT_FAMILY_NOISE_TOKENS = frozenset({
     "problem", "problems", "recap", "summary", "the", "to", "using", "via",
     "with", "worked",
 })
+
+
+def has_incompatible_gemini_concept_family_contract(value: object) -> bool:
+    """Identify explicit Gemini family metadata from another contract version.
+
+    Unversioned rows remain compatible so legitimate pre-contract feedback and
+    assessments keep their historical behavior.
+    """
+    if isinstance(value, Mapping):
+        parsed = dict(value)
+    else:
+        try:
+            parsed = json.loads(str(value or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            return False
+    if not isinstance(parsed, dict):
+        return False
+    nested = parsed.get("selection_metadata") or parsed.get("selection")
+    if isinstance(nested, dict):
+        parsed = {**parsed, **nested}
+    version = str(parsed.get("concept_family_contract_version") or "").strip()
+    authority = str(parsed.get("selection_authority") or "").strip().casefold()
+    return bool(version) and authority == "gemini" and (
+        version != CONCEPT_FAMILY_CONTRACT_VERSION
+    )
+
+
 def concept_family_identity_tokens(
     value: object,
 ) -> tuple[str, ...]:

@@ -193,9 +193,9 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                 "UPDATE reels SET search_context_json = ? WHERE id = ?",
                 (
                     json.dumps({
-                        "selection_contract_version": "quality_silence_v38",
+                        "selection_contract_version": "quality_silence_v39",
                         "selection_authority": "gemini",
-                        "concept_family_contract_version": "concept_family_v2",
+                        "concept_family_contract_version": "concept_family_v3",
                         "concept_family": "Newton's third law of motion",
                         "concept_aliases": [],
                     }),
@@ -278,8 +278,8 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         concepts = [
             {"id": "first", "title": "Newton's first law"},
             {"id": "inertia", "title": "inertia and motion"},
-            {"id": "second", "title": "Newton's second law"},
-            {"id": "fma", "title": "F=ma and net force"},
+            {"id": "second", "title": "Newton's second law overview"},
+            {"id": "fma", "title": "force-mass-acceleration proportionality"},
             {"id": "thermo", "title": "first law of thermodynamics"},
         ]
 
@@ -297,15 +297,15 @@ class AdaptiveCurriculumTests(unittest.TestCase):
             {
                 "first": profile("Newton's first law"),
                 "inertia": profile("Newton's first law"),
-                "second": profile("Newton's second law"),
-                "fma": profile("Newton's second law"),
+                "second": profile("Newton's second law overview"),
+                "fma": profile("force-mass-acceleration proportionality"),
                 "thermo": profile("first law of thermodynamics"),
             },
         )
         self.assertIn("inertia", families["first"])
         self.assertIn("first", families["inertia"])
-        self.assertIn("fma", families["second"])
-        self.assertIn("second", families["fma"])
+        self.assertNotIn("fma", families["second"])
+        self.assertNotIn("second", families["fma"])
         self.assertNotIn("second", families["first"])
         self.assertNotIn("first", families["second"])
         self.assertNotIn("thermo", families["first"])
@@ -338,24 +338,27 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         self.assertEqual(untrusted_families["inertia"], {"inertia"})
         self.assertEqual(untrusted_families["first"], {"first"})
 
-        broad_families = self.svc._concept_family_ids(
+        comparison_families = self.svc._concept_family_ids(
             [
                 {"id": "newton-members", "title": "Newton's first and second laws"},
                 {"id": "newton-overview", "title": "Newton's laws comparison"},
                 {"id": "world-members", "title": "World War I and II comparison"},
-                {"id": "world-overview", "title": "World Wars overview"},
+                {
+                    "id": "world-overview",
+                    "title": "World War I and II comparison overview",
+                },
             ],
             {
-                "newton-members": profile("Newton's laws of motion"),
-                "newton-overview": profile("Newton's laws of motion"),
-                "world-members": profile("World Wars"),
-                "world-overview": profile("World Wars"),
+                "newton-members": profile("Newtonian laws comparison"),
+                "newton-overview": profile("Newtonian laws comparison"),
+                "world-members": profile("World Wars comparison"),
+                "world-overview": profile("World Wars comparison"),
             },
         )
-        self.assertIn("newton-overview", broad_families["newton-members"])
-        self.assertIn("newton-members", broad_families["newton-overview"])
-        self.assertIn("world-overview", broad_families["world-members"])
-        self.assertIn("world-members", broad_families["world-overview"])
+        self.assertIn("newton-overview", comparison_families["newton-members"])
+        self.assertIn("newton-members", comparison_families["newton-overview"])
+        self.assertIn("world-overview", comparison_families["world-members"])
+        self.assertIn("world-members", comparison_families["world-overview"])
 
         terminal_notation_families = self.svc._concept_family_ids(
             [
@@ -404,9 +407,9 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                 "UPDATE reels SET search_context_json = ? WHERE id = ?",
                 (
                     json.dumps({
-                        "selection_contract_version": "quality_silence_v38",
+                        "selection_contract_version": "quality_silence_v39",
                         "selection_authority": "gemini",
-                        "concept_family_contract_version": "concept_family_v2",
+                        "concept_family_contract_version": "concept_family_v3",
                         "concept_family": family,
                         "concept_aliases": aliases,
                     }),
@@ -428,9 +431,9 @@ class AdaptiveCurriculumTests(unittest.TestCase):
             "UPDATE reels SET search_context_json = ? WHERE id = ?",
             (
                 json.dumps({
-                    "selection_contract_version": "quality_silence_v38",
+                    "selection_contract_version": "quality_silence_v39",
                     "selection_authority": "gemini",
-                    "concept_family_contract_version": "concept_family_v2",
+                    "concept_family_contract_version": "concept_family_v3",
                     "concept_family": "Newton's first law",
                     "concept_aliases": ["photosynthesis"],
                 }),
@@ -443,20 +446,227 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         )
         self.assertNotIn("c2", profiles)
 
+    def test_previous_broad_family_contract_is_not_trusted_for_adaptation(
+        self,
+    ) -> None:
+        self._insert_reel("stale-broad-family", "c1", "va", 1, 0.4)
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = ?",
+            (
+                json.dumps({
+                    "selection_contract_version": "quality_silence_v38",
+                    "selection_authority": "gemini",
+                    "concept_family_contract_version": "concept_family_v2",
+                    "concept_family": "Newton's second law of motion",
+                    "concept_aliases": [],
+                }),
+                "stale-broad-family",
+            ),
+        )
+
+        profiles = self.svc._persisted_concept_family_profiles(
+            self.conn,
+            self.MATERIAL,
+        )
+
+        self.assertNotIn("c1", profiles)
+
+    def test_stale_gemini_family_signals_are_excluded_from_v3_adaptation(
+        self,
+    ) -> None:
+        self.conn.execute(
+            "UPDATE learner_material_progress SET difficulty_reset_at = '' "
+            "WHERE learner_id = ? AND material_id = ?",
+            (self.LEARNER, self.MATERIAL),
+        )
+        for reel_id, concept_id, video_id, start in (
+            ("stale-v2", "c1", "va", 1),
+            ("current-v3", "c1", "vb", 30),
+            ("legacy-unversioned", "c2", "vc", 60),
+        ):
+            self._insert_reel(reel_id, concept_id, video_id, start, 0.6)
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = 'stale-v2'",
+            (json.dumps({
+                "selection_authority": "gemini",
+                "concept_family_contract_version": "concept_family_v2",
+                "concept_family": "Newton's second law of motion",
+                "concept_aliases": [],
+            }),),
+        )
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = 'current-v3'",
+            (json.dumps({
+                "selection_authority": "gemini",
+                "concept_family_contract_version": "concept_family_v3",
+                "concept_family": "force-mass-acceleration proportionality",
+                "concept_aliases": [],
+            }),),
+        )
+        for reel_id, helpful, confusing in (
+            ("stale-v2", False, True),
+            ("current-v3", True, False),
+            ("legacy-unversioned", False, True),
+        ):
+            self.svc.record_feedback(
+                self.conn,
+                reel_id,
+                helpful=helpful,
+                confusing=confusing,
+                rating=None,
+                saved=False,
+                learner_id=self.LEARNER,
+            )
+        self.conn.execute(
+            "UPDATE reel_feedback SET mastery_updated_at = CASE reel_id "
+            "WHEN 'current-v3' THEN '2026-07-20T00:00:00+00:00' "
+            "WHEN 'legacy-unversioned' THEN '2026-07-21T00:00:00+00:00' "
+            "ELSE '2099-01-01T00:00:00+00:00' END "
+            "WHERE learner_id = ?",
+            (self.LEARNER,),
+        )
+        self._insert_assessment_outcome(
+            session_id="stale-v2-quiz",
+            concept_id="c1",
+            adjustment=-0.12,
+            source_reel_id="stale-v2",
+        )
+        self._insert_assessment_outcome(
+            session_id="current-v3-quiz",
+            concept_id="c1",
+            adjustment=0.08,
+            source_reel_id="current-v3",
+        )
+        self._insert_assessment_outcome(
+            session_id="legacy-unversioned-quiz",
+            concept_id="c2",
+            adjustment=-0.12,
+            source_reel_id="legacy-unversioned",
+        )
+        self.conn.execute(
+            "UPDATE assessment_concept_outcomes SET created_at = CASE session_id "
+            "WHEN 'current-v3-quiz' THEN '2026-07-20T01:00:00+00:00' "
+            "WHEN 'legacy-unversioned-quiz' THEN '2026-07-21T01:00:00+00:00' "
+            "ELSE '2099-01-01T01:00:00+00:00' END "
+            "WHERE learner_id = ?",
+            (self.LEARNER,),
+        )
+
+        coverage, adjustments, latest, _ = self.svc._learner_adaptation_context(
+            self.conn,
+            self.MATERIAL,
+            self.LEARNER,
+        )
+
+        self.assertEqual(
+            coverage,
+            {
+                "c1": {"helpful": 2.0, "confusing": 0.0},
+                "c2": {"helpful": 0.0, "confusing": 2.0},
+            },
+        )
+        self.assertAlmostEqual(adjustments["c1"], 0.12)
+        self.assertAlmostEqual(adjustments["c2"], -0.18)
+        self.assertEqual((latest or {}).get("session_id"), "legacy-unversioned-quiz")
+        self.assertEqual(
+            [
+                row["concept_id"]
+                for row in (latest or {}).get("assessment_remediations") or []
+            ],
+            ["c2"],
+        )
+        self.assertAlmostEqual(
+            self.svc.update_level_adjustment(
+                self.conn,
+                self.MATERIAL,
+                self.LEARNER,
+            ),
+            -0.06,
+        )
+
+    def test_stale_reels_do_not_affect_acquisition_but_legacy_rows_still_do(
+        self,
+    ) -> None:
+        self._insert_reel("stale-helpful", "c1", "va", 1, 0.4)
+        self._insert_reel("current-count", "c2", "vb", 30, 0.4)
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = 'stale-helpful'",
+            (json.dumps({
+                "selection_authority": "gemini",
+                "concept_family_contract_version": "concept_family_v2",
+                "concept_family": "Newton's second law of motion",
+                "concept_aliases": [],
+            }),),
+        )
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = 'current-count'",
+            (json.dumps({
+                "selection_authority": "gemini",
+                "concept_family_contract_version": "concept_family_v3",
+                "concept_family": "net force vector sum",
+                "concept_aliases": [],
+            }),),
+        )
+        self.svc.record_feedback(
+            self.conn,
+            "stale-helpful",
+            helpful=True,
+            confusing=False,
+            rating=5,
+            saved=False,
+            learner_id=self.LEARNER,
+        )
+        self._insert_assessment_outcome(
+            session_id="stale-helpful-quiz",
+            concept_id="c1",
+            adjustment=0.08,
+            source_reel_id="stale-helpful",
+        )
+        concepts = [
+            dict(row)
+            for row in self.conn.execute(
+                "SELECT * FROM concepts WHERE material_id = ? ORDER BY id",
+                (self.MATERIAL,),
+            ).fetchall()
+        ]
+        self.assertEqual(
+            [row["id"] for row in self.svc._order_concepts(
+                self.conn, self.MATERIAL, concepts, self.LEARNER
+            )],
+            ["c1", "c2"],
+        )
+
+        self._insert_reel("legacy-helpful", "c1", "vc", 60, 0.4)
+        self.svc.record_feedback(
+            self.conn,
+            "legacy-helpful",
+            helpful=True,
+            confusing=False,
+            rating=5,
+            saved=False,
+            learner_id=self.LEARNER,
+        )
+        self.assertEqual(
+            [row["id"] for row in self.svc._order_concepts(
+                self.conn, self.MATERIAL, concepts, self.LEARNER
+            )],
+            ["c2", "c1"],
+        )
+
     def test_persisted_family_profiles_reject_conflicting_shared_facet(self) -> None:
         self.conn.execute("UPDATE concepts SET title = 'Newton laws' WHERE id = 'c1'")
         contexts = (
             {
-                "selection_contract_version": "quality_silence_v38",
+                "selection_contract_version": "quality_silence_v39",
                 "selection_authority": "gemini",
-                "concept_family_contract_version": "concept_family_v2",
+                "concept_family_contract_version": "concept_family_v3",
                 "concept_family": "Newton's first law",
                 "concept_aliases": [],
             },
             {
-                "selection_contract_version": "quality_silence_v38",
+                "selection_contract_version": "quality_silence_v39",
                 "selection_authority": "gemini",
-                "concept_family_contract_version": "concept_family_v2",
+                "concept_family_contract_version": "concept_family_v3",
                 "concept_family": "Newton's second law",
                 "concept_aliases": [],
             },
@@ -575,9 +785,9 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                 "UPDATE reels SET search_context_json = ? WHERE id = ?",
                 (
                     json.dumps({
-                        "selection_contract_version": "quality_silence_v38",
+                        "selection_contract_version": "quality_silence_v39",
                         "selection_authority": "gemini",
-                        "concept_family_contract_version": "concept_family_v2",
+                        "concept_family_contract_version": "concept_family_v3",
                         "concept_family": family,
                         "concept_aliases": [],
                     }),
@@ -606,6 +816,124 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         self.assertNotIn(thermo_id, coverage)
         self.assertAlmostEqual(adjustments[newton_id], 0.04)
         self.assertNotIn(thermo_id, adjustments)
+
+    def test_narrow_physics_families_keep_feedback_and_quiz_signals_isolated(
+        self,
+    ) -> None:
+        facets = (
+            ("units-definition", "Force measurement units", "SI force units", "va"),
+            ("units-paraphrase", "Newtons as force units", "SI force units", "vb"),
+            (
+                "proportionality",
+                "How force and mass change acceleration",
+                "force-mass-acceleration proportionality",
+                "vc",
+            ),
+            ("net-force", "Adding forces", "net force vector sum", "va"),
+            (
+                "frictionless",
+                "Acceleration without friction",
+                "frictionless Newton second-law application",
+                "vb",
+            ),
+            (
+                "friction",
+                "Acceleration with friction",
+                "frictional Newton second-law application",
+                "vc",
+            ),
+        )
+        concept_ids: dict[str, str] = {}
+        for index, (key, title, family, video_id) in enumerate(facets):
+            concept_id = ensure_clip_concept(
+                self.conn,
+                material_id=self.MATERIAL,
+                title=title,
+                semantic_identity=family,
+            )[0]
+            concept_ids[key] = concept_id
+            reel_id = f"narrow-family-{key}"
+            self._insert_reel(
+                reel_id,
+                concept_id,
+                video_id,
+                index * 30 + 1,
+                0.4,
+            )
+            self.conn.execute(
+                "UPDATE reels SET search_context_json = ? WHERE id = ?",
+                (
+                    json.dumps({
+                        "selection_contract_version": "quality_silence_v39",
+                        "selection_authority": "gemini",
+                        "concept_family_contract_version": "concept_family_v3",
+                        "concept_family": family,
+                        "concept_aliases": [],
+                    }),
+                    reel_id,
+                ),
+            )
+
+        self.assertEqual(
+            concept_ids["units-definition"],
+            concept_ids["units-paraphrase"],
+        )
+        self.assertEqual(len(set(concept_ids.values())), 5)
+
+        units_id = concept_ids["units-definition"]
+        proportionality_id = concept_ids["proportionality"]
+        self.svc.record_feedback(
+            self.conn,
+            "narrow-family-units-definition",
+            helpful=True,
+            confusing=False,
+            rating=None,
+            saved=False,
+            learner_id=self.LEARNER,
+        )
+        coverage, adjustments, _, _ = self.svc._learner_adaptation_context(
+            self.conn,
+            self.MATERIAL,
+            self.LEARNER,
+        )
+        self.assertEqual(
+            coverage,
+            {units_id: {"helpful": 1.0, "confusing": 0.0}},
+        )
+        self.assertEqual(set(adjustments), {units_id})
+        self.assertAlmostEqual(adjustments[units_id], 0.04)
+
+        self.conn.execute(
+            "UPDATE learner_material_progress SET difficulty_reset_at = '' "
+            "WHERE learner_id = ? AND material_id = ?",
+            (self.LEARNER, self.MATERIAL),
+        )
+        self._insert_assessment_outcome(
+            session_id="narrow-family-wrong-quiz",
+            concept_id=proportionality_id,
+            adjustment=-0.12,
+            video_id="vc",
+            difficulty=0.4,
+        )
+        coverage, adjustments, latest, _ = self.svc._learner_adaptation_context(
+            self.conn,
+            self.MATERIAL,
+            self.LEARNER,
+        )
+        self.assertEqual(
+            coverage,
+            {
+                units_id: {"helpful": 1.0, "confusing": 0.0},
+                proportionality_id: {"helpful": 0.0, "confusing": 1.0},
+            },
+        )
+        self.assertAlmostEqual(adjustments[units_id], 0.04)
+        self.assertAlmostEqual(adjustments[proportionality_id], -0.12)
+        self.assertEqual(set(adjustments), {units_id, proportionality_id})
+        self.assertEqual(
+            set((latest or {}).get("concept_family_ids") or []),
+            {proportionality_id},
+        )
 
     def test_need_help_prefers_easier_same_concept_from_other_source(self) -> None:
         self._insert_reel("watched", "c1", "va", 1, 0.8)
@@ -744,6 +1072,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         video_id: str = "va",
         difficulty: float = 0.8,
         learner_id: str | None = None,
+        source_reel_id: str | None = None,
     ) -> None:
         learner = learner_id or self.LEARNER
         timestamp = now_iso()
@@ -767,7 +1096,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
             "(learner_id, session_id, material_id, concept_id, question_count, "
             "correct_count, accuracy, adjustment, source_reel_id, source_video_id, "
             "source_difficulty, created_at) "
-            "VALUES (?, ?, ?, ?, 1, ?, ?, ?, NULL, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
             (
                 learner,
                 session_id,
@@ -776,6 +1105,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                 1 if adjustment > 0 else 0,
                 1.0 if adjustment > 0 else 0.0,
                 adjustment,
+                source_reel_id,
                 video_id,
                 difficulty,
                 timestamp,
@@ -866,9 +1196,9 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                 "UPDATE reels SET search_context_json = ? WHERE id = ?",
                 (
                     json.dumps({
-                        "selection_contract_version": "quality_silence_v38",
+                        "selection_contract_version": "quality_silence_v39",
                         "selection_authority": "gemini",
-                        "concept_family_contract_version": "concept_family_v2",
+                        "concept_family_contract_version": "concept_family_v3",
                         "concept_family": "Newton's third law of motion",
                         "concept_aliases": [],
                     }),

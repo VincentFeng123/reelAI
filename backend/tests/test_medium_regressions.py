@@ -96,6 +96,7 @@ class MediumRegressionTests(unittest.TestCase):
                 t_end REAL NOT NULL,
                 transcript_snippet TEXT NOT NULL DEFAULT '',
                 takeaways_json TEXT NOT NULL DEFAULT '[]',
+                search_context_json TEXT NOT NULL DEFAULT '{}',
                 base_score REAL NOT NULL DEFAULT 0,
                 difficulty REAL,
                 created_at TEXT NOT NULL DEFAULT ''
@@ -3430,7 +3431,7 @@ class MediumRegressionTests(unittest.TestCase):
         conn = self._build_ranked_feed_test_conn()
         service = ReelService(embedding_service=None, youtube_service=None)
         current_version = service.RANKED_FEED_CACHE_VERSION
-        self.assertGreater(current_version, 13)
+        self.assertEqual(current_version, 46)
 
         stale_relevance = {
             "score": 0.9,
@@ -3440,7 +3441,7 @@ class MediumRegressionTests(unittest.TestCase):
             "off_topic_penalty": 0.0,
             "reason": "legacy cache entry",
         }
-        service.RANKED_FEED_CACHE_VERSION = 13
+        service.RANKED_FEED_CACHE_VERSION = current_version - 1
         with mock.patch.object(
             service,
             "_score_text_relevance",

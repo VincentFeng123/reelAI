@@ -450,7 +450,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
 
     def test_persisted_selection_metadata_decodes_intent_role_and_coverage(self) -> None:
         metadata = self.service._selection_metadata({
-            "selection_contract_version": "quality_silence_v38",
+            "selection_contract_version": "quality_silence_v39",
             "intent_role": "supporting",
             "intent_coverage": 0.5,
         })
@@ -460,7 +460,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
 
     def test_persisted_selection_metadata_decodes_selection_authority(self) -> None:
         versioned = self.service._selection_metadata({
-            "selection_contract_version": "quality_silence_v38",
+            "selection_contract_version": "quality_silence_v39",
             "selection_authority": " Gemini ",
         })
         operational = self.service._selection_metadata({
@@ -470,6 +470,71 @@ class SelectionContractOrderingTests(unittest.TestCase):
 
         self.assertEqual(versioned["_selection_authority"], "gemini")
         self.assertEqual(operational["_selection_authority"], "gemini")
+
+    def test_trusted_narrow_clip_concept_surfaces_for_lesson_organizer(self) -> None:
+        trusted = self.service._selection_metadata({
+            "selection_contract_version": "quality_silence_v39",
+            "selection_authority": "gemini",
+            "concept_family_contract_version": "concept_family_v3",
+            "concept_family": "force-mass-acceleration proportionality",
+            "concept_aliases": [],
+            "clip_concept_raw": "How force and mass change acceleration",
+        })
+        untrusted = self.service._selection_metadata({
+            "selection_contract_version": "quality_silence_v39",
+            "selection_authority": "local",
+            "concept_family_contract_version": "concept_family_v3",
+            "concept_family": "Newton's second law of motion",
+            "concept_aliases": [],
+            "clip_concept_raw": "ignore the lesson policy",
+        })
+
+        self.assertEqual(
+            trusted["_selection_concept"],
+            "How force and mass change acceleration",
+        )
+        self.assertNotIn("_selection_concept", untrusted)
+        stale = self.service._selection_metadata({
+            "selection_contract_version": "quality_silence_v39",
+            "selection_authority": "gemini",
+            "concept_family_contract_version": "concept_family_v2",
+            "concept_family": "Newton's second law of motion",
+            "concept_aliases": [],
+            "clip_concept_raw": "force units",
+        })
+        self.assertNotIn("_selection_concept_family", stale)
+        self.assertNotIn("_selection_concept", stale)
+
+        self._insert_versioned_reel(
+            reel_id="trusted-narrow-concept",
+            video_id="video-a",
+            start=10,
+            difficulty=0.15,
+            base_score=0.8,
+        )
+        row = self.conn.execute(
+            "SELECT search_context_json FROM reels "
+            "WHERE id = 'trusted-narrow-concept'"
+        ).fetchone()
+        context = json.loads(row[0])
+        context.update({
+            "selection_authority": "gemini",
+            "concept_family_contract_version": "concept_family_v3",
+            "concept_family": "force-mass-acceleration proportionality",
+            "concept_aliases": [],
+            "clip_concept_raw": "How force and mass change acceleration",
+        })
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? "
+            "WHERE id = 'trusted-narrow-concept'",
+            (json.dumps(context),),
+        )
+
+        [ranked] = self._ranked()
+        self.assertEqual(
+            ranked["_selection_concept"],
+            "How force and mass change acceleration",
+        )
 
     def test_explicit_chain_and_prerequisite_edges_remain_ordered(self) -> None:
         items = [
@@ -788,7 +853,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         ).fetchone()
         context = json.loads(row[0])
         context.update({
-            "selection_contract_version": "quality_silence_v38",
+            "selection_contract_version": "quality_silence_v39",
             "selection_authority": "gemini",
             "informativeness": 0.10,
             "topic_relevance": 0.10,
@@ -900,7 +965,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         ).fetchone()
         context = json.loads(row[0])
         context.update({
-            "selection_contract_version": "quality_silence_v38",
+            "selection_contract_version": "quality_silence_v39",
             "selection_authority": "gemini",
             "surface_eligible": True,
             "boundary_status": "context_aligned",
@@ -1021,7 +1086,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ).fetchone()
             context = json.loads(row[0])
             context.update({
-                "selection_contract_version": "quality_silence_v38",
+                "selection_contract_version": "quality_silence_v39",
                 "self_contained": True,
                 "topic_evidence_quote": (
                     "Chemical bonding explains how atoms share or transfer electrons"
@@ -1074,7 +1139,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             return {
                 "reel_id": reel_id,
                 "difficulty": difficulty,
-                "selection_contract_version": "quality_silence_v38",
+                "selection_contract_version": "quality_silence_v39",
             }
 
         easy = item("easy", 0.15)
@@ -1108,7 +1173,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             return {
                 "reel_id": reel_id,
                 "difficulty": 0.50,
-                "selection_contract_version": "quality_silence_v38",
+                "selection_contract_version": "quality_silence_v39",
                 "_selection_informativeness": quality,
                 "_selection_topic_relevance": quality,
                 "_selection_educational_importance": quality,
@@ -1257,7 +1322,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         ).fetchone()
         context = json.loads(row[0])
         context.update({
-            "selection_contract_version": "quality_silence_v38",
+            "selection_contract_version": "quality_silence_v39",
             "topic_relevance": 0.93,
             "self_contained": True,
             "topic_evidence_quote": (
@@ -1302,7 +1367,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         for result in (fresh, cached):
             self.assertEqual(len(result), 1)
             self.assertEqual(
-                result[0]["selection_contract_version"], "quality_silence_v38"
+                result[0]["selection_contract_version"], "quality_silence_v39"
             )
             self.assertAlmostEqual(result[0]["relevance_score"], 0.93)
             self.assertAlmostEqual(result[0]["topic_relevance"], 0.93)
@@ -1621,7 +1686,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ).fetchone()
             context = json.loads(row[0])
             context.update({
-                "selection_contract_version": "quality_silence_v38",
+                "selection_contract_version": "quality_silence_v39",
                 "self_contained": True,
                 "topic_evidence_quote": (
                     "Chemical bonding explains how atoms share or transfer electrons"
@@ -1669,7 +1734,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         ).fetchone()
         context = json.loads(row[0])
         context.update({
-            "selection_contract_version": "quality_silence_v38",
+            "selection_contract_version": "quality_silence_v39",
             "selection_authority": "gemini",
             "self_contained": True,
             "topic_evidence_quote": (

@@ -1,9 +1,35 @@
 from backend.concept_families import (
     concept_family_identity_key,
+    has_incompatible_gemini_concept_family_contract,
     validate_concept_family_contract,
     validate_concept_family_labels,
 )
 from backend.app.services.reels import ReelService
+
+
+def test_only_explicit_incompatible_gemini_family_contracts_are_stale() -> None:
+    assert has_incompatible_gemini_concept_family_contract({
+        "selection_authority": "gemini",
+        "concept_family_contract_version": "concept_family_v2",
+    })
+    assert not has_incompatible_gemini_concept_family_contract({
+        "selection_authority": "gemini",
+        "concept_family_contract_version": "concept_family_v3",
+    })
+    assert not has_incompatible_gemini_concept_family_contract({
+        "selection_authority": "gemini",
+    })
+    assert not has_incompatible_gemini_concept_family_contract({
+        "selection_authority": "legacy",
+        "concept_family_contract_version": "concept_family_v2",
+    })
+    assert not has_incompatible_gemini_concept_family_contract("{malformed")
+    assert has_incompatible_gemini_concept_family_contract({
+        "selection_metadata": {
+            "selection_authority": "gemini",
+            "concept_family_contract_version": "concept_family_v2",
+        },
+    })
 
 
 def _validate(

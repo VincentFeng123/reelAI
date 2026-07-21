@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ...concept_families import (
+    CONCEPT_FAMILY_CONTRACT_VERSION,
     concept_family_identity_key as shared_concept_family_identity_key,
     validate_concept_family_contract,
 )
@@ -150,7 +151,6 @@ GROQ_BOUNDARY_END_POSTROLL_SEC = 0.02
 GROQ_BOUNDARY_NEIGHBOR_GUARD_SEC = 0.01
 GROQ_BOUNDARY_WINDOW_SEC = 12.0
 GROQ_BOUNDARY_WINDOW_MARGIN_SEC = 2.0
-CONCEPT_FAMILY_CONTRACT_VERSION = "concept_family_v2"
 # Live boundary windows regularly need 9-12 seconds including local WAV decode
 # and the provider round trip. Keep the request bounded while leaving enough
 # headroom for a healthy short-window transcription to finish.
@@ -822,7 +822,7 @@ def _boundary_evidence_grade(
     if (
         not isinstance(context, dict)
         or str(context.get("selection_contract_version") or "").strip()
-        != "quality_silence_v38"
+        != "quality_silence_v39"
     ):
         return 0
     if (
@@ -3778,7 +3778,7 @@ def _verified_direct_adapter_clips(
             search_context.pop("surface_reason", None)
         search_context.update(
             **_concept_family_search_context(clip),
-            selection_contract_version="quality_silence_v38",
+            selection_contract_version="quality_silence_v39",
             **(
                 {"selection_authority": "gemini"}
                 if gemini_authoritative
@@ -6512,7 +6512,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v38",
+                    selection_contract_version="quality_silence_v39",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,

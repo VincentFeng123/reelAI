@@ -49,7 +49,7 @@ def _strict_boundary_context(
     return {
         "selection_candidate_id": candidate_id,
         "surface_eligible": surface,
-        "selection_contract_version": "quality_silence_v38",
+        "selection_contract_version": "quality_silence_v39",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -74,7 +74,7 @@ def _transcript_boundary_context(
     return {
         "selection_candidate_id": candidate_id,
         "surface_eligible": surface,
-        "selection_contract_version": "quality_silence_v38",
+        "selection_contract_version": "quality_silence_v39",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -154,7 +154,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "topic_evidence_quote": "Decay has a constant probability per second",
             }),
             {
-                "concept_family_contract_version": "concept_family_v2",
+                "concept_family_contract_version": "concept_family_v3",
                 "selection_authority": "gemini",
                 "concept_family": "radioactive decay law",
                 "concept_aliases": [],
@@ -165,11 +165,11 @@ class PersistenceIntegrityTests(unittest.TestCase):
         self,
     ) -> None:
         for title, family in (
-            ("Kepler's Fifth Law", "Kepler's laws of planetary motion"),
-            ("Asimov's Zeroth Law", "Asimov's laws of robotics"),
-            ("Beethoven's Fifth Symphony", "Beethoven symphonies"),
-            ("The First Crusade", "the Crusades"),
-            ("The Fifth Cranial Nerve", "cranial nerves"),
+            ("Kepler's Fifth Law", "Kepler's fifth law of planetary motion"),
+            ("Asimov's Zeroth Law", "Asimov's zeroth law of robotics"),
+            ("Beethoven's Fifth Symphony", "Beethoven's Symphony No. 5"),
+            ("The First Crusade", "First Crusade"),
+            ("The Fifth Cranial Nerve", "trigeminal nerve (cranial nerve V)"),
         ):
             context = pipeline_module._concept_family_search_context({
                 "selection_authority": "gemini",
@@ -184,7 +184,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
             self.assertEqual(context["concept_aliases"], [])
             self.assertEqual(
                 context["concept_family_contract_version"],
-                "concept_family_v2",
+                "concept_family_v3",
             )
 
         self.assertEqual(
@@ -198,7 +198,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "topic_evidence_quote": "Kepler's fifth law governs planetary motion",
             }),
             {
-                "concept_family_contract_version": "concept_family_v2",
+                "concept_family_contract_version": "concept_family_v3",
                 "selection_authority": "gemini",
                 "concept_family": "Kepler's fifth law of planetary motion",
                 "concept_aliases": [],
@@ -216,7 +216,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "topic_evidence_quote": "Apollo 11 carried astronauts to the Moon",
             }),
             {
-                "concept_family_contract_version": "concept_family_v2",
+                "concept_family_contract_version": "concept_family_v3",
                 "selection_authority": "gemini",
                 "concept_family": "Apollo 11 mission",
                 "concept_aliases": [],
@@ -548,7 +548,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
         first_clip = gemini_segment._public_clips(
             [{
                 "facet": "  Net   Force—Acceleration  ",
-                "concept_family": "Newton's second law",
+                "concept_family": "net-force-acceleration relationship",
                 "concept_aliases": ["F=ma", "net force equation"],
                 "learning_objective": "Explain Newton's second law as F=ma",
                 "topic_evidence_quote": "Net force produces acceleration in this system",
@@ -559,7 +559,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
         second_clip = gemini_segment._public_clips(
             [{
                 "facet": "net-force / acceleration",
-                "concept_family": "Newton's second law",
+                "concept_family": "net-force-acceleration relationship",
                 "concept_aliases": ["F=ma"],
                 "learning_objective": "Explain Newton's second law as F=ma",
                 "topic_evidence_quote": "Acceleration follows from the applied net force",
@@ -642,7 +642,10 @@ class PersistenceIntegrityTests(unittest.TestCase):
 
         self.assertEqual(first_clip["concept"], "Net Force—Acceleration")
         self.assertEqual(second_clip["concept"], "net-force / acceleration")
-        self.assertEqual(first_clip["concept_family"], "Newton's second law")
+        self.assertEqual(
+            first_clip["concept_family"],
+            "net-force-acceleration relationship",
+        )
         self.assertEqual(first_clip["concept_aliases"], [])
         self.assertEqual(first.concept_id, second.concept_id)
         self.assertNotEqual(first.concept_id, "concept-a")
@@ -651,12 +654,18 @@ class PersistenceIntegrityTests(unittest.TestCase):
             str(
                 uuid.uuid5(
                     uuid.NAMESPACE_URL,
-                    "reelai:clip-concept-family-v1:material-a:newton second law",
+                    "reelai:clip-concept-family-v1:material-a:net force acceleration relationship",
                 )
             ),
         )
-        self.assertEqual(first.concept_title, "Newton's second law")
-        self.assertEqual(second.concept_title, "Newton's second law")
+        self.assertEqual(
+            first.concept_title,
+            "net-force-acceleration relationship",
+        )
+        self.assertEqual(
+            second.concept_title,
+            "net-force-acceleration relationship",
+        )
 
         with db_module.get_conn() as conn:
             concept_rows = db_module.fetch_all(
@@ -673,7 +682,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
 
         self.assertCountEqual(
             [row["title"] for row in concept_rows],
-            ["Newton's second law", "Test concept"],
+            ["net-force-acceleration relationship", "Test concept"],
         )
         self.assertEqual(
             [row["concept_id"] for row in reel_rows],
@@ -691,13 +700,17 @@ class PersistenceIntegrityTests(unittest.TestCase):
             self.assertEqual(provenance["clip_concept_key"], "net force acceleration")
             self.assertEqual(provenance["clip_concept_id"], first.concept_id)
             self.assertEqual(
-                provenance["clip_concept_title"], "Newton's second law"
+                provenance["clip_concept_title"],
+                "net-force-acceleration relationship",
             )
             self.assertEqual(
                 provenance["concept_family_contract_version"],
-                "concept_family_v2",
+                "concept_family_v3",
             )
-            self.assertEqual(provenance["concept_family"], "Newton's second law")
+            self.assertEqual(
+                provenance["concept_family"],
+                "net-force-acceleration relationship",
+            )
             self.assertEqual(provenance["concept_aliases"], [])
 
     def test_scratch_concepts_are_scoped_to_their_material(self) -> None:
@@ -904,7 +917,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "search_context": {
                     "selection_candidate_id": candidate_id,
                     "surface_eligible": True,
-                    "selection_contract_version": "quality_silence_v38",
+                    "selection_contract_version": "quality_silence_v39",
                     "speech_corridor_verified": True,
                     "boundary_status": "verified",
                     "boundary_diagnostics": {
@@ -1099,7 +1112,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
             )
         context = json.loads(row["search_context_json"])
         self.assertEqual(
-            context["selection_contract_version"], "quality_silence_v38"
+            context["selection_contract_version"], "quality_silence_v39"
         )
         self.assertEqual(context["boundary_status"], "context_aligned")
 

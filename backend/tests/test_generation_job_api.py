@@ -63,9 +63,9 @@ def test_fresh_inventory_and_selector_cache_share_current_contract() -> None:
     assert {
         main.SELECTION_CONTRACT_VERSION,
         ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
-    } == {"quality_silence_v38"}
-    assert generation_jobs.REQUEST_SCHEMA_VERSION == "adaptive_clip_concepts_v3"
-    assert segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v38"
+    } == {"quality_silence_v39"}
+    assert generation_jobs.REQUEST_SCHEMA_VERSION == "adaptive_clip_concepts_v4"
+    assert segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v39"
     assert "quality_silence_v18" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v19" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v20" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
@@ -83,18 +83,20 @@ def test_fresh_inventory_and_selector_cache_share_current_contract() -> None:
     assert "quality_silence_v32" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v37" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v38" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
+    assert "quality_silence_v39" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
 
 
 def test_current_request_filter_rejects_stale_or_unversioned_inventory() -> None:
-    current = {"reel_id": "current", "selection_contract_version": "quality_silence_v38"}
+    current = {"reel_id": "current", "selection_contract_version": "quality_silence_v39"}
     internal_current = {
         "reel_id": "internal-current",
-        "_selection_contract_version": "quality_silence_v38",
+        "_selection_contract_version": "quality_silence_v39",
     }
 
     assert main._current_selection_contract_reels([
         {"reel_id": "stale", "selection_contract_version": "quality_silence_v36"},
         {"reel_id": "previous", "selection_contract_version": "quality_silence_v37"},
+        {"reel_id": "old-adaptive", "selection_contract_version": "quality_silence_v38"},
         {"reel_id": "missing"},
         current,
         internal_current,
@@ -680,9 +682,9 @@ def test_semantic_family_expands_organizer_signals_without_staling_active_job() 
         db._migrate_reel_feedback_uniqueness_sqlite(conn)
         conn.execute("UPDATE concepts SET title = ? WHERE id = 'c1'", ("Newton's first law",))
         source_context = json.dumps({
-            "selection_contract_version": "quality_silence_v38",
+            "selection_contract_version": "quality_silence_v39",
             "selection_authority": "gemini",
-            "concept_family_contract_version": "concept_family_v2",
+            "concept_family_contract_version": "concept_family_v3",
             "concept_family": "Newton's first law",
             "concept_aliases": [],
         })
@@ -720,11 +722,12 @@ def test_semantic_family_expands_organizer_signals_without_staling_active_job() 
             title="inertia and motion",
         )
         target_context = json.dumps({
-            "selection_contract_version": "quality_silence_v38",
+            "selection_contract_version": "quality_silence_v39",
             "selection_authority": "gemini",
-            "concept_family_contract_version": "concept_family_v2",
+            "concept_family_contract_version": "concept_family_v3",
             "concept_family": "Newton's first law",
             "concept_aliases": [],
+            "clip_concept_raw": "inertia resists changes in motion",
         })
         conn.execute(
             "INSERT INTO reels "
@@ -759,6 +762,11 @@ def test_semantic_family_expands_organizer_signals_without_staling_active_job() 
             target_reel,
             preserve_lesson_order_metadata=True,
         )
+        assert (
+            organizer_reel["_selection_concept"]
+            == "inertia resists changes in motion"
+        )
+        assert "_selection_concept" not in main._public_generation_reel(target_reel)
         prompt = lesson_ordering._user_prompt(
             [{
                 **organizer_reel,
@@ -772,9 +780,106 @@ def test_semantic_family_expands_organizer_signals_without_staling_active_job() 
             prompt.split("CLIPS_JSON:\n", 1)[1].split("\n\nFinal request:", 1)[0]
         )
         organizer_clip = prompt_payload["clips"][0]
+        assert organizer_clip["concept_title"] == "inertia resists changes in motion"
         assert organizer_clip["concept_family"] == "Newton's first law"
         assert organizer_clip["concept_aliases"] == []
         assert organizer_clip["learner_signal"] == signals[related_id]
+    finally:
+        conn.close()
+
+
+def test_organizer_adaptation_ignores_explicit_stale_family_provenance() -> None:
+    conn = _conn()
+    learner_id = "owner:family-rollout"
+    try:
+        db._migrate_reel_feedback_uniqueness_sqlite(conn)
+        for video_id in ("stale-video", "current-video", "legacy-video"):
+            conn.execute(
+                "INSERT INTO videos (id, title, channel_title, duration_sec, "
+                "created_at) VALUES (?, ?, 'channel', 300, "
+                "'2026-07-10T00:00:01+00:00')",
+                (video_id, video_id),
+            )
+        contexts = {
+            "stale-reel": json.dumps({
+                "selection_contract_version": "quality_silence_v38",
+                "selection_authority": "gemini",
+                "concept_family_contract_version": "concept_family_v2",
+                "concept_family": "cellular respiration",
+                "concept_aliases": [],
+            }),
+            "current-reel": json.dumps({
+                "selection_contract_version": "quality_silence_v39",
+                "selection_authority": "gemini",
+                "concept_family_contract_version": "concept_family_v3",
+                "concept_family": "mitochondrial ATP production",
+                "concept_aliases": [],
+                "clip_concept_raw": "mitochondrial ATP production",
+            }),
+            "legacy-reel": "{}",
+        }
+        for index, (reel_id, video_id) in enumerate((
+            ("stale-reel", "stale-video"),
+            ("current-reel", "current-video"),
+            ("legacy-reel", "legacy-video"),
+        )):
+            conn.execute(
+                "INSERT INTO reels (id, material_id, concept_id, video_id, "
+                "video_url, t_start, t_end, transcript_snippet, takeaways_json, "
+                "base_score, difficulty, created_at, search_context_json) "
+                "VALUES (?, 'm1', 'c1', ?, '', ?, ?, 'ATP explanation', '[]', "
+                "1.0, 0.5, '2026-07-10T00:00:02+00:00', ?)",
+                (reel_id, video_id, index * 30, index * 30 + 20, contexts[reel_id]),
+            )
+        for reel_id, helpful, confusing in (
+            ("stale-reel", False, True),
+            ("current-reel", True, False),
+            ("legacy-reel", False, True),
+        ):
+            main.reel_service.record_feedback(
+                conn,
+                reel_id,
+                helpful=helpful,
+                confusing=confusing,
+                rating=None,
+                saved=False,
+                learner_id=learner_id,
+            )
+
+        signals = main._learner_concept_signals(
+            conn,
+            material_id="m1",
+            learner_id=learner_id,
+        )
+        assert signals["c1"]["helpful"] == 1.0
+        assert signals["c1"]["confusing"] == 1.0
+        assert signals["c1"]["adjustment"] == pytest.approx(-0.02)
+        prompt = lesson_ordering._user_prompt(
+            [{
+                "reel_id": "current-reel",
+                "concept_id": "c1",
+                "_selection_concept": "mitochondrial ATP production",
+            }],
+            topic="cell biology",
+            learner_level="beginner",
+            concept_signals=signals,
+        )
+        prompt_payload = json.loads(
+            prompt.split("CLIPS_JSON:\n", 1)[1].split("\n\nFinal request:", 1)[0]
+        )
+        assert prompt_payload["clips"][0]["learner_signal"] == signals["c1"]
+
+        assert main._lesson_prior_concept_coverage(
+            conn,
+            material_id="m1",
+            reel_ids=["stale-reel"],
+        ) == []
+        prior = main._lesson_prior_concept_coverage(
+            conn,
+            material_id="m1",
+            reel_ids=["stale-reel", "current-reel", "legacy-reel"],
+        )
+        assert sum(int(row["delivered_count"]) for row in prior) == 2
     finally:
         conn.close()
 
@@ -1208,7 +1313,7 @@ def test_fresh_generation_gives_organizer_every_candidate_from_bounded_work(
         ).fetchone()[0])
         context["concept_family"] = "mitochondrial oxidative phosphorylation"
         context["concept_aliases"] = []
-        context["concept_family_contract_version"] = "concept_family_v2"
+        context["concept_family_contract_version"] = "concept_family_v3"
         context["selection_authority"] = "gemini"
         context["source_rank"] = index % 3
         context["selection_candidate_id"] = f"candidate-{index}"
@@ -1422,7 +1527,7 @@ def test_raw_parent_inventory_prevents_top_up_after_smaller_selected_subset(
             (f"raw-parent-reel-{index}",),
         ).fetchone()[0])
         context["selection_authority"] = "gemini"
-        context["concept_family_contract_version"] = "concept_family_v2"
+        context["concept_family_contract_version"] = "concept_family_v3"
         context["concept_family"] = "mitochondrial oxidative phosphorylation"
         context["concept_aliases"] = []
         context["topic_evidence_quote"] = lesson
@@ -1707,7 +1812,7 @@ def _insert_generation_reel(
             json.dumps({
                 "surface_eligible": True,
                 "boundary_status": "verified",
-                "selection_contract_version": "quality_silence_v38",
+                "selection_contract_version": "quality_silence_v39",
                 "speech_corridor_verified": True,
                 "directly_teaches_topic": True,
                 "substantive": True,
@@ -1741,7 +1846,7 @@ def _insert_generation_reel(
         "video_id": video_id,
         "t_start": 0.0,
         "t_end": 30.0,
-        "selection_contract_version": "quality_silence_v38",
+        "selection_contract_version": "quality_silence_v39",
     }
 
 
@@ -2781,7 +2886,7 @@ def _set_reel_boundary_state(
                 "speech_corridor_verified": True,
                 "selection_caption_cues": caption_cues,
                 "boundary_diagnostics": boundary_diagnostics,
-                "selection_contract_version": "quality_silence_v38",
+                "selection_contract_version": "quality_silence_v39",
                 "directly_teaches_topic": True,
                 "substantive": True,
                 "factually_grounded": True,
@@ -2918,7 +3023,7 @@ def _released_feed_reel(reel_id: str, index: int) -> dict:
         "_selection_topic_relevance": 0.9,
         "_selection_source_rank": index,
         "_selection_ordered": True,
-        "selection_contract_version": "quality_silence_v38",
+        "selection_contract_version": "quality_silence_v39",
     }
 
 
@@ -3179,7 +3284,7 @@ def test_released_feed_keeps_overlapping_declared_lesson_chain(monkeypatch) -> N
         t_start=10.0,
         t_end=30.0,
         search_context={
-            "selection_contract_version": "quality_silence_v38",
+            "selection_contract_version": "quality_silence_v39",
             "chain_id": "worked-example",
             "selection_candidate_id": "prerequisite-candidate",
         },
@@ -3190,7 +3295,7 @@ def test_released_feed_keeps_overlapping_declared_lesson_chain(monkeypatch) -> N
         t_start=10.0,
         t_end=50.0,
         search_context={
-            "selection_contract_version": "quality_silence_v38",
+            "selection_contract_version": "quality_silence_v39",
             "chain_id": "worked-example",
             "selection_candidate_id": "dependent-candidate",
             "prerequisite_ids": ["prerequisite-candidate"],
@@ -3594,7 +3699,7 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
             "takeaways": [],
             "score": 0.93,
             "relevance_score": 0.13,
-            "_selection_contract_version": "quality_silence_v38",
+            "_selection_contract_version": "quality_silence_v39",
             "_selection_topic_relevance": 0.93,
             "_selection_source_rank": 0,
         }],
@@ -3616,7 +3721,7 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
 
         assert len(reels) == 1
         assert reels[0]["video_id"] == "AbCdEf12345"
-        assert reels[0]["selection_contract_version"] == "quality_silence_v38"
+        assert reels[0]["selection_contract_version"] == "quality_silence_v39"
         assert reels[0]["relevance_score"] == 0.93
         assert reels[0]["topic_relevance"] == 0.93
         assert not any(key.startswith("_selection_") for key in reels[0])
@@ -4681,7 +4786,7 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
                 json.dumps({
                         "surface_eligible": True,
                         "boundary_status": "verified",
-                        "selection_contract_version": "quality_silence_v38",
+                        "selection_contract_version": "quality_silence_v39",
                         "speech_corridor_verified": True,
                         "directly_teaches_topic": True,
                         "substantive": True,
@@ -5883,7 +5988,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
                 "video_id": f"{mode}-video-{index % expected_source_cap}",
                 "t_start": float(index * 10),
                 "t_end": float(index * 10 + 8),
-                "selection_contract_version": "quality_silence_v38",
+                "selection_contract_version": "quality_silence_v39",
             }
             kwargs["on_reel_created"](reel)
         generated_count += int(kwargs["max_new_reels"])
@@ -5900,7 +6005,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
         lambda *_args, **_kwargs: [
             {
                 "reel_id": f"{mode}-reel-{index}",
-                "selection_contract_version": "quality_silence_v38",
+                "selection_contract_version": "quality_silence_v39",
             }
             for index in range(expected_reel_cap)
         ],
@@ -7395,7 +7500,7 @@ def test_generation_stream_replays_monotonic_persisted_events(monkeypatch) -> No
         payload={
             "reel": {
                 "reel_id": "provisional",
-                "selection_contract_version": "quality_silence_v38",
+                "selection_contract_version": "quality_silence_v39",
             },
             "provisional": True,
         },
@@ -7470,7 +7575,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
                 "video_id": "streamed-video",
                 "t_start": 10.0,
                 "t_end": 40.0,
-                "selection_contract_version": "quality_silence_v38",
+                "selection_contract_version": "quality_silence_v39",
             },
             "provisional": True,
         },
@@ -7495,7 +7600,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
         "_ranked_request_reels",
         lambda *_args, **_kwargs: [{
             "reel_id": "ranked-reel",
-            "selection_contract_version": "quality_silence_v38",
+            "selection_contract_version": "quality_silence_v39",
         }],
     )
     monkeypatch.setattr(
@@ -7556,7 +7661,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
                 "video_id": f"ranked-video-{index}",
                 "t_start": float(index * 30),
                 "t_end": float(index * 30 + 20),
-                "selection_contract_version": "quality_silence_v38",
+                "selection_contract_version": "quality_silence_v39",
             }
             for index in range(4)
         ],
@@ -9156,7 +9261,7 @@ def test_v7_feed_merges_value_ranked_batches_without_breaking_batch_topology(
             "_selection_topic_relevance": relevance,
             "_selection_source_rank": source_rank,
             "_selection_ordered": True,
-            "selection_contract_version": "quality_silence_v38",
+            "selection_contract_version": "quality_silence_v39",
         }
 
     root_reels = [
@@ -9287,7 +9392,7 @@ def test_generation_chain_uses_nearest_difficulty_across_all_batches(
             "_selection_topic_relevance": 0.9,
             "_selection_source_rank": 0,
             "_selection_ordered": True,
-            "selection_contract_version": "quality_silence_v38",
+            "selection_contract_version": "quality_silence_v39",
         }
 
     monkeypatch.setattr(
@@ -9503,7 +9608,7 @@ def test_generate_cross_request_reservoir_is_owned_by_current_batch(
             {
                 "reel_id": "verified-concept-reel",
                 "video_id": "verified-concept-video-0",
-                "selection_contract_version": "quality_silence_v38",
+                "selection_contract_version": "quality_silence_v39",
             }
         ],
     )
@@ -9557,7 +9662,7 @@ def test_generate_cross_request_reservoir_is_owned_by_current_batch(
             {
                 "reel_id": "verified-concept-reel",
                 "video_id": "verified-concept-video-0",
-                "selection_contract_version": "quality_silence_v38",
+                "selection_contract_version": "quality_silence_v39",
             }
         ]
         assert conn.execute(

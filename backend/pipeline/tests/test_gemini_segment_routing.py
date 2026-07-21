@@ -1191,7 +1191,8 @@ def test_live_pro_selector_retries_invalid_intent_contract_and_fails_closed(
         assert result.error is None
     else:
         assert result.rejection_reasons == [
-            "request_failure:GeminiSelectorContractError"
+            "request_failure:GeminiSelectorContractError",
+            expected_reason,
         ]
         assert result.error == (
             "GeminiSelectorContractError: Gemini model call failed"

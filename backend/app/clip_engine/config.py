@@ -50,6 +50,13 @@ LESSON_ORDER_MODEL = (
     and "pro" not in _lesson_order_model_name
     else "gemini-2.5-flash-lite"
 )
+_lesson_order_selected_name = LESSON_ORDER_MODEL.rsplit("/", 1)[-1].casefold()
+LESSON_ORDER_FALLBACK_MODEL = (
+    "gemini-2.5-flash-lite"
+    if _lesson_order_selected_name.startswith("gemini-2.5-flash")
+    and "lite" not in _lesson_order_selected_name
+    else "gemini-2.5-flash"
+)
 
 CLIP_ENGINE = os.environ.get("CLIP_ENGINE", "gemini")
 OUTPUT_MODE = os.environ.get("OUTPUT_MODE", "embed")

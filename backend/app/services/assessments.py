@@ -14,6 +14,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from ...concept_families import has_incompatible_gemini_concept_family_contract
 from ..db import (
     dumps_json,
     execute_modify,
@@ -1732,17 +1733,25 @@ class AssessmentService:
         if next_level is None:
             return None
         reset_at = str(progress.get("difficulty_reset_at") or "")
-        outcomes = fetch_all(
-            conn,
-            """
-            SELECT session_id, concept_id, question_count, correct_count,
-                   adjustment, created_at
-            FROM assessment_concept_outcomes
-            WHERE learner_id = ? AND material_id = ? AND created_at > ?
-            ORDER BY created_at DESC, session_id DESC, concept_id ASC
-            """,
-            (learner_id, material_id, reset_at),
-        )
+        outcomes = [
+            row
+            for row in fetch_all(
+                conn,
+                """
+                SELECT o.session_id, o.concept_id, o.question_count,
+                       o.correct_count, o.adjustment, o.created_at,
+                       source_reel.search_context_json AS source_search_context_json
+                FROM assessment_concept_outcomes o
+                LEFT JOIN reels source_reel ON source_reel.id = o.source_reel_id
+                WHERE o.learner_id = ? AND o.material_id = ? AND o.created_at > ?
+                ORDER BY o.created_at DESC, o.session_id DESC, o.concept_id ASC
+                """,
+                (learner_id, material_id, reset_at),
+            )
+            if not has_incompatible_gemini_concept_family_contract(
+                row.get("source_search_context_json")
+            )
+        ]
         total_questions = sum(max(0, int(row.get("question_count") or 0)) for row in outcomes)
         correct_questions = sum(max(0, int(row.get("correct_count") or 0)) for row in outcomes)
         concept_ids = {

@@ -2692,12 +2692,52 @@ def test_complete_copular_adjective_is_not_a_dangling_modifier(
     "text",
     [
         "Check whether p is below 0.05. Reject the null if so.",
+        "The operation is supported, so you can do so",
+        "The evidence is conclusive, and I think so",
         "If the condition holds, use method A; use method B if not.",
     ],
 )
 def test_complete_local_if_proform_is_not_a_dangling_clause(text):
     assert not G._terminal_content_is_explicitly_incomplete(text)
     assert not G._cue_has_explicit_dangling_end(text, "")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Is that so?",
+        "Why is it so?",
+        "Set it just so",
+        "Perhaps so",
+        "Maybe so",
+        "Probably so",
+        "More so",
+        "Not so",
+        "Exactly so",
+        "Quite so",
+        "Just so",
+        "This is so.",
+        "That is so.",
+        "It is so.",
+        "We can now see why this is so.",
+    ],
+)
+def test_terminal_so_proforms_are_not_result_clause_leadins(text):
+    assert not G._terminal_so_is_dangling_connective(text)
+    assert not G._cue_has_explicit_dangling_end(text, "")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Acceleration is inversely proportional to the mass of the object so",
+        "The second value is larger so",
+        "We have the premise, so.",
+    ],
+)
+def test_terminal_so_result_clause_leadins_remain_dangling(text):
+    assert G._terminal_so_is_dangling_connective(text)
+    assert G._cue_has_explicit_dangling_end(text, "")
 
 
 def test_production_chi_square_candidate_rejects_prior_test_tail_and_method_mix():

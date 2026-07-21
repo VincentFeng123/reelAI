@@ -55,6 +55,8 @@ def _reel(
 def _generation_result(
     ordered_ids: list[str],
     checkpoint_ids: list[str] | None = None,
+    *,
+    model: str | None = None,
 ) -> gemini_client.GenerationResult:
     return gemini_client.GenerationResult(
         text=json.dumps(
@@ -64,7 +66,7 @@ def _generation_result(
             }
         ),
         telemetry=gemini_client.GeminiCallTelemetry(
-            model=config.LESSON_ORDER_MODEL,
+            model=model or config.LESSON_ORDER_MODEL,
             operation="ordering",
             prompt_version=lesson_ordering.LESSON_ORDER_PROMPT_VERSION,
             thinking_level="disabled",
@@ -87,7 +89,17 @@ def test_orders_every_clip_and_returns_organizer_checkpoints(monkeypatch) -> Non
     ]
     captured: dict[str, str] = {}
 
-    def fake_generate(system_prompt, user_prompt, *, should_cancel, dispatch_state):
+    calls: list[str] = []
+
+    def fake_generate(
+        system_prompt,
+        user_prompt,
+        *,
+        model,
+        should_cancel,
+        dispatch_state,
+    ):
+        calls.append(model)
         captured["system"] = system_prompt
         captured["user"] = user_prompt
         assert should_cancel is None
@@ -108,10 +120,89 @@ def test_orders_every_clip_and_returns_organizer_checkpoints(monkeypatch) -> Non
     assert result.reels == [reels[1], reels[2], reels[0]]
     assert result.assessment_checkpoint_reel_ids == ["worked"]
     assert result.degraded is False
+    assert calls == [config.LESSON_ORDER_MODEL]
     assert "short batch may have none" in captured["system"]
     assert "gradient descent" in captured["user"]
     assert "beginner" in captured["user"]
     assert "assessment_checkpoint_reel_ids" in captured["user"]
+
+
+def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_progression() -> None:
+    payload = lesson_ordering._clip_payload({
+        **_reel(
+            "proportionality",
+            video_id="physics-a",
+            start=0,
+            concept="force-mass-acceleration proportionality",
+        ),
+        "concept_id": "adaptive-proportionality",
+        "adaptive_concept_title": "Newton's second law of motion",
+        "_selection_concept": "How force and mass change acceleration",
+        "_selection_concept_family": "force-mass-acceleration proportionality",
+    })
+
+    assert payload["concept_title"] == "How force and mass change acceleration"
+    assert payload["concept_family"] == "force-mass-acceleration proportionality"
+    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v8"
+    assert "semantic restatements" in lesson_ordering._SYSTEM_PROMPT
+    assert "concept, then explanation, then application or worked example" in (
+        lesson_ordering._SYSTEM_PROMPT
+    )
+
+
+def test_compact_clip_columns_reconstruct_every_organizer_value_without_shift() -> None:
+    reel = _reel(
+        "net-force",
+        video_id="physics-source",
+        start=12.5,
+        concept="net force vector sum",
+        concept_id="concept-net-force",
+        selection_candidate_id="candidate-net-force",
+        chain_id="force-progression",
+        chain_position=2,
+        prerequisite_ids=["candidate-force-definition"],
+        concept_family="net force vector sum",
+        ai_summary="Explains how force vectors combine",
+        takeaways=["Add force vectors", "Use direction signs"],
+        transcript_snippet="Net force is the vector sum of every applied force.",
+        difficulty=0.42,
+        topic_relevance=0.91,
+        informativeness=0.87,
+    )
+    clip = lesson_ordering._clip_payload(
+        reel,
+        concept_signals={
+            "concept-net-force": {
+                "helpful": 1.0,
+                "confusing": 2.0,
+                "adjustment": -0.08,
+            }
+        },
+    )
+
+    compact = lesson_ordering._compact_clip_payload(
+        [clip],
+        concept_text_limit=96,
+        semantic_text_limit=1_000,
+    )
+    columns = compact["columns"]
+    [row] = compact["clips"]
+
+    assert len(columns) == len(set(columns)) == len(row) == 18
+    decoded = dict(zip(columns, row, strict=True))
+    assert decoded["chain_position"] == 2
+    assert decoded["prerequisite_candidate_refs"] == [1]
+    assert decoded["concept_title"] == "net force vector sum"
+    assert decoded["concept_family"] == "net force vector sum"
+    assert decoded["learner_signal_hca"] == [1.0, 2.0, -0.08]
+    assert decoded["summary_excerpt"] == "Explains how force vectors combine"
+    assert decoded["takeaways_excerpt"] == "Add force vectors | Use direction signs"
+    assert decoded["transcript_excerpt"] == (
+        "Net force is the vector sum of every applied force."
+    )
+    assert decoded["difficulty"] == 0.42
+    assert decoded["topic_relevance"] == 0.91
+    assert decoded["informativeness"] == 0.87
 
 
 def test_small_batch_keeps_the_full_object_prompt_byte_for_byte() -> None:
@@ -1112,7 +1203,7 @@ def test_transient_provider_failure_retries_then_orders(monkeypatch) -> None:
         _reel("one", video_id="a", start=0, concept="one"),
         _reel("two", video_id="b", start=0, concept="two"),
     ]
-    calls = 0
+    models: list[str] = []
     transient_telemetry = replace(
         _generation_result(["one", "two"]).telemetry,
         provider_error_type="ServiceUnavailable",
@@ -1121,20 +1212,25 @@ def test_transient_provider_failure_retries_then_orders(monkeypatch) -> None:
     )
 
     def fake_generate(*_args, **kwargs):
-        nonlocal calls
-        calls += 1
+        models.append(kwargs["model"])
         kwargs["dispatch_state"].dispatched = True
-        if calls == 1:
+        if len(models) == 1:
             raise gemini_client.GeminiTransportError(
                 "temporarily unavailable", transient_telemetry
             )
-        return _generation_result(["one", "two"])
+        return _generation_result(
+            ["one", "two"],
+            model=config.LESSON_ORDER_FALLBACK_MODEL,
+        )
 
     monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
 
     result = lesson_ordering.order_lesson_batch(reels, topic="topic")
 
-    assert calls == 2
+    assert models == [
+        config.LESSON_ORDER_MODEL,
+        config.LESSON_ORDER_FALLBACK_MODEL,
+    ]
     assert result.ordered_reel_ids == ["one", "two"]
     assert result.degraded is False
 
@@ -1148,7 +1244,7 @@ def test_permanent_provider_rejection_is_not_retried(
         _reel("one", video_id="a", start=0, concept="one"),
         _reel("two", video_id="b", start=0, concept="two"),
     ]
-    calls = 0
+    models: list[str] = []
     permanent_telemetry = replace(
         _generation_result(["one", "two"]).telemetry,
         provider_error_type="BadRequest",
@@ -1158,8 +1254,7 @@ def test_permanent_provider_rejection_is_not_retried(
     )
 
     def fake_generate(*_args, **kwargs):
-        nonlocal calls
-        calls += 1
+        models.append(kwargs["model"])
         kwargs["dispatch_state"].dispatched = True
         raise gemini_client.GeminiTransportError(
             "bad request", permanent_telemetry
@@ -1169,8 +1264,44 @@ def test_permanent_provider_rejection_is_not_retried(
 
     result = lesson_ordering.order_lesson_batch(reels, topic="topic")
 
-    assert calls == 1
+    assert models == [config.LESSON_ORDER_MODEL]
     assert result.reels == reels
+    assert result.degraded is True
+    assert result.fallback_reason == "provider_call_failed"
+
+
+def test_two_retryable_organizer_failures_keep_deterministic_fallback(
+    monkeypatch,
+) -> None:
+    reels = [
+        _reel("later", video_id="same", start=40, concept="application"),
+        _reel("earlier", video_id="same", start=5, concept="definition"),
+    ]
+    models: list[str] = []
+    transient_telemetry = replace(
+        _generation_result(["earlier", "later"]).telemetry,
+        provider_error_type="ServiceUnavailable",
+        provider_status_code=503,
+        retryable=True,
+    )
+
+    def fake_generate(*_args, **kwargs):
+        models.append(kwargs["model"])
+        kwargs["dispatch_state"].dispatched = True
+        raise gemini_client.GeminiTransportError(
+            "temporarily unavailable",
+            replace(transient_telemetry, model=kwargs["model"]),
+        )
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(reels, topic="topic")
+
+    assert models == [
+        config.LESSON_ORDER_MODEL,
+        config.LESSON_ORDER_FALLBACK_MODEL,
+    ]
+    assert result.ordered_reel_ids == ["earlier", "later"]
     assert result.degraded is True
     assert result.fallback_reason == "provider_call_failed"
 
@@ -1342,6 +1473,7 @@ def test_generate_content_receives_text_only_and_no_media_configuration(
         lesson_ordering._generate_lesson_order_async(
             lesson_ordering._SYSTEM_PROMPT,
             user_prompt,
+            model=config.LESSON_ORDER_MODEL,
             should_cancel=None,
             dispatch_state=lesson_ordering._DispatchState(),
         )

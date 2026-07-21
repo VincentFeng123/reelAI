@@ -474,6 +474,7 @@ def test_material_fingerprint_ignores_generated_clip_facets_but_tracks_source_co
 @pytest.mark.parametrize(
     "stale_version",
     [
+        "adaptive_clip_concepts_v3",
         "adaptive_clip_concepts_v2",
         "quality_silence_v6",
         "quality_silence_v9",
@@ -513,7 +514,7 @@ def test_request_key_version_invalidates_stale_inventory(
         "target_clip_duration_min_sec": 20,
         "target_clip_duration_max_sec": 55,
     }
-    assert jobs.REQUEST_SCHEMA_VERSION == "adaptive_clip_concepts_v3"
+    assert jobs.REQUEST_SCHEMA_VERSION == "adaptive_clip_concepts_v4"
     verified_key = jobs.build_request_key(**params)
     monkeypatch.setattr(jobs, "REQUEST_SCHEMA_VERSION", stale_version)
 

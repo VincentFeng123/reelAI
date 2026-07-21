@@ -352,7 +352,7 @@ def test_pro_boundary_fallback_preserves_canonical_video_cache_identity(monkeypa
 
 
 def test_direct_url_segment_cache_hit_skips_all_gemini_and_budget(monkeypatch):
-    assert run.segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v38"
+    assert run.segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v39"
     transcript = {
         "segments": [{
             "cue_id": "cached-cue",
@@ -726,6 +726,76 @@ def test_boundary_repair_usage_is_recorded_in_repair_stage():
     usage = context.usage_payload()
     assert usage["by_stage"]["repair"]["calls"] == 1
     assert usage["counters"]["boundary_repairs"] == 1
+
+
+def test_selector_contract_diagnostics_reach_job_usage(monkeypatch):
+    context = GenerationContext("slow")
+    request = "photosynthesis"
+    invalid_plan = run.gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": "an unrelated request",
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": "an unrelated request",
+                "requirement": "Teach an unrelated request",
+            }],
+        },
+        topics=[],
+    )
+
+    def return_invalid_contract(*_args, **_kwargs):
+        return invalid_plan, {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_authoritative",
+            "prompt_tokens": 100,
+            "candidate_tokens": 20,
+            "thought_tokens": 10,
+            "total_tokens": 130,
+        }
+
+    monkeypatch.setattr(
+        run.gemini_segment,
+        "_call_model",
+        return_invalid_contract,
+    )
+    settings = {"generation_context": context}
+    run._wire_segment_runtime(settings, "video")
+    result = run.gemini_segment.segment_clips_detailed(
+        {
+            "segments": [{
+                "cue_id": "cue-0",
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Plants convert light into stored chemical energy.",
+            }],
+            "words": [],
+        },
+        settings,
+        topic=request,
+        video_id="video",
+        routing_mode="pro_only",
+    )
+
+    usage = context.usage_payload()
+    assert result.rejection_reasons == [
+        "request_failure:GeminiSelectorContractError",
+        "intent_contract_request_mismatch",
+    ]
+    assert len(usage["provider_calls"]) == 2
+    metadata = usage["provider_calls"][1]["metadata"]
+    assert metadata["selector_contract_rejection_reasons"] == [
+        "intent_contract_request_mismatch",
+    ]
+    assert metadata["selector_intent_contract_error"] == (
+        "intent_contract_request_mismatch"
+    )
+    assert metadata["selector_contract_retry_attempt"] == 2
+    assert metadata["selector_contract_retry_exhausted"] is True
+    assert usage["summary"]["rejection_reason_counts"] == {
+        "intent_contract_request_mismatch": 1,
+        "request_failure:GeminiSelectorContractError": 1,
+    }
 
 
 def test_flash_lite_failover_usage_preserves_attempts_and_degraded_status():

@@ -10887,6 +10887,68 @@ def test_trusted_universal_end_extends_protected_claim_to_completion() -> None:
     )
 
 
+def test_trusted_universal_end_completes_terminal_so_connective() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 1.68,
+            "end": 40.879,
+            "text": (
+                "What's the main idea behind Newton's second law? A larger net "
+                "force produces a larger acceleration."
+            ),
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 42.239,
+            "end": 81.6,
+            "text": (
+                "Acceleration is inversely related or inversely proportional to "
+                "the mass of the object so"
+            ),
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 80.8,
+            "end": 91.0,
+            "text": (
+                "if you double the force while mass stays constant, the "
+                "acceleration doubles. A new topic starts here."
+            ),
+        },
+    ]
+    plan = _compact_custom_plan(
+        request="Newton's second law",
+        start_quote="main idea behind Newton's second law",
+        end_quote="proportional to the mass of the object so",
+        claim_quote="Acceleration is inversely related or inversely proportional",
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={"end_line": 1})],
+    })
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=plan.request_intent.exact_request,
+    )
+
+    assert report.accepted_count == report.proposed_count == 1
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-0", "cue-1", "cue-2"]
+    assert clip["_clip_text"].endswith("the acceleration doubles.")
+    assert "A new topic" not in clip["_clip_text"]
+    assert "completed_unfinished_spoken_unit" in (
+        clip["_boundary_fallback_reasons"]
+    )
+
+
 def test_trusted_universal_end_trims_unpunctuated_navigation_before_dangling_tail(
 ) -> None:
     segments = [
@@ -11117,7 +11179,7 @@ def test_trusted_universal_end_never_crosses_a_section_gap() -> None:
             "cue_id": "cue-0",
             "start": 0.0,
             "end": 5.0,
-            "text": "The important acceleration result is",
+            "text": "Acceleration is inversely proportional to mass so",
         },
         {
             "cue_id": "cue-1",
@@ -11128,9 +11190,9 @@ def test_trusted_universal_end_never_crosses_a_section_gap() -> None:
     ]
     plan = _compact_custom_plan(
         request="acceleration",
-        start_quote="The important acceleration result",
-        end_quote="acceleration result is",
-        claim_quote="important acceleration result is",
+        start_quote="Acceleration is inversely proportional",
+        end_quote="proportional to mass so",
+        claim_quote="Acceleration is inversely proportional to mass",
     )
 
     report = gemini_segment._plan_to_report(
@@ -11144,12 +11206,11 @@ def test_trusted_universal_end_never_crosses_a_section_gap() -> None:
         topic=plan.request_intent.exact_request,
     )
 
-    assert report.accepted_count == report.proposed_count == 1
-    assert report.rejected_reasons == []
-    [clip] = report.clips
-    assert clip["cue_ids"] == ["cue-0"]
-    assert "archive format" not in clip["_clip_text"]
-    assert "unresolved_dangling_end" in clip["_boundary_fallback_reasons"]
+    assert report.accepted_count == 0
+    assert report.proposed_count == 1
+    assert report.rejected_reasons == [
+        "proposal_0:unresolved_dangling_end",
+    ]
 
 
 def test_trusted_universal_end_recovers_truncated_caption_word() -> None:
@@ -11370,12 +11431,11 @@ def test_trusted_universal_end_does_not_cross_lexical_reset() -> None:
         topic=plan.request_intent.exact_request,
     )
 
-    assert report.accepted_count == report.proposed_count == 1
-    assert report.rejected_reasons == []
-    [clip] = report.clips
-    assert clip["cue_ids"] == ["cue-0"]
-    assert "archive formats" not in clip["_clip_text"]
-    assert "unresolved_dangling_end" in clip["_boundary_fallback_reasons"]
+    assert report.accepted_count == 0
+    assert report.proposed_count == 1
+    assert report.rejected_reasons == [
+        "proposal_0:unresolved_dangling_end",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -11508,12 +11568,11 @@ def test_trusted_universal_end_completion_is_bounded() -> None:
         topic=plan.request_intent.exact_request,
     )
 
-    assert report.accepted_count == report.proposed_count == 1
-    assert report.rejected_reasons == []
-    [clip] = report.clips
-    assert clip["cue_ids"] == ["cue-0"]
-    assert "distant sentence" not in clip["_clip_text"]
-    assert "unresolved_dangling_end" in clip["_boundary_fallback_reasons"]
+    assert report.accepted_count == 0
+    assert report.proposed_count == 1
+    assert report.rejected_reasons == [
+        "proposal_0:unresolved_dangling_end",
+    ]
 
 
 def test_trusted_universal_truncated_word_does_not_absorb_later_squared() -> None:
@@ -12064,7 +12123,7 @@ def test_compact_schema_and_final_audit_require_context_complete_evidence_and_ed
     assert "never omit it solely for boundary uncertainty" in normalized
 
 
-def test_selector_and_audit_require_one_formal_canonical_family_across_wording() -> None:
+def test_selector_and_audit_require_formal_smallest_reusable_family() -> None:
     plan = _compact_custom_plan(
         request="Explain the law of inertia and F=ma",
         start_quote="Objects resist changes in motion",
@@ -12093,8 +12152,11 @@ def test_selector_and_audit_require_one_formal_canonical_family_across_wording()
     ):
         normalized = " ".join(prompt.split()).casefold()
         assert "standard formal" in normalized
+        assert "smallest reusable" in normalized
+        assert "broad umbrella" in normalized
         assert "law of inertia -> newton's first law of motion" in normalized
-        assert "f=ma -> newton's second law of motion" in normalized
+        assert "force-mass-acceleration proportionality" in normalized
+        assert "f=ma -> newton's second law of motion" not in normalized
         assert "apollo11 -> apollo 11 mission" in normalized
         assert "python3.12 -> python 3.12" in normalized
         assert "hlaii -> hla class ii" in normalized
@@ -12605,7 +12667,7 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
         "eq",
     } <= audit_required
     assert gemini_segment._PRO_BOUNDARY_AUDIT_PROMPT_VERSION == (
-        "pro_candidate_audit_v7"
+        "pro_candidate_audit_v8"
     )
 
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
@@ -13948,7 +14010,7 @@ def test_pro_candidate_audit_uses_ai_family_without_semantic_retry(
     assert "contract_retry_attempt" not in calls[0]
 
 
-def test_pro_candidate_audit_canonicalizes_fma_in_one_call(
+def test_pro_candidate_audit_keeps_narrow_fma_family_in_one_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = "Explain F=ma"
@@ -13966,9 +14028,9 @@ def test_pro_candidate_audit_canonicalizes_fma_in_one_call(
         "id": "candidate-1",
         "d": "keep",
         "obj": "Explain how net force, mass, and acceleration relate",
-        "t": "Newton's Second Law of Motion",
+        "t": "Force-Mass-Acceleration Relationship",
         "f": "net force, mass, and acceleration",
-        "family": "Newton's second law of motion",
+        "family": "force-mass-acceleration proportionality",
         "a": ["F=ma"],
         "direct": True,
         "ie": [{"id": "subject", "q": claim}],
@@ -14002,10 +14064,35 @@ def test_pro_candidate_audit_canonicalizes_fma_in_one_call(
     )
 
     assert rejections == []
-    assert audited.topics[0].concept_family == "Newton's second law of motion"
+    assert (
+        audited.topics[0].concept_family
+        == "force-mass-acceleration proportionality"
+    )
     assert audited.topics[0].concept_aliases == []
     assert dispatches == len(calls) == 1
     assert "contract_retry_attempt" not in calls[0]
+
+
+def test_live_adaptive_family_contract_requires_smallest_reusable_subtopic() -> None:
+    selector_description = str(
+        gemini_segment._CompactBoundaryTopic.model_fields[
+            "concept_family"
+        ].description
+        or ""
+    )
+    audit_description = str(
+        gemini_segment._ProCandidateAuditItem.model_fields[
+            "concept_family"
+        ].description
+        or ""
+    )
+    guide = gemini_segment._compact_output_guide()
+
+    for contract in (selector_description, audit_description, guide):
+        assert "smallest reusable" in contract
+        assert "broad umbrella" in contract
+    assert "force units" in guide
+    assert "force-mass-acceleration proportionality" in guide
 
 
 def test_concept_family_contract_keeps_ai_family_and_drops_aliases():
@@ -14796,6 +14883,10 @@ def test_invalid_selector_contract_without_retry_time_is_operational_failure(
     assert result.classification_reasons == [
         "request_failure:GeminiSelectorContractError"
     ]
+    assert result.rejection_reasons == [
+        "request_failure:GeminiSelectorContractError",
+        "intent_contract_request_mismatch",
+    ]
     assert len(result.calls) == 1
     assert result.calls[0]["selector_contract_retry_attempt"] == 1
     assert (
@@ -14859,6 +14950,10 @@ def test_invalid_selector_schema_without_retry_time_is_operational_failure(
     )
     assert result.classification_reasons == [
         "request_failure:GeminiSelectorSchemaError"
+    ]
+    assert result.rejection_reasons == [
+        "request_failure:GeminiSelectorSchemaError",
+        "candidate_1:invalid_claim_quote",
     ]
     assert len(result.calls) == 1
     assert result.calls[0]["partial_schema_retry_attempt"] == 1
@@ -17470,6 +17565,114 @@ def test_bare_directional_path_is_joint_but_ordinary_to_phrase_is_not() -> None:
             ["precision", "versus", "recall"],
         ),
         (
+            "Compare precision and recall",
+            [
+                {
+                    "constraint_id": "precision",
+                    "kind": "subject",
+                    "source_phrase": "precision",
+                    "requirement": "Teach precision",
+                },
+                {
+                    "constraint_id": "recall",
+                    "kind": "subject",
+                    "source_phrase": "recall",
+                    "requirement": "Teach recall",
+                },
+            ],
+            ["precision", "Compare", "recall"],
+        ),
+        (
+            "comparison between precision and recall",
+            [
+                {
+                    "constraint_id": "precision",
+                    "kind": "subject",
+                    "source_phrase": "precision",
+                    "requirement": "Teach precision",
+                },
+                {
+                    "constraint_id": "recall",
+                    "kind": "subject",
+                    "source_phrase": "recall",
+                    "requirement": "Teach recall",
+                },
+            ],
+            ["precision", "comparison between", "recall"],
+        ),
+        (
+            "difference between precision and recall",
+            [
+                {
+                    "constraint_id": "precision",
+                    "kind": "subject",
+                    "source_phrase": "precision",
+                    "requirement": "Teach precision",
+                },
+                {
+                    "constraint_id": "recall",
+                    "kind": "subject",
+                    "source_phrase": "recall",
+                    "requirement": "Teach recall",
+                },
+            ],
+            ["precision", "difference between", "recall"],
+        ),
+        (
+            "Precision compared with recall",
+            [
+                {
+                    "constraint_id": "precision",
+                    "kind": "subject",
+                    "source_phrase": "Precision",
+                    "requirement": "Teach precision",
+                },
+                {
+                    "constraint_id": "recall",
+                    "kind": "subject",
+                    "source_phrase": "recall",
+                    "requirement": "Teach recall",
+                },
+            ],
+            ["Precision", "compared with", "recall"],
+        ),
+        (
+            "How does precision compare to recall?",
+            [
+                {
+                    "constraint_id": "precision",
+                    "kind": "subject",
+                    "source_phrase": "precision",
+                    "requirement": "Teach precision",
+                },
+                {
+                    "constraint_id": "recall",
+                    "kind": "subject",
+                    "source_phrase": "recall",
+                    "requirement": "Teach recall",
+                },
+            ],
+            ["precision", "compare to", "recall"],
+        ),
+        (
+            "Precision and recall comparison",
+            [
+                {
+                    "constraint_id": "precision",
+                    "kind": "subject",
+                    "source_phrase": "Precision",
+                    "requirement": "Teach precision",
+                },
+                {
+                    "constraint_id": "recall",
+                    "kind": "subject",
+                    "source_phrase": "recall",
+                    "requirement": "Teach recall",
+                },
+            ],
+            ["Precision", "comparison", "recall"],
+        ),
+        (
             "mitosis vs. meiosis",
             [
                 {
@@ -17486,6 +17689,24 @@ def test_bare_directional_path_is_joint_but_ordinary_to_phrase_is_not() -> None:
                 },
             ],
             ["mitosis", "vs.", "meiosis"],
+        ),
+        (
+            "precision versus recall",
+            [
+                {
+                    "constraint_id": "precision",
+                    "kind": "subject",
+                    "source_phrase": "precision",
+                    "requirement": "Teach precision",
+                },
+                {
+                    "constraint_id": "recall",
+                    "kind": "subject",
+                    "source_phrase": "recall",
+                    "requirement": "Teach recall",
+                },
+            ],
+            ["precision", "versus", "recall"],
         ),
     ],
 )
@@ -17506,6 +17727,10 @@ def test_binary_comparison_contract_normalizes_merged_model_constraints(
         plan,
         exact_request,
     )
+    live_contract = gemini_segment._validate_live_pro_selector_contract(
+        plan,
+        exact_request,
+    )
 
     assert error is None
     assert [
@@ -17518,6 +17743,299 @@ def test_binary_comparison_contract_normalizes_merged_model_constraints(
     assert [
         constraint.source_phrase for constraint in constraints.values()
     ] == expected_phrases
+    assert live_contract.intent_error == (
+        "intent_contract_incomplete_joint_structure"
+    )
+    assert live_contract.intent_signature is None
+
+
+@pytest.mark.parametrize(
+    ("exact_request", "task_phrase", "outcome_phrase"),
+    [
+        ("Compare precision and recall", "Compare", "precision and recall"),
+        ("Precision compared with recall", "compared with", "Precision"),
+        (
+            "How does precision compare to recall?",
+            "compare to",
+            "recall",
+        ),
+        ("Precision and recall comparison", "comparison", "Precision and recall"),
+    ],
+)
+def test_pure_binary_comparison_requires_relationship_regardless_model_enum(
+    exact_request: str,
+    task_phrase: str,
+    outcome_phrase: str,
+) -> None:
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": exact_request,
+            "constraints": [
+                {
+                    "constraint_id": "task",
+                    "kind": "task",
+                    "source_phrase": task_phrase,
+                    "requirement": "Compare the requested measures",
+                },
+                {
+                    "constraint_id": "outcome",
+                    "kind": "outcome",
+                    "source_phrase": outcome_phrase,
+                    "requirement": "Distinguish precision from recall",
+                },
+            ],
+        },
+        topics=[],
+    )
+
+    constraints, error = gemini_segment._validated_intent_constraints(
+        plan,
+        exact_request,
+    )
+    live_contract = gemini_segment._validate_live_pro_selector_contract(
+        plan,
+        exact_request,
+    )
+
+    assert constraints == {}
+    assert error == "intent_contract_incomplete_joint_structure"
+    assert live_contract.intent_error == error
+    assert live_contract.intent_signature is None
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "input/output processing",
+        "How does precision compare?",
+        "precision comparison",
+        "Compare precision and recall, then tune the threshold",
+        "precision and recall comparison metrics",
+    ],
+)
+def test_ambiguous_comparison_text_is_not_parsed_as_pure_binary(
+    request_text: str,
+) -> None:
+    assert gemini_segment._pure_binary_comparison_parts(request_text) is None
+
+
+@pytest.mark.parametrize(
+    ("exact_request", "subject_phrase"),
+    [
+        ("Explain HTTP/2", "HTTP/2"),
+        ("Teach TCP/IP basics", "TCP/IP basics"),
+        ("Explain input/output processing", "input/output processing"),
+        ("C/C++ memory management", "C/C++ memory management"),
+    ],
+)
+def test_technical_slash_notation_does_not_imply_a_comparison(
+    exact_request: str,
+    subject_phrase: str,
+) -> None:
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": exact_request,
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": subject_phrase,
+                "requirement": f"Teach {subject_phrase}",
+            }],
+        },
+        topics=[],
+    )
+
+    constraints, error = gemini_segment._validated_intent_constraints(
+        plan,
+        exact_request,
+    )
+    contract = gemini_segment._validate_live_pro_selector_contract(
+        plan,
+        exact_request,
+    )
+
+    assert not gemini_segment._request_requires_joint_intent_coverage(
+        exact_request,
+        constraints,
+    )
+    assert list(constraints) == ["subject"]
+    assert error is None
+    assert contract.intent_error is None
+
+
+def test_slash_comparison_requires_gemini_relationship_structure() -> None:
+    exact_request = "precision/recall"
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": exact_request,
+            "constraints": [
+                {
+                    "constraint_id": "precision",
+                    "kind": "subject",
+                    "source_phrase": "precision",
+                    "requirement": "Teach precision",
+                },
+                {
+                    "constraint_id": "relationship",
+                    "kind": "relationship",
+                    "source_phrase": "precision/recall",
+                    "requirement": "Compare precision with recall",
+                },
+                {
+                    "constraint_id": "recall",
+                    "kind": "subject",
+                    "source_phrase": "recall",
+                    "requirement": "Teach recall",
+                },
+            ],
+        },
+        topics=[],
+    )
+
+    constraints, error = gemini_segment._validated_intent_constraints(
+        plan,
+        exact_request,
+    )
+    contract = gemini_segment._validate_live_pro_selector_contract(
+        plan,
+        exact_request,
+    )
+
+    assert gemini_segment._contract_has_explicit_slash_comparison(
+        exact_request,
+        constraints,
+    )
+    assert gemini_segment._request_requires_joint_intent_coverage(
+        exact_request,
+        constraints,
+    )
+    assert error is None
+    assert contract.intent_error is None
+
+
+@pytest.mark.parametrize(
+    ("exact_request", "task_phrase", "outcome_phrase"),
+    [
+        (
+            "Explain how precision compares with recall",
+            "Explain",
+            "precision compares with recall",
+        ),
+        (
+            "Teach the transition from mitosis to cytokinesis",
+            "Teach",
+            "from mitosis to cytokinesis",
+        ),
+    ],
+)
+def test_unparsed_relational_request_without_relationship_fails_closed(
+    exact_request: str,
+    task_phrase: str,
+    outcome_phrase: str,
+) -> None:
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": exact_request,
+            "constraints": [
+                {
+                    "constraint_id": "task",
+                    "kind": "task",
+                    "source_phrase": task_phrase,
+                    "requirement": "Honor the requested teaching task",
+                },
+                {
+                    "constraint_id": "outcome",
+                    "kind": "outcome",
+                    "source_phrase": outcome_phrase,
+                    "requirement": "Teach the requested relationship",
+                },
+            ],
+        },
+        topics=[],
+    )
+
+    constraints, error = gemini_segment._validated_intent_constraints(
+        plan,
+        exact_request,
+    )
+    live_contract = gemini_segment._validate_live_pro_selector_contract(
+        plan,
+        exact_request,
+    )
+
+    assert constraints == {}
+    assert error == "intent_contract_incomplete_joint_structure"
+    assert live_contract.intent_error == error
+    assert live_contract.intent_signature is None
+
+
+def test_fake_scope_enums_cannot_bypass_required_relationship() -> None:
+    exact_request = "Explain how precision compares with recall"
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": exact_request,
+            "constraints": [
+                {
+                    "constraint_id": "subject",
+                    "kind": "subject",
+                    "source_phrase": "precision",
+                    "requirement": "Teach precision",
+                },
+                {
+                    "constraint_id": "task",
+                    "kind": "task",
+                    "source_phrase": "Explain",
+                    "requirement": "Explain the request",
+                },
+                {
+                    "constraint_id": "scope-how",
+                    "kind": "scope",
+                    "source_phrase": "how",
+                    "requirement": "Cover how",
+                },
+                {
+                    "constraint_id": "scope-precision",
+                    "kind": "scope",
+                    "source_phrase": "precision",
+                    "requirement": "Cover precision",
+                },
+                {
+                    "constraint_id": "scope-recall",
+                    "kind": "scope",
+                    "source_phrase": "recall",
+                    "requirement": "Cover recall",
+                },
+                {
+                    "constraint_id": "outcome",
+                    "kind": "outcome",
+                    "source_phrase": "compares with",
+                    "requirement": "Teach the comparison",
+                },
+            ],
+        },
+        topics=[],
+    )
+
+    constraints, error = gemini_segment._validated_intent_constraints(
+        plan,
+        exact_request,
+    )
+    live_contract = gemini_segment._validate_live_pro_selector_contract(
+        plan,
+        exact_request,
+    )
+
+    assert gemini_segment._request_requires_joint_intent_coverage(
+        exact_request,
+        {
+            constraint.constraint_id: constraint
+            for constraint in plan.request_intent.constraints
+        },
+    )
+    assert constraints == {}
+    assert error == "intent_contract_incomplete_joint_structure"
+    assert live_contract.intent_error == error
+    assert live_contract.intent_signature is None
 
 
 @pytest.mark.parametrize(
@@ -17622,6 +18140,109 @@ def test_live_selector_accepts_ai_constraints_without_a_lexical_token_union(
     ]
     assert error is None
     assert contract.intent_error is None
+
+
+@pytest.mark.parametrize(
+    ("exact_request", "model_constraints"),
+    [
+        (
+            "Explain ATP production in cellular respiration for a beginner: "
+            "glycolysis, the Krebs cycle, and the electron transport chain, why "
+            "oxygen matters, then compare ATP yield.",
+            (
+                ("subject", "ATP production in cellular respiration"),
+                ("task", "Explain"),
+                ("scope", "for a beginner"),
+                ("scope", "glycolysis"),
+                ("scope", "the Krebs cycle"),
+                ("scope", "the electron transport chain"),
+                ("task", "why oxygen matters"),
+                ("outcome", "compare ATP yield"),
+            ),
+        ),
+        (
+            "Teach solving quadratic equations for a beginner: factoring, "
+            "completing the square, and the quadratic formula, then compare when "
+            "each method is useful.",
+            (
+                ("subject", "solving quadratic equations"),
+                ("task", "Teach"),
+                ("scope", "for a beginner"),
+                ("scope", "factoring"),
+                ("scope", "completing the square"),
+                ("scope", "the quadratic formula"),
+                ("outcome", "compare when each method is useful"),
+            ),
+        ),
+        (
+            "Explain sorting algorithms for a beginner: bubble sort, merge sort, "
+            "and quicksort, then compare their time and space tradeoffs.",
+            (
+                ("subject", "sorting algorithms"),
+                ("task", "Explain"),
+                ("scope", "for a beginner"),
+                ("scope", "bubble sort"),
+                ("scope", "merge sort"),
+                ("scope", "quicksort"),
+                ("outcome", "compare their time and space tradeoffs"),
+            ),
+        ),
+        (
+            "Explain negligence for a beginner: duty, breach, causation, and "
+            "damages, then compare contributory and comparative negligence.",
+            (
+                ("subject", "negligence"),
+                ("task", "Explain"),
+                ("scope", "for a beginner"),
+                ("scope", "duty"),
+                ("scope", "breach"),
+                ("scope", "causation"),
+                ("scope", "damages"),
+                ("outcome", "compare contributory and comparative negligence"),
+            ),
+        ),
+    ],
+)
+def test_live_selector_accepts_ai_multi_facet_plan_with_final_comparison(
+    exact_request: str,
+    model_constraints: tuple[tuple[str, str], ...],
+) -> None:
+    constraints_payload = [
+        {
+            "constraint_id": f"constraint-{index}",
+            "kind": kind,
+            "source_phrase": source_phrase,
+            "requirement": f"Honor the request for {source_phrase}",
+        }
+        for index, (kind, source_phrase) in enumerate(model_constraints)
+    ]
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": exact_request,
+            "constraints": constraints_payload,
+        },
+        topics=[],
+    )
+
+    constraints, error = gemini_segment._validated_intent_constraints(
+        plan,
+        exact_request,
+    )
+    contract = gemini_segment._validate_live_pro_selector_contract(
+        plan,
+        exact_request,
+    )
+
+    assert gemini_segment._request_requires_joint_intent_coverage(
+        exact_request,
+        constraints,
+    )
+    assert error is None
+    assert list(constraints) == [
+        item["constraint_id"] for item in constraints_payload
+    ]
+    assert contract.intent_error is None
+    assert contract.rejection_reasons == ()
 
 
 def test_repaired_binary_comparison_is_regrounded_before_acceptance() -> None:

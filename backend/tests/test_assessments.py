@@ -1927,6 +1927,44 @@ def test_auto_promotion_requires_sustained_broad_mastery_and_never_demotes(conn)
     ).fetchone()[0] == "advanced"
 
 
+def test_auto_promotion_ignores_stale_gemini_family_outcomes(conn) -> None:
+    service = AssessmentService()
+    service._ensure_learner_progress(conn, LEARNER, MATERIAL)
+    conn.execute(
+        "UPDATE learner_material_progress SET difficulty_reset_at = ? "
+        "WHERE learner_id = ? AND material_id = ?",
+        ("2026-07-09T00:00:00+00:00", LEARNER, MATERIAL),
+    )
+    stale_context = json.dumps({
+        "selection_authority": "gemini",
+        "concept_family_contract_version": "concept_family_v2",
+    })
+    for index in range(3):
+        _seed_promotion_outcome(conn, index=index)
+        reel_id = f"promotion-r{index}"
+        conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = ?",
+            (stale_context, reel_id),
+        )
+        conn.execute(
+            "UPDATE assessment_concept_outcomes SET source_reel_id = ? "
+            "WHERE session_id = ?",
+            (reel_id, f"promotion-session-{index}"),
+        )
+
+    assert service._maybe_auto_promote_level(
+        conn,
+        learner_id=LEARNER,
+        material_id=MATERIAL,
+        promoted_at="2026-07-11T00:00:00+00:00",
+    ) is None
+    assert conn.execute(
+        "SELECT selected_level FROM learner_material_progress "
+        "WHERE learner_id = ? AND material_id = ?",
+        (LEARNER, MATERIAL),
+    ).fetchone()[0] == "beginner"
+
+
 def test_auto_promotion_is_blocked_by_recent_negative_outcome(conn) -> None:
     service = AssessmentService()
     service._ensure_learner_progress(conn, LEARNER, MATERIAL)
