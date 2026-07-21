@@ -514,7 +514,7 @@ def test_text_only_pro_retries_one_malformed_structured_response(
     assert result.calls[2]["operation"] == "pro_boundary_audit"
 
     budget = context.budget.snapshot()["gemini"]
-    assert budget["selector_calls"] == 2
+    assert budget["selector_calls"] == 1
     assert budget["boundary_audit_calls"] == 1
     assert budget["committed_cost_usd"] == pytest.approx(0.0455)
     assert budget["inflight_reserved_cost_usd"] == 0.0
@@ -589,7 +589,7 @@ def test_text_only_pro_stops_after_two_malformed_structured_responses(
     assert all(call["video_grounded"] is False for call in result.calls)
 
     budget = context.budget.snapshot()["gemini"]
-    assert budget["selector_calls"] == 2
+    assert budget["selector_calls"] == 1
     assert budget["boundary_audit_calls"] == 0
     assert budget["committed_cost_usd"] == pytest.approx(0.043)
     assert budget["inflight_reserved_cost_usd"] == 0.0

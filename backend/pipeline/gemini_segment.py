@@ -21360,6 +21360,7 @@ def _call_model(
     failover_model: str | None = None,
     media_resolution=None,
     estimated_media_tokens: int = 0,
+    claim_logical_quota: bool = True,
 ) -> tuple[BaseModel, dict]:
     from ..gemini_client import (
         _gemini_status_code,
@@ -21457,7 +21458,10 @@ def _call_model(
                 + max(0, int(estimated_media_tokens))
             )
 
-        logical_quota_reserved = False
+        # A schema/contract retry is still the same logical selector for one
+        # source.  Its caller can therefore request a cost-only ticket while
+        # transport retries inside this invocation continue sharing that state.
+        logical_quota_reserved = not claim_logical_quota
         physical_dispatches = 0
         billing_unknown_attempts = 0
         billing_unknown_reserved_cost_usd = 0.0
@@ -21881,6 +21885,7 @@ def _audit_pro_boundaries(
     deadline: float,
     cancelled: CancelledCb,
     _retry_contract_once: bool = True,
+    _claim_logical_quota: bool = True,
 ) -> tuple[_CompactBoundaryPlan, list[dict], list[str]]:
     """Let Pro independently audit admission and word edges; all failures retain."""
     if not plan.topics or not segments:
@@ -21906,6 +21911,9 @@ def _audit_pro_boundaries(
                     budget_reserve=settings.get("_segment_budget_reserve"),
                     budget_reconcile=settings.get("_segment_budget_reconcile"),
                     max_retries=1,
+                    claim_logical_quota=(
+                        _claim_logical_quota and structured_attempt == 1
+                    ),
                 )
             except _SchemaResponseError as exc:
                 call = _exception_telemetry(exc)
@@ -22258,6 +22266,7 @@ def _audit_pro_boundaries(
                 deadline=deadline,
                 cancelled=cancelled,
                 _retry_contract_once=False,
+                _claim_logical_quota=False,
             )
             if retry_calls:
                 retry_calls[0].setdefault("contract_retry_attempt", 2)
@@ -22450,7 +22459,10 @@ def _run_selection_profile(
         else deadline
     )
 
-    def invoke_selector() -> tuple[BaseModel, dict]:
+    def invoke_selector(
+        *,
+        claim_logical_quota: bool = True,
+    ) -> tuple[BaseModel, dict]:
         return _call_model(
             system,
             selector_user,
@@ -22483,6 +22495,7 @@ def _run_selection_profile(
             ),
             media_resolution=media_resolution,
             estimated_media_tokens=estimated_media_tokens,
+            claim_logical_quota=claim_logical_quota,
         )
 
     calls: list[dict] = []
@@ -22508,7 +22521,7 @@ def _run_selection_profile(
             raise
         calls.append(first_call)
         try:
-            parsed, call = invoke_selector()
+            parsed, call = invoke_selector(claim_logical_quota=False)
         except Exception as retry_exc:
             retry_call = _exception_telemetry(retry_exc)
             retry_call.setdefault("error_type", type(retry_exc).__name__)
@@ -22566,7 +22579,9 @@ def _run_selection_profile(
             })
         calls.append(first_call)
         try:
-            retry_parsed, retry_call = invoke_selector()
+            retry_parsed, retry_call = invoke_selector(
+                claim_logical_quota=False,
+            )
         except Exception as retry_exc:
             if _cancel_requested(cancelled):
                 raise

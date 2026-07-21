@@ -30,6 +30,7 @@ class GeminiBlockedResponseError(RuntimeError):
 def _valid_expansion_json() -> str:
     return json.dumps({
         "corrected": "Physics",
+        "summary_preserved_constraint_ids": ["subject"],
         "intent_constraints": [{
             "constraint_id": "subject",
             "kind": "subject",

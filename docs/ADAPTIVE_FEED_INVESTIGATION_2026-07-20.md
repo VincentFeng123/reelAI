@@ -1092,6 +1092,45 @@
 - Fix: Update only the stale assertion to the production version; do not change cache behavior, practice UI, or unrelated practice code.
 - Exact retest: Passed locally: the production retrieval/expansion group passed all 108 tests with the version-8 assertion, and the complete backend suite passed 4,038 tests plus 40 subtests with 1 skip.
 
+### AF-099 — Fresh cross-domain production searches terminate without persisted reels
+
+- Status: Root causes confirmed; universal fixes implemented locally; exact-SHA production retest pending
+- Severity: Critical — a clean signed-in Pro search can finish without showing any educational clip, preventing relevance, boundary, progression, quiz, and feedback adaptation from functioning
+- Production reproduction (exact deployed SHA `9af1d72ec4f63307571317b5c8c42a57fa9fe53f`, clean Postgres/Redis): Physics material `89b3deef…` and initial law jobs emitted terminal empty batches despite successful YouTube discovery, transcript retrieval, and first Gemini Pro selector calls. Biology `6f3a9669…`, math `407be62e…`, and software `db9cdd14…` exhausted after roughly 8–10 seconds with the UI's `No matching YouTube videos` message. Direct Supadata probes disproved source scarcity: the focused law query returned 20 videos while the conversational literal returned only one.
+- Root cause A — retrieval: Gemini Flash-Lite returned valid concise three-query plans twice with HTTP 200, but `_validated_ai_queries()` rejected them. Biology's focused branches omitted only a format constraint already retained by its broad branch; math omitted discourse words such as `smooth`, `progression`, `start`, and `then`; software omitted `teach` and `then`. The deterministic whole-prompt token-union and complete-N-slot facet-cover gates therefore discarded good AI retrieval plans and sent only the long conversational sentence to Supadata.
+- Root cause B — clipping retries: Slow jobs admit three logical source selectors. Three sources selected concurrently and each first Pro call succeeded, but schema/intent-contract retry calls were incorrectly counted as new logical source selectors. With all three source slots already claimed, every retry was denied before dispatch as `ProviderBudgetExceededError`; the retained invalid/empty plans had no candidate for the required Pro audit. The quota represented physical retry attempts as new sources instead of charging only their separately bounded cost.
+- Root cause C — representation continuity: The expansion output already contained a corrected intent, but ingestion sent the original conversational literal back into Gemini Pro. Retrieval and clipping therefore did not share the same compact AI interpretation, forcing the selector to re-parse filler and sequencing language independently.
+- Universal fix: Expansion cache v11 makes the existing Flash-Lite call return one <=220-character standalone, intent-preserving learning summary and searches from that summary; no additional model call is added. Validation retains anchored source constraints, known IDs, and all subject IDs, but no longer uses local token heuristics to veto otherwise valid subject-grounded AI branches or synthesize the long literal when focused branches exist. The original request remains persisted as `topic_terms`/`_literal_topic`, while the same AI summary is now passed into Gemini Pro. Selector and audit schema/contract retries reuse their source's logical quota and still acquire a separately cost-bounded physical dispatch ticket.
+- Focused retest: The captured biology/math/software production plans now dispatch three short Supadata queries after one Gemini call, preserve the original literal for traceability, and pass 142 expansion/search/provider regressions. A live provider smoke returned the cellular-respiration summary and three focused queries on its first call. The summary-to-Pro handoff test passes. The independent changed-path regression gate passes 928 tests, including selector/audit retry accounting and production-shaped diagnostics.
+- Exact production retest: Pending the same five-domain clean-state sequence, complete regressions, identical-SHA deployment verification, and time-to-first-reel comparison.
+
+### AF-100 — Non-Gemini correction was mistaken for the compressed intent
+
+- Status: Fixed locally; exact-SHA production retest pending
+- Severity: High — a deterministic or legacy discovery result can narrow a short ambiguous learning request before Gemini Pro, producing clips for the surrounding subject instead of the requested leaf concept
+- Reproduction: The complete backend gate passed discovery topic `Atp in cellular respiration mitochondria`, but a deterministic `corrected` value of `cellular respiration` was sent to clipping. Both material-generation variants failed because the ATP leaf identity disappeared.
+- Root cause: The first AF-099 summary handoff treated every discovery `corrected` field as the new Gemini intent summary. Older deterministic/fallback paths use that field for retrieval normalization and do not guarantee an intent-preserving compression contract.
+- Universal fix: Trust `corrected` as the Gemini Pro selection intent only when discovery records `provider_used == gemini`; deterministic and literal-fallback paths retain the authoritative topic. The original request remains `_literal_topic` in all paths.
+- Exact retest: The focused Gemini-summary and non-Gemini-preservation tests pass; the original acronym/sibling-context regressions and complete backend gate are rerun below.
+
+### AF-101 — Compressed summary was not structurally bound to its anchored intent
+
+- Status: Fixed locally; exact-SHA production retest pending
+- Severity: Critical — a malformed but schema-valid expansion could return grounded subject constraints and search queries while placing an unrelated concept in `corrected`, after which Gemini Pro would clip against the unrelated summary
+- Reproduction: A chain-rule expansion can declare anchored chain-rule constraints/queries while returning `corrected = quotient rule`; the current validator accepts the search plan because it validates constraints and query IDs but never binds the downstream summary to those IDs.
+- Root cause: The initial compressed-summary schema described `corrected` as intent-preserving but did not require an explicit structural coverage claim for that field. Query coverage IDs therefore protected retrieval branches without protecting the separate summary handed to clipping.
+- Universal fix: The same expansion response must return the exact set of anchored intent-constraint IDs preserved by its concise summary. Deterministic validation checks only exact known-ID set equality; it does not re-decide semantics with lexical matching and adds no provider call. A missing, duplicate, incomplete, or unknown summary binding rejects that response and uses the existing bounded retry.
+- Exact retest: Passed locally: incomplete, unknown, and duplicate summary-constraint bindings are rejected; the complete expansion/retrieval group passes 115 tests and the independent changed-path gate passes 928 tests. The final real-provider matrix accepted all five domain summaries and focused query plans on their first call.
+
+### AF-102 — Real Gemini expansion can lengthen the request and exhaust its retry
+
+- Status: Fixed locally; exact-SHA production retest pending
+- Severity: Critical — after both bounded expansion attempts fail their response contract, retrieval falls back to the long conversational literal that produced zero biology, math, and software results in AF-099
+- Reproduction: The first real v10 Newton provider response exceeded the schema's 240-character `corrected` limit. The actual two-attempt production entry point then returned `provider_used=literal_fallback` with the original 211-character request as its only query. Later direct samples landed at 240 and 236 characters, showing that schema-only length metadata did not reliably make Gemini compress the request.
+- Root cause: The system prompt required a concise summary but stated no concrete length boundary in natural language. Gemini could expand the request up to or beyond the schema edge; the retry repeated the same underspecified instruction.
+- Universal fix: The prompt now requires a compact summary of at most 200 characters without dropping any anchored constraint, while the response schema allows a 220-character safety margin. The cache advances to v11. The existing two-attempt retry remains unchanged, so the healthy path still makes one Flash-Lite call and adds no sleep or network round trip.
+- Exact retest: Passed locally and against the real provider. The expansion/retrieval group passes 115 tests. Physics, biology, math, software, and law each returned `provider_used=gemini` on the first call, with compact accepted summaries of 197, 175, 162, 168, and 202 characters respectively and three focused queries each; none used the literal fallback.
+
 ### Release constraint — healthy-path reel streaming latency
 
 - Requirement: These fixes must not increase time-to-first-ready or subsequent reel streaming cadence on successful requests.
@@ -1129,7 +1168,7 @@
 - Feed-focused frontend suite: 72 passed.
 - TypeScript check: passed.
 - Production Next.js build: passed.
-- `git diff --check`: passed after the final graph rebuild.
+- Scoped production/test/log `git diff --check`: passed after the final graph rebuild. The generated, unstaged `graphify-out/GRAPH_REPORT.md` still contains generator-emitted trailing spaces and is excluded from the release diff.
 - The only excluded backend test file was `backend/tests/test_labels_api.py`; collection imports the unrelated standalone `backend/main.py` and the local environment lacks `sse_starlette`. The active runtime under review is `backend.app.main`, and every active-backend/adaptive test collected and passed.
 - Canonical-only Gemini/Pro selector contract after AF-085 through AF-096: 652 passed in 3.84 seconds.
 - Canonical identity, persistence, adaptation, segment-cache, and organizer regression matrix: 372 passed, 3 subtests passed in 4.24 seconds.
@@ -1140,3 +1179,8 @@
 - Current TypeScript check: passed.
 - Current production Next.js build: passed.
 - Final complete backend suite after AF-097/AF-098: 4,038 passed, 1 skipped, 40 subtests passed in 46.66 seconds; no failure remains.
+- Final AF-099 through AF-102 changed-path gate: 928 passed; independent review GO with no domain-specific branch, new healthy-path call, or new sleep.
+- Final expansion/retrieval contract group: 115 passed; the real v11 provider matrix passed physics, biology, math, software, and law on the first call.
+- Final complete backend suite after AF-102: 4,047 passed, 1 skipped, 40 subtests passed in 52.17 seconds.
+- Final healthy-path latency guards: 4 passed; expansion, Gemini dispatch, and selector success paths remain one physical attempt with no retry wait.
+- Current frontend suite after the backend-only AF-099 through AF-102 patch: 191 passed; TypeScript check and production Next.js build passed.

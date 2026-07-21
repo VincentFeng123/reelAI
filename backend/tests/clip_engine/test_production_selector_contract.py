@@ -14672,6 +14672,125 @@ def test_long_video_metadata_does_not_create_media_budget_or_block_dispatch(
     assert budget["inflight_reserved_cost_usd"] == 0.0
 
 
+def test_contract_retry_reuses_logical_selector_slot_at_three_source_cap(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("slow", generation_id="selector-contract-retry-cap")
+    for _ in range(2):
+        reservation = context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
+        )
+        context.reconcile_gemini_call(
+            model_used="gemini-3.1-pro-preview",
+            usage={
+                **reservation,
+                "prompt_tokens": 100,
+                "candidate_tokens": 10,
+                "thought_tokens": 0,
+                "dispatched": True,
+            },
+        )
+
+    request = "photosynthesis"
+    claim = "convert light into stored chemical energy through photosynthesis"
+    valid_plan = _compact_custom_plan(
+        request=request,
+        start_quote="Plants convert light",
+        end_quote="energy through photosynthesis",
+        claim_quote=claim,
+    )
+    invalid_plan = valid_plan.model_copy(update={
+        "request_intent": valid_plan.request_intent.model_copy(update={
+            "exact_request": "an unrelated request",
+        }),
+    })
+    audit = gemini_segment._ProCandidateAuditPlan(items=[{
+        **_pro_audit_semantic_defaults(valid_plan, evidence_quote=claim),
+        "id": "candidate-1",
+        "d": "keep",
+        "obj": "Explain how photosynthesis stores captured light energy",
+        "ev": claim,
+        "ds": 0,
+        "dq": "Plants convert light",
+        "dc": True,
+        "s": 0,
+        "e": 0,
+        "sq": "Plants convert light",
+        "eq": "energy through photosynthesis",
+    }])
+    selector_responses = iter([invalid_plan, valid_plan])
+    audit_responses = iter([
+        gemini_segment._ProCandidateAuditPlan(items=[]),
+        audit,
+    ])
+    dispatched_schemas: list[type] = []
+
+    def fake_generate(_system, _user, schema, **kwargs):
+        dispatched_schemas.append(schema)
+        telemetry = {
+            "model": kwargs["model"],
+            "prompt_tokens": 1_000,
+            "candidate_tokens": 100,
+            "thought_tokens": 100,
+            "total_tokens": 1_200,
+        }
+        _settle_mock_dispatch(kwargs, telemetry)
+        parsed = (
+            next(selector_responses)
+            if schema is gemini_segment._CompactBoundaryPlan
+            else next(audit_responses)
+        )
+        return SimpleNamespace(
+            text=parsed.model_dump_json(by_alias=True),
+            telemetry=telemetry,
+        )
+
+    monkeypatch.setattr(gemini_client, "generate_json_v3", fake_generate)
+    monkeypatch.setattr(
+        gemini_client,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 1_000,
+    )
+
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "cue-0",
+                "start": 0.0,
+                "end": 8.0,
+                "text": (
+                    "Plants convert light into stored chemical energy through "
+                    "photosynthesis."
+                ),
+            }],
+            "words": [],
+            "source": "supadata",
+        },
+        {
+            "_segment_operation": "pro_authoritative",
+            "_segment_budget_reserve": context.reserve_gemini_call,
+            "_segment_budget_reconcile": context.reconcile_gemini_call,
+        },
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic=request,
+    )
+
+    assert result.error is None
+    assert result.accepted_count == 1
+    assert dispatched_schemas == [
+        gemini_segment._CompactBoundaryPlan,
+        gemini_segment._CompactBoundaryPlan,
+        gemini_segment._ProCandidateAuditPlan,
+        gemini_segment._ProCandidateAuditPlan,
+    ]
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["selector_calls"] == 3
+    assert budget["boundary_audit_calls"] == 1
+
+
 def test_long_preferred_video_url_dispatches_one_pro_transcript_only_call(
     monkeypatch,
 ) -> None:

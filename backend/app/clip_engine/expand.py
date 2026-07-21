@@ -43,7 +43,7 @@ PRACTICE_FAST_EXPAND_MODEL = "gemini-3.1-flash-lite"
 PRACTICE_FAST_EXPAND_TIMEOUT_MS = 10_000
 PRACTICE_FAST_EXPAND_OUTPUT_TOKENS = 2_048
 PRACTICE_FAST_EXPAND_ATTEMPTS = 2
-PRACTICE_FAST_EXPAND_CACHE_VERSION = 8
+PRACTICE_FAST_EXPAND_CACHE_VERSION = 11
 # An expansion can be nearly one segment-cache lifetime old when it discovers a
 # newly analyzed source. Keeping it for two lifetimes guarantees that source's
 # subsequent valid segment-cache lifetime never triggers another expansion call.
@@ -76,10 +76,25 @@ class _PracticeFastQuery(BaseModel):
 class _PracticeFastExpansion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    corrected: str
+    corrected: str = Field(
+        min_length=1,
+        max_length=220,
+        description=(
+            "Concise standalone learning-intent summary preserving the subject, "
+            "level, requested facets, relationships, tasks, outcomes, and order."
+        ),
+    )
     intent_constraints: list[_PracticeFastIntentConstraint] = Field(
         min_length=1,
         max_length=16,
+    )
+    summary_preserved_constraint_ids: list[str] = Field(
+        min_length=1,
+        max_length=16,
+        description=(
+            "Every intent constraint ID preserved by corrected, each listed "
+            "exactly once."
+        ),
     )
     queries: list[_PracticeFastQuery]
 
@@ -91,13 +106,18 @@ class _PracticeFastExpansion(BaseModel):
         return self
 
 
-_PRACTICE_FAST_SYSTEM = """You expand a user's search topic into a diverse set of
+_PRACTICE_FAST_SYSTEM = """You compress a user's learning request and expand it into a diverse set of
 YouTube search queries that maximize topical coverage.
 
 Do this:
-1. Spellcheck and correct the user's input.
+1. Spellcheck the input and compress it into corrected: one concise, standalone,
+   intent-preserving learning summary. Preserve the governing subject, learner level, requested
+   concepts, relationships, tasks, outcomes, and teaching order. Remove conversational filler,
+   but never broaden, add, or drop a requirement. corrected must make sense without the original
+   request, must not merely copy or expand a long conversational sentence, and must be at most
+   200 characters. Use compact wording rather than dropping a constraint to meet the limit.
 2. Infer the most likely intent or sense.
-3. Produce up to N concise queries that a person would actually search on YouTube.
+3. From corrected, produce up to N concise queries that a person would actually search on YouTube.
 4. Preserve the user's named subject in every query. Cover close synonyms, genuinely related
    informational facets, useful prerequisites, and educational sources, but never redirect the
    search into a merely adjacent field.
@@ -117,17 +137,22 @@ Do this:
    each variable," Newton's second law F=ma is SUBJECT,
    Explain is TASK, net force, mass, acceleration, and units are four separate SCOPE constraints,
    and solving for each variable is OUTCOME.
-7. The first broad query must preserve every constraint. Every later focused query must preserve
+7. For corrected, return summary_preserved_constraint_ids containing exactly every intent
+   constraint ID that corrected preserves. corrected must preserve all of them. List each ID
+   exactly once, with no omissions, duplicates, or unknown IDs; if any requirement is absent,
+   revise corrected before returning it.
+8. The first broad query must preserve every constraint. Every later focused query must preserve
    every subject constraint plus one or more distinct task, relationship, scope, format, or outcome
    constraints. Collectively target every named facet or list member; when the request says each,
    every, or all, give distinct members focused coverage where N permits.
-8. For every query, return exactly the IDs of the constraints it preserves. Synonyms and natural
+9. For every query, return exactly the IDs of the constraints it preserves. Synonyms and natural
    YouTube wording are welcome, but focused queries must not lose the governing subject or drift
    into an adjacent field.
 
-Return only the requested JSON object with corrected, intent_constraints, and queries. Keep
-corrected separate from queries. Return N optimized search queries; do not automatically spend
-one query on the raw literal wording."""
+Return only the requested JSON object with corrected, intent_constraints,
+summary_preserved_constraint_ids, and queries. corrected is the downstream learning intent; keep
+it separate from the retrieval queries. Return N optimized search queries; do not automatically
+spend one query on the raw literal wording."""
 
 
 def literal_fallback(topic: str, n: int) -> dict:
@@ -320,10 +345,15 @@ def _validated_ai_queries(
     parsed: _PracticeFastExpansion,
     count: int,
 ) -> list[str]:
-    """Prefer broad-plus-focused coverage, or a complete all-focused cover."""
+    """Prefer broad-plus-focused subject-grounded retrieval branches."""
     constraints = list(parsed.intent_constraints)
     constraint_ids = {constraint.constraint_id for constraint in constraints}
     if not constraint_ids:
+        return []
+    summary_ids = list(parsed.summary_preserved_constraint_ids)
+    if len(summary_ids) != len(set(summary_ids)):
+        return []
+    if set(summary_ids) != constraint_ids:
         return []
     subject_ids = {
         constraint.constraint_id
@@ -336,17 +366,6 @@ def _validated_ai_queries(
         not _contains_ordered_topic_terms(topic, constraint.source_phrase)
         for constraint in constraints
     ):
-        return []
-    required_topic_tokens = {
-        token for token in _intent_tokens(topic) if token not in _INTENT_STOPWORDS
-    }
-    covered_topic_tokens = {
-        token
-        for constraint in constraints
-        for token in _intent_tokens(constraint.source_phrase)
-        if token not in _INTENT_STOPWORDS
-    }
-    if required_topic_tokens and not required_topic_tokens.issubset(covered_topic_tokens):
         return []
 
     broad: list[str] = []
@@ -375,7 +394,7 @@ def _validated_ai_queries(
         focused.append((query.text, signature))
 
     normalized_model_broad = _normalize(broad, len(broad))
-    primary_broad = normalized_model_broad[0] if normalized_model_broad else topic
+    primary_broad = normalized_model_broad[0] if normalized_model_broad else ""
     broad_keys = {
         _key(query) for query in [topic, *normalized_model_broad]
     }
@@ -389,40 +408,29 @@ def _validated_ai_queries(
         focused_keys.add(key)
         normalized_focused.append((text, signature))
     if not non_subject_ids:
-        return _normalize(
-            [primary_broad, *normalized_model_broad[1:]],
-            count,
-        )
+        return _normalize(normalized_model_broad, count)
     if len(non_subject_ids) <= 2:
         normalized_focused.extend(
             (query, frozenset(non_subject_ids))
             for query in normalized_model_broad[1:]
         )
     if count <= 1:
-        return _normalize([primary_broad], count)
-    if count > 1 and non_subject_ids and not normalized_focused:
+        return _normalize(
+            [primary_broad or normalized_focused[0][0]]
+            if primary_broad or normalized_focused
+            else [],
+            count,
+        )
+    if not primary_broad and not normalized_focused:
         return []
 
-    focused_limit = max(0, count - 1)
+    focused_limit = max(0, count - int(bool(primary_broad)))
     selected_indices = _covering_focus_indices(
         normalized_focused,
         non_subject_ids,
         focused_limit,
     )
-    if selected_indices is None and not normalized_model_broad:
-        selected_indices = _covering_focus_indices(
-            normalized_focused,
-            non_subject_ids,
-            count,
-        )
-        if selected_indices is not None:
-            return _normalize(
-                [normalized_focused[index][0] for index in selected_indices],
-                count,
-            )
-    if selected_indices is None:
-        return []
-    selected_index_set = set(selected_indices)
+    selected_index_set = set(selected_indices or ())
     for index in range(len(normalized_focused)):
         if len(selected_index_set) >= focused_limit:
             break
@@ -433,8 +441,9 @@ def _validated_ai_queries(
     ]
     return _normalize(
         [
-            primary_broad,
+            *([primary_broad] if primary_broad else []),
             *(query for query, _signature in selected_focused),
+            *normalized_model_broad[1:],
         ],
         count,
     )
@@ -511,7 +520,8 @@ async def _practice_fast_gemini_raw_async(
     level_line = f"\nViewer level: {level_text}" if level_text else ""
     user = (
         f"User topic: {topic!r}\nN = {max(1, int(n))}{level_line}\n"
-        "Return corrected, intent_constraints, and queries as JSON."
+        "Return corrected, intent_constraints, summary_preserved_constraint_ids, "
+        "and queries as JSON."
     )
     reservation: dict[str, object] = {}
     try:

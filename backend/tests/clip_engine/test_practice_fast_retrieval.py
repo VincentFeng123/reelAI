@@ -44,6 +44,7 @@ def _intent_expansion_json(
 ) -> str:
     return json.dumps({
         "corrected": corrected,
+        "summary_preserved_constraint_ids": ["subject"],
         "intent_constraints": [{
             "constraint_id": "subject",
             "kind": "subject",
@@ -58,6 +59,18 @@ def _intent_expansion_json(
             for query in queries
         ],
     })
+
+
+def _expansion_payload_json(payload: dict) -> str:
+    completed = dict(payload)
+    completed.setdefault(
+        "summary_preserved_constraint_ids",
+        [
+            constraint["constraint_id"]
+            for constraint in completed.get("intent_constraints", [])
+        ],
+    )
+    return json.dumps(completed)
 
 
 def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypatch):
@@ -96,8 +109,27 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
 def test_practice_fast_expansion_requests_focused_sources() -> None:
     prompt = " ".join(expand._PRACTICE_FAST_SYSTEM.casefold().split())
 
-    assert expand.PRACTICE_FAST_EXPAND_CACHE_VERSION == 8
+    assert expand.PRACTICE_FAST_EXPAND_CACHE_VERSION == 11
     assert expand.PRACTICE_FAST_EXPAND_OUTPUT_TOKENS == 2_048
+    assert "one concise, standalone, intent-preserving learning summary" in prompt
+    assert "must make sense without the original request" in prompt
+    assert "must be at most 200 characters" in prompt
+    assert "compact wording rather than dropping a constraint" in prompt
+    assert "from corrected, produce up to n concise queries" in prompt
+    corrected_schema = expand._PracticeFastExpansion.model_json_schema()["properties"][
+        "corrected"
+    ]
+    assert corrected_schema["minLength"] == 1
+    assert corrected_schema["maxLength"] == 220
+    expansion_schema = expand._PracticeFastExpansion.model_json_schema()
+    summary_ids_schema = expansion_schema["properties"][
+        "summary_preserved_constraint_ids"
+    ]
+    assert "summary_preserved_constraint_ids" in expansion_schema["required"]
+    assert summary_ids_schema["minItems"] == 1
+    assert summary_ids_schema["maxItems"] == 16
+    assert "list each id exactly once" in prompt
+    assert "no omissions, duplicates, or unknown ids" in prompt
     assert "prefer focused teaching videos" in prompt
     assert "never query for a full course" in prompt
     assert "unless the user explicitly requests that format" in prompt
@@ -109,6 +141,191 @@ def test_practice_fast_expansion_requests_focused_sources() -> None:
         prompt
     )
     assert "net force, mass, acceleration, and units are four separate scope" in prompt
+
+
+@pytest.mark.parametrize(
+    ("topic", "corrected", "constraints", "queries"),
+    [
+        (
+            (
+                "Teach cellular respiration for a beginner in a clear progression: "
+                "glycolysis, the Krebs cycle, oxidative phosphorylation, and ATP "
+                "yield, with each stage connected to the next."
+            ),
+            (
+                "Beginner cellular respiration progression connecting glycolysis, "
+                "the Krebs cycle, oxidative phosphorylation, and ATP yield."
+            ),
+            [
+                ("c1", "subject", "cellular respiration"),
+                ("c2", "task", "Teach ... for a beginner"),
+                ("c3", "scope", "glycolysis"),
+                ("c4", "scope", "the Krebs cycle"),
+                ("c5", "scope", "oxidative phosphorylation"),
+                ("c6", "scope", "ATP yield"),
+                ("c7", "relationship", "each stage connected to the next"),
+                ("c8", "format", "clear progression"),
+            ],
+            [
+                (
+                    "cellular respiration steps explained glycolysis krebs cycle "
+                    "oxidative phosphorylation connection",
+                    ["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8"],
+                ),
+                (
+                    "glycolysis and krebs cycle explained for beginners",
+                    ["c1", "c2", "c3", "c4", "c7"],
+                ),
+                (
+                    "oxidative phosphorylation and ATP yield explained",
+                    ["c1", "c2", "c5", "c6"],
+                ),
+            ],
+        ),
+        (
+            (
+                "Teach derivatives for a beginner in a smooth progression: start "
+                "with slope and rate-of-change intuition, derive the power rule, "
+                "then solve one worked derivative problem and interpret the answer."
+            ),
+            (
+                "Beginner derivatives progression from slope and rate-of-change "
+                "intuition through the power rule, one worked problem, and "
+                "interpretation."
+            ),
+            [
+                ("c1", "subject", "derivatives"),
+                ("c2", "task", "Teach"),
+                ("c3", "scope", "beginner"),
+                ("c4", "scope", "slope and rate-of-change intuition"),
+                ("c5", "scope", "derive the power rule"),
+                (
+                    "c6",
+                    "outcome",
+                    "solve one worked derivative problem and interpret the answer",
+                ),
+            ],
+            [
+                (
+                    "calculus derivatives for beginners slope rate of change power "
+                    "rule derivation and examples",
+                    ["c1", "c2", "c3", "c4", "c5", "c6"],
+                ),
+                (
+                    "derivatives intuitive understanding slope and rate of change",
+                    ["c1", "c2", "c3", "c4"],
+                ),
+                (
+                    "derivative power rule proof and worked example interpretation",
+                    ["c1", "c5", "c6"],
+                ),
+            ],
+        ),
+        (
+            (
+                "Teach nullability notation for a beginner software developer: "
+                "compare Swift String? with Swift String, then explain TypeScript's "
+                "non-null assertion !, with safe-use examples and common mistakes."
+            ),
+            (
+                "Beginner software nullability: compare Swift String? with String, "
+                "explain TypeScript's non-null assertion !, and cover safe use and "
+                "common mistakes."
+            ),
+            [
+                ("c1", "subject", "nullability notation"),
+                ("c2", "scope", "beginner software developer"),
+                ("c3", "task", "compare Swift String? with Swift String"),
+                ("c4", "task", "explain TypeScript's non-null assertion !"),
+                ("c5", "outcome", "safe-use examples"),
+                ("c6", "outcome", "common mistakes"),
+            ],
+            [
+                (
+                    "nullability in programming for beginners Swift optionals and "
+                    "TypeScript non-null assertion explained",
+                    ["c1", "c2", "c3", "c4"],
+                ),
+                (
+                    "Swift String versus String? optional explanation with safe "
+                    "handling examples",
+                    ["c1", "c3", "c5"],
+                ),
+                (
+                    "TypeScript non-null assertion operator ! common mistakes and "
+                    "safe usage",
+                    ["c1", "c4", "c6"],
+                ),
+            ],
+        ),
+    ],
+    ids=["cellular-respiration", "derivatives", "nullability"],
+)
+def test_live_cross_domain_expansions_reach_supadata_as_short_ai_branches(
+    monkeypatch,
+    topic,
+    corrected,
+    constraints,
+    queries,
+):
+    payload = {
+        "corrected": corrected,
+        "intent_constraints": [
+            {
+                "constraint_id": constraint_id,
+                "kind": kind,
+                "source_phrase": source_phrase,
+                "requirement": f"Preserve {source_phrase}",
+            }
+            for constraint_id, kind, source_phrase in constraints
+        ],
+        "queries": [
+            {
+                "text": query,
+                "preserved_constraint_ids": preserved_constraint_ids,
+            }
+            for query, preserved_constraint_ids in queries
+        ],
+    }
+    gemini_calls = 0
+    search_calls = []
+
+    def fake_raw(*_args, **_kwargs):
+        nonlocal gemini_calls
+        gemini_calls += 1
+        return _expansion_payload_json(payload)
+
+    def fake_search_all(search_queries, filters=None, **_kwargs):
+        del filters
+        search_calls.append(list(search_queries))
+        return {
+            "per_query": [
+                {"query": query, "videos": [], "next_page_token": None}
+                for query in search_queries
+            ],
+            "credits_used": len(search_queries),
+            "warning": None,
+        }
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        topic,
+        limit=3,
+        breadth=8,
+        retrieval_profile="deep",
+    )
+
+    expected_queries = [query for query, _preserved in queries]
+    assert gemini_calls == 1
+    assert search_calls == [expected_queries]
+    assert result["queries"] == expected_queries
+    assert result["corrected"] == corrected
+    assert corrected != topic
+    assert result["topic_terms"] == [topic]
+    assert result["provider_used"] == "gemini"
+    assert topic not in expected_queries
 
 
 def test_practice_fast_expansion_keeps_broad_query_then_subject_grounded_focus(
@@ -154,7 +371,7 @@ def test_practice_fast_expansion_keeps_broad_query_then_subject_grounded_focus(
     monkeypatch.setattr(
         expand,
         "_practice_fast_gemini_raw",
-        lambda *_args, **_kwargs: json.dumps(payload),
+        lambda *_args, **_kwargs: _expansion_payload_json(payload),
     )
 
     result = expand.expand_query_practice_fast("chain rule worked example", 3)
@@ -225,7 +442,7 @@ def test_practice_fast_expansion_collectively_targets_named_request_facets(monke
     monkeypatch.setattr(
         expand,
         "_practice_fast_gemini_raw",
-        lambda *_args, **_kwargs: json.dumps(payload),
+        lambda *_args, **_kwargs: _expansion_payload_json(payload),
     )
 
     result = expand.expand_query_practice_fast(topic, 3)
@@ -241,7 +458,9 @@ def test_practice_fast_expansion_collectively_targets_named_request_facets(monke
     }
 
 
-def test_practice_fast_expansion_repairs_missing_model_broad_query_safely(monkeypatch):
+def test_practice_fast_expansion_uses_focused_queries_without_synthesizing_long_literal(
+    monkeypatch,
+):
     topic = (
         "Explain Newton's second law F=ma from intuition through worked examples, "
         "including net force, mass, acceleration, units, and solving for each variable"
@@ -300,7 +519,7 @@ def test_practice_fast_expansion_repairs_missing_model_broad_query_safely(monkey
     monkeypatch.setattr(
         expand,
         "_practice_fast_gemini_raw",
-        lambda *_args, **_kwargs: json.dumps(payload),
+        lambda *_args, **_kwargs: _expansion_payload_json(payload),
     )
 
     result = expand.expand_query_practice_fast(topic, 3)
@@ -308,9 +527,9 @@ def test_practice_fast_expansion_repairs_missing_model_broad_query_safely(monkey
     assert result == {
         "corrected": topic,
         "queries": [
-            topic,
             "Newton second law intuitive explanation and units",
             "Newton second law worked examples solve F m and a",
+            "Newton second law net force mass acceleration practice",
         ],
         "provider_used": "gemini",
     }
@@ -373,7 +592,7 @@ def test_practice_fast_expansion_uses_all_slots_for_complete_focused_cover(
     monkeypatch.setattr(
         expand,
         "_practice_fast_gemini_raw",
-        lambda *_args, **_kwargs: json.dumps(payload),
+        lambda *_args, **_kwargs: _expansion_payload_json(payload),
     )
 
     result = expand.expand_query_practice_fast(topic, 3)
@@ -385,7 +604,9 @@ def test_practice_fast_expansion_uses_all_slots_for_complete_focused_cover(
     }
 
 
-def test_practice_fast_expansion_rejects_incomplete_all_focused_cover(monkeypatch):
+def test_practice_fast_expansion_keeps_grounded_branches_when_slots_miss_one_facet(
+    monkeypatch,
+):
     topic = "physics force mass acceleration units"
     all_ids = ["subject", "force", "mass", "acceleration", "units"]
     payload = {
@@ -419,15 +640,19 @@ def test_practice_fast_expansion_rejects_incomplete_all_focused_cover(monkeypatc
     monkeypatch.setattr(
         expand,
         "_practice_fast_gemini_raw",
-        lambda *_args, **_kwargs: json.dumps(payload),
+        lambda *_args, **_kwargs: _expansion_payload_json(payload),
     )
 
     result = expand.expand_query_practice_fast(topic, 3)
 
     assert result == {
         "corrected": topic,
-        "queries": [topic],
-        "provider_used": "literal_fallback",
+        "queries": [
+            "physics force lesson",
+            "physics mass lesson",
+            "physics acceleration lesson",
+        ],
+        "provider_used": "gemini",
     }
 
 
@@ -474,7 +699,7 @@ def test_practice_fast_expansion_prioritizes_distinct_facet_coverage(monkeypatch
     monkeypatch.setattr(
         expand,
         "_practice_fast_gemini_raw",
-        lambda *_args, **_kwargs: json.dumps(payload),
+        lambda *_args, **_kwargs: _expansion_payload_json(payload),
     )
 
     result = expand.expand_query_practice_fast(topic, 3)
@@ -544,7 +769,7 @@ def test_practice_fast_expansion_finds_non_greedy_complete_facet_cover(monkeypat
     monkeypatch.setattr(
         expand,
         "_practice_fast_gemini_raw",
-        lambda *_args, **_kwargs: json.dumps(payload),
+        lambda *_args, **_kwargs: _expansion_payload_json(payload),
     )
 
     result = expand.expand_query_practice_fast(topic, 3)
@@ -552,7 +777,7 @@ def test_practice_fast_expansion_finds_non_greedy_complete_facet_cover(monkeypat
     assert result == {
         "corrected": topic,
         "queries": [
-            topic,
+            "physics force mass acceleration and units",
             "physics force mass and energy",
             "physics acceleration units and momentum",
         ],
@@ -560,7 +785,9 @@ def test_practice_fast_expansion_finds_non_greedy_complete_facet_cover(monkeypat
     }
 
 
-def test_practice_fast_expansion_rejects_partial_focused_facet_coverage(monkeypatch):
+def test_practice_fast_expansion_keeps_partial_focus_beside_complete_broad_query(
+    monkeypatch,
+):
     topic = "physics force mass acceleration units"
     all_ids = ["subject", "force", "mass", "acceleration", "units"]
     payload = {
@@ -590,15 +817,18 @@ def test_practice_fast_expansion_rejects_partial_focused_facet_coverage(monkeypa
     monkeypatch.setattr(
         expand,
         "_practice_fast_gemini_raw",
-        lambda *_args, **_kwargs: json.dumps(payload),
+        lambda *_args, **_kwargs: _expansion_payload_json(payload),
     )
 
     result = expand.expand_query_practice_fast(topic, 3)
 
     assert result == {
         "corrected": topic,
-        "queries": [topic],
-        "provider_used": "literal_fallback",
+        "queries": [
+            "physics force mass acceleration units overview",
+            "physics force lesson",
+        ],
+        "provider_used": "gemini",
     }
 
 
@@ -656,7 +886,6 @@ def test_practice_fast_expansion_rejects_partial_focused_facet_coverage(monkeypa
             {
                 "corrected": "chain rule worked example",
                 "queries": [
-                    "chain rule worked example",
                     "chain rule worked walkthrough",
                     "chain rule example answer",
                 ],
@@ -665,7 +894,7 @@ def test_practice_fast_expansion_rejects_partial_focused_facet_coverage(monkeypa
         ),
     ],
 )
-def test_practice_fast_expansion_requires_subject_and_repairs_missing_broad_query(
+def test_practice_fast_expansion_requires_subject_and_accepts_focused_queries(
     monkeypatch,
     intent_constraints,
     queries,
@@ -679,7 +908,7 @@ def test_practice_fast_expansion_requires_subject_and_repairs_missing_broad_quer
     monkeypatch.setattr(
         expand,
         "_practice_fast_gemini_raw",
-        lambda *_args, **_kwargs: json.dumps(payload),
+        lambda *_args, **_kwargs: _expansion_payload_json(payload),
     )
 
     result = expand.expand_query_practice_fast("chain rule worked example", 3)
@@ -687,7 +916,7 @@ def test_practice_fast_expansion_requires_subject_and_repairs_missing_broad_quer
     assert result == expected
 
 
-def test_practice_fast_expansion_falls_back_to_exact_request_when_contract_drops_qualifier(
+def test_practice_fast_expansion_trusts_grounded_ai_retrieval_branch_when_plan_is_sparse(
     monkeypatch,
 ):
     payload = {
@@ -704,6 +933,97 @@ def test_practice_fast_expansion_falls_back_to_exact_request_when_contract_drops
             {
                 "text": "chain rule definition lecture",
                 "preserved_constraint_ids": ["subject"],
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: _expansion_payload_json(payload),
+    )
+
+    result = expand.expand_query_practice_fast("chain rule worked example", 3)
+
+    assert result == {
+        "corrected": "chain rule worked example",
+        "queries": ["chain rule definition lecture"],
+        "provider_used": "gemini",
+    }
+
+
+def test_practice_fast_expansion_rejects_ungrounded_ai_subject(monkeypatch):
+    payload = {
+        "corrected": "quotient rule",
+        "intent_constraints": [
+            {
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": "quotient rule",
+                "requirement": "Teach the quotient rule",
+            },
+        ],
+        "queries": [
+            {
+                "text": "quotient rule lecture",
+                "preserved_constraint_ids": ["subject"],
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: _expansion_payload_json(payload),
+    )
+
+    result = expand.expand_query_practice_fast("chain rule worked example", 3)
+
+    assert result == {
+        "corrected": "chain rule worked example",
+        "queries": ["chain rule worked example"],
+        "provider_used": "literal_fallback",
+    }
+
+
+@pytest.mark.parametrize(
+    "summary_ids",
+    [
+        ["subject", "task"],
+        ["subject", "task", "outcome", "unknown"],
+        ["subject", "task", "outcome", "outcome"],
+    ],
+    ids=["incomplete", "unknown", "duplicate"],
+)
+def test_practice_fast_expansion_rejects_unbound_corrected_summary(
+    monkeypatch,
+    summary_ids,
+):
+    payload = {
+        "corrected": "quotient rule worked example",
+        "summary_preserved_constraint_ids": summary_ids,
+        "intent_constraints": [
+            {
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": "chain rule",
+                "requirement": "Teach the chain rule",
+            },
+            {
+                "constraint_id": "task",
+                "kind": "task",
+                "source_phrase": "worked",
+                "requirement": "Work through the process",
+            },
+            {
+                "constraint_id": "outcome",
+                "kind": "outcome",
+                "source_phrase": "example",
+                "requirement": "Reach a concrete example answer",
+            },
+        ],
+        "queries": [
+            {
+                "text": "chain rule worked example",
+                "preserved_constraint_ids": ["subject", "task", "outcome"],
             },
         ],
     }

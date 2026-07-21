@@ -1077,8 +1077,8 @@ def discover_practice_fast(
     return {
         "corrected": corrected,
         "queries": initial_queries,
-        # AI queries discover sources only. The exact user request remains the
-        # sole transcript-selection and evidence identity downstream.
+        # AI queries discover sources only. The exact request stays attached as
+        # evidence identity while the validated Gemini summary drives selection.
         "topic_terms": [literal_query],
         "provider_used": expansion.get("provider_used") or "literal_fallback",
         "videos": videos,

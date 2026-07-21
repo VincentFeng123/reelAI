@@ -4846,6 +4846,15 @@ class IngestionPipeline:
             discovered_video["_knowledge_level"] = knowledge_level
             discovered_video["_topic_terms"] = topic_terms
             discovered_video["_literal_topic"] = authoritative_topic
+            # The expansion model's concise, intent-preserving summary is the
+            # shared retrieval/selection contract. Keep the literal request on
+            # the source for traceability, but do not make Gemini Pro re-parse
+            # conversational search text after expansion already normalized it.
+            discovered_video["_selection_topic"] = (
+                corrected_topic
+                if str(disc.get("provider_used") or "").casefold() == "gemini"
+                else authoritative_topic
+            )
             discovered_video["_search_context"] = _retrieval_search_context(
                 requested_topic=authoritative_topic,
                 corrected_topic=corrected_topic,
@@ -4945,7 +4954,10 @@ class IngestionPipeline:
             return executor.submit(
                 self._clip_and_filter,
                 videos[index],
-                authoritative_topic,
+                str(
+                    videos[index].get("_selection_topic")
+                    or authoritative_topic
+                ),
                 language,
                 fetch_should_cancel,
                 generation_context,

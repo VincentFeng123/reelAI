@@ -573,10 +573,11 @@ def test_mixed_provider_failures_do_not_block_a_valid_completed_source(
     assert context.counters()["provider_failures"] == 2
 
 
-def test_ingest_topic_uses_literal_identity_for_segmentation(monkeypatch) -> None:
+def test_ingest_topic_uses_ai_intent_summary_for_segmentation(monkeypatch) -> None:
     captured_topics: list[str] = []
     discovery = {
         "corrected": "Calculus",
+        "provider_used": "gemini",
         "topic_terms": ["calclus", "Calculus"],
         "videos": [_video()],
         "credits_used": 0,
@@ -598,7 +599,38 @@ def test_ingest_topic_uses_literal_identity_for_segmentation(monkeypatch) -> Non
         max_videos=1,
     )
 
-    assert captured_topics == ["calclus"]
+    assert captured_topics == ["Calculus"]
+    assert discovery["videos"][0]["_literal_topic"] == "calclus"
+
+
+def test_ingest_topic_does_not_treat_non_gemini_correction_as_intent_summary(
+    monkeypatch,
+) -> None:
+    captured_topics: list[str] = []
+    discovery = {
+        "corrected": "cellular respiration",
+        "provider_used": "deterministic",
+        "topic_terms": ["ATP in cellular respiration mitochondria"],
+        "videos": [_video()],
+        "credits_used": 0,
+        "warning": None,
+    }
+
+    def fake_clip(_url, *, topic, **_kwargs):
+        captured_topics.append(topic)
+        return {"clips": [], "transcript": _transcript(), "notes": ""}
+
+    monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: discovery)
+    monkeypatch.setattr(pipeline_module, "_run_clip", fake_clip)
+
+    _pipeline().ingest_topic(
+        topic="ATP in cellular respiration mitochondria",
+        material_id="material",
+        concept_id="concept",
+        max_videos=1,
+    )
+
+    assert captured_topics == ["ATP in cellular respiration mitochondria"]
 
 
 def test_ingest_topic_rejects_transcript_window_without_topic_evidence(monkeypatch) -> None:
