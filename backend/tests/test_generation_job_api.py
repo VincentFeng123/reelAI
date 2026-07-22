@@ -3767,6 +3767,75 @@ def test_generation_worker_retries_transient_provider_twice_then_succeeds_same_j
         conn.close()
 
 
+def test_generation_worker_exhaustion_uses_cumulative_cross_attempt_stage_counters(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_transactional_worker_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="cumulative-exhaustion-diagnostics",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    retrieval_calls = 0
+
+    def generate_stage(_worker_conn, **kwargs) -> None:
+        nonlocal retrieval_calls
+        retrieval_calls += 1
+        context = kwargs["generation_context"]
+        if retrieval_calls <= 2:
+            context.increment_counter("discovered_videos", 2)
+            context.increment_counter("usable_transcripts", 2)
+            raise ProviderTransientError(
+                "Gemini is temporarily unavailable.",
+                provider="gemini",
+                operation="segmentation",
+                status_code=503,
+            )
+        context.increment_counter("gemini_empty_results")
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    try:
+        for attempt in (1, 2, 3):
+            leased = generation_jobs.lease_job(
+                conn,
+                job_id=str(job["id"]),
+                lease_owner=f"cumulative-diagnostics-worker-{attempt}",
+                now=now + timedelta(seconds=attempt - 1),
+            )
+            assert leased and leased["attempt_count"] == attempt
+            main._run_leased_generation_job(leased, threading.Event())
+
+        exhausted = generation_jobs.get_job(conn, str(job["id"]))
+        assert exhausted and exhausted["status"] == "exhausted"
+        assert exhausted["attempt_count"] == 3
+        usage = json.loads(str(exhausted["usage_json"] or "{}"))
+        assert usage["counters"]["discovered_videos"] == 4
+        assert usage["counters"]["usable_transcripts"] == 4
+        assert usage["counters"]["gemini_empty_results"] == 1
+        terminal_detail = json.loads(
+            str(exhausted["terminal_error_json"] or "{}")
+        )
+        assert terminal_detail["counters"]["discovered_videos"] == 4
+        assert terminal_detail["counters"]["usable_transcripts"] == 4
+        assert terminal_detail["counters"]["gemini_empty_results"] == 1
+        assert "content quality" in str(
+            exhausted["terminal_error_message"]
+        ).casefold()
+        assert "no matching youtube videos" not in str(
+            exhausted["terminal_error_message"]
+        ).casefold()
+        assert retrieval_calls == 3
+    finally:
+        conn.close()
+
+
 def test_same_job_retry_composes_with_ancestral_source_attempt_bound(
     monkeypatch,
 ) -> None:
@@ -3986,9 +4055,15 @@ def test_generation_worker_retries_response_validation_three_times_with_precise_
         "intent_contract_incomplete_joint_structure"
     )
 
-    def fail_stage(_worker_conn, **_kwargs) -> None:
+    def fail_stage(_worker_conn, **kwargs) -> None:
         nonlocal attempts
         attempts += 1
+        context = kwargs["generation_context"]
+        if attempts <= 2:
+            context.increment_counter("discovered_videos", 2)
+            context.increment_counter("usable_transcripts", 2)
+        else:
+            context.increment_counter("gemini_empty_results")
         raise ProviderResponseValidationError(
             "Gemini responded, but its clip plan did not satisfy "
             "the learning-request contract.",
@@ -4041,6 +4116,12 @@ def test_generation_worker_retries_response_validation_three_times_with_precise_
         assert status["error"]["code"] == "provider_response_invalid"
         assert status["error"]["detail"]["detail"] == detail
         assert status["error"]["detail"]["status_code"] == 200
+        assert usage["counters"]["discovered_videos"] == 4
+        assert usage["counters"]["usable_transcripts"] == 4
+        assert usage["counters"]["gemini_empty_results"] == 1
+        terminal_detail = json.loads(str(failed["terminal_error_json"] or "{}"))
+        assert terminal_detail["counters"] == usage["counters"]
+        assert status["error"]["detail"]["counters"] == usage["counters"]
         assert attempts == 3
     finally:
         conn.close()

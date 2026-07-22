@@ -43,15 +43,6 @@ _LONG_TOPIC_RELATION = re.compile(
     r"\b(?:work together|interact|combine|to maintain|to preserve|to pass|across)\b",
     re.IGNORECASE,
 )
-_INVALID_PROVIDER_CURSOR = re.compile(
-    r"\b(?:"
-    r"(?:invalid|expired)(?:\s+or\s+(?:invalid|expired))?\s+"
-    r"(?:continuation\s+token|page\s+token|nextpagetoken|cursor)"
-    r"|(?:continuation\s+token|page\s+token|nextpagetoken|cursor)\s+"
-    r"(?:is\s+)?(?:invalid|expired)"
-    r")\b",
-    re.IGNORECASE,
-)
 _FOCUSED_ANALYSIS_SOURCE_MAX_SEC = 30 * 60
 
 
@@ -441,19 +432,19 @@ def _continue_provider_pages(
             warning = "Search budget exhausted with provider pages remaining."
             break
         except ProviderRequestError as exc:
-            if exc.status_code != 400 or not _INVALID_PROVIDER_CURSOR.search(
-                str(exc.detail or "")
+            if (
+                exc.status_code != 400
+                or not supadata_search.is_invalid_cursor_detail(exc.detail)
             ):
                 raise
             logger.warning(
-                "Provider continuation cursor was rejected; continuing another "
-                "query branch query=%r",
-                query,
+                "Provider continuation cursor was rejected; skipping unusable "
+                "cursor branch."
             )
             warning = (
                 warning
-                or "A provider continuation cursor was rejected; continued with "
-                "another grounded search query."
+                or "A provider continuation cursor was rejected; the unusable "
+                "cursor branch was skipped."
             )
             continue
 

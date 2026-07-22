@@ -9,6 +9,7 @@ from backend.app.clip_engine.errors import (
     ProviderError,
     ProviderQuotaError,
     ProviderRateLimitError,
+    ProviderRequestError,
     ProviderTransientError,
 )
 from backend.app.clip_engine.provider_cache import MemoryProviderCache
@@ -401,6 +402,63 @@ def test_permanent_search_response_is_not_retried(monkeypatch, status):
     with pytest.raises(ProviderError):
         ss.search_one("permanent", cache_store=MemoryProviderCache())
     assert calls == 1
+
+
+def test_invalid_cursor_is_negatively_cached_after_first_rejection(monkeypatch):
+    calls = 0
+
+    def invalid_cursor(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _Resp(400, {"message": "Invalid or expired continuation token"})
+
+    monkeypatch.setattr(ss.httpx, "get", invalid_cursor)
+    cache = MemoryProviderCache()
+    context = GenerationContext("slow")
+
+    with pytest.raises(ProviderRequestError):
+        ss.search_one(
+            "circuits",
+            page_token="bad-cursor",
+            context=context,
+            cache_store=cache,
+        )
+    remaining_after_first = context.budget.remaining("search")
+
+    second = ss.search_one(
+        "circuits",
+        page_token="bad-cursor",
+        context=context,
+        cache_store=cache,
+    )
+
+    assert calls == 1
+    assert second["videos"] == []
+    assert second["next_page_token"] is None
+    assert second["cache_hit"] is True
+    assert context.budget.remaining("search") == remaining_after_first
+
+
+def test_unrelated_cursor_400_is_not_negatively_cached(monkeypatch):
+    calls = 0
+
+    def invalid_request(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _Resp(400, {"message": "cursor cannot be combined with query"})
+
+    monkeypatch.setattr(ss.httpx, "get", invalid_request)
+    cache = MemoryProviderCache()
+
+    for _ in range(2):
+        with pytest.raises(ProviderRequestError):
+            ss.search_one(
+                "circuits",
+                page_token="bad-request",
+                cache_store=cache,
+            )
+
+    assert calls == 2
 
 
 def test_network_errors_retry_at_most_twice_then_surface(monkeypatch):

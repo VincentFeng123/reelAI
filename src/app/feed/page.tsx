@@ -1000,6 +1000,14 @@ function sourceVideoKeyFromUrl(value: string): string {
   }
 }
 
+function sourceVideoIdForReel(reel: Reel): string {
+  const urlVideoId = sourceVideoKeyFromUrl(reel.video_url);
+  if (/^[A-Za-z0-9_-]{11}$/.test(urlVideoId)) {
+    return urlVideoId;
+  }
+  return String(reel.video_id || "").trim().replace(/^yt:/, "");
+}
+
 function preferNonEmptyString(nextValue: string | undefined, currentValue: string | undefined): string | undefined {
   return typeof nextValue === "string" && nextValue.trim() ? nextValue : currentValue;
 }
@@ -4679,7 +4687,6 @@ function FeedPageInner() {
       currentIndex,
       currentReels.length - 1,
     );
-    const currentActiveReelId = currentReels[currentIndex]?.reel_id;
     const watchedPrefix = currentReels.slice(0, preservedThroughIndex + 1);
     const excludeReelIds = watchedPrefix.map((reel) => String(reel.reel_id || "").trim()).filter(Boolean);
     const tailCapacity = Math.max(0, MAX_REELS_PER_FEED_SESSION - watchedPrefix.length);
@@ -4748,16 +4755,69 @@ function FeedPageInner() {
     const serverOrderedTail = dedupeByIdentity(mergeReelBatchesInServerOrder(
       successful.map((pages) => dedupeByIdentity(pages.flatMap((response) => response.reels))),
     ));
-    const nextReels = dedupeByIdentity(serverOrderedTail, watchedPrefix).slice(0, MAX_REELS_PER_FEED_SESSION);
-    updateSessionReels(nextReels);
-    const nextActiveIndex = currentActiveReelId
-      ? nextReels.findIndex((reel) => reel.reel_id === currentActiveReelId)
+    const liveReels = reelsRef.current;
+    const liveCurrentIndex = liveReels.length > 0
+      ? clamp(activeIndexRef.current, 0, liveReels.length - 1)
+      : 0;
+    const livePreservedThroughIndex = liveReels.length > 0
+      ? clamp(
+          Math.max(liveCurrentIndex, watchedFrontierIndexRef.current),
+          liveCurrentIndex,
+          liveReels.length - 1,
+        )
       : -1;
-    activeIndexRef.current = nextActiveIndex >= 0 ? nextActiveIndex : currentIndex;
+    const liveActiveReelId = liveReels[liveCurrentIndex]?.reel_id;
+    const liveWatchedPrefix = liveReels.slice(0, livePreservedThroughIndex + 1);
+    const liveUnseenRows = liveReels.slice(livePreservedThroughIndex + 1);
+    const liveExcludeReelIds = liveWatchedPrefix
+      .map((reel) => String(reel.reel_id || "").trim())
+      .filter(Boolean);
+    const liveExcludeVideoIds = new Set(
+      liveWatchedPrefix.map(sourceVideoIdForReel).filter(Boolean),
+    );
+    const sharesIdentity = (left: Reel, right: Reel): boolean => {
+      const leftReelId = String(left.reel_id || "").trim();
+      const rightReelId = String(right.reel_id || "").trim();
+      return (
+        Boolean(leftReelId && rightReelId && leftReelId === rightReelId)
+        || reelClipKey(left) === reelClipKey(right)
+      );
+    };
+    adaptiveExcludeReelIdsRef.current = liveExcludeReelIds.slice(-200);
+    const eligibleServerTail = serverOrderedTail.filter((reel) => {
+      const sourceVideoId = sourceVideoIdForReel(reel);
+      return (
+        !liveWatchedPrefix.some((watchedReel) => sharesIdentity(reel, watchedReel))
+        && (!sourceVideoId || !liveExcludeVideoIds.has(sourceVideoId))
+      );
+    });
+    const remainingReleasedRows = [...liveUnseenRows];
+    const organizedTail: Reel[] = [];
+    let remainingNewCapacity = Math.max(0, MAX_REELS_PER_FEED_SESSION - liveReels.length);
+    for (const serverReel of eligibleServerTail) {
+      const releasedIndex = remainingReleasedRows.findIndex(
+        (releasedReel) => sharesIdentity(serverReel, releasedReel),
+      );
+      if (releasedIndex >= 0) {
+        organizedTail.push(...remainingReleasedRows.splice(releasedIndex, 1));
+        continue;
+      }
+      if (remainingNewCapacity > 0) {
+        organizedTail.push(serverReel);
+        remainingNewCapacity -= 1;
+      }
+    }
+    organizedTail.push(...remainingReleasedRows);
+    const nextReels = dedupeByIdentity(organizedTail, liveWatchedPrefix);
+    updateSessionReels(nextReels);
+    const nextActiveIndex = liveActiveReelId
+      ? nextReels.findIndex((reel) => reel.reel_id === liveActiveReelId)
+      : -1;
+    activeIndexRef.current = nextActiveIndex >= 0 ? nextActiveIndex : liveCurrentIndex;
     setActiveIndex(activeIndexRef.current);
     setTotal(Math.max(
       nextReels.length,
-      watchedPrefix.length + successful.reduce((sum, pages) => {
+      liveWatchedPrefix.length + successful.reduce((sum, pages) => {
         const lastResponse = pages[pages.length - 1];
         return sum + Math.max(0, Number(lastResponse?.total) || 0);
       }, 0),
@@ -4797,6 +4857,7 @@ function FeedPageInner() {
     renewActiveSearchScope,
     rememberFeedContinuationToken,
     rememberFeedGenerationJob,
+    reelClipKey,
     settingsScopeReady,
     updateSessionReels,
   ]);

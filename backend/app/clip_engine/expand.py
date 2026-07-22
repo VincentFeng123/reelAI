@@ -2,8 +2,9 @@
 
 Topic correction, aliases, and semantic expansion are owned by the persisted
 TopicExpansionService. The existing ``expand_query`` API retains its stable templates.
-Production retrieval uses ``expand_query_practice_fast`` for one cached Flash call and
-falls back only to the user's literal request when the provider is unavailable.
+Production retrieval uses ``expand_query_practice_fast`` for a cached Gemini plan.
+Recoverable failures receive bounded corrective Gemini retries; exhausted failures
+remain typed so the durable generation controller can retry them.
 """
 from __future__ import annotations
 
@@ -18,10 +19,22 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ... import gemini_client
 from ...concept_tokens import semantic_key, semantic_tokens
 from . import config
 from .cancellation import raise_if_cancelled, run_cancellable
-from .errors import CancellationError, ProviderConfigurationError
+from .errors import (
+    CancellationError,
+    ModelUnavailableError,
+    ProviderAuthenticationError,
+    ProviderConfigurationError,
+    ProviderError,
+    ProviderQuotaError,
+    ProviderRateLimitError,
+    ProviderRequestError,
+    ProviderResponseValidationError,
+    ProviderTransientError,
+)
 from .segment_cache import SEGMENT_CACHE_TTL_SEC
 from .singleflight import singleflight
 from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
@@ -39,10 +52,12 @@ _INTENT_STOPWORDS = frozenset({
 })
 
 PRACTICE_FAST_EXPAND_MODEL = "gemini-3.1-flash-lite"
+PRACTICE_FAST_EXPAND_FALLBACK_MODEL = "gemini-3.6-flash"
 # Gemini rejects manually configured deadlines below ten seconds.
 PRACTICE_FAST_EXPAND_TIMEOUT_MS = 10_000
 PRACTICE_FAST_EXPAND_OUTPUT_TOKENS = 2_048
-PRACTICE_FAST_EXPAND_ATTEMPTS = 2
+PRACTICE_FAST_EXPAND_FALLBACK_OUTPUT_TOKENS = 4_096
+PRACTICE_FAST_EXPAND_ATTEMPTS = 3
 PRACTICE_FAST_EXPAND_CACHE_VERSION = 13
 PRACTICE_FAST_INTENT_CONTRACT_VERSION = "expansion_intent_v2"
 # An expansion can be nearly one segment-cache lifetime old when it discovers a
@@ -127,15 +142,51 @@ class _PracticeFastIntentConstraint(BaseModel):
 class _PracticeFastJointStructure(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    member_constraint_ids: list[str] = Field(min_length=2, max_length=16)
-    relation_constraint_id: str = Field(min_length=1, max_length=32)
+    member_constraint_ids: list[str] = Field(
+        min_length=2,
+        max_length=16,
+        description=(
+            "At least two separately declared side or stage constraint IDs. "
+            "Never include relation_constraint_id."
+        ),
+    )
+    relation_constraint_id: str = Field(
+        min_length=1,
+        max_length=32,
+        description=(
+            "The separately declared relationship constraint ID; it is not a "
+            "member_constraint_id."
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _remove_redundant_relation_member(cls, value):
+        if not isinstance(value, dict):
+            return value
+        relation_id = value.get("relation_constraint_id")
+        member_ids = value.get("member_constraint_ids")
+        if not relation_id or not isinstance(member_ids, list):
+            return value
+        if relation_id not in member_ids:
+            return value
+        normalized = dict(value)
+        normalized_members = [
+            member_id for member_id in member_ids if member_id != relation_id
+        ]
+        if len(normalized_members) < 2:
+            raise ValueError(
+                "joint member_constraint_ids must contain at least two "
+                "non-relation side or stage constraint IDs; "
+                "relation_constraint_id must not also be a member"
+            )
+        normalized["member_constraint_ids"] = normalized_members
+        return normalized
 
     @model_validator(mode="after")
     def _unique_members(self):
         if len(self.member_constraint_ids) != len(set(self.member_constraint_ids)):
             raise ValueError("joint member constraint ids must be unique")
-        if self.relation_constraint_id in self.member_constraint_ids:
-            raise ValueError("joint relation id cannot also be a member id")
         return self
 
 
@@ -730,6 +781,7 @@ async def _practice_fast_gemini_raw_async(
     tried_queries: Sequence[str] = (),
     recovery_reason: str | None = None,
     rejected_video_ids: Sequence[str] = (),
+    validation_feedback: str | None = None,
 ) -> str:
     """Make the path's single provider call. There is intentionally no model fallback."""
     raise_if_cancelled(should_cancel)
@@ -778,14 +830,28 @@ async def _practice_fast_gemini_raw_async(
                 "tried queries: "
                 + json.dumps(normalized_tried, ensure_ascii=True)
             )
+    normalized_feedback = " ".join(str(validation_feedback or "").split())[:500]
+    if normalized_feedback:
+        user += (
+            "\nCORRECTIVE_RETRY: The prior JSON response failed strict local "
+            "validation: "
+            + json.dumps(normalized_feedback, ensure_ascii=True)
+            + ". Correct that contract violation while preserving every original "
+            "request constraint; return the complete JSON object again."
+        )
     reservation: dict[str, object] = {}
+    output_tokens = (
+        PRACTICE_FAST_EXPAND_FALLBACK_OUTPUT_TOKENS
+        if model == PRACTICE_FAST_EXPAND_FALLBACK_MODEL
+        else PRACTICE_FAST_EXPAND_OUTPUT_TOKENS
+    )
     try:
         if context is not None:
             reserved = context.reserve_gemini_call(
                 operation="expansion",
                 model=model,
                 prompt_text=f"{_PRACTICE_FAST_SYSTEM}\n\n{user}",
-                max_output_tokens=PRACTICE_FAST_EXPAND_OUTPUT_TOKENS,
+                max_output_tokens=output_tokens,
             )
             if isinstance(reserved, dict):
                 reservation = dict(reserved)
@@ -796,9 +862,11 @@ async def _practice_fast_gemini_raw_async(
                 config=types.GenerateContentConfig(
                     system_instruction=_PRACTICE_FAST_SYSTEM,
                     response_mime_type="application/json",
-                    response_json_schema=_PracticeFastExpansion.model_json_schema(),
+                    response_json_schema=gemini_client._gemini3_json_schema(
+                        _PracticeFastExpansion
+                    ),
                     thinking_config=types.ThinkingConfig(thinking_level="low"),
-                    max_output_tokens=PRACTICE_FAST_EXPAND_OUTPUT_TOKENS,
+                    max_output_tokens=output_tokens,
                 ),
             )
         except Exception as exc:
@@ -809,7 +877,7 @@ async def _practice_fast_gemini_raw_async(
                     model_used=model,
                     quality_degraded=False,
                     usage={**reservation, "dispatched": True},
-                    status_code=None,
+                    status_code=gemini_client._gemini_status_code(exc),
                     error_code=f"dispatch_failed:{type(exc).__name__}",
                 )
             raise
@@ -870,6 +938,7 @@ def _practice_fast_gemini_raw(
     tried_queries: Sequence[str] = (),
     recovery_reason: str | None = None,
     rejected_video_ids: Sequence[str] = (),
+    validation_feedback: str | None = None,
 ) -> str:
     return run_cancellable(
         lambda: _practice_fast_gemini_raw_async(
@@ -882,13 +951,14 @@ def _practice_fast_gemini_raw(
             tried_queries=tried_queries,
             recovery_reason=recovery_reason,
             rejected_video_ids=rejected_video_ids,
+            validation_feedback=validation_feedback,
         ),
         should_cancel,
     )
 
 
 def _practice_fast_failure_is_retryable(exc: Exception) -> bool:
-    """Retry only transport/local-contract failures, 408/429, and 5xx."""
+    """Retry transport/local-contract failures, provider 499, 408/429, and 5xx."""
     error_types = {base.__name__ for base in type(exc).__mro__}
     if (
         isinstance(exc, (CancellationError, ProviderConfigurationError))
@@ -919,7 +989,7 @@ def _practice_fast_failure_is_retryable(exc: Exception) -> bool:
         if status is not None:
             break
     if status is not None:
-        return status in {408, 429} or 500 <= status <= 599
+        return status in {408, 429, 499} or 500 <= status <= 599
 
     retryable = getattr(exc, "retryable", None)
     if retryable is None and telemetry is not None:
@@ -933,6 +1003,67 @@ def _practice_fast_failure_is_retryable(exc: Exception) -> bool:
     return True if retryable is None else bool(retryable)
 
 
+def _practice_fast_validation_feedback(exc: Exception) -> str:
+    """Return compact structural feedback without replaying the rejected payload."""
+    if not isinstance(exc, ValueError):
+        return ""
+    message = str(exc).split("[type=", 1)[0]
+    return " ".join(message.split())[:500]
+
+
+def _practice_fast_failure_log_summary(exc: Exception) -> str:
+    """Describe a failure without logging rejected model or learner values."""
+    parts = [f"type={type(exc).__name__}"]
+    status = gemini_client._gemini_status_code(exc)
+    if status is not None:
+        parts.append(f"status={status}")
+    validation_feedback = _practice_fast_validation_feedback(exc)
+    if validation_feedback:
+        parts.append(f"validation={validation_feedback}")
+    return " ".join(parts)
+
+
+def _practice_fast_provider_error(exc: Exception) -> ProviderError:
+    """Preserve typed failures and classify raw Gemini expansion failures."""
+    status = gemini_client._gemini_status_code(exc)
+    if isinstance(exc, ProviderError) and (
+        status is None or isinstance(exc, ProviderResponseValidationError)
+    ):
+        return exc
+    detail = type(exc).__name__
+    kwargs = {
+        "provider": "gemini",
+        "operation": "expansion",
+        "status_code": status,
+        "detail": detail,
+    }
+    if status in {401, 403}:
+        return ProviderAuthenticationError(
+            "Gemini authentication failed.", **kwargs
+        )
+    if status == 402:
+        return ProviderQuotaError("Gemini quota is exhausted.", **kwargs)
+    if status == 404:
+        return ModelUnavailableError(
+            "The configured Gemini expansion model is unavailable.", **kwargs
+        )
+    if status == 429:
+        return ProviderRateLimitError("Gemini expansion is rate limited.", **kwargs)
+    if status in {408, 499} or (status is not None and 500 <= status <= 599):
+        return ProviderTransientError(
+            "Gemini expansion is temporarily unavailable.", **kwargs
+        )
+    if isinstance(exc, ValueError):
+        return ProviderResponseValidationError(
+            "Gemini responded, but its query plan did not satisfy the "
+            "learning-request contract.",
+            **{**kwargs, "status_code": status or 200},
+        )
+    if status is None and _practice_fast_failure_is_retryable(exc):
+        return ProviderTransientError("Could not reach Gemini expansion.", **kwargs)
+    return ProviderRequestError("Gemini rejected the expansion request.", **kwargs)
+
+
 def expand_query_practice_fast(
     topic: str,
     n: int,
@@ -944,7 +1075,7 @@ def expand_query_practice_fast(
     recovery_reason: str | None = None,
     rejected_video_ids: Sequence[str] = (),
 ) -> dict:
-    """Return cached Flash search terms, failing safely to the literal request.
+    """Return cached Gemini search terms or raise a typed provider failure.
 
     Expansion deliberately does not reserve the Supadata search budget tracked by
     ``context``. The context enables durable cache reuse and usage accounting.
@@ -992,6 +1123,7 @@ def expand_query_practice_fast(
         return cached
 
     errors: list[str] = []
+    last_failure: Exception | None = None
     with singleflight(cache_key, should_cancel) if cache_key else nullcontext():
         cached = _read_cached_expansion(cache_key, count) if cache_key else None
         if cached is not None:
@@ -1014,11 +1146,19 @@ def expand_query_practice_fast(
                 metadata={"cache_key": cache_key},
             )
             return cached
+        validation_feedback = ""
+        use_fallback_model = False
         for attempt in range(PRACTICE_FAST_EXPAND_ATTEMPTS):
             raise_if_cancelled(should_cancel)
+            model = (
+                PRACTICE_FAST_EXPAND_FALLBACK_MODEL
+                if use_fallback_model
+                or attempt + 1 == PRACTICE_FAST_EXPAND_ATTEMPTS
+                else PRACTICE_FAST_EXPAND_MODEL
+            )
             try:
                 kwargs = {
-                    "model": PRACTICE_FAST_EXPAND_MODEL,
+                    "model": model,
                     "level": level,
                     "should_cancel": should_cancel,
                 }
@@ -1032,6 +1172,8 @@ def expand_query_practice_fast(
                     kwargs["rejected_video_ids"] = (
                         _normalized_rejected_video_ids(rejected_video_ids)
                     )
+                if validation_feedback:
+                    kwargs["validation_feedback"] = validation_feedback
                 raw = _practice_fast_gemini_raw(topic, count, **kwargs)
                 parsed = _PracticeFastExpansion.model_validate_json(raw)
                 corrected = " ".join(str(parsed.corrected or topic).split()) or topic
@@ -1081,31 +1223,36 @@ def expand_query_practice_fast(
                 return result
             except CancellationError:
                 raise
+            except gemini_client.GeminiCancelledError as exc:
+                raise CancellationError("Generation cancelled.") from exc
             except Exception as exc:
                 raise_if_cancelled(should_cancel)
+                last_failure = exc
+                validation_feedback = _practice_fast_validation_feedback(exc)
                 errors.append(
-                    f"{PRACTICE_FAST_EXPAND_MODEL} attempt {attempt + 1}: {exc}"
+                    f"{model} attempt {attempt + 1}: "
+                    f"{_practice_fast_failure_log_summary(exc)}"
                 )
+                if (
+                    gemini_client._gemini_status_code(exc) == 404
+                    and model == PRACTICE_FAST_EXPAND_MODEL
+                    and PRACTICE_FAST_EXPAND_FALLBACK_MODEL != model
+                ):
+                    use_fallback_model = True
+                    continue
                 if (
                     attempt + 1 >= PRACTICE_FAST_EXPAND_ATTEMPTS
                     or not _practice_fast_failure_is_retryable(exc)
                 ):
                     break
-    if recovering_zero_results:
-        logger.info(
-            "practice-fast Gemini zero-result recovery unavailable: %s",
-            "; ".join(errors),
-        )
-        return {
-            "corrected": topic,
-            "queries": [],
-            "provider_used": "gemini_recovery_unavailable",
-        }
-    logger.info(
-        "practice-fast Gemini expansion unavailable; using literal fallback: %s",
+    logger.warning(
+        "practice-fast Gemini %s failed: %s",
+        "zero-result recovery" if recovering_zero_results else "expansion",
         "; ".join(errors),
     )
-    return literal_fallback(topic, count)
+    if last_failure is None:
+        last_failure = RuntimeError("Gemini expansion ended without a response")
+    raise _practice_fast_provider_error(last_failure) from last_failure
 
 
 def expand_query(
