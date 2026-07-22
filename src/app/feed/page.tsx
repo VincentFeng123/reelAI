@@ -2153,6 +2153,7 @@ function FeedPageInner() {
       options: {
         preserveUnmatchedUnseen: boolean;
         preserveUnmatchedLockedPrefix: boolean;
+        appendAuthoritativeAfterStableUnseen: boolean;
       },
     ): SessionMergeResult => {
       const currentRows = reelsRef.current;
@@ -2218,14 +2219,19 @@ function FeedPageInner() {
       // Restored snapshots are only a cache, so their unmatched unseen rows
       // must be removed when page one supplies the authoritative inventory.
       if (options.preserveUnmatchedUnseen) {
-        authoritativeTail.push(...stableUnseenRows.filter((reel) => {
+        const unmatchedStableUnseen = stableUnseenRows.filter((reel) => {
           if (consumedStableUnseen.has(reel)) {
             return false;
           }
           const reelId = String(reel.reel_id || "").trim();
           return !(reelId && provisionalReelIds.has(reelId))
             && !provisionalClipKeys.has(reelClipKey(reel));
-        }));
+        });
+        if (options.appendAuthoritativeAfterStableUnseen) {
+          authoritativeTail.unshift(...unmatchedStableUnseen);
+        } else {
+          authoritativeTail.push(...unmatchedStableUnseen);
+        }
       }
       const reordered = dedupeByIdentity([...lockedPrefix, ...authoritativeTail]);
       if (!options.preserveUnmatchedLockedPrefix && authoritativeActiveReel) {
@@ -2273,6 +2279,7 @@ function FeedPageInner() {
     materialIdValue: string,
     response: Awaited<ReturnType<typeof fetchFeed>>,
     searchScope: FeedSearchScope,
+    options?: { appendAuthoritativeAfterStableUnseen?: boolean },
   ): Promise<void> | null => {
     const jobId = String(response.generation_job_id || "").trim();
     const status = response.generation_job_status;
@@ -2319,7 +2326,11 @@ function FeedPageInner() {
         const reconciled = reconcileGeneratedReels(
           streamedReels,
           data.reels,
-          { preserveUnmatchedUnseen: true, preserveUnmatchedLockedPrefix: true },
+          {
+            preserveUnmatchedUnseen: true,
+            preserveUnmatchedLockedPrefix: true,
+            appendAuthoritativeAfterStableUnseen: options?.appendAuthoritativeAfterStableUnseen === true,
+          },
         );
         settleGenerationContinuation(materialIdValue, data);
         madeProgress = madeProgress || reconciled.addedCount > 0;
@@ -2461,6 +2472,7 @@ function FeedPageInner() {
             ? reconcileGeneratedReels([], fetchedReels, {
                 preserveUnmatchedUnseen: false,
                 preserveUnmatchedLockedPrefix: false,
+                appendAuthoritativeAfterStableUnseen: false,
               })
             : mergeSessionReels(fetchedReels)
           : mergeSessionReels(fetchedReels, reelsRef.current);
@@ -2516,6 +2528,7 @@ function FeedPageInner() {
             row.materialId,
             row.data!,
             searchScope,
+            { appendAuthoritativeAfterStableUnseen: true },
           );
         }
         syncGenerationLockState();
@@ -2708,7 +2721,11 @@ function FeedPageInner() {
             const reconciled = reconcileGeneratedReels(
               streamedReels,
               data.reels,
-              { preserveUnmatchedUnseen: true, preserveUnmatchedLockedPrefix: true },
+              {
+                preserveUnmatchedUnseen: true,
+                preserveUnmatchedLockedPrefix: true,
+                appendAuthoritativeAfterStableUnseen: Boolean(continuationToken),
+              },
             );
             settleGenerationContinuation(id, data);
             const batchAddedReels = dedupeByIdentity([...streamedReels, ...reconciled.addedReels]);
@@ -4605,7 +4622,12 @@ function FeedPageInner() {
       }
       rememberFeedContinuationToken(feedMaterialIds[index], lastResponse);
       rememberFeedGenerationJob(feedMaterialIds[index], lastResponse);
-      void consumeFeedGenerationJob(feedMaterialIds[index], lastResponse, searchScope);
+      void consumeFeedGenerationJob(
+        feedMaterialIds[index],
+        lastResponse,
+        searchScope,
+        { appendAuthoritativeAfterStableUnseen: false },
+      );
     }
     setAssessmentPreparingFeed(false);
   }, [

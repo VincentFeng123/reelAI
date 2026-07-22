@@ -69,7 +69,7 @@ def test_fresh_inventory_and_selector_cache_share_current_contract() -> None:
         main.SELECTION_CONTRACT_VERSION,
         ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
     } == {"quality_silence_v39"}
-    assert generation_jobs.REQUEST_SCHEMA_VERSION == "adaptive_clip_concepts_v4"
+    assert generation_jobs.REQUEST_SCHEMA_VERSION == "adaptive_clip_concepts_v5"
     assert segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v39"
     assert "quality_silence_v18" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v19" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
@@ -1057,6 +1057,170 @@ def test_lesson_prior_coverage_unions_trusted_intent_obligation_keys() -> None:
         conn.close()
 
 
+def test_lesson_prior_coverage_preserves_distinct_bounded_objective_evidence() -> None:
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO concepts (id, material_id, title, keywords_json, summary, "
+            "created_at) VALUES ('c-objective', 'm1', 'Aggregate response', '[]', "
+            "'', '2026-07-20T00:00:00+00:00')"
+        )
+        context = json.dumps({
+            "selection_contract_version": main.SELECTION_CONTRACT_VERSION,
+            "selection_authority": "gemini",
+            "concept_family_contract_version": "concept_family_v3",
+            "concept_family": "aggregate response",
+            "concept_aliases": [],
+        })
+        rows = [
+            (
+                "prior-objective-a",
+                "prior-objective-video-a",
+                "Opposing inputs cancel so the aggregate response is zero.",
+                "The first input is balanced by an equal opposing input.",
+                "2026-07-20T00:00:01+00:00",
+            ),
+            (
+                "prior-objective-b",
+                "prior-objective-video-b",
+                "One input exceeds the other, producing a nonzero response.",
+                "Subtract the smaller opposing input before computing the response.",
+                "2026-07-20T00:00:02+00:00",
+            ),
+            (
+                "prior-objective-c",
+                "prior-objective-video-c",
+                "Opposing inputs cancel so the aggregate response is zero.",
+                "The first input is balanced by an equal opposing input.",
+                "2026-07-20T00:00:03+00:00",
+            ),
+            (
+                "prior-objective-d",
+                "prior-objective-video-d",
+                "",
+                "A transcript-only explanation supplies grounded fallback evidence.",
+                "2026-07-20T00:00:04+00:00",
+            ),
+        ]
+        for reel_id, video_id, summary, transcript, created_at in rows:
+            conn.execute(
+                "INSERT INTO videos (id, title, channel_title, duration_sec, "
+                "created_at) VALUES (?, ?, 'Test', 120, ?)",
+                (video_id, video_id, created_at),
+            )
+            conn.execute(
+                "INSERT INTO reels (id, material_id, concept_id, video_id, "
+                "video_url, t_start, t_end, transcript_snippet, takeaways_json, "
+                "ai_summary, base_score, difficulty, search_context_json, "
+                "created_at) VALUES (?, 'm1', 'c-objective', ?, '', 0, 30, ?, "
+                "'[]', ?, 1, 0.2, ?, ?)",
+                (reel_id, video_id, transcript, summary, context, created_at),
+            )
+
+        prior, recent = main._lesson_prior_coverage(
+            conn,
+            material_id="m1",
+            reel_ids=[row[0] for row in rows],
+        )
+
+        assert prior == [{
+            "concept_id": "c-objective",
+            "concept_family": "aggregate response",
+            "concept_title": "Aggregate response",
+            "learning_objective_excerpts": [
+                "Opposing inputs cancel so the aggregate response is zero.",
+                "One input exceeds the other, producing a nonzero response.",
+                "A transcript-only explanation supplies grounded fallback evidence.",
+            ],
+            "delivered_count": 4,
+        }]
+        assert [item["learning_objective_excerpt"] for item in recent] == [
+            "Opposing inputs cancel so the aggregate response is zero.",
+            "One input exceeds the other, producing a nonzero response.",
+            "Opposing inputs cancel so the aggregate response is zero.",
+            "A transcript-only explanation supplies grounded fallback evidence.",
+        ]
+        assert [item["release_rank"] for item in recent] == [0, 1, 2, 3]
+    finally:
+        conn.close()
+
+
+def test_lesson_prior_coverage_preserves_release_order_across_query_chunks(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    reel_ids = [f"chunk-history-{index:03d}" for index in range(402)]
+    release_ids = list(reversed(reel_ids))
+    try:
+        conn.execute(
+            "INSERT INTO videos (id, title, channel_title, duration_sec, "
+            "created_at) VALUES ('chunk-history-video', 'History', 'Test', 1000, "
+            "'2026-07-20T00:00:00+00:00')"
+        )
+        conn.executemany(
+            "INSERT INTO reels (id, material_id, concept_id, video_id, "
+            "video_url, t_start, t_end, transcript_snippet, takeaways_json, "
+            "ai_summary, base_score, difficulty, created_at) VALUES "
+            "(?, 'm1', 'c1', 'chunk-history-video', '', ?, ?, ?, '[]', ?, "
+            "1, 0.2, '2026-07-20T00:00:00+00:00')",
+            [
+                (
+                    reel_id,
+                    float(index),
+                    float(index) + 0.5,
+                    f"Transcript {index:03d}",
+                    f"Objective {index:03d}",
+                )
+                for index, reel_id in enumerate(reel_ids)
+            ],
+        )
+        fetch_calls: list[tuple[str, tuple[object, ...]]] = []
+        original_fetch_all = main.fetch_all
+
+        def counted_fetch_all(worker_conn, query, params=()):
+            bound_params = tuple(params)
+            fetch_calls.append((query, bound_params))
+            return original_fetch_all(worker_conn, query, bound_params)
+
+        monkeypatch.setattr(main, "fetch_all", counted_fetch_all)
+
+        prior, recent = main._lesson_prior_coverage(
+            conn,
+            material_id="m1",
+            reel_ids=release_ids,
+        )
+
+        assert len(fetch_calls) == 2
+        assert [len(params) for _query, params in fetch_calls] == [401, 3]
+        assert fetch_calls[0][1] == ("m1", *release_ids[:400])
+        assert fetch_calls[1][1] == ("m1", *release_ids[400:])
+        assert prior == [{
+            "concept_id": "c1",
+            "concept_family": "",
+            "concept_title": "Mitochondria",
+            "learning_objective_excerpts": [
+                "Objective 002",
+                "Objective 001",
+                "Objective 000",
+            ],
+            "delivered_count": 402,
+        }]
+        assert [
+            (
+                recent[index]["learning_objective_excerpt"],
+                recent[index]["release_rank"],
+            )
+            for index in (0, 399, 400, 401)
+        ] == [
+            ("Objective 401", 0),
+            ("Objective 002", 399),
+            ("Objective 001", 400),
+            ("Objective 000", 401),
+        ]
+    finally:
+        conn.close()
+
+
 def test_lesson_prior_coverage_does_not_truncate_late_obligation_witness() -> None:
     conn = _conn()
     obligation = intent_obligation(
@@ -1426,8 +1590,14 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
         conn.close()
 
 
-def test_generation_organizer_can_select_any_subset_from_a_larger_candidate_window(
+@pytest.mark.parametrize(
+    ("with_continuation_token", "effective_target"),
+    [(False, 0.70), (True, 0.70), (False, None)],
+)
+def test_generation_organizer_uses_source_history_with_or_without_continuation_token(
     monkeypatch,
+    with_continuation_token: bool,
+    effective_target: float | None,
 ) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
@@ -1463,6 +1633,16 @@ def test_generation_organizer_can_select_any_subset_from_a_larger_candidate_wind
         job_id=str(prior_job["id"]),
         reel_ids=[f"window-reel-{index}" for index in range(3)],
     )
+    request_params = {
+        "generation_mode": "fast",
+        "num_reels": 3,
+        "knowledge_level": "beginner",
+        "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
+    }
+    if effective_target is not None:
+        request_params["effective_level_target"] = effective_target
+    if with_continuation_token:
+        request_params["continuation_token"] = prior_job["id"]
     job, _ = generation_jobs.submit_or_get_active(
         conn,
         material_id="m1",
@@ -1470,13 +1650,7 @@ def test_generation_organizer_can_select_any_subset_from_a_larger_candidate_wind
         request_key="lesson-order-candidate-window",
         content_fingerprint="fingerprint",
         learner_id="learner-1",
-        request_params={
-            "generation_mode": "fast",
-            "num_reels": 3,
-            "knowledge_level": "beginner",
-            "continuation_token": prior_job["id"],
-            "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
-        },
+        request_params=request_params,
         source_generation_id=source_generation_id,
         now=now,
     )
@@ -1489,6 +1663,8 @@ def test_generation_organizer_can_select_any_subset_from_a_larger_candidate_wind
     assert leased
     overlap_filter_calls: list[list[str]] = []
     original_overlap_filter = main._filter_continuation_release_temporal_overlaps
+    original_continuation_history = main._continuation_delivered_reel_ids
+    continuation_history_calls: list[str | None] = []
 
     def filter_before_final(worker_conn, **kwargs):
         overlap_filter_calls.append([
@@ -1496,22 +1672,45 @@ def test_generation_organizer_can_select_any_subset_from_a_larger_candidate_wind
         ])
         return original_overlap_filter(worker_conn, **kwargs)
 
+    def count_continuation_history(worker_conn, continuation_token):
+        continuation_history_calls.append(continuation_token)
+        return original_continuation_history(worker_conn, continuation_token)
+
     def order_batch(reels, **kwargs):
         assert [reel["reel_id"] for reel in reels] == [
             f"window-reel-{index}" for index in range(3, 9)
         ]
         assert kwargs["release_limit"] == len(reels) == 6
+        assert kwargs["learner_level"] == "beginner"
+        assert kwargs["learner_difficulty_target"] == effective_target
         assert kwargs["prior_concept_coverage"] == [{
             "concept_id": "c1",
             "concept_family": "",
             "concept_title": "Mitochondria",
+            "learning_objective_excerpts": [
+                "Cells use adenosine triphosphate to transfer usable chemical energy."
+            ],
             "delivered_count": 3,
         }]
+        assert kwargs["recent_prior_objective_coverage"] == [
+            {
+                "concept_id": "c1",
+                "concept_family": "",
+                "concept_title": "Mitochondria",
+                "learning_objective_excerpt": (
+                    "Cells use adenosine triphosphate to transfer usable chemical "
+                    "energy."
+                ),
+                "release_rank": index,
+            }
+            for index in range(3)
+        ]
         selected = [reels[0], reels[1], reels[2], reels[4], reels[5]]
         return mock.Mock(
             reels=selected,
             ordered_reel_ids=[reel["reel_id"] for reel in selected],
             assessment_checkpoint_reel_ids=[],
+            prior_restatement_reel_ids=["window-reel-6"],
             model_used="gemini-test",
             degraded=False,
             fallback_reason=None,
@@ -1536,6 +1735,11 @@ def test_generation_organizer_can_select_any_subset_from_a_larger_candidate_wind
     monkeypatch.setattr(main, "order_lesson_batch", order_batch)
     monkeypatch.setattr(
         main,
+        "_continuation_delivered_reel_ids",
+        count_continuation_history,
+    )
+    monkeypatch.setattr(
+        main,
         "_filter_continuation_release_temporal_overlaps",
         filter_before_final,
     )
@@ -1545,6 +1749,7 @@ def test_generation_organizer_can_select_any_subset_from_a_larger_candidate_wind
         assert overlap_filter_calls == [[
             f"window-reel-{index}" for index in range(3, 9)
         ]]
+        assert len(continuation_history_calls) == 1
 
         final = next(
             event
@@ -1567,6 +1772,16 @@ def test_generation_organizer_can_select_any_subset_from_a_larger_candidate_wind
             "window-reel-7",
             "window-reel-8",
         ]
+        generation_row = main._fetch_generation_row(
+            conn,
+            str(completed["result_generation_id"]),
+        )
+        assert generation_row is not None
+        lesson_order = json.loads(str(generation_row["lesson_order_json"]))
+        assert lesson_order["prior_restatement_reel_ids"] == ["window-reel-6"]
+        assert set(lesson_order["prior_restatement_reel_ids"]).isdisjoint(
+            lesson_order["ordered_reel_ids"]
+        )
         status_payload = main._generation_job_status_payload(conn, completed)
         assert [reel["reel_id"] for reel in status_payload["reels"]] == expected_ids
         replay = main._sanitize_generation_replay_events(
@@ -3955,6 +4170,40 @@ def test_continuation_filter_drops_exact_parent_reel_id() -> None:
         conn.close()
 
 
+def test_continuation_filter_leaves_history_empty_without_authoritative_release() -> None:
+    conn = _conn()
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="unreleased-history-source",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    child_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="unreleased-history-child",
+        generation_mode="slow",
+        retrieval_profile="unified",
+        source_generation_id=source_generation_id,
+    )
+    child = _released_feed_reel("unreleased-child", 1)
+    prior_reel_ids: list[str] = []
+    try:
+        assert main._filter_continuation_release_temporal_overlaps(
+            conn,
+            source_generation_id=source_generation_id,
+            generation_id=child_generation_id,
+            reels=[child],
+            prior_reel_ids_out=prior_reel_ids,
+        ) == [child]
+        assert prior_reel_ids == []
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("chain_length", [2, 40])
 def test_continuation_history_queries_stay_bounded_as_chain_grows(
     chain_length: int,
@@ -4020,9 +4269,9 @@ def test_continuation_history_queries_stay_bounded_as_chain_grows(
 
         assert filtered == [current]
         assert len(filter_reads) <= 3
-        assert delivered == sorted(
+        assert delivered == [
             f"history-{index}" for index in range(chain_length)
-        )
+        ]
         assert len(delivered_reads) <= 3
     finally:
         conn.set_trace_callback(None)
@@ -7398,6 +7647,37 @@ def test_generate_returns_202_and_idempotently_reuses_active_job(monkeypatch) ->
         conn.close()
 
 
+def test_generate_submission_persists_adjusted_soft_difficulty_target(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    monkeypatch.setattr(
+        main.reel_service,
+        "learner_progress",
+        lambda *_args, **_kwargs: {
+            "selected_level": "intermediate",
+            "global_adjustment": 0.20,
+        },
+    )
+    try:
+        response = asyncio.run(
+            main.generate_reels(
+                object(),
+                ReelsGenerateRequest(material_id="m1", concept_id="c1"),
+            )
+        )
+        job = generation_jobs.get_job(conn, json.loads(response.body)["job_id"])
+        assert job is not None
+        params = json.loads(str(job["request_params_json"]))
+        assert params["knowledge_level"] == "intermediate"
+        assert params["effective_level_target"] == 0.70
+        assert params["request_schema_version"] == "adaptive_clip_concepts_v5"
+    finally:
+        conn.close()
+
+
 def test_generate_does_not_coalesce_jobs_across_learners(monkeypatch) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
@@ -8922,6 +9202,14 @@ def test_feed_autofill_false_never_submits_and_true_submits_before_return(monkey
     wake = mock.Mock(side_effect=assert_committed_wake)
     monkeypatch.setattr(main, "get_conn", committed_connection)
     monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    monkeypatch.setattr(
+        main.reel_service,
+        "learner_progress",
+        lambda *_args, **_kwargs: {
+            "selected_level": "intermediate",
+            "global_adjustment": 0.20,
+        },
+    )
 
     def fail_on_unversioned_feed(*_args, **_kwargs):
         raise AssertionError("fresh feed must not rank base/legacy inventory")
@@ -8940,7 +9228,14 @@ def test_feed_autofill_false_never_submits_and_true_submits_before_return(monkey
         assert conn.execute("SELECT COUNT(*) FROM reel_generation_jobs").fetchone()[0] == 1
         queued_job = generation_jobs.get_job(conn, queued["generation_job_id"])
         assert queued_job is not None
-        assert json.loads(queued_job["request_params_json"])["num_reels"] == 9
+        queued_params = json.loads(queued_job["request_params_json"])
+        assert queued_params["num_reels"] == 9
+        assert queued_params["knowledge_level"] == "intermediate"
+        assert queued_params["effective_level_target"] == 0.70
+        assert queued_params["request_schema_version"] == (
+            "adaptive_clip_concepts_v5"
+        )
+        assert queued["effective_level_target"] == 0.70
         assert main.GENERATION_OUTPUT_CEILINGS == {"fast": 9, "slow": 9}
         wake.assert_called_once_with()
         assert rate_calls == [

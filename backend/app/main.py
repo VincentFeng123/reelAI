@@ -155,6 +155,7 @@ from .services.lesson_ordering import (
     _filter_same_source_overlaps,
     order_lesson_batch,
 )
+from .services.knowledge_level import effective_level_target
 from .services.idempotency import (
     IdempotencyConflictError,
     complete_idempotency_key,
@@ -3750,6 +3751,7 @@ def _filter_continuation_release_temporal_overlaps(
     source_generation_id: str | None,
     generation_id: str,
     reels: list[dict[str, Any]],
+    prior_reel_ids_out: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Remove child clips already covered by an authoritative source release."""
     if not source_generation_id or not reels:
@@ -3777,6 +3779,12 @@ def _filter_continuation_release_temporal_overlaps(
     )
     if not prior_reel_ids:
         return reels
+    if prior_reel_ids_out is not None:
+        prior_reel_ids_out.extend(
+            reel_id
+            for reel_id in prior_reel_ids
+            if reel_id not in prior_reel_ids_out
+        )
     prior_reel_id_set = set(prior_reel_ids)
     current_by_id = {
         reel_id: reel
@@ -5043,7 +5051,7 @@ def _continuation_delivered_reel_ids(
         generation_rows=generation_rows,
         releases_by_generation=releases,
     )
-    return sorted(set(delivered or ()))
+    return list(dict.fromkeys(delivered or ()))
 
 
 def _currently_surfaceable_generation_reel_ids(
@@ -5454,20 +5462,24 @@ def _learner_concept_signals(
     }
 
 
-def _lesson_prior_concept_coverage(
+def _lesson_prior_coverage(
     conn,
     *,
     material_id: str,
     reel_ids: Iterable[str],
-) -> list[dict[str, Any]]:
-    """Summarize already released canonical concepts for the lesson editor."""
-    clean_ids = sorted({
-        str(reel_id or "").strip()
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return canonical and recent clip-level history in release order."""
+    clean_ids = list(dict.fromkeys(
+        clean_id
         for reel_id in reel_ids
-        if str(reel_id or "").strip()
-    })
+        if (clean_id := str(reel_id or "").strip())
+    ))
     if not clean_ids:
-        return []
+        return [], []
+    release_rank_by_id = {
+        reel_id: release_rank
+        for release_rank, reel_id in enumerate(clean_ids)
+    }
     rows: list[dict[str, Any]] = []
     # Chunk only for database parameter limits; never truncate semantic history.
     for offset in range(0, len(clean_ids), 400):
@@ -5476,8 +5488,10 @@ def _lesson_prior_concept_coverage(
         rows.extend(fetch_all(
             conn,
             f"""
-            SELECT reels.concept_id, reels.search_context_json, reels.t_start,
-                   reels.t_end, concepts.title AS concept_title
+            SELECT reels.id AS reel_id, reels.concept_id,
+                   reels.search_context_json, reels.t_start,
+                   reels.t_end, reels.ai_summary, reels.transcript_snippet,
+                   concepts.title AS concept_title
             FROM reels
             LEFT JOIN concepts ON concepts.id = reels.concept_id
             WHERE reels.material_id = ?
@@ -5485,7 +5499,12 @@ def _lesson_prior_concept_coverage(
             """,
             (material_id, *reel_id_chunk),
         ))
+    rows.sort(key=lambda row: release_rank_by_id.get(
+        str(row.get("reel_id") or ""),
+        len(release_rank_by_id),
+    ))
     coverage: dict[tuple[str, str], dict[str, Any]] = {}
+    recent_objectives: list[dict[str, Any]] = []
     for row in rows:
         if has_incompatible_gemini_concept_family_contract(
             row.get("search_context_json")
@@ -5503,6 +5522,14 @@ def _lesson_prior_concept_coverage(
         concept_title = " ".join(
             str(row.get("concept_title") or "").split()
         )[:240]
+        objective_parts = (
+            " ".join(str(row.get("ai_summary") or "").split()),
+            " ".join(str(row.get("transcript_snippet") or "").split()),
+        )
+        learning_objective_excerpt = next(
+            (part[:500] for part in objective_parts if part),
+            "",
+        )
         identity = (
             ("concept", concept_id)
             if concept_id
@@ -5516,10 +5543,29 @@ def _lesson_prior_concept_coverage(
                 "concept_id": concept_id,
                 "concept_family": concept_family,
                 "concept_title": concept_title,
+                "learning_objective_excerpts": [],
                 "delivered_count": 0,
             },
         )
         item["delivered_count"] = int(item["delivered_count"]) + 1
+        objective_excerpts = item["learning_objective_excerpts"]
+        if (
+            learning_objective_excerpt
+            and learning_objective_excerpt not in objective_excerpts
+        ):
+            objective_excerpts.append(learning_objective_excerpt)
+            del objective_excerpts[:-3]
+        if learning_objective_excerpt:
+            recent_objectives.append({
+                "concept_id": concept_id,
+                "concept_family": concept_family,
+                "concept_title": concept_title,
+                "learning_objective_excerpt": learning_objective_excerpt,
+                "release_rank": release_rank_by_id.get(
+                    str(row.get("reel_id") or ""),
+                    0,
+                ),
+            })
         obligation_keys = intent_obligation_keys(
             metadata.get("_selection_intent_obligations") or ()
         )
@@ -5528,7 +5574,22 @@ def _lesson_prior_concept_coverage(
                 *item.get("intent_obligation_keys", ()),
                 *obligation_keys,
             })
-    return [coverage[key] for key in sorted(coverage)]
+    return [coverage[key] for key in sorted(coverage)], recent_objectives
+
+
+def _lesson_prior_concept_coverage(
+    conn,
+    *,
+    material_id: str,
+    reel_ids: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Compatibility view for canonical prior-concept coverage callers."""
+    concepts, _recent_objectives = _lesson_prior_coverage(
+        conn,
+        material_id=material_id,
+        reel_ids=reel_ids,
+    )
+    return concepts
 
 
 def _learner_adaptation_fingerprint(
@@ -6219,6 +6280,7 @@ def _run_leased_generation_job(
             activate_generation = False
             candidate_final_reels: list[dict[str, Any]] = []
             stored_order_ids: list[str] | None = None
+            authoritative_prior_reel_ids: list[str] = []
             if cumulative_count or has_verified_reservoir or rankable_fallback:
                 candidate_final_reels = rankable_fallback or _generation_job_reels(
                     conn,
@@ -6237,6 +6299,7 @@ def _run_leased_generation_job(
                             source_generation_id=source_generation_id,
                             generation_id=generation_id,
                             reels=candidate_final_reels,
+                            prior_reel_ids_out=authoritative_prior_reel_ids,
                         )
                     )
             if candidate_final_reels:
@@ -6255,10 +6318,21 @@ def _run_leased_generation_job(
                         propagate_concept_families=False,
                         remediation_concept_ids_out=remediation_concept_ids,
                     )
-                    prior_reel_ids = set(_continuation_delivered_reel_ids(
+                    prior_reel_ids = (
+                        authoritative_prior_reel_ids
+                        or _continuation_delivered_reel_ids(
+                            conn,
+                            str(params.get("continuation_token") or "").strip(),
+                        )
+                    )
+                    (
+                        prior_concept_coverage,
+                        recent_prior_objective_coverage,
+                    ) = _lesson_prior_coverage(
                         conn,
-                        str(params.get("continuation_token") or "").strip(),
-                    ))
+                        material_id=material_id,
+                        reel_ids=prior_reel_ids,
+                    )
                     ordering = order_lesson_batch(
                         final_reels,
                         topic=_lesson_order_topic(
@@ -6267,6 +6341,9 @@ def _run_leased_generation_job(
                             reels=final_reels,
                         ),
                         learner_level=str(params.get("knowledge_level") or "beginner"),
+                        learner_difficulty_target=params.get(
+                            "effective_level_target"
+                        ),
                         concept_signals=concept_signals,
                         remediation_concept_ids=remediation_concept_ids,
                         # The request count controls acquisition/stream cadence,
@@ -6274,10 +6351,9 @@ def _run_leased_generation_job(
                         # candidate in this bounded pool may be included or
                         # omitted without adding provider or boundary work.
                         release_limit=len(final_reels),
-                        prior_concept_coverage=_lesson_prior_concept_coverage(
-                            conn,
-                            material_id=material_id,
-                            reel_ids=prior_reel_ids,
+                        prior_concept_coverage=prior_concept_coverage,
+                        recent_prior_objective_coverage=(
+                            recent_prior_objective_coverage
                         ),
                         should_cancel=should_cancel,
                         generation_context=context,
@@ -6322,6 +6398,13 @@ def _run_leased_generation_job(
                         if ordering.assessment_checkpoint_reel_ids is not None
                         else None
                     )
+                    organizer_prior_restatement_ids = getattr(
+                        ordering,
+                        "prior_restatement_reel_ids",
+                        None,
+                    )
+                    if not isinstance(organizer_prior_restatement_ids, list):
+                        organizer_prior_restatement_ids = []
                     ordering_degraded = ordering.degraded
                     checkpoint_ids = assessment_checkpoint_reel_ids(
                         released_ordered_ids,
@@ -6333,6 +6416,9 @@ def _run_leased_generation_job(
                         "prompt_version": LESSON_ORDER_PROMPT_VERSION,
                         "ordered_reel_ids": released_ordered_ids,
                         "assessment_checkpoint_reel_ids": checkpoint_ids,
+                        "prior_restatement_reel_ids": (
+                            organizer_prior_restatement_ids
+                        ),
                         "terminal_summary_start_reel_id": (
                             terminal_summary_start_reel_id
                         ),
@@ -8314,6 +8400,14 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
         )
         learner_progress = reel_service.learner_progress(conn, payload.material_id, learner_id)
         learner_knowledge_level = str(learner_progress.get("selected_level") or "beginner")
+        try:
+            learner_difficulty_target = effective_level_target(
+                learner_knowledge_level,
+                learner_progress.get("global_adjustment"),
+            )
+        except (TypeError, ValueError, OverflowError):
+            learner_knowledge_level = "beginner"
+            learner_difficulty_target = effective_level_target("beginner", 0.0)
         adaptation_fingerprint = _learner_adaptation_fingerprint(
             conn,
             material_id=payload.material_id,
@@ -8352,6 +8446,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             "min_relevance": min_relevance,
             "preferred_video_duration": safe_video_duration_pref,
             "knowledge_level": learner_knowledge_level,
+            "effective_level_target": learner_difficulty_target,
             "adaptation_fingerprint": adaptation_fingerprint,
             "language": "en",
         }
@@ -9519,6 +9614,7 @@ def feed(
             "min_relevance": safe_relevance,
             "preferred_video_duration": safe_duration,
             "knowledge_level": knowledge_level,
+            "effective_level_target": effective_level,
             "adaptation_fingerprint": adaptation_fingerprint,
             "language": "en",
         }

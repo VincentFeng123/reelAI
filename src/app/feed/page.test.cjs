@@ -495,7 +495,7 @@ test("generation finals cannot reconcile after their search scope is invalidated
     if (
       ts.isCallExpression(node)
       && node.expression.getText(sourceFile) === "reconcileGeneratedReels"
-      && node.arguments[2]?.getText(sourceFile) === "{ preserveUnmatchedUnseen: true, preserveUnmatchedLockedPrefix: true }"
+      && node.arguments[2]?.getText(sourceFile).includes("preserveUnmatchedLockedPrefix: true")
     ) {
       let statement = node;
       while (statement.parent && !ts.isBlock(statement.parent)) {
@@ -510,10 +510,10 @@ test("generation finals cannot reconcile after their search scope is invalidated
   assert.equal(finalReconciliations.length, 2, "every generation path must remain covered");
   for (const reconciliation of finalReconciliations) {
     const reconciliationCall = reconciliation.call;
-    assert.equal(
-      reconciliationCall.arguments[2]?.getText(sourceFile),
-      "{ preserveUnmatchedUnseen: true, preserveUnmatchedLockedPrefix: true }",
-      "stream settlement must explicitly retain unmatched provisional rows",
+    assert.match(
+      reconciliationCall.arguments[2]?.getText(sourceFile) || "",
+      /preserveUnmatchedUnseen:/,
+      "stream settlement must explicitly choose how unmatched unseen rows are handled",
     );
     const block = reconciliation.statement.parent;
     assert.ok(ts.isBlock(block), "final reconciliation must remain in a guarded block");
@@ -636,6 +636,7 @@ test("feed-owned jobs start the shared stream immediately and only once per mate
     "material-b",
     { generation_job_id: "job-b", generation_job_status: "queued" },
     searchScope,
+    { appendAuthoritativeAfterStableUnseen: false },
   );
 
   assert.ok(first instanceof Promise);
@@ -672,6 +673,7 @@ test("feed-owned jobs start the shared stream immediately and only once per mate
   ]);
   assert.deepEqual(reconciled.map((args) => args[1][0].reel_id), ["final-material-a", "final-material-b"]);
   assert.ok(reconciled.every((args) => args[2].preserveUnmatchedUnseen === true));
+  assert.ok(reconciled.every((args) => args[2].appendAuthoritativeAfterStableUnseen === false));
 });
 
 test("feed starts returned generation jobs before yielding to bootstrap", () => {
@@ -743,6 +745,7 @@ test("feed-owned final inventory reconciles when no candidate event arrived", as
     "material-a",
     { generation_job_id: "job-a", generation_job_status: "running" },
     searchScope,
+    { appendAuthoritativeAfterStableUnseen: true },
   );
 
   assert.equal(reconciled.length, 1);
@@ -751,6 +754,7 @@ test("feed-owned final inventory reconciles when no candidate event arrived", as
   assert.deepEqual(reconciled[0][2], {
     preserveUnmatchedUnseen: true,
     preserveUnmatchedLockedPrefix: true,
+    appendAuthoritativeAfterStableUnseen: true,
   });
   assert.equal(isGeneratingRef.current, false);
 });
@@ -1184,8 +1188,30 @@ test("generation continuation stays server-owned while adaptive requests exclude
   const callbackText = source.slice(requestMoreStart, requestMoreEnd);
   assert.match(callbackText, /const continuationToken = continuationTokenByMaterialRef\.current\.get\(id\)/);
   assert.match(callbackText, /continuationToken,/);
+  assert.match(
+    callbackText,
+    /appendAuthoritativeAfterStableUnseen: Boolean\(continuationToken\)/,
+  );
   assert.match(callbackText, /getAdaptiveExcludeVideoIds\(\)/);
   assert.match(callbackText, /excludeVideoIds: adaptiveExcludeVideoIds/);
+});
+
+test("durable continuation recovery appends while adaptive replacement keeps tail authority", () => {
+  const loadPageStart = source.indexOf("const loadPage = useCallback(");
+  const loadPageEnd = source.indexOf("const requestMore = useCallback(", loadPageStart);
+  const loadPageText = source.slice(loadPageStart, loadPageEnd);
+  assert.match(
+    loadPageText,
+    /consumeFeedGenerationJob\([\s\S]*?appendAuthoritativeAfterStableUnseen: true/,
+  );
+
+  const rerankStart = source.indexOf("const rerankUnseenTail = useCallback(");
+  const rerankEnd = source.indexOf("const reportActiveReelProgress", rerankStart);
+  const rerankText = source.slice(rerankStart, rerankEnd);
+  assert.match(
+    rerankText,
+    /consumeFeedGenerationJob\([\s\S]*?appendAuthoritativeAfterStableUnseen: false/,
+  );
 });
 
 test("a restored feed response seeds the next continuation token", () => {
@@ -1268,6 +1294,7 @@ test("restored reconciliation removes cached unseen rows and stream settlement d
     {
       preserveUnmatchedUnseen: false,
       preserveUnmatchedLockedPrefix: false,
+      appendAuthoritativeAfterStableUnseen: false,
     },
   );
   assert.deepEqual(
@@ -1299,12 +1326,63 @@ test("restored reconciliation removes cached unseen rows and stream settlement d
     {
       preserveUnmatchedUnseen: true,
       preserveUnmatchedLockedPrefix: true,
+      appendAuthoritativeAfterStableUnseen: false,
     },
   );
   assert.deepEqual(
     renderedRows.map((row) => row.reel_id),
     ["confirmed-watched", "vanished-watched", "authoritative-current", "new-unseen", "prior-unseen"],
   );
+});
+
+test("plain continuation settlement appends novel authority after the existing unseen lesson", () => {
+  const currentRows = [
+    { reel_id: "locked", video_url: "locked" },
+    { reel_id: "existing-explanation", video_url: "existing-explanation" },
+    { reel_id: "existing-application", video_url: "existing-application" },
+  ];
+  const reelsRef = { current: currentRows };
+  const activeIndexRef = { current: 0 };
+  const watchedFrontierIndexRef = { current: 0 };
+  let renderedRows = currentRows;
+  const reconcile = compileUseCallback("reconcileGeneratedReels", {
+    reelsRef,
+    activeIndexRef,
+    watchedFrontierIndexRef,
+    pendingResumeRef: { current: null },
+    reelClipKey: (reel) => reel.video_url,
+    dedupeByIdentity: (rows) => {
+      const seen = new Set();
+      return rows.filter((row) => !seen.has(row.reel_id) && seen.add(row.reel_id));
+    },
+    updateSessionReels: (rows) => {
+      reelsRef.current = rows;
+      renderedRows = rows;
+    },
+    setActiveIndex: () => {},
+    setTotal: () => {},
+  });
+
+  reconcile(
+    [],
+    [
+      { reel_id: "continuation-reasoning", video_url: "continuation-reasoning" },
+      { reel_id: "continuation-example", video_url: "continuation-example" },
+    ],
+    {
+      preserveUnmatchedUnseen: true,
+      preserveUnmatchedLockedPrefix: true,
+      appendAuthoritativeAfterStableUnseen: true,
+    },
+  );
+
+  assert.deepEqual(renderedRows.map((row) => row.reel_id), [
+    "locked",
+    "existing-explanation",
+    "existing-application",
+    "continuation-reasoning",
+    "continuation-example",
+  ]);
 });
 
 test("generation settlement freezes the watched frontier and preserves authoritative unseen order", () => {
@@ -1346,6 +1424,7 @@ test("generation settlement freezes the watched frontier and preserves authorita
     {
       preserveUnmatchedUnseen: true,
       preserveUnmatchedLockedPrefix: true,
+      appendAuthoritativeAfterStableUnseen: false,
     },
   );
 

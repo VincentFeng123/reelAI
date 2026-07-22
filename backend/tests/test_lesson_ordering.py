@@ -17,6 +17,10 @@ from backend.app.services import lesson_ordering
 from backend.intent_obligations import intent_obligation
 
 
+_REAL_READ_CACHED_LESSON_ORDER = lesson_ordering._read_cached_lesson_order
+_REAL_WRITE_CACHED_LESSON_ORDER = lesson_ordering._write_cached_lesson_order
+
+
 @pytest.fixture(autouse=True)
 def _isolate_persistent_cache(monkeypatch) -> None:
     monkeypatch.setattr(
@@ -61,12 +65,16 @@ def _generation_result(
     *,
     model: str | None = None,
     terminal_summary_start_reel_id: str | None = None,
+    prior_restatement_reel_ids: list[str] | None = None,
 ) -> gemini_client.GenerationResult:
     return gemini_client.GenerationResult(
         text=json.dumps(
             {
                 "ordered_reel_ids": ordered_ids,
                 "assessment_checkpoint_reel_ids": checkpoint_ids or [],
+                "prior_restatement_reel_ids": (
+                    prior_restatement_reel_ids or []
+                ),
                 "terminal_summary_start_reel_id": (
                     terminal_summary_start_reel_id
                 ),
@@ -113,6 +121,13 @@ def test_orders_every_clip_and_returns_organizer_checkpoints(monkeypatch) -> Non
     captured: dict[str, str] = {}
 
     calls: list[str] = []
+    prompt_calls = 0
+    render_prompt = lesson_ordering._user_prompt
+
+    def count_prompt(*args, **kwargs):
+        nonlocal prompt_calls
+        prompt_calls += 1
+        return render_prompt(*args, **kwargs)
 
     def fake_generate(
         system_prompt,
@@ -131,12 +146,14 @@ def test_orders_every_clip_and_returns_organizer_checkpoints(monkeypatch) -> Non
             ["worked"],
         )
 
+    monkeypatch.setattr(lesson_ordering, "_user_prompt", count_prompt)
     monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
 
     result = lesson_ordering.order_lesson_batch(
         reels,
         topic="gradient descent",
         learner_level="beginner",
+        learner_difficulty_target=0.70,
     )
 
     assert result.ordered_reel_ids == ["intro", "core", "worked"]
@@ -144,9 +161,11 @@ def test_orders_every_clip_and_returns_organizer_checkpoints(monkeypatch) -> Non
     assert result.assessment_checkpoint_reel_ids == ["worked"]
     assert result.degraded is False
     assert calls == [config.LESSON_ORDER_MODEL]
+    assert prompt_calls == 1
     assert "short batch may have none" in captured["system"]
     assert "gradient descent" in captured["user"]
     assert "beginner" in captured["user"]
+    assert '"learner_difficulty_target":0.7' in captured["user"]
     assert "assessment_checkpoint_reel_ids" in captured["user"]
 
 
@@ -166,7 +185,7 @@ def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_
 
     assert payload["concept_title"] == "How force and mass change acceleration"
     assert payload["concept_family"] == "force-mass-acceleration proportionality"
-    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v10"
+    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v12"
     assert "semantic restatements" in lesson_ordering._SYSTEM_PROMPT
     assert "concept, then explanation, then application or worked example" in (
         lesson_ordering._SYSTEM_PROMPT
@@ -175,8 +194,115 @@ def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_
     assert "Never return zero clips solely because of difficulty" in (
         lesson_ordering._SYSTEM_PROMPT
     )
+    assert "after learner feedback and quiz adjustment" in " ".join(
+        lesson_ordering._SYSTEM_PROMPT.split()
+    )
     assert "learner_level" not in payload
     assert "difficulty" in payload
+
+
+def test_prior_objective_evidence_lets_existing_ai_omit_only_cross_source_restatement(
+    monkeypatch,
+) -> None:
+    repeated_facet = _obligation(
+        "balanced aggregate response",
+        "Teach why equal opposing inputs produce zero aggregate response",
+    )
+    repeated = _reel(
+        "repeated",
+        video_id="repeat-video",
+        start=0,
+        concept="balanced aggregate",
+        concept_id="child-repeat",
+        _selection_concept_family="aggregate response",
+        ai_summary="Equal opposing inputs balance, leaving zero aggregate response.",
+        transcript_snippet="The inputs are equal and opposite, so the total is zero.",
+        _selection_intent_obligations=[repeated_facet],
+    )
+    reasoning = _reel(
+        "reasoning",
+        video_id="reasoning-video",
+        start=0,
+        concept="unbalanced aggregate",
+        concept_id="child-reasoning",
+        _selection_concept_family="aggregate response",
+        ai_summary="One input exceeds the opposing input, producing a nonzero response.",
+        transcript_snippet="Subtract the opposing input to obtain the nonzero total.",
+    )
+    application = _reel(
+        "application",
+        video_id="application-video",
+        start=0,
+        concept="rotated-frame aggregate",
+        concept_id="child-application",
+        _selection_concept_family="aggregate response",
+        ai_summary="Resolve the inputs in a rotated frame before computing the aggregate.",
+        transcript_snippet="Project each input onto the rotated axes and combine components.",
+    )
+    captured: dict[str, str] = {}
+    calls = 0
+
+    def fake_generate(system_prompt, user_prompt, **_kwargs):
+        nonlocal calls
+        calls += 1
+        captured.update(system=system_prompt, user=user_prompt)
+        learning_request = json.loads(
+            user_prompt.split("LEARNING_REQUEST_JSON:\n", 1)[1].split(
+                "\n\nCLIPS_JSON:\n", 1
+            )[0]
+        )
+        assert learning_request["prior_concept_coverage"][0][
+            "learning_objective_excerpts"
+        ] == [
+            "Opposing inputs cancel so the aggregate response is zero."
+        ]
+        clip_payload = json.loads(
+            user_prompt.split("CLIPS_JSON:\n", 1)[1].split(
+                "\n\nFinal request:", 1
+            )[0]
+        )
+        assert [clip["summary"] for clip in clip_payload["clips"]] == [
+            repeated["ai_summary"],
+            reasoning["ai_summary"],
+            application["ai_summary"],
+        ]
+        assert clip_payload["clips"][0]["intent_obligations"] == [
+            repeated_facet
+        ]
+        return _generation_result(
+            ["reasoning", "application"],
+            prior_restatement_reel_ids=["repeated"],
+        )
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+    monkeypatch.setattr(
+        lesson_ordering.time,
+        "sleep",
+        lambda *_args, **_kwargs: pytest.fail(
+            "healthy cross-batch organizer call must not sleep"
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [repeated, reasoning, application],
+        topic="Start with balance, then explain nonzero response and rotated frames.",
+        release_limit=3,
+        prior_concept_coverage=[{
+            "concept_id": "parent-balance",
+            "concept_family": "aggregate response",
+            "concept_title": "opposing inputs at balance",
+            "learning_objective_excerpts": [
+                "Opposing inputs cancel so the aggregate response is zero."
+            ],
+            "delivered_count": 1,
+        }],
+    )
+
+    assert calls == 1
+    assert result.ordered_reel_ids == ["reasoning", "application"]
+    assert result.prior_restatement_reel_ids == ["repeated"]
+    assert "semantically equivalent" in captured["system"]
+    assert "source, title, or concept ID differs" in captured["system"]
 
 
 def test_compact_clip_columns_reconstruct_every_organizer_value_without_shift() -> None:
@@ -245,6 +371,7 @@ def test_small_batch_keeps_the_full_object_prompt_byte_for_byte() -> None:
         "learner_level": "beginner",
         "release_limit": 2,
         "prior_concept_coverage": [],
+        "recent_prior_objective_coverage": [],
         "available_intent_obligations": [],
         "prior_intent_obligation_keys": [],
     }
@@ -260,6 +387,7 @@ def test_small_batch_keeps_the_full_object_prompt_byte_for_byte() -> None:
         + "\n\nFinal request: Return at most 2 clips as a coherent feedback-aware "
         "subset, preserve prerequisites and same-source chronology, and return only "
         "{\"ordered_reel_ids\":[...],\"assessment_checkpoint_reel_ids\":[...],"
+        "\"prior_restatement_reel_ids\":[...],"
         "\"terminal_summary_start_reel_id\":null} "
         "with no other text or fields."
     )
@@ -270,6 +398,197 @@ def test_small_batch_keeps_the_full_object_prompt_byte_for_byte() -> None:
         learner_level="beginner",
         release_limit=2,
     ) == expected
+
+
+def test_recent_prior_sidecar_keeps_newest_cross_id_objectives_beyond_concept_cap() -> None:
+    reel = _reel(
+        "child-balance",
+        video_id="child-source",
+        start=0,
+        concept="balanced aggregate response",
+        concept_id="child-balance-concept",
+    )
+    prior_concepts = [
+        {
+            "concept_id": f"quiet-{index}",
+            "concept_family": f"quiet family {index}",
+            "concept_title": f"quiet concept {index}",
+            "learning_objective_excerpts": [f"Previously taught quiet objective {index}."],
+            "delivered_count": 2,
+        }
+        for index in range(40)
+    ]
+    recent = [
+        {
+            "concept_id": f"recent-{index}",
+            "concept_family": "recent family",
+            "concept_title": f"recent concept {index}",
+            "learning_objective_excerpt": f"Recent objective {index}.",
+            "release_rank": index,
+        }
+        for index in range(11)
+    ] + [{
+        "concept_id": "parent-balance-concept",
+        "concept_family": "aggregate response",
+        "concept_title": "opposing inputs at balance",
+        "learning_objective_excerpt": (
+            "Equal opposing inputs yield a zero aggregate response."
+        ),
+        "release_rank": 11,
+    }]
+
+    prompt = lesson_ordering._user_prompt(
+        [reel],
+        topic="Explain balanced aggregate responses.",
+        learner_level="beginner",
+        release_limit=1,
+        prior_concept_coverage=prior_concepts,
+        recent_prior_objective_coverage=recent,
+    )
+    learning_request = json.loads(
+        prompt.split("LEARNING_REQUEST_JSON:\n", 1)[1].split(
+            "\n\nCLIPS_JSON:\n", 1
+        )[0]
+    )
+
+    assert len(learning_request["prior_concept_coverage"]) == 40
+    assert all(
+        item["concept_id"].startswith("quiet-")
+        for item in learning_request["prior_concept_coverage"]
+    )
+    recent_payload = learning_request["recent_prior_objective_coverage"]
+    assert len(recent_payload) == lesson_ordering.LESSON_ORDER_RECENT_PRIOR_OBJECTIVE_LIMIT
+    assert recent_payload[0]["concept_id"] == "parent-balance-concept"
+    assert [item["learning_objective_excerpt"] for item in recent_payload] == [
+        "Equal opposing inputs yield a zero aggregate response.",
+        *[f"Recent objective {index}." for index in range(10, 2, -1)],
+    ]
+    assert all("release_rank" not in item for item in recent_payload)
+
+
+def test_compact_prompt_uses_available_budget_for_distinct_prior_objectives() -> None:
+    common_prefix = "Shared setup before the objectives diverge. " + ("context " * 12)
+
+    def objective(index: int, phase: int) -> str:
+        return (
+            f"{common_prefix}concept {index} phase {phase} teaches a distinct result. "
+            + ("evidence " * 80)
+        )[:500]
+
+    prior = [
+        {
+            "concept_id": f"concept-{index}-" + ("c" * 220),
+            "concept_family": f"family-{index}-" + ("f" * 70),
+            "concept_title": f"title-{index}-" + ("t" * 190),
+            "learning_objective_excerpts": [
+                objective(index, phase) for phase in range(3)
+            ],
+            "delivered_count": 1,
+        }
+        for index in range(40)
+    ]
+    candidate = _reel(
+        "candidate",
+        video_id="candidate",
+        start=0,
+        concept="candidate",
+        concept_id="candidate-concept",
+    )
+    recent = [
+        {
+            "concept_id": (
+                "candidate-concept" if index == 11 else f"recent-{index}"
+            ),
+            "concept_family": f"recent family {index}",
+            "concept_title": f"recent title {index}",
+            "learning_objective_excerpt": objective(100 + index, 0),
+            "release_rank": index,
+        }
+        for index in range(12)
+    ]
+    prompt = lesson_ordering._user_prompt(
+        [candidate],
+        topic="Teach the candidate after the established objectives.",
+        learner_level="intermediate",
+        release_limit=1,
+        prior_concept_coverage=prior,
+        recent_prior_objective_coverage=recent,
+    )
+    learning_request = json.loads(
+        prompt.split("LEARNING_REQUEST_JSON:\n", 1)[1].split(
+            "\n\nCLIPS_JSON:\n", 1
+        )[0]
+    )
+    prior_payload = learning_request["prior_concept_coverage"]
+    columns = {
+        column: position
+        for position, column in enumerate(prior_payload["columns"])
+    }
+    first_objectives = prior_payload["rows"][0][
+        columns["learning_objective_excerpts"]
+    ]
+    recent_payload = learning_request["recent_prior_objective_coverage"]
+    recent_columns = {
+        column: position
+        for position, column in enumerate(recent_payload["columns"])
+    }
+    recent_rows = recent_payload["rows"]
+    clips_payload = json.loads(
+        prompt.split("CLIPS_JSON:\n", 1)[1].split(
+            "\n\nFinal request:", 1
+        )[0]
+    )
+    clip_columns = {
+        column: position
+        for position, column in enumerate(clips_payload["columns"])
+    }
+
+    assert prior_payload["format"] == "compact_rows_v1"
+    assert len(prompt) <= lesson_ordering.LESSON_ORDER_MAX_USER_PROMPT_CHARS
+    assert len(prompt) > 60_000
+    assert len(first_objectives) == len(set(first_objectives)) == 3
+    assert all(len(item) > len(common_prefix) for item in first_objectives)
+    assert len(recent_rows) == 9
+    recent_objectives = [
+        row[recent_columns["learning_objective_excerpt"]]
+        for row in recent_rows
+    ]
+    assert len(recent_objectives) == len(set(recent_objectives)) == 9
+    assert all(len(item) > len(common_prefix) for item in recent_objectives)
+    assert (
+        recent_rows[0][recent_columns["concept_ref"]]
+        == clips_payload["clips"][0][clip_columns["concept_ref"]]
+    )
+
+
+def test_compact_recent_prior_objectives_dedupe_after_truncation() -> None:
+    compact = lesson_ordering._compact_learning_request(
+        {
+            "recent_prior_objective_coverage": [
+                {
+                    "concept_id": "first",
+                    "learning_objective_excerpt": (
+                        "Shared prefix before first distinct ending"
+                    ),
+                },
+                {
+                    "concept_id": "second",
+                    "learning_objective_excerpt": (
+                        "Shared prefix before second distinct ending"
+                    ),
+                },
+            ],
+        },
+        concept_text_limit=96,
+        semantic_text_limit=13,
+        concept_refs={},
+        obligation_refs={},
+    )
+
+    recent = compact["recent_prior_objective_coverage"]
+    assert recent["format"] == "compact_rows_v1"
+    assert len(recent["rows"]) == 1
+    assert recent["rows"][0][-1] == "Shared prefix"
 
 
 def test_max_candidate_prompt_keeps_every_clip_under_fixed_input_budget() -> None:
@@ -328,12 +647,30 @@ def test_max_candidate_prompt_keeps_every_clip_under_fixed_input_budget() -> Non
                 "concept_id": reels[index]["concept_id"],
                 "concept_family": max_field("prior-family", index, 96),
                 "concept_title": max_field("prior-title", index, 240),
+                "learning_objective_excerpts": [
+                    max_field(f"prior-objective-{phase}", index, 500)
+                    for phase in range(3)
+                ],
                 "delivered_count": 100,
                 "intent_obligation_keys": [
                     obligations[index % len(obligations)]["key"]
                 ],
             }
             for index in range(40)
+        ],
+        recent_prior_objective_coverage=[
+            {
+                "concept_id": max_field("recent-concept", index, 256),
+                "concept_family": max_field("recent-family", index, 96),
+                "concept_title": max_field("recent-title", index, 240),
+                "learning_objective_excerpt": max_field(
+                    f"r{index:02d}-objective",
+                    index,
+                    500,
+                ),
+                "release_rank": index,
+            }
+            for index in range(12)
         ],
     )
     learning_payload = json.loads(
@@ -357,6 +694,12 @@ def test_max_candidate_prompt_keeps_every_clip_under_fixed_input_budget() -> Non
         for position, column in enumerate(prior_payload["columns"])
     }
     prior_rows = prior_payload["rows"]
+    recent_prior_payload = learning_payload["recent_prior_objective_coverage"]
+    recent_prior_columns = {
+        column: position
+        for position, column in enumerate(recent_prior_payload["columns"])
+    }
+    recent_prior_rows = recent_prior_payload["rows"]
     obligation_payload = learning_payload["available_intent_obligations"]
     obligation_columns = {
         column: position
@@ -368,6 +711,8 @@ def test_max_candidate_prompt_keeps_every_clip_under_fixed_input_budget() -> Non
     assert len(rows) == 128
     assert prior_payload["format"] == "compact_rows_v1"
     assert len(prior_rows) == 40
+    assert recent_prior_payload["format"] == "compact_rows_v1"
+    assert len(recent_prior_rows) == 9
     assert obligation_payload["format"] == "compact_rows_v1"
     assert len(obligation_payload["rows"]) == 16
     assert len(learning_payload["prior_intent_obligation_refs"]) == 16
@@ -399,6 +744,19 @@ def test_max_candidate_prompt_keeps_every_clip_under_fixed_input_budget() -> Non
     )
     assert all(prior_row[prior_columns["concept_family"]] for prior_row in prior_rows)
     assert all(prior_row[prior_columns["concept_title"]] for prior_row in prior_rows)
+    assert all(
+        1 <= len(prior_row[prior_columns["learning_objective_excerpts"]]) <= 3
+        and all(prior_row[prior_columns["learning_objective_excerpts"]])
+        and len(set(prior_row[prior_columns["learning_objective_excerpts"]]))
+        == len(prior_row[prior_columns["learning_objective_excerpts"]])
+        for prior_row in prior_rows
+    )
+    recent_excerpts = [
+        row[recent_prior_columns["learning_objective_excerpt"]]
+        for row in recent_prior_rows
+    ]
+    assert all(recent_excerpts)
+    assert len(set(recent_excerpts)) == len(recent_excerpts) == 9
     assert all(
         len(row[columns["prerequisite_candidate_refs"]]) == 16
         for row in rows
@@ -462,6 +820,7 @@ def test_max_candidate_subset_dispatches_once_with_sufficient_output_budget(
         {
             "ordered_reel_ids": reel_ids,
             "assessment_checkpoint_reel_ids": reel_ids,
+            "prior_restatement_reel_ids": [],
             "terminal_summary_start_reel_id": reel_ids[-1],
         },
         separators=(",", ":"),
@@ -853,6 +1212,324 @@ def test_prior_grounded_facet_coverage_does_not_force_repetition(
         clip for clip in clips if clip["reel_id"] == "complete-square"
     )
     assert complete_square_clip["intent_obligations"] == [completing_square]
+
+
+def test_ai_declared_prior_restatement_is_not_readded_for_a_different_obligation_key(
+    monkeypatch,
+) -> None:
+    repeated_facet = _obligation(
+        "balanced aggregate response",
+        "Teach why equal opposing inputs produce zero aggregate response",
+    )
+    reels = [
+        _reel(
+            "repeat",
+            video_id="new-source",
+            start=0,
+            concept="balanced aggregate response",
+            concept_id="child-balance",
+            ai_summary="Equal opposing inputs cancel, leaving a zero response.",
+            _selection_intent_obligations=[repeated_facet],
+        ),
+        _reel(
+            "novel",
+            video_id="novel-source",
+            start=0,
+            concept="nonzero aggregate reasoning",
+            concept_id="child-reasoning",
+            ai_summary="Subtract the smaller opposing input to find the nonzero response.",
+        ),
+    ]
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result(
+            ["novel"],
+            prior_restatement_reel_ids=["repeat"],
+        )
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="Explain balanced and nonzero aggregate responses.",
+        release_limit=2,
+        prior_concept_coverage=[{
+            "concept_id": "parent-balance",
+            "concept_family": "aggregate response",
+            "concept_title": "opposing inputs at balance",
+            "learning_objective_excerpts": [
+                "Opposing inputs cancel so the aggregate response is zero."
+            ],
+            "delivered_count": 1,
+        }],
+    )
+
+    assert calls == 1
+    assert result.ordered_reel_ids == ["novel"]
+    assert result.prior_restatement_reel_ids == ["repeat"]
+
+
+def test_recent_prior_objective_alone_can_authorize_restatement_declaration(
+    monkeypatch,
+) -> None:
+    repeated_facet = _obligation(
+        "balanced aggregate response",
+        "Teach why equal opposing inputs produce zero aggregate response",
+    )
+    repeated = _reel(
+        "repeat",
+        video_id="new-source",
+        start=0,
+        concept="balanced aggregate response",
+        _selection_intent_obligations=[repeated_facet],
+    )
+    novel = _reel(
+        "novel",
+        video_id="novel-source",
+        start=0,
+        concept="nonzero aggregate reasoning",
+    )
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result(
+            ["novel"],
+            prior_restatement_reel_ids=["repeat"],
+        )
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        [repeated, novel],
+        topic="Explain balanced and nonzero aggregate responses.",
+        recent_prior_objective_coverage=[{
+            "concept_id": "prior-balance",
+            "learning_objective_excerpt": (
+                "Equal opposing inputs produce zero aggregate response."
+            ),
+            "release_rank": 0,
+        }],
+    )
+
+    assert calls == 1
+    assert result.ordered_reel_ids == ["novel"]
+    assert result.prior_restatement_reel_ids == ["repeat"]
+
+
+def test_prior_restatement_without_prior_objective_evidence_retries_and_is_ignored(
+    monkeypatch,
+) -> None:
+    facet = _obligation("new facet", "Teach the new facet")
+    reels = [
+        _reel(
+            "facet",
+            video_id="facet-source",
+            start=0,
+            concept="new facet",
+            _selection_intent_obligations=[facet],
+        ),
+        _reel("intro", video_id="intro-source", start=0, concept="orientation"),
+    ]
+    responses = iter([
+        _generation_result(
+            ["intro"],
+            prior_restatement_reel_ids=["facet"],
+        ),
+        _generation_result(["intro"]),
+    ])
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return next(responses)
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="Teach the new facet.",
+        release_limit=2,
+    )
+
+    assert calls == 2
+    assert "facet" in result.ordered_reel_ids
+    assert result.prior_restatement_reel_ids == []
+
+
+def test_identityless_prior_history_cannot_authorize_restatement_declaration(
+    monkeypatch,
+) -> None:
+    facet = _obligation("new facet", "Teach the new facet")
+    reels = [
+        _reel(
+            "facet",
+            video_id="facet-source",
+            start=0,
+            concept="new facet",
+            _selection_intent_obligations=[facet],
+        ),
+        _reel("intro", video_id="intro-source", start=0, concept="orientation"),
+    ]
+    responses = iter([
+        _generation_result(
+            ["intro"],
+            prior_restatement_reel_ids=["facet"],
+        ),
+        _generation_result(["intro"]),
+    ])
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return next(responses)
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="Teach the new facet.",
+        release_limit=2,
+        prior_concept_coverage=[{
+            "learning_objective_excerpts": [
+                "This row is filtered because it has no concept identity."
+            ],
+            "delivered_count": 1,
+        }],
+    )
+
+    assert calls == 2
+    assert "facet" in result.ordered_reel_ids
+    assert result.prior_restatement_reel_ids == []
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_reason"),
+    [
+        (
+            {
+                "ordered_reel_ids": ["selected"],
+                "assessment_checkpoint_reel_ids": [],
+                "terminal_summary_start_reel_id": None,
+            },
+            "invalid_model_response",
+        ),
+        (
+            {
+                "ordered_reel_ids": ["selected"],
+                "assessment_checkpoint_reel_ids": [],
+                "prior_restatement_reel_ids": ["unknown"],
+                "terminal_summary_start_reel_id": None,
+            },
+            "invalid_model_order",
+        ),
+        (
+            {
+                "ordered_reel_ids": ["selected"],
+                "assessment_checkpoint_reel_ids": [],
+                "prior_restatement_reel_ids": ["repeat", "repeat"],
+                "terminal_summary_start_reel_id": None,
+            },
+            "invalid_model_order",
+        ),
+        (
+            {
+                "ordered_reel_ids": ["selected"],
+                "assessment_checkpoint_reel_ids": [],
+                "prior_restatement_reel_ids": ["selected"],
+                "terminal_summary_start_reel_id": None,
+            },
+            "invalid_model_order",
+        ),
+    ],
+)
+def test_prior_restatement_contract_retries_missing_or_invalid_ids(
+    monkeypatch,
+    payload: dict[str, Any],
+    expected_reason: str,
+) -> None:
+    reels = [
+        _reel("selected", video_id="selected", start=0, concept="new reasoning"),
+        _reel("repeat", video_id="repeat", start=0, concept="prior restatement"),
+    ]
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return replace(
+            _generation_result(["selected"]),
+            text=json.dumps(payload),
+        )
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="Teach the new reasoning without repeating the prior explanation.",
+        prior_concept_coverage=[{
+            "concept_id": "prior",
+            "learning_objective_excerpts": ["The prior explanation."],
+            "delivered_count": 1,
+        }],
+    )
+
+    assert calls == lesson_ordering.LESSON_ORDER_ATTEMPTS == 2
+    assert result.degraded is True
+    assert result.fallback_reason == expected_reason
+
+
+def test_remediation_override_removes_readded_candidate_from_restatement_declaration(
+    monkeypatch,
+) -> None:
+    repeated = _reel(
+        "repeat",
+        video_id="repeat-source",
+        start=0,
+        concept="balanced response remediation",
+        concept_id="needs-remediation",
+        difficulty=0.1,
+    )
+    novel = _reel(
+        "novel",
+        video_id="novel-source",
+        start=0,
+        concept="new application",
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(
+            ["novel"],
+            prior_restatement_reel_ids=["repeat"],
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [repeated, novel],
+        topic="Remediate the balanced response, then apply it.",
+        remediation_concept_ids=["needs-remediation"],
+        release_limit=2,
+        prior_concept_coverage=[{
+            "concept_id": "parent-balance",
+            "learning_objective_excerpts": [
+                "Equal opposing inputs yield a zero response."
+            ],
+            "delivered_count": 1,
+        }],
+    )
+
+    assert "repeat" in result.ordered_reel_ids
+    assert result.prior_restatement_reel_ids == []
+    assert set(result.ordered_reel_ids).isdisjoint(
+        result.prior_restatement_reel_ids
+    )
 
 
 def test_one_candidate_can_satisfy_multiple_grounded_request_facets(
@@ -2811,6 +3488,186 @@ def test_cache_read_observes_cancellation_before_return(monkeypatch) -> None:
         )
 
 
+def test_lesson_order_cache_round_trips_validated_prior_restatements(
+    monkeypatch,
+) -> None:
+    reels = [
+        _reel("selected", video_id="selected", start=0, concept="new reasoning"),
+        _reel("repeat", video_id="repeat", start=0, concept="prior restatement"),
+    ]
+    stored: dict[str, Any] = {}
+
+    class ConnectionContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "get_conn",
+        lambda **_kwargs: ConnectionContext(),
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "upsert",
+        lambda _conn, _table, values, **_kwargs: stored.update(values),
+    )
+
+    _REAL_WRITE_CACHED_LESSON_ORDER(
+        "cache-key",
+        ordered_ids=["selected"],
+        checkpoint_ids=[],
+        prior_restatement_ids=["repeat"],
+        terminal_summary_start_reel_id=None,
+        model_used=config.LESSON_ORDER_MODEL,
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "fetch_one",
+        lambda *_args, **_kwargs: {
+            "response_json": stored["response_json"],
+            "created_at": stored["created_at"],
+        },
+    )
+
+    cached = _REAL_READ_CACHED_LESSON_ORDER(
+        "cache-key",
+        original=reels,
+        reel_ids=["selected", "repeat"],
+        generation_context=None,
+        has_prior_objective_evidence=True,
+        release_limit=2,
+    )
+
+    assert cached is not None
+    assert cached.ordered_reel_ids == ["selected"]
+    assert cached.prior_restatement_reel_ids == ["repeat"]
+    response_payload = json.loads(stored["response_json"])
+    assert response_payload["prompt_version"] == "lesson_order_v12"
+    assert response_payload["cache_version"] == 10
+    assert _REAL_READ_CACHED_LESSON_ORDER(
+        "cache-key",
+        original=reels,
+        reel_ids=["selected", "repeat"],
+        generation_context=None,
+        has_prior_objective_evidence=False,
+        release_limit=2,
+    ) is None
+
+    invalid_payloads = []
+    stale = dict(response_payload)
+    stale["cache_version"] = 9
+    invalid_payloads.append(stale)
+    missing = dict(response_payload)
+    missing.pop("prior_restatement_reel_ids")
+    invalid_payloads.append(missing)
+    for invalid_ids in (["unknown"], ["repeat", "repeat"], ["selected"]):
+        invalid = dict(response_payload)
+        invalid["prior_restatement_reel_ids"] = invalid_ids
+        invalid_payloads.append(invalid)
+    for invalid in invalid_payloads:
+        stored["response_json"] = json.dumps(invalid)
+        assert _REAL_READ_CACHED_LESSON_ORDER(
+            "cache-key",
+            original=reels,
+            reel_ids=["selected", "repeat"],
+            generation_context=None,
+            has_prior_objective_evidence=True,
+            release_limit=2,
+        ) is None
+
+
+def test_real_cache_hit_preserves_prior_restatement_mandatory_exemption(
+    monkeypatch,
+) -> None:
+    repeated_facet = _obligation(
+        "balanced aggregate response",
+        "Teach why equal opposing inputs produce zero aggregate response",
+    )
+    reels = [
+        _reel("selected", video_id="selected", start=0, concept="new reasoning"),
+        _reel(
+            "repeat",
+            video_id="repeat",
+            start=0,
+            concept="prior restatement",
+            _selection_intent_obligations=[repeated_facet],
+        ),
+    ]
+    stored: dict[str, Any] = {}
+    cache_hits: list[dict[str, Any]] = []
+
+    class ConnectionContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    class Context:
+        def record_cache_hit(self, **kwargs):
+            cache_hits.append(kwargs)
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "get_conn",
+        lambda **_kwargs: ConnectionContext(),
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "upsert",
+        lambda _conn, _table, values, **_kwargs: stored.update(values),
+    )
+    _REAL_WRITE_CACHED_LESSON_ORDER(
+        "cache-key",
+        ordered_ids=["selected"],
+        checkpoint_ids=[],
+        prior_restatement_ids=["repeat"],
+        terminal_summary_start_reel_id=None,
+        model_used=config.LESSON_ORDER_MODEL,
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "fetch_one",
+        lambda *_args, **_kwargs: {
+            "response_json": stored["response_json"],
+            "created_at": stored["created_at"],
+        },
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_read_cached_lesson_order",
+        _REAL_READ_CACHED_LESSON_ORDER,
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a valid cache hit must not call the organizer provider"
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="Teach the new reasoning without repeating prior balance content.",
+        prior_concept_coverage=[{
+            "concept_id": "prior-balance",
+            "learning_objective_excerpts": [
+                "Equal opposing inputs produce zero aggregate response."
+            ],
+            "delivered_count": 1,
+        }],
+        generation_context=Context(),
+    )
+
+    assert result.provider_called is False
+    assert result.ordered_reel_ids == ["selected"]
+    assert result.prior_restatement_reel_ids == ["repeat"]
+    assert len(cache_hits) == 1
+
+
 def test_post_cache_write_cancellation_records_and_reconciles_billed_call(
     monkeypatch,
 ) -> None:
@@ -2872,6 +3729,7 @@ def test_generate_content_receives_text_only_and_no_media_configuration(
                     {
                         "ordered_reel_ids": ["intro", "core"],
                         "assessment_checkpoint_reel_ids": [],
+                        "prior_restatement_reel_ids": [],
                     }
                 ),
                 model_version=config.LESSON_ORDER_MODEL,
