@@ -929,6 +929,31 @@ def test_gemini3_non_503_remains_capped_at_one_retry(monkeypatch, status_code):
     assert exc_info.value.telemetry.retries == 1
 
 
+def test_gemini3_explicit_full_transient_budget_recovers_504_then_timeout(
+    monkeypatch,
+):
+    fake = _FakeClient(
+        _HTTPError(504),
+        TimeoutError("transport timed out"),
+        _FakeResponse(),
+    )
+    monkeypatch.setattr(gc.time, "sleep", lambda _seconds: None)
+
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        max_retries=2,
+        use_full_transient_retry_budget=True,
+    )
+
+    assert len(fake.models.calls) == 3
+    assert result.telemetry.retries == 2
+    assert [
+        item["provider_error_type"]
+        for item in result.telemetry.error_history
+    ] == ["_HTTPError", "TimeoutError"]
+
+
 def test_gemini3_second_503_retry_honors_retry_after(monkeypatch):
     fake = _FakeClient(
         _HTTPError(503),

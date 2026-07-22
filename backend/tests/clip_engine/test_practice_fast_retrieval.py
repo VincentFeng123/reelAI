@@ -45,10 +45,12 @@ def _intent_expansion_json(
     return json.dumps({
         "corrected": corrected,
         "summary_preserved_constraint_ids": ["subject"],
+        "joint_structures": [],
         "intent_constraints": [{
             "constraint_id": "subject",
             "kind": "subject",
             "source_phrase": source_phrase,
+            "source_occurrence": 0,
             "requirement": f"Teach {corrected}",
         }],
         "queries": [
@@ -63,6 +65,11 @@ def _intent_expansion_json(
 
 def _expansion_payload_json(payload: dict) -> str:
     completed = dict(payload)
+    completed["intent_constraints"] = [
+        {"source_occurrence": 0, **constraint}
+        for constraint in completed.get("intent_constraints", [])
+    ]
+    completed.setdefault("joint_structures", [])
     completed.setdefault(
         "summary_preserved_constraint_ids",
         [
@@ -71,6 +78,114 @@ def _expansion_payload_json(payload: dict) -> str:
         ],
     )
     return json.dumps(completed)
+
+
+def _without_intent_contract(result: dict) -> dict:
+    public = dict(result)
+    intent_contract = public.pop("intent_contract", None)
+    if public.get("provider_used") == "gemini":
+        assert intent_contract["version"] == "expansion_intent_v1"
+        assert intent_contract["request_intent"]["constraints"]
+    else:
+        assert intent_contract is None
+    return public
+
+
+def _intent_contract(exact_request: str = "physics") -> dict:
+    return {
+        "version": "expansion_intent_v1",
+        "request_intent": {
+            "exact_request": exact_request,
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": exact_request,
+                "source_occurrence": 0,
+                "requirement": f"Teach {exact_request}",
+            }],
+            "joint_structures": [],
+        },
+    }
+
+
+def _selector_contract_payload(
+    exact_request: str,
+    constraints: list[dict],
+    *,
+    joint_structures: list[dict] | None = None,
+) -> dict:
+    constraint_ids = [constraint["constraint_id"] for constraint in constraints]
+    return {
+        "corrected": exact_request,
+        "intent_constraints": constraints,
+        "joint_structures": list(joint_structures or []),
+        "summary_preserved_constraint_ids": constraint_ids,
+        "queries": [{
+            "text": exact_request,
+            "preserved_constraint_ids": constraint_ids,
+        }],
+    }
+
+
+def _selector_intent_contract(
+    exact_request: str,
+    constraints: list[dict],
+    *,
+    joint_structures: list[dict] | None = None,
+) -> dict:
+    return {
+        "version": expand.PRACTICE_FAST_INTENT_CONTRACT_VERSION,
+        "request_intent": {
+            "exact_request": exact_request,
+            "constraints": constraints,
+            "joint_structures": list(joint_structures or []),
+        },
+    }
+
+
+def _selector_constraint(
+    constraint_id: str,
+    kind: str,
+    source_phrase: str,
+    source_occurrence: int | None = 0,
+) -> dict:
+    constraint = {
+        "constraint_id": constraint_id,
+        "kind": kind,
+        "source_phrase": source_phrase,
+        "requirement": f"Preserve {constraint_id}",
+    }
+    if source_occurrence is not None:
+        constraint["source_occurrence"] = source_occurrence
+    return constraint
+
+
+def _repeated_c_constraints(
+    subject_occurrence: int | None,
+    outcome_occurrence: int,
+) -> list[dict]:
+    return [
+        _selector_constraint("subject", "subject", "C", subject_occurrence),
+        _selector_constraint("outcome", "outcome", "C", outcome_occurrence),
+    ]
+
+
+def _comparison_constraints(
+    relation_kind: str = "relationship",
+    relation_phrase: str = "Compare alpha with beta",
+) -> list[dict]:
+    return [
+        _selector_constraint("alpha", "subject", "alpha"),
+        _selector_constraint("beta", "scope", "beta"),
+        _selector_constraint("compare", relation_kind, relation_phrase),
+    ]
+
+
+def _comparison_joint_structure() -> list[dict]:
+    return [{
+        "member_constraint_ids": ["alpha", "beta"],
+        "relation_constraint_id": "compare",
+    }]
 
 
 def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypatch):
@@ -95,7 +210,7 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
     assert expand.PRACTICE_FAST_EXPAND_MODEL == "gemini-3.1-flash-lite"
     assert expand.PRACTICE_FAST_EXPAND_TIMEOUT_MS == 10_000
     assert expand.PRACTICE_FAST_EXPAND_ATTEMPTS == 2
-    assert result == {
+    assert _without_intent_contract(result) == {
         "corrected": "Calculus",
         "queries": ["calculus spoken lecture", "Derivatives", "Limits"],
         "provider_used": "gemini",
@@ -109,7 +224,7 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
 def test_practice_fast_expansion_requests_focused_sources() -> None:
     prompt = " ".join(expand._PRACTICE_FAST_SYSTEM.casefold().split())
 
-    assert expand.PRACTICE_FAST_EXPAND_CACHE_VERSION == 11
+    assert expand.PRACTICE_FAST_EXPAND_CACHE_VERSION == 12
     assert expand.PRACTICE_FAST_EXPAND_OUTPUT_TOKENS == 2_048
     assert "one concise, standalone, intent-preserving learning summary" in prompt
     assert "must make sense without the original request" in prompt
@@ -126,6 +241,13 @@ def test_practice_fast_expansion_requests_focused_sources() -> None:
         "summary_preserved_constraint_ids"
     ]
     assert "summary_preserved_constraint_ids" in expansion_schema["required"]
+    assert "joint_structures" in expansion_schema["required"]
+    assert "default" not in expansion_schema["properties"]["joint_structures"]
+    constraint_schema = expansion_schema["$defs"][
+        "_PracticeFastIntentConstraint"
+    ]
+    assert "source_occurrence" in constraint_schema["required"]
+    assert "default" not in constraint_schema["properties"]["source_occurrence"]
     assert summary_ids_schema["minItems"] == 1
     assert summary_ids_schema["maxItems"] == 16
     assert "list each id exactly once" in prompt
@@ -144,6 +266,254 @@ def test_practice_fast_expansion_requests_focused_sources() -> None:
 
 
 @pytest.mark.parametrize(
+    ("topic", "constraints", "joint_structures"),
+    [
+        (
+            "Teach C, then test C.",
+            _repeated_c_constraints(0, 2),
+            [],
+        ),
+        (
+            "Teach C, then test C.",
+            _repeated_c_constraints(None, 1),
+            [],
+        ),
+        (
+            "Teach C, then test C.",
+            _repeated_c_constraints(0, 0),
+            [],
+        ),
+        (
+            "Compare alpha with beta.",
+            _comparison_constraints(relation_kind="scope"),
+            _comparison_joint_structure(),
+        ),
+        (
+            "Compare alpha with beta.",
+            _comparison_constraints(relation_phrase="Compare alpha"),
+            _comparison_joint_structure(),
+        ),
+    ],
+    ids=[
+        "wrong-occurrence",
+        "missing-repeated-occurrence",
+        "duplicate-positioned-identity",
+        "invalid-relation-kind",
+        "invalid-relation-topology",
+    ],
+)
+def test_expansion_retries_selector_rejected_contract_before_cache_or_return(
+    monkeypatch,
+    topic,
+    constraints,
+    joint_structures,
+) -> None:
+    raw = json.dumps(_selector_contract_payload(
+        topic,
+        constraints,
+        joint_structures=joint_structures,
+    ))
+    provider_calls = 0
+    cache_writes = []
+
+    def fake_raw(*_args, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        return raw
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
+    monkeypatch.setattr(expand, "_read_cached_expansion", lambda *_args: None)
+    monkeypatch.setattr(
+        expand,
+        "_write_cached_expansion",
+        lambda *args: cache_writes.append(args),
+    )
+
+    result = expand.expand_query_practice_fast(
+        topic,
+        1,
+        context=GenerationContext("fast"),
+    )
+
+    assert provider_calls == expand.PRACTICE_FAST_EXPAND_ATTEMPTS
+    assert cache_writes == []
+    assert result == expand.literal_fallback(topic, 1)
+
+
+@pytest.mark.parametrize(
+    ("topic", "constraints", "joint_structures"),
+    [
+        (
+            "Teach C, then test C.",
+            _repeated_c_constraints(0, 1),
+            [],
+        ),
+        (
+            "Compare alpha with beta.",
+            _comparison_constraints(),
+            _comparison_joint_structure(),
+        ),
+    ],
+    ids=["repeated-source-phrase", "joint-relationship"],
+)
+def test_expansion_accepts_selector_trusted_contract_in_one_call(
+    monkeypatch,
+    topic,
+    constraints,
+    joint_structures,
+) -> None:
+    raw = json.dumps(_selector_contract_payload(
+        topic,
+        constraints,
+        joint_structures=joint_structures,
+    ))
+    provider_calls = 0
+    cache_writes = []
+
+    def fake_raw(*_args, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        return raw
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
+    monkeypatch.setattr(expand, "_read_cached_expansion", lambda *_args: None)
+    monkeypatch.setattr(
+        expand,
+        "_write_cached_expansion",
+        lambda *args: cache_writes.append(args),
+    )
+
+    result = expand.expand_query_practice_fast(
+        topic,
+        1,
+        context=GenerationContext("fast"),
+    )
+
+    assert provider_calls == 1
+    assert result["provider_used"] == "gemini"
+    assert result["intent_contract"]["request_intent"]["constraints"] == constraints
+    assert (
+        result["intent_contract"]["request_intent"]["joint_structures"]
+        == joint_structures
+    )
+    assert expand._validated_selector_intent_contract(
+        result["intent_contract"]
+    ) == result["intent_contract"]
+    assert len(cache_writes) == 1
+    assert cache_writes[0][1] == result
+
+
+@pytest.mark.parametrize(
+    ("topic", "constraints", "joint_structures"),
+    [
+        (
+            "Explain Newton's second law F=ma with net force and acceleration.",
+            [
+                ("subject", "subject", "Newton's second law F=ma"),
+                ("force", "scope", "net force"),
+                ("acceleration", "scope", "acceleration"),
+            ],
+            [],
+        ),
+        (
+            "Compare glycolysis with the Krebs cycle during cellular respiration.",
+            [
+                ("subject", "subject", "cellular respiration"),
+                ("glycolysis", "scope", "glycolysis"),
+                ("krebs", "scope", "the Krebs cycle"),
+                (
+                    "compare",
+                    "relationship",
+                    "Compare glycolysis with the Krebs cycle",
+                ),
+            ],
+            [{
+                "member_constraint_ids": ["glycolysis", "krebs"],
+                "relation_constraint_id": "compare",
+            }],
+        ),
+        (
+            "Derive the chain rule and solve one composite-function example.",
+            [
+                ("subject", "subject", "chain rule"),
+                ("derive", "task", "Derive"),
+                ("example", "outcome", "solve one composite-function example"),
+            ],
+            [],
+        ),
+        (
+            "Explain quicksort partitioning and trace one recursive example.",
+            [
+                ("subject", "subject", "quicksort"),
+                ("partition", "scope", "partitioning"),
+                ("trace", "outcome", "trace one recursive example"),
+            ],
+            [],
+        ),
+        (
+            "Apply negligence duty, breach, causation, and damages to one fact pattern.",
+            [
+                ("subject", "subject", "negligence"),
+                ("duty", "scope", "duty"),
+                ("breach", "scope", "breach"),
+                ("causation", "scope", "causation"),
+                ("damages", "scope", "damages"),
+                ("apply", "outcome", "Apply"),
+            ],
+            [],
+        ),
+    ],
+    ids=["physics", "biology", "math", "software", "law"],
+)
+def test_expansion_preserves_atomic_cross_domain_request_contracts(
+    monkeypatch,
+    topic,
+    constraints,
+    joint_structures,
+) -> None:
+    constraint_ids = [constraint_id for constraint_id, _kind, _phrase in constraints]
+    payload = {
+        "corrected": topic.rstrip("."),
+        "intent_constraints": [
+            {
+                "constraint_id": constraint_id,
+                "kind": kind,
+                "source_phrase": source_phrase,
+                "source_occurrence": 0,
+                "requirement": f"Preserve {source_phrase}",
+            }
+            for constraint_id, kind, source_phrase in constraints
+        ],
+        "joint_structures": joint_structures,
+        "summary_preserved_constraint_ids": constraint_ids,
+        "queries": [{
+            "text": topic.rstrip("."),
+            "preserved_constraint_ids": constraint_ids,
+        }],
+    }
+    calls = 0
+
+    def fake_raw(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return json.dumps(payload)
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
+
+    result = expand.expand_query_practice_fast(topic, 1)
+
+    contract = result["intent_contract"]
+    assert calls == 1
+    assert contract["version"] == "expansion_intent_v1"
+    assert contract["request_intent"]["exact_request"] == topic
+    assert [
+        item["constraint_id"]
+        for item in contract["request_intent"]["constraints"]
+    ] == constraint_ids
+    assert contract["request_intent"]["joint_structures"] == joint_structures
+
+
+@pytest.mark.parametrize(
     ("topic", "corrected", "constraints", "queries"),
     [
         (
@@ -158,7 +528,7 @@ def test_practice_fast_expansion_requests_focused_sources() -> None:
             ),
             [
                 ("c1", "subject", "cellular respiration"),
-                ("c2", "task", "Teach ... for a beginner"),
+                ("c2", "task", "Teach"),
                 ("c3", "scope", "glycolysis"),
                 ("c4", "scope", "the Krebs cycle"),
                 ("c5", "scope", "oxidative phosphorylation"),
@@ -376,7 +746,7 @@ def test_practice_fast_expansion_keeps_broad_query_then_subject_grounded_focus(
 
     result = expand.expand_query_practice_fast("chain rule worked example", 3)
 
-    assert result == {
+    assert _without_intent_contract(result) == {
         "corrected": "chain rule worked example",
         "queries": [
             "chain rule worked example",
@@ -447,7 +817,7 @@ def test_practice_fast_expansion_collectively_targets_named_request_facets(monke
 
     result = expand.expand_query_practice_fast(topic, 3)
 
-    assert result == {
+    assert _without_intent_contract(result) == {
         "corrected": topic,
         "queries": [
             "Newton second law F=ma complete worked examples for every variable",
@@ -495,7 +865,7 @@ def test_practice_fast_expansion_uses_focused_queries_without_synthesizing_long_
             {
                 "constraint_id": "worked",
                 "kind": "outcome",
-                "source_phrase": "worked examples, and solving for each variable",
+                    "source_phrase": "worked examples",
                 "requirement": "Solve each variable in worked examples",
             },
         ],
@@ -524,7 +894,7 @@ def test_practice_fast_expansion_uses_focused_queries_without_synthesizing_long_
 
     result = expand.expand_query_practice_fast(topic, 3)
 
-    assert result == {
+    assert _without_intent_contract(result) == {
         "corrected": topic,
         "queries": [
             "Newton second law intuitive explanation and units",
@@ -550,7 +920,7 @@ def test_practice_fast_expansion_uses_all_slots_for_complete_focused_cover(
         ("second_law", "scope", "net force and F=ma"),
         ("free_body", "scope", "free-body diagrams"),
         ("third_law", "scope", "third-law action-reaction pairs"),
-        ("sequence", "format", "begin then then then and finish"),
+            ("sequence", "format", "begin with"),
         (
             "practice",
             "outcome",
@@ -597,7 +967,7 @@ def test_practice_fast_expansion_uses_all_slots_for_complete_focused_cover(
 
     result = expand.expand_query_practice_fast(topic, 3)
 
-    assert result == {
+    assert _without_intent_contract(result) == {
         "corrected": topic,
         "queries": [query["text"] for query in payload["queries"]],
         "provider_used": "gemini",
@@ -645,7 +1015,7 @@ def test_practice_fast_expansion_keeps_grounded_branches_when_slots_miss_one_fac
 
     result = expand.expand_query_practice_fast(topic, 3)
 
-    assert result == {
+    assert _without_intent_contract(result) == {
         "corrected": topic,
         "queries": [
             "physics force lesson",
@@ -774,7 +1144,7 @@ def test_practice_fast_expansion_finds_non_greedy_complete_facet_cover(monkeypat
 
     result = expand.expand_query_practice_fast(topic, 3)
 
-    assert result == {
+    assert _without_intent_contract(result) == {
         "corrected": topic,
         "queries": [
             "physics force mass acceleration and units",
@@ -822,7 +1192,7 @@ def test_practice_fast_expansion_keeps_partial_focus_beside_complete_broad_query
 
     result = expand.expand_query_practice_fast(topic, 3)
 
-    assert result == {
+    assert _without_intent_contract(result) == {
         "corrected": topic,
         "queries": [
             "physics force mass acceleration units overview",
@@ -913,7 +1283,7 @@ def test_practice_fast_expansion_requires_subject_and_accepts_focused_queries(
 
     result = expand.expand_query_practice_fast("chain rule worked example", 3)
 
-    assert result == expected
+    assert _without_intent_contract(result) == expected
 
 
 def test_practice_fast_expansion_trusts_grounded_ai_retrieval_branch_when_plan_is_sparse(
@@ -944,7 +1314,7 @@ def test_practice_fast_expansion_trusts_grounded_ai_retrieval_branch_when_plan_i
 
     result = expand.expand_query_practice_fast("chain rule worked example", 3)
 
-    assert result == {
+    assert _without_intent_contract(result) == {
         "corrected": "chain rule worked example",
         "queries": ["chain rule definition lecture"],
         "provider_used": "gemini",
@@ -977,7 +1347,7 @@ def test_practice_fast_expansion_rejects_ungrounded_ai_subject(monkeypatch):
 
     result = expand.expand_query_practice_fast("chain rule worked example", 3)
 
-    assert result == {
+    assert _without_intent_contract(result) == {
         "corrected": "chain rule worked example",
         "queries": ["chain rule worked example"],
         "provider_used": "literal_fallback",
@@ -1035,7 +1405,7 @@ def test_practice_fast_expansion_rejects_unbound_corrected_summary(
 
     result = expand.expand_query_practice_fast("chain rule worked example", 3)
 
-    assert result == {
+    assert _without_intent_contract(result) == {
         "corrected": "chain rule worked example",
         "queries": ["chain rule worked example"],
         "provider_used": "literal_fallback",
@@ -1133,7 +1503,7 @@ def test_practice_fast_expansion_never_falls_back_to_pro(monkeypatch):
     result = expand.expand_query_practice_fast("physics", 3)
 
     assert calls == ["gemini-3.1-flash-lite", "gemini-3.1-flash-lite"]
-    assert result == {
+    assert _without_intent_contract(result) == {
         "corrected": "physics",
         "queries": ["physics"],
         "provider_used": "literal_fallback",
@@ -1152,7 +1522,7 @@ def test_practice_fast_expansion_uses_literal_fallback_after_flash(monkeypatch):
     result = expand.expand_query_practice_fast("physics", 3)
 
     assert calls == ["gemini-3.1-flash-lite", "gemini-3.1-flash-lite"]
-    assert result == {
+    assert _without_intent_contract(result) == {
         "corrected": "physics",
         "queries": ["physics"],
         "provider_used": "literal_fallback",
@@ -1178,7 +1548,7 @@ def test_practice_fast_expansion_retries_failed_flash_step_once(monkeypatch):
     result = expand.expand_query_practice_fast("physics", 3)
 
     assert calls == 2
-    assert result == {
+    assert _without_intent_contract(result) == {
         "corrected": "Physics",
         "queries": ["Physics", "mechanics", "waves"],
         "provider_used": "gemini",
@@ -1204,7 +1574,7 @@ def test_practice_fast_expansion_does_not_retry_permanent_configuration(
     result = expand.expand_query_practice_fast("physics", 3)
 
     assert calls == 1
-    assert result == {
+    assert _without_intent_contract(result) == {
         "corrected": "physics",
         "queries": ["physics"],
         "provider_used": "literal_fallback",
@@ -1277,6 +1647,7 @@ def test_practice_fast_expansion_cache_outlives_segment_ttl_and_expires(monkeypa
             "version": expand.PRACTICE_FAST_EXPAND_CACHE_VERSION,
             "corrected": "Physics",
             "queries": ["physics lecture", "mechanics", "waves"],
+            "intent_contract": _intent_contract(),
         }),
         "created_at": (
             datetime.now(timezone.utc)
@@ -1333,6 +1704,53 @@ def test_practice_fast_expansion_cache_outlives_segment_ttl_and_expires(monkeypa
 
     assert refreshed["queries"] == ["Physics", "mechanics", "waves"]
     assert provider_calls == 1
+
+
+@pytest.mark.parametrize(
+    "intent_contract",
+    [
+        None,
+        {"version": "expansion_intent_v0", "request_intent": {}},
+        {
+            "version": "expansion_intent_v1",
+            "request_intent": {
+                "exact_request": "physics",
+                "constraints": [],
+                "joint_structures": [],
+            },
+        },
+        _selector_intent_contract(
+            "Teach C, then test C.",
+            _repeated_c_constraints(0, 0),
+        ),
+        _selector_intent_contract(
+            "Compare alpha with beta.",
+            _comparison_constraints(relation_phrase="Compare alpha"),
+            joint_structures=_comparison_joint_structure(),
+        ),
+    ],
+)
+def test_current_expansion_cache_rejects_missing_or_malformed_intent_contract(
+    monkeypatch,
+    intent_contract,
+) -> None:
+    row = {
+        "response_json": json.dumps({
+            "version": expand.PRACTICE_FAST_EXPAND_CACHE_VERSION,
+            "corrected": "Physics",
+            "queries": ["physics lecture"],
+            "intent_contract": intent_contract,
+        }),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    monkeypatch.setattr(
+        expand,
+        "get_conn",
+        lambda *args, **kwargs: nullcontext(object()),
+    )
+    monkeypatch.setattr(expand, "fetch_one", lambda *_args, **_kwargs: row)
+
+    assert expand._read_cached_expansion("cache-key", 3) is None
 
 
 def test_practice_fast_expansion_does_not_swallow_cancellation(monkeypatch):
@@ -1534,6 +1952,7 @@ def test_niche_bootstrap_backoff_removes_only_trailing_search_intent(topic, expe
 def test_deep_search_runs_only_ai_queries_without_broadening_selection(monkeypatch):
     topic = "chain-rule worked example"
     calls = []
+    intent_contract = _intent_contract(topic)
 
     def fake_search_all(queries, filters=None, **kwargs):
         calls.append((list(queries), kwargs.get("parallel_prefix")))
@@ -1562,6 +1981,7 @@ def test_deep_search_runs_only_ai_queries_without_broadening_selection(monkeypat
             "corrected": expansion_topic,
             "queries": [expansion_topic, "chain rule derivative example"],
             "provider_used": "gemini",
+            "intent_contract": intent_contract,
         }
 
     monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
@@ -1580,6 +2000,7 @@ def test_deep_search_runs_only_ai_queries_without_broadening_selection(monkeypat
     assert expansion_calls == [(topic, 3, None)]
     assert result["queries"] == [topic, "chain rule derivative example"]
     assert result["topic_terms"] == [topic]
+    assert result["intent_contract"] == intent_contract
 
 
 def test_deep_source_ranking_does_not_filter_by_learner_level(monkeypatch):

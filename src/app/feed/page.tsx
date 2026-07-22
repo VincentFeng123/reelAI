@@ -4610,7 +4610,7 @@ function FeedPageInner() {
               limit: 25,
               excludeReelIds,
               excludeVideoIds,
-              autofill: false,
+              autofill: true,
               prefetch: 0,
               generationMode,
               minRelevance: tuning.minRelevance,

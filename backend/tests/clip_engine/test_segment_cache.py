@@ -72,7 +72,7 @@ def _key(transcript: dict, settings: dict | None = None, *, topic: str = "physic
 def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> None:
     transcript = _transcript()
     baseline = _key(transcript)
-    assert baseline.startswith("clip-segmentation:quality_silence_v39:v37:")
+    assert baseline.startswith("clip-segmentation:quality_silence_v40:v38:")
 
     changed_text = deepcopy(transcript)
     changed_text["segments"][0]["text"] = "changed lesson"
@@ -127,6 +127,42 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
             "_segment_video_url": "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
         },
     ) != _key(transcript, grounded)
+
+    intent_contract = {
+        "version": "expansion_intent_v1",
+        "request_intent": {
+            "exact_request": "Explain force and mass",
+            "constraints": [{
+                "constraint_id": "force",
+                "kind": "subject",
+                "source_phrase": "force",
+                "source_occurrence": 0,
+                "requirement": "Explain force",
+            }],
+            "joint_structures": [],
+        },
+    }
+    contract_key = _key(
+        transcript,
+        {"_segment_intent_contract": intent_contract},
+    )
+    reordered_contract = {
+        "request_intent": intent_contract["request_intent"],
+        "version": intent_contract["version"],
+    }
+    assert contract_key != baseline
+    assert contract_key == _key(
+        transcript,
+        {"_segment_intent_contract": reordered_contract},
+    )
+    changed_contract = deepcopy(intent_contract)
+    changed_contract["request_intent"]["constraints"][0]["requirement"] = (
+        "Explain force precisely"
+    )
+    assert contract_key != _key(
+        transcript,
+        {"_segment_intent_contract": changed_contract},
+    )
 
     original_primary = segment_cache.pipeline_config.SEGMENT_FLASH_MODEL
     monkeypatch.setattr(segment_cache.pipeline_config, "SEGMENT_FLASH_MODEL", "new-model")

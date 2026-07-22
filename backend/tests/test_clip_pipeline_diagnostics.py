@@ -748,17 +748,34 @@ def test_mixed_provider_failures_do_not_block_a_valid_completed_source(
 
 def test_ingest_topic_uses_ai_intent_summary_for_segmentation(monkeypatch) -> None:
     captured_topics: list[str] = []
+    captured_contracts: list[dict | None] = []
+    intent_contract = {
+        "version": "expansion_intent_v1",
+        "request_intent": {
+            "exact_request": "calclus",
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": "calclus",
+                "source_occurrence": 0,
+                "requirement": "Learn calculus",
+            }],
+            "joint_structures": [],
+        },
+    }
     discovery = {
         "corrected": "Calculus",
         "provider_used": "gemini",
+        "intent_contract": intent_contract,
         "topic_terms": ["calclus", "Calculus"],
         "videos": [_video()],
         "credits_used": 0,
         "warning": None,
     }
 
-    def fake_clip(_url, *, topic, **_kwargs):
+    def fake_clip(_url, *, topic, **kwargs):
         captured_topics.append(topic)
+        captured_contracts.append(kwargs.get("intent_contract"))
         return {"clips": [], "transcript": _transcript(), "notes": ""}
 
     monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: discovery)
@@ -773,6 +790,7 @@ def test_ingest_topic_uses_ai_intent_summary_for_segmentation(monkeypatch) -> No
     )
 
     assert captured_topics == ["Calculus"]
+    assert captured_contracts == [intent_contract]
     assert discovery["videos"][0]["_literal_topic"] == "calclus"
 
 
@@ -6295,7 +6313,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
 ) -> None:
     strict_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v39",
+        "selection_contract_version": "quality_silence_v40",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -6305,7 +6323,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
     }
     transcript_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v39",
+        "selection_contract_version": "quality_silence_v40",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -6368,7 +6386,7 @@ def test_failed_boundary_storage_does_not_consume_ready_material_cap(
     deferred.append({
         "search_context_json": json.dumps({
             "surface_eligible": True,
-            "selection_contract_version": "quality_silence_v39",
+            "selection_contract_version": "quality_silence_v40",
             "speech_corridor_verified": True,
             "boundary_status": "verified",
             "boundary_diagnostics": {
@@ -7234,7 +7252,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v39"
+        assert context["selection_contract_version"] == "quality_silence_v40"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"
@@ -7542,6 +7560,20 @@ def test_clip_call_uses_one_medium_thinking_pro_selector_and_ignores_duration(
     monkeypatch,
 ) -> None:
     captured: dict = {}
+    intent_contract = {
+        "version": "expansion_intent_v1",
+        "request_intent": {
+            "exact_request": "Intro to Python",
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": "Python",
+                "source_occurrence": 0,
+                "requirement": "Learn Python",
+            }],
+            "joint_structures": [],
+        },
+    }
 
     def clip(_url, **kwargs):
         captured.update(kwargs["settings"])
@@ -7559,6 +7591,7 @@ def test_clip_call_uses_one_medium_thinking_pro_selector_and_ignores_duration(
         target_clip_duration_sec=40,
         target_clip_duration_min_sec=10,
         target_clip_duration_max_sec=55,
+        intent_contract=intent_contract,
     )
 
     fallback_gate = captured.get("_segment_pro_fallback_gate")
@@ -7567,6 +7600,7 @@ def test_clip_call_uses_one_medium_thinking_pro_selector_and_ignores_duration(
     assert captured["_segment_routing_mode"] == "pro_only"
     assert captured["_segment_thinking_level"] == "medium"
     assert captured["_segment_allow_flash_lite_failover"] is False
+    assert captured["_segment_intent_contract"] == intent_contract
     assert "_segment_target_sec" not in captured
     assert "_segment_target_min_sec" not in captured
     assert "_segment_target_max_sec" not in captured

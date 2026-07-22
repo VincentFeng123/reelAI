@@ -1244,9 +1244,9 @@ class ReelService:
     # v45: retain candidate, chain, position, and prerequisite organizer metadata.
     # v46: retain the trusted narrow clip concept for organizer input.
     # v47: treat legacy level-mismatch inventory as a soft ordering candidate.
-    # The separate contract key below invalidates prior inventory under v39.
-    RANKED_FEED_CACHE_VERSION = 47
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v39"
+    # The separate contract key below invalidates prior inventory under v40.
+    RANKED_FEED_CACHE_VERSION = 48
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v40"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
         "quality_silence_v4",
@@ -1284,6 +1284,7 @@ class ReelService:
         "quality_silence_v37",
         "quality_silence_v38",
         "quality_silence_v39",
+        "quality_silence_v40",
     })
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
@@ -2557,6 +2558,7 @@ class ReelService:
                 "quality_silence_v37",
                 "quality_silence_v38",
                 "quality_silence_v39",
+                "quality_silence_v40",
             }
             for reel in generated
         ):
@@ -6364,6 +6366,7 @@ class ReelService:
                 "quality_silence_v37",
                 "quality_silence_v38",
                 "quality_silence_v39",
+                "quality_silence_v40",
             },
         )
         metadata["_selection_substantive"] = selection_bool(
@@ -6405,6 +6408,7 @@ class ReelService:
                 "quality_silence_v37",
                 "quality_silence_v38",
                 "quality_silence_v39",
+                "quality_silence_v40",
             },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
@@ -8038,6 +8042,7 @@ class ReelService:
                             "quality_silence_v37",
                             "quality_silence_v38",
                             "quality_silence_v39",
+                            "quality_silence_v40",
                         }
                         and selection_metadata.get(
                             "_selection_speech_corridor_verified"
@@ -8088,6 +8093,7 @@ class ReelService:
                     "quality_silence_v37",
                     "quality_silence_v38",
                     "quality_silence_v39",
+                    "quality_silence_v40",
                 } and (
                     (
                         min(
@@ -8136,6 +8142,7 @@ class ReelService:
                             "quality_silence_v37",
                             "quality_silence_v38",
                             "quality_silence_v39",
+                            "quality_silence_v40",
                         }
                         else self._selection_number(
                             selection_metadata.get("_selection_topic_relevance"), 0.0
@@ -8564,6 +8571,7 @@ class ReelService:
                 "quality_silence_v37",
                 "quality_silence_v38",
                 "quality_silence_v39",
+                "quality_silence_v40",
             }:
                 # V5+ captions must be immutable selection-time evidence. A
                 # provider artifact key identifies a retrieval profile and may
@@ -8616,6 +8624,7 @@ class ReelService:
                         "quality_silence_v37",
                         "quality_silence_v38",
                         "quality_silence_v39",
+                        "quality_silence_v40",
                     }
                     or transcript_artifact_key
                     else str(clean_item.get("transcript_snippet") or "")

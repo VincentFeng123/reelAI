@@ -29,6 +29,11 @@ def _source_start(value: object) -> int | None:
     return value if 0 <= value <= 1_000_000 else None
 
 
+def _identity_source_phrase(value: object) -> str:
+    """Normalize an optional request-delimiting comma for stable identity."""
+    return _clean_text(value, 160).removesuffix(",")
+
+
 def intent_obligation_key(
     source_phrase: object,
     source_start: object = 0,
@@ -38,7 +43,9 @@ def intent_obligation_key(
     # and identifiers such as C/c may name different requested concepts. The
     # character offset distinguishes repeated phrases without depending on the
     # model's enum choice or requirement wording.
-    phrase = _clean_text(source_phrase, 160)
+    # Gemini may copy or omit a comma that only delimits this same positioned
+    # phrase in the request. Internal punctuation remains identity-bearing.
+    phrase = _identity_source_phrase(source_phrase)
     start = _source_start(source_start)
     if not phrase or start is None:
         return ""

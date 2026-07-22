@@ -50,7 +50,7 @@ def _strict_boundary_context(
     return {
         "selection_candidate_id": candidate_id,
         "surface_eligible": surface,
-        "selection_contract_version": "quality_silence_v39",
+        "selection_contract_version": "quality_silence_v40",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -75,7 +75,7 @@ def _transcript_boundary_context(
     return {
         "selection_candidate_id": candidate_id,
         "surface_eligible": surface,
-        "selection_contract_version": "quality_silence_v39",
+        "selection_contract_version": "quality_silence_v40",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -1032,7 +1032,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "search_context": {
                     "selection_candidate_id": candidate_id,
                     "surface_eligible": True,
-                    "selection_contract_version": "quality_silence_v39",
+                    "selection_contract_version": "quality_silence_v40",
                     "speech_corridor_verified": True,
                     "boundary_status": "verified",
                     "boundary_diagnostics": {
@@ -1227,7 +1227,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
             )
         context = json.loads(row["search_context_json"])
         self.assertEqual(
-            context["selection_contract_version"], "quality_silence_v39"
+            context["selection_contract_version"], "quality_silence_v40"
         )
         self.assertEqual(context["boundary_status"], "context_aligned")
 

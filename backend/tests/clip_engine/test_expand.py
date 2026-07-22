@@ -134,11 +134,14 @@ def test_practice_fast_healthy_expansion_has_one_call_and_no_retry_wait(
     result = expand.expand_query_practice_fast("physics", 1)
 
     assert calls == 1
+    intent_contract = result.pop("intent_contract")
     assert result == {
         "corrected": "Physics",
         "queries": ["physics explained"],
         "provider_used": "gemini",
     }
+    assert intent_contract["version"] == "expansion_intent_v1"
+    assert intent_contract["request_intent"]["exact_request"] == "physics"
 
 
 @pytest.mark.parametrize(

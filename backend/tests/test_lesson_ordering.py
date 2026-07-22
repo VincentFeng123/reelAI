@@ -66,20 +66,19 @@ def _generation_result(
     model: str | None = None,
     terminal_summary_start_reel_id: str | None = None,
     prior_restatement_reel_ids: list[str] | None = None,
+    current_restatement_reel_ids: list[str] | None = None,
 ) -> gemini_client.GenerationResult:
+    payload = {
+        "ordered_reel_ids": ordered_ids,
+        "assessment_checkpoint_reel_ids": checkpoint_ids or [],
+        "prior_restatement_reel_ids": prior_restatement_reel_ids or [],
+        "terminal_summary_start_reel_id": terminal_summary_start_reel_id,
+    }
+    payload["current_restatement_reel_ids"] = (
+        current_restatement_reel_ids or []
+    )
     return gemini_client.GenerationResult(
-        text=json.dumps(
-            {
-                "ordered_reel_ids": ordered_ids,
-                "assessment_checkpoint_reel_ids": checkpoint_ids or [],
-                "prior_restatement_reel_ids": (
-                    prior_restatement_reel_ids or []
-                ),
-                "terminal_summary_start_reel_id": (
-                    terminal_summary_start_reel_id
-                ),
-            }
-        ),
+        text=json.dumps(payload),
         telemetry=gemini_client.GeminiCallTelemetry(
             model=model or config.LESSON_ORDER_MODEL,
             operation="ordering",
@@ -94,6 +93,163 @@ def _generation_result(
             total_tokens=140,
         ),
     )
+
+
+def test_required_unseen_clip_dominates_optional_cross_source_strict_restatement(
+    monkeypatch,
+) -> None:
+    rich_obligation = _obligation(
+        "resource cleanup",
+        "Explain unconditional cleanup and its resource-management use",
+    )
+    grouped_obligation = _obligation(
+        "try except else finally",
+        "Use try, except, else, and finally blocks",
+    )
+    reels = [
+        _reel(
+            "rich-required",
+            video_id="rich-source",
+            start=0,
+            concept="finally cleanup",
+            transcript_snippet=(
+                "The finally block always executes after success or failure, so use it "
+                "to close files, database connections, and other resources."
+            ),
+            _selection_intent_obligations=[rich_obligation],
+        ),
+        _reel(
+            "strict-subset",
+            video_id="different-source",
+            start=0,
+            concept="always executes",
+            transcript_snippet="The finally block always executes whether an exception happens or not.",
+            _selection_intent_obligations=[grouped_obligation],
+        ),
+        _reel(
+            "new-application",
+            video_id="application-source",
+            start=0,
+            concept="transaction rollback application",
+            transcript_snippet=(
+                "A transaction handler rolls back after an exception and records the failed operation."
+            ),
+        ),
+    ]
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(
+            ["rich-required", "new-application"],
+            current_restatement_reel_ids=["strict-subset"],
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="Teach exception handling and a transaction application.",
+        required_reel_ids=["rich-required"],
+    )
+
+    assert result.ordered_reel_ids == ["rich-required", "new-application"]
+    assert result.current_restatement_reel_ids == ["strict-subset"]
+
+
+def test_removed_selected_dominator_clears_current_restatement_declaration(
+    monkeypatch,
+) -> None:
+    obligation = _obligation("cleanup", "Teach cleanup")
+    reels = [
+        _reel(
+            "kept",
+            video_id="same-source",
+            start=0,
+            concept="different cleanup explanation",
+            t_end=100,
+            transcript_snippet="A different cleanup explanation.",
+            _selection_intent_obligations=[obligation],
+        ),
+        _reel(
+            "dominator",
+            video_id="same-source",
+            start=0,
+            concept="finally cleanup",
+            t_end=90,
+            transcript_snippet="Finally always runs and closes files.",
+            _selection_intent_obligations=[obligation],
+        ),
+        _reel(
+            "subset",
+            video_id="other-source",
+            start=0,
+            concept="finally always runs",
+            transcript_snippet="Finally always runs.",
+            _selection_intent_obligations=[obligation],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(
+            ["kept", "dominator"],
+            current_restatement_reel_ids=["subset"],
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(reels, topic="Teach cleanup.")
+
+    assert result.ordered_reel_ids == ["kept"]
+    assert result.current_restatement_reel_ids == []
+
+
+def test_compact_organizer_transcript_represents_beginning_middle_and_end() -> None:
+    transcript = " ".join(
+        [
+            "BEGIN_SENTINEL introduces the governing concept.",
+            "context " * 260,
+            "MIDDLE_SENTINEL teaches an independently repeated mechanism.",
+            "context " * 260,
+            "END_SENTINEL completes the application and result.",
+        ]
+    )
+    prompt = lesson_ordering._user_prompt(
+        [
+            _reel(
+                "long-clip",
+                video_id="long-source",
+                start=0,
+                concept="long lesson",
+                transcript_snippet=transcript,
+            )
+        ],
+        topic="Teach the long lesson.",
+        learner_level="beginner",
+        release_limit=1,
+    )
+
+    assert "BEGIN_SENTINEL" in prompt
+    assert "MIDDLE_SENTINEL" in prompt
+    assert "END_SENTINEL" in prompt
+    clip = lesson_ordering._clip_payload(
+        _reel(
+            "long-clip",
+            video_id="long-source",
+            start=0,
+            concept="long lesson",
+            transcript_snippet=transcript,
+        )
+    )
+    compact = lesson_ordering._compact_clip_payload(
+        [clip],
+        concept_text_limit=96,
+        semantic_text_limit=96,
+    )
+    transcript_position = compact["columns"].index("transcript_excerpt")
+    compact_excerpt = compact["clips"][0][transcript_position]
+    assert "BEGIN_SENTINEL" in compact_excerpt
+    assert "independently repea" in compact_excerpt
+    assert "application and result" in compact_excerpt
 
 
 def _obligation(
@@ -203,6 +359,7 @@ def test_locally_repairable_model_plan_keeps_ai_subset_without_retry(
         ordered_ids,
         checkpoint_ids,
         prior_restatement_ids,
+        current_restatement_ids,
         terminal_summary_start_reel_id,
         model_used,
     ) -> None:
@@ -210,6 +367,7 @@ def test_locally_repairable_model_plan_keeps_ai_subset_without_retry(
             "ordered_ids": list(ordered_ids),
             "checkpoint_ids": list(checkpoint_ids),
             "prior_restatement_ids": list(prior_restatement_ids),
+            "current_restatement_ids": list(current_restatement_ids),
             "terminal_summary_start_reel_id": terminal_summary_start_reel_id,
             "model_used": model_used,
         })
@@ -283,6 +441,7 @@ def test_locally_repairable_model_plan_keeps_ai_subset_without_retry(
     assert cached["ordered_ids"] == result.ordered_reel_ids
     assert cached["checkpoint_ids"] == result.assessment_checkpoint_reel_ids
     assert cached["prior_restatement_ids"] == []
+    assert cached["current_restatement_ids"] == []
     assert lesson_ordering._valid_selected_order(
         cached["ordered_ids"],
         [reel["reel_id"] for reel in reels],
@@ -539,7 +698,7 @@ def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_
 
     assert payload["concept_title"] == "How force and mass change acceleration"
     assert payload["concept_family"] == "force-mass-acceleration proportionality"
-    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v13"
+    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v14"
     assert "semantic restatements" in lesson_ordering._SYSTEM_PROMPT
     assert "concept, then explanation, then application or worked example" in (
         lesson_ordering._SYSTEM_PROMPT
@@ -941,6 +1100,7 @@ def test_small_batch_keeps_the_full_object_prompt_byte_for_byte() -> None:
         "subset, preserve prerequisites and same-source chronology, and return only "
         "{\"ordered_reel_ids\":[...],\"assessment_checkpoint_reel_ids\":[...],"
         "\"prior_restatement_reel_ids\":[...],"
+        "\"current_restatement_reel_ids\":[...],"
         "\"terminal_summary_start_reel_id\":null} "
         "with no other text or fields."
     )
@@ -1374,6 +1534,7 @@ def test_max_candidate_subset_dispatches_once_with_sufficient_output_budget(
             "ordered_reel_ids": reel_ids,
             "assessment_checkpoint_reel_ids": reel_ids,
             "prior_restatement_reel_ids": [],
+            "current_restatement_reel_ids": [],
             "terminal_summary_start_reel_id": reel_ids[-1],
         },
         separators=(",", ":"),
@@ -2022,6 +2183,7 @@ def test_identityless_prior_history_restatement_declaration_is_repaired(
                 "ordered_reel_ids": ["selected"],
                 "assessment_checkpoint_reel_ids": [],
                 "prior_restatement_reel_ids": ["unknown"],
+                "current_restatement_reel_ids": [],
                 "terminal_summary_start_reel_id": None,
             },
             "invalid_model_order",
@@ -2031,6 +2193,7 @@ def test_identityless_prior_history_restatement_declaration_is_repaired(
                 "ordered_reel_ids": ["selected"],
                 "assessment_checkpoint_reel_ids": [],
                 "prior_restatement_reel_ids": ["repeat", "repeat"],
+                "current_restatement_reel_ids": [],
                 "terminal_summary_start_reel_id": None,
             },
             "invalid_model_order",
@@ -2040,13 +2203,34 @@ def test_identityless_prior_history_restatement_declaration_is_repaired(
                 "ordered_reel_ids": ["selected"],
                 "assessment_checkpoint_reel_ids": [],
                 "prior_restatement_reel_ids": ["selected"],
+                "current_restatement_reel_ids": [],
+                "terminal_summary_start_reel_id": None,
+            },
+            "invalid_model_order",
+        ),
+        (
+            {
+                "ordered_reel_ids": ["selected"],
+                "assessment_checkpoint_reel_ids": [],
+                "prior_restatement_reel_ids": [],
+                "current_restatement_reel_ids": ["unknown"],
+                "terminal_summary_start_reel_id": None,
+            },
+            "invalid_model_order",
+        ),
+        (
+            {
+                "ordered_reel_ids": ["selected"],
+                "assessment_checkpoint_reel_ids": [],
+                "prior_restatement_reel_ids": [],
+                "current_restatement_reel_ids": ["selected"],
                 "terminal_summary_start_reel_id": None,
             },
             "invalid_model_order",
         ),
     ],
 )
-def test_prior_restatement_contract_retries_missing_shape_and_repairs_ids(
+def test_restatement_contract_retries_missing_shape_and_repairs_ids(
     monkeypatch,
     payload: dict[str, Any],
     expected_reason: str,
@@ -2091,6 +2275,7 @@ def test_prior_restatement_contract_retries_missing_shape_and_repairs_ids(
             if payload.get("prior_restatement_reel_ids") == ["repeat", "repeat"]
             else []
         )
+        assert result.current_restatement_reel_ids == []
 
 
 def test_remediation_override_removes_readded_candidate_from_restatement_declaration(
@@ -4135,12 +4320,18 @@ def test_cache_read_observes_cancellation_before_return(monkeypatch) -> None:
         )
 
 
-def test_lesson_order_cache_round_trips_validated_prior_restatements(
+def test_lesson_order_cache_round_trips_validated_restatements(
     monkeypatch,
 ) -> None:
     reels = [
         _reel("selected", video_id="selected", start=0, concept="new reasoning"),
         _reel("repeat", video_id="repeat", start=0, concept="prior restatement"),
+        _reel(
+            "current-subset",
+            video_id="current-subset",
+            start=0,
+            concept="current strict subset",
+        ),
     ]
     stored: dict[str, Any] = {}
 
@@ -4167,6 +4358,7 @@ def test_lesson_order_cache_round_trips_validated_prior_restatements(
         ordered_ids=["selected"],
         checkpoint_ids=[],
         prior_restatement_ids=["repeat"],
+        current_restatement_ids=["current-subset"],
         terminal_summary_start_reel_id=None,
         model_used=config.LESSON_ORDER_MODEL,
     )
@@ -4182,7 +4374,7 @@ def test_lesson_order_cache_round_trips_validated_prior_restatements(
     cached = _REAL_READ_CACHED_LESSON_ORDER(
         "cache-key",
         original=reels,
-        reel_ids=["selected", "repeat"],
+        reel_ids=["selected", "repeat", "current-subset"],
         generation_context=None,
         has_prior_objective_evidence=True,
         release_limit=2,
@@ -4191,13 +4383,14 @@ def test_lesson_order_cache_round_trips_validated_prior_restatements(
     assert cached is not None
     assert cached.ordered_reel_ids == ["selected"]
     assert cached.prior_restatement_reel_ids == ["repeat"]
+    assert cached.current_restatement_reel_ids == ["current-subset"]
     response_payload = json.loads(stored["response_json"])
-    assert response_payload["prompt_version"] == "lesson_order_v13"
-    assert response_payload["cache_version"] == 11
+    assert response_payload["prompt_version"] == "lesson_order_v14"
+    assert response_payload["cache_version"] == 12
     assert _REAL_READ_CACHED_LESSON_ORDER(
         "cache-key",
         original=reels,
-        reel_ids=["selected", "repeat"],
+        reel_ids=["selected", "repeat", "current-subset"],
         generation_context=None,
         has_prior_objective_evidence=False,
         release_limit=2,
@@ -4210,20 +4403,108 @@ def test_lesson_order_cache_round_trips_validated_prior_restatements(
     missing = dict(response_payload)
     missing.pop("prior_restatement_reel_ids")
     invalid_payloads.append(missing)
+    missing_current = dict(response_payload)
+    missing_current.pop("current_restatement_reel_ids")
+    invalid_payloads.append(missing_current)
     for invalid_ids in (["unknown"], ["repeat", "repeat"], ["selected"]):
         invalid = dict(response_payload)
         invalid["prior_restatement_reel_ids"] = invalid_ids
+        invalid_payloads.append(invalid)
+    for invalid_ids in (
+        ["unknown"],
+        ["current-subset", "current-subset"],
+        ["selected"],
+        ["repeat"],
+    ):
+        invalid = dict(response_payload)
+        invalid["current_restatement_reel_ids"] = invalid_ids
         invalid_payloads.append(invalid)
     for invalid in invalid_payloads:
         stored["response_json"] = json.dumps(invalid)
         assert _REAL_READ_CACHED_LESSON_ORDER(
             "cache-key",
             original=reels,
-            reel_ids=["selected", "repeat"],
+            reel_ids=["selected", "repeat", "current-subset"],
             generation_context=None,
             has_prior_objective_evidence=True,
             release_limit=2,
         ) is None
+
+
+def test_cache_overlap_repair_clears_current_restatement_declaration(
+    monkeypatch,
+) -> None:
+    reels = [
+        _reel(
+            "kept",
+            video_id="same-source",
+            start=0,
+            concept="different cleanup explanation",
+            t_end=100,
+        ),
+        _reel(
+            "dominator",
+            video_id="same-source",
+            start=0,
+            concept="finally cleanup",
+            t_end=90,
+        ),
+        _reel(
+            "subset",
+            video_id="other-source",
+            start=0,
+            concept="finally always runs",
+        ),
+    ]
+    stored: dict[str, Any] = {}
+
+    class ConnectionContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "get_conn",
+        lambda **_kwargs: ConnectionContext(),
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "upsert",
+        lambda _conn, _table, values, **_kwargs: stored.update(values),
+    )
+    _REAL_WRITE_CACHED_LESSON_ORDER(
+        "cache-key",
+        ordered_ids=["kept", "dominator"],
+        checkpoint_ids=[],
+        prior_restatement_ids=[],
+        current_restatement_ids=["subset"],
+        terminal_summary_start_reel_id=None,
+        model_used=config.LESSON_ORDER_MODEL,
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "fetch_one",
+        lambda *_args, **_kwargs: {
+            "response_json": stored["response_json"],
+            "created_at": stored["created_at"],
+        },
+    )
+
+    cached = _REAL_READ_CACHED_LESSON_ORDER(
+        "cache-key",
+        original=reels,
+        reel_ids=["kept", "dominator", "subset"],
+        generation_context=None,
+        has_prior_objective_evidence=False,
+        release_limit=3,
+    )
+
+    assert cached is not None
+    assert cached.ordered_reel_ids == ["kept"]
+    assert cached.current_restatement_reel_ids == []
 
 
 def test_lesson_order_cache_round_trip_preserves_overlapping_required_reels(

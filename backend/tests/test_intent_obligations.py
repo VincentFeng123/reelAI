@@ -28,6 +28,26 @@ def test_obligation_identity_ignores_enum_and_requirement_rewording() -> None:
     assert intent_obligation_key("C", 8) != intent_obligation_key("C", 24)
 
 
+def test_obligation_identity_ignores_only_a_terminal_request_comma() -> None:
+    phrase = "causation (including proximate cause)"
+
+    assert intent_obligation_key(phrase, 55) == intent_obligation_key(
+        f"{phrase},",
+        55,
+    )
+    assert intent_obligation_key(phrase, 55) != intent_obligation_key(
+        f"{phrase},",
+        56,
+    )
+    assert intent_obligation_key(
+        "causation, including proximate cause",
+        55,
+    ) != intent_obligation_key(
+        "causation including proximate cause",
+        55,
+    )
+
+
 def test_obligation_round_trip_preserves_compatibility_math_identity() -> None:
     complex_numbers = intent_obligation(
         kind="subject",

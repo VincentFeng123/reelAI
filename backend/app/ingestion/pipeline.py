@@ -273,6 +273,7 @@ def _run_clip(
     target_clip_duration_sec: int | None = None,
     target_clip_duration_min_sec: int | None = None,
     target_clip_duration_max_sec: int | None = None,
+    intent_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     settings: dict[str, Any] = {
         "language": language,
@@ -281,6 +282,8 @@ def _run_clip(
     }
     if knowledge_level:
         settings["_knowledge_level"] = str(knowledge_level).strip().lower()
+    if isinstance(intent_contract, dict):
+        settings["_segment_intent_contract"] = dict(intent_contract)
     if candidate_rank is not None:
         settings["_segment_candidate_rank"] = int(candidate_rank)
     if max_clips is not None:
@@ -874,7 +877,7 @@ def _boundary_evidence_grade(
     if (
         not isinstance(context, dict)
         or str(context.get("selection_contract_version") or "").strip()
-        != "quality_silence_v39"
+        != "quality_silence_v40"
     ):
         return 0
     if (
@@ -3889,7 +3892,7 @@ def _verified_direct_adapter_clips(
         search_context.update(
             **_concept_family_search_context(clip),
             **_intent_obligation_search_context(clip),
-            selection_contract_version="quality_silence_v39",
+            selection_contract_version="quality_silence_v40",
             **(
                 {"selection_authority": "gemini"}
                 if gemini_authoritative
@@ -4703,6 +4706,16 @@ class IngestionPipeline:
         query_plan = disc.get("query_plan")
         if not isinstance(query_plan, SearchQueryPlan):
             query_plan = None
+        intent_contract = (
+            dict(disc["intent_contract"])
+            if isinstance(disc.get("intent_contract"), dict)
+            else None
+        )
+        selection_topic = (
+            str(disc.get("corrected") or query)
+            if str(disc.get("provider_used") or "").casefold() == "gemini"
+            else query
+        )
 
         _search_warning = disc.get("warning")
         if _search_warning:
@@ -4724,8 +4737,9 @@ class IngestionPipeline:
                     source_duration="any",
                 )
                 engine_out = _run_clip(
-                    v["url"], topic=query, language=language,
+                    v["url"], topic=selection_topic, language=language,
                     should_cancel=should_cancel,
+                    intent_contract=intent_contract,
                 )
                 eligible_clips = _strict_topic_clips(
                     list(engine_out["clips"]),
@@ -4955,6 +4969,11 @@ class IngestionPipeline:
                 if term
             )
         topic_terms = list(dict.fromkeys(topic_terms))
+        intent_contract = (
+            dict(disc["intent_contract"])
+            if isinstance(disc.get("intent_contract"), dict)
+            else None
+        )
         for source_rank, discovered_video in enumerate(disc["videos"]):
             discovered_video["_retrieval_profile"] = retrieval_profile
             discovered_video["_knowledge_level"] = knowledge_level
@@ -4969,6 +4988,8 @@ class IngestionPipeline:
                 if str(disc.get("provider_used") or "").casefold() == "gemini"
                 else topic
             )
+            if intent_contract is not None:
+                discovered_video["_segment_intent_contract"] = intent_contract
             discovered_video["_search_context"] = _retrieval_search_context(
                 requested_topic=authoritative_topic,
                 corrected_topic=corrected_topic,
@@ -6375,6 +6396,11 @@ class IngestionPipeline:
                 target_clip_duration_max_sec=v.get(
                     "_target_clip_duration_max_sec"
                 ),
+                intent_contract=(
+                    v.get("_segment_intent_contract")
+                    if isinstance(v.get("_segment_intent_contract"), dict)
+                    else None
+                ),
             )
         transcript = engine_out["transcript"]
         query_plan = (
@@ -6619,7 +6645,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v39",
+                    selection_contract_version="quality_silence_v40",
                     **_intent_obligation_search_context(clip),
                     content_score=content_score,
                     quality_floor=quality_floor,

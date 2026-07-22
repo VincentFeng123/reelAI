@@ -913,7 +913,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertEqual(len(feed), 2)
         self.assertTrue(all(
-            reel.get("selection_contract_version") == "quality_silence_v39"
+            reel.get("selection_contract_version") == "quality_silence_v40"
             for reel in feed
         ))
 
@@ -1400,10 +1400,10 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
     def test_cache_version_includes_recall_and_stored_details(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 47)
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 48)
         self.assertEqual(
             main_module.reel_service.RANKED_FEED_CACHE_CONTRACT_VERSION,
-            "quality_silence_v39",
+            "quality_silence_v40",
         )
         self.assertIn(
             "quality_silence_v27",

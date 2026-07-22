@@ -43,15 +43,43 @@ PRACTICE_FAST_EXPAND_MODEL = "gemini-3.1-flash-lite"
 PRACTICE_FAST_EXPAND_TIMEOUT_MS = 10_000
 PRACTICE_FAST_EXPAND_OUTPUT_TOKENS = 2_048
 PRACTICE_FAST_EXPAND_ATTEMPTS = 2
-PRACTICE_FAST_EXPAND_CACHE_VERSION = 11
+PRACTICE_FAST_EXPAND_CACHE_VERSION = 12
+PRACTICE_FAST_INTENT_CONTRACT_VERSION = "expansion_intent_v1"
 # An expansion can be nearly one segment-cache lifetime old when it discovers a
 # newly analyzed source. Keeping it for two lifetimes guarantees that source's
 # subsequent valid segment-cache lifetime never triggers another expansion call.
 PRACTICE_FAST_EXPAND_CACHE_TTL_SEC = 2 * SEGMENT_CACHE_TTL_SEC
 
 
+def _require_source_occurrence_schema(schema: dict[str, object]) -> None:
+    """Keep old fixtures readable while requiring positioned live output."""
+    required = schema.setdefault("required", [])
+    if isinstance(required, list) and "source_occurrence" not in required:
+        required.append("source_occurrence")
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        field_schema = properties.get("source_occurrence")
+        if isinstance(field_schema, dict):
+            field_schema.pop("default", None)
+
+
+def _require_joint_structures_schema(schema: dict[str, object]) -> None:
+    """Require the relationship graph in Gemini output, including an empty list."""
+    required = schema.setdefault("required", [])
+    if isinstance(required, list) and "joint_structures" not in required:
+        required.append("joint_structures")
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        field_schema = properties.get("joint_structures")
+        if isinstance(field_schema, dict):
+            field_schema.pop("default", None)
+
+
 class _PracticeFastIntentConstraint(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra=_require_source_occurrence_schema,
+    )
 
     constraint_id: str = Field(min_length=1, max_length=32)
     kind: Literal[
@@ -63,7 +91,23 @@ class _PracticeFastIntentConstraint(BaseModel):
         "outcome",
     ]
     source_phrase: str = Field(min_length=1, max_length=160)
+    source_occurrence: int = Field(default=0, ge=0, strict=True)
     requirement: str = Field(min_length=1, max_length=240)
+
+
+class _PracticeFastJointStructure(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    member_constraint_ids: list[str] = Field(min_length=2, max_length=16)
+    relation_constraint_id: str = Field(min_length=1, max_length=32)
+
+    @model_validator(mode="after")
+    def _unique_members(self):
+        if len(self.member_constraint_ids) != len(set(self.member_constraint_ids)):
+            raise ValueError("joint member constraint ids must be unique")
+        if self.relation_constraint_id in self.member_constraint_ids:
+            raise ValueError("joint relation id cannot also be a member id")
+        return self
 
 
 class _PracticeFastQuery(BaseModel):
@@ -74,7 +118,10 @@ class _PracticeFastQuery(BaseModel):
 
 
 class _PracticeFastExpansion(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra=_require_joint_structures_schema,
+    )
 
     corrected: str = Field(
         min_length=1,
@@ -87,6 +134,10 @@ class _PracticeFastExpansion(BaseModel):
     intent_constraints: list[_PracticeFastIntentConstraint] = Field(
         min_length=1,
         max_length=16,
+    )
+    joint_structures: list[_PracticeFastJointStructure] = Field(
+        default_factory=list,
+        max_length=8,
     )
     summary_preserved_constraint_ids: list[str] = Field(
         min_length=1,
@@ -103,7 +154,92 @@ class _PracticeFastExpansion(BaseModel):
         ids = [constraint.constraint_id for constraint in self.intent_constraints]
         if len(set(ids)) != len(ids):
             raise ValueError("intent constraint ids must be unique")
+        id_set = set(ids)
+        if any(
+            structure.relation_constraint_id not in id_set
+            or any(
+                member_id not in id_set
+                for member_id in structure.member_constraint_ids
+            )
+            for structure in self.joint_structures
+        ):
+            raise ValueError("joint structures must reference declared constraint ids")
+        structure_keys = [
+            (
+                tuple(structure.member_constraint_ids),
+                structure.relation_constraint_id,
+            )
+            for structure in self.joint_structures
+        ]
+        if len(structure_keys) != len(set(structure_keys)):
+            raise ValueError("joint structures must be unique")
         return self
+
+
+class _PracticeFastRequestIntent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    exact_request: str = Field(min_length=1)
+    constraints: list[_PracticeFastIntentConstraint] = Field(
+        min_length=1,
+        max_length=16,
+    )
+    joint_structures: list[_PracticeFastJointStructure] = Field(
+        default_factory=list,
+        max_length=8,
+    )
+
+    @model_validator(mode="after")
+    def _valid_references(self):
+        ids = [constraint.constraint_id for constraint in self.constraints]
+        if len(ids) != len(set(ids)):
+            raise ValueError("intent constraint ids must be unique")
+        id_set = set(ids)
+        if any(
+            structure.relation_constraint_id not in id_set
+            or any(
+                member_id not in id_set
+                for member_id in structure.member_constraint_ids
+            )
+            for structure in self.joint_structures
+        ):
+            raise ValueError("joint structures must reference declared constraint ids")
+        structure_keys = [
+            (
+                tuple(structure.member_constraint_ids),
+                structure.relation_constraint_id,
+            )
+            for structure in self.joint_structures
+        ]
+        if len(structure_keys) != len(set(structure_keys)):
+            raise ValueError("joint structures must be unique")
+        return self
+
+
+class _PracticeFastIntentContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal["expansion_intent_v1"]
+    request_intent: _PracticeFastRequestIntent
+
+
+def _validated_selector_intent_contract(
+    raw_contract: object,
+) -> dict[str, object] | None:
+    """Use the clip selector's exact structural trust gate as the authority."""
+    if not isinstance(raw_contract, dict):
+        return None
+    from ...pipeline.gemini_segment import _trusted_request_intent_from_settings
+
+    trusted = _trusted_request_intent_from_settings({
+        "_segment_intent_contract": raw_contract,
+    })
+    if trusted is None:
+        return None
+    return {
+        "version": PRACTICE_FAST_INTENT_CONTRACT_VERSION,
+        "request_intent": trusted.model_dump(mode="json"),
+    }
 
 
 _PRACTICE_FAST_SYSTEM = """You compress a user's learning request and expand it into a diverse set of
@@ -130,26 +266,32 @@ Do this:
    Give every named subject, requested operation or task, requested relationship, scope qualifier,
    requested format, and requested outcome its own constraint and label its kind. Give every named
    member of a list its own separate constraint; the schema supports sixteen. Copy the exact words
-   that introduced each constraint into source_phrase. Do not collapse a requested task or facet
+   that introduced each constraint into source_phrase and return its zero-based
+   source_occurrence in the exact request. Use zero unless the identical phrase appears earlier.
+   Do not collapse a requested task or facet
    into the subject. SUBJECT means the governing named topic, law, concept, or object; components
    and named list members under that governing topic are SCOPE constraints. For
    "Explain Newton's second law F=ma with net force, mass, acceleration, units, and solving for
    each variable," Newton's second law F=ma is SUBJECT,
    Explain is TASK, net force, mass, acceleration, and units are four separate SCOPE constraints,
    and solving for each variable is OUTCOME.
-7. For corrected, return summary_preserved_constraint_ids containing exactly every intent
+7. Return joint_structures=[] when no explicit comparison, contrast, transition, or ordered
+   relationship is requested. Otherwise return one item per relationship: member_constraint_ids
+   names its separately declared sides or stages and relation_constraint_id names its separately
+   declared relationship constraint. Never bundle named members merely to make this graph.
+8. For corrected, return summary_preserved_constraint_ids containing exactly every intent
    constraint ID that corrected preserves. corrected must preserve all of them. List each ID
    exactly once, with no omissions, duplicates, or unknown IDs; if any requirement is absent,
    revise corrected before returning it.
-8. The first broad query must preserve every constraint. Every later focused query must preserve
+9. The first broad query must preserve every constraint. Every later focused query must preserve
    every subject constraint plus one or more distinct task, relationship, scope, format, or outcome
    constraints. Collectively target every named facet or list member; when the request says each,
    every, or all, give distinct members focused coverage where N permits.
-9. For every query, return exactly the IDs of the constraints it preserves. Synonyms and natural
+10. For every query, return exactly the IDs of the constraints it preserves. Synonyms and natural
    YouTube wording are welcome, but focused queries must not lose the governing subject or drift
    into an adjacent field.
 
-Return only the requested JSON object with corrected, intent_constraints,
+Return only the requested JSON object with corrected, intent_constraints, joint_structures,
 summary_preserved_constraint_ids, and queries. corrected is the downstream learning intent; keep
 it separate from the retrieval queries. Return N optimized search queries; do not automatically
 spend one query on the raw literal wording."""
@@ -225,10 +367,22 @@ def _read_cached_expansion(cache_key: str, count: int) -> dict | None:
     queries = _normalize(raw_queries, count)
     if not corrected or not queries:
         return None
+    trusted_contract = _validated_selector_intent_contract(
+        payload.get("intent_contract")
+    )
+    if trusted_contract is None:
+        return None
+    try:
+        intent_contract = _PracticeFastIntentContract.model_validate(
+            trusted_contract
+        ).model_dump(mode="json")
+    except (TypeError, ValueError):
+        return None
     return {
         "corrected": corrected,
         "queries": queries,
         "provider_used": "gemini",
+        "intent_contract": intent_contract,
     }
 
 
@@ -245,6 +399,7 @@ def _write_cached_expansion(cache_key: str, result: dict) -> None:
                             "version": PRACTICE_FAST_EXPAND_CACHE_VERSION,
                             "corrected": result["corrected"],
                             "queries": result["queries"],
+                            "intent_contract": result["intent_contract"],
                         }
                     ),
                     "created_at": now_iso(),
@@ -520,8 +675,8 @@ async def _practice_fast_gemini_raw_async(
     level_line = f"\nViewer level: {level_text}" if level_text else ""
     user = (
         f"User topic: {topic!r}\nN = {max(1, int(n))}{level_line}\n"
-        "Return corrected, intent_constraints, summary_preserved_constraint_ids, "
-        "and queries as JSON."
+        "Return corrected, intent_constraints, joint_structures, "
+        "summary_preserved_constraint_ids, and queries as JSON."
     )
     reservation: dict[str, object] = {}
     try:
@@ -732,10 +887,30 @@ def expand_query_practice_fast(
                         "contract"
                     )
                 raise_if_cancelled(should_cancel)
+                intent_contract_model = _PracticeFastIntentContract(
+                    version=PRACTICE_FAST_INTENT_CONTRACT_VERSION,
+                    request_intent=_PracticeFastRequestIntent(
+                        exact_request=topic,
+                        constraints=list(parsed.intent_constraints),
+                        joint_structures=list(parsed.joint_structures),
+                    ),
+                )
+                intent_contract = _validated_selector_intent_contract(
+                    intent_contract_model.model_dump(
+                        mode="json",
+                        exclude_unset=True,
+                    )
+                )
+                if intent_contract is None:
+                    raise ValueError(
+                        "Gemini returned an intent contract rejected by the "
+                        "clip selector"
+                    )
                 result = {
                     "corrected": corrected,
                     "queries": queries,
                     "provider_used": "gemini",
+                    "intent_contract": intent_contract,
                 }
                 if cache_key:
                     _write_cached_expansion(cache_key, result)

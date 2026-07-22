@@ -26,6 +26,27 @@ def _settle_mock_dispatch(kwargs: dict, telemetry: object) -> None:
     )
 
 
+def _settle_mock_dispatches(kwargs: dict, count: int) -> dict:
+    telemetry = {
+        "model": kwargs["model"],
+        "operation": kwargs["operation"],
+        "prompt_tokens": 500,
+        "candidate_tokens": 50,
+        "thought_tokens": 25,
+    }
+    for attempt in range(1, count + 1):
+        ticket = kwargs["before_dispatch"](
+            model=kwargs["model"], attempt=attempt,
+        )
+        kwargs["after_dispatch"](
+            ticket,
+            model=kwargs["model"],
+            attempt=attempt,
+            telemetry=telemetry,
+        )
+    return telemetry
+
+
 def _proposal(*, end_line: int = 0) -> gemini_segment._BoundaryTopic:
     return gemini_segment._BoundaryTopic(
         candidate_id="photosynthesis-core",
@@ -12070,7 +12091,7 @@ def test_boundary_prompt_requires_cross_domain_subject_anchoring_and_context() -
     assert "part b is not whole merely because its local arithmetic reaches an answer" in (
         normalized
     )
-    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v23"
+    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v24"
 
 
 @pytest.mark.parametrize(
@@ -13786,7 +13807,8 @@ def test_pro_boundary_audit_retries_one_schema_failure(
         nonlocal attempted
         attempted += 1
         assert kwargs["operation"] == "pro_boundary_audit"
-        assert kwargs["max_retries"] == 1
+        assert kwargs["max_retries"] == (2 if attempted == 1 else 1)
+        assert kwargs["use_full_transient_retry_budget"] is True
         assert kwargs.get("retry_status_codes") is None
         telemetry = {
             "model": "gemini-3.1-pro-preview",
@@ -13847,6 +13869,125 @@ def test_pro_boundary_audit_retries_one_schema_failure(
         None if retry_recovers else True
     )
     assert rejections == []
+
+
+def test_pro_boundary_audit_schema_recovery_cannot_compose_past_three_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Bayes' theorem"
+    claim = (
+        "Bayes' theorem updates a prior probability using the likelihood"
+    )
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="Bayes' theorem updates a prior probability",
+        end_quote="using the likelihood of the observed evidence",
+        claim_quote=claim,
+    )
+    segments = [{
+        "cue_id": "cue-0",
+        "start": 0.0,
+        "end": 8.0,
+        "text": (
+            "Bayes' theorem updates a prior probability using the likelihood of "
+            "the observed evidence."
+        ),
+    }]
+    configured_retries: list[int] = []
+    provider_dispatches = 0
+
+    def exhausted_transport_then_invalid_schema(
+        _system, _user, _schema, **kwargs,
+    ):
+        nonlocal provider_dispatches
+        configured_retries.append(kwargs["max_retries"])
+        dispatch_count = kwargs["max_retries"] + 1
+        provider_dispatches += dispatch_count
+        telemetry = _settle_mock_dispatches(kwargs, dispatch_count)
+        return SimpleNamespace(text="{}", telemetry=telemetry)
+
+    monkeypatch.setattr(
+        gemini_client,
+        "generate_json_v3",
+        exhausted_transport_then_invalid_schema,
+    )
+    retained, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert retained == plan
+    assert rejections == []
+    assert configured_retries == [2]
+    assert provider_dispatches == 3
+    assert [call["physical_dispatches"] for call in calls] == [3]
+    assert calls[0]["structured_retry_exhausted"] is True
+
+
+def test_pro_boundary_audit_recursive_contract_recovery_shares_dispatch_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Newton's second law F=ma"
+    claim = "net force equals mass times acceleration"
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="Newton's second law says",
+        end_quote="mass times acceleration",
+        claim_quote=claim,
+    )
+    segments = [{
+        "cue_id": "cue-0",
+        "start": 0.0,
+        "end": 8.0,
+        "text": (
+            "Newton's second law says net force equals mass times acceleration."
+        ),
+    }]
+    invalid_contract = gemini_segment._ProCandidateAuditPlan(items=[])
+    configured_retries: list[int] = []
+    provider_dispatches = 0
+
+    def contract_then_schema_failure(_system, _user, _schema, **kwargs):
+        nonlocal provider_dispatches
+        configured_retries.append(kwargs["max_retries"])
+        dispatch_count = 2 if len(configured_retries) == 1 else 1
+        provider_dispatches += dispatch_count
+        telemetry = _settle_mock_dispatches(kwargs, dispatch_count)
+        return SimpleNamespace(
+            text=(
+                invalid_contract.model_dump_json(by_alias=True)
+                if len(configured_retries) == 1
+                else "{}"
+            ),
+            telemetry=telemetry,
+        )
+
+    monkeypatch.setattr(
+        gemini_client,
+        "generate_json_v3",
+        contract_then_schema_failure,
+    )
+    retained, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert retained == plan
+    assert rejections == []
+    assert configured_retries == [2, 0]
+    assert provider_dispatches == 3
+    assert [call["physical_dispatches"] for call in calls] == [2, 1]
+    assert calls[0]["contract_retry_attempt"] == 1
+    assert calls[1]["contract_retry_attempt"] == 2
+    assert calls[1]["structured_retry_exhausted"] is True
 
 
 def test_pro_boundary_audit_can_repair_beyond_two_coarse_cues(
@@ -25053,4 +25194,314 @@ def test_trusted_evidence_anchoring_is_stable_under_appended_duplicates() -> Non
         appended_clip["start_cue_id"],
         appended_clip["end_cue_id"],
         appended_clip["_clip_text"],
+    )
+
+
+def _af169_intent_contract() -> dict:
+    return {
+        "version": "expansion_intent_v1",
+        "request_intent": {
+            "exact_request": "Teach glycolysis and the Krebs cycle.",
+            "constraints": [
+                {
+                    "constraint_id": "task",
+                    "kind": "task",
+                    "source_phrase": "Teach",
+                    "source_occurrence": 0,
+                    "requirement": "Teach the requested stages",
+                },
+                {
+                    "constraint_id": "glycolysis",
+                    "kind": "subject",
+                    "source_phrase": "glycolysis",
+                    "source_occurrence": 0,
+                    "requirement": "Teach glycolysis",
+                },
+                {
+                    "constraint_id": "krebs",
+                    "kind": "scope",
+                    "source_phrase": "the Krebs cycle",
+                    "source_occurrence": 0,
+                    "requirement": "Teach the Krebs cycle",
+                },
+            ],
+            "joint_structures": [],
+        },
+    }
+
+
+def test_bound_selector_uses_upstream_intent_and_topics_only_response() -> None:
+    settings = {"_segment_intent_contract": _af169_intent_contract()}
+    request_intent = gemini_segment._trusted_request_intent_from_settings(settings)
+
+    assert request_intent is not None
+    _system, user = gemini_segment._boundary_prompts(
+        "[0] 00:00 Glycolysis begins cellular respiration.",
+        1,
+        "Cellular respiration stages: glycolysis and Krebs cycle",
+        request_intent=request_intent,
+    )
+    normalized = " ".join(user.split())
+    assert "Authoritative upstream request_intent (immutable)" in normalized
+    assert "Do not reinterpret, rename, merge, split, reorder, omit, or add" in normalized
+    assert "Return only the object {topics}" in normalized
+    assert "Return only the object {request_intent, topics}" not in normalized
+    assert "Interpret the exact request before selecting anything" not in normalized
+
+    schema = gemini_segment._ContractBoundCompactBoundaryPlan.model_json_schema()
+    assert set(schema["required"]) == {"topics"}
+    parsed, rejections = gemini_segment._validate_model_response(
+        gemini_segment._ContractBoundCompactBoundaryPlan,
+        json.dumps({"topics": []}),
+    )
+    assert isinstance(parsed, gemini_segment._ContractBoundCompactBoundaryPlan)
+    assert rejections == []
+
+
+@pytest.mark.parametrize(
+    "contract",
+    [
+        {"version": "expansion_intent_v0", "request_intent": {}},
+        {
+            "version": "expansion_intent_v1",
+            "request_intent": {
+                "exact_request": "Teach glycolysis.",
+                "constraints": [{
+                    "constraint_id": "subject",
+                    "kind": "subject",
+                    "source_phrase": "not copied from the request",
+                    "source_occurrence": 0,
+                    "requirement": "Teach glycolysis",
+                }],
+                "joint_structures": [],
+            },
+        },
+    ],
+)
+def test_invalid_upstream_intent_contract_is_contractless(contract) -> None:
+    assert gemini_segment._trusted_request_intent_from_settings({
+        "_segment_intent_contract": contract,
+    }) is None
+
+
+def test_bound_selector_keeps_healthy_provider_call_count_unchanged(monkeypatch) -> None:
+    schemas: list[type] = []
+
+    def fake_call(_system, _user, schema, **_kwargs):
+        schemas.append(schema)
+        return schema(topics=[]), {"operation": "pro_fallback"}
+
+    monkeypatch.setattr(gemini_segment, "_call_model", fake_call)
+    report, classification, calls = gemini_segment._run_selection_profile(
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        {
+            "segments": [{
+                "cue_id": "cue-0",
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Glycolysis begins cellular respiration.",
+            }],
+            "words": [],
+        },
+        "Cellular respiration stages: glycolysis and Krebs cycle",
+        {"_segment_intent_contract": _af169_intent_contract()},
+        deadline=time.monotonic() + 120.0,
+        cancelled=lambda: False,
+    )
+
+    assert schemas == [gemini_segment._ContractBoundCompactBoundaryPlan]
+    assert len(calls) == 1
+    assert report.clips == []
+    assert classification.status == "invalid"
+
+
+def test_invalid_upstream_contract_preserves_same_call_interpretation(monkeypatch) -> None:
+    topic = "Cellular respiration stages"
+    schemas: list[type] = []
+
+    def fake_call(_system, _user, schema, **_kwargs):
+        schemas.append(schema)
+        return gemini_segment._CompactBoundaryPlan(
+            request_intent={
+                "exact_request": topic,
+                "constraints": [{
+                    "constraint_id": "subject",
+                    "kind": "subject",
+                    "source_phrase": topic,
+                    "source_occurrence": 0,
+                    "requirement": f"Teach {topic}",
+                }],
+                "joint_structures": [],
+            },
+            topics=[],
+        ), {"operation": "pro_fallback"}
+
+    monkeypatch.setattr(gemini_segment, "_call_model", fake_call)
+    _report, _classification, calls = gemini_segment._run_selection_profile(
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        {
+            "segments": [{
+                "cue_id": "cue-0",
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Glycolysis begins cellular respiration.",
+            }],
+            "words": [],
+        },
+        topic,
+        {"_segment_intent_contract": {"version": "unknown"}},
+        deadline=time.monotonic() + 120.0,
+        cancelled=lambda: False,
+    )
+
+    assert schemas == [gemini_segment._CompactBoundaryPlan]
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("evidence", "reason"),
+    [
+        (
+            [{"id": "unknown", "q": "Cells use chlorophyll to capture light energy"}],
+            "intent_evidence_unknown_id",
+        ),
+        (
+            [
+                {"id": "subject", "q": "Cells use chlorophyll to capture light energy"},
+                {"id": "subject", "q": "capture light energy and power the chemical reactions"},
+            ],
+            "intent_evidence_duplicate_id",
+        ),
+    ],
+)
+def test_live_selector_rejects_unknown_or_duplicate_upstream_evidence_ids(
+    evidence,
+    reason,
+) -> None:
+    plan = _compact_plan(
+        exact_request="photosynthesis",
+        constraints=[{
+            "constraint_id": "subject",
+            "kind": "subject",
+            "source_phrase": "photosynthesis",
+            "source_occurrence": 0,
+            "requirement": "Teach photosynthesis",
+        }],
+        evidence=evidence,
+    )
+
+    result = gemini_segment._validate_live_pro_selector_contract(
+        plan,
+        "photosynthesis",
+    )
+
+    assert result.plan.topics == []
+    assert any(reason in rejection for rejection in result.candidate_rejections)
+
+
+def test_bound_audit_treats_upstream_ids_as_authoritative() -> None:
+    request_intent = gemini_segment._trusted_request_intent_from_settings({
+        "_segment_intent_contract": _af169_intent_contract(),
+    })
+    assert request_intent is not None
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent=request_intent,
+        topics=[],
+    )
+    _system, user, _allowed = gemini_segment._pro_boundary_audit_prompts(
+        plan,
+        [{
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "Glycolysis begins cellular respiration.",
+        }],
+        "Cellular respiration stages",
+        intent_authoritative=True,
+    )
+
+    assert "Selection topic summary (TOPIC): Cellular respiration stages" in user
+    assert "Exact original user request: Teach glycolysis and the Krebs cycle." in user
+    assert "constraints below are authoritative and immutable" in user
+    assert "navigation aids, not authority" not in user
+
+
+def test_obligation_source_identity_uses_original_request_not_corrected_summary() -> None:
+    exact_request = "Teach C, then test C."
+    evidence_quote = "This lesson teaches how C is tested"
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": exact_request,
+            "constraints": [
+                {
+                    "constraint_id": "subject",
+                    "kind": "subject",
+                    "source_phrase": "C",
+                    "source_occurrence": 0,
+                    "requirement": "Teach C",
+                },
+                {
+                    "constraint_id": "outcome",
+                    "kind": "outcome",
+                    "source_phrase": "C",
+                    "source_occurrence": 1,
+                    "requirement": "Test C",
+                },
+            ],
+            "joint_structures": [],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="test-c",
+            start_line=0,
+            end_line=0,
+            start_quote="This lesson teaches",
+            end_quote="in a complete example.",
+            claim_quote=evidence_quote,
+            title="Testing C",
+            learning_objective="Explain how C is tested",
+            facet="C testing",
+            concept_family="C testing",
+            concept_aliases=[],
+            informativeness=0.9,
+            topic_relevance=0.9,
+            educational_importance=0.9,
+            difficulty=0.4,
+            directly_teaches_topic=False,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[{
+                "id": "outcome",
+                "q": evidence_quote,
+            }],
+        )],
+    )
+    segments = [{
+        "cue_id": "cue-0",
+        "start": 0.0,
+        "end": 7.0,
+        "text": f"{evidence_quote} in a complete example.",
+    }]
+
+    first = gemini_segment._trusted_universal_compact_plan_to_report(
+        plan,
+        segments,
+        "C testing",
+    )
+    second = gemini_segment._trusted_universal_compact_plan_to_report(
+        plan,
+        segments,
+        "Testing C in context",
+    )
+
+    assert first.accepted_count == second.accepted_count == 1
+    first_obligations = first.clips[0]["intent_obligations"]
+    second_obligations = second.clips[0]["intent_obligations"]
+    assert first_obligations == second_obligations
+    assert first_obligations[0]["source_phrase"] == "C"
+    assert first_obligations[0]["source_start"] == exact_request.rindex("C")
+    assert first_obligations[0]["key"] == intent_obligation_key(
+        "C",
+        exact_request.rindex("C"),
     )

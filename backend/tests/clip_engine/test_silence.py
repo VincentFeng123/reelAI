@@ -147,7 +147,7 @@ def test_previous_context_aligned_contract_remains_viewable() -> None:
 
 def test_current_strict_boundary_is_bound_to_persisted_range() -> None:
     context = {
-        "selection_contract_version": "quality_silence_v39",
+        "selection_contract_version": "quality_silence_v40",
         "boundary_status": "verified",
         "boundary_diagnostics": {
             "acoustic_verified": True,

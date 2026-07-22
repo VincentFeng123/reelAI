@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
@@ -204,7 +205,7 @@ def test_pro_selector_and_boundary_audit_recover_one_transient_failure(
     ] == [504, 429]
 
 
-def test_boundary_audit_late_transient_gets_one_physical_retry(
+def test_boundary_audit_late_transients_get_three_physical_attempts(
     monkeypatch,
 ) -> None:
     plan = _newton_plan()
@@ -225,6 +226,8 @@ def test_boundary_audit_late_transient_gets_one_physical_retry(
             if len(self.calls) == 1:
                 clock["now"] = 119.0
                 raise _RetryHTTPError(504)
+            if len(self.calls) == 2:
+                raise TimeoutError("audit transport timed out")
             return _RetryResponse(audit.model_dump_json(by_alias=True))
 
     fake = TimedAuditClient()
@@ -275,14 +278,15 @@ def test_boundary_audit_late_transient_gets_one_physical_retry(
         "newton-second-law"
     ]
     assert rejections == []
-    assert len(fake.calls) == 2
+    assert len(fake.calls) == 3
     assert [
         call["config"].http_options.timeout for call in fake.calls
-    ] == [60_000, 60_000]
+    ] == [60_000, 60_000, 58_000]
     assert len(calls) == 1
-    assert calls[0]["retries"] == 1
-    assert calls[0]["physical_dispatches"] == 2
+    assert calls[0]["retries"] == 2
+    assert calls[0]["physical_dispatches"] == 3
     assert calls[0]["error_history"][0]["provider_status_code"] == 504
+    assert calls[0]["error_history"][1]["provider_error_type"] == "TimeoutError"
     assert context.budget.snapshot()["gemini"]["boundary_audit_calls"] == 1
 
 
@@ -962,3 +966,19 @@ def test_retry_waits_for_physical_capacity_then_dispatches_exactly_once(
     assert final_budget["selector_calls"] == 1
     assert final_budget["inflight_reserved_cost_usd"] == 0.0
     assert final_budget["cost_exposure_usd"] <= final_budget["cost_limit_usd"]
+
+
+def test_bound_selector_topics_only_payload_reduces_output_contract() -> None:
+    full_plan = _newton_plan()
+    bound_plan = gemini_segment._ContractBoundCompactBoundaryPlan(
+        topics=list(full_plan.topics),
+    )
+
+    full_payload = full_plan.model_dump_json(by_alias=True)
+    bound_payload = bound_plan.model_dump_json(by_alias=True)
+
+    assert len(bound_payload) < len(full_payload)
+    assert "request_intent" not in bound_payload
+    assert json.loads(bound_payload) == {
+        "topics": json.loads(full_payload)["topics"],
+    }

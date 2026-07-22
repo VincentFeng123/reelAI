@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import parseaddr
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any, Callable, Literal
 from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
@@ -436,7 +436,7 @@ LESSON_ORDER_CANDIDATE_LIMITS = {
     for mode, source_budget in GENERATION_SOURCE_BUDGETS.items()
 }
 SOURCE_ANALYSIS_MAX_ATTEMPTS = 2
-SELECTION_CONTRACT_VERSION = "quality_silence_v39"
+SELECTION_CONTRACT_VERSION = "quality_silence_v40"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -3485,7 +3485,12 @@ def _merge_selection_ordered_reel_lists(
         merged.append(reel)
 
 
-def _response_generation_ids(conn, generation_id: str | None) -> list[str]:
+def _response_generation_ids(
+    conn,
+    generation_id: str | None,
+    *,
+    generation_rows_out: dict[str, dict[str, Any]] | None = None,
+) -> list[str]:
     if not generation_id:
         return []
 
@@ -3500,6 +3505,8 @@ def _response_generation_ids(conn, generation_id: str | None) -> list[str]:
         if not generation_row:
             ordered.append(current_generation_id)
             return
+        if generation_rows_out is not None:
+            generation_rows_out[current_generation_id] = generation_row
         source_generation_id = str(generation_row.get("source_generation_id") or "").strip()
         if source_generation_id:
             collect(source_generation_id)
@@ -3507,6 +3514,64 @@ def _response_generation_ids(conn, generation_id: str | None) -> list[str]:
 
     collect(generation_id)
     return ordered
+
+
+def _same_adaptation_current_restatement_policy(
+    generation_rows: Mapping[str, Mapping[str, Any]],
+    generation_ids: Iterable[str],
+    *,
+    adaptation_fingerprint: object,
+) -> tuple[set[str], set[str]]:
+    """Return exact organizer omissions and their selected availability guards."""
+    fingerprint = str(adaptation_fingerprint or "").strip()
+    if not fingerprint:
+        return set(), set()
+    restatement_ids: set[str] = set()
+    guard_ids: set[str] = set()
+    for generation_id in generation_ids:
+        row = generation_rows.get(str(generation_id or "").strip())
+        if not isinstance(row, Mapping):
+            continue
+        metadata = _parse_generation_lesson_order_metadata(
+            row.get("lesson_order_json"),
+            generation_id=str(generation_id or "").strip(),
+        )
+        if (
+            not isinstance(metadata, dict)
+            or str(metadata.get("adaptation_fingerprint") or "").strip()
+            != fingerprint
+        ):
+            continue
+        raw_ids = metadata.get("current_restatement_reel_ids")
+        raw_guards = metadata.get("current_restatement_guard_reel_ids")
+        if not isinstance(raw_ids, list) or not isinstance(raw_guards, list):
+            continue
+        normalized = [
+            value.strip() if isinstance(value, str) else ""
+            for value in raw_ids
+        ]
+        normalized_guards = [
+            value.strip() if isinstance(value, str) else ""
+            for value in raw_guards
+        ]
+        if (
+            any(not reel_id for reel_id in normalized)
+            or len(set(normalized)) != len(normalized)
+            or not normalized_guards
+            or any(not reel_id for reel_id in normalized_guards)
+            or len(set(normalized_guards)) != len(normalized_guards)
+            or not set(normalized).isdisjoint(normalized_guards)
+        ):
+            logger.warning(
+                "Ignoring invalid current restatements generation_id=%s",
+                generation_id,
+            )
+            continue
+        restatement_ids.update(normalized)
+        guard_ids.update(normalized_guards)
+    if not restatement_ids or not guard_ids:
+        return set(), set()
+    return restatement_ids, guard_ids
 
 
 def _generation_chain_rows_snapshot(
@@ -4283,6 +4348,16 @@ def _generation_chain_meets_source_budget(
     )
 
 
+def _canonical_excluded_video_id_set(values: object) -> set[str]:
+    if not isinstance(values, (list, tuple, set)):
+        return set()
+    return {
+        video_id
+        for value in values
+        if (video_id := _bare_video_id(str(value or "")))
+    }
+
+
 def _latest_compatible_generation_job(
     conn,
     *,
@@ -4317,9 +4392,9 @@ def _latest_compatible_generation_job(
         """,
         query_params,
     )
-    expected_exclusions = sorted(_normalize_excluded_video_ids(
-        request_params.get("exclude_video_ids") or []
-    ))
+    expected_exclusions = _canonical_excluded_video_id_set(
+        request_params.get("exclude_video_ids")
+    )
     expected_relevance = _normalize_min_relevance(request_params.get("min_relevance"))
     expected_adaptation_fingerprint = str(
         request_params.get("adaptation_fingerprint")
@@ -4345,9 +4420,9 @@ def _latest_compatible_generation_job(
             != str(request_params.get("language") or "en").strip().lower()
             or str(prior_params.get("adaptation_fingerprint") or "")
             != expected_adaptation_fingerprint
-            or sorted(_normalize_excluded_video_ids(
-                prior_params.get("exclude_video_ids") or []
-            )) != expected_exclusions
+            or _canonical_excluded_video_id_set(
+                prior_params.get("exclude_video_ids")
+            ) != expected_exclusions
             or _normalize_min_relevance(prior_params.get("min_relevance"))
             != expected_relevance
         ):
@@ -4365,8 +4440,11 @@ def _verified_cross_request_source_generation(
     concept_id: str | None,
     content_fingerprint: str,
     request_params: dict[str, Any],
+    matched_request_params_out: dict[str, Any] | None = None,
 ) -> str | None:
     """Return compatible other-mode inventory only when its whole chain is verified."""
+    if matched_request_params_out is not None:
+        matched_request_params_out.clear()
     concept_clause = "AND concept_id IS NULL"
     candidate_params: tuple[Any, ...] = (
         material_id,
@@ -4395,17 +4473,13 @@ def _verified_cross_request_source_generation(
         """,
         candidate_params,
     )
-    expected_exclusions = sorted(
-        _normalize_excluded_video_ids(request_params.get("exclude_video_ids") or [])
+    expected_exclusions = _canonical_excluded_video_id_set(
+        request_params.get("exclude_video_ids")
     )
     expected_relevance = _normalize_min_relevance(
         request_params.get("min_relevance")
     )
-    expected_adaptation_fingerprint = str(
-        request_params.get("adaptation_fingerprint")
-        or GENERATION_EMPTY_ADAPTATION_FINGERPRINT
-    )
-    cross_relevance_fallback: str | None = None
+    cross_relevance_fallback: tuple[str, dict[str, Any]] | None = None
     for row in candidates:
         try:
             prior_params = json.loads(str(row.get("request_params_json") or "{}"))
@@ -4416,8 +4490,6 @@ def _verified_cross_request_source_generation(
         if (
             str(prior_params.get("request_schema_version") or "")
             != GENERATION_REQUEST_SCHEMA_VERSION
-            or str(prior_params.get("adaptation_fingerprint") or "")
-            != expected_adaptation_fingerprint
             or bool(prior_params.get("creative_commons_only"))
             != bool(request_params.get("creative_commons_only"))
             or _normalize_preferred_video_duration(
@@ -4428,10 +4500,9 @@ def _verified_cross_request_source_generation(
             )
             or str(prior_params.get("language") or "en").strip().lower()
             != str(request_params.get("language") or "en").strip().lower()
-            or sorted(_normalize_excluded_video_ids(
-                prior_params.get("exclude_video_ids") or []
-            ))
-            != expected_exclusions
+            or not _canonical_excluded_video_id_set(
+                prior_params.get("exclude_video_ids")
+            ).issubset(expected_exclusions)
         ):
             continue
         generation_id = str(row.get("result_generation_id") or "").strip()
@@ -4446,10 +4517,17 @@ def _verified_cross_request_source_generation(
                 _normalize_min_relevance(prior_params.get("min_relevance"))
                 == expected_relevance
             ):
+                if matched_request_params_out is not None:
+                    matched_request_params_out.update(prior_params)
                 return generation_id
             if cross_relevance_fallback is None:
-                cross_relevance_fallback = generation_id
-    return cross_relevance_fallback
+                cross_relevance_fallback = (generation_id, prior_params)
+    if cross_relevance_fallback is None:
+        return None
+    generation_id, prior_params = cross_relevance_fallback
+    if matched_request_params_out is not None:
+        matched_request_params_out.update(prior_params)
+    return generation_id
 
 
 def _cancel_stale_active_adaptation_jobs(
@@ -4603,6 +4681,7 @@ def _ranked_request_reels(
     released_only: bool = False,
     preserve_lesson_order_metadata: bool = False,
     apply_generation_lesson_order: bool = True,
+    seen_reel_ids_out: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     try:
         material_row = fetch_one(conn, "SELECT subject_tag, source_type FROM materials WHERE id = ?", (material_id,))
@@ -4742,6 +4821,8 @@ def _ranked_request_reels(
         material_id=material_id,
         learner_id=learner_id,
     )
+    if seen_reel_ids_out is not None:
+        seen_reel_ids_out.update(seen_reel_ids)
     if seen_reel_ids:
         ranked = [
             reel
@@ -5173,6 +5254,8 @@ def _generation_job_reels(
     apply_release_order: bool = True,
     preserve_lesson_order_metadata: bool = False,
     prior_unseen_reels_out: list[dict[str, Any]] | None = None,
+    editorial_excluded_reel_ids: Iterable[str] = (),
+    editorial_guard_reel_ids: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
     generation_id = str(job_row.get("result_generation_id") or "").strip()
     if not generation_id:
@@ -5183,6 +5266,17 @@ def _generation_job_reels(
         conn,
         continuation_token,
     )
+    editorial_excluded_ids = list(dict.fromkeys(
+        reel_id
+        for value in editorial_excluded_reel_ids
+        if (reel_id := str(value or "").strip())
+    ))
+    editorial_guard_ids = {
+        reel_id
+        for value in editorial_guard_reel_ids
+        if (reel_id := str(value or "").strip())
+    }
+    seen_reel_ids: set[str] = set()
     mode = "fast" if str(params.get("generation_mode") or "slow") == "fast" else "slow"
     requested = max(
         1,
@@ -5237,6 +5331,11 @@ def _generation_job_reels(
         released_only=released_only,
         preserve_lesson_order_metadata=preserve_lesson_order_metadata,
         apply_generation_lesson_order=apply_release_order,
+        **(
+            {"seen_reel_ids_out": seen_reel_ids}
+            if editorial_excluded_ids and editorial_guard_ids
+            else {}
+        ),
     )
     internal_reels = [
         _public_generation_reel(
@@ -5246,6 +5345,23 @@ def _generation_job_reels(
         for reel in ranked
     ]
     valid_reels = _current_selection_contract_reels(internal_reels)
+    available_guard_ids = {
+        str(reel.get("reel_id") or "").strip()
+        for reel in valid_reels
+        if str(reel.get("reel_id") or "").strip()
+    } | set(delivered_reel_ids) | seen_reel_ids
+    if (
+        editorial_excluded_ids
+        and editorial_guard_ids
+        and editorial_guard_ids.issubset(available_guard_ids)
+    ):
+        editorial_excluded_id_set = set(editorial_excluded_ids)
+        valid_reels = [
+            reel
+            for reel in valid_reels
+            if str(reel.get("reel_id") or "").strip()
+            not in editorial_excluded_id_set
+        ]
     if prior_unseen_reels_out is not None and delivered_reel_ids:
         delivered_reel_id_set = set(delivered_reel_ids)
         prior_unseen_reels_out.extend(
@@ -5311,6 +5427,8 @@ def _current_level_reusable_generation_reel_count(
     learner_id: str,
     request_params: dict[str, Any],
     requested: int,
+    editorial_excluded_reel_ids: Iterable[str] = (),
+    editorial_guard_reel_ids: Iterable[str] = (),
 ) -> int:
     """Count reusable source-chain inventory up to the startup target."""
     if not generation_id:
@@ -5330,6 +5448,8 @@ def _current_level_reusable_generation_reel_count(
                 requested_override=INITIAL_READY_REEL_TARGET,
                 organizer_candidate_limit=INITIAL_READY_REEL_TARGET,
                 apply_release_order=False,
+                editorial_excluded_reel_ids=editorial_excluded_reel_ids,
+                editorial_guard_reel_ids=editorial_guard_reel_ids,
             )
         ),
     )
@@ -6200,9 +6320,21 @@ def _run_leased_generation_job(
             generation_has_lesson_order = (
                 _stored_generation_lesson_order_ids(conn, generation_id) is not None
             )
+            source_generation_rows: dict[str, dict[str, Any]] = {}
             source_generation_ids = _response_generation_ids(
                 conn,
                 source_generation_id,
+                generation_rows_out=source_generation_rows,
+            )
+            (
+                same_adaptation_restatement_ids,
+                same_adaptation_restatement_guard_ids,
+            ) = _same_adaptation_current_restatement_policy(
+                source_generation_rows,
+                source_generation_ids,
+                adaptation_fingerprint=params.get(
+                    "adaptation_fingerprint"
+                ),
             )
             prior_consumed_video_ids = _generation_chain_consumed_video_ids(
                 conn,
@@ -6231,6 +6363,12 @@ def _run_leased_generation_job(
                 learner_id=learner_id,
                 request_params=params,
                 requested=requested_count,
+                editorial_excluded_reel_ids=(
+                    same_adaptation_restatement_ids
+                ),
+                editorial_guard_reel_ids=(
+                    same_adaptation_restatement_guard_ids
+                ),
             )
             analyzed_source_budget = _generation_chain_analyzed_source_budget(
                 conn,
@@ -6388,6 +6526,10 @@ def _run_leased_generation_job(
                     prior_unseen_reels_out=(
                         prior_unseen_reels if collect_prior_unseen else None
                     ),
+                    editorial_excluded_reel_ids=same_adaptation_restatement_ids,
+                    editorial_guard_reel_ids=(
+                        same_adaptation_restatement_guard_ids
+                    ),
                 )
             )
             stage_counters = context.counters()
@@ -6409,6 +6551,10 @@ def _run_leased_generation_job(
                     preserve_lesson_order_metadata=True,
                     prior_unseen_reels_out=(
                         prior_unseen_reels if collect_prior_unseen else None
+                    ),
+                    editorial_excluded_reel_ids=same_adaptation_restatement_ids,
+                    editorial_guard_reel_ids=(
+                        same_adaptation_restatement_guard_ids
                     ),
                 )
                 if stored_order_ids is None:
@@ -6567,6 +6713,13 @@ def _run_leased_generation_job(
                     )
                     if not isinstance(organizer_prior_restatement_ids, list):
                         organizer_prior_restatement_ids = []
+                    organizer_current_restatement_ids = getattr(
+                        ordering,
+                        "current_restatement_reel_ids",
+                        None,
+                    )
+                    if not isinstance(organizer_current_restatement_ids, list):
+                        organizer_current_restatement_ids = []
                     ordering_degraded = ordering.degraded
                     checkpoint_ids = assessment_checkpoint_reel_ids(
                         released_ordered_ids,
@@ -6584,6 +6737,17 @@ def _run_leased_generation_job(
                         "prior_restatement_reel_ids": (
                             organizer_prior_restatement_ids
                         ),
+                        "current_restatement_reel_ids": (
+                            organizer_current_restatement_ids
+                        ),
+                        "current_restatement_guard_reel_ids": (
+                            organizer_ordered_ids
+                            if organizer_current_restatement_ids
+                            else []
+                        ),
+                        "adaptation_fingerprint": str(
+                            params.get("adaptation_fingerprint") or ""
+                        ).strip(),
                         "terminal_summary_start_reel_id": (
                             terminal_summary_start_reel_id
                         ),
@@ -9853,6 +10017,7 @@ def feed(
                 terminal_retry_suppressed = True
         cross_request_source = False
         cross_request_source_covers_mode = False
+        cross_request_source_params: dict[str, Any] = {}
         if retry_source_job:
             generation_id = str(
                 retry_source_job.get("result_generation_id") or ""
@@ -9882,6 +10047,7 @@ def feed(
                 concept_id=None,
                 content_fingerprint=content_fingerprint,
                 request_params=request_params,
+                matched_request_params_out=cross_request_source_params,
             )
             cross_request_source = generation_id is not None
             if generation_id is not None:
@@ -9941,6 +10107,14 @@ def feed(
             and cross_request_source_covers_mode
             and initial_reservoir_shortfall
         )
+        cross_request_adaptation_changed = bool(
+            cross_request_source
+            and str(
+                cross_request_source_params.get("adaptation_fingerprint")
+                or GENERATION_EMPTY_ADAPTATION_FINGERPRINT
+            )
+            != adaptation_fingerprint
+        )
         if (
             autofill
             and page == 1
@@ -9951,7 +10125,8 @@ def feed(
                 (
                     cross_request_source
                     and (
-                        not cross_request_source_covers_mode
+                        cross_request_adaptation_changed
+                        or not cross_request_source_covers_mode
                         or initial_reservoir_shortfall
                     )
                 )

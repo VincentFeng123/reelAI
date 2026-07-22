@@ -21,9 +21,9 @@ from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 
 logger = logging.getLogger(__name__)
 
-SEGMENT_CACHE_VERSION = 37
+SEGMENT_CACHE_VERSION = 38
 SEGMENT_CACHE_TTL_SEC = 30 * 24 * 60 * 60
-SELECTION_CONTRACT_VERSION = "quality_silence_v39"
+SELECTION_CONTRACT_VERSION = "quality_silence_v40"
 
 
 def _objective_tokens(clip: Mapping[str, Any]) -> set[str]:
@@ -79,6 +79,13 @@ def _relevant_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
         settings.get("_segment_video_url") or ""
     ).split())
     video_grounding_enabled = video_grounding_required and bool(video_url)
+    raw_intent_contract = settings.get("_segment_intent_contract")
+    intent_contract = None
+    if isinstance(raw_intent_contract, Mapping):
+        try:
+            intent_contract = json.loads(_canonical_json(raw_intent_contract))
+        except (TypeError, ValueError):
+            intent_contract = None
     return {
         "fine_snap": (
             bool(pipeline_config.SEGMENT_FINE_SNAP)
@@ -94,6 +101,7 @@ def _relevant_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
         "thinking_level": " ".join(str(
             settings.get("_segment_thinking_level") or "medium"
         ).split()).lower(),
+        "intent_contract": intent_contract,
         "video_grounding": {
             "enabled": video_grounding_enabled,
             "required": video_grounding_required,

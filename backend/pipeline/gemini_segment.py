@@ -1740,7 +1740,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v3"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v23"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v24"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -1764,6 +1764,7 @@ _PRO_FINAL_AUDIT_RESERVED_S = 60.0
 # Keep the healthy audit inside the unchanged workflow deadline. Only a
 # transient provider failure may use this bounded second-attempt window.
 _PRO_AUDIT_RETRY_GRACE_S = 60.0
+_PRO_AUDIT_MAX_PHYSICAL_DISPATCHES = 3
 _PRO_SELECTOR_ATTEMPT_TIMEOUT_S = (
     _TOTAL_DEADLINE_S - _PRO_FINAL_AUDIT_RESERVED_S
 )
@@ -1798,6 +1799,7 @@ _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
 _PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v11"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
+_UPSTREAM_INTENT_CONTRACT_VERSION = "expansion_intent_v1"
 
 _PRICING_VERSION = "gemini-standard-2026-07-11"
 _PRICING_PER_MILLION = {
@@ -2241,6 +2243,12 @@ class _CompactBoundaryTopic(_StrictModel):
 
 class _CompactBoundaryPlan(_StrictModel):
     request_intent: _RequestIntent
+    topics: list[_CompactBoundaryTopic] = Field(max_length=_MAX_CLIPS)
+
+
+class _ContractBoundCompactBoundaryPlan(_StrictModel):
+    """Topics-only response when expansion already supplied request identity."""
+
     topics: list[_CompactBoundaryTopic] = Field(max_length=_MAX_CLIPS)
 
 
@@ -3060,6 +3068,7 @@ def _boundary_prompts(
     *,
     learner_level: str = "",
     video_grounded: bool = False,
+    request_intent: _RequestIntent | None = None,
 ) -> tuple[str, str]:
     # Kept in the signature for compatibility with older callers, but selector
     # prompts are permanently transcript-only to prevent video-token charges.
@@ -3110,52 +3119,85 @@ def _boundary_prompts(
         else ""
     )
     exact_request = topic.strip() or "(all educational topics)"
+    if request_intent is None:
+        request_context = f"Exact user request: {exact_request}\n"
+        intent_task = (
+            "1. Interpret the exact request before selecting anything. Return request_intent with "
+            "exact_request copied exactly from the Exact user request above and 1-16 atomic "
+            "constraints. Give every constraint a unique constraint_id, its kind, a concise "
+            "requirement, source_phrase copied as exact consecutive words from that request, "
+            "and source_occurrence equal to that phrase's zero-based occurrence in the request. "
+            "Use source_occurrence=0 normally and 1, 2, and so on only when the identical phrase "
+            "appears earlier. This position, not constraint array order, identifies the source. "
+            "Together the source phrases must cover every content-bearing request term. Preserve "
+            "named subjects, requested operations or tasks, relationships, scope qualifiers, "
+            "formats, and outcomes. Return joint_structures=[] when no explicit comparison, "
+            "contrast, transition, or ordered relationship is requested. Otherwise return one "
+            "joint_structures item per requested relationship: member_constraint_ids names the "
+            "two or more atomic sides/stages and relation_constraint_id names the separate "
+            "constraint that states their comparison, transition, or ordering. These are ID "
+            "references, not positional enum slots: members may have any honest semantic kind, "
+            "and their order in constraints is irrelevant. Never bundle two separately named "
+            "members into one source phrase. Give every separately named member of a list its own atomic "
+            "constraint, even when words such as including, through, each, or all introduce the "
+            "list. Keep the governing named concept as SUBJECT and label its named components or "
+            "facets as separate SCOPE constraints; never bundle the members into one constraint. "
+            "For 'Explain photosynthesis including chlorophyll, light reactions, the Calvin cycle, "
+            "and ATP,' use separate constraints for the governing photosynthesis subject, the "
+            "explanation task, and each of those four named facets. This verbatim exact_request is "
+            "TOPIC for all selection and "
+            "relevance decisions. Do not substitute retrieval expansions or a broader topic. "
+            "When a request contains a function, equation, expression, formula, identifier, or "
+            "other structured object, keep the complete object in one atomic constraint; never "
+            "reduce it to one shared term. "
+            "Treat course, exam, grade, learner-level, and curriculum labels as scope constraints, "
+            "not spoken subject constraints; the exact request and supplied transcript establish "
+            "those qualifiers. Words such as 'every', 'each', 'all', 'step-by-step', 'including "
+            "every algebra step', and 'final result' are required FORMAT or OUTCOME constraints, "
+            "never optional SCOPE constraints. A PRIMARY candidate fulfills such a request only "
+            "when one contiguous span contains the named setup, every spoken transformation, and "
+            "the requested final result. A supporting candidate may connect to only the constraints "
+            "its grounded ie honestly identifies. "
+            "Then scan the whole transcript from first to last and understand it before selecting. "
+            "Internally distinguish required setup and teaching from administration, promotion, "
+            "navigation, repetition, and visual-dependent speech; do not output that section map.\n"
+        )
+        response_object = "{request_intent, topics}"
+    else:
+        authoritative_contract = json.dumps(
+            request_intent.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        request_context = (
+            f"Selection topic summary (TOPIC): {exact_request}\n"
+            f"Exact original user request: {request_intent.exact_request}\n"
+            "Authoritative upstream request_intent (immutable): "
+            f"{authoritative_contract}\n"
+        )
+        intent_task = (
+            "1. Use the authoritative upstream request_intent exactly as supplied. It already "
+            "contains the atomic interpretation of the original request. Do not reinterpret, "
+            "rename, merge, split, reorder, omit, or add constraints or IDs, and do not return "
+            "request_intent. Use the concise TOPIC summary for selection while treating every "
+            "upstream constraint and joint structure as mandatory request context. Every ie.id "
+            "must be one declared upstream constraint_id; never invent an ID. A PRIMARY candidate "
+            "must fulfill every required non-scope constraint in one contiguous span. A SUPPORTING "
+            "candidate may connect only to the upstream constraints its grounded ie honestly "
+            "identifies. Then scan the whole transcript from first to last and understand it before "
+            "selecting. Internally distinguish required setup and teaching from administration, "
+            "promotion, navigation, repetition, and visual-dependent speech; do not output that "
+            "section map.\n"
+        )
+        response_object = "{topics}"
     user = (
         f"Transcript ({n} lines, formatted `[index] MM:SS text`; valid line IDs are "
         f"0 through {n - 1}):\n{lines}\n\n"
-        f"Exact user request: {exact_request}\n"
+        f"{request_context}"
         f"{_topic_rule(topic)}\n\n"
         f"{learner_line}"
         "Task:\n"
-        "1. Interpret the exact request before selecting anything. Return request_intent with "
-        "exact_request copied exactly from the Exact user request above and 1-16 atomic "
-        "constraints. Give every constraint a unique constraint_id, its kind, a concise "
-        "requirement, source_phrase copied as exact consecutive words from that request, "
-        "and source_occurrence equal to that phrase's zero-based occurrence in the request. "
-        "Use source_occurrence=0 normally and 1, 2, and so on only when the identical phrase "
-        "appears earlier. This position, not constraint array order, identifies the source. "
-        "Together the source phrases must cover every content-bearing request term. Preserve "
-        "named subjects, requested operations or tasks, relationships, scope qualifiers, "
-        "formats, and outcomes. Return joint_structures=[] when no explicit comparison, "
-        "contrast, transition, or ordered relationship is requested. Otherwise return one "
-        "joint_structures item per requested relationship: member_constraint_ids names the "
-        "two or more atomic sides/stages and relation_constraint_id names the separate "
-        "constraint that states their comparison, transition, or ordering. These are ID "
-        "references, not positional enum slots: members may have any honest semantic kind, "
-        "and their order in constraints is irrelevant. Never bundle two separately named "
-        "members into one source phrase. Give every separately named member of a list its own atomic "
-        "constraint, even when words such as including, through, each, or all introduce the "
-        "list. Keep the governing named concept as SUBJECT and label its named components or "
-        "facets as separate SCOPE constraints; never bundle the members into one constraint. "
-        "For 'Explain photosynthesis including chlorophyll, light reactions, the Calvin cycle, "
-        "and ATP,' use separate constraints for the governing photosynthesis subject, the "
-        "explanation task, and each of those four named facets. This verbatim exact_request is "
-        "TOPIC for all selection and "
-        "relevance decisions. Do not substitute retrieval expansions or a broader topic. "
-        "When a request contains a function, equation, expression, formula, identifier, or "
-        "other structured object, keep the complete object in one atomic constraint; never "
-        "reduce it to one shared term. "
-        "Treat course, exam, grade, learner-level, and curriculum labels as scope constraints, "
-        "not spoken subject constraints; the exact request and supplied transcript establish "
-        "those qualifiers. Words such as 'every', 'each', 'all', 'step-by-step', 'including "
-        "every algebra step', and 'final result' are required FORMAT or OUTCOME constraints, "
-        "never optional SCOPE constraints. A PRIMARY candidate fulfills such a request only "
-        "when one contiguous span contains the named setup, every spoken transformation, and "
-        "the requested final result. A supporting candidate may connect to only the constraints "
-        "its grounded ie honestly identifies. "
-        "Then scan the whole transcript from first to last and understand it before selecting. "
-        "Internally distinguish required setup and teaching from administration, promotion, "
-        "navigation, repetition, and visual-dependent speech; do not output that section map.\n"
+        f"{intent_task}"
         "2. Map every distinct educational unit genuinely related to TOPIC across the whole "
         "transcript. A PRIMARY unit fulfills every required non-scope constraint in one "
         "complete span. A SUPPORTING unit has a substantive educational connection to at "
@@ -3323,7 +3365,7 @@ def _boundary_prompts(
         "tail. If the supplied transcript itself ends before completion, keep the otherwise "
         "good candidate at the widest grounded cue range, set self and stand honestly, and "
         "never omit it solely for boundary uncertainty. Do not output this audit.\n"
-        f"Return only the object {{request_intent, topics}}. Every topic must contain "
+        f"Return only the object {response_object}. Every topic must contain "
         f"{_selection_fields(enriched=False, compact=True)}. The ie list must be nonempty and "
         "use {id, q} items where id is the constraint_id and q is an exact consecutive 5-16 "
         "word transcript quote wholly inside the candidate. For a primary topic, ground every "
@@ -3402,6 +3444,8 @@ def _pro_boundary_audit_prompts(
     plan: _CompactBoundaryPlan,
     segments: list[dict],
     topic: str,
+    *,
+    intent_authoritative: bool = False,
 ) -> tuple[str, str, dict[str, int]]:
     """Render Gemini's final text-only semantic and boundary audit."""
     allowed: dict[str, int] = {}
@@ -3474,12 +3518,25 @@ def _pro_boundary_audit_prompts(
         "audit_id. Never add, merge, split, rank, or omit candidates. Do not provide hidden "
         "reasoning or prose outside the schema."
     )
+    if intent_authoritative:
+        request_context = (
+            f"Selection topic summary (TOPIC): "
+            f"{topic.strip() or '(all educational topics)'}\n"
+            f"Exact original user request: {plan.request_intent.exact_request}\n"
+            "The upstream request_intent constraints below are authoritative and immutable. "
+            "Use their exact IDs for repaired intent evidence; do not merge, split, rename, "
+            "omit, or reinterpret them:\n"
+        )
+    else:
+        request_context = (
+            f"Exact original user request (the sole TOPIC): "
+            f"{topic.strip() or '(all educational topics)'}\n"
+            "The first selector's parsed constraints are navigation aids, not authority; the "
+            "exact original request above wins whenever they differ:\n"
+        )
     user = (
-        f"Exact original user request (the sole TOPIC): "
-        f"{topic.strip() or '(all educational topics)'}\n"
-        "The first selector's parsed constraints are navigation aids, not authority; the "
-        "exact original request above wins whenever they differ:\n"
-        f"{constraints}\n\n"
+        request_context
+        + f"{constraints}\n\n"
         "<full_transcript_cues>\n"
         f"{rendered_cues}\n"
         "</full_transcript_cues>\n\n"
@@ -12263,6 +12320,34 @@ def _validated_intent_constraints(
     return constraints, None
 
 
+def _trusted_request_intent_from_settings(
+    settings: dict,
+) -> _RequestIntent | None:
+    """Read a strictly grounded expansion contract without semantic inference."""
+    raw_contract = settings.get("_segment_intent_contract")
+    if (
+        not isinstance(raw_contract, dict)
+        or set(raw_contract) != {"version", "request_intent"}
+        or raw_contract.get("version") != _UPSTREAM_INTENT_CONTRACT_VERSION
+    ):
+        return None
+    try:
+        request_intent = _RequestIntent.model_validate(
+            raw_contract.get("request_intent")
+        )
+        validation_plan = _CompactBoundaryPlan(
+            request_intent=request_intent,
+            topics=[],
+        )
+    except (TypeError, ValidationError, ValueError):
+        return None
+    _constraints, error = _validated_intent_constraints(
+        validation_plan,
+        request_intent.exact_request,
+    )
+    return request_intent if error is None else None
+
+
 @dataclass(frozen=True)
 class _LiveSelectorContract:
     plan: _CompactBoundaryPlan
@@ -12313,7 +12398,7 @@ def _validate_live_pro_selector_contract(
         else plan.request_intent.constraints
     )
     canonical_sources = _canonical_intent_constraint_sources(
-        topic or plan.request_intent.exact_request,
+        plan.request_intent.exact_request or topic,
         list(signature_constraints),
     )
     constraint_signatures = {
@@ -12359,6 +12444,23 @@ def _validate_live_pro_selector_contract(
     valid_topics: list[_CompactBoundaryTopic] = []
     candidate_rejections: list[str] = []
     for proposal in plan.topics:
+        evidence_ids = [
+            str(item.constraint_id)
+            for item in proposal.intent_evidence
+        ]
+        if any(
+            constraint_id not in constraint_signatures
+            for constraint_id in evidence_ids
+        ):
+            candidate_rejections.append(
+                f"candidate_{proposal.candidate_id}:intent_evidence_unknown_id"
+            )
+            continue
+        if len(evidence_ids) != len(set(evidence_ids)):
+            candidate_rejections.append(
+                f"candidate_{proposal.candidate_id}:intent_evidence_duplicate_id"
+            )
+            continue
         family_payload, family_error = _validated_proposal_concept_family_payload(
             proposal
         )
@@ -17014,7 +17116,7 @@ def _trusted_universal_compact_plan_to_report(
         for constraint in plan.request_intent.constraints
     }
     canonical_constraint_sources = _canonical_intent_constraint_sources(
-        topic or plan.request_intent.exact_request,
+        plan.request_intent.exact_request or topic,
         plan.request_intent.constraints,
     )
     constraint_kinds = {
@@ -17944,7 +18046,7 @@ def _trusted_compact_plan_to_report(
         for constraint in plan.request_intent.constraints
     }
     canonical_constraint_sources = _canonical_intent_constraint_sources(
-        topic or plan.request_intent.exact_request,
+        plan.request_intent.exact_request or topic,
         plan.request_intent.constraints,
     )
     constraint_kinds = {
@@ -21457,7 +21559,12 @@ def _validate_model_response(
     schema: type[BaseModel], text: str,
 ) -> tuple[BaseModel, list[str]]:
     """Validate one response, salvaging valid boundary candidates independently."""
-    if schema not in {_BoundaryPlan, _CompactBoundaryPlan, _IntentBoundaryPlan}:
+    if schema not in {
+        _BoundaryPlan,
+        _CompactBoundaryPlan,
+        _ContractBoundCompactBoundaryPlan,
+        _IntentBoundaryPlan,
+    }:
         return schema.model_validate_json(text), []
 
     payload = json.loads(text)
@@ -21475,7 +21582,9 @@ def _validate_model_response(
 
     request_intent: _RequestIntent | None = None
     topic_schema: type[BaseModel] = (
-        _CompactBoundaryTopic if schema is _CompactBoundaryPlan else _BoundaryTopic
+        _CompactBoundaryTopic
+        if schema in {_CompactBoundaryPlan, _ContractBoundCompactBoundaryPlan}
+        else _BoundaryTopic
     )
     if schema in {_CompactBoundaryPlan, _IntentBoundaryPlan}:
         request_intent = _RequestIntent.model_validate(payload["request_intent"])
@@ -21515,6 +21624,10 @@ def _validate_model_response(
         assert request_intent is not None
         return _CompactBoundaryPlan(
             request_intent=request_intent,
+            topics=topics,
+        ), rejection_reasons
+    if schema is _ContractBoundCompactBoundaryPlan:
+        return _ContractBoundCompactBoundaryPlan(
             topics=topics,
         ), rejection_reasons
     return _BoundaryPlan(topics=topics), rejection_reasons
@@ -21680,6 +21793,7 @@ def _call_model(
     budget_reserve: Optional[Callable[..., object]] = None,
     budget_reconcile: Optional[Callable[..., object]] = None,
     max_retries: int = 1,
+    use_full_transient_retry_budget: bool = False,
     retry_status_codes: frozenset[int] | set[int] | None = None,
     failover_model: str | None = None,
     media_resolution=None,
@@ -21895,6 +22009,9 @@ def _call_model(
                         initial_attempt_deadline_monotonic
                     ),
                     max_retries=max_retries,
+                    use_full_transient_retry_budget=(
+                        use_full_transient_retry_budget
+                    ),
                     retry_status_codes=retry_status_codes,
                     cancelled=cancelled,
                     media_resolution=media_resolution,
@@ -22228,11 +22345,41 @@ def _audit_pro_boundaries(
     cancelled: CancelledCb,
     _retry_contract_once: bool = True,
     _claim_logical_quota: bool = True,
+    _remaining_physical_dispatches: int = _PRO_AUDIT_MAX_PHYSICAL_DISPATCHES,
 ) -> tuple[_CompactBoundaryPlan, list[dict], list[str]]:
     """Let Pro independently audit admission and word edges; all failures retain."""
     if not plan.topics or not segments:
         return plan, [], []
-    system, user, allowed = _pro_boundary_audit_prompts(plan, segments, topic)
+    remaining_physical_dispatches = max(
+        0,
+        min(
+            _PRO_AUDIT_MAX_PHYSICAL_DISPATCHES,
+            int(_remaining_physical_dispatches),
+        ),
+    )
+    if remaining_physical_dispatches == 0:
+        return plan, [], []
+
+    def consume_physical_dispatches(call: dict) -> None:
+        nonlocal remaining_physical_dispatches
+        raw_count = call.get("physical_dispatches")
+        if isinstance(raw_count, bool) or not isinstance(raw_count, int):
+            dispatch_count = 0 if call.get("dispatched") is False else 1
+        else:
+            dispatch_count = max(0, raw_count)
+        remaining_physical_dispatches = max(
+            0,
+            remaining_physical_dispatches - dispatch_count,
+        )
+
+    system, user, allowed = _pro_boundary_audit_prompts(
+        plan,
+        segments,
+        topic,
+        intent_authoritative=(
+            _trusted_request_intent_from_settings(settings) is not None
+        ),
+    )
     sink = settings.get("_segment_telemetry")
     calls: list[dict] = []
     try:
@@ -22259,28 +22406,38 @@ def _audit_pro_boundaries(
                     ),
                     budget_reserve=settings.get("_segment_budget_reserve"),
                     budget_reconcile=settings.get("_segment_budget_reconcile"),
-                    max_retries=1,
+                    max_retries=min(
+                        2,
+                        remaining_physical_dispatches - 1,
+                    ),
+                    use_full_transient_retry_budget=True,
                     claim_logical_quota=(
                         _claim_logical_quota and structured_attempt == 1
                     ),
                 )
             except _SchemaResponseError as exc:
                 call = _exception_telemetry(exc)
+                consume_physical_dispatches(call)
                 call.update({
                     "error_type": type(exc).__name__,
                     "video_grounded": False,
                     "structured_retry_attempt": structured_attempt,
                     "structured_retry_reason": "invalid_structured_response",
-                    "structured_retry_exhausted": structured_attempt == 2,
+                    "structured_retry_exhausted": (
+                        structured_attempt == 2
+                        or remaining_physical_dispatches == 0
+                    ),
                 })
                 calls.append(call)
                 if (
                     structured_attempt == 1
+                    and remaining_physical_dispatches > 0
                     and not _cancel_requested(cancelled)
                     and deadline - time.monotonic() >= 5.0
                 ):
                     continue
                 raise
+            consume_physical_dispatches(call)
             call["video_grounded"] = False
             if structured_attempt == 2:
                 call.update({
@@ -22598,10 +22755,14 @@ def _audit_pro_boundaries(
         if calls:
             calls[-1].update({
                 "contract_retry_reason": "invalid_audit_contract",
-                "contract_retry_exhausted": not _retry_contract_once,
+                "contract_retry_exhausted": (
+                    not _retry_contract_once
+                    or remaining_physical_dispatches == 0
+                ),
             })
         if (
             _retry_contract_once
+            and remaining_physical_dispatches > 0
             and not _cancel_requested(cancelled)
             and deadline - time.monotonic() >= 5.0
         ):
@@ -22616,6 +22777,9 @@ def _audit_pro_boundaries(
                 cancelled=cancelled,
                 _retry_contract_once=False,
                 _claim_logical_quota=False,
+                _remaining_physical_dispatches=(
+                    remaining_physical_dispatches
+                ),
             )
             if retry_calls:
                 retry_calls[0].setdefault("contract_retry_attempt", 2)
@@ -22715,6 +22879,11 @@ def _run_selection_profile(
         or settings.get("learner_level")
         or ""
     )
+    trusted_request_intent = (
+        _trusted_request_intent_from_settings(settings)
+        if profile == PRO_BOUNDARY_PROFILE
+        else None
+    )
     boundary_profile = profile in {FLASH_SPLIT_PROFILE, PRO_BOUNDARY_PROFILE}
     # Video input is intentionally disabled for selection. Gemini receives only
     # the indexed transcript and exact user request, regardless of stale caller
@@ -22761,8 +22930,13 @@ def _run_selection_profile(
             topic,
             learner_level=learner_level,
             video_grounded=video_grounding_requested,
+            request_intent=trusted_request_intent,
         )
-        schema = _CompactBoundaryPlan
+        schema = (
+            _ContractBoundCompactBoundaryPlan
+            if trusted_request_intent is not None
+            else _CompactBoundaryPlan
+        )
         model = config.SEGMENT_PRO_MODEL
         # Medium was both faster and more complete than high across the clean
         # cross-domain boundary corpus, while materially reducing billed thought
@@ -22825,7 +22999,7 @@ def _run_selection_profile(
         *,
         claim_logical_quota: bool = True,
     ) -> tuple[BaseModel, dict]:
-        return _call_model(
+        parsed_response, call = _call_model(
             system,
             selector_user,
             schema,
@@ -22862,6 +23036,15 @@ def _run_selection_profile(
             estimated_media_tokens=estimated_media_tokens,
             claim_logical_quota=claim_logical_quota,
         )
+        if (
+            trusted_request_intent is not None
+            and isinstance(parsed_response, _ContractBoundCompactBoundaryPlan)
+        ):
+            parsed_response = _CompactBoundaryPlan(
+                request_intent=trusted_request_intent,
+                topics=list(parsed_response.topics),
+            )
+        return parsed_response, call
 
     calls: list[dict] = []
     try:
@@ -22908,7 +23091,11 @@ def _run_selection_profile(
         assert isinstance(parsed, _CompactBoundaryPlan)
         first_selector_contract = _validate_live_pro_selector_contract(
             parsed,
-            topic,
+            (
+                trusted_request_intent.exact_request
+                if trusted_request_intent is not None
+                else topic
+            ),
         )
         parsed = first_selector_contract.plan
         _annotate_live_selector_contract(call, first_selector_contract)
@@ -22980,7 +23167,11 @@ def _run_selection_profile(
             assert isinstance(retry_parsed, _CompactBoundaryPlan)
             retry_selector_contract = _validate_live_pro_selector_contract(
                 retry_parsed,
-                topic,
+                (
+                    trusted_request_intent.exact_request
+                    if trusted_request_intent is not None
+                    else topic
+                ),
             )
             retry_parsed = retry_selector_contract.plan
             _annotate_live_selector_contract(

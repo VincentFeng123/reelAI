@@ -353,7 +353,7 @@ def test_pro_boundary_fallback_preserves_canonical_video_cache_identity(monkeypa
 
 
 def test_direct_url_segment_cache_hit_skips_all_gemini_and_budget(monkeypatch):
-    assert run.segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v39"
+    assert run.segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v40"
     transcript = {
         "segments": [{
             "cue_id": "cached-cue",

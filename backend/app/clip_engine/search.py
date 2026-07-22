@@ -1122,6 +1122,7 @@ def discover_practice_fast(
         # evidence identity while the validated Gemini summary drives selection.
         "topic_terms": [retrieval_query],
         "provider_used": expansion.get("provider_used") or "literal_fallback",
+        "intent_contract": expansion.get("intent_contract"),
         "videos": videos,
         "credits_used": (
             int(initial.get("credits_used") or 0)

@@ -1322,7 +1322,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         ).fetchone()
         context = json.loads(row[0])
         context.update({
-            "selection_contract_version": "quality_silence_v39",
+            "selection_contract_version": "quality_silence_v40",
             "topic_relevance": 0.93,
             "self_contained": True,
             "topic_evidence_quote": (
@@ -1367,7 +1367,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         for result in (fresh, cached):
             self.assertEqual(len(result), 1)
             self.assertEqual(
-                result[0]["selection_contract_version"], "quality_silence_v39"
+                result[0]["selection_contract_version"], "quality_silence_v40"
             )
             self.assertAlmostEqual(result[0]["relevance_score"], 0.93)
             self.assertAlmostEqual(result[0]["topic_relevance"], 0.93)

@@ -551,6 +551,7 @@ def generate_json_v3(
     prompt_version: str,
     initial_attempt_deadline_monotonic: Optional[float] = None,
     max_retries: int = 1,
+    use_full_transient_retry_budget: bool = False,
     retry_status_codes: frozenset[int] | set[int] | None = None,
     cancelled=None,
     media_resolution=None,
@@ -788,7 +789,7 @@ def generate_json_v3(
             else:
                 retry_limit = (
                     max_retries
-                    if status_code == 503
+                    if use_full_transient_retry_budget or status_code == 503
                     else min(max_retries, 1)
                 )
             if not retryable or attempt >= retry_limit:

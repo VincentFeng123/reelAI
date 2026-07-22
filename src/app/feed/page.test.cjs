@@ -3495,9 +3495,10 @@ test("every adaptive rerank invalidates old generation before changing inventory
       creativeCommonsOnly: false,
       preferredVideoDuration: "any",
     }),
-    fetchAdaptiveFeedPageWithRetry: async ({ signal, excludeVideoIds }) => {
+    fetchAdaptiveFeedPageWithRetry: async ({ signal, excludeVideoIds, autofill }) => {
       assert.equal(signal, activeSearchScopeRef.current.controller.signal);
       assert.deepEqual(excludeVideoIds, ["dQw4w9WgXcQ"]);
+      assert.equal(autofill, true, "adaptive inventory must queue its current organizer");
       events.push(`fetch:${activeSearchScopeRef.current.seq}`);
       return {
         reels: [],
