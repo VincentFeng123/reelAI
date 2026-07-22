@@ -12180,6 +12180,9 @@ def test_selector_and_pro_audit_treat_multifacet_requests_as_atomic_curricula(
     )
     assert "preserve any-length indivisible derivations" in selector_prompt
     assert "never impose a duration cap" in selector_prompt
+    assert "set stand=false" in selector_prompt
+    assert "indispensable setup" in selector_prompt
+    assert "separately complete earlier unit" in selector_prompt
 
     assert "atomicity — repair umbrella spans before boundaries" in (
         audit_prompt
@@ -12279,7 +12282,7 @@ def test_pro_audit_shrinks_an_umbrella_to_one_atomic_objective_in_one_call(
     assert rejections == []
     assert len(dispatches) == len(calls) == 1
     assert dispatches[0]["operation"] == "pro_boundary_audit"
-    assert dispatches[0]["prompt_version"] == "pro_candidate_audit_v10"
+    assert dispatches[0]["prompt_version"] == "pro_candidate_audit_v11"
     [topic] = audited.topics
     assert (topic.start_line, topic.end_line) == (0, 0)
     assert topic.end_quote == "and produces ATP"
@@ -12786,6 +12789,14 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
     assert "reject_unrelated only" in normalized
     assert "reject_filler_dominated only" in normalized
     assert "reject_factually_incorrect only" in normalized
+    assert "reject_context_dependent only" in normalized
+    assert "indispensable setup exists only in a separately complete earlier unit" in (
+        normalized
+    )
+    assert "repair makes the returned span independently understandable" in normalized
+    assert "exact evidence quote must expose the unresolved dependency" in normalized
+    assert "a label alone cannot" in normalized
+    assert "this does not override reject_context_dependent" in normalized
     assert "explicitly conflates distinct laws, concepts, mechanisms" in normalized
     assert "if factual correctness is merely uncertain, decision must be keep" in normalized
     assert "first salvage the candidate's best academically sound related unit" in normalized
@@ -12853,6 +12864,9 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
     assert "boundary fields are non-semantic echo sentinels" in normalized
     assert "filler/navigation only" in normalized
     audit_schema = gemini_segment._ProCandidateAuditPlan.model_json_schema()
+    assert "reject_context_dependent" in audit_schema["$defs"][
+        "_ProAuditDecision"
+    ]["enum"]
     audit_required = set(
         audit_schema["$defs"]["_ProCandidateAuditItem"]["required"]
     )
@@ -12876,7 +12890,7 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
         "eq",
     } <= audit_required
     assert gemini_segment._PRO_BOUNDARY_AUDIT_PROMPT_VERSION == (
-        "pro_candidate_audit_v10"
+        "pro_candidate_audit_v11"
     )
 
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
@@ -13968,6 +13982,182 @@ def test_pro_candidate_audit_can_reject_grounded_unrelated_or_filler(
 
         assert audited.topics == []
         assert rejections == [f"gemini_audit:candidate-1:{decision}"]
+
+
+def test_pro_candidate_audit_drops_only_grounded_context_dependent_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain how an opposing factor changes a baseline response"
+    segments = [
+        {
+            "cue_id": "cue-foundation",
+            "start": 0.0,
+            "end": 10.0,
+            "text": (
+                "The baseline component equals input times angle because the axes "
+                "are aligned with the surface."
+            ),
+        },
+        {
+            "cue_id": "cue-dependent-1",
+            "start": 10.0,
+            "end": 20.0,
+            "text": (
+                "For the extension, the opposing factor reduces the net response. "
+                "The normal factor as mentioned before is baseline times angle."
+            ),
+        },
+        {
+            "cue_id": "cue-dependent-2",
+            "start": 20.0,
+            "end": 30.0,
+            "text": (
+                "Therefore the extension response subtracts the opposing factor and "
+                "reaches its complete result."
+            ),
+        },
+    ]
+    intent = {
+        "exact_request": request,
+        "constraints": [{
+            "constraint_id": "response",
+            "kind": "relationship",
+            "source_phrase": "opposing factor changes a baseline response",
+            "requirement": "Explain how an opposing factor changes a baseline response",
+        }],
+    }
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent=intent,
+        topics=[
+            gemini_segment._CompactBoundaryTopic(
+                candidate_id="foundation",
+                start_line=0,
+                end_line=0,
+                start_quote="The baseline component",
+                end_quote="aligned with the surface",
+                claim_quote="baseline component equals input times angle",
+                title="Baseline Component",
+                learning_objective="Explain the baseline component",
+                facet="baseline component",
+                concept_family="baseline response component",
+                concept_aliases=[],
+                informativeness=0.9,
+                topic_relevance=0.8,
+                educational_importance=0.9,
+                difficulty=0.2,
+                directly_teaches_topic=False,
+                substantive=True,
+                factually_grounded=True,
+                self_contained=True,
+                is_standalone=True,
+                intent_evidence=[{
+                    "id": "response",
+                    "q": "baseline component equals input times angle",
+                }],
+            ),
+            gemini_segment._CompactBoundaryTopic(
+                candidate_id="dependent-extension",
+                start_line=1,
+                end_line=2,
+                start_quote="For the extension",
+                end_quote="reaches its complete result",
+                claim_quote="opposing factor reduces the net response",
+                title="Opposing Factor Extension",
+                learning_objective="Apply the opposing factor to the response",
+                facet="opposing factor extension",
+                concept_family="opposing-factor response",
+                concept_aliases=[],
+                informativeness=0.9,
+                topic_relevance=0.9,
+                educational_importance=0.9,
+                difficulty=0.4,
+                directly_teaches_topic=False,
+                substantive=True,
+                factually_grounded=True,
+                self_contained=True,
+                is_standalone=True,
+                intent_evidence=[{
+                    "id": "response",
+                    "q": "opposing factor reduces the net response",
+                }],
+            ),
+        ],
+    )
+    dependency_evidence = (
+        "normal factor as mentioned before is baseline times angle"
+    )
+    audit = gemini_segment._ProCandidateAuditPlan(items=[
+        {
+            "id": "candidate-1",
+            "d": "keep",
+            "obj": "Explain the baseline response component",
+            "t": "Baseline Component",
+            "f": "baseline component",
+            "family": "baseline response component",
+            "a": [],
+            "direct": False,
+            "ie": [{
+                "id": "response",
+                "q": "baseline component equals input times angle",
+            }],
+            "ev": "baseline component equals input times angle",
+            "ds": 0,
+            "dq": "The baseline component",
+            "dc": True,
+            "s": 0,
+            "e": 0,
+            "sq": "The baseline component",
+            "eq": "aligned with the surface",
+        },
+        {
+            "id": "candidate-2",
+            "d": "reject_context_dependent",
+            "obj": "Apply an opposing factor using an earlier baseline definition",
+            "t": "Opposing Factor Extension",
+            "f": "opposing factor extension",
+            "family": "opposing-factor response",
+            "a": [],
+            "direct": False,
+            "ie": [],
+            "ev": dependency_evidence,
+            "ds": 1,
+            "dq": "For the extension",
+            "dc": True,
+            "s": 1,
+            "e": 2,
+            "sq": "For the extension",
+            "eq": "reaches its complete result",
+        },
+    ])
+    events: list[dict] = []
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        lambda *_args, **_kwargs: (
+            audit,
+            {"model": "gemini-3.1-pro-preview", "operation": "pro_boundary_audit"},
+        ),
+    )
+
+    audited, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {"_segment_telemetry": events.append},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert [topic.candidate_id for topic in audited.topics] == ["foundation"]
+    assert rejections == [
+        "gemini_audit:candidate-2:reject_context_dependent"
+    ]
+    assert len(calls) == 1
+    completed = next(
+        event for event in events if event["event"] == "candidate_audit"
+    )
+    assert completed["rejected_context_dependent_count"] == 1
+    assert completed["rejected_unrelated_count"] == 0
 
 
 def test_pro_candidate_audit_rejects_explicit_newton_law_conflation(

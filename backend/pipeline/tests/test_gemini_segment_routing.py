@@ -1765,7 +1765,14 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
     (G.FLASH_SPLIT_PROFILE,
          ("low", 6_400, 45.0, "flash_boundary_selector", "gemini-3.5-flash", 1)),
     (G.PRO_BOUNDARY_PROFILE,
-         ("medium", 12_288, 90.0, "pro_fallback", "gemini-3.1-pro-preview", 1)),
+         (
+             "medium",
+             12_288,
+             G._PRO_SELECTOR_ATTEMPT_TIMEOUT_S,
+             "pro_fallback",
+             "gemini-3.1-pro-preview",
+             1,
+         )),
     ],
 )
 def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, expected):

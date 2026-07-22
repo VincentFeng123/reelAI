@@ -1538,6 +1538,166 @@ test("a reel that becomes active while the organizer runs stays locked ahead of 
   assert.equal(renderedActiveIndex, 1, "settlement must not move the active viewport");
 });
 
+test("reconciliation that commits first makes the inserted prerequisite the next scroll target", () => {
+  const currentRows = [
+    { reel_id: "current", video_url: "current" },
+    { reel_id: "old-target", video_url: "old-target" },
+    { reel_id: "later-unseen", video_url: "later-unseen" },
+  ];
+  const reelsRef = { current: currentRows };
+  const activeIndexRef = { current: 0 };
+  let renderedRows = currentRows;
+  let renderedActiveIndex = activeIndexRef.current;
+  const reconcile = compileUseCallback("reconcileGeneratedReels", {
+    reelsRef,
+    activeIndexRef,
+    watchedFrontierIndexRef: { current: 0 },
+    pendingResumeRef: { current: null },
+    reelClipKey: (reel) => reel.video_url,
+    dedupeByIdentity: (rows) => {
+      const seen = new Set();
+      return rows.filter((row) => !seen.has(row.reel_id) && seen.add(row.reel_id));
+    },
+    updateSessionReels: (rows) => {
+      reelsRef.current = rows;
+      renderedRows = rows;
+    },
+    setActiveIndex: (index) => {
+      renderedActiveIndex = index;
+    },
+    setTotal: () => {},
+  });
+
+  reconcile(
+    [],
+    [{ reel_id: "inserted-prerequisite", video_url: "inserted-prerequisite" }],
+    {
+      preserveUnmatchedUnseen: true,
+      preserveUnmatchedLockedPrefix: true,
+      appendAuthoritativeAfterStableUnseen: true,
+      authoritativeTailOrder: ["inserted-prerequisite", "old-target", "later-unseen"],
+    },
+  );
+
+  assert.deepEqual(renderedRows.map((row) => row.reel_id), [
+    "current",
+    "inserted-prerequisite",
+    "old-target",
+    "later-unseen",
+  ]);
+  assert.equal(renderedRows[activeIndexRef.current], currentRows[0]);
+  assert.equal(renderedActiveIndex, 0, "reconciliation must not move the current reel");
+
+  const commitOneReelMove = compileUseCallback("commitOneReelMove", {
+    pendingAutoplayAdvanceRef: { current: false },
+    reels: currentRows,
+    activeIndexRef,
+    beginSnapTransitionLock: () => {},
+    setActiveIndex: (index) => {
+      renderedActiveIndex = index;
+    },
+    feedNeedsBootstrapTopUp: () => false,
+    maybeLoadMore: () => {},
+  });
+  commitOneReelMove(1);
+
+  assert.equal(activeIndexRef.current, 1);
+  assert.equal(renderedActiveIndex, 1);
+  assert.equal(reelsRef.current[1].reel_id, "inserted-prerequisite");
+  assert.equal(reelsRef.current[2].reel_id, "old-target");
+});
+
+test("a pending scroll gate advances to a prerequisite inserted before the gate settles", async () => {
+  const currentRows = [
+    { reel_id: "current", video_url: "current" },
+    { reel_id: "old-target", video_url: "old-target" },
+    { reel_id: "later-unseen", video_url: "later-unseen" },
+  ];
+  const reelsRef = { current: currentRows };
+  const activeIndexRef = { current: 0 };
+  let renderedRows = currentRows;
+  let renderedActiveIndex = activeIndexRef.current;
+  const reconcile = compileUseCallback("reconcileGeneratedReels", {
+    reelsRef,
+    activeIndexRef,
+    watchedFrontierIndexRef: { current: 0 },
+    pendingResumeRef: { current: null },
+    reelClipKey: (reel) => reel.video_url,
+    dedupeByIdentity: (rows) => {
+      const seen = new Set();
+      return rows.filter((row) => !seen.has(row.reel_id) && seen.add(row.reel_id));
+    },
+    updateSessionReels: (rows) => {
+      reelsRef.current = rows;
+      renderedRows = rows;
+    },
+    setActiveIndex: (index) => {
+      renderedActiveIndex = index;
+    },
+    setTotal: () => {},
+  });
+  const commitOneReelMove = compileUseCallback("commitOneReelMove", {
+    pendingAutoplayAdvanceRef: { current: false },
+    reels: currentRows,
+    activeIndexRef,
+    beginSnapTransitionLock: () => {},
+    setActiveIndex: (index) => {
+      renderedActiveIndex = index;
+    },
+    feedNeedsBootstrapTopUp: () => false,
+    maybeLoadMore: () => {},
+  });
+  let settleGate;
+  const gateRequest = {
+    key: "material-a",
+    seq: 1,
+    reelId: "current",
+    promise: new Promise((resolve) => {
+      settleGate = resolve;
+    }),
+    advanceRequested: false,
+    advanceHandlerAttached: false,
+  };
+  const jumpOneReel = compileUseCallback("jumpOneReel", {
+    assessmentBootstrapPending: false,
+    assessmentSession: null,
+    assessmentStartRequestRef: { current: gateRequest },
+    assessmentGatePending: false,
+    commitOneReelMove,
+    reelsRef,
+    activeIndexRef,
+    maybeLoadMore: () => {},
+    reportForwardScrollForReel: () => gateRequest,
+    isSearchScopeActive: () => true,
+  });
+
+  jumpOneReel(1);
+  assert.equal(activeIndexRef.current, 0, "the current reel stays visible while the gate is pending");
+
+  reconcile(
+    [],
+    [{ reel_id: "inserted-prerequisite", video_url: "inserted-prerequisite" }],
+    {
+      preserveUnmatchedUnseen: true,
+      preserveUnmatchedLockedPrefix: true,
+      appendAuthoritativeAfterStableUnseen: true,
+      authoritativeTailOrder: ["inserted-prerequisite", "old-target", "later-unseen"],
+    },
+  );
+
+  assert.equal(activeIndexRef.current, 0);
+  assert.equal(renderedRows[activeIndexRef.current], currentRows[0]);
+  assert.equal(renderedActiveIndex, 0, "reconciliation must not move the pending gate's current reel");
+
+  settleGate("continue");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(activeIndexRef.current, 1);
+  assert.equal(renderedActiveIndex, 1);
+  assert.equal(reelsRef.current[1].reel_id, "inserted-prerequisite");
+  assert.equal(reelsRef.current[2].reel_id, "old-target");
+});
+
 test("a continuation plan reorders only its material inside a grouped unseen tail", () => {
   const currentRows = [
     { reel_id: "locked-a", material_id: "material-a", video_url: "locked-a" },

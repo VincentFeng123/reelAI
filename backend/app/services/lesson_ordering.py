@@ -1676,15 +1676,20 @@ def _surviving_terminal_summary_start(
     if terminal_summary_start_reel_id not in before_ids:
         return None
     suffix = before_ids[before_ids.index(terminal_summary_start_reel_id) :]
-    retained = set(after_ids)
-    surviving = next((reel_id for reel_id in suffix if reel_id in retained), None)
-    if surviving is None:
-        return None
-    surviving_position = after_ids.index(surviving)
     suffix_ids = set(suffix)
+    surviving_position = next(
+        (
+            index
+            for index, reel_id in enumerate(after_ids)
+            if reel_id in suffix_ids
+        ),
+        None,
+    )
+    if surviving_position is None:
+        return None
     if any(reel_id not in suffix_ids for reel_id in after_ids[surviving_position:]):
         return None
-    return surviving
+    return after_ids[surviving_position]
 
 
 def _enforce_mandatory_selection(
@@ -2890,6 +2895,154 @@ def _valid_terminal_summary_start(
     )
 
 
+def _model_order_validation_failures(
+    *,
+    ordered_ids: Sequence[str],
+    checkpoint_ids: Sequence[str],
+    prior_restatement_ids: Sequence[str],
+    terminal_summary_start_reel_id: str | None,
+    input_ids: Sequence[str],
+    required_reel_ids: Sequence[str],
+    release_limit: int,
+    has_prior_objective_evidence: bool,
+) -> list[str]:
+    """Return privacy-safe predicate names for a parsed model response."""
+    failures: list[str] = []
+    selected_set = set(ordered_ids)
+    input_set = set(input_ids)
+    if len(ordered_ids) > release_limit:
+        failures.append("selected_over_release_limit")
+    if not ordered_ids:
+        failures.append("selected_empty")
+    if len(selected_set) != len(ordered_ids):
+        failures.append("selected_duplicate_ids")
+    if not selected_set.issubset(input_set):
+        failures.append("selected_unknown_ids")
+    if not set(required_reel_ids).issubset(selected_set):
+        failures.append("required_ids_missing")
+
+    checkpoint_set = set(checkpoint_ids)
+    if len(checkpoint_set) != len(checkpoint_ids):
+        failures.append("checkpoint_duplicate_ids")
+    if not checkpoint_set.issubset(selected_set):
+        failures.append("checkpoint_unselected_ids")
+    elif checkpoint_ids:
+        selected_position = {
+            reel_id: index for index, reel_id in enumerate(ordered_ids)
+        }
+        positions = [selected_position[reel_id] for reel_id in checkpoint_ids]
+        if positions != sorted(positions):
+            failures.append("checkpoint_order_invalid")
+
+    restatement_set = set(prior_restatement_ids)
+    if len(restatement_set) != len(prior_restatement_ids):
+        failures.append("prior_restatement_duplicate_ids")
+    if not restatement_set.issubset(input_set):
+        failures.append("prior_restatement_unknown_ids")
+    if not restatement_set.isdisjoint(selected_set):
+        failures.append("prior_restatement_selected_ids")
+    if prior_restatement_ids and not has_prior_objective_evidence:
+        failures.append("prior_restatement_without_evidence")
+    if not _valid_terminal_summary_start(
+        terminal_summary_start_reel_id,
+        ordered_ids,
+    ):
+        failures.append("terminal_summary_invalid")
+    return failures
+
+
+def _salvage_model_order(
+    *,
+    ordered_ids: Sequence[str],
+    checkpoint_ids: Sequence[str],
+    prior_restatement_ids: Sequence[str],
+    terminal_summary_start_reel_id: str | None,
+    reel_ids: Sequence[str],
+    reels_by_id: Mapping[str, Mapping[str, Any]],
+    release_limit: int,
+    required_reel_ids: Sequence[str],
+    has_prior_objective_evidence: bool,
+) -> tuple[list[str], list[str], list[str], str | None] | None:
+    """Repair local constraints while retaining Gemini's selected subset.
+
+    Unknown, duplicate, empty, over-limit, or missing-required selections remain
+    retryable model failures. Auxiliary lists and satisfiable ordering/dependency
+    constraints are safe to reconcile without replacing the AI plan with every
+    input clip.
+    """
+    if (
+        len(ordered_ids) > release_limit
+        or not _valid_selected_order(ordered_ids, reel_ids)
+        or not set(required_reel_ids).issubset(ordered_ids)
+    ):
+        return None
+
+    retained: set[str] = set()
+    protected: set[str] = set()
+    for reel_id in required_reel_ids:
+        closure = _selection_dependency_closure(reel_id, reels_by_id)
+        retained.update(closure)
+        protected.update(closure)
+    if len(retained) > release_limit:
+        return None
+    for reel_id in ordered_ids:
+        closure = _selection_dependency_closure(reel_id, reels_by_id)
+        if len(retained | closure) > release_limit:
+            return None
+        retained.update(closure)
+    if not retained:
+        return None
+
+    retained_input_ids = [
+        reel_id for reel_id in reel_ids if reel_id in retained
+    ]
+    _, repaired_ids = _constraint_safe_fallback_order(
+        [reels_by_id[reel_id] for reel_id in retained_input_ids],
+        retained_input_ids,
+        preferred_ids=[*ordered_ids, *required_reel_ids],
+    )
+    repaired_ids, _ = _filter_same_source_overlaps(
+        repaired_ids,
+        (),
+        reels_by_id,
+        protected_ids=protected,
+    )
+    if (
+        not repaired_ids
+        or len(repaired_ids) > release_limit
+        or not set(required_reel_ids).issubset(repaired_ids)
+        or not _preserves_source_chronology(repaired_ids, reels_by_id)
+        or not _preserves_declared_dependencies(repaired_ids, reels_by_id)
+    ):
+        return None
+
+    checkpoint_set = set(checkpoint_ids)
+    repaired_checkpoint_ids = [
+        reel_id for reel_id in repaired_ids if reel_id in checkpoint_set
+    ]
+    repaired_id_set = set(repaired_ids)
+    repaired_restatement_ids = (
+        [
+            reel_id
+            for reel_id in dict.fromkeys(prior_restatement_ids)
+            if reel_id in reels_by_id and reel_id not in repaired_id_set
+        ]
+        if has_prior_objective_evidence
+        else []
+    )
+    repaired_terminal_summary_start = _surviving_terminal_summary_start(
+        terminal_summary_start_reel_id,
+        before_ids=ordered_ids,
+        after_ids=repaired_ids,
+    )
+    return (
+        repaired_ids,
+        repaired_checkpoint_ids,
+        repaired_restatement_ids,
+        repaired_terminal_summary_start,
+    )
+
+
 def _preserves_source_chronology(
     ordered_ids: Sequence[str],
     reels_by_id: Mapping[str, Mapping[str, Any]],
@@ -2984,6 +3137,8 @@ def _record_gemini(
     status_code: int | None,
     error_code: str = "",
     dispatched: bool,
+    validation_failures: Sequence[str] = (),
+    validation_repairs: Sequence[str] = (),
 ) -> None:
     if context is None:
         return
@@ -2993,6 +3148,18 @@ def _record_gemini(
     usage = telemetry.as_dict() if telemetry is not None else {}
     usage.update(reservation)
     usage["dispatched"] = bool(dispatched)
+    if validation_failures:
+        usage["validation_failures"] = list(dict.fromkeys(
+            str(failure)
+            for failure in validation_failures
+            if str(failure)
+        ))
+    if validation_repairs:
+        usage["validation_repairs"] = list(dict.fromkeys(
+            str(repair)
+            for repair in validation_repairs
+            if str(repair)
+        ))
     try:
         record(
             operation="ordering",
@@ -3092,7 +3259,10 @@ def _read_cached_lesson_order(
         return None
     before_overlap_ids = list(ordered_ids)
     ordered_ids, checkpoint_ids = _filter_same_source_overlaps(
-        ordered_ids, checkpoint_ids, reels_by_id
+        ordered_ids,
+        checkpoint_ids,
+        reels_by_id,
+        protected_ids=required_reel_ids or (),
     )
     terminal_summary_start = _surviving_terminal_summary_start(
         terminal_summary_start,
@@ -3531,38 +3701,68 @@ def _order_lesson_batch(
         ]
         if known_preference:
             preferred_ids = known_preference
-        model_order_valid = (
+        validation_failures = _model_order_validation_failures(
+            ordered_ids=ordered_ids,
+            checkpoint_ids=checkpoint_ids,
+            prior_restatement_ids=prior_restatement_ids,
+            terminal_summary_start_reel_id=terminal_summary_start,
+            input_ids=reel_ids,
+            required_reel_ids=normalized_required_reel_ids,
+            release_limit=effective_release_limit,
+            has_prior_objective_evidence=has_prior_objective_evidence,
+        )
+        validation_repairs: list[str] = []
+        selection_shape_valid = (
             len(ordered_ids) <= effective_release_limit
             and _valid_selected_order(ordered_ids, reel_ids)
-            and set(normalized_required_reel_ids).issubset(ordered_ids)
-            and _valid_assessment_checkpoints(checkpoint_ids, ordered_ids)
-            and _valid_prior_restatements(
-                prior_restatement_ids,
-                ordered_ids,
-                reel_ids,
-                has_prior_objective_evidence=has_prior_objective_evidence,
-            )
-            and _valid_terminal_summary_start(
-                terminal_summary_start,
-                ordered_ids,
-            )
         )
-        if model_order_valid:
+        if selection_shape_valid:
             before_overlap_ids = list(ordered_ids)
-            ordered_ids, checkpoint_ids = _filter_same_source_overlaps(
+            filtered_ids, filtered_checkpoint_ids = _filter_same_source_overlaps(
                 ordered_ids, checkpoint_ids, reels_by_id
             )
-            terminal_summary_start = _surviving_terminal_summary_start(
+            filtered_terminal_summary_start = _surviving_terminal_summary_start(
                 terminal_summary_start,
                 before_ids=before_overlap_ids,
-                after_ids=ordered_ids,
+                after_ids=filtered_ids,
             )
-            model_order_valid = (
+            if (
                 set(normalized_required_reel_ids).issubset(ordered_ids)
-                and _preserves_source_chronology(ordered_ids, reels_by_id)
-                and _preserves_declared_dependencies(ordered_ids, reels_by_id)
+                and not set(normalized_required_reel_ids).issubset(filtered_ids)
+            ):
+                validation_failures.append("required_ids_removed_by_overlap")
+            if not _preserves_source_chronology(filtered_ids, reels_by_id):
+                validation_failures.append("source_chronology_invalid")
+            if not _preserves_declared_dependencies(filtered_ids, reels_by_id):
+                validation_failures.append("dependencies_invalid")
+            if not validation_failures:
+                ordered_ids = filtered_ids
+                checkpoint_ids = filtered_checkpoint_ids
+                terminal_summary_start = filtered_terminal_summary_start
+
+        if validation_failures:
+            salvaged = _salvage_model_order(
+                ordered_ids=ordered_ids,
+                checkpoint_ids=checkpoint_ids,
+                prior_restatement_ids=prior_restatement_ids,
+                terminal_summary_start_reel_id=terminal_summary_start,
+                reel_ids=reel_ids,
+                reels_by_id=reels_by_id,
+                release_limit=effective_release_limit,
+                required_reel_ids=normalized_required_reel_ids,
+                has_prior_objective_evidence=has_prior_objective_evidence,
             )
-        if not model_order_valid:
+            if salvaged is not None:
+                validation_repairs = list(dict.fromkeys(validation_failures))
+                (
+                    ordered_ids,
+                    checkpoint_ids,
+                    prior_restatement_ids,
+                    terminal_summary_start,
+                ) = salvaged
+                validation_failures = []
+
+        if validation_failures:
             last_reason = "invalid_model_order"
             _record_gemini(
                 generation_context,
@@ -3573,6 +3773,7 @@ def _order_lesson_batch(
                 status_code=200,
                 error_code=last_reason,
                 dispatched=True,
+                validation_failures=validation_failures,
             )
             if attempt < LESSON_ORDER_ATTEMPTS:
                 continue
@@ -3622,6 +3823,7 @@ def _order_lesson_batch(
             quality_degraded=False,
             status_code=200,
             dispatched=True,
+            validation_repairs=validation_repairs,
         )
         return LessonOrderResult(
             reels=[reels_by_id[reel_id] for reel_id in ordered_ids],

@@ -204,6 +204,88 @@ def test_pro_selector_and_boundary_audit_recover_one_transient_failure(
     ] == [504, 429]
 
 
+def test_boundary_audit_late_transient_gets_one_physical_retry(
+    monkeypatch,
+) -> None:
+    plan = _newton_plan()
+    audit = _newton_audit_plan()
+    clock = {"now": 60.0}
+
+    class TimedAuditClient:
+        def __init__(self):
+            self.calls: list[dict] = []
+            self.models = self
+
+        def generate_content(self, model, contents, config):
+            self.calls.append({
+                "model": model,
+                "contents": contents,
+                "config": config,
+            })
+            if len(self.calls) == 1:
+                clock["now"] = 119.0
+                raise _RetryHTTPError(504)
+            return _RetryResponse(audit.model_dump_json(by_alias=True))
+
+    fake = TimedAuditClient()
+    context = GenerationContext("fast", generation_id="late-audit-transient")
+    monkeypatch.setattr(gemini_client, "get_client", lambda: fake)
+    monkeypatch.setattr(
+        gemini_client,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 100,
+    )
+    monkeypatch.setattr(
+        gemini_client.time,
+        "monotonic",
+        lambda: clock["now"],
+    )
+    monkeypatch.setattr(
+        gemini_client.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    monkeypatch.setattr(
+        gemini_client.random,
+        "uniform",
+        lambda lower, _upper: lower,
+    )
+
+    retained, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        [{
+            "cue_id": "supadata-cue-0",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "Newton's second law says that the net force on an object "
+                "equals its mass times its acceleration."
+            ),
+        }],
+        plan.request_intent.exact_request,
+        {
+            "_segment_budget_reserve": context.reserve_gemini_call,
+            "_segment_budget_reconcile": context.reconcile_gemini_call,
+        },
+        deadline=120.0,
+        cancelled=None,
+    )
+
+    assert [topic.candidate_id for topic in retained.topics] == [
+        "newton-second-law"
+    ]
+    assert rejections == []
+    assert len(fake.calls) == 2
+    assert [
+        call["config"].http_options.timeout for call in fake.calls
+    ] == [60_000, 60_000]
+    assert len(calls) == 1
+    assert calls[0]["retries"] == 1
+    assert calls[0]["physical_dispatches"] == 2
+    assert calls[0]["error_history"][0]["provider_status_code"] == 504
+    assert context.budget.snapshot()["gemini"]["boundary_audit_calls"] == 1
+
+
 def test_late_pro_499_retry_shares_deadline_and_reconciles_each_dispatch(
     monkeypatch,
 ) -> None:
@@ -487,7 +569,7 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     assert result.calls[0]["reserved_output_tokens"] == call["max_output_tokens"]
     assert audit_call["schema"] is gemini_segment._ProCandidateAuditPlan
     assert audit_call["operation"] == "pro_boundary_audit"
-    assert audit_call["prompt_version"] == "pro_candidate_audit_v10"
+    assert audit_call["prompt_version"] == "pro_candidate_audit_v11"
     assert audit_call["thinking_level"] == "high"
     assert audit_call["media_resolution"] is None
     assert gemini_segment._PRO_FINAL_AUDIT_RESERVED_S >= 60.0
@@ -496,12 +578,23 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
         == 2 * gemini_segment._PRO_FINAL_AUDIT_RESERVED_S
     )
     assert call["timeout_s"] == gemini_segment._PRO_SELECTOR_ATTEMPT_TIMEOUT_S
-    assert call["deadline_monotonic"] == audit_call["deadline_monotonic"]
+    assert audit_call["deadline_monotonic"] == pytest.approx(
+        call["deadline_monotonic"]
+        + gemini_segment._PRO_AUDIT_RETRY_GRACE_S
+    )
     assert call["initial_attempt_deadline_monotonic"] == pytest.approx(
         call["deadline_monotonic"]
         - gemini_segment._PRO_FINAL_AUDIT_RESERVED_S
     )
-    assert audit_call["initial_attempt_deadline_monotonic"] is None
+    assert audit_call["initial_attempt_deadline_monotonic"] is not None
+    assert audit_call["initial_attempt_deadline_monotonic"] == pytest.approx(
+        call["deadline_monotonic"]
+    )
+    assert audit_call["deadline_monotonic"] - audit_call[
+        "initial_attempt_deadline_monotonic"
+    ] == pytest.approx(
+        gemini_segment._PRO_AUDIT_RETRY_GRACE_S
+    )
     assert result.calls[1]["video_grounded"] is False
 
     budget = context.budget.snapshot()["gemini"]

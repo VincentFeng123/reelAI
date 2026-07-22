@@ -169,6 +169,360 @@ def test_orders_every_clip_and_returns_organizer_checkpoints(monkeypatch) -> Non
     assert "assessment_checkpoint_reel_ids" in captured["user"]
 
 
+def test_locally_repairable_model_plan_keeps_ai_subset_without_retry(
+    monkeypatch,
+) -> None:
+    reels = [
+        _reel("a-intro", video_id="source-a", start=10, concept="orientation"),
+        _reel("a-core", video_id="source-a", start=100, concept="core idea"),
+        _reel("b-definition", video_id="source-b", start=10, concept="definition"),
+        _reel("b-mechanism", video_id="source-b", start=20, concept="mechanism"),
+        _reel("b-example", video_id="source-b", start=30, concept="worked example"),
+        _reel("c-application", video_id="source-c", start=10, concept="application"),
+        _reel("c-advanced", video_id="source-c", start=20, concept="advanced case"),
+        _reel("c-peripheral", video_id="source-c", start=30, concept="peripheral tangent"),
+    ]
+    calls = 0
+
+    class Context:
+        def __init__(self) -> None:
+            self.records: list[dict[str, Any]] = []
+
+        def reserve_gemini_call(self, **_kwargs):
+            return {}
+
+        def record_gemini(self, **kwargs):
+            self.records.append(kwargs)
+
+    context = Context()
+    cached: dict[str, Any] = {}
+
+    def capture_cache(
+        _cache_key,
+        *,
+        ordered_ids,
+        checkpoint_ids,
+        prior_restatement_ids,
+        terminal_summary_start_reel_id,
+        model_used,
+    ) -> None:
+        cached.update({
+            "ordered_ids": list(ordered_ids),
+            "checkpoint_ids": list(checkpoint_ids),
+            "prior_restatement_ids": list(prior_restatement_ids),
+            "terminal_summary_start_reel_id": terminal_summary_start_reel_id,
+            "model_used": model_used,
+        })
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result(
+            [
+                "a-core",
+                "a-intro",
+                "b-example",
+                "b-definition",
+                "b-mechanism",
+                "c-application",
+                "c-advanced",
+            ],
+            ["c-advanced", "b-example", "a-core"],
+            # There is no prior objective evidence, so this auxiliary
+            # declaration is locally repairable and must not discard the AI's
+            # otherwise useful seven-clip subset.
+            prior_restatement_reel_ids=["c-peripheral"],
+        )
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        fake_generate,
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_write_cached_lesson_order",
+        capture_cache,
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="Teach the core idea, mechanism, worked example, and application.",
+        release_limit=len(reels),
+        generation_context=context,
+    )
+
+    assert calls == 1
+    assert result.degraded is False
+    assert result.ordered_reel_ids == [
+        "a-intro",
+        "a-core",
+        "b-definition",
+        "b-mechanism",
+        "b-example",
+        "c-application",
+        "c-advanced",
+    ]
+    assert "c-peripheral" not in result.ordered_reel_ids
+    assert result.assessment_checkpoint_reel_ids == [
+        "a-core",
+        "b-example",
+        "c-advanced",
+    ]
+    assert result.prior_restatement_reel_ids == []
+    assert len(context.records) == 1
+    assert context.records[0]["quality_degraded"] is False
+    assert set(context.records[0]["usage"]["validation_repairs"]) == {
+        "checkpoint_order_invalid",
+        "prior_restatement_without_evidence",
+        "source_chronology_invalid",
+    }
+    serialized_usage = json.dumps(context.records[0]["usage"])
+    assert "c-peripheral" not in serialized_usage
+    assert "Teach the core idea" not in serialized_usage
+    assert cached["ordered_ids"] == result.ordered_reel_ids
+    assert cached["checkpoint_ids"] == result.assessment_checkpoint_reel_ids
+    assert cached["prior_restatement_ids"] == []
+    assert lesson_ordering._valid_selected_order(
+        cached["ordered_ids"],
+        [reel["reel_id"] for reel in reels],
+    )
+    assert lesson_ordering._valid_assessment_checkpoints(
+        cached["checkpoint_ids"],
+        cached["ordered_ids"],
+    )
+    assert lesson_ordering._valid_prior_restatements(
+        cached["prior_restatement_ids"],
+        cached["ordered_ids"],
+        [reel["reel_id"] for reel in reels],
+        has_prior_objective_evidence=False,
+    )
+    assert lesson_ordering._valid_terminal_summary_start(
+        cached["terminal_summary_start_reel_id"],
+        cached["ordered_ids"],
+    )
+    reels_by_id = {reel["reel_id"]: reel for reel in reels}
+    assert lesson_ordering._preserves_source_chronology(
+        cached["ordered_ids"],
+        reels_by_id,
+    )
+    assert lesson_ordering._preserves_declared_dependencies(
+        cached["ordered_ids"],
+        reels_by_id,
+    )
+
+
+def test_missing_required_foundation_retries_before_accepting_application(
+    monkeypatch,
+) -> None:
+    reels = [
+        _reel(
+            "required-foundation",
+            video_id="foundation-source",
+            start=0,
+            concept="required foundation",
+        ),
+        _reel(
+            "application",
+            video_id="application-source",
+            start=0,
+            concept="application",
+        ),
+    ]
+    responses = iter([
+        _generation_result(["application"]),
+        _generation_result(["required-foundation", "application"]),
+    ])
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return next(responses)
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        fake_generate,
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="Teach the foundation before its application.",
+        release_limit=2,
+        required_reel_ids=["required-foundation"],
+    )
+
+    assert calls == 2
+    assert result.degraded is False
+    assert result.ordered_reel_ids == ["required-foundation", "application"]
+
+
+def test_salvaged_model_plan_keeps_present_required_id_and_dependency_closure(
+    monkeypatch,
+) -> None:
+    setup = _reel(
+        "required-setup",
+        video_id="setup-source",
+        start=0,
+        concept="required setup",
+        selection_candidate_id="setup-candidate",
+    )
+    required_application = _reel(
+        "required-application",
+        video_id="application-source",
+        start=0,
+        concept="required application",
+        prerequisite_ids=["setup-candidate"],
+    )
+    recovered_foundation = _reel(
+        "recovered-foundation",
+        video_id="foundation-source",
+        start=0,
+        concept="recovered foundation",
+    )
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result([
+            "recovered-foundation",
+            "required-application",
+        ])
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        fake_generate,
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [required_application, recovered_foundation, setup],
+        topic="Recover the foundation before the required application.",
+        release_limit=3,
+        required_reel_ids=["required-application"],
+    )
+
+    assert calls == 1
+    assert result.degraded is False
+    assert set(result.ordered_reel_ids) == {
+        "required-setup",
+        "required-application",
+        "recovered-foundation",
+    }
+    assert result.ordered_reel_ids.index("required-setup") < (
+        result.ordered_reel_ids.index("required-application")
+    )
+
+
+def test_selected_root_with_over_limit_dependency_closure_retries(
+    monkeypatch,
+) -> None:
+    independent = _reel(
+        "independent",
+        video_id="independent-source",
+        start=0,
+        concept="independent concept",
+    )
+    foundation = _reel(
+        "foundation",
+        video_id="chain-source-a",
+        start=0,
+        concept="chain foundation",
+        selection_candidate_id="foundation-candidate",
+    )
+    intermediate = _reel(
+        "intermediate",
+        video_id="chain-source-b",
+        start=0,
+        concept="chain intermediate",
+        selection_candidate_id="intermediate-candidate",
+        prerequisite_ids=["foundation-candidate"],
+    )
+    advanced = _reel(
+        "advanced",
+        video_id="chain-source-c",
+        start=0,
+        concept="chain advanced",
+        prerequisite_ids=["intermediate-candidate"],
+    )
+    responses = iter([
+        _generation_result(
+            ["independent", "advanced"],
+            ["advanced", "advanced"],
+        ),
+        _generation_result(["foundation", "intermediate"], ["intermediate"]),
+    ])
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return next(responses)
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        fake_generate,
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [independent, foundation, intermediate, advanced],
+        topic="Teach a dependency-safe lesson.",
+        release_limit=2,
+    )
+
+    assert calls == 2
+    assert result.degraded is False
+    assert result.ordered_reel_ids == ["foundation", "intermediate"]
+    assert result.assessment_checkpoint_reel_ids == ["intermediate"]
+
+
+def test_unsalvageable_order_records_only_validation_predicate_names(
+    monkeypatch,
+) -> None:
+    reels = [
+        _reel("private-one", video_id="a", start=0, concept="private concept one"),
+        _reel("private-two", video_id="b", start=0, concept="private concept two"),
+    ]
+
+    class Context:
+        def __init__(self) -> None:
+            self.records: list[dict[str, Any]] = []
+
+        def reserve_gemini_call(self, **_kwargs):
+            return {}
+
+        def record_gemini(self, **kwargs):
+            self.records.append(kwargs)
+
+    context = Context()
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(
+            ["private-one", "private-one"]
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="private learner request text",
+        generation_context=context,
+    )
+
+    assert result.degraded is True
+    assert len(context.records) == lesson_ordering.LESSON_ORDER_ATTEMPTS
+    for record in context.records:
+        assert record["error_code"] == "invalid_model_order"
+        assert record["usage"]["validation_failures"] == [
+            "selected_duplicate_ids"
+        ]
+        assert "private-one" not in json.dumps(record["usage"])
+        assert "private learner request text" not in json.dumps(record["usage"])
+
+
 def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_progression() -> None:
     payload = lesson_ordering._clip_payload({
         **_reel(
@@ -1352,6 +1706,50 @@ def test_terminal_recap_is_dropped_when_hard_chronology_blocks_suffix(
     assert result.terminal_summary_start_reel_id is None
 
 
+def test_salvaged_terminal_summary_marker_follows_repaired_suffix_order(
+    monkeypatch,
+) -> None:
+    earlier = _reel(
+        "recap-earlier",
+        video_id="same-recap-source",
+        start=10,
+        concept="first recap",
+    )
+    later = _reel(
+        "recap-later",
+        video_id="same-recap-source",
+        start=20,
+        concept="second recap",
+    )
+    cached_marker: list[str | None] = []
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(
+            ["recap-later", "recap-earlier"],
+            terminal_summary_start_reel_id="recap-later",
+        ),
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_write_cached_lesson_order",
+        lambda _cache_key, **kwargs: cached_marker.append(
+            kwargs["terminal_summary_start_reel_id"]
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [later, earlier],
+        topic="Finish with the first recap followed by the second recap.",
+    )
+
+    assert result.degraded is False
+    assert result.ordered_reel_ids == ["recap-earlier", "recap-later"]
+    assert result.terminal_summary_start_reel_id == "recap-earlier"
+    assert cached_marker == ["recap-earlier"]
+
+
 def test_prior_grounded_facet_coverage_does_not_force_repetition(
     monkeypatch,
 ) -> None:
@@ -1520,7 +1918,7 @@ def test_recent_prior_objective_alone_can_authorize_restatement_declaration(
     assert result.prior_restatement_reel_ids == ["repeat"]
 
 
-def test_prior_restatement_without_prior_objective_evidence_retries_and_is_ignored(
+def test_prior_restatement_without_prior_objective_evidence_is_repaired(
     monkeypatch,
 ) -> None:
     facet = _obligation("new facet", "Teach the new facet")
@@ -1556,12 +1954,12 @@ def test_prior_restatement_without_prior_objective_evidence_retries_and_is_ignor
         release_limit=2,
     )
 
-    assert calls == 2
+    assert calls == 1
     assert "facet" in result.ordered_reel_ids
     assert result.prior_restatement_reel_ids == []
 
 
-def test_identityless_prior_history_cannot_authorize_restatement_declaration(
+def test_identityless_prior_history_restatement_declaration_is_repaired(
     monkeypatch,
 ) -> None:
     facet = _obligation("new facet", "Teach the new facet")
@@ -1603,7 +2001,7 @@ def test_identityless_prior_history_cannot_authorize_restatement_declaration(
         }],
     )
 
-    assert calls == 2
+    assert calls == 1
     assert "facet" in result.ordered_reel_ids
     assert result.prior_restatement_reel_ids == []
 
@@ -1648,7 +2046,7 @@ def test_identityless_prior_history_cannot_authorize_restatement_declaration(
         ),
     ],
 )
-def test_prior_restatement_contract_retries_missing_or_invalid_ids(
+def test_prior_restatement_contract_retries_missing_shape_and_repairs_ids(
     monkeypatch,
     payload: dict[str, Any],
     expected_reason: str,
@@ -1679,9 +2077,20 @@ def test_prior_restatement_contract_retries_missing_or_invalid_ids(
         }],
     )
 
-    assert calls == lesson_ordering.LESSON_ORDER_ATTEMPTS == 2
-    assert result.degraded is True
-    assert result.fallback_reason == expected_reason
+    if expected_reason == "invalid_model_response":
+        assert calls == lesson_ordering.LESSON_ORDER_ATTEMPTS == 2
+        assert result.degraded is True
+        assert result.fallback_reason == expected_reason
+    else:
+        assert calls == 1
+        assert result.degraded is False
+        assert result.fallback_reason is None
+        assert result.ordered_reel_ids == ["selected"]
+        assert result.prior_restatement_reel_ids == (
+            ["repeat"]
+            if payload.get("prior_restatement_reel_ids") == ["repeat", "repeat"]
+            else []
+        )
 
 
 def test_remediation_override_removes_readded_candidate_from_restatement_declaration(
@@ -2986,7 +3395,7 @@ def test_explicit_sequence_preserves_operator_concepts_in_fallback_order() -> No
     )
 
 
-def test_invalid_order_retries_same_organizer_step_then_succeeds(monkeypatch) -> None:
+def test_invalid_order_is_repaired_without_retry(monkeypatch) -> None:
     first = _reel("first", video_id="first-video", start=0, concept="first law")
     third_intro = _reel(
         "third-intro", video_id="third-video", start=10, concept="third law"
@@ -2999,9 +3408,7 @@ def test_invalid_order_retries_same_organizer_step_then_succeeds(monkeypatch) ->
     def fake_generate(*_args, **_kwargs):
         nonlocal calls
         calls += 1
-        if calls == 1:
-            return _generation_result(["third-later", "first", "third-intro"])
-        return _generation_result(["first", "third-intro", "third-later"])
+        return _generation_result(["third-later", "first", "third-intro"])
 
     monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
 
@@ -3010,12 +3417,12 @@ def test_invalid_order_retries_same_organizer_step_then_succeeds(monkeypatch) ->
         topic="Begin with first law, then third law",
     )
 
-    assert calls == lesson_ordering.LESSON_ORDER_ATTEMPTS == 2
+    assert calls == 1
     assert result.ordered_reel_ids == ["first", "third-intro", "third-later"]
     assert result.degraded is False
 
 
-def test_twice_invalid_order_degrades_to_requested_concept_progression(
+def test_invalid_order_repairs_hard_chronology_without_topic_rewrite(
     monkeypatch,
 ) -> None:
     reels = [
@@ -3080,16 +3487,15 @@ def test_twice_invalid_order_degrades_to_requested_concept_progression(
         ),
     )
 
-    assert calls == 2
+    assert calls == 1
     assert result.ordered_reel_ids == [
-        "first-law",
-        "inertia-example",
-        "net-force",
         "third-intro",
         "third-example",
+        "first-law",
+        "net-force",
     ]
-    assert result.degraded is True
-    assert result.fallback_reason == "invalid_model_order"
+    assert result.degraded is False
+    assert result.fallback_reason is None
 
 
 def test_organizer_may_omit_a_mastered_concept(monkeypatch) -> None:
@@ -3150,7 +3556,7 @@ def test_organizer_may_omit_a_mastered_concept(monkeypatch) -> None:
     assert '"adjustment":0.08' in captured["user"]
 
 
-def test_organizer_subset_cannot_orphan_a_declared_prerequisite(monkeypatch) -> None:
+def test_organizer_subset_salvage_adds_declared_prerequisite(monkeypatch) -> None:
     definition = _reel(
         "definition",
         video_id="a",
@@ -3176,11 +3582,11 @@ def test_organizer_subset_cannot_orphan_a_declared_prerequisite(monkeypatch) -> 
 
     assert result.reels == [definition, example]
     assert result.ordered_reel_ids == ["definition", "example"]
-    assert result.degraded is True
-    assert result.fallback_reason == "invalid_model_order"
+    assert result.degraded is False
+    assert result.fallback_reason is None
 
 
-def test_organizer_subset_cannot_skip_an_earlier_chain_member(monkeypatch) -> None:
+def test_organizer_subset_salvage_adds_earlier_chain_member(monkeypatch) -> None:
     chain_one = _reel(
         "chain-one",
         video_id="a",
@@ -3209,7 +3615,7 @@ def test_organizer_subset_cannot_skip_an_earlier_chain_member(monkeypatch) -> No
 
     assert result.reels == [independent, chain_one, chain_two]
     assert result.ordered_reel_ids == ["independent", "chain-one", "chain-two"]
-    assert result.degraded is True
+    assert result.degraded is False
 
 
 def test_explicit_empty_checkpoint_list_is_authoritative(monkeypatch) -> None:
@@ -3249,10 +3655,18 @@ def test_single_reel_still_asks_organizer_to_choose_checkpoint(monkeypatch) -> N
 
 
 @pytest.mark.parametrize(
-    "checkpoint_ids",
-    [["unknown"], ["core", "core"], ["core", "intro"]],
+    ("checkpoint_ids", "expected_checkpoint_ids"),
+    [
+        (["unknown"], []),
+        (["core", "core"], ["core"]),
+        (["core", "intro"], ["intro", "core"]),
+    ],
 )
-def test_invalid_checkpoint_plan_degrades_atomically(monkeypatch, checkpoint_ids) -> None:
+def test_invalid_checkpoint_plan_is_sanitized(
+    monkeypatch,
+    checkpoint_ids,
+    expected_checkpoint_ids,
+) -> None:
     reels = [
         _reel("intro", video_id="a", start=0, concept="intro"),
         _reel("core", video_id="b", start=0, concept="core"),
@@ -3268,11 +3682,45 @@ def test_invalid_checkpoint_plan_degrades_atomically(monkeypatch, checkpoint_ids
     result = lesson_ordering.order_lesson_batch(reels, topic="topic")
 
     assert result.reels == reels
-    assert result.degraded is True
-    assert result.assessment_checkpoint_reel_ids is None
+    assert result.degraded is False
+    assert result.assessment_checkpoint_reel_ids == expected_checkpoint_ids
 
 
-def test_same_source_chronology_cannot_be_reversed(monkeypatch) -> None:
+def test_checkpoint_repair_preserves_ai_cross_source_semantic_order(
+    monkeypatch,
+) -> None:
+    definition = _reel(
+        "definition",
+        video_id="definition-source",
+        start=0,
+        concept="definition",
+    )
+    application = _reel(
+        "application",
+        video_id="application-source",
+        start=0,
+        concept="application",
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(
+            ["application", "definition"],
+            ["application", "application"],
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [definition, application],
+        topic="Start definition then application",
+    )
+
+    assert result.degraded is False
+    assert result.ordered_reel_ids == ["application", "definition"]
+    assert result.assessment_checkpoint_reel_ids == ["application"]
+
+
+def test_same_source_chronology_is_repaired_without_degrading(monkeypatch) -> None:
     reels = [
         _reel("later", video_id="same", start=40, concept="example"),
         _reel("earlier", video_id="same", start=5, concept="definition"),
@@ -3287,11 +3735,11 @@ def test_same_source_chronology_cannot_be_reversed(monkeypatch) -> None:
 
     assert result.reels == [reels[1], reels[0]]
     assert result.ordered_reel_ids == ["earlier", "later"]
-    assert result.degraded is True
-    assert result.assessment_checkpoint_reel_ids is None
+    assert result.degraded is False
+    assert result.assessment_checkpoint_reel_ids == []
 
 
-def test_degraded_mixed_source_fallback_orders_and_dedupes_overlapping_clips(
+def test_salvaged_mixed_source_plan_orders_and_dedupes_overlapping_clips(
     monkeypatch,
 ) -> None:
     reels = [
@@ -3345,7 +3793,7 @@ def test_degraded_mixed_source_fallback_orders_and_dedupes_overlapping_clips(
         result.ordered_reel_ids,
         {reel["reel_id"]: reel for reel in reels},
     )
-    assert result.degraded is True
+    assert result.degraded is False
 
 
 def test_organizer_first_choice_wins_same_source_overlap_and_checkpoint_is_filtered(
@@ -3453,7 +3901,7 @@ def test_overlap_filter_preserves_declared_lesson_edges(
     assert result.degraded is False
 
 
-def test_invalid_permutation_and_dependency_order_fall_back_without_dropping_clips(
+def test_dependency_order_is_repaired_but_duplicate_selection_falls_back(
     monkeypatch,
 ) -> None:
     reels = [
@@ -3479,7 +3927,7 @@ def test_invalid_permutation_and_dependency_order_fall_back_without_dropping_cli
     )
     dependency_result = lesson_ordering.order_lesson_batch(reels, topic="topic")
     assert dependency_result.reels == reels
-    assert dependency_result.degraded is True
+    assert dependency_result.degraded is False
 
     monkeypatch.setattr(
         lesson_ordering,
@@ -3776,6 +4224,84 @@ def test_lesson_order_cache_round_trips_validated_prior_restatements(
             has_prior_objective_evidence=True,
             release_limit=2,
         ) is None
+
+
+def test_lesson_order_cache_round_trip_preserves_overlapping_required_reels(
+    monkeypatch,
+) -> None:
+    reels = [
+        _reel(
+            "prior-first",
+            video_id="shared-video",
+            start=0,
+            concept="first previously released explanation",
+        ),
+        _reel(
+            "prior-second",
+            video_id="shared-video",
+            start=2,
+            concept="second previously released explanation",
+        ),
+        _reel(
+            "new-foundation",
+            video_id="foundation-video",
+            start=0,
+            concept="new foundation",
+        ),
+    ]
+    stored: dict[str, Any] = {}
+
+    class ConnectionContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "get_conn",
+        lambda **_kwargs: ConnectionContext(),
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "upsert",
+        lambda _conn, _table, values, **_kwargs: stored.update(values),
+    )
+    _REAL_WRITE_CACHED_LESSON_ORDER(
+        "cache-key",
+        ordered_ids=["new-foundation", "prior-first", "prior-second"],
+        checkpoint_ids=[],
+        prior_restatement_ids=[],
+        terminal_summary_start_reel_id=None,
+        model_used=config.LESSON_ORDER_MODEL,
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "fetch_one",
+        lambda *_args, **_kwargs: {
+            "response_json": stored["response_json"],
+            "created_at": stored["created_at"],
+        },
+    )
+
+    cached = _REAL_READ_CACHED_LESSON_ORDER(
+        "cache-key",
+        original=reels,
+        reel_ids=["prior-first", "prior-second", "new-foundation"],
+        generation_context=None,
+        has_prior_objective_evidence=False,
+        release_limit=3,
+        required_reel_ids=["prior-first", "prior-second"],
+    )
+
+    assert cached is not None
+    assert cached.provider_called is False
+    assert cached.ordered_reel_ids == [
+        "new-foundation",
+        "prior-first",
+        "prior-second",
+    ]
 
 
 def test_real_cache_hit_preserves_prior_restatement_mandatory_exemption(

@@ -1761,6 +1761,9 @@ _FLASH_REPAIR_TIMEOUT_S = 20.0
 _FLASH_ENRICH_TIMEOUT_S = 25.0
 _PRO_TIMEOUT_S = 90.0
 _PRO_FINAL_AUDIT_RESERVED_S = 60.0
+# Keep the healthy audit inside the unchanged workflow deadline. Only a
+# transient provider failure may use this bounded second-attempt window.
+_PRO_AUDIT_RETRY_GRACE_S = 60.0
 _PRO_SELECTOR_ATTEMPT_TIMEOUT_S = (
     _TOTAL_DEADLINE_S - _PRO_FINAL_AUDIT_RESERVED_S
 )
@@ -1793,7 +1796,7 @@ _SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
 _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
-_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v10"
+_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v11"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
 
 _PRICING_VERSION = "gemini-standard-2026-07-11"
@@ -2270,6 +2273,7 @@ class _ProAuditDecision(str, Enum):
     REJECT_UNRELATED = "reject_unrelated"
     REJECT_FILLER_DOMINATED = "reject_filler_dominated"
     REJECT_FACTUALLY_INCORRECT = "reject_factually_incorrect"
+    REJECT_CONTEXT_DEPENDENT = "reject_context_dependent"
 
 
 def _require_pro_audit_semantic_schema(schema: dict[str, object]) -> None:
@@ -2495,6 +2499,10 @@ _POLICY_AND_EXAMPLES = """Policy:
   explanation's natural conclusion. Never prepend a separately complete prerequisite or
   background lesson merely because it appears earlier; return that as its own candidate when
   it qualifies. For a worked example, include the question or setup, reasoning, and answer.
+- Set stand=false when indispensable setup for this candidate exists only in a separately
+  complete earlier unit. Do not call the candidate standalone merely because a later organizer
+  could put that earlier unit first. References to prior speech are evidence to inspect in the
+  complete transcript, not a lexical rule; a phrase alone never determines this field.
 - For a worked numerical example that solves for a dimensioned physical quantity, a bare
   number is not a complete answer. Continue through the contiguous spoken unit statement
   (for example, "two meters per second squared") and place eq after that unit. A later
@@ -3458,9 +3466,11 @@ def _pro_boundary_audit_prompts(
         "URL, frame, thumbnail, file, or visual metadata is attached or available. Perform "
         "three independent tasks for every candidate: decide semantic admission from its "
         "literal speech, correct its semantic metadata and evidence, and choose context-complete "
-        "word boundaries. A bad, early, late, "
-        "incomplete, or uncertain cut can NEVER cause rejection; keep the related candidate "
-        "and repair or retain its best grounded boundaries. Return exactly one item for every "
+        "word boundaries. An ordinary bad, early, late, incomplete, or uncertain cut can "
+        "never cause rejection; keep the related candidate and repair or retain its best "
+        "grounded boundaries. The sole context exception is the narrowly defined "
+        "reject_context_dependent decision below, after same-objective edge repair has been "
+        "exhausted. Return exactly one item for every "
         "audit_id. Never add, merge, split, rank, or omit candidates. Do not provide hidden "
         "reasoning or prose outside the schema."
     )
@@ -3511,9 +3521,23 @@ def _pro_boundary_audit_prompts(
           "speaker posing or correcting a misconception, rhetorical questions, missing visual "
           "context, possible transcription error, or the auditor's own uncertainty. If factual "
           "correctness is merely uncertain, decision MUST be keep.\n"
-          "No other rejection reason exists. NEVER reject for a wrong/incomplete boundary, "
-          "unresolved context, duration, visual dependence, factual uncertainty, duplication, "
-          "repetition, self-contained/standalone status, any score, or learner difficulty. "
+          "- decision=reject_context_dependent ONLY when related substantive teaching still "
+          "depends on indispensable spoken setup, givens, notation, a comparison baseline, "
+          "formula referent, scenario object, or prior result; that indispensable setup exists "
+          "only in a separately complete earlier unit; and no contiguous same-objective edge "
+          "repair makes the returned span independently understandable. If nearby contiguous "
+          "speech for this same objective supplies the missing context, decision MUST be keep "
+          "and the returned boundaries must include it. Never use this decision for a merely "
+          "useful prerequisite, a technical term explicitly named at the opening, missing "
+          "visual context, or a boundary problem repairable within the same objective. The "
+          "exact evidence quote must expose the unresolved dependency in the ORIGINAL current "
+          "speech; a generic topic phrase, inferred omission, or outside knowledge is "
+          "insufficient.\n"
+          "No other rejection reason exists. NEVER reject for an ordinary wrong/incomplete "
+          "boundary, duration, visual dependence, factual uncertainty, duplication, "
+          "repetition, a selector's self-contained/standalone label, any score, or learner "
+          "difficulty. Only exact quoted evidence satisfying reject_context_dependent can "
+          "ground that narrow rejection; a label alone cannot. "
           "Advanced but related material stays; downstream may store and defer it for later.\n"
           "Examples: For 'Newton's second law F=ma,' a same-force/larger-mass/smaller-"
           "acceleration explanation is KEEP, while a lesson whose actual objective is p=mv "
@@ -3524,18 +3548,21 @@ def _pro_boundary_audit_prompts(
           "approximation is KEEP. For 'Bayes theorem,' Bayesian prior-likelihood-posterior "
           "teaching is KEEP, while maximum-likelihood estimation with no Bayesian connection "
           "is REJECT_UNRELATED. For 'quicksort,' its partition mechanism is KEEP, while a "
-          "mergesort-only explanation is REJECT_UNRELATED. A related clip that starts late, "
-          "ends early, or is advanced is always KEEP.\n"
+          "mergesort-only explanation is REJECT_UNRELATED. A related clip with an ordinary "
+          "repairable late start or early end, or that is advanced, is KEEP. This does not "
+          "override reject_context_dependent when indispensable setup exists only in a "
+          "separately complete earlier unit and same-objective edge repair cannot supply it.\n"
           "For every decision, actual_objective must context-completely name what the literal "
           "speech actually teaches—not a generic matching word. When a coarse span contains "
           "several lessons, actual_objective is the narrowest complete teaching unit proved by "
           "the audit evidence_quote, not the video's umbrella agenda, a list "
           "of neighboring topics, or an earlier prerequisite. Evidence location and length "
           "follow the compact ev rules below. For a rejection ev must specifically ground the "
-          "unrelated objective, filler dominance, or explicit false/conflated assertion. The "
-          "quote itself must identify the competing objective, unmistakable filler, or "
-          "definitive factual error; if it is generic, depends on missing "
-          "context, or supports both related and unrelated readings, decision MUST be keep.\n\n"
+          "unrelated objective, filler dominance, explicit false/conflated assertion, or "
+          "narrow unresolved dependency. The quote itself must identify the competing "
+          "objective, unmistakable filler, definitive factual error, or literal unresolved "
+          "reference. If it is generic, requires outside inference to establish the "
+          "rejection, or supports both related and unrelated readings, decision MUST be keep.\n\n"
           "SEMANTIC METADATA — derive it afresh from literal speech, not selector labels or "
           "outside knowledge. title, obj, facet, family, aliases, direct, ie, and ev must all "
           "describe the same atomic relationship actually established by the returned span. "
@@ -3554,7 +3581,9 @@ def _pro_boundary_audit_prompts(
           "its speech teaches the parts' relationship—not an agenda, list, recap, or adjacency. "
           "Preserve any-length indivisible derivations, proofs, worked problems, mechanisms, "
           "and causal chains; duration never decides atomicity.\n\n"
-          "BOUNDARIES — perform this separately; a failure here never changes KEEP to reject:\n"
+          "BOUNDARIES — perform this separately. Ordinary edge uncertainty never changes "
+          "KEEP to reject; reject_context_dependent applies only after the transcript proves "
+          "that same-objective repair cannot supply the indispensable omitted setup:\n"
           "Reread the literal current speech as a cold listener. The opening must include the "
           "candidate's own necessary setup and resolve every referent. Openings such as 'This "
           "law,' 'This equation,' 'First it means,' 'Second it means,' or a numbered/listed "
@@ -22209,6 +22238,10 @@ def _audit_pro_boundaries(
     try:
         for structured_attempt in range(1, 3):
             try:
+                audit_initial_attempt_deadline = deadline
+                audit_retry_deadline = (
+                    deadline + _PRO_AUDIT_RETRY_GRACE_S
+                )
                 audit, call = _call_model(
                     system,
                     user,
@@ -22217,10 +22250,13 @@ def _audit_pro_boundaries(
                     thinking_level="high",
                     max_output_tokens=_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS,
                     timeout_s=_PRO_TIMEOUT_S,
-                    deadline_monotonic=deadline,
+                    deadline_monotonic=audit_retry_deadline,
                     operation="pro_boundary_audit",
                     prompt_version=_PRO_BOUNDARY_AUDIT_PROMPT_VERSION,
                     cancelled=cancelled,
+                    initial_attempt_deadline_monotonic=(
+                        audit_initial_attempt_deadline
+                    ),
                     budget_reserve=settings.get("_segment_budget_reserve"),
                     budget_reconcile=settings.get("_segment_budget_reconcile"),
                     max_retries=1,
@@ -22619,6 +22655,7 @@ def _audit_pro_boundaries(
             _ProAuditDecision.REJECT_UNRELATED,
             _ProAuditDecision.REJECT_FILLER_DOMINATED,
             _ProAuditDecision.REJECT_FACTUALLY_INCORRECT,
+            _ProAuditDecision.REJECT_CONTEXT_DEPENDENT,
         )
     }
     _emit(
@@ -22648,6 +22685,9 @@ def _audit_pro_boundaries(
         ],
         rejected_factually_incorrect_count=decision_counts[
             _ProAuditDecision.REJECT_FACTUALLY_INCORRECT.value
+        ],
+        rejected_context_dependent_count=decision_counts[
+            _ProAuditDecision.REJECT_CONTEXT_DEPENDENT.value
         ],
     )
     return (
