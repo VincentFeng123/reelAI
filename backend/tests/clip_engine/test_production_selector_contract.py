@@ -12070,7 +12070,7 @@ def test_boundary_prompt_requires_cross_domain_subject_anchoring_and_context() -
     assert "part b is not whole merely because its local arithmetic reaches an answer" in (
         normalized
     )
-    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v22"
+    assert gemini_segment.PRO_BOUNDARY_PROFILE == "pro_boundary_v23"
 
 
 @pytest.mark.parametrize(
@@ -12111,6 +12111,180 @@ def test_boundary_prompt_requires_each_supporting_objective_to_advance_governing
         in normalized
     )
     assert "do not output this audit" in normalized
+
+
+@pytest.mark.parametrize(
+    "topic",
+    [
+        "Teach cellular respiration: glycolysis, Krebs cycle, and electron transport",
+        "Teach chain rule intuition, derivation, examples, and common mistakes",
+        "Teach transactions: dirty reads, repeatable reads, and serializability",
+        "Teach negligence: duty, breach, causation, damages, and defenses",
+        "Teach Newton's second law: intuition, free-body diagrams, and incline problems",
+    ],
+)
+def test_selector_and_pro_audit_treat_multifacet_requests_as_atomic_curricula(
+    topic: str,
+) -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 8.0,
+            "text": "The first objective receives its own complete explanation.",
+        },
+        {
+            "start": 8.0,
+            "end": 16.0,
+            "text": "The second objective is independently explained and completed.",
+        },
+        {
+            "start": 16.0,
+            "end": 24.0,
+            "text": "The third objective reaches its own separate conclusion.",
+        },
+    ]
+    selector_system, selector_user = gemini_segment._boundary_prompts(
+        "\n".join(
+            f"[{index}] 00:{index * 8:02d} {segment['text']}"
+            for index, segment in enumerate(segments)
+        ),
+        len(segments),
+        topic,
+    )
+    plan = _compact_custom_plan(
+        request=topic,
+        start_quote="The first objective",
+        end_quote="its own separate conclusion",
+        claim_quote="The first objective receives its own complete explanation",
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={"end_line": 2})],
+    })
+    audit_system, audit_user, _allowed = (
+        gemini_segment._pro_boundary_audit_prompts(plan, segments, topic)
+    )
+
+    selector_prompt = " ".join(
+        f"{selector_system}\n{selector_user}".split()
+    ).casefold()
+    audit_prompt = " ".join(f"{audit_system}\n{audit_user}".split()).casefold()
+
+    assert topic.casefold() in selector_prompt
+    assert topic.casefold() in audit_prompt
+    assert "multi-part requests are curricula for separate atomic facet units" in (
+        selector_prompt
+    )
+    assert "not permission for an umbrella primary" in selector_prompt
+    assert "keep a synthesis only when its speech teaches the parts' relationship" in (
+        selector_prompt
+    )
+    assert "preserve any-length indivisible derivations" in selector_prompt
+    assert "never impose a duration cap" in selector_prompt
+
+    assert "atomicity — repair umbrella spans before boundaries" in (
+        audit_prompt
+    )
+    assert "keep the nearest one proved by ev/ie" in audit_prompt
+    assert "shrink s/e and sq/eq" in audit_prompt
+    assert "not an agenda, list, recap, or adjacency" in audit_prompt
+    assert "preserve any-length indivisible derivations" in audit_prompt
+    assert "duration never decides atomicity" in audit_prompt
+
+
+def test_pro_audit_shrinks_an_umbrella_to_one_atomic_objective_in_one_call(
+    monkeypatch,
+) -> None:
+    request = (
+        "Teach cellular respiration: glycolysis, Krebs cycle, and electron transport"
+    )
+    segments = [
+        {
+            "start": 0.0,
+            "end": 10.0,
+            "text": (
+                "In cellular respiration, glycolysis converts glucose into pyruvate "
+                "and produces ATP."
+            ),
+        },
+        {
+            "start": 10.0,
+            "end": 20.0,
+            "text": "The Krebs cycle oxidizes acetyl CoA and transfers electrons.",
+        },
+        {
+            "start": 20.0,
+            "end": 30.0,
+            "text": (
+                "The electron transport chain uses oxygen and drives ATP synthase."
+            ),
+        },
+    ]
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="In cellular respiration",
+        end_quote="drives ATP synthase",
+        claim_quote=(
+            "In cellular respiration, glycolysis converts glucose into pyruvate"
+        ),
+    )
+    plan = plan.model_copy(update={
+        "topics": [plan.topics[0].model_copy(update={"end_line": 2})],
+    })
+    audit = gemini_segment._ProCandidateAuditPlan(items=[{
+        "candidate_id": "candidate-1",
+        "decision": "keep",
+        "actual_objective": "Explain glycolysis's role in cellular respiration",
+        "title": "Glycolysis in Cellular Respiration",
+        "facet": "glycolysis",
+        "concept_family": "cellular respiration glycolysis",
+        "concept_aliases": [],
+        "directly_teaches_topic": False,
+        "intent_evidence": [{
+            "id": "subject",
+            "q": (
+                "In cellular respiration, glycolysis converts glucose into pyruvate"
+            ),
+        }],
+        "evidence_quote": (
+            "glycolysis converts glucose into pyruvate and produces ATP"
+        ),
+        "direct_start_line": 0,
+        "direct_start_quote": "In cellular respiration",
+        "direct_start_context_resolved": True,
+        "start_line": 0,
+        "end_line": 0,
+        "start_quote": "In cellular respiration",
+        "end_quote": "and produces ATP",
+    }])
+    dispatches: list[dict] = []
+
+    def call_model(*_args, **kwargs):
+        dispatches.append(kwargs)
+        return audit, {
+            "model": gemini_segment.config.SEGMENT_PRO_MODEL,
+            "operation": kwargs["operation"],
+        }
+
+    monkeypatch.setattr(gemini_segment, "_call_model", call_model)
+
+    audited, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert rejections == []
+    assert len(dispatches) == len(calls) == 1
+    assert dispatches[0]["operation"] == "pro_boundary_audit"
+    assert dispatches[0]["prompt_version"] == "pro_candidate_audit_v10"
+    [topic] = audited.topics
+    assert (topic.start_line, topic.end_line) == (0, 0)
+    assert topic.end_quote == "and produces ATP"
+    assert topic.learning_objective == "Explain glycolysis's role in cellular respiration"
+    assert topic.directly_teaches_topic is False
 
 
 def test_compact_schema_and_final_audit_require_context_complete_evidence_and_edges() -> None:
@@ -12702,7 +12876,7 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
         "eq",
     } <= audit_required
     assert gemini_segment._PRO_BOUNDARY_AUDIT_PROMPT_VERSION == (
-        "pro_candidate_audit_v9"
+        "pro_candidate_audit_v10"
     )
 
     audit = gemini_segment._ProCandidateAuditPlan(items=[{

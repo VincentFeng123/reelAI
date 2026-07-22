@@ -1065,7 +1065,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ["hard-v3", "easy-v3"],
         )
 
-    def test_v13_reservoir_keeps_deferred_levels_out_of_the_current_feed(self) -> None:
+    def test_legacy_level_deferred_inventory_is_soft_and_nearest_first(self) -> None:
         def insert_current(
             reel_id: str,
             video_id: str,
@@ -1116,14 +1116,14 @@ class SelectionContractOrderingTests(unittest.TestCase):
 
         self.assertEqual(
             [item["reel_id"] for item in self._ranked(require_verified_boundaries=True)],
-            [],
+            ["intermediate", "advanced"],
         )
 
         insert_current("beginner", "video-c", 0.15, surface_eligible=True)
         self.conn.execute("DELETE FROM ranked_feed_cache")
         self.assertEqual(
             [item["reel_id"] for item in self._ranked(require_verified_boundaries=True)],
-            ["beginner"],
+            ["beginner", "intermediate", "advanced"],
         )
 
         self.service.set_learner_level(
@@ -1131,7 +1131,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         )
         self.assertEqual(
             [item["reel_id"] for item in self._ranked(require_verified_boundaries=True)],
-            ["advanced", "beginner"],
+            ["advanced", "intermediate", "beginner"],
         )
 
     def test_nearest_level_order_is_stable_and_never_drops_valid_inventory(self) -> None:
@@ -1527,7 +1527,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             )
         self.assertEqual(missing_snapshot[0]["captions"], [])
 
-    def test_v4_deferred_boundary_clips_release_only_at_their_matching_level(self) -> None:
+    def test_legacy_boundary_bins_remain_available_with_matching_level_first(self) -> None:
         cases = (
             ("bin-33", "video-a", 10, 0.33),
             ("bin-34", "video-b", 20, 0.34),
@@ -1568,9 +1568,9 @@ class SelectionContractOrderingTests(unittest.TestCase):
             )
 
         expected_by_level = {
-            "beginner": ["bin-33"],
-            "intermediate": ["bin-34", "bin-66"],
-            "advanced": ["bin-67"],
+            "beginner": ["bin-33", "bin-34", "bin-66", "bin-67"],
+            "intermediate": ["bin-34", "bin-66", "bin-33", "bin-67"],
+            "advanced": ["bin-67", "bin-34", "bin-66", "bin-33"],
         }
         for level, expected in expected_by_level.items():
             self.service.set_learner_level(
@@ -1721,7 +1721,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             {"strict-verified", "transcript-aligned"},
         )
 
-    def test_gemini_level_mismatched_clip_is_reused_when_the_level_matches(self) -> None:
+    def test_gemini_level_mismatched_clip_remains_available_at_every_level(self) -> None:
         self._insert_versioned_reel(
             reel_id="advanced-reservoir",
             video_id="video-a",
@@ -1765,7 +1765,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
                 item["reel_id"]
                 for item in self._ranked(require_verified_boundaries=True)
             ],
-            [],
+            ["advanced-reservoir"],
         )
 
         self.service.set_learner_level(
@@ -1779,7 +1779,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ["advanced-reservoir"],
         )
 
-    def test_dependent_waits_until_its_deferred_prerequisite_is_ready(self) -> None:
+    def test_soft_level_prerequisite_surfaces_before_its_dependent(self) -> None:
         self._insert_versioned_reel(
             reel_id="deferred-parent",
             video_id="video-a",
@@ -1836,12 +1836,34 @@ class SelectionContractOrderingTests(unittest.TestCase):
                 (json.dumps(context), reel_id),
             )
 
+        self.assertEqual(
+            [
+                item["reel_id"]
+                for item in self._ranked(require_verified_boundaries=True)
+            ],
+            ["deferred-parent", "advanced-dependent"],
+        )
+
+        self.service.set_learner_level(
+            self.conn, self.MATERIAL, self.LEARNER, "intermediate",
+        )
+        self.assertEqual(
+            [
+                item["reel_id"]
+                for item in self._ranked(require_verified_boundaries=True)
+            ],
+            ["deferred-parent", "advanced-dependent"],
+        )
+
         self.service.set_learner_level(
             self.conn, self.MATERIAL, self.LEARNER, "advanced",
         )
         self.assertEqual(
-            self._ranked(require_verified_boundaries=True),
-            [],
+            [
+                item["reel_id"]
+                for item in self._ranked(require_verified_boundaries=True)
+            ],
+            ["deferred-parent", "advanced-dependent"],
         )
 
         self.conn.execute(
@@ -1853,6 +1875,15 @@ class SelectionContractOrderingTests(unittest.TestCase):
                 for item in self._ranked(require_verified_boundaries=True)
             ],
             ["deferred-parent", "advanced-dependent"],
+        )
+
+        self.conn.execute("DELETE FROM reels WHERE id = 'deferred-parent'")
+        self.assertEqual(
+            [
+                item["reel_id"]
+                for item in self._ranked(require_verified_boundaries=True)
+            ],
+            [],
         )
 
 

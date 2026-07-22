@@ -1510,7 +1510,7 @@ class IngestTopicProgressTests(unittest.TestCase):
         self.assertLess(elapsed, 0.2)
         self.assertTrue(stalled_cancelled.wait(0.1))
 
-    def test_deferred_valid_clip_stores_and_slow_surface_clip_still_finishes(self) -> None:
+    def test_off_level_valid_clip_streams_without_delaying_nearer_clip_order(self) -> None:
         pipeline = self._pipeline()
         videos = [self._video("slow-video"), self._video("deferred-video")]
         slow_started = threading.Event()
@@ -1573,9 +1573,9 @@ class IngestTopicProgressTests(unittest.TestCase):
             )
             elapsed = time.monotonic() - started
 
-        self.assertEqual(reels, ["slow-video"])
+        self.assertEqual(reels, ["slow-video", "deferred-video"])
         self.assertEqual(stored, ["deferred-video", "slow-video"])
-        self.assertEqual(streamed, ["slow-video"])
+        self.assertEqual(streamed, ["deferred-video", "slow-video"])
         self.assertGreaterEqual(elapsed, 0.05)
         self.assertLess(elapsed, 0.3)
 
@@ -1850,7 +1850,7 @@ class IngestTopicProgressTests(unittest.TestCase):
         self.assertEqual(calls[2:], ["video-2"])
         self.assertEqual(reels, ["video-2"] * 5)
 
-    def test_deep_backfill_counts_only_surfaceable_persisted_clips(self) -> None:
+    def test_deep_backfill_counts_only_semantically_surfaceable_clips(self) -> None:
         pipeline = self._pipeline()
         videos = [self._video(f"video-{index}") for index in range(3)]
         calls: list[str] = []
@@ -1867,9 +1867,9 @@ class IngestTopicProgressTests(unittest.TestCase):
                 "search_context": {
                     "surface_eligible": surface_eligible,
                     "surface_reason": (
-                        "" if surface_eligible else "level_mismatch"
+                        "" if surface_eligible else "topic_relevance_below_threshold"
                     ),
-                    "deferred_level": not surface_eligible,
+                    "deferred_level": False,
                 },
             }], {"transcript": {
                 "source": "supadata",
@@ -1924,6 +1924,80 @@ class IngestTopicProgressTests(unittest.TestCase):
         self.assertEqual(set(calls[:2]), {"video-0", "video-1"})
         self.assertEqual(calls[2:], ["video-2"])
         self.assertEqual(reels, ["video-2"])
+
+    def test_legacy_level_mismatch_is_soft_inventory(self) -> None:
+        pipeline = self._pipeline()
+        video = self._video("legacy-level-video")
+        persisted_contexts: list[dict] = []
+
+        def persist(**kwargs):
+            persisted_contexts.append(dict(kwargs["clip"]["search_context"]))
+            return kwargs["v"]["id"], mock.sentinel.metadata
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": [video],
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(
+                pipeline,
+                "_clip_and_filter",
+                return_value=(video, [{
+                    "title": "legacy-level-video",
+                    "start": 0.0,
+                    "end": 1.0,
+                    "cue_ids": ["cue-1"],
+                    "selection_candidate_id": "legacy-level-video",
+                    "search_context": {
+                        "surface_eligible": False,
+                        "surface_reason": "level_mismatch",
+                        "deferred_level": True,
+                    },
+                }], {"transcript": {
+                    "source": "supadata",
+                    "native_mode": False,
+                    "artifact_key": "supadata:legacy-level-video",
+                    "duration": 1.0,
+                    "segments": [{
+                        "cue_id": "cue-1",
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "A complete educational thought.",
+                    }],
+                }}),
+            ),
+            mock.patch.object(pipeline, "_persist_engine_clip", side_effect=persist),
+            mock.patch.object(
+                pipeline_module,
+                "_supadata_boundary_diagnostics",
+                return_value={
+                    "method": "test",
+                    "start_padding_ms": 0,
+                    "end_padding_ms": 0,
+                },
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=1,
+                max_reels=1,
+                retrieval_profile="deep",
+                generation_context=GenerationContext("slow"),
+            )
+
+        self.assertEqual(reels, ["legacy-level-video"])
+        self.assertEqual(len(persisted_contexts), 1)
+        self.assertIs(persisted_contexts[0]["surface_eligible"], True)
+        self.assertNotIn("surface_reason", persisted_contexts[0])
+        self.assertIs(persisted_contexts[0]["deferred_level"], True)
 
     def test_bootstrap_reserves_one_slot_per_initial_source(self) -> None:
         pipeline = self._pipeline()

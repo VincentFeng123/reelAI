@@ -45,14 +45,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-LESSON_ORDER_PROMPT_VERSION = "lesson_order_v9"
+LESSON_ORDER_PROMPT_VERSION = "lesson_order_v10"
 LESSON_ORDER_TIMEOUT_S = 10.0
 # A legal 128-UUID order, 128 checkpoints, and terminal marker is 10,113 ASCII
 # bytes. Actual
 # generated length, not this ceiling, drives latency.
 LESSON_ORDER_MAX_OUTPUT_TOKENS = 10_240
 LESSON_ORDER_ATTEMPTS = 2
-LESSON_ORDER_CACHE_VERSION = 7
+LESSON_ORDER_CACHE_VERSION = 8
 LESSON_ORDER_CACHE_TTL_SEC = 30 * 24 * 60 * 60
 LESSON_ORDER_MAX_CLIPS = 200
 LESSON_ORDER_MAX_USER_PROMPT_CHARS = 64_000
@@ -106,9 +106,24 @@ Use each clip's narrow concept and learner_signal when deciding inclusion:
   near-duplicate repetition.
 - A zero signal is neutral. Never omit an essential prerequisite solely due to mastery.
 
+Treat LEARNING_REQUEST_JSON.learner_level as a soft starting preference, never an
+eligibility rule. Each clip's difficulty is the only clip-level scale: beginner is
+0.00 to below 0.34, intermediate is 0.34 to below 0.67, and advanced is 0.67 to 1.00.
+Prefer the learner's current band when it contains suitable clips. If it does not,
+use the closest adjacent band; on an equal-distance choice, start with the easier
+band. If only farther valid clips exist, still return a nonempty coherent lesson.
+Within a progression, prefer easier or foundational material before harder material.
+Feedback remediation, required prerequisites, and lesson coherence may override the
+nominal band preference. Never return zero clips solely because of difficulty.
+
 Omit semantic restatements even when they come from different sources or use different
 titles. Keep multiple clips about one concept only when each contributes a genuinely new
 explanation, reasoning step, application, misconception, or worked-example step.
+
+Treat multi-part requests as curricula of atomic units. Prefer an equivalent coherent
+atomic set over an umbrella and never choose both it and nested restatements; keep a
+synthesis only when it teaches the parts' relationship. Duration alone never omits the
+only valid clip or splits an indivisible derivation, proof, problem, mechanism, or chain.
 
 Use previously released coverage in LEARNING_REQUEST_JSON.prior_concept_coverage as
 curriculum history, not as a mastery score.
@@ -1493,6 +1508,47 @@ def _enforce_mandatory_selection(
         if strongest_concept_id
         and _opaque_id(reel.get("concept_id")) == strongest_concept_id
     }
+    exact_difficulties = {
+        reel_id: difficulty
+        for reel_id in exact_candidates
+        if (
+            difficulty := _finite_number(reels_by_id[reel_id].get("difficulty"))
+        ) is not None
+    }
+    easiest_exact_difficulty = min(exact_difficulties.values(), default=None)
+    organizer_has_preferred_exact = bool(
+        not exact_candidates
+        or (
+            easiest_exact_difficulty is None
+            and selected_set & exact_candidates
+        )
+        or any(
+            reel_id in selected_set
+            and difficulty == easiest_exact_difficulty
+            for reel_id, difficulty in exact_difficulties.items()
+        )
+    )
+    selected_obligation_keys = set().union(
+        *(obligations_by_reel.get(reel_id, set()) for reel_id in selected_ids)
+    ) if selected_ids else set()
+    organizer_selection_is_complete = bool(
+        len(selected_ids) == len(result.ordered_reel_ids)
+        and len(selected_ids) <= effective_release_limit
+        and required_obligation_keys.issubset(selected_obligation_keys)
+        and organizer_has_preferred_exact
+        and all(
+            _selection_dependency_closure(reel_id, reels_by_id).issubset(
+                selected_set
+            )
+            for reel_id in selected_ids
+        )
+    )
+    if organizer_selection_is_complete:
+        # The model has already satisfied every mandatory invariant. Preserve
+        # its semantic editorial choice instead of replacing an atomic lesson
+        # set with a lower-cardinality umbrella that covers the same keys.
+        return result
+
     obligation_keys = sorted(required_obligation_keys)
     obligation_bits = {
         key: 1 << index for index, key in enumerate(obligation_keys)

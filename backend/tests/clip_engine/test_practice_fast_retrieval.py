@@ -2009,6 +2009,66 @@ def test_discover_practice_fast_threads_runtime_args_and_applies_exclude_top_n(m
     ]
 
 
+@pytest.mark.parametrize(
+    ("retrieval_profile", "expected_query"),
+    [
+        ("deep", "gravitational force components on an incline explained"),
+        ("bootstrap", "gravitational force components on an incline for beginners"),
+    ],
+)
+def test_practice_fast_searches_narrow_focus_without_losing_literal_context(
+    monkeypatch,
+    retrieval_profile,
+    expected_query,
+):
+    narrow = "gravitational force components on an incline"
+    broad = (
+        "Learn Newton's second law from concept to worked free-body diagram "
+        "problems, including friction on an incline."
+    )
+    expanded_topics = []
+    searched_queries = []
+
+    def fake_expand(topic, *_args, **_kwargs):
+        expanded_topics.append(topic)
+        return {
+            "corrected": narrow,
+            "queries": [f"{topic} explained"],
+            "provider_used": "gemini",
+        }
+
+    def fake_search_all(queries, filters=None, **_kwargs):
+        searched_queries.extend(queries)
+        return {
+            "per_query": [
+                {
+                    "query": query,
+                    "videos": [{"id": "focused-video", "viewCount": 100}],
+                }
+                for query in queries
+            ],
+            "credits_used": len(queries),
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        narrow,
+        limit=1,
+        breadth=1,
+        level="beginner",
+        literal_topic=broad,
+        retrieval_profile=retrieval_profile,
+    )
+
+    assert expanded_topics == ([narrow] if retrieval_profile == "deep" else [])
+    assert searched_queries == [expected_query]
+    assert result["topic_terms"] == [narrow]
+    assert [video["id"] for video in result["videos"]] == ["focused-video"]
+
+
 def test_consumed_first_page_fetches_next_provider_page_before_exhaustion(monkeypatch):
     calls = []
     monkeypatch.setattr(

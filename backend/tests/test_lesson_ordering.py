@@ -166,11 +166,17 @@ def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_
 
     assert payload["concept_title"] == "How force and mass change acceleration"
     assert payload["concept_family"] == "force-mass-acceleration proportionality"
-    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v9"
+    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v10"
     assert "semantic restatements" in lesson_ordering._SYSTEM_PROMPT
     assert "concept, then explanation, then application or worked example" in (
         lesson_ordering._SYSTEM_PROMPT
     )
+    assert "closest adjacent band" in lesson_ordering._SYSTEM_PROMPT
+    assert "Never return zero clips solely because of difficulty" in (
+        lesson_ordering._SYSTEM_PROMPT
+    )
+    assert "learner_level" not in payload
+    assert "difficulty" in payload
 
 
 def test_compact_clip_columns_reconstruct_every_organizer_value_without_shift() -> None:
@@ -894,6 +900,96 @@ def test_one_candidate_can_satisfy_multiple_grounded_request_facets(
     )
 
     assert result.ordered_reel_ids == ["both", "recap"]
+
+
+def test_complete_atomic_organizer_choice_is_not_replaced_by_umbrella(
+    monkeypatch,
+) -> None:
+    glycolysis = _obligation("glycolysis", "Teach glycolysis")
+    krebs = _obligation("Krebs cycle", "Teach the Krebs cycle")
+    electron_transport = _obligation(
+        "electron transport", "Teach the electron transport chain"
+    )
+    reels = [
+        {
+            **_reel(
+                "umbrella",
+                video_id="umbrella",
+                start=0,
+                concept="cellular respiration survey",
+                _selection_intent_obligations=[
+                    glycolysis,
+                    krebs,
+                    electron_transport,
+                ],
+            ),
+            "t_end": 535.0,
+        },
+        _reel(
+            "glycolysis",
+            video_id="glycolysis",
+            start=0,
+            concept="glycolysis",
+            _selection_intent_obligations=[glycolysis],
+        ),
+        _reel(
+            "krebs",
+            video_id="krebs",
+            start=0,
+            concept="Krebs cycle",
+            _selection_intent_obligations=[krebs],
+        ),
+        _reel(
+            "electron-transport",
+            video_id="electron-transport",
+            start=0,
+            concept="electron transport chain",
+            _selection_intent_obligations=[electron_transport],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(
+            ["glycolysis", "krebs", "electron-transport"]
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="cellular respiration stages",
+        release_limit=3,
+    )
+
+    assert result.ordered_reel_ids == [
+        "glycolysis",
+        "krebs",
+        "electron-transport",
+    ]
+
+
+def test_unique_indivisible_long_clip_remains_eligible(monkeypatch) -> None:
+    proof = _reel(
+        "long-proof",
+        video_id="proof",
+        start=10,
+        concept="complete worked derivation",
+    )
+    proof["t_end"] = 250.0
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["long-proof"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [proof],
+        topic="derive the result step by step",
+        release_limit=1,
+    )
+
+    assert result.ordered_reel_ids == ["long-proof"]
+    assert result.reels == [proof]
 
 
 def test_obligation_search_finds_complete_nongreedy_release(monkeypatch) -> None:

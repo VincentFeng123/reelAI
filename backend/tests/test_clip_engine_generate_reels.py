@@ -549,6 +549,10 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             ingest_topic.call_args.kwargs["literal_topic"],
             "biology and life",
         )
+        self.assertEqual(
+            ingest_topic.call_args.kwargs["topic"],
+            "Cellular respiration",
+        )
 
     def test_explicit_concept_generation_keeps_concept_as_literal_topic(self) -> None:
         with db_module.get_conn(transactional=True) as conn:
@@ -1396,7 +1400,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
     def test_cache_version_includes_recall_and_stored_details(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 46)
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 47)
         self.assertEqual(
             main_module.reel_service.RANKED_FEED_CACHE_CONTRACT_VERSION,
             "quality_silence_v39",

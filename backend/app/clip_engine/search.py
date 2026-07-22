@@ -827,8 +827,9 @@ def discover_practice_fast(
 
     The signature intentionally matches ``discover`` so live wiring can switch paths
     without dropping cancellation, budgets, provider caching, filters, or exclusions.
-    Planner arguments remain a compatibility surface; the user's literal text always
-    remains the downstream relevance identity.
+    Planner arguments remain a compatibility surface. ``topic`` is the narrow
+    acquisition focus; ``literal_topic`` is retained by the caller as immutable
+    request context and must not replace that focus during retrieval.
     """
     del use_query_planner
     topic = " ".join(str(topic or "").split())
@@ -850,23 +851,23 @@ def discover_practice_fast(
         raise SearchError("search budget exhausted")
 
     raise_if_cancelled(should_cancel)
-    literal_query = " ".join(str(literal_topic or topic).split()) or topic
+    retrieval_query = topic
     task_backoff_query = (
-        _niche_bootstrap_backoff_query(literal_query) if bootstrap else None
+        _niche_bootstrap_backoff_query(retrieval_query) if bootstrap else None
     )
-    component_queries = _long_topic_component_queries(literal_query) if bootstrap else []
+    component_queries = _long_topic_component_queries(retrieval_query) if bootstrap else []
     initial_queries: list[str] = []
     seen_query_keys: set[str] = set()
     expansion: dict[str, object] = {
-        "corrected": literal_query,
-        "queries": [literal_query],
+        "corrected": retrieval_query,
+        "queries": [retrieval_query],
         "provider_used": "literal_fallback",
     }
     if bootstrap:
-        planned_queries = [_difficulty_bootstrap_query(literal_query, level)]
+        planned_queries = [_difficulty_bootstrap_query(retrieval_query, level)]
     else:
         expansion = expand.expand_query_practice_fast(
-            literal_query,
+            retrieval_query,
             # Both modes share one cached three-query plan. Their bounded
             # provider budgets decide how much of that plan can be used.
             expansion_count,
@@ -874,7 +875,7 @@ def discover_practice_fast(
             should_cancel=should_cancel,
             context=context,
         )
-        planned_queries = list(expansion.get("queries") or []) or [literal_query]
+        planned_queries = list(expansion.get("queries") or []) or [retrieval_query]
     for candidate in planned_queries:
         query = " ".join(str(candidate or "").split())
         key = " ".join(query.casefold().split())
@@ -904,12 +905,12 @@ def discover_practice_fast(
 
     from ..services.search_query_plan import semantic_query_family
 
-    root_family = semantic_query_family(literal_query)
+    root_family = semantic_query_family(retrieval_query)
 
     def annotate(result_sets: list[dict], *, expanded: bool = False) -> None:
         for result_set in result_sets:
             query = " ".join(str(result_set.get("query") or "").split())
-            is_literal = query.casefold() == literal_query.casefold()
+            is_literal = query.casefold() == retrieval_query.casefold()
             result_set.update(
                 query_family=(semantic_query_family(query) or root_family),
                 query_trust=("literal" if is_literal else "ai" if expanded else "trusted"),
@@ -958,7 +959,7 @@ def discover_practice_fast(
             enough=enough_ranked_videos,
             annotate=annotate,
             recovery_queries=(
-                _grounded_cursor_recovery_queries(literal_query)
+                _grounded_cursor_recovery_queries(retrieval_query)
                 if str(expansion.get("provider_used") or "")
                 == "literal_fallback"
                 else ()
@@ -1007,21 +1008,21 @@ def discover_practice_fast(
         fallback_result = {"per_query": [], "credits_used": 0, "warning": None}
         component_result = {"per_query": [], "credits_used": 0, "warning": None}
         qualified_key = " ".join(initial_queries[0].casefold().split())
-        literal_key = " ".join(literal_query.casefold().split())
+        literal_key = " ".join(retrieval_query.casefold().split())
         if (
             not eligible_initial
             and qualified_key != literal_key
             and len(initial_queries) < query_count
         ):
             fallback_result = supadata_search.search_all(
-                [literal_query],
+                [retrieval_query],
                 filters,
                 **search_runtime,
             )
             raise_if_cancelled(should_cancel)
             annotate(fallback_result["per_query"])
             per_query.extend(fallback_result["per_query"])
-            initial_queries.append(literal_query)
+            initial_queries.append(retrieval_query)
 
         remaining_component_queries: list[str] = []
         for component in component_queries:
@@ -1063,11 +1064,11 @@ def discover_practice_fast(
             video for video in ranked if video.get("id") not in excluded
         ][:top_n]
         return {
-            "corrected": literal_query,
+            "corrected": retrieval_query,
             "queries": initial_queries,
             # The deterministic qualifier is retrieval-only. Transcript
             # segmentation and topic-evidence checks retain the raw topic.
-            "topic_terms": [literal_query],
+            "topic_terms": [retrieval_query],
             "provider_used": "deterministic",
             "videos": videos,
             "credits_used": (
@@ -1110,13 +1111,16 @@ def discover_practice_fast(
             else None
         ),
     )
-    corrected = " ".join(str(expansion.get("corrected") or literal_query).split()) or literal_query
+    corrected = (
+        " ".join(str(expansion.get("corrected") or retrieval_query).split())
+        or retrieval_query
+    )
     return {
         "corrected": corrected,
         "queries": initial_queries,
         # AI queries discover sources only. The exact request stays attached as
         # evidence identity while the validated Gemini summary drives selection.
-        "topic_terms": [literal_query],
+        "topic_terms": [retrieval_query],
         "provider_used": expansion.get("provider_used") or "literal_fallback",
         "videos": videos,
         "credits_used": (

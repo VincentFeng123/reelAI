@@ -1740,7 +1740,7 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v3"
-PRO_BOUNDARY_PROFILE = "pro_boundary_v22"
+PRO_BOUNDARY_PROFILE = "pro_boundary_v23"
 # Production Flash performs only the compact, quality-critical boundary choice.
 PRODUCTION_FLASH_PROFILE = FLASH_SPLIT_PROFILE
 # Authoritative and fallback Pro routes use the same compact boundary contract.
@@ -1790,7 +1790,7 @@ _SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
 _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
-_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v9"
+_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v10"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
 
 _PRICING_VERSION = "gemini-standard-2026-07-11"
@@ -2501,6 +2501,10 @@ _POLICY_AND_EXAMPLES = """Policy:
   genuinely related facet or worked example into its own candidate. For a constrained
   request, distinguish exact PRIMARY units from related SUPPORTING units; do not collapse the
   source to one literal match.
+- Multi-part requests are curricula for separate atomic facet units, not permission for an
+  umbrella PRIMARY made from adjacent independent lessons. Keep a synthesis only when its
+  speech teaches the parts' relationship. Preserve any-length indivisible derivations,
+  proofs, worked problems, mechanisms, or causal chains; never impose a duration cap.
 - An outline such as "three areas of calculus" or "two goals of this lesson" is navigation,
   not a teaching unit and not valid evidence. Return the substantive atomic units it names as
   separate candidates. Keep two concepts together only when their spoken relationship or
@@ -3156,6 +3160,9 @@ def _boundary_prompts(
         "quality bar merely to produce more clips. Return qualifying moments up to "
         f"{_MAX_SELECTOR_CANDIDATES} for this source; "
         "do not stop after the first few units or at an arbitrary count below that cap. "
+        "Keep independent request facets as separate candidates; never widen PRIMARY across "
+        "sibling lessons merely for coverage. Keep a cross-facet unit only when its speech "
+        "teaches their relationship, and preserve any-length indivisible teaching arcs. "
         "MANDATORY REQUEST-COVERAGE AUDIT (silent): Build a checklist from every request "
         "constraint and every member governed by words such as 'each', 'every', and 'all'. "
         "Scan the entire transcript separately for every checklist item. Return every "
@@ -3538,6 +3545,12 @@ def _pro_boundary_audit_prompts(
           "do not prove a reciprocal, causal, comparative, equivalence, or sequence relation. "
           "Reclassify a kept candidate to the narrow relationship its speech really teaches; "
           "do not reject related teaching merely because the selector mislabeled it.\n\n"
+          "ATOMICITY — repair umbrella spans before boundaries: If a span contains independent "
+          "objectives, keep the nearest one proved by ev/ie and shrink s/e and sq/eq to its "
+          "setup through conclusion; correct direct/ie to that unit. Keep a synthesis only if "
+          "its speech teaches the parts' relationship—not an agenda, list, recap, or adjacency. "
+          "Preserve any-length indivisible derivations, proofs, worked problems, mechanisms, "
+          "and causal chains; duration never decides atomicity.\n\n"
           "BOUNDARIES — perform this separately; a failure here never changes KEEP to reject:\n"
           "Reread the literal current speech as a cold listener. The opening must include the "
           "candidate's own necessary setup and resolve every referent. Openings such as 'This "

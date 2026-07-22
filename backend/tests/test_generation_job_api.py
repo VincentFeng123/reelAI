@@ -4599,7 +4599,7 @@ def test_generation_job_reels_reuses_unseen_source_inventory_without_redelivery(
         conn.close()
 
 
-def test_fast_final_surfaces_only_matching_difficulty_inventory() -> None:
+def test_fast_final_uses_nearest_difficulty_without_hiding_valid_inventory() -> None:
     conn = _conn()
     generation_id = main._create_generation_row(
         conn,
@@ -4653,11 +4653,10 @@ def test_fast_final_surfaces_only_matching_difficulty_inventory() -> None:
         )
 
         assert [reel["reel_id"] for reel in reels] == [
-            "mixed-reel-0",
-            "mixed-reel-1",
+            f"mixed-reel-{index}" for index in range(8)
         ]
         assert main._count_generation_reels(conn, generation_id) == 13
-        assert main._count_generation_surfaceable_reels(conn, generation_id) == 2
+        assert main._count_generation_surfaceable_reels(conn, generation_id) == 13
         assert main._count_material_ready_reels(conn, "m1") == 13
     finally:
         conn.close()
@@ -4876,7 +4875,7 @@ def test_gemini_authority_reuse_bypasses_semantic_and_boundary_gates() -> None:
         conn.close()
 
 
-def test_transcript_aligned_inventory_counts_reuses_and_replays_only_current_surface_rows() -> None:
+def test_transcript_aligned_inventory_treats_legacy_level_mismatch_as_soft() -> None:
     conn = _conn()
     generation_id = "transcript-boundary-generation"
     created_at = "2026-07-10T00:00:00+00:00"
@@ -4933,7 +4932,7 @@ def test_transcript_aligned_inventory_counts_reuses_and_replays_only_current_sur
             (json.dumps(context), "transcript-boundary-reel"),
         )
         assert main._count_generation_reels(conn, generation_id) == 1
-        assert main._count_generation_surfaceable_reels(conn, generation_id) == 0
+        assert main._count_generation_surfaceable_reels(conn, generation_id) == 1
         assert main._usable_boundary_reel_ids(
             conn, ["transcript-boundary-reel"]
         ) == {"transcript-boundary-reel"}
@@ -5655,7 +5654,7 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
         conn.close()
 
 
-def test_deferred_only_generation_persists_reusable_inventory_without_current_surface(
+def test_off_level_generation_releases_valid_inventory_without_second_search(
     monkeypatch,
 ) -> None:
     conn = _conn()
@@ -5720,11 +5719,11 @@ def test_deferred_only_generation_persists_reusable_inventory_without_current_su
         terminal_job = generation_jobs.get_job(conn, job["id"])
         assert terminal_job is not None
         generation_id = str(terminal_job["result_generation_id"] or "")
-        assert terminal_job["status"] == "partial"
+        assert terminal_job["status"] == "completed"
         assert generation_id
         assert terminal_job["terminal_error_code"] is None
         assert main._count_generation_reels(conn, generation_id) == 1
-        assert main._count_generation_surfaceable_reels(conn, generation_id) == 0
+        assert main._count_generation_surfaceable_reels(conn, generation_id) == 1
         stored_context = json.loads(str(conn.execute(
             "SELECT search_context_json FROM reels WHERE id = 'deferred-only-reel'"
         ).fetchone()["search_context_json"]))
@@ -5748,10 +5747,10 @@ def test_deferred_only_generation_persists_reusable_inventory_without_current_su
         terminal_event = next(event for event in events if event["type"] == "terminal")
         assert [
             reel["reel_id"] for reel in final_event["payload"]["reels"]
-        ] == []
+        ] == ["deferred-only-reel"]
         assert final_event["payload"]["generation_id"] == generation_id
         assert final_event["payload"]["authoritative"] is True
-        assert terminal_event["payload"]["status"] == "partial"
+        assert terminal_event["payload"]["status"] == "completed"
         assert terminal_event["payload"]["result_generation_id"] == generation_id
 
         assert main._verified_cross_request_source_generation(
@@ -5767,7 +5766,7 @@ def test_deferred_only_generation_persists_reusable_inventory_without_current_su
         conn.close()
 
 
-def test_generation_worker_persists_a_nearest_level_clip_for_later_reuse(
+def test_generation_worker_releases_nearest_level_clip_when_it_is_only_valid_clip(
     monkeypatch,
 ) -> None:
     conn = _conn()
@@ -5859,7 +5858,7 @@ def test_generation_worker_persists_a_nearest_level_clip_for_later_reuse(
         generation_id = str(terminal_job["result_generation_id"] or "")
         assert generation_id
         assert main._count_generation_reels(conn, generation_id) == 1
-        assert main._count_generation_surfaceable_reels(conn, generation_id) == 0
+        assert main._count_generation_surfaceable_reels(conn, generation_id) == 1
         assert main._verified_reusable_generation_chain(
             conn,
             generation_id=generation_id,
@@ -5870,7 +5869,7 @@ def test_generation_worker_persists_a_nearest_level_clip_for_later_reuse(
         final_event = next(event for event in events if event["type"] == "final")
         assert [
             reel["reel_id"] for reel in final_event["payload"]["reels"]
-        ] == []
+        ] == ["usable-intermediate-fallback"]
         assert final_event["payload"]["generation_id"] == generation_id
         terminal_event = next(
             event for event in events if event["type"] == "terminal"
@@ -6021,7 +6020,7 @@ def test_deferred_only_slow_reservoir_queues_current_batch_after_level_change(
         conn.close()
 
 
-def test_cross_request_current_level_reservoir_does_not_force_fresh_top_up(
+def test_cross_request_legacy_level_reservoir_does_not_force_fresh_top_up(
     monkeypatch,
 ) -> None:
     conn = _conn()
@@ -6035,6 +6034,31 @@ def test_cross_request_current_level_reservoir_does_not_force_fresh_top_up(
         generation_mode="slow",
         retrieval_profile="unified",
     )
+    for index in range(5):
+        reel_id = f"legacy-level-reel-{index}"
+        _insert_generation_reel(
+            conn,
+            generation_id=source_generation_id,
+            reel_id=reel_id,
+            video_id=f"legacy-level-video-{index}",
+            created_at=(now + timedelta(seconds=index)).isoformat(),
+        )
+        row = conn.execute(
+            "SELECT search_context_json FROM reels WHERE id = ?",
+            (reel_id,),
+        ).fetchone()
+        context = json.loads(str(row[0]))
+        context.update({
+            "surface_eligible": False,
+            "surface_reason": "level_mismatch",
+            "deferred_level": True,
+            "boundary_confidence": 0.9,
+        })
+        conn.execute(
+            "UPDATE reels SET difficulty = 0.85, search_context_json = ? "
+            "WHERE id = ?",
+            (json.dumps(context), reel_id),
+        )
     job, _ = generation_jobs.submit_or_get_active(
         conn,
         material_id="m1",
@@ -6053,28 +6077,55 @@ def test_cross_request_current_level_reservoir_does_not_force_fresh_top_up(
         now=now,
     )
     assert leased
-    calls: list[dict] = []
+    organizer_candidates: list[str] = []
 
-    def generate_stage(_worker_conn, **kwargs) -> None:
-        calls.append(kwargs)
+    def order_batch(reels, **_kwargs):
+        organizer_candidates.extend(str(reel["reel_id"]) for reel in reels)
+        selected = list(reels)
+        return mock.Mock(
+            reels=selected,
+            ordered_reel_ids=[str(reel["reel_id"]) for reel in selected],
+            assessment_checkpoint_reel_ids=[],
+            model_used="gemini-test",
+            degraded=False,
+            fallback_reason=None,
+            provider_called=True,
+        )
 
-    monkeypatch.setattr(
-        main,
-        "_current_level_reusable_generation_reel_count",
-        lambda *_args, **_kwargs: 5,
+    generate_stage = mock.Mock(
+        side_effect=AssertionError("soft level inventory must prevent retrieval")
     )
     monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
     monkeypatch.setattr(
-        main,
-        "_generation_job_reels",
-        lambda *_args, **_kwargs: [
-            {"reel_id": f"reel-{index}"} for index in range(5)
-        ],
+        main.reel_service,
+        "_score_text_relevance",
+        lambda *_args, **_kwargs: {
+            "score": 0.99,
+            "concept_overlap": 1.0,
+            "context_overlap": 1.0,
+            "matched_terms": ["cell", "energy"],
+            "off_topic_penalty": 0.0,
+            "reason": "matched exact topic",
+        },
     )
     try:
+        assert main._current_level_reusable_generation_reel_count(
+            conn,
+            generation_id=source_generation_id,
+            material_id="m1",
+            concept_id="c1",
+            learner_id="learner-1",
+            request_params={"generation_mode": "slow", "num_reels": 5},
+            requested=5,
+        ) == 5
+
         main._run_leased_generation_job(leased, threading.Event())
 
-        assert calls == []
+        generate_stage.assert_not_called()
+        assert set(organizer_candidates) == {
+            f"legacy-level-reel-{index}" for index in range(5)
+        }
         assert generation_jobs.get_job(conn, job["id"])["status"] == "completed"
     finally:
         conn.close()
@@ -9803,7 +9854,7 @@ def test_feed_fast_reservoir_queues_slow_top_up_despite_full_ranked_page(
         conn.close()
 
 
-def test_feed_queues_only_when_cross_level_reservoir_has_no_current_level_clip(
+def test_feed_queues_when_cross_request_reservoir_has_no_reusable_clip(
     monkeypatch,
 ) -> None:
     conn = _conn()
@@ -10561,7 +10612,7 @@ def test_generate_fast_reservoir_queues_slow_top_up(
         conn.close()
 
 
-def test_generate_queues_when_cross_level_reservoir_has_no_current_level_clip(
+def test_generate_queues_when_cross_request_reservoir_has_no_reusable_clip(
     monkeypatch,
 ) -> None:
     conn = _conn()

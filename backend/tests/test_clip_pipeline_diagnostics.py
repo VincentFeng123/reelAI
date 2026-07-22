@@ -798,12 +798,22 @@ def test_ingest_topic_does_not_treat_non_gemini_correction_as_intent_summary(
 
     _pipeline().ingest_topic(
         topic="ATP in cellular respiration mitochondria",
+        literal_topic=(
+            "Learn cellular respiration from glycolysis through the Krebs cycle "
+            "and oxidative phosphorylation"
+        ),
         material_id="material",
         concept_id="concept",
         max_videos=1,
     )
 
     assert captured_topics == ["ATP in cellular respiration mitochondria"]
+    assert discovery["videos"][0]["_literal_topic"].startswith(
+        "Learn cellular respiration"
+    )
+    assert discovery["videos"][0]["_search_context"]["requested_topic"].startswith(
+        "Learn cellular respiration"
+    )
 
 
 def test_ingest_topic_rejects_transcript_window_without_topic_evidence(monkeypatch) -> None:
@@ -1174,7 +1184,7 @@ def test_topic_generation_preserves_shared_gemini_cue_overlap_before_persistence
         retrieval_profile="deep",
     )
 
-    assert reels == ["reel-preferred-left"]
+    assert reels == ["reel-preferred-left", "reel-secondary-right"]
     assert set(verification_calls) == {(0.0, 12.0), (8.0, 30.0)}
     by_id = {
         str(clip["selection_candidate_id"]).split("::")[-1]: clip
@@ -4257,7 +4267,7 @@ def test_topic_generation_dedupes_groq_refinement_for_one_shared_cue_video(
         retrieval_profile="deep",
     )
 
-    assert reels == ["reel-preferred-left"]
+    assert reels == ["reel-preferred-left", "reel-secondary-right"]
     assert len(stored) == 2
     assert groq_words.call_count == 1
     by_id = {
@@ -4730,6 +4740,105 @@ def test_groq_word_spans_add_safe_cushions_without_reaching_neighbor() -> None:
     )
     assert aligned.end_sec >= projection["end"]["quote_last_end_sec"]
     assert aligned.end_sec < projection["end"]["excluded_neighbor_onset_sec"]
+
+
+def test_context_boundary_stays_strictly_before_excluded_neighbor_onset() -> None:
+    result = pipeline_module._transcript_aligned_result(
+        pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "unavailable",
+            16.26,
+            43.12,
+            {"stage": "transcript", "reason": "complete_discourse_boundary"},
+        ),
+        speech_bounds=(16.26, 43.12),
+        search_limits=(15.82, 44.079),
+        projection_diagnostics={
+            "end": {
+                "mode": "cue_edge",
+                "cue_id": "selected-cue",
+                "required_speech_sec": 43.12,
+                "excluded_neighbor_onset_sec": 44.079,
+            }
+        },
+    )
+
+    assert result.status == "context_aligned"
+    assert result.end_sec == pytest.approx(44.069)
+    assert result.diagnostics["final_range"] == [16.26, 44.069]
+    assert result.diagnostics["required_speech_range"] == [16.26, 43.12]
+    assert result.diagnostics["excluded_neighbor_guard"] == {
+        "mode": "strict_before_excluded_neighbor_onset",
+        "excluded_neighbor_cue_id": "",
+        "excluded_neighbor_onset_sec": 44.079,
+        "original_end_sec": 44.079,
+        "guarded_end_sec": 44.069,
+        "margin_ms": 10,
+    }
+
+
+def test_context_boundary_does_not_shorten_an_end_before_the_next_cue() -> None:
+    result = pipeline_module._transcript_aligned_result(
+        pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "unavailable",
+            16.26,
+            43.12,
+            {"stage": "transcript", "reason": "complete_discourse_boundary"},
+        ),
+        speech_bounds=(16.26, 43.12),
+        search_limits=(15.82, 44.079),
+        projection_diagnostics={
+            "end": {
+                "mode": "cue_edge",
+                "required_speech_sec": 43.12,
+                "excluded_neighbor_onset_sec": 44.5,
+            }
+        },
+    )
+
+    assert result.end_sec == pytest.approx(44.079)
+    assert "excluded_neighbor_guard" not in result.diagnostics
+
+
+def test_gemini_playable_fallback_guards_a_touching_excluded_cue() -> None:
+    transcript = {
+        "duration": 50.0,
+        "segments": [
+            {
+                "cue_id": "selected-cue",
+                "start": 16.26,
+                "end": 44.079,
+                "text": "Friction opposes motion and is therefore to the left.",
+            },
+            {
+                "cue_id": "excluded-joke",
+                "start": 44.079,
+                "end": 48.0,
+                "text": "I feel like there should be snow on the ground.",
+            },
+        ],
+    }
+    clip = _quality_clip(
+        cue_id="selected-cue",
+        start=16.26,
+        end=44.079,
+        quote="Friction opposes motion and is therefore to the left.",
+        selection_authority="gemini",
+    )
+
+    diagnostics = pipeline_module._apply_gemini_playable_boundary_fallback(
+        transcript,
+        clip,
+        source_end_sec=50.0,
+        reason="boundary_refinement_unavailable",
+    )
+
+    assert diagnostics is not None
+    assert clip["cue_ids"] == ["selected-cue"]
+    assert clip["end"] == pytest.approx(44.069)
+    assert diagnostics["final_range"] == [16.26, 44.069]
+    assert diagnostics["excluded_neighbor_guard"]["excluded_neighbor_cue_id"] == (
+        "excluded-joke"
+    )
 
 
 def test_groq_word_span_cushions_clamp_at_tight_neighbor_speech() -> None:
@@ -6402,7 +6511,7 @@ def test_hard_gemini_contract_rejects_off_topic_candidates(
     assert clips == []
 
 
-def test_gemini_authority_bypasses_material_semantic_but_not_level_filters(
+def test_gemini_authority_bypasses_local_semantic_and_level_gates(
     monkeypatch,
 ) -> None:
     engine_out = _one_cue_selector_result(
@@ -6674,7 +6783,7 @@ def test_each_quality_axis_has_a_hard_point_seven_five_gate(
         ("advanced", [10.0, 0.0], [False, True]),
     ],
 )
-def test_candidate_plan_prioritizes_level_eligible_then_difficulty(
+def test_candidate_plan_prioritizes_nearest_level_by_difficulty(
     monkeypatch,
     knowledge_level: str,
     expected_starts: list[float],
@@ -6717,7 +6826,7 @@ def test_candidate_plan_prioritizes_level_eligible_then_difficulty(
     ] == expected_deferred
 
 
-def test_all_deferred_source_stores_for_later_without_filling_current_batch(
+def test_all_off_level_source_fills_current_batch_with_nearest_valid_clip(
     monkeypatch,
 ) -> None:
     engine_out = {
@@ -6765,18 +6874,18 @@ def test_all_deferred_source_stores_for_later_without_filling_current_batch(
         on_reel_created=emitted.append,
     )
 
-    assert reels == []
-    assert emitted == []
+    assert reels == ["nearest-level-reel"]
+    assert emitted == ["nearest-level-reel"]
     assert stored[0]["search_context"]["deferred_level"] is True
-    assert stored[0]["search_context"]["surface_reason"] == "level_mismatch"
-    assert stored[0]["search_context"]["surface_eligible"] is False
+    assert "surface_reason" not in stored[0]["search_context"]
+    assert stored[0]["search_context"]["surface_eligible"] is True
     assert context.counters()["stored_clips"] == 1
-    assert context.counters()["deferred_clips"] == 1
-    assert context.counters()["level_deferred_clips"] == 1
-    assert context.counters()["persisted_clips"] == 0
+    assert context.counters()["deferred_clips"] == 0
+    assert context.counters()["level_deferred_clips"] == 0
+    assert context.counters()["persisted_clips"] == 1
 
 
-def test_gemini_authority_is_level_deferred_during_persistence(
+def test_gemini_authority_keeps_off_level_difficulty_as_advisory_metadata(
     monkeypatch,
 ) -> None:
     engine_out = {
@@ -6828,15 +6937,15 @@ def test_gemini_authority_is_level_deferred_during_persistence(
         max_persisted_reels=1,
     )
 
-    assert reels == []
+    assert reels == ["authoritative-reel"]
     context = stored[0]["search_context"]
     assert context["selection_authority"] == "gemini"
-    assert context["surface_eligible"] is False
+    assert context["surface_eligible"] is True
     assert context["deferred_level"] is True
-    assert context["surface_reason"] == "level_mismatch"
+    assert "surface_reason" not in context
 
 
-def test_all_deferred_source_stores_all_valid_clips_without_streaming(
+def test_all_off_level_source_streams_all_valid_clips_nearest_first(
     monkeypatch,
 ) -> None:
     transcript = _transcript()
@@ -6898,8 +7007,14 @@ def test_all_deferred_source_stores_all_valid_clips_without_streaming(
         on_reel_created=emitted.append,
     )
 
-    assert reels == []
-    assert emitted == []
+    assert [reel.rsplit("::", 1)[-1] for reel in reels] == [
+        "intermediate-python",
+        "advanced-python",
+    ]
+    assert [reel.rsplit("::", 1)[-1] for reel in emitted] == [
+        "intermediate-python",
+        "advanced-python",
+    ]
 
 
 def test_current_level_candidate_precedes_without_suppressing_other_levels(
@@ -6964,8 +7079,8 @@ def test_current_level_candidate_precedes_without_suppressing_other_levels(
     )
 
     assert stored == ["beginner-python", "advanced-python"]
-    assert reels == ["reel-beginner-python"]
-    assert emitted == ["reel-beginner-python"]
+    assert reels == ["reel-beginner-python", "reel-advanced-python"]
+    assert emitted == ["reel-beginner-python", "reel-advanced-python"]
 
 
 def test_candidate_plan_prioritizes_primary_intent_only_within_difficulty_stage(

@@ -73,10 +73,7 @@ from .segmenter import (
 from .search_query_plan import build_search_query_plan
 from .topic_expansion import TopicExpansionService
 from .structural_classifier import classify_passage
-from .knowledge_level import (
-    difficulty_matches_knowledge_level,
-    effective_level_target,
-)
+from .knowledge_level import effective_level_target
 
 logger = logging.getLogger(__name__)
 
@@ -1246,8 +1243,9 @@ class ReelService:
     # v44: retain trusted Gemini concept-family metadata in ranked response rows.
     # v45: retain candidate, chain, position, and prerequisite organizer metadata.
     # v46: retain the trusted narrow clip concept for organizer input.
+    # v47: treat legacy level-mismatch inventory as a soft ordering candidate.
     # The separate contract key below invalidates prior inventory under v39.
-    RANKED_FEED_CACHE_VERSION = 46
+    RANKED_FEED_CACHE_VERSION = 47
     RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v39"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
@@ -7975,74 +7973,17 @@ class ReelService:
             surface_reason = str(
                 selection_metadata.get("_selection_surface_reason") or ""
             )
-            legacy_difficulty_matches_level = (
-                abs(self._difficulty(row) - level_target) <= 0.35
-            )
-            difficulty_matches_level = (
-                difficulty_matches_knowledge_level(
-                    self._difficulty(row),
-                    str(progress.get("selected_level") or "beginner"),
-                )
-                if selection_version in {
-                    "quality_silence_v3",
-                    "quality_silence_v4",
-                    "quality_silence_v5",
-                    "quality_silence_v6",
-                    "quality_silence_v7",
-                    "quality_silence_v8",
-                    "quality_silence_v9",
-                    "quality_silence_v10",
-                    "quality_silence_v11",
-                    "quality_silence_v12",
-                    "quality_silence_v13",
-                    "quality_silence_v14",
-                    "quality_silence_v15",
-                    "quality_silence_v16",
-                    "quality_silence_v17",
-                    "quality_silence_v18",
-                    "quality_silence_v19",
-                    "quality_silence_v20",
-                    "quality_silence_v21",
-                    "quality_silence_v22",
-                    "quality_silence_v23",
-                    "quality_silence_v24",
-                    "quality_silence_v25",
-                    "quality_silence_v26",
-                    "quality_silence_v27",
-                    "quality_silence_v28",
-                    "quality_silence_v29",
-                    "quality_silence_v30",
-                    "quality_silence_v31",
-                    "quality_silence_v32",
-                    "quality_silence_v35",
-                    "quality_silence_v36",
-                    "quality_silence_v37",
-                    "quality_silence_v38",
-                    "quality_silence_v39",
-                }
-                else legacy_difficulty_matches_level
-            )
-            # A level-deferred clip is stored as reusable inventory, not a
-            # nearest-level fallback. It may return only once this learner's
-            # current level matches the clip's difficulty.
-            deferred_level_candidate = (
-                surface_reason == "level_mismatch"
-                and difficulty_matches_knowledge_level(
-                    self._difficulty(row),
-                    str(progress.get("selected_level") or "beginner"),
-                )
-            )
+            # Compatibility for rows persisted by the former hard-level gate:
+            # difficulty changes order, never membership.
+            soft_level_candidate = surface_reason == "level_mismatch"
             prerequisite_may_become_ready = (
                 surface_reason == "prerequisite_not_surfaceable"
-                and difficulty_matches_level
             )
-            if surface_reason == "level_mismatch" and not deferred_level_candidate:
-                continue
             if (
                 not gemini_selection_authoritative
                 and surface_eligible is False
                 and not (
-                deferred_level_candidate or prerequisite_may_become_ready
+                    soft_level_candidate or prerequisite_may_become_ready
                 )
             ):
                 continue

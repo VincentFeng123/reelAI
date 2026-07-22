@@ -2841,8 +2841,6 @@ def _gemini_selection_is_authoritative(context: object) -> bool:
 def _count_generation_reels(
     conn,
     generation_id: str,
-    *,
-    include_level_deferred: bool = True,
 ) -> int:
     try:
         rows = fetch_all(
@@ -2868,8 +2866,6 @@ def _count_generation_reels(
                 "1", "true", "yes", "on",
             }
         surface_reason = str(context.get("surface_reason") or "").strip().lower()
-        if surface_reason == "level_mismatch" and not include_level_deferred:
-            continue
         if (
             not _gemini_selection_is_authoritative(context)
             and surface_eligible is not True
@@ -2885,13 +2881,9 @@ def _count_generation_reels(
 
 
 def _count_generation_surfaceable_reels(conn, generation_id: str) -> int:
-    """Count clips that can fill the learner's current generation batch."""
+    """Count usable clips; difficulty affects order, never eligibility."""
 
-    return _count_generation_reels(
-        conn,
-        generation_id,
-        include_level_deferred=False,
-    )
+    return _count_generation_reels(conn, generation_id)
 
 
 def _count_material_ready_reels(conn, material_id: str) -> int:
@@ -5196,7 +5188,7 @@ def _reused_generation_reels(
     request_params: dict[str, Any],
     requested: int,
 ) -> list[dict[str, Any]]:
-    """Read a compatible reservoir under the current learner-level rules."""
+    """Read a compatible reservoir with difficulty retained as a soft signal."""
     return _generation_job_reels(
         conn,
         {
@@ -5220,7 +5212,7 @@ def _current_level_reusable_generation_reel_count(
     request_params: dict[str, Any],
     requested: int,
 ) -> int:
-    """Count raw eligible source-chain inventory up to the startup target."""
+    """Count reusable source-chain inventory up to the startup target."""
     if not generation_id:
         return 0
     return min(
@@ -6457,9 +6449,8 @@ def _run_leased_generation_job(
                         )
                 activate_generation = True
             elif has_verified_reservoir:
-                # A fresh generation may contain only verified clips deferred
-                # for another learner level. Keep that reusable reservoir active
-                # without persisting an empty release order.
+                # Preserve a verified reservoir when another operational guard
+                # leaves no releasable row; learner difficulty is not such a guard.
                 final_reels = []
                 activate_generation = True
             elif provider_cursor_open:

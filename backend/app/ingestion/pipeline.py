@@ -151,7 +151,7 @@ CAPTION_PROJECTION_START_PREROLL_SEC = 0.15
 PROJECTED_END_COVERAGE_SEC = 0.002
 GROQ_BOUNDARY_START_PREROLL_SEC = 0.10
 GROQ_BOUNDARY_END_POSTROLL_SEC = 0.02
-GROQ_BOUNDARY_NEIGHBOR_GUARD_SEC = 0.01
+EXCLUDED_NEIGHBOR_END_GUARD_SEC = 0.01
 GROQ_BOUNDARY_WINDOW_SEC = 12.0
 GROQ_BOUNDARY_WINDOW_MARGIN_SEC = 2.0
 # Live boundary windows regularly need 9-12 seconds including local WAV decode
@@ -779,6 +779,24 @@ def _apply_gemini_playable_boundary_fallback(
     end = max(0.0, min(end, source_end))
     if end <= start:
         return None
+    endpoint_guard: dict[str, Any] | None = None
+    segments = [
+        segment
+        for segment in (transcript.get("segments") or [])
+        if isinstance(segment, dict)
+    ]
+    span = _candidate_line_span(segments, clip)
+    if span is not None and span[1] + 1 < len(segments):
+        next_index = span[1] + 1
+        next_segment = segments[next_index]
+        end, endpoint_guard = _guard_shared_excluded_neighbor_endpoint(
+            start_sec=start,
+            end_sec=end,
+            excluded_neighbor_onset_sec=next_segment.get("start"),
+            excluded_neighbor_cue_id=str(
+                next_segment.get("cue_id") or f"cue-{next_index}"
+            ),
+        )
     clip["start"] = round(start, 3)
     clip["end"] = round(end, 3)
     return {
@@ -787,6 +805,11 @@ def _apply_gemini_playable_boundary_fallback(
         "reason": str(reason or "boundary_refinement_unavailable"),
         "final_range": [clip["start"], clip["end"]],
         "source_end_sec": round(source_end, 3),
+        **(
+            {"excluded_neighbor_guard": endpoint_guard}
+            if endpoint_guard is not None
+            else {}
+        ),
     }
 
 
@@ -1394,7 +1417,7 @@ def _projected_speech_bounds(
                         quote_last_end_sec + GROQ_BOUNDARY_END_POSTROLL_SEC,
                         max(
                             quote_last_end_sec,
-                            excluded_sec - GROQ_BOUNDARY_NEIGHBOR_GUARD_SEC,
+                            excluded_sec - EXCLUDED_NEIGHBOR_END_GUARD_SEC,
                         ),
                     ),
                 )
@@ -2144,6 +2167,38 @@ def _candidate_line_span(
     return indices[0], indices[-1]
 
 
+def _guard_shared_excluded_neighbor_endpoint(
+    *,
+    start_sec: float,
+    end_sec: float,
+    excluded_neighbor_onset_sec: float,
+    excluded_neighbor_cue_id: str = "",
+) -> tuple[float, dict[str, Any] | None]:
+    """Keep a selected interval half-open at a touching excluded cue."""
+
+    try:
+        start = float(start_sec)
+        end = float(end_sec)
+        neighbor_onset = float(excluded_neighbor_onset_sec)
+    except (TypeError, ValueError, OverflowError):
+        return end_sec, None
+    if not all(math.isfinite(value) for value in (start, end, neighbor_onset)):
+        return end, None
+    if abs(end - neighbor_onset) > SPEECH_OWNERSHIP_EPSILON_SEC:
+        return end, None
+    guarded_end = round(neighbor_onset - EXCLUDED_NEIGHBOR_END_GUARD_SEC, 3)
+    if guarded_end <= start + SPEECH_OWNERSHIP_EPSILON_SEC:
+        return end, None
+    return guarded_end, {
+        "mode": "strict_before_excluded_neighbor_onset",
+        "excluded_neighbor_cue_id": str(excluded_neighbor_cue_id or ""),
+        "excluded_neighbor_onset_sec": round(neighbor_onset, 3),
+        "original_end_sec": round(end, 3),
+        "guarded_end_sec": guarded_end,
+        "margin_ms": round(EXCLUDED_NEIGHBOR_END_GUARD_SEC * 1000),
+    }
+
+
 def _selector_authorized_acoustic_context(
     transcript: dict[str, Any],
     raw_clip: dict[str, Any],
@@ -2813,6 +2868,27 @@ def _transcript_aligned_result(
         final_end = semantic_end
     else:
         final_end = required_end
+    endpoint_guard: dict[str, Any] | None = None
+    if (
+        isinstance(end_projection, dict)
+        and str(end_projection.get("mode") or "") == "cue_edge"
+    ):
+        guarded_end, candidate_guard = _guard_shared_excluded_neighbor_endpoint(
+            start_sec=final_start,
+            end_sec=final_end,
+            excluded_neighbor_onset_sec=end_projection.get(
+                "excluded_neighbor_onset_sec"
+            ),
+            excluded_neighbor_cue_id=str(
+                end_projection.get("excluded_neighbor_cue_id") or ""
+            ),
+        )
+        if (
+            candidate_guard is not None
+            and required_end <= guarded_end + SPEECH_OWNERSHIP_EPSILON_SEC
+        ):
+            final_end = guarded_end
+            endpoint_guard = candidate_guard
     if (
         not all(
             math.isfinite(value)
@@ -2850,6 +2926,11 @@ def _transcript_aligned_result(
                 round(semantic_end, 3),
             ],
             "final_range": [round(final_start, 3), round(final_end, 3)],
+            **(
+                {"excluded_neighbor_guard": endpoint_guard}
+                if endpoint_guard is not None
+                else {}
+            ),
         },
     )
 
@@ -4886,7 +4967,7 @@ class IngestionPipeline:
             discovered_video["_selection_topic"] = (
                 corrected_topic
                 if str(disc.get("provider_used") or "").casefold() == "gemini"
-                else authoritative_topic
+                else topic
             )
             discovered_video["_search_context"] = _retrieval_search_context(
                 requested_topic=authoritative_topic,
@@ -5694,9 +5775,14 @@ class IngestionPipeline:
                 if gemini_authoritative:
                     search_context["selection_authority"] = "gemini"
                     search_context.pop("surface_reason", None)
+                soft_level_candidate = (
+                    str(search_context.get("surface_reason") or "").strip().lower()
+                    == "level_mismatch"
+                )
                 semantic_eligible = bool(
                     gemini_authoritative
                     or search_context.get("surface_eligible") is not False
+                    or soft_level_candidate
                 )
                 prerequisite_ids = {
                     str(value or "").strip()
@@ -5708,6 +5794,8 @@ class IngestionPipeline:
                     or prerequisite_ids.issubset(surfaceable_candidate_ids)
                 )
                 surface_eligible = semantic_eligible and prerequisites_ready
+                if soft_level_candidate:
+                    search_context.pop("surface_reason", None)
                 boundary_verified_for_storage = False
                 permanently_rejected = False
 
@@ -5895,18 +5983,14 @@ class IngestionPipeline:
                 else:
                     search_context.setdefault("boundary_status", "caption_aligned")
 
-                if surface_eligible and bool(search_context.get("deferred_level")):
-                    surface_eligible = False
-                    search_context["surface_reason"] = "level_mismatch"
-
                 search_context["surface_eligible"] = bool(surface_eligible)
                 clip["search_context"] = search_context
                 if permanently_rejected:
                     if generation_context is not None:
                         # ``deferred_clips`` remains the backward-compatible
                         # aggregate for every non-surfaceable candidate. The
-                        # specific counter distinguishes terminal boundary
-                        # rejection from reusable difficulty deferral.
+                        # specific counter identifies terminal boundary
+                        # rejection; difficulty never reaches this branch.
                         generation_context.increment_counter("deferred_clips")
                         generation_context.increment_counter(
                             "permanently_rejected_clips"
@@ -5939,18 +6023,11 @@ class IngestionPipeline:
                 candidate_id = str(
                     clip.get("selection_candidate_id") or ""
                 ).strip()
-                if candidate_id and (
-                    surface_eligible
-                    or search_context.get("surface_reason") == "level_mismatch"
-                ):
+                if candidate_id and surface_eligible:
                     surfaceable_candidate_ids.add(candidate_id)
                 if not surface_eligible:
                     if generation_context is not None:
                         generation_context.increment_counter("deferred_clips")
-                        if search_context.get("surface_reason") == "level_mismatch":
-                            generation_context.increment_counter(
-                                "level_deferred_clips"
-                            )
                     continue
                 persisted_by_index[candidate_index] = reel
                 if on_reel_created is not None and (
@@ -5960,8 +6037,8 @@ class IngestionPipeline:
                     on_reel_created(reel)
                     callback_indices.add(candidate_index)
 
-            # Level-mismatched clips remain stored for a later learner level;
-            # only clips surfaceable now consume this batch's target.
+            # Difficulty is advisory: keep every otherwise-valid clip in the
+            # organizer pool and order the nearest learner level first.
             selected_reels = persisted_by_index
             selected_indices = sorted(
                 selected_reels,
