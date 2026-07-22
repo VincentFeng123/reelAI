@@ -78,6 +78,16 @@ class _LessonOrderResponse(BaseModel):
     terminal_summary_start_reel_id: str | None = None
 
 
+def _provider_response_schema() -> dict[str, Any]:
+    schema = _LessonOrderResponse.model_json_schema()
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        for property_schema in properties.values():
+            if isinstance(property_schema, dict):
+                property_schema.pop("maxItems", None)
+    return schema
+
+
 @dataclass(frozen=True)
 class LessonOrderResult:
     reels: list[dict[str, Any]]
@@ -1049,7 +1059,7 @@ def _lesson_order_cache_key(system_prompt: str, user_prompt: str) -> str:
         "fallback_model": config.LESSON_ORDER_FALLBACK_MODEL,
         "system_prompt": system_prompt,
         "user_prompt": user_prompt,
-        "response_schema": _LessonOrderResponse.model_json_schema(),
+        "response_schema": _provider_response_schema(),
         "thinking_budget": 0,
         "max_output_tokens": LESSON_ORDER_MAX_OUTPUT_TOKENS,
     }
@@ -1175,7 +1185,7 @@ async def _generate_lesson_order_async(
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     response_mime_type="application/json",
-                    response_json_schema=_LessonOrderResponse.model_json_schema(),
+                    response_json_schema=_provider_response_schema(),
                     thinking_config=types.ThinkingConfig(thinking_budget=0),
                     max_output_tokens=LESSON_ORDER_MAX_OUTPUT_TOKENS,
                 ),

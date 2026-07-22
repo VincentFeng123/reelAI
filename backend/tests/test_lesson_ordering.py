@@ -3782,7 +3782,34 @@ def test_generate_content_receives_text_only_and_no_media_configuration(
     request_config = captured["config"]
     assert getattr(request_config, "media_resolution", None) is None
     assert getattr(request_config, "response_mime_type", None) == "application/json"
+    assert getattr(request_config, "response_json_schema", None) == (
+        lesson_ordering._provider_response_schema()
+    )
     assert not isinstance(captured["contents"], (list, dict, bytes, bytearray))
+
+
+def test_provider_schema_avoids_large_array_grammar_without_weakening_validation() -> None:
+    local_schema = lesson_ordering._LessonOrderResponse.model_json_schema()
+    provider_schema = lesson_ordering._provider_response_schema()
+
+    assert provider_schema["required"] == local_schema["required"]
+    assert provider_schema["additionalProperties"] is False
+    for field_name in (
+        "ordered_reel_ids",
+        "assessment_checkpoint_reel_ids",
+        "prior_restatement_reel_ids",
+    ):
+        assert local_schema["properties"][field_name]["maxItems"] == 200
+        assert "maxItems" not in provider_schema["properties"][field_name]
+
+    with pytest.raises(ValueError):
+        lesson_ordering._LessonOrderResponse.model_validate(
+            {
+                "ordered_reel_ids": [f"reel-{index}" for index in range(201)],
+                "assessment_checkpoint_reel_ids": [],
+                "prior_restatement_reel_ids": [],
+            }
+        )
 
 
 @pytest.mark.parametrize("finish_reason", ["SAFETY", "RECITATION", "BLOCKLIST"])
