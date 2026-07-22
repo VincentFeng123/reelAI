@@ -2154,6 +2154,8 @@ function FeedPageInner() {
         preserveUnmatchedUnseen: boolean;
         preserveUnmatchedLockedPrefix: boolean;
         appendAuthoritativeAfterStableUnseen: boolean;
+        authoritativeTailOrder?: string[] | null;
+        authoritativeTailMaterialId?: string | null;
       },
     ): SessionMergeResult => {
       const currentRows = reelsRef.current;
@@ -2233,7 +2235,44 @@ function FeedPageInner() {
           authoritativeTail.push(...unmatchedStableUnseen);
         }
       }
-      const reordered = dedupeByIdentity([...lockedPrefix, ...authoritativeTail]);
+      let reconciledTail = authoritativeTail;
+      if (Array.isArray(options.authoritativeTailOrder) && options.authoritativeTailOrder.length > 0) {
+        const plannedIds = options.authoritativeTailOrder.map((reelId) => String(reelId || "").trim());
+        const uniquePlannedIds = new Set(plannedIds);
+        const scopedMaterialId = String(options.authoritativeTailMaterialId || "").trim();
+        const isPlannedMaterial = (reel: Reel) => (
+          !scopedMaterialId || String(reel.material_id || "").trim() === scopedMaterialId
+        );
+        const lockedIds = new Set(
+          lockedPrefix
+            .filter(isPlannedMaterial)
+            .map((reel) => String(reel.reel_id || "").trim())
+            .filter(Boolean),
+        );
+        const dedupedTail = dedupeByIdentity(authoritativeTail);
+        const plannedMaterialTail = dedupedTail.filter(isPlannedMaterial);
+        const tailIds = plannedMaterialTail.map((reel) => String(reel.reel_id || "").trim());
+        const tailById = new Map(
+          tailIds.map((reelId, index) => [reelId, plannedMaterialTail[index]] as const),
+        );
+        const knownIds = new Set([...lockedIds, ...tailIds]);
+        const plannedTailIds = plannedIds.filter((reelId) => !lockedIds.has(reelId));
+        const planIsValid = plannedIds.every(Boolean)
+          && uniquePlannedIds.size === plannedIds.length
+          && plannedIds.every((reelId) => knownIds.has(reelId))
+          && tailIds.every(Boolean)
+          && tailById.size === plannedMaterialTail.length
+          && plannedTailIds.length === plannedMaterialTail.length
+          && plannedTailIds.every((reelId) => tailById.has(reelId));
+        if (planIsValid) {
+          const plannedMaterialRows = plannedTailIds.map((reelId) => tailById.get(reelId)!);
+          let plannedMaterialIndex = 0;
+          reconciledTail = dedupedTail.map((reel) => (
+            isPlannedMaterial(reel) ? plannedMaterialRows[plannedMaterialIndex++] : reel
+          ));
+        }
+      }
+      const reordered = dedupeByIdentity([...lockedPrefix, ...reconciledTail]);
       if (!options.preserveUnmatchedLockedPrefix && authoritativeActiveReel) {
         const nextActiveIndex = reordered.indexOf(authoritativeActiveReel);
         if (nextActiveIndex >= 0) {
@@ -2330,6 +2369,12 @@ function FeedPageInner() {
             preserveUnmatchedUnseen: true,
             preserveUnmatchedLockedPrefix: true,
             appendAuthoritativeAfterStableUnseen: options?.appendAuthoritativeAfterStableUnseen === true,
+            ...(data.reconciliation_tail_reel_ids?.length
+              ? {
+                  authoritativeTailOrder: data.reconciliation_tail_reel_ids,
+                  authoritativeTailMaterialId: materialIdValue,
+                }
+              : {}),
           },
         );
         settleGenerationContinuation(materialIdValue, data);
@@ -2725,6 +2770,12 @@ function FeedPageInner() {
                 preserveUnmatchedUnseen: true,
                 preserveUnmatchedLockedPrefix: true,
                 appendAuthoritativeAfterStableUnseen: Boolean(continuationToken),
+                ...(data.reconciliation_tail_reel_ids?.length
+                  ? {
+                      authoritativeTailOrder: data.reconciliation_tail_reel_ids,
+                      authoritativeTailMaterialId: id,
+                    }
+                  : {}),
               },
             );
             settleGenerationContinuation(id, data);

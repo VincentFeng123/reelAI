@@ -390,9 +390,19 @@ def _gemini_status_code(error: Exception) -> int | None:
     return None
 
 
-def _transient_gemini_error(error: Exception) -> bool:
+def _transient_gemini_error(
+    error: Exception,
+    *,
+    retry_provider_cancelled: bool = False,
+) -> bool:
     status = _gemini_status_code(error)
     if status is not None:
+        # Google can return 499 when its serving attempt is cancelled even
+        # though the application is still active. Treat that provider-side
+        # cancellation as transient only for callers that have explicitly
+        # confirmed their own cancellation signal is clear.
+        if status == 499:
+            return bool(retry_provider_cancelled)
         # A known status is authoritative. In particular, do not let text such
         # as "field unavailable" turn a 4xx schema/auth failure into a retry.
         return status in _TRANSIENT_STATUS_CODES
@@ -539,6 +549,7 @@ def generate_json_v3(
     deadline_monotonic: Optional[float],
     operation: str,
     prompt_version: str,
+    initial_attempt_deadline_monotonic: Optional[float] = None,
     max_retries: int = 1,
     retry_status_codes: frozenset[int] | set[int] | None = None,
     cancelled=None,
@@ -554,6 +565,8 @@ def generate_json_v3(
     policy. A second retry is permitted only after an HTTP 503; non-503 failures
     remain capped at one retry. ``deadline_monotonic`` is an absolute
     ``time.monotonic()`` deadline shared by the caller's complete workflow.
+    ``initial_attempt_deadline_monotonic`` may reserve the workflow tail while
+    still allowing a transient retry to use the full operation deadline.
     Cancellation is cooperative between in-flight HTTP requests. Optional
     dispatch hooks run once around every physical provider attempt, including
     retries, so callers can admit and settle attempt-scoped resources.
@@ -571,6 +584,11 @@ def generate_json_v3(
         raise ValueError("timeout_s must be positive")
     if deadline_monotonic is not None and not math.isfinite(float(deadline_monotonic)):
         raise ValueError("deadline_monotonic must be finite")
+    if (
+        initial_attempt_deadline_monotonic is not None
+        and not math.isfinite(float(initial_attempt_deadline_monotonic))
+    ):
+        raise ValueError("initial_attempt_deadline_monotonic must be finite")
     if (isinstance(max_retries, bool) or not isinstance(max_retries, int)
             or max_retries not in (0, 1, 2)):
         raise ValueError("max_retries must be 0, 1, or 2")
@@ -596,6 +614,11 @@ def generate_json_v3(
         if deadline_monotonic is not None
         else time.monotonic() + float(timeout_s)
     )
+    initial_attempt_deadline = (
+        min(operation_deadline, float(initial_attempt_deadline_monotonic))
+        if initial_attempt_deadline_monotonic is not None
+        else operation_deadline
+    )
     client = None
     max_attempts = max_retries + 1
     requests_started = 0
@@ -612,7 +635,10 @@ def generate_json_v3(
             )
             raise GeminiCancelledError("Gemini call cancelled", telemetry)
 
-        remaining_s = operation_deadline - time.monotonic()
+        attempt_deadline = (
+            initial_attempt_deadline if attempt == 0 else operation_deadline
+        )
+        remaining_s = attempt_deadline - time.monotonic()
         if remaining_s <= 0 or (attempt > 0 and remaining_s < 5.0):
             telemetry = last_failure_telemetry or _call_telemetry(
                 model=mdl, operation=operation, prompt_version=prompt_version,
@@ -621,23 +647,6 @@ def generate_json_v3(
                 error_history=error_history,
             )
             raise GeminiDeadlineExceededError("Gemini call deadline exceeded", telemetry)
-        request_timeout_s = min(float(timeout_s), remaining_s)
-
-        http_options = types.HttpOptions(
-            timeout=max(1, int(request_timeout_s * 1000.0)),
-            retry_options=types.HttpRetryOptions(attempts=1),
-        )
-        config_kwargs = dict(
-            system_instruction=system,
-            response_mime_type="application/json",
-            response_json_schema=_gemini3_json_schema(schema),
-            max_output_tokens=int(max_output_tokens),
-            thinking_config=types.ThinkingConfig(thinking_level=level),
-            http_options=http_options,
-        )
-        if media_resolution is not None:
-            config_kwargs["media_resolution"] = media_resolution
-        request_config = types.GenerateContentConfig(**config_kwargs)
         if client is None:
             client = get_client()
         # Client construction can block on credential or transport setup. Do
@@ -651,7 +660,7 @@ def generate_json_v3(
                 error_history=error_history,
             )
             raise GeminiCancelledError("Gemini call cancelled", telemetry)
-        if time.monotonic() >= operation_deadline:
+        if time.monotonic() >= attempt_deadline:
             telemetry = last_failure_telemetry or _call_telemetry(
                 model=mdl, operation=operation, prompt_version=prompt_version,
                 thinking_level=level, started=started,
@@ -665,13 +674,81 @@ def generate_json_v3(
         dispatch_ticket = None
         if before_dispatch is not None:
             dispatch_ticket = before_dispatch(model=mdl, attempt=attempt + 1)
+        application_cancelled = _cancel_requested(cancelled)
+        if application_cancelled or time.monotonic() >= attempt_deadline:
+            telemetry = last_failure_telemetry or _call_telemetry(
+                model=mdl,
+                operation=operation,
+                prompt_version=prompt_version,
+                thinking_level=level,
+                started=started,
+                retries=max(0, requests_started - 1),
+                error_history=error_history,
+            )
+            if after_dispatch is not None:
+                after_dispatch(
+                    dispatch_ticket,
+                    model=mdl,
+                    attempt=attempt + 1,
+                    telemetry=telemetry,
+                    dispatched=False,
+                )
+            if application_cancelled:
+                raise GeminiCancelledError("Gemini call cancelled", telemetry)
+            raise GeminiDeadlineExceededError(
+                "Gemini call deadline exceeded", telemetry,
+            )
+        try:
+            request_timeout_s = min(
+                float(timeout_s),
+                attempt_deadline - time.monotonic(),
+            )
+            http_options = types.HttpOptions(
+                timeout=max(1, int(request_timeout_s * 1000.0)),
+                retry_options=types.HttpRetryOptions(attempts=1),
+            )
+            config_kwargs = dict(
+                system_instruction=system,
+                response_mime_type="application/json",
+                response_json_schema=_gemini3_json_schema(schema),
+                max_output_tokens=int(max_output_tokens),
+                thinking_config=types.ThinkingConfig(thinking_level=level),
+                http_options=http_options,
+            )
+            if media_resolution is not None:
+                config_kwargs["media_resolution"] = media_resolution
+            request_config = types.GenerateContentConfig(**config_kwargs)
+        except Exception as error:  # noqa: BLE001
+            telemetry = _call_telemetry(
+                model=mdl,
+                operation=operation,
+                prompt_version=prompt_version,
+                thinking_level=level,
+                started=started,
+                retries=max(0, requests_started - 1),
+                error=error,
+                error_history=error_history,
+            )
+            if after_dispatch is not None:
+                after_dispatch(
+                    dispatch_ticket,
+                    model=mdl,
+                    attempt=attempt + 1,
+                    telemetry=telemetry,
+                    dispatched=False,
+                )
+            raise
         requests_started += 1
         try:
             response = client.models.generate_content(
                 model=mdl, contents=user, config=request_config,
             )
         except Exception as error:  # noqa: BLE001
-            retryable = _transient_gemini_error(error)
+            application_cancelled = _cancel_requested(cancelled)
+            retryable = _transient_gemini_error(
+                error,
+                retry_provider_cancelled=not application_cancelled,
+            )
             error_history.append({
                 "provider_error_type": type(error).__name__,
                 "provider_status_code": _gemini_status_code(error),
@@ -693,7 +770,7 @@ def generate_json_v3(
                     attempt=attempt + 1,
                     telemetry=telemetry,
                 )
-            if _cancel_requested(cancelled):
+            if application_cancelled or _cancel_requested(cancelled):
                 raise GeminiCancelledError("Gemini call cancelled", telemetry) from error
             if time.monotonic() >= operation_deadline:
                 raise GeminiDeadlineExceededError(
@@ -750,7 +827,7 @@ def generate_json_v3(
             )
         if _cancel_requested(cancelled):
             raise GeminiCancelledError("Gemini call cancelled", telemetry)
-        if time.monotonic() >= operation_deadline:
+        if time.monotonic() >= attempt_deadline:
             raise GeminiDeadlineExceededError("Gemini call deadline exceeded", telemetry)
         finish_reason = (telemetry.finish_reason or "").upper()
         response_error_type: type[GeminiCallError] | None = None

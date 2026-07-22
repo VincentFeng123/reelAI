@@ -185,7 +185,7 @@ def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_
 
     assert payload["concept_title"] == "How force and mass change acceleration"
     assert payload["concept_family"] == "force-mass-acceleration proportionality"
-    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v12"
+    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v13"
     assert "semantic restatements" in lesson_ordering._SYSTEM_PROMPT
     assert "concept, then explanation, then application or worked example" in (
         lesson_ordering._SYSTEM_PROMPT
@@ -199,6 +199,204 @@ def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_
     )
     assert "learner_level" not in payload
     assert "difficulty" in payload
+
+
+def test_required_prior_unseen_anchor_can_move_after_recovered_foundations(
+    monkeypatch,
+) -> None:
+    reels = [
+        _reel(
+            "prior-application",
+            video_id="incline-video",
+            start=100,
+            concept="incline worked application",
+            difficulty=0.45,
+        ),
+        _reel(
+            "recovered-foundation",
+            video_id="foundation-video",
+            start=0,
+            concept="net force and F equals m a",
+            difficulty=0.20,
+        ),
+        _reel(
+            "recovered-simple-problem",
+            video_id="simple-video",
+            start=0,
+            concept="single force worked problem",
+            difficulty=0.25,
+        ),
+    ]
+    captured_prompt = ""
+
+    def fake_generate(_system_prompt, user_prompt, **_kwargs):
+        nonlocal captured_prompt
+        captured_prompt = user_prompt
+        return _generation_result([
+            "recovered-foundation",
+            "recovered-simple-problem",
+            "prior-application",
+        ])
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic=(
+            "Start with net force and F=ma, then solve progressively harder "
+            "problems ending with an incline."
+        ),
+        learner_level="beginner",
+        learner_difficulty_target=0.15,
+        release_limit=len(reels),
+        required_reel_ids=["prior-application"],
+    )
+
+    learning_request = json.loads(
+        captured_prompt.split("LEARNING_REQUEST_JSON:\n", 1)[1].split(
+            "\n\nCLIPS_JSON:\n", 1
+        )[0]
+    )
+    assert learning_request["required_reel_ids"] == ["prior-application"]
+    assert result.ordered_reel_ids == [
+        "recovered-foundation",
+        "recovered-simple-problem",
+        "prior-application",
+    ]
+    assert result.degraded is False
+
+
+def test_required_prior_unseen_anchor_omission_retries_then_recovers(
+    monkeypatch,
+) -> None:
+    reels = [
+        _reel(
+            "prior-application",
+            video_id="application-video",
+            start=0,
+            concept="advanced application",
+        ),
+        _reel(
+            "recovered-foundation",
+            video_id="foundation-video",
+            start=0,
+            concept="foundation",
+        ),
+    ]
+    responses = iter([
+        _generation_result(["recovered-foundation"]),
+        _generation_result(["recovered-foundation", "prior-application"]),
+    ])
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return next(responses)
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="foundation before application",
+        release_limit=2,
+        required_reel_ids=["prior-application"],
+    )
+
+    assert calls == 2
+    assert result.ordered_reel_ids == [
+        "recovered-foundation",
+        "prior-application",
+    ]
+    assert result.degraded is False
+
+
+def test_required_prior_unseen_anchor_survives_append_safe_fallback(
+    monkeypatch,
+) -> None:
+    reels = [
+        _reel(
+            "prior-application",
+            video_id="application-video",
+            start=0,
+            concept="advanced application",
+        ),
+        _reel(
+            "recovered-foundation",
+            video_id="foundation-video",
+            start=0,
+            concept="foundation",
+        ),
+    ]
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result(["recovered-foundation"])
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="foundation before application",
+        release_limit=2,
+        required_reel_ids=["prior-application"],
+    )
+
+    assert calls == 2
+    assert result.ordered_reel_ids == [
+        "prior-application",
+        "recovered-foundation",
+    ]
+    assert result.degraded is True
+    assert result.fallback_reason == "invalid_model_order"
+
+
+def test_overlapping_required_prior_unseen_anchors_both_survive_fallback(
+    monkeypatch,
+) -> None:
+    reels = [
+        _reel(
+            "prior-first",
+            video_id="shared-video",
+            start=0,
+            concept="first previously released explanation",
+        ),
+        _reel(
+            "prior-second",
+            video_id="shared-video",
+            start=2,
+            concept="second previously released explanation",
+        ),
+        _reel(
+            "recovered-foundation",
+            video_id="foundation-video",
+            start=0,
+            concept="recovered foundation",
+        ),
+    ]
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["recovered-foundation"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="foundation before both existing explanations",
+        release_limit=3,
+        required_reel_ids=["prior-first", "prior-second"],
+    )
+
+    assert result.ordered_reel_ids == [
+        "prior-first",
+        "prior-second",
+        "recovered-foundation",
+    ]
+    assert result.degraded is True
+    assert result.fallback_reason == "invalid_model_order"
 
 
 def test_prior_objective_evidence_lets_existing_ai_omit_only_cross_source_restatement(
@@ -370,6 +568,7 @@ def test_small_batch_keeps_the_full_object_prompt_byte_for_byte() -> None:
         "topic": "first concept then second concept",
         "learner_level": "beginner",
         "release_limit": 2,
+        "required_reel_ids": [],
         "prior_concept_coverage": [],
         "recent_prior_objective_coverage": [],
         "available_intent_obligations": [],
@@ -3545,8 +3744,8 @@ def test_lesson_order_cache_round_trips_validated_prior_restatements(
     assert cached.ordered_reel_ids == ["selected"]
     assert cached.prior_restatement_reel_ids == ["repeat"]
     response_payload = json.loads(stored["response_json"])
-    assert response_payload["prompt_version"] == "lesson_order_v12"
-    assert response_payload["cache_version"] == 10
+    assert response_payload["prompt_version"] == "lesson_order_v13"
+    assert response_payload["cache_version"] == 11
     assert _REAL_READ_CACHED_LESSON_ORDER(
         "cache-key",
         original=reels,

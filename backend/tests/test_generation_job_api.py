@@ -69,7 +69,7 @@ def test_fresh_inventory_and_selector_cache_share_current_contract() -> None:
         main.SELECTION_CONTRACT_VERSION,
         ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
     } == {"quality_silence_v39"}
-    assert generation_jobs.REQUEST_SCHEMA_VERSION == "adaptive_clip_concepts_v5"
+    assert generation_jobs.REQUEST_SCHEMA_VERSION == "adaptive_clip_concepts_v6"
     assert segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v39"
     assert "quality_silence_v18" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
     assert "quality_silence_v19" in ReelService.DIFFICULTY_FALLBACK_CONTRACTS
@@ -1677,13 +1677,23 @@ def test_generation_organizer_uses_source_history_with_or_without_continuation_t
         return original_continuation_history(worker_conn, continuation_token)
 
     def order_batch(reels, **kwargs):
+        expected_candidate_indexes = (
+            range(9) if with_continuation_token else range(3, 9)
+        )
         assert [reel["reel_id"] for reel in reels] == [
-            f"window-reel-{index}" for index in range(3, 9)
+            f"window-reel-{index}" for index in expected_candidate_indexes
         ]
-        assert kwargs["release_limit"] == len(reels) == 6
+        assert kwargs["release_limit"] == len(reels) == (
+            9 if with_continuation_token else 6
+        )
         assert kwargs["learner_level"] == "beginner"
         assert kwargs["learner_difficulty_target"] == effective_target
-        assert kwargs["prior_concept_coverage"] == [{
+        assert kwargs["required_reel_ids"] == (
+            [f"window-reel-{index}" for index in range(3)]
+            if with_continuation_token
+            else []
+        )
+        expected_prior_coverage = [{
             "concept_id": "c1",
             "concept_family": "",
             "concept_title": "Mitochondria",
@@ -1692,7 +1702,7 @@ def test_generation_organizer_uses_source_history_with_or_without_continuation_t
             ],
             "delivered_count": 3,
         }]
-        assert kwargs["recent_prior_objective_coverage"] == [
+        expected_recent_coverage = [
             {
                 "concept_id": "c1",
                 "concept_family": "",
@@ -1705,10 +1715,37 @@ def test_generation_organizer_uses_source_history_with_or_without_continuation_t
             }
             for index in range(3)
         ]
-        selected = [reels[0], reels[1], reels[2], reels[4], reels[5]]
+        assert kwargs["prior_concept_coverage"] == (
+            [] if with_continuation_token else expected_prior_coverage
+        )
+        assert kwargs["recent_prior_objective_coverage"] == (
+            [] if with_continuation_token else expected_recent_coverage
+        )
+        selected_ids = (
+            [
+                "window-reel-3",
+                "window-reel-4",
+                "window-reel-5",
+                "window-reel-7",
+                "window-reel-8",
+                "window-reel-0",
+                "window-reel-1",
+                "window-reel-2",
+            ]
+            if with_continuation_token
+            else [
+                "window-reel-3",
+                "window-reel-4",
+                "window-reel-5",
+                "window-reel-7",
+                "window-reel-8",
+            ]
+        )
+        reels_by_id = {reel["reel_id"]: reel for reel in reels}
+        selected = [reels_by_id[reel_id] for reel_id in selected_ids]
         return mock.Mock(
             reels=selected,
-            ordered_reel_ids=[reel["reel_id"] for reel in selected],
+            ordered_reel_ids=selected_ids,
             assessment_checkpoint_reel_ids=[],
             prior_restatement_reel_ids=["window-reel-6"],
             model_used="gemini-test",
@@ -1727,11 +1764,12 @@ def test_generation_organizer_uses_source_history_with_or_without_continuation_t
         "_current_level_reusable_generation_reel_count",
         lambda *_args, **_kwargs: 3,
     )
-    monkeypatch.setattr(
-        main,
-        "_ranked_request_reels",
-        lambda *_args, **_kwargs: list(candidate_rows[3:]),
-    )
+    def ranked_request_reels(*_args, **kwargs):
+        if with_continuation_token and not kwargs.get("exclude_reel_ids"):
+            return list(candidate_rows)
+        return list(candidate_rows[3:])
+
+    monkeypatch.setattr(main, "_ranked_request_reels", ranked_request_reels)
     monkeypatch.setattr(main, "order_lesson_batch", order_batch)
     monkeypatch.setattr(
         main,
@@ -1782,8 +1820,24 @@ def test_generation_organizer_uses_source_history_with_or_without_continuation_t
         assert set(lesson_order["prior_restatement_reel_ids"]).isdisjoint(
             lesson_order["ordered_reel_ids"]
         )
+        expected_tail = (
+            [
+                "window-reel-3",
+                "window-reel-4",
+                "window-reel-5",
+                "window-reel-7",
+                "window-reel-8",
+                "window-reel-0",
+                "window-reel-1",
+                "window-reel-2",
+            ]
+            if with_continuation_token
+            else None
+        )
+        assert lesson_order["reconciliation_tail_reel_ids"] == expected_tail
         status_payload = main._generation_job_status_payload(conn, completed)
         assert [reel["reel_id"] for reel in status_payload["reels"]] == expected_ids
+        assert status_payload["reconciliation_tail_reel_ids"] == expected_tail
         replay = main._sanitize_generation_replay_events(
             conn,
             completed,
@@ -1793,6 +1847,15 @@ def test_generation_organizer_uses_source_history_with_or_without_continuation_t
         assert [
             reel["reel_id"] for reel in sanitized_final["payload"]["reels"]
         ] == expected_ids
+        assert (
+            sanitized_final["payload"]["reconciliation_tail_reel_ids"]
+            == expected_tail
+        )
+        if with_continuation_token:
+            assert main._authoritative_release_reel_ids(
+                conn,
+                str(completed["result_generation_id"]),
+            ) == expected_tail
     finally:
         conn.close()
 
@@ -4034,6 +4097,91 @@ def test_terminal_summary_marker_projects_to_first_surviving_recap() -> None:
     ) is None
 
 
+def test_reconciliation_tail_reorders_only_unseen_and_current_release_ids() -> None:
+    existing_ids = [
+        "durably-seen",
+        "prior-unseen",
+        "current-foundation",
+        "current-practice",
+    ]
+
+    assert main._apply_reconciliation_tail_order(
+        existing_ids,
+        {
+            "ordered_reel_ids": ["current-foundation", "current-practice"],
+            "reconciliation_tail_reel_ids": [
+                "current-foundation",
+                "prior-unseen",
+                "current-practice",
+            ],
+        },
+    ) == [
+        "durably-seen",
+        "current-foundation",
+        "prior-unseen",
+        "current-practice",
+    ]
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {
+            "ordered_reel_ids": ["current"],
+            "reconciliation_tail_reel_ids": ["current", "unknown"],
+        },
+        {
+            "ordered_reel_ids": ["current"],
+            "reconciliation_tail_reel_ids": ["current", "current"],
+        },
+        {
+            "ordered_reel_ids": ["current"],
+            "reconciliation_tail_reel_ids": ["current", " "],
+        },
+        {"reconciliation_tail_reel_ids": ["current", "prior-unseen"]},
+        {
+            "ordered_reel_ids": [],
+            "reconciliation_tail_reel_ids": ["current", "prior-unseen"],
+        },
+        {
+            "ordered_reel_ids": ["current", "current"],
+            "reconciliation_tail_reel_ids": ["current", "prior-unseen"],
+        },
+        {
+            "ordered_reel_ids": ["current", "second-current"],
+            "reconciliation_tail_reel_ids": ["current", "prior-unseen"],
+        },
+        {
+            "ordered_reel_ids": "current",
+            "reconciliation_tail_reel_ids": ["current", "prior-unseen"],
+        },
+        {
+            "ordered_reel_ids": ["current"],
+            "reconciliation_tail_reel_ids": "current",
+        },
+        None,
+        [],
+    ],
+)
+def test_invalid_reconciliation_tail_fails_closed_to_append_order(
+    metadata: object,
+) -> None:
+    existing_ids = ["durably-seen", "prior-unseen", "current", "second-current"]
+
+    assert main._apply_reconciliation_tail_order(existing_ids, metadata) == existing_ids
+
+
+def test_reconciliation_tail_rejects_whitespace_only_current_or_tail_ids() -> None:
+    assert main._lesson_reconciliation_tail_ids({
+        "ordered_reel_ids": ["current"],
+        "reconciliation_tail_reel_ids": ["current", " "],
+    }) == []
+    assert main._lesson_reconciliation_tail_ids({
+        "ordered_reel_ids": [" "],
+        "reconciliation_tail_reel_ids": [" "],
+    }) == []
+
+
 def test_authoritative_chain_places_later_teaching_before_earlier_recap(
     monkeypatch,
 ) -> None:
@@ -4082,6 +4230,58 @@ def test_authoritative_chain_places_later_teaching_before_earlier_recap(
             "later-teaching",
             "first-recap",
             "later-recap",
+        ]
+    finally:
+        conn.close()
+
+
+def test_authoritative_chain_applies_reconciliation_tail_after_locked_history() -> None:
+    conn = _conn()
+    child_generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [
+            (
+                ["durably-seen", "prior-unseen"],
+                ["durably-seen", "prior-unseen"],
+            ),
+            (
+                ["current-foundation", "current-practice"],
+                ["current-foundation", "current-practice"],
+            ),
+        ],
+    )
+    source_generation_id = next(iter(rows))
+    try:
+        main._persist_generation_lesson_order(
+            conn,
+            generation_id=source_generation_id,
+            metadata={
+                "version": 2,
+                "ordered_reel_ids": ["durably-seen", "prior-unseen"],
+            },
+        )
+        main._persist_generation_lesson_order(
+            conn,
+            generation_id=child_generation_id,
+            metadata={
+                "version": 2,
+                "ordered_reel_ids": ["current-foundation", "current-practice"],
+                "reconciliation_tail_reel_ids": [
+                    "current-foundation",
+                    "prior-unseen",
+                    "current-practice",
+                ],
+            },
+        )
+
+        assert main._authoritative_release_reel_ids(
+            conn,
+            child_generation_id,
+        ) == [
+            "durably-seen",
+            "current-foundation",
+            "prior-unseen",
+            "current-practice",
         ]
     finally:
         conn.close()
@@ -7673,7 +7873,7 @@ def test_generate_submission_persists_adjusted_soft_difficulty_target(
         params = json.loads(str(job["request_params_json"]))
         assert params["knowledge_level"] == "intermediate"
         assert params["effective_level_target"] == 0.70
-        assert params["request_schema_version"] == "adaptive_clip_concepts_v5"
+        assert params["request_schema_version"] == "adaptive_clip_concepts_v6"
     finally:
         conn.close()
 
@@ -9233,7 +9433,7 @@ def test_feed_autofill_false_never_submits_and_true_submits_before_return(monkey
         assert queued_params["knowledge_level"] == "intermediate"
         assert queued_params["effective_level_target"] == 0.70
         assert queued_params["request_schema_version"] == (
-            "adaptive_clip_concepts_v5"
+            "adaptive_clip_concepts_v6"
         )
         assert queued["effective_level_target"] == 0.70
         assert main.GENERATION_OUTPUT_CEILINGS == {"fast": 9, "slow": 9}

@@ -1761,6 +1761,9 @@ _FLASH_REPAIR_TIMEOUT_S = 20.0
 _FLASH_ENRICH_TIMEOUT_S = 25.0
 _PRO_TIMEOUT_S = 90.0
 _PRO_FINAL_AUDIT_RESERVED_S = 60.0
+_PRO_SELECTOR_ATTEMPT_TIMEOUT_S = (
+    _TOTAL_DEADLINE_S - _PRO_FINAL_AUDIT_RESERVED_S
+)
 _SELECTION_OUTPUT_TOKENS = 24_576
 # Required per-clip concept metadata expanded the exhaustive forty-candidate
 # payload; 6,400 preserves the existing 1,024-token reasoning/safety margin.
@@ -21644,6 +21647,7 @@ def _call_model(
     operation: str,
     prompt_version: str,
     cancelled: CancelledCb,
+    initial_attempt_deadline_monotonic: float | None = None,
     budget_reserve: Optional[Callable[..., object]] = None,
     budget_reconcile: Optional[Callable[..., object]] = None,
     max_retries: int = 1,
@@ -21669,12 +21673,17 @@ def _call_model(
             if isinstance((text := getattr(part, "text", None)), str) and text
         )
     prompt_text = f"{system}\n\n{prompt_user_text}"
+    admission_deadline = (
+        min(deadline_monotonic, initial_attempt_deadline_monotonic)
+        if initial_attempt_deadline_monotonic is not None
+        else deadline_monotonic
+    )
     selector_slot = _acquire_selector_slot(
         operation=operation,
         model=model,
         thinking_level=thinking_level,
         prompt_version=prompt_version,
-        deadline_monotonic=deadline_monotonic,
+        deadline_monotonic=admission_deadline,
         cancelled=cancelled,
     )
     try:
@@ -21700,7 +21709,7 @@ def _call_model(
                 "candidate_tokens": max_output_tokens,
             })
             if conservative_uncomputed_cost > _MAX_UNCOUNTED_SELECTOR_COST_USD:
-                remaining_s = max(0.0, deadline_monotonic - time.monotonic())
+                remaining_s = max(0.0, admission_deadline - time.monotonic())
                 if remaining_s >= 1.0 and not _cancel_requested(cancelled):
                     try:
                         estimated_text_tokens = count_request_tokens(
@@ -21711,7 +21720,7 @@ def _call_model(
                             timeout_s=min(10.0, remaining_s),
                             thinking_level=thinking_level,
                             max_output_tokens=max_output_tokens,
-                            deadline_monotonic=deadline_monotonic,
+                            deadline_monotonic=admission_deadline,
                             cancelled=cancelled,
                         )
                     except Exception as exc:
@@ -21759,7 +21768,6 @@ def _call_model(
         last_physical_telemetry: dict[str, object] = {}
 
         def before_provider_dispatch(*, model: str, attempt: int) -> object:
-            del attempt
             nonlocal logical_quota_reserved, reservation
             if not callable(budget_reserve):
                 return None
@@ -21771,7 +21779,9 @@ def _call_model(
                 estimated_input_tokens=estimated_input_tokens,
                 max_physical_attempts=1,
                 count_logical_call=not logical_quota_reserved,
-                deadline_monotonic=deadline_monotonic,
+                deadline_monotonic=(
+                    admission_deadline if attempt == 1 else deadline_monotonic
+                ),
                 cancelled=cancelled,
             )
             # Only a successful admission consumes the one logical selector or
@@ -21788,16 +21798,25 @@ def _call_model(
             model: str,
             attempt: int,
             telemetry: object,
+            dispatched: bool = True,
         ) -> None:
             del attempt
             nonlocal physical_dispatches
             nonlocal billing_unknown_attempts
             nonlocal billing_unknown_reserved_cost_usd
             nonlocal last_physical_telemetry
+            ticket_fields = dict(ticket) if isinstance(ticket, dict) else {}
+            if not dispatched:
+                if callable(budget_reconcile) and ticket_fields:
+                    budget_reconcile(
+                        model_used=model,
+                        usage={**ticket_fields, "dispatched": False},
+                        dispatched=False,
+                    )
+                return
             physical_dispatches += 1
             physical_usage = _telemetry_dict(telemetry)
             last_physical_telemetry = dict(physical_usage)
-            ticket_fields = dict(ticket) if isinstance(ticket, dict) else {}
             physical_usage.update(ticket_fields)
             physical_usage.update({
                 "model": model,
@@ -21843,6 +21862,9 @@ def _call_model(
                     deadline_monotonic=deadline_monotonic,
                     operation=operation,
                     prompt_version=prompt_version,
+                    initial_attempt_deadline_monotonic=(
+                        initial_attempt_deadline_monotonic
+                    ),
                     max_retries=max_retries,
                     retry_status_codes=retry_status_codes,
                     cancelled=cancelled,
@@ -22708,7 +22730,7 @@ def _run_selection_profile(
         level, cap, timeout = (
             "medium",
             _PRO_BOUNDARY_OUTPUT_TOKENS,
-            _PRO_TIMEOUT_S,
+            _PRO_SELECTOR_ATTEMPT_TIMEOUT_S,
         )
         operation = "pro_fallback"
     else:
@@ -22748,10 +22770,15 @@ def _run_selection_profile(
     retry_pro_transient_once = profile == PRO_BOUNDARY_PROFILE
     retry_capacity_once = retry_flash_capacity_once or retry_pro_transient_once
     operation = str(settings.get("_segment_operation") or operation)
-    selector_deadline = (
+    # Selector and audit share the same source deadline. Admission, token
+    # preflight, and the first healthy Pro attempt retain the original selector
+    # window. Only a transient provider failure lets the bounded retry borrow
+    # from the audit window.
+    selector_deadline = deadline
+    selector_initial_attempt_deadline = (
         deadline - _PRO_FINAL_AUDIT_RESERVED_S
         if profile == PRO_BOUNDARY_PROFILE
-        else deadline
+        else None
     )
 
     def invoke_selector(
@@ -22770,6 +22797,9 @@ def _run_selection_profile(
             operation=operation,
             prompt_version=profile,
             cancelled=cancelled,
+            initial_attempt_deadline_monotonic=(
+                selector_initial_attempt_deadline
+            ),
             budget_reserve=settings.get("_segment_budget_reserve"),
             budget_reconcile=settings.get("_segment_budget_reconcile"),
             # The live Pro selector uses the full transient policy. The dormant

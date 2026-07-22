@@ -136,6 +136,7 @@ class ReelsGenerateResponse(BaseModel):
     batch_size: int = 0
     continuation_token: str | None = None
     terminal_status: Literal["completed", "partial", "exhausted"] | None = None
+    reconciliation_tail_reel_ids: list[str] | None = None
 
 
 class GenerationJobQueuedResponse(BaseModel):
@@ -163,6 +164,7 @@ class GenerationJobStatusResponse(BaseModel):
     usage: dict = Field(default_factory=dict)
     error: dict | None = None
     reels: list[ReelOut] = Field(default_factory=list)
+    reconciliation_tail_reel_ids: list[str] | None = None
     created_at: str | None = None
     started_at: str | None = None
     completed_at: str | None = None

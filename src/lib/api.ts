@@ -1368,6 +1368,7 @@ function finalResponseFromEvent(event: Extract<ReelsGenerateStreamEvent, { type:
     reels: Array.isArray(event.payload.reels) ? event.payload.reels : [],
     generation_id: event.payload.generation_id,
     response_profile: "unified",
+    reconciliation_tail_reel_ids: event.payload.reconciliation_tail_reel_ids,
   };
 }
 
@@ -1381,6 +1382,7 @@ function terminalResponseFromStatus(status: GenerationJobStatusResponse): ReelsG
     response_profile: "unified",
     model_used: status.model_used,
     quality_degraded: status.quality_degraded,
+    reconciliation_tail_reel_ids: status.reconciliation_tail_reel_ids,
   };
 }
 

@@ -74,6 +74,7 @@ export type ReelsGenerateResponse = {
   batch_size?: number;
   continuation_token?: string | null;
   terminal_status?: GenerationBatchTerminalStatus | null;
+  reconciliation_tail_reel_ids?: string[] | null;
 };
 
 export type GenerationBatchTerminalStatus = "completed" | "partial" | "exhausted";
@@ -159,6 +160,7 @@ export type ReelsGenerateStreamEvent = GenerationStreamEventBase & (
         reels: Reel[];
         generation_id?: string | null;
         authoritative: true;
+        reconciliation_tail_reel_ids?: string[] | null;
       };
     }
   | {
@@ -189,6 +191,7 @@ export type GenerationJobStatusResponse = {
   usage?: Record<string, unknown> | null;
   error?: TypedApiError | null;
   reels?: Reel[];
+  reconciliation_tail_reel_ids?: string[] | null;
 };
 
 export type GenerationJobCancelResponse = GenerationJobStatusResponse;

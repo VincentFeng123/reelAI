@@ -204,6 +204,98 @@ def test_pro_selector_and_boundary_audit_recover_one_transient_failure(
     ] == [504, 429]
 
 
+def test_late_pro_499_retry_shares_deadline_and_reconciles_each_dispatch(
+    monkeypatch,
+) -> None:
+    plan = _newton_plan()
+    audit = _newton_audit_plan()
+    clock = {"now": 0.0}
+
+    class TimedClient:
+        def __init__(self):
+            self.calls: list[dict] = []
+            self.models = self
+
+        def generate_content(self, model, contents, config):
+            self.calls.append({
+                "model": model,
+                "contents": contents,
+                "config": config,
+            })
+            if len(self.calls) == 1:
+                clock["now"] = 59.0
+                raise _RetryHTTPError(499)
+            if len(self.calls) == 2:
+                return _RetryResponse(plan.model_dump_json(by_alias=True))
+            return _RetryResponse(audit.model_dump_json(by_alias=True))
+
+    fake = TimedClient()
+    context = GenerationContext("fast", generation_id="late-pro-499")
+    monkeypatch.setattr(gemini_client, "get_client", lambda: fake)
+    monkeypatch.setattr(gemini_client.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        gemini_client.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    monkeypatch.setattr(
+        gemini_client.random,
+        "uniform",
+        lambda lower, _upper: lower,
+    )
+    monkeypatch.setattr(
+        gemini_client,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 100,
+    )
+
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "supadata-cue-0",
+                "start": 0.0,
+                "end": 8.0,
+                "text": (
+                    "Newton's second law says that the net force on an object "
+                    "equals its mass times its acceleration."
+                ),
+            }],
+            "words": [],
+            "source": "supadata",
+        },
+        {
+            "_segment_operation": "pro_authoritative",
+            "_segment_budget_reserve": context.reserve_gemini_call,
+            "_segment_budget_reconcile": context.reconcile_gemini_call,
+        },
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic="Newton's second law F=ma",
+        deadline_monotonic=120.0,
+    )
+
+    assert result.error is None
+    assert result.accepted_count == 1
+    assert len(fake.calls) == 3
+    assert [
+        call["config"].http_options.timeout for call in fake.calls
+    ] == [60_000, 60_000, 60_000]
+    selector_call, audit_call = result.calls
+    assert selector_call["retries"] == 1
+    assert selector_call["physical_dispatches"] == 2
+    assert selector_call["billing_unknown_attempts"] == 1
+    assert selector_call["provider_status_code"] is None
+    assert selector_call["error_history"][0]["provider_status_code"] == 499
+    assert audit_call["operation"] == "pro_boundary_audit"
+    assert audit_call["physical_dispatches"] == 1
+
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["selector_calls"] == 1
+    assert budget["boundary_audit_calls"] == 1
+    assert budget["billing_unknown_cost_exposure_usd"] > 0.0
+    assert budget["inflight_reserved_cost_usd"] == 0.0
+    assert budget["cost_exposure_usd"] <= budget["cost_limit_usd"]
+
+
 def test_pro_selector_and_boundary_audit_do_not_retry_permanent_4xx(
     monkeypatch,
 ) -> None:
@@ -403,10 +495,13 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
         gemini_segment._TOTAL_DEADLINE_S
         == 2 * gemini_segment._PRO_FINAL_AUDIT_RESERVED_S
     )
-    assert (
-        audit_call["deadline_monotonic"] - call["deadline_monotonic"]
-        == pytest.approx(gemini_segment._PRO_FINAL_AUDIT_RESERVED_S)
+    assert call["timeout_s"] == gemini_segment._PRO_SELECTOR_ATTEMPT_TIMEOUT_S
+    assert call["deadline_monotonic"] == audit_call["deadline_monotonic"]
+    assert call["initial_attempt_deadline_monotonic"] == pytest.approx(
+        call["deadline_monotonic"]
+        - gemini_segment._PRO_FINAL_AUDIT_RESERVED_S
     )
+    assert audit_call["initial_attempt_deadline_monotonic"] is None
     assert result.calls[1]["video_grounded"] is False
 
     budget = context.budget.snapshot()["gemini"]

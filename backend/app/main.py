@@ -3022,6 +3022,62 @@ def _stored_generation_lesson_order_ids(
     return ordered_ids
 
 
+def _lesson_reconciliation_tail_ids(
+    metadata: dict[str, Any] | None,
+) -> list[str] | None:
+    """Return a validated optional cross-batch unseen-tail order."""
+    if not isinstance(metadata, dict):
+        return None
+    values = metadata.get("reconciliation_tail_reel_ids")
+    if values is None:
+        return None
+    if not isinstance(values, list):
+        return []
+    tail_ids = [value if isinstance(value, str) else "" for value in values]
+    current_ids = metadata.get("ordered_reel_ids")
+    if (
+        not tail_ids
+        or any(not reel_id.strip() for reel_id in tail_ids)
+        or len(set(tail_ids)) != len(tail_ids)
+        or not isinstance(current_ids, list)
+        or not current_ids
+        or any(
+            not isinstance(reel_id, str) or not reel_id.strip()
+            for reel_id in current_ids
+        )
+        or len(set(current_ids)) != len(current_ids)
+        or not set(current_ids).issubset(tail_ids)
+    ):
+        return []
+    return tail_ids
+
+
+def _stored_generation_reconciliation_tail_ids(
+    conn,
+    generation_id: str | None,
+) -> list[str] | None:
+    return _lesson_reconciliation_tail_ids(
+        _stored_generation_lesson_order_metadata(conn, generation_id)
+    )
+
+
+def _apply_reconciliation_tail_order(
+    existing_ids: list[str],
+    metadata: dict[str, Any] | None,
+) -> list[str]:
+    """Overlay a validated unseen-tail plan without moving unmentioned history."""
+    tail_ids = _lesson_reconciliation_tail_ids(metadata)
+    if not tail_ids:
+        return existing_ids
+    existing_id_set = set(existing_ids)
+    if not set(tail_ids).issubset(existing_id_set):
+        return existing_ids
+    tail_id_set = set(tail_ids)
+    return [
+        reel_id for reel_id in existing_ids if reel_id not in tail_id_set
+    ] + tail_ids
+
+
 def _surviving_terminal_summary_start_reel_id(
     *,
     ordered_reel_ids: Iterable[str],
@@ -3648,7 +3704,18 @@ def _authoritative_release_ids_from_snapshot(
         terminal_summary_ids.extend(released_ids[marker_index:])
     if not found_authoritative_release:
         return None
-    return list(dict.fromkeys([*teaching_ids, *terminal_summary_ids]))
+    ordered_ids = list(dict.fromkeys([*teaching_ids, *terminal_summary_ids]))
+    for generation_id in generation_ids:
+        ordered_ids = _apply_reconciliation_tail_order(
+            ordered_ids,
+            _parse_generation_lesson_order_metadata(
+                (generation_rows.get(generation_id) or {}).get(
+                    "lesson_order_json"
+                ),
+                generation_id=generation_id,
+            ),
+        )
+    return ordered_ids
 
 
 def _authoritative_generation_release_reel_ids(
@@ -3868,6 +3935,13 @@ def _authoritative_release_reel_ids(
             continue
         seen_ids.add(reel_id)
         ordered_ids.append(reel_id)
+    for current_generation_id in generation_ids:
+        ordered_ids = _apply_reconciliation_tail_order(
+            ordered_ids,
+            _stored_generation_lesson_order_metadata(
+                conn, current_generation_id
+            ),
+        )
     return _remove_authoritative_release_temporal_overlaps(
         conn,
         generation_ids=generation_ids,
@@ -5098,12 +5172,17 @@ def _generation_job_reels(
     organizer_candidate_limit: int | None = None,
     apply_release_order: bool = True,
     preserve_lesson_order_metadata: bool = False,
+    prior_unseen_reels_out: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     generation_id = str(job_row.get("result_generation_id") or "").strip()
     if not generation_id:
         return []
     params = _job_request_params(job_row)
     continuation_token = str(params.get("continuation_token") or "").strip()
+    delivered_reel_ids = _continuation_delivered_reel_ids(
+        conn,
+        continuation_token,
+    )
     mode = "fast" if str(params.get("generation_mode") or "slow") == "fast" else "slow"
     requested = max(
         1,
@@ -5151,9 +5230,8 @@ def _generation_job_reels(
         page=1,
         limit=ranking_limit,
         learner_id=str(job_row.get("learner_id") or LEGACY_LEARNER_ID),
-        exclude_reel_ids=_continuation_delivered_reel_ids(
-            conn,
-            continuation_token,
+        exclude_reel_ids=(
+            [] if prior_unseen_reels_out is not None else delivered_reel_ids
         ),
         include_source_chain=True,
         released_only=released_only,
@@ -5168,6 +5246,20 @@ def _generation_job_reels(
         for reel in ranked
     ]
     valid_reels = _current_selection_contract_reels(internal_reels)
+    if prior_unseen_reels_out is not None and delivered_reel_ids:
+        delivered_reel_id_set = set(delivered_reel_ids)
+        prior_unseen_reels_out.extend(
+            reel
+            for reel in valid_reels
+            if str(reel.get("reel_id") or "").strip()
+            in delivered_reel_id_set
+        )
+        valid_reels = [
+            reel
+            for reel in valid_reels
+            if str(reel.get("reel_id") or "").strip()
+            not in delivered_reel_id_set
+        ]
     ordered_reels = (
         _apply_generation_lesson_order(
             conn,
@@ -5261,6 +5353,7 @@ def _generation_job_status_payload(conn, job_row: dict[str, Any]) -> dict[str, A
             error["detail"] = detail
     status = str(job_row.get("status") or "")
     surfaceable_terminal = status in {"completed", "partial", "exhausted"}
+    result_generation_id = str(job_row.get("result_generation_id") or "").strip()
     return {
         "job_id": str(job_row.get("id") or ""),
         "status": status or "queued",
@@ -5273,12 +5366,20 @@ def _generation_job_status_payload(conn, job_row: dict[str, Any]) -> dict[str, A
         "deadline_at": _normalize_datetime_for_api(job_row.get("deadline_at")),
         "material_id": str(job_row.get("material_id") or ""),
         "request_key": str(job_row.get("request_key") or ""),
-        "result_generation_id": str(job_row.get("result_generation_id") or "") or None,
+        "result_generation_id": result_generation_id or None,
         "model_used": str(job_row.get("model_used") or "") or None,
         "quality_degraded": bool(job_row.get("quality_degraded")),
         "usage": usage if isinstance(usage, dict) else {},
         "error": error,
         "reels": _generation_job_reels(conn, job_row) if surfaceable_terminal else [],
+        "reconciliation_tail_reel_ids": (
+            _stored_generation_reconciliation_tail_ids(
+                conn,
+                result_generation_id,
+            )
+            if surfaceable_terminal and result_generation_id
+            else None
+        ),
         "created_at": _normalize_datetime_for_api(job_row.get("created_at")),
         "started_at": _normalize_datetime_for_api(job_row.get("started_at")),
         "completed_at": _normalize_datetime_for_api(job_row.get("completed_at")),
@@ -5322,6 +5423,14 @@ def _sanitize_generation_replay_events(
             payload["reels"] = authoritative_reels
             if suppress_inventory:
                 payload["generation_id"] = None
+                payload["reconciliation_tail_reel_ids"] = None
+            else:
+                payload["reconciliation_tail_reel_ids"] = (
+                    _stored_generation_reconciliation_tail_ids(
+                        conn,
+                        str(job_row.get("result_generation_id") or "").strip(),
+                    )
+                )
             payload["authoritative"] = True
             event["payload"] = payload
         sanitized.append(event)
@@ -6259,6 +6368,14 @@ def _run_leased_generation_job(
                 **job_row,
                 "result_generation_id": generation_id,
             }
+            stored_order_ids = _stored_generation_lesson_order_ids(
+                conn,
+                generation_id,
+            )
+            prior_unseen_reels: list[dict[str, Any]] = []
+            collect_prior_unseen = bool(
+                is_continuation and stored_order_ids is None
+            )
             rankable_fallback = (
                 []
                 if cumulative_count or has_verified_reservoir
@@ -6268,6 +6385,9 @@ def _run_leased_generation_job(
                     organizer_candidate_limit=lesson_candidate_limit,
                     apply_release_order=False,
                     preserve_lesson_order_metadata=True,
+                    prior_unseen_reels_out=(
+                        prior_unseen_reels if collect_prior_unseen else None
+                    ),
                 )
             )
             stage_counters = context.counters()
@@ -6278,8 +6398,8 @@ def _run_leased_generation_job(
             ordering_degraded = False
             recall_preparation: dict[str, int] | None = None
             activate_generation = False
+            reconciliation_tail_reel_ids: list[str] | None = None
             candidate_final_reels: list[dict[str, Any]] = []
-            stored_order_ids: list[str] | None = None
             authoritative_prior_reel_ids: list[str] = []
             if cumulative_count or has_verified_reservoir or rankable_fallback:
                 candidate_final_reels = rankable_fallback or _generation_job_reels(
@@ -6287,10 +6407,9 @@ def _run_leased_generation_job(
                     refreshed_job,
                     organizer_candidate_limit=lesson_candidate_limit,
                     preserve_lesson_order_metadata=True,
-                )
-                stored_order_ids = _stored_generation_lesson_order_ids(
-                    conn,
-                    generation_id,
+                    prior_unseen_reels_out=(
+                        prior_unseen_reels if collect_prior_unseen else None
+                    ),
                 )
                 if stored_order_ids is None:
                     candidate_final_reels = (
@@ -6325,20 +6444,54 @@ def _run_leased_generation_job(
                             str(params.get("continuation_token") or "").strip(),
                         )
                     )
+                    prior_reel_rank = {
+                        reel_id: index
+                        for index, reel_id in enumerate(prior_reel_ids)
+                    }
+                    prior_unseen_by_id = {
+                        reel_id: reel
+                        for reel in prior_unseen_reels
+                        if (
+                            reel_id := str(reel.get("reel_id") or "").strip()
+                        ) in prior_reel_rank
+                        and reel_id not in surfaceable_candidate_ids
+                    }
+                    ordered_prior_unseen_reels = [
+                        prior_unseen_by_id[reel_id]
+                        for reel_id in prior_reel_ids
+                        if reel_id in prior_unseen_by_id
+                    ]
+                    required_prior_unseen_ids = [
+                        str(reel.get("reel_id") or "")
+                        for reel in ordered_prior_unseen_reels
+                    ]
+                    prior_history_ids = (
+                        [
+                            reel_id
+                            for reel_id in prior_reel_ids
+                            if reel_id not in prior_unseen_by_id
+                        ]
+                        if is_continuation
+                        else prior_reel_ids
+                    )
                     (
                         prior_concept_coverage,
                         recent_prior_objective_coverage,
                     ) = _lesson_prior_coverage(
                         conn,
                         material_id=material_id,
-                        reel_ids=prior_reel_ids,
+                        reel_ids=prior_history_ids,
                     )
+                    organizer_candidates = [
+                        *ordered_prior_unseen_reels,
+                        *final_reels,
+                    ]
                     ordering = order_lesson_batch(
-                        final_reels,
+                        organizer_candidates,
                         topic=_lesson_order_topic(
                             conn,
                             material_id=material_id,
-                            reels=final_reels,
+                            reels=organizer_candidates,
                         ),
                         learner_level=str(params.get("knowledge_level") or "beginner"),
                         learner_difficulty_target=params.get(
@@ -6350,7 +6503,8 @@ def _run_leased_generation_job(
                         # not Gemini's editorial subset. Every already-verified
                         # candidate in this bounded pool may be included or
                         # omitted without adding provider or boundary work.
-                        release_limit=len(final_reels),
+                        release_limit=len(organizer_candidates),
+                        required_reel_ids=required_prior_unseen_ids,
                         prior_concept_coverage=prior_concept_coverage,
                         recent_prior_objective_coverage=(
                             recent_prior_objective_coverage
@@ -6377,6 +6531,14 @@ def _run_leased_generation_job(
                             str(reel.get("reel_id") or "")
                             for reel in ordering.reels
                         ]
+                    reconciliation_tail_reel_ids = (
+                        organizer_ordered_ids
+                        if required_prior_unseen_ids
+                        and set(required_prior_unseen_ids).issubset(
+                            organizer_ordered_ids
+                        )
+                        else None
+                    )
                     terminal_summary_start_reel_id = (
                         _surviving_terminal_summary_start_reel_id(
                             ordered_reel_ids=organizer_ordered_ids,
@@ -6415,6 +6577,9 @@ def _run_leased_generation_job(
                         "version": 2,
                         "prompt_version": LESSON_ORDER_PROMPT_VERSION,
                         "ordered_reel_ids": released_ordered_ids,
+                        "reconciliation_tail_reel_ids": (
+                            reconciliation_tail_reel_ids
+                        ),
                         "assessment_checkpoint_reel_ids": checkpoint_ids,
                         "prior_restatement_reel_ids": (
                             organizer_prior_restatement_ids
@@ -6460,6 +6625,9 @@ def _run_leased_generation_job(
 
                 lesson_order_metadata = (
                     _stored_generation_lesson_order_metadata(conn, generation_id) or {}
+                )
+                reconciliation_tail_reel_ids = (
+                    _lesson_reconciliation_tail_ids(lesson_order_metadata)
                 )
                 ordered_reel_ids = lesson_order_metadata.get("ordered_reel_ids")
                 organizer_checkpoint_ids = (
@@ -6603,6 +6771,9 @@ def _run_leased_generation_job(
                         "reels": final_reels,
                         "generation_id": generation_id if has_terminal_result else None,
                         "authoritative": True,
+                        "reconciliation_tail_reel_ids": (
+                            reconciliation_tail_reel_ids
+                        ),
                     },
                     lease_owner=lease_owner,
                 )
@@ -8607,6 +8778,14 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 "batch_size": len(cached_reels),
                 "continuation_token": str(completed_job.get("id") or "") or None,
                 "terminal_status": str(completed_job.get("status") or "completed"),
+                "reconciliation_tail_reel_ids": (
+                    _stored_generation_reconciliation_tail_ids(
+                        conn,
+                        str(
+                            completed_job.get("result_generation_id") or ""
+                        ).strip(),
+                    )
+                ),
             }
         elif (
             not active_job

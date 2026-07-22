@@ -448,6 +448,226 @@ def test_gemini3_retries_one_transient_error_with_short_jitter(
                for call in fake.models.calls)
 
 
+@pytest.mark.parametrize("status_code", [499, 504])
+def test_gemini3_late_transient_retries_inside_shared_deadline(
+    monkeypatch,
+    status_code,
+):
+    # Admission and CountTokens have already consumed forty seconds of the
+    # reserved first-attempt window before generate_json_v3 begins.
+    clock = {"now": 40.0}
+    sleeps = []
+
+    class Models:
+        def __init__(self):
+            self.calls = []
+
+        def generate_content(self, model, contents, config):
+            self.calls.append({"config": config})
+            if len(self.calls) == 1:
+                clock["now"] = 59.0
+                raise _HTTPError(status_code)
+            return _FakeResponse()
+
+    fake = SimpleNamespace(models=Models())
+    monkeypatch.setattr(gc.time, "monotonic", lambda: clock["now"])
+
+    def advance(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(gc.time, "sleep", advance)
+    monkeypatch.setattr(gc.random, "uniform", lambda lower, _upper: lower)
+
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        timeout_s=60.0,
+        deadline_monotonic=120.0,
+        initial_attempt_deadline_monotonic=60.0,
+        max_retries=1,
+    )
+
+    assert result.telemetry.retries == 1
+    assert sleeps == [1.0]
+    assert len(fake.models.calls) == 2
+    assert [
+        call["config"].http_options.timeout for call in fake.models.calls
+    ] == [20_000, 60_000]
+    assert result.telemetry.error_history == ({
+        "provider_error_type": "_HTTPError",
+        "provider_status_code": status_code,
+        "retryable": True,
+    },)
+
+
+def test_gemini3_initial_attempt_deadline_rejects_late_healthy_response(
+    monkeypatch,
+):
+    clock = {"now": 0.0}
+
+    class Models:
+        def __init__(self):
+            self.calls = []
+
+        def generate_content(self, model, contents, config):
+            self.calls.append({"config": config})
+            clock["now"] = 61.0
+            return _FakeResponse()
+
+    fake = SimpleNamespace(models=Models())
+    monkeypatch.setattr(gc.time, "monotonic", lambda: clock["now"])
+
+    with pytest.raises(gc.GeminiDeadlineExceededError):
+        _call_v3(
+            monkeypatch,
+            fake,
+            timeout_s=60.0,
+            deadline_monotonic=120.0,
+            initial_attempt_deadline_monotonic=60.0,
+            max_retries=1,
+        )
+
+    assert len(fake.models.calls) == 1
+
+
+def test_gemini3_abandons_admitted_attempt_that_crosses_initial_deadline(
+    monkeypatch,
+):
+    clock = {"now": 0.0}
+    fake = _FakeClient(_FakeResponse())
+    abandoned = []
+
+    def before_dispatch(**_kwargs):
+        clock["now"] = 61.0
+        return "reserved-ticket"
+
+    def after_dispatch(ticket, **kwargs):
+        abandoned.append((ticket, kwargs["dispatched"]))
+
+    monkeypatch.setattr(gc.time, "monotonic", lambda: clock["now"])
+
+    with pytest.raises(gc.GeminiDeadlineExceededError):
+        _call_v3(
+            monkeypatch,
+            fake,
+            timeout_s=60.0,
+            deadline_monotonic=120.0,
+            initial_attempt_deadline_monotonic=60.0,
+            before_dispatch=before_dispatch,
+            after_dispatch=after_dispatch,
+        )
+
+    assert fake.models.calls == []
+    assert abandoned == [("reserved-ticket", False)]
+
+
+def test_gemini3_recomputes_attempt_timeout_after_partial_admission_wait(
+    monkeypatch,
+):
+    clock = {"now": 40.0}
+    fake = _FakeClient(_FakeResponse())
+
+    def before_dispatch(**_kwargs):
+        clock["now"] = 55.0
+        return "reserved-ticket"
+
+    monkeypatch.setattr(gc.time, "monotonic", lambda: clock["now"])
+
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        timeout_s=60.0,
+        deadline_monotonic=120.0,
+        initial_attempt_deadline_monotonic=60.0,
+        before_dispatch=before_dispatch,
+    )
+
+    assert result.text == '{"ok": true}'
+    assert len(fake.models.calls) == 1
+    assert fake.models.calls[0]["config"].http_options.timeout == 5_000
+
+
+def test_gemini3_abandons_cost_ticket_when_request_config_fails(monkeypatch):
+    fake = _FakeClient(_FakeResponse())
+    abandoned = []
+
+    def fail_config(**_kwargs):
+        raise RuntimeError("request config unavailable")
+
+    monkeypatch.setattr(gc.types, "GenerateContentConfig", fail_config)
+
+    with pytest.raises(RuntimeError, match="request config unavailable"):
+        _call_v3(
+            monkeypatch,
+            fake,
+            before_dispatch=lambda **_kwargs: "reserved-ticket",
+            after_dispatch=lambda ticket, **kwargs: abandoned.append(
+                (ticket, kwargs["dispatched"])
+            ),
+        )
+
+    assert fake.models.calls == []
+    assert abandoned == [("reserved-ticket", False)]
+
+
+def test_gemini3_application_cancellation_wins_over_provider_499(
+    monkeypatch,
+):
+    state = {"cancelled": False}
+    sleeps = []
+
+    class Models:
+        def __init__(self):
+            self.calls = []
+
+        def generate_content(self, model, contents, config):
+            self.calls.append({"config": config})
+            state["cancelled"] = True
+            raise _HTTPError(499)
+
+    fake = SimpleNamespace(models=Models())
+    monkeypatch.setattr(gc.time, "sleep", sleeps.append)
+
+    with pytest.raises(gc.GeminiCancelledError) as caught:
+        _call_v3(
+            monkeypatch,
+            fake,
+            timeout_s=60.0,
+            deadline_monotonic=gc.time.monotonic() + 120.0,
+            max_retries=1,
+            cancelled=lambda: state["cancelled"],
+        )
+
+    assert len(fake.models.calls) == 1
+    assert sleeps == []
+    assert caught.value.telemetry.provider_status_code == 499
+    assert caught.value.telemetry.retryable is False
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
+def test_gemini3_shared_deadline_never_retries_permanent_4xx(
+    monkeypatch,
+    status_code,
+):
+    fake = _FakeClient(_HTTPError(status_code), _FakeResponse())
+    sleeps = []
+    monkeypatch.setattr(gc.time, "sleep", sleeps.append)
+
+    with pytest.raises(gc.GeminiTransportError) as caught:
+        _call_v3(
+            monkeypatch,
+            fake,
+            timeout_s=60.0,
+            deadline_monotonic=gc.time.monotonic() + 120.0,
+            max_retries=1,
+        )
+
+    assert len(fake.models.calls) == 1
+    assert sleeps == []
+    assert caught.value.telemetry.retryable is False
+
+
 def test_gemini3_retry_status_policy_still_retries_allowed_503(monkeypatch):
     fake = _FakeClient(_HTTPError(503), _FakeResponse())
     monkeypatch.setattr(gc.time, "sleep", lambda _seconds: None)

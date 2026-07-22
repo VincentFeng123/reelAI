@@ -10,6 +10,7 @@ const reelCardSource = fs.readFileSync(path.join(__dirname, "../../components/Re
 const feedQuerySource = fs.readFileSync(path.join(__dirname, "../../lib/feedQuery.ts"), "utf8");
 const localDemoSource = fs.readFileSync(path.join(__dirname, "../../lib/localDemo.ts"), "utf8");
 const typesSource = fs.readFileSync(path.join(__dirname, "../../lib/types.ts"), "utf8");
+const apiSource = fs.readFileSync(path.join(__dirname, "../../lib/api.ts"), "utf8");
 const sourceFile = ts.createSourceFile(
   filePath,
   source,
@@ -722,6 +723,7 @@ test("feed-owned final inventory reconciles when no candidate event arrived", as
         batch_size: 2,
         continuation_token: "job-a",
         terminal_status: "partial",
+        reconciliation_tail_reel_ids: ["final-b", "final-a"],
       };
     },
     isSearchScopeActive: () => true,
@@ -755,6 +757,8 @@ test("feed-owned final inventory reconciles when no candidate event arrived", as
     preserveUnmatchedUnseen: true,
     preserveUnmatchedLockedPrefix: true,
     appendAuthoritativeAfterStableUnseen: true,
+    authoritativeTailOrder: ["final-b", "final-a"],
+    authoritativeTailMaterialId: "material-a",
   });
   assert.equal(isGeneratingRef.current, false);
 });
@@ -1237,6 +1241,36 @@ test("the Reel contract explicitly retains v4 selection metadata", () => {
   assert.match(typesSource, /selection_contract_version\?: string \| null;/);
 });
 
+test("durable generation transports preserve the authoritative reconciliation tail", () => {
+  assert.ok(
+    [...typesSource.matchAll(/reconciliation_tail_reel_ids\?: string\[\] \| null;/g)].length >= 3,
+    "response, final event, and status contracts must all carry the optional tail plan",
+  );
+  const eventMapperStart = apiSource.indexOf("function finalResponseFromEvent(");
+  const statusMapperStart = apiSource.indexOf("function terminalResponseFromStatus(");
+  const durableMetadataStart = apiSource.indexOf("function withDurableBatchMetadata(");
+  assert.ok(eventMapperStart >= 0 && statusMapperStart > eventMapperStart);
+  assert.ok(durableMetadataStart > statusMapperStart);
+  assert.match(
+    apiSource.slice(eventMapperStart, statusMapperStart),
+    /reconciliation_tail_reel_ids: event\.payload\.reconciliation_tail_reel_ids/,
+  );
+  assert.match(
+    apiSource.slice(statusMapperStart, durableMetadataStart),
+    /reconciliation_tail_reel_ids: status\.reconciliation_tail_reel_ids/,
+  );
+  assert.equal(
+    [...source.matchAll(/authoritativeTailOrder: data\.reconciliation_tail_reel_ids/g)].length,
+    2,
+    "feed-owned and direct continuation settlement must both apply a validated tail plan",
+  );
+  assert.equal(
+    [...source.matchAll(/authoritativeTailMaterialId: (?:materialIdValue|id)/g)].length,
+    2,
+    "both settlement paths must scope the plan to its generating material",
+  );
+});
+
 test("restored reconciliation removes cached unseen rows and stream settlement drops rejected provisionals", () => {
   const currentRows = [
     { reel_id: "confirmed-watched", video_url: "confirmed-watched", video_title: "Cached watched" },
@@ -1383,6 +1417,233 @@ test("plain continuation settlement appends novel authority after the existing u
     "continuation-reasoning",
     "continuation-example",
   ]);
+});
+
+test("an authoritative continuation plan reorders only the unseen union", () => {
+  const currentRows = [
+    { reel_id: "locked", video_url: "locked" },
+    { reel_id: "existing-explanation", video_url: "existing-explanation" },
+    { reel_id: "existing-application", video_url: "existing-application" },
+  ];
+  const reelsRef = { current: currentRows };
+  const activeIndexRef = { current: 0 };
+  const watchedFrontierIndexRef = { current: 0 };
+  let renderedRows = currentRows;
+  const reconcile = compileUseCallback("reconcileGeneratedReels", {
+    reelsRef,
+    activeIndexRef,
+    watchedFrontierIndexRef,
+    pendingResumeRef: { current: null },
+    reelClipKey: (reel) => reel.video_url,
+    dedupeByIdentity: (rows) => {
+      const seen = new Set();
+      return rows.filter((row) => !seen.has(row.reel_id) && seen.add(row.reel_id));
+    },
+    updateSessionReels: (rows) => {
+      reelsRef.current = rows;
+      renderedRows = rows;
+    },
+    setActiveIndex: () => {},
+    setTotal: () => {},
+  });
+
+  reconcile(
+    [],
+    [
+      { reel_id: "recovered-foundation", video_url: "recovered-foundation" },
+      { reel_id: "new-problem", video_url: "new-problem" },
+    ],
+    {
+      preserveUnmatchedUnseen: true,
+      preserveUnmatchedLockedPrefix: true,
+      appendAuthoritativeAfterStableUnseen: true,
+      authoritativeTailOrder: [
+        "recovered-foundation",
+        "existing-explanation",
+        "new-problem",
+        "existing-application",
+      ],
+    },
+  );
+
+  assert.deepEqual(renderedRows.map((row) => row.reel_id), [
+    "locked",
+    "recovered-foundation",
+    "existing-explanation",
+    "new-problem",
+    "existing-application",
+  ]);
+  assert.equal(activeIndexRef.current, 0);
+});
+
+test("a reel that becomes active while the organizer runs stays locked ahead of its planned insertion", () => {
+  const currentRows = [
+    { reel_id: "watched", video_url: "watched" },
+    { reel_id: "now-active-anchor", video_url: "now-active-anchor" },
+    { reel_id: "later-unseen", video_url: "later-unseen" },
+  ];
+  const reelsRef = { current: currentRows };
+  const activeIndexRef = { current: 1 };
+  const watchedFrontierIndexRef = { current: 0 };
+  let renderedRows = currentRows;
+  let renderedActiveIndex = activeIndexRef.current;
+  const reconcile = compileUseCallback("reconcileGeneratedReels", {
+    reelsRef,
+    activeIndexRef,
+    watchedFrontierIndexRef,
+    pendingResumeRef: { current: null },
+    reelClipKey: (reel) => reel.video_url,
+    dedupeByIdentity: (rows) => {
+      const seen = new Set();
+      return rows.filter((row) => !seen.has(row.reel_id) && seen.add(row.reel_id));
+    },
+    updateSessionReels: (rows) => {
+      reelsRef.current = rows;
+      renderedRows = rows;
+    },
+    setActiveIndex: (index) => {
+      renderedActiveIndex = index;
+    },
+    setTotal: () => {},
+  });
+
+  reconcile(
+    [],
+    [
+      { reel_id: "recovered-foundation", video_url: "recovered-foundation" },
+      { reel_id: "new-problem", video_url: "new-problem" },
+    ],
+    {
+      preserveUnmatchedUnseen: true,
+      preserveUnmatchedLockedPrefix: true,
+      appendAuthoritativeAfterStableUnseen: true,
+      authoritativeTailOrder: [
+        "recovered-foundation",
+        "now-active-anchor",
+        "later-unseen",
+        "new-problem",
+      ],
+    },
+  );
+
+  assert.deepEqual(renderedRows.map((row) => row.reel_id), [
+    "watched",
+    "now-active-anchor",
+    "recovered-foundation",
+    "later-unseen",
+    "new-problem",
+  ]);
+  assert.equal(renderedRows[1], currentRows[1], "the active reel object must remain in the locked prefix");
+  assert.equal(activeIndexRef.current, 1);
+  assert.equal(renderedActiveIndex, 1, "settlement must not move the active viewport");
+});
+
+test("a continuation plan reorders only its material inside a grouped unseen tail", () => {
+  const currentRows = [
+    { reel_id: "locked-a", material_id: "material-a", video_url: "locked-a" },
+    { reel_id: "old-a", material_id: "material-a", video_url: "old-a" },
+    { reel_id: "old-b", material_id: "material-b", video_url: "old-b" },
+  ];
+  const reelsRef = { current: currentRows };
+  const activeIndexRef = { current: 0 };
+  const watchedFrontierIndexRef = { current: 0 };
+  let renderedRows = currentRows;
+  const reconcile = compileUseCallback("reconcileGeneratedReels", {
+    reelsRef,
+    activeIndexRef,
+    watchedFrontierIndexRef,
+    pendingResumeRef: { current: null },
+    reelClipKey: (reel) => reel.video_url,
+    dedupeByIdentity: (rows) => {
+      const seen = new Set();
+      return rows.filter((row) => !seen.has(row.reel_id) && seen.add(row.reel_id));
+    },
+    updateSessionReels: (rows) => {
+      reelsRef.current = rows;
+      renderedRows = rows;
+    },
+    setActiveIndex: () => {},
+    setTotal: () => {},
+  });
+
+  reconcile(
+    [],
+    [{ reel_id: "new-a", material_id: "material-a", video_url: "new-a" }],
+    {
+      preserveUnmatchedUnseen: true,
+      preserveUnmatchedLockedPrefix: true,
+      appendAuthoritativeAfterStableUnseen: true,
+      authoritativeTailOrder: ["new-a", "old-a"],
+      authoritativeTailMaterialId: "material-a",
+    },
+  );
+
+  assert.deepEqual(renderedRows.map((row) => row.reel_id), [
+    "locked-a",
+    "new-a",
+    "old-b",
+    "old-a",
+  ]);
+  assert.equal(renderedRows[2], currentRows[2], "foreign material must keep its exact slot");
+});
+
+test("invalid or missing continuation plans keep the append-safe AF158 order", () => {
+  const currentRows = [
+    { reel_id: "locked", video_url: "locked" },
+    { reel_id: "existing-explanation", video_url: "existing-explanation" },
+    { reel_id: "existing-application", video_url: "existing-application" },
+  ];
+  const reelsRef = { current: currentRows };
+  const activeIndexRef = { current: 0 };
+  const watchedFrontierIndexRef = { current: 0 };
+  let renderedRows = currentRows;
+  const reconcile = compileUseCallback("reconcileGeneratedReels", {
+    reelsRef,
+    activeIndexRef,
+    watchedFrontierIndexRef,
+    pendingResumeRef: { current: null },
+    reelClipKey: (reel) => reel.video_url,
+    dedupeByIdentity: (rows) => {
+      const seen = new Set();
+      return rows.filter((row) => !seen.has(row.reel_id) && seen.add(row.reel_id));
+    },
+    updateSessionReels: (rows) => {
+      reelsRef.current = rows;
+      renderedRows = rows;
+    },
+    setActiveIndex: () => {},
+    setTotal: () => {},
+  });
+  const finalInventory = [
+    { reel_id: "recovered-foundation", video_url: "recovered-foundation" },
+    { reel_id: "new-problem", video_url: "new-problem" },
+  ];
+  const invalidPlans = [
+    undefined,
+    [],
+    ["recovered-foundation", "existing-explanation", "new-problem"],
+    ["recovered-foundation", "existing-explanation", "new-problem", "new-problem"],
+    ["recovered-foundation", "existing-explanation", "new-problem", "unknown-reel"],
+  ];
+
+  for (const authoritativeTailOrder of invalidPlans) {
+    reelsRef.current = currentRows;
+    renderedRows = currentRows;
+    reconcile([], finalInventory, {
+      preserveUnmatchedUnseen: true,
+      preserveUnmatchedLockedPrefix: true,
+      appendAuthoritativeAfterStableUnseen: true,
+      ...(authoritativeTailOrder === undefined ? {} : { authoritativeTailOrder }),
+    });
+    assert.deepEqual(renderedRows.map((row) => row.reel_id), [
+      "locked",
+      "existing-explanation",
+      "existing-application",
+      "recovered-foundation",
+      "new-problem",
+    ]);
+    assert.equal(new Set(renderedRows.map((row) => row.reel_id)).size, renderedRows.length);
+  }
 });
 
 test("generation settlement freezes the watched frontier and preserves authoritative unseen order", () => {
@@ -1995,7 +2256,7 @@ test("authoritative finals lock the watched prefix and retain server order for t
   assert.match(source, /Math\.max\(activeIndexRef\.current, watchedFrontierIndexRef\.current\) \+ 1/);
   assert.match(source, /const lockedPrefix = currentRows\.slice\(0, lockedPrefixLength\)/);
   assert.match(source, /const stableUnseenRows = currentRows\.slice\(lockedPrefixLength\)/);
-  assert.match(source, /const reordered = dedupeByIdentity\(\[\.\.\.lockedPrefix, \.\.\.authoritativeTail\]\)/);
+  assert.match(source, /const reordered = dedupeByIdentity\(\[\.\.\.lockedPrefix, \.\.\.reconciledTail\]\)/);
   assert.doesNotMatch(source, /orderReelsByDifficulty/);
   assert.match(source, /watchedFrontierIndex: dedupedReels\.length > 0/);
 });

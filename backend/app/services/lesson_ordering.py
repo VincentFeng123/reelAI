@@ -45,14 +45,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-LESSON_ORDER_PROMPT_VERSION = "lesson_order_v12"
+LESSON_ORDER_PROMPT_VERSION = "lesson_order_v13"
 LESSON_ORDER_TIMEOUT_S = 10.0
 # Even an invalid worst-case schema payload with three 128-UUID lists and a
 # terminal marker is 15,136 ASCII bytes. Actual
 # generated length, not this ceiling, drives latency.
 LESSON_ORDER_MAX_OUTPUT_TOKENS = 10_240
 LESSON_ORDER_ATTEMPTS = 2
-LESSON_ORDER_CACHE_VERSION = 10
+LESSON_ORDER_CACHE_VERSION = 11
 LESSON_ORDER_CACHE_TTL_SEC = 30 * 24 * 60 * 60
 LESSON_ORDER_MAX_CLIPS = 200
 LESSON_ORDER_MAX_USER_PROMPT_CHARS = 64_000
@@ -156,6 +156,12 @@ recent_prior_objective_coverage is a bounded clip-level lane for the newest rele
 objectives that were not already retained in prior_concept_coverage. Compare it in exactly the
 same way.
 
+LEARNING_REQUEST_JSON.required_reel_ids are previously released clips that were still unseen
+when this continuation began. Every one is mandatory: keep each exact ID once, but freely move
+it relative to newly recovered clips so the complete unseen lesson follows the clearest
+prerequisite, concept, reasoning, and application progression. A required ID is not evidence
+that its old position was pedagogically correct.
+
 Build a teaching progression when the available clips support it:
 1. Start with orientation, prerequisites, motivation, or a concise introduction.
 2. Put the core concept or definition before material that depends on it.
@@ -217,6 +223,8 @@ misconception, remediation, or worked step.
 
 Hard output rules:
 - Return one or more supplied reel_ids in ordered_reel_ids. You may omit a supplied ID.
+- Include every exact LEARNING_REQUEST_JSON.required_reel_ids value once in
+  ordered_reel_ids. They may be reordered but never omitted.
 - Return no more than LEARNING_REQUEST_JSON.release_limit reel_ids.
 - Return no unknown reel_id and no duplicate reel_id.
 - Never include a dependent clip without its supplied prerequisite. If a later member
@@ -891,6 +899,7 @@ def _user_prompt(
     learner_difficulty_target: float | None = None,
     concept_signals: Mapping[str, Mapping[str, Any]] | None = None,
     release_limit: int | None = None,
+    required_reel_ids: Sequence[str] | None = None,
     prior_concept_coverage: Sequence[Mapping[str, Any]] | None = None,
     recent_prior_objective_coverage: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
@@ -898,6 +907,11 @@ def _user_prompt(
         release_limit,
         len(reels),
     )
+    candidate_reel_ids = {
+        reel_id
+        for reel in reels
+        if (reel_id := _opaque_id(reel.get("reel_id")))
+    }
     candidate_concept_ids = {
         concept_id
         for reel in reels
@@ -1016,6 +1030,11 @@ def _user_prompt(
         "topic": _clean_text(topic, 500),
         "learner_level": _clean_text(learner_level, 80) or None,
         "release_limit": effective_release_limit,
+        "required_reel_ids": list(dict.fromkeys(
+            reel_id
+            for value in required_reel_ids or ()
+            if (reel_id := _opaque_id(value)) in candidate_reel_ids
+        )),
         "prior_concept_coverage": normalized_prior_coverage,
         "recent_prior_objective_coverage": normalized_recent_coverage,
     }
@@ -1674,6 +1693,7 @@ def _enforce_mandatory_selection(
     original: Sequence[dict[str, Any]],
     remediation_concept_ids: Sequence[str] | None,
     release_limit: int | None,
+    required_reel_ids: Sequence[str] | None,
     prior_concept_coverage: Sequence[Mapping[str, Any]] | None,
     recent_prior_objective_coverage: Sequence[Mapping[str, Any]] | None,
 ) -> LessonOrderResult:
@@ -1694,6 +1714,11 @@ def _enforce_mandatory_selection(
         if reel_id in reels_by_id
     ]
     selected_set = set(selected_ids)
+    required_identity_ids = {
+        reel_id
+        for value in required_reel_ids or ()
+        if (reel_id := _opaque_id(value)) in reels_by_id
+    }
     effective_release_limit = _effective_release_limit(
         release_limit,
         len(reels_by_id),
@@ -1763,6 +1788,7 @@ def _enforce_mandatory_selection(
     organizer_selection_is_complete = bool(
         len(selected_ids) == len(result.ordered_reel_ids)
         and len(selected_ids) <= effective_release_limit
+        and required_identity_ids.issubset(selected_set)
         and required_obligation_keys.issubset(selected_obligation_keys)
         and organizer_has_preferred_exact
         and all(
@@ -2620,6 +2646,8 @@ def _enforce_mandatory_selection(
         for index, reel_id in enumerate(reel_ids)
         if best_selected_bits & (1 << index)
     }
+    for reel_id in required_identity_ids:
+        mandatory_ids.update(dependency_closures[reel_id])
 
     # Mandatory witnesses win release slots; remaining organizer choices fill the
     # lesson only when their complete dependency closure still fits.
@@ -2650,7 +2678,10 @@ def _enforce_mandatory_selection(
         (),
         reels_by_id,
     )
-    if closure_mask(set(deduplicated_ids)) & best_mask != best_mask:
+    if (
+        closure_mask(set(deduplicated_ids)) & best_mask != best_mask
+        or not required_identity_ids.issubset(deduplicated_ids)
+    ):
         deduplicated_ids, _ = _filter_same_source_overlaps(
             mandatory_first,
             (),
@@ -2748,13 +2779,21 @@ def _fallback(
     topic: str = "",
     preferred_ids: Sequence[str] = (),
     release_limit: int | None = None,
+    required_reel_ids: Sequence[str] = (),
 ) -> LessonOrderResult:
-    ordered_reels, ordered_reel_ids = _constraint_safe_fallback_order(
-        reels,
-        reel_ids,
-        topic=topic,
-        preferred_ids=preferred_ids,
-    )
+    if required_reel_ids:
+        # A failed cross-batch organizer must degrade to the existing unseen
+        # tail followed by the new delta. Partial model preferences are not a
+        # valid authority for moving already-released anchors.
+        ordered_reels = list(reels)
+        ordered_reel_ids = list(reel_ids)
+    else:
+        ordered_reels, ordered_reel_ids = _constraint_safe_fallback_order(
+            reels,
+            reel_ids,
+            topic=topic,
+            preferred_ids=preferred_ids,
+        )
     if (
         len(ordered_reels) == len(ordered_reel_ids)
         and all(ordered_reel_ids)
@@ -2762,7 +2801,10 @@ def _fallback(
     ):
         reels_by_id = dict(zip(ordered_reel_ids, ordered_reels, strict=True))
         ordered_reel_ids, _ = _filter_same_source_overlaps(
-            ordered_reel_ids, (), reels_by_id
+            ordered_reel_ids,
+            (),
+            reels_by_id,
+            protected_ids=required_reel_ids,
         )
         ordered_reels = [reels_by_id[reel_id] for reel_id in ordered_reel_ids]
     effective_release_limit = _effective_release_limit(
@@ -2976,6 +3018,7 @@ def _read_cached_lesson_order(
     generation_context: "GenerationContext | Any | None",
     has_prior_objective_evidence: bool,
     release_limit: int | None = None,
+    required_reel_ids: Sequence[str] | None = None,
 ) -> LessonOrderResult | None:
     try:
         with get_conn() as conn:
@@ -3033,6 +3076,7 @@ def _read_cached_lesson_order(
     if (
         len(ordered_ids) > _effective_release_limit(release_limit, len(original))
         or not _valid_selected_order(ordered_ids, reel_ids)
+        or not set(required_reel_ids or ()).issubset(ordered_ids)
         or not _valid_assessment_checkpoints(checkpoint_ids, ordered_ids)
         or not _valid_prior_restatements(
             prior_restatement_ids,
@@ -3056,7 +3100,8 @@ def _read_cached_lesson_order(
         after_ids=ordered_ids,
     )
     if (
-        not _preserves_source_chronology(ordered_ids, reels_by_id)
+        not set(required_reel_ids or ()).issubset(ordered_ids)
+        or not _preserves_source_chronology(ordered_ids, reels_by_id)
         or not _preserves_declared_dependencies(ordered_ids, reels_by_id)
     ):
         return None
@@ -3134,6 +3179,7 @@ def _order_lesson_batch(
     learner_difficulty_target: float | None = None,
     concept_signals: Mapping[str, Mapping[str, Any]] | None = None,
     release_limit: int | None = None,
+    required_reel_ids: Sequence[str] | None = None,
     prior_concept_coverage: Sequence[Mapping[str, Any]] | None = None,
     recent_prior_objective_coverage: Sequence[Mapping[str, Any]] | None = None,
     should_cancel: Callable[[], bool] | None = None,
@@ -3162,6 +3208,22 @@ def _order_lesson_batch(
             topic=topic,
             release_limit=release_limit,
         )
+    normalized_required_reel_ids = list(dict.fromkeys(
+        _opaque_id(value) for value in required_reel_ids or ()
+    ))
+    if (
+        any(not reel_id for reel_id in normalized_required_reel_ids)
+        or not set(normalized_required_reel_ids).issubset(reel_ids)
+    ):
+        return _fallback(
+            original,
+            reel_ids,
+            reason="invalid_required_reel_ids",
+            model_used="",
+            provider_called=False,
+            topic=topic,
+            release_limit=release_limit,
+        )
     effective_release_limit = _effective_release_limit(
         release_limit,
         len(original),
@@ -3175,6 +3237,7 @@ def _order_lesson_batch(
             learner_difficulty_target=learner_difficulty_target,
             concept_signals=concept_signals,
             release_limit=effective_release_limit,
+            required_reel_ids=normalized_required_reel_ids,
             prior_concept_coverage=prior_concept_coverage,
             recent_prior_objective_coverage=recent_prior_objective_coverage,
         )
@@ -3193,6 +3256,7 @@ def _order_lesson_batch(
             generation_context=generation_context,
             has_prior_objective_evidence=has_prior_objective_evidence,
             release_limit=effective_release_limit,
+            required_reel_ids=normalized_required_reel_ids,
         )
         raise_if_cancelled(should_cancel)
         if cached is not None:
@@ -3219,6 +3283,7 @@ def _order_lesson_batch(
                 generation_context=generation_context,
                 has_prior_objective_evidence=has_prior_objective_evidence,
                 release_limit=effective_release_limit,
+                required_reel_ids=normalized_required_reel_ids,
             )
             raise_if_cancelled(should_cancel)
             if cached is not None:
@@ -3230,6 +3295,7 @@ def _order_lesson_batch(
                 learner_difficulty_target=learner_difficulty_target,
                 concept_signals=concept_signals,
                 release_limit=effective_release_limit,
+                required_reel_ids=normalized_required_reel_ids,
                 prior_concept_coverage=prior_concept_coverage,
                 recent_prior_objective_coverage=(
                     recent_prior_objective_coverage
@@ -3468,6 +3534,7 @@ def _order_lesson_batch(
         model_order_valid = (
             len(ordered_ids) <= effective_release_limit
             and _valid_selected_order(ordered_ids, reel_ids)
+            and set(normalized_required_reel_ids).issubset(ordered_ids)
             and _valid_assessment_checkpoints(checkpoint_ids, ordered_ids)
             and _valid_prior_restatements(
                 prior_restatement_ids,
@@ -3491,7 +3558,8 @@ def _order_lesson_batch(
                 after_ids=ordered_ids,
             )
             model_order_valid = (
-                _preserves_source_chronology(ordered_ids, reels_by_id)
+                set(normalized_required_reel_ids).issubset(ordered_ids)
+                and _preserves_source_chronology(ordered_ids, reels_by_id)
                 and _preserves_declared_dependencies(ordered_ids, reels_by_id)
             )
         if not model_order_valid:
@@ -3578,8 +3646,9 @@ def _order_lesson_batch(
         provider_called=provider_called,
         telemetry=last_telemetry,
         topic=topic,
-        preferred_ids=preferred_ids,
+        preferred_ids=(preferred_ids if not normalized_required_reel_ids else ()),
         release_limit=effective_release_limit,
+        required_reel_ids=normalized_required_reel_ids,
     )
 
 
@@ -3592,6 +3661,7 @@ def order_lesson_batch(
     concept_signals: Mapping[str, Mapping[str, Any]] | None = None,
     remediation_concept_ids: Sequence[str] | None = None,
     release_limit: int | None = None,
+    required_reel_ids: Sequence[str] | None = None,
     prior_concept_coverage: Sequence[Mapping[str, Any]] | None = None,
     recent_prior_objective_coverage: Sequence[Mapping[str, Any]] | None = None,
     should_cancel: Callable[[], bool] | None = None,
@@ -3604,6 +3674,7 @@ def order_lesson_batch(
         learner_difficulty_target=learner_difficulty_target,
         concept_signals=concept_signals,
         release_limit=release_limit,
+        required_reel_ids=required_reel_ids,
         prior_concept_coverage=prior_concept_coverage,
         recent_prior_objective_coverage=recent_prior_objective_coverage,
         should_cancel=should_cancel,
@@ -3614,6 +3685,7 @@ def order_lesson_batch(
         original=list(reels),
         remediation_concept_ids=remediation_concept_ids,
         release_limit=release_limit,
+        required_reel_ids=required_reel_ids,
         prior_concept_coverage=prior_concept_coverage,
         recent_prior_objective_coverage=recent_prior_objective_coverage,
     )
