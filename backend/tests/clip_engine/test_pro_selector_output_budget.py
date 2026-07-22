@@ -101,6 +101,8 @@ def _newton_plan() -> gemini_segment._CompactBoundaryPlan:
             self_contained=True,
             is_standalone=True,
             intent_evidence=[{"id": "law", "q": claim}],
+            objective_constraint_ids=["law"],
+            relationship_witnesses=[],
         )],
     )
 
@@ -119,7 +121,12 @@ def _newton_audit_plan() -> gemini_segment._ProCandidateAuditPlan:
             "id": "law",
             "q": "net force on an object equals its mass times its acceleration",
         }],
+        "objective_constraint_ids": ["law"],
+        "relationship_witnesses": [],
         "evidence_quote": (
+            "force on an object equals its mass times its acceleration"
+        ),
+        "objective_witness_quote": (
             "force on an object equals its mass times its acceleration"
         ),
         "direct_start_line": 0,
@@ -132,12 +139,21 @@ def _newton_audit_plan() -> gemini_segment._ProCandidateAuditPlan:
     }])
 
 
-def test_v8_audit_budget_fits_forty_items_plus_observed_high_thinking() -> None:
+def test_v12_audit_budget_fits_forty_items_plus_observed_high_thinking() -> None:
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
         "id": f"candidate-{index}",
         "d": "reject_filler_dominated",
         "obj": "o" * 120,
+        "t": "t",
+        "f": "f",
+        "family": "x",
+        "a": [],
+        "direct": False,
+        "ie": [],
+        "oi": [],
+        "rw": [],
         "ev": "e" * 112,
+        "ow": "e" * 112,
         "ds": 999,
         "dq": "d" * 84,
         "dc": True,
@@ -152,8 +168,43 @@ def test_v8_audit_budget_fits_forty_items_plus_observed_high_thinking() -> None:
     assert len(audit.items) == 40
     assert (
         conservative_candidate_tokens + _OBSERVED_PRO_THOUGHT_TOKENS
-        <= gemini_segment._PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS
+        <= gemini_segment._pro_boundary_audit_output_tokens(len(audit.items))
     )
+    assert gemini_segment._pro_boundary_audit_output_tokens(40) == (
+        gemini_segment._PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS
+    )
+
+
+def test_typical_nine_candidate_audit_uses_smaller_admissible_output_reservation() -> None:
+    audit = gemini_segment._ProCandidateAuditPlan(items=[{
+        "id": f"candidate-{index}",
+        "d": "reject_filler_dominated",
+        "obj": "o" * 120,
+        "t": "t",
+        "f": "f",
+        "family": "x",
+        "a": [],
+        "direct": False,
+        "ie": [],
+        "oi": [],
+        "rw": [],
+        "ev": "e" * 112,
+        "ow": "e" * 112,
+        "ds": 999,
+        "dq": "d" * 84,
+        "dc": True,
+        "s": 999,
+        "e": 999,
+        "sq": "s" * 84,
+        "eq": "q" * 84,
+    } for index in range(1, 10)])
+    payload_tokens = math.ceil(
+        len(audit.model_dump_json(by_alias=True).encode("utf-8")) / 2
+    )
+    reservation = gemini_segment._pro_boundary_audit_output_tokens(9)
+
+    assert payload_tokens + _OBSERVED_PRO_THOUGHT_TOKENS <= reservation
+    assert reservation < 19_200
 
 
 def test_pro_selector_and_boundary_audit_recover_one_transient_failure(
@@ -422,26 +473,26 @@ def test_pro_selector_and_boundary_audit_do_not_retry_permanent_4xx(
         _RetryResponse(_newton_audit_plan().model_dump_json(by_alias=True)),
     )
     monkeypatch.setattr(gemini_client, "get_client", lambda: audit_fake)
-    retained, calls, rejections = gemini_segment._audit_pro_boundaries(
-        plan,
-        [{
-            "cue_id": "supadata-cue-0",
-            "start": 0.0,
-            "end": 8.0,
-            "text": (
-                "Newton's second law says that the net force on an object "
-                "equals its mass times its acceleration."
-            ),
-        }],
-        plan.request_intent.exact_request,
-        {},
-        deadline=time.monotonic() + 30.0,
-        cancelled=None,
-    )
+    with pytest.raises(gemini_segment._ModelCallError) as exc_info:
+        gemini_segment._audit_pro_boundaries(
+            plan,
+            [{
+                "cue_id": "supadata-cue-0",
+                "start": 0.0,
+                "end": 8.0,
+                "text": (
+                    "Newton's second law says that the net force on an object "
+                    "equals its mass times its acceleration."
+                ),
+            }],
+            plan.request_intent.exact_request,
+            {},
+            deadline=time.monotonic() + 30.0,
+            cancelled=None,
+        )
 
-    assert retained == plan
-    assert rejections == []
     assert len(audit_fake.calls) == 1
+    calls = exc_info.value.selection_attempt_calls
     assert calls[0]["provider_status_code"] == 403
     assert calls[0]["retryable"] is False
 
@@ -573,7 +624,7 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     assert result.calls[0]["reserved_output_tokens"] == call["max_output_tokens"]
     assert audit_call["schema"] is gemini_segment._ProCandidateAuditPlan
     assert audit_call["operation"] == "pro_boundary_audit"
-    assert audit_call["prompt_version"] == "pro_candidate_audit_v11"
+    assert audit_call["prompt_version"] == "pro_candidate_audit_v12"
     assert audit_call["thinking_level"] == "high"
     assert audit_call["media_resolution"] is None
     assert gemini_segment._PRO_FINAL_AUDIT_RESERVED_S >= 60.0
@@ -789,7 +840,7 @@ def test_text_only_pro_stops_after_two_malformed_structured_responses(
 
 @pytest.mark.parametrize(
     ("mode", "selector_count", "cost_limit"),
-    [("fast", 2, 1.00), ("slow", 3, 1.50)],
+    [("fast", 3, 1.50), ("slow", 5, 2.50)],
 )
 def test_pro_selector_and_audit_retry_headroom_stays_within_job_cost_ceiling(
     mode: str,
@@ -831,11 +882,30 @@ def test_pro_selector_and_audit_retry_headroom_stays_within_job_cost_ceiling(
         },
         dispatched=True,
     )
+    selector_retry_reservations = []
     for reservation in selector_reservations:
+        # A transport failure with no provider usage remains conservatively
+        # billing-unknown, then one cost-only physical retry succeeds.
         context.reconcile_gemini_call(
             model_used="gemini-3.1-pro-preview",
             usage={
                 **reservation,
+                "dispatched": True,
+            },
+            dispatched=True,
+        )
+        retry_reservation = context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=30_000,
+            max_output_tokens=gemini_segment._PRO_BOUNDARY_OUTPUT_TOKENS,
+            count_logical_call=False,
+        )
+        selector_retry_reservations.append(retry_reservation)
+        context.reconcile_gemini_call(
+            model_used="gemini-3.1-pro-preview",
+            usage={
+                **retry_reservation,
                 "prompt_tokens": 1_000,
                 "candidate_tokens": 100,
                 "thought_tokens": 0,
@@ -849,12 +919,14 @@ def test_pro_selector_and_audit_retry_headroom_stays_within_job_cost_ceiling(
         )
 
     audit_reservations = []
+    audit_retry_reservations = []
+    audit_output_tokens = gemini_segment._pro_boundary_audit_output_tokens(9)
     for _ in range(selector_count):
         reservation = context.reserve_gemini_call(
             operation="pro_boundary_audit",
             model="gemini-3.1-pro-preview",
             estimated_input_tokens=30_000,
-            max_output_tokens=gemini_segment._PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS,
+            max_output_tokens=audit_output_tokens,
         )
         audit_reservations.append(reservation)
         assert (
@@ -865,6 +937,22 @@ def test_pro_selector_and_audit_retry_headroom_stays_within_job_cost_ceiling(
             model_used="gemini-3.1-pro-preview",
             usage={
                 **reservation,
+                "dispatched": True,
+            },
+            dispatched=True,
+        )
+        retry_reservation = context.reserve_gemini_call(
+            operation="pro_boundary_audit",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=30_000,
+            max_output_tokens=audit_output_tokens,
+            count_logical_call=False,
+        )
+        audit_retry_reservations.append(retry_reservation)
+        context.reconcile_gemini_call(
+            model_used="gemini-3.1-pro-preview",
+            usage={
+                **retry_reservation,
                 "prompt_tokens": 1_000,
                 "candidate_tokens": 100,
                 "thought_tokens": 0,
@@ -875,8 +963,8 @@ def test_pro_selector_and_audit_retry_headroom_stays_within_job_cost_ceiling(
 
     assert all(
         reservation["reserved_output_tokens"]
-        == gemini_segment._PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS
-        for reservation in audit_reservations
+        == audit_output_tokens
+        for reservation in [*audit_reservations, *audit_retry_reservations]
     )
     budget = context.budget.snapshot()["gemini"]
     assert budget["selector_calls"] == selector_count
@@ -892,7 +980,7 @@ def test_retry_waits_for_physical_capacity_then_dispatches_exactly_once(
     peer_ticket = context.budget.reserve_gemini(
         model="gemini-3.5-flash",
         operation="flash_grounded_enrichment",
-        estimated_cost_usd=0.60,
+        estimated_cost_usd=1.00,
         max_physical_attempts=1,
     )
     fake = _RetryClient(

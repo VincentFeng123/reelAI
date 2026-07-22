@@ -25,6 +25,7 @@ from backend.app.clip_engine.errors import (
 )
 from backend.app.clip_engine.provider_runtime import ProviderUsageRecord
 from backend.app.ingestion import pipeline as ingestion_pipeline
+from backend.app.ingestion import persistence as ingestion_persistence
 from backend.app.ingestion.persistence import ensure_clip_concept
 from backend.app.ingestion.models import (
     IngestMetadata,
@@ -177,6 +178,7 @@ def test_intent_obligations_reach_organizer_only_from_trusted_gemini_metadata() 
 
     for untrusted in (
         {**trusted, "selection_authority": "local"},
+        {**trusted, "intent_obligation_contract_version": "intent_obligation_v1"},
         {**trusted, "intent_obligation_contract_version": "intent_obligation_v0"},
         {
             **trusted,
@@ -729,7 +731,7 @@ def test_ambiguous_final_release_commit_is_not_replayed_or_duplicated(
         conn.close()
 
 
-def test_semantic_family_metadata_does_not_expand_exact_organizer_signals() -> None:
+def test_semantic_family_metadata_keeps_fingerprint_exact_but_propagates_to_organizer() -> None:
     conn = _conn()
     learner_id = "owner:semantic-family"
     try:
@@ -756,6 +758,12 @@ def test_semantic_family_metadata_does_not_expand_exact_organizer_signals() -> N
             "'An object keeps its state of motion unless a net force acts.', '[]', "
             "1.0, 0.5, '2026-07-10T00:00:02+00:00', ?)",
             (source_context,),
+        )
+        ingestion_persistence._record_concept_family_profile(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            search_context=json.loads(source_context),
         )
         main.reel_service.record_feedback(
             conn,
@@ -792,6 +800,12 @@ def test_semantic_family_metadata_does_not_expand_exact_organizer_signals() -> N
             "0.4, '2026-07-10T00:00:03+00:00', ?)",
             ("new-family-reel", related_id, target_context),
         )
+        ingestion_persistence._record_concept_family_profile(
+            conn,
+            material_id="m1",
+            concept_id=related_id,
+            search_context=json.loads(target_context),
+        )
 
         assert main._learner_adaptation_fingerprint(
             conn, material_id="m1", learner_id=learner_id
@@ -801,6 +815,15 @@ def test_semantic_family_metadata_does_not_expand_exact_organizer_signals() -> N
         )
         assert signals["c1"]["helpful"] == 1.0
         assert related_id not in signals
+        organizer_signals = main._learner_concept_signals(
+            conn,
+            material_id="m1",
+            learner_id=learner_id,
+            propagate_concept_families=True,
+            candidate_concept_ids={related_id},
+        )
+        assert organizer_signals[related_id]["helpful"] == 1.0
+        assert organizer_signals[related_id]["confusing"] == 0.0
         ranked = main.reel_service.ranked_feed(
             conn,
             material_id="m1",
@@ -825,7 +848,7 @@ def test_semantic_family_metadata_does_not_expand_exact_organizer_signals() -> N
             }],
             topic="Newton's laws",
             learner_level="beginner",
-            concept_signals=signals,
+            concept_signals=organizer_signals,
         )
         prompt_payload = json.loads(
             prompt.split("CLIPS_JSON:\n", 1)[1].split("\n\nFinal request:", 1)[0]
@@ -835,9 +858,9 @@ def test_semantic_family_metadata_does_not_expand_exact_organizer_signals() -> N
         assert organizer_clip["concept_family"] == "Newton's first law"
         assert organizer_clip["concept_aliases"] == []
         assert organizer_clip["learner_signal"] == {
-            "helpful": 0.0,
+            "helpful": 1.0,
             "confusing": 0.0,
-            "adjustment": 0.0,
+            "adjustment": 0.04,
         }
 
         main.reel_service.record_feedback(
@@ -859,6 +882,19 @@ def test_semantic_family_metadata_does_not_expand_exact_organizer_signals() -> N
         assert confusing_signals["c1"]["confusing"] == 1.0
         assert related_id not in confusing_signals
         assert remediation_concept_ids == ["c1"]
+        propagated_remediation_ids: list[str] = []
+        propagated_confusing = main._learner_concept_signals(
+            conn,
+            material_id="m1",
+            learner_id=learner_id,
+            propagate_concept_families=True,
+            candidate_concept_ids={related_id},
+            remediation_concept_ids_out=propagated_remediation_ids,
+        )
+        assert propagated_confusing[related_id]["confusing"] == 1.0
+        assert propagated_confusing[related_id]["helpful"] == 0.0
+        assert propagated_confusing[related_id]["adjustment"] == -0.06
+        assert propagated_remediation_ids == ["c1"]
     finally:
         conn.close()
 
@@ -1429,6 +1465,85 @@ def test_persisted_lesson_order_projects_onto_remaining_unseen_reels() -> None:
         conn.close()
 
 
+def _released_empty_generation_chain(
+    conn: sqlite3.Connection,
+    *,
+    now: datetime,
+    prefix: str,
+    reel_count: int,
+    empty_node_count: int,
+) -> tuple[str, str, list[str], list[str]]:
+    root_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key=f"{prefix}-root",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    root_reel_ids = [f"{prefix}-reel-{index}" for index in range(reel_count)]
+    for index, reel_id in enumerate(root_reel_ids):
+        _insert_generation_reel(
+            conn,
+            generation_id=root_generation_id,
+            reel_id=reel_id,
+            video_id=f"{prefix}-video-{index}",
+            created_at=(now + timedelta(seconds=index)).isoformat(),
+        )
+        _mark_generation_reel_as_gemini(conn, reel_id)
+    root_job = _terminal_job_for_generation(
+        conn,
+        request_key=f"{prefix}-root",
+        generation_id=root_generation_id,
+        completed_at=now.isoformat(),
+        request_params={"generation_mode": "slow", "num_reels": 9},
+    )
+    _append_authoritative_release(
+        conn,
+        job_id=str(root_job["id"]),
+        reel_ids=root_reel_ids,
+    )
+    main._persist_generation_lesson_order(
+        conn,
+        generation_id=root_generation_id,
+        metadata={"version": 2, "ordered_reel_ids": root_reel_ids},
+    )
+
+    source_generation_id = root_generation_id
+    editorial_tail = list(root_reel_ids)
+    for node_index in range(empty_node_count):
+        generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=f"{prefix}-empty-{node_index}",
+            generation_mode="slow",
+            retrieval_profile="unified",
+            source_generation_id=source_generation_id,
+        )
+        job = _terminal_job_for_generation(
+            conn,
+            request_key=f"{prefix}-empty-{node_index}",
+            generation_id=generation_id,
+            completed_at=(now + timedelta(seconds=20 + node_index)).isoformat(),
+            status="partial",
+            request_params={"generation_mode": "slow", "num_reels": 9},
+        )
+        _append_authoritative_release(conn, job_id=str(job["id"]), reel_ids=[])
+        editorial_tail = list(reversed(editorial_tail))
+        main._persist_generation_lesson_order(
+            conn,
+            generation_id=generation_id,
+            metadata={
+                "version": 2,
+                "ordered_reel_ids": [],
+                "reconciliation_tail_reel_ids": editorial_tail,
+            },
+        )
+        source_generation_id = generation_id
+    return root_generation_id, source_generation_id, root_reel_ids, editorial_tail
+
+
 @pytest.mark.parametrize(
     ("checkpoint_ids", "preparation_complete"),
     [
@@ -1455,6 +1570,29 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
     concept_signals = {
         "c1": {"helpful": 1.0, "confusing": 0.0, "adjustment": 0.04}
     }
+    trusted_organizer_fields = {
+        "_selection_intent_connections": [{
+            "key": "io:connection",
+            "kind": "relationship",
+            "source_phrase": "energy transfer",
+            "requirement": "Connect ATP to usable chemical energy.",
+            "evidence_quote": "ATP transfers usable chemical energy.",
+        }],
+        "_selection_intent_relationship_witnesses": [{
+            "obligation_key": "io:connection",
+            "members": ["ATP", "usable chemical energy"],
+            "links": ["ATP transfers usable chemical energy"],
+        }],
+        "_selection_intent_curriculum_edges": [{
+            "before_key": "io:atp",
+            "after_key": "io:transfer",
+            "relation_key": "io:connection",
+        }],
+        "_selection_intent_role": "primary",
+        "_selection_intent_coverage": 0.9,
+        "_selection_directly_teaches_topic": True,
+    }
+    signal_propagation_calls: list[bool] = []
     adaptation_fingerprint = hashlib.sha256(
         json.dumps(concept_signals, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -1484,21 +1622,31 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
 
     def generate_stage(worker_conn, **kwargs) -> None:
         for index in range(3):
-            generated.append(
-                _insert_generation_reel(
-                    worker_conn,
-                    generation_id=str(kwargs["generation_id"]),
-                    reel_id=f"release-reel-{index}",
-                    video_id=f"release-video-{index}",
-                    created_at=(now + timedelta(seconds=index)).isoformat(),
-                )
+            reel = _insert_generation_reel(
+                worker_conn,
+                generation_id=str(kwargs["generation_id"]),
+                reel_id=f"release-reel-{index}",
+                video_id=f"release-video-{index}",
+                created_at=(now + timedelta(seconds=index)).isoformat(),
             )
+            if index == 0:
+                reel.update(trusted_organizer_fields)
+                reel["_selection_untrusted_private_field"] = "strip-me"
+            generated.append(reel)
 
     def order_batch(reels, **kwargs):
         assert kwargs["topic"] == "Cell biology"
         assert kwargs["concept_signals"] == {
             "c1": {"helpful": 1.0, "confusing": 0.0, "adjustment": 0.04}
         }
+        organizer_reel = next(
+            reel for reel in reels if reel["reel_id"] == "release-reel-0"
+        )
+        assert {
+            key: organizer_reel.get(key)
+            for key in trusted_organizer_fields
+        } == trusted_organizer_fields
+        assert "_selection_untrusted_private_field" not in organizer_reel
         ordered = list(reversed(reels))
         return mock.Mock(
             reels=ordered,
@@ -1537,10 +1685,17 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
         return original_append(worker_conn, **kwargs)
 
     monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+
+    def learner_signals(*_args, **kwargs):
+        signal_propagation_calls.append(
+            bool(kwargs.get("propagate_concept_families"))
+        )
+        return concept_signals
+
     monkeypatch.setattr(
         main,
         "_learner_concept_signals",
-        lambda *_args, **_kwargs: concept_signals,
+        learner_signals,
     )
     monkeypatch.setattr(
         main,
@@ -1561,6 +1716,7 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
         completed = generation_jobs.get_job(conn, job["id"])
         assert completed is not None
         assert completed["status"] == "completed"
+        assert True in signal_propagation_calls
         assert len(preparation_calls) == (1 if checkpoint_ids else 0)
         generation_row = main._fetch_generation_row(
             conn, str(completed["result_generation_id"])
@@ -1592,6 +1748,12 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
             "release-reel-1",
             "release-reel-0",
         ]
+        public_reel = next(
+            reel
+            for reel in final["payload"]["reels"]
+            if reel["reel_id"] == "release-reel-0"
+        )
+        assert not any(key.startswith("_selection_") for key in public_reel)
     finally:
         conn.close()
 
@@ -2428,9 +2590,12 @@ def test_raw_parent_inventory_prevents_top_up_after_smaller_selected_subset(
     def order_batch(reels, **kwargs):
         organizer_calls.append([str(reel["reel_id"]) for reel in reels])
         assert set(organizer_calls[0]) == {
-            f"raw-parent-reel-{index}" for index in range(8, 120)
+            f"raw-parent-reel-{index}" for index in range(120)
         }
-        assert kwargs["release_limit"] == 112
+        assert kwargs["release_limit"] == 120
+        assert kwargs["required_reel_ids"] == [
+            f"raw-parent-reel-{index}" for index in range(8)
+        ]
         selected = list(reels[:9])
         return mock.Mock(
             reels=selected,
@@ -2475,7 +2640,338 @@ def test_raw_parent_inventory_prevents_top_up_after_smaller_selected_subset(
         assert len(organizer_calls) == 1
         completed = generation_jobs.get_job(conn, job["id"])
         assert completed is not None
-        assert completed["status"] == "completed"
+        assert completed["status"] == "partial"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("prior_adaptation", "current_adaptation"),
+    [
+        ("after-helpful", "after-confusing"),
+        ("after-quiz-correct", "after-feedback-confusing"),
+    ],
+)
+def test_feedback_rerank_reuses_unseen_releases_through_empty_organizer_child(
+    monkeypatch,
+    prior_adaptation: str,
+    current_adaptation: str,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    (
+        root_generation_id,
+        helpful_generation_id,
+        root_reel_ids,
+        helpful_tail,
+    ) = _released_empty_generation_chain(
+        conn,
+        now=now,
+        prefix="feedback-root",
+        reel_count=12,
+        empty_node_count=1,
+    )
+    main._persist_generation_lesson_order(
+        conn,
+        generation_id=helpful_generation_id,
+        metadata={
+            "version": 2,
+            "ordered_reel_ids": [],
+            "reconciliation_tail_reel_ids": helpful_tail,
+            "adaptation_fingerprint": prior_adaptation,
+        },
+    )
+
+    current_params = {
+        "generation_mode": "slow",
+        "num_reels": 9,
+        "knowledge_level": "beginner",
+        "adaptation_fingerprint": current_adaptation,
+        "exclude_video_ids": [
+            "feedback-root-video-0",
+            "feedback-root-video-1",
+        ],
+    }
+    current_job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key=current_adaptation,
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params=current_params,
+        source_generation_id=helpful_generation_id,
+        now=now + timedelta(seconds=30),
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=str(current_job["id"]),
+        lease_owner="recursive-feedback-worker",
+        now=now + timedelta(seconds=30),
+    )
+    assert leased is not None
+    assert main._current_level_reusable_generation_reel_count(
+        conn,
+        generation_id=helpful_generation_id,
+        material_id="m1",
+        concept_id="c1",
+        learner_id="learner-1",
+        request_params=current_params,
+        requested=9,
+    ) == main.INITIAL_READY_REEL_TARGET
+    monkeypatch.setattr(
+        main,
+        "_learner_adaptation_fingerprint",
+        lambda *_args, **_kwargs: current_adaptation,
+    )
+    acquire = mock.Mock(
+        side_effect=AssertionError("full recursive reservoir must not acquire")
+    )
+    organizer_calls: list[tuple[list[str], list[str]]] = []
+
+    def order_current(reels, **kwargs):
+        organizer_calls.append((
+            [str(reel["reel_id"]) for reel in reels],
+            list(kwargs["required_reel_ids"]),
+        ))
+        ordered = list(reversed(reels))
+        return mock.Mock(
+            reels=ordered,
+            ordered_reel_ids=[str(reel["reel_id"]) for reel in ordered],
+            assessment_checkpoint_reel_ids=[],
+            current_restatement_reel_ids=[],
+            prior_restatement_reel_ids=[],
+            terminal_summary_start_reel_id=None,
+            model_used="gemini-test",
+            degraded=False,
+            fallback_reason=None,
+            provider_called=True,
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", acquire)
+    monkeypatch.setattr(main, "order_lesson_batch", order_current)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        acquire.assert_not_called()
+        completed = generation_jobs.get_job(conn, str(current_job["id"]))
+        expected_available_ids = helpful_tail[:-2]
+        assert organizer_calls == [
+            (expected_available_ids, expected_available_ids)
+        ]
+        assert completed is not None
+        assert completed["status"] == "partial"
+        current_generation_id = str(completed["result_generation_id"])
+        assert main._count_generation_reels(conn, current_generation_id) == 0
+        metadata = main._stored_generation_lesson_order_metadata(
+            conn, current_generation_id
+        )
+        assert metadata is not None
+        assert metadata["ordered_reel_ids"] == []
+        assert metadata["reconciliation_tail_reel_ids"] == list(
+            reversed(expected_available_ids)
+        )
+        assert main._authoritative_release_reel_ids(
+            conn, current_generation_id
+        ) == [root_reel_ids[1], root_reel_ids[0], *root_reel_ids[2:]]
+    finally:
+        conn.close()
+
+
+def test_recursive_inventory_crosses_multiple_empty_nodes_with_editorial_plans() -> None:
+    conn = _conn()
+    now = datetime.now(timezone.utc)
+    (
+        root_generation_id,
+        second_empty_generation_id,
+        root_reel_ids,
+        second_tail,
+    ) = _released_empty_generation_chain(
+        conn,
+        now=now,
+        prefix="multi-empty",
+        reel_count=11,
+        empty_node_count=2,
+    )
+    source_generation_ids = main._response_generation_ids(
+        conn, second_empty_generation_id
+    )
+
+    conn.execute(
+        "INSERT INTO learner_reel_progress "
+        "(learner_id, reel_id, material_id, max_fraction, scrolled_at, "
+        "created_at, updated_at) VALUES (?, ?, 'm1', 0.5, ?, ?, ?)",
+        (
+            "learner-1",
+            root_reel_ids[0],
+            now.isoformat(),
+            now.isoformat(),
+            now.isoformat(),
+        ),
+    )
+    request_params = {
+        "generation_mode": "slow",
+        "num_reels": 9,
+        "knowledge_level": "beginner",
+        "exclude_video_ids": ["multi-empty-video-1"],
+    }
+    current_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="multi-empty-current",
+        generation_mode="slow",
+        retrieval_profile="unified",
+        source_generation_id=second_empty_generation_id,
+    )
+    prior_unseen_reels: list[dict] = []
+    try:
+        assert main._response_generation_ids(
+            conn, current_generation_id
+        ) == [*source_generation_ids, current_generation_id]
+        assert len(source_generation_ids) == 3
+        assert main._current_level_reusable_generation_reel_count(
+            conn,
+            generation_id=second_empty_generation_id,
+            material_id="m1",
+            concept_id="c1",
+            learner_id="learner-1",
+            request_params=request_params,
+            requested=9,
+        ) == main.INITIAL_READY_REEL_TARGET
+        assert main._generation_job_reels(
+            conn,
+            {
+                "result_generation_id": current_generation_id,
+                "material_id": "m1",
+                "concept_id": "c1",
+                "learner_id": "learner-1",
+                "request_params_json": json.dumps(request_params),
+            },
+            organizer_candidate_limit=main.LESSON_ORDER_CANDIDATE_LIMITS["slow"],
+            preserve_lesson_order_metadata=True,
+            prior_unseen_reels_out=prior_unseen_reels,
+        ) == []
+        expected_available_ids = [
+            reel_id
+            for reel_id in second_tail
+            if reel_id not in {root_reel_ids[0], root_reel_ids[1]}
+        ]
+        assert [reel["reel_id"] for reel in prior_unseen_reels] == (
+            expected_available_ids
+        )
+        assert len(set(expected_available_ids)) == len(expected_available_ids) == 9
+    finally:
+        conn.close()
+
+
+def test_partial_recursive_inventory_runs_one_bounded_top_up(monkeypatch) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    (
+        root_generation_id,
+        empty_generation_id,
+        root_reel_ids,
+        prior_tail,
+    ) = _released_empty_generation_chain(
+        conn,
+        now=now,
+        prefix="partial-chain-root",
+        reel_count=4,
+        empty_node_count=1,
+    )
+    current_params = {
+        "generation_mode": "slow",
+        "num_reels": 9,
+        "knowledge_level": "beginner",
+        "adaptation_fingerprint": "partial-chain-current",
+        "fresh_source_budget": True,
+        "exclude_video_ids": ["partial-chain-root-video-0"],
+    }
+    current_job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="partial-chain-current",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params=current_params,
+        source_generation_id=empty_generation_id,
+        now=now + timedelta(seconds=30),
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=str(current_job["id"]),
+        lease_owner="partial-chain-worker",
+        now=now + timedelta(seconds=30),
+    )
+    assert leased is not None
+    monkeypatch.setattr(
+        main,
+        "_learner_adaptation_fingerprint",
+        lambda *_args, **_kwargs: "partial-chain-current",
+    )
+    acquisition_calls: list[dict] = []
+    organizer_calls: list[tuple[list[str], list[str]]] = []
+
+    def acquire(worker_conn, **kwargs) -> None:
+        acquisition_calls.append(kwargs)
+        for index in range(6):
+            reel_id = f"partial-chain-new-reel-{index}"
+            _insert_generation_reel(
+                worker_conn,
+                generation_id=str(kwargs["generation_id"]),
+                reel_id=reel_id,
+                video_id=f"partial-chain-new-video-{index}",
+                created_at=(now + timedelta(seconds=40 + index)).isoformat(),
+            )
+            _mark_generation_reel_as_gemini(worker_conn, reel_id)
+
+    def order_current(reels, **kwargs):
+        organizer_calls.append((
+            [str(reel["reel_id"]) for reel in reels],
+            list(kwargs["required_reel_ids"]),
+        ))
+        return mock.Mock(
+            reels=list(reels),
+            ordered_reel_ids=[str(reel["reel_id"]) for reel in reels],
+            assessment_checkpoint_reel_ids=[],
+            current_restatement_reel_ids=[],
+            prior_restatement_reel_ids=[],
+            terminal_summary_start_reel_id=None,
+            model_used="gemini-test",
+            degraded=False,
+            fallback_reason=None,
+            provider_called=True,
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", acquire)
+    monkeypatch.setattr(main, "order_lesson_batch", order_current)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        assert len(acquisition_calls) == 1
+        assert acquisition_calls[0]["max_generation_videos"] == 3
+        assert acquisition_calls[0]["max_new_reels"] == 6
+        assert acquisition_calls[0]["exclude_generation_ids"] == [
+            root_generation_id,
+            empty_generation_id,
+        ]
+        expected_new_ids = [f"partial-chain-new-reel-{index}" for index in range(6)]
+        expected_prior_ids = [
+            reel_id for reel_id in prior_tail if reel_id != root_reel_ids[0]
+        ]
+        assert organizer_calls == [
+            ([*expected_prior_ids, *expected_new_ids], expected_prior_ids)
+        ]
+        completed = generation_jobs.get_job(conn, str(current_job["id"]))
+        assert completed is not None
+        assert completed["status"] == "partial"
+        assert main._count_generation_reels(
+            conn, str(completed["result_generation_id"])
+        ) == 6
     finally:
         conn.close()
 
@@ -2813,6 +3309,26 @@ def _insert_generation_reel(
         "t_end": 30.0,
         "selection_contract_version": "quality_silence_v40",
     }
+
+
+def _mark_generation_reel_as_gemini(
+    conn: sqlite3.Connection,
+    reel_id: str,
+) -> None:
+    context = json.loads(str(conn.execute(
+        "SELECT search_context_json FROM reels WHERE id = ?",
+        (reel_id,),
+    ).fetchone()[0]))
+    context.update({
+        "selection_authority": "gemini",
+        "concept_family_contract_version": "concept_family_v3",
+        "concept_family": "mitochondrial oxidative phosphorylation",
+        "concept_aliases": [],
+    })
+    conn.execute(
+        "UPDATE reels SET search_context_json = ? WHERE id = ?",
+        (json.dumps(context), reel_id),
+    )
 
 
 def test_generation_worker_retries_setup_and_release_transactions_without_replaying_work(
@@ -3533,6 +4049,7 @@ def test_generation_worker_retries_response_validation_three_times_with_precise_
 def test_reclaimed_lease_restores_gemini_exposure_from_durable_usage_ledger(
     monkeypatch,
 ) -> None:
+    restored_exposure = (350_000 * 4.0 + 1_111 * 18.0) / 1_000_000.0
     conn = _conn()
     _patch_transactional_worker_context(monkeypatch, conn)
     now = datetime.now(timezone.utc)
@@ -3561,15 +4078,15 @@ def test_reclaimed_lease_restores_gemini_exposure_from_durable_usage_ledger(
         operation="segmentation",
         model="gemini-3.1-pro-preview",
         billable_requests=1,
-        input_tokens=100_000,
-        output_tokens=60_000,
-        total_tokens=160_000,
+        input_tokens=350_000,
+        output_tokens=1_111,
+        total_tokens=351_111,
         metadata={
             "provider_call": True,
             "billing_usage_known": True,
             "cached_tokens": 0,
-            "reserved_cost_usd": 0.95,
-            "admitted_cost_usd": 0.95,
+            "reserved_cost_usd": 1.45,
+            "admitted_cost_usd": 1.45,
         },
         now=now,
     )
@@ -3602,13 +4119,15 @@ def test_reclaimed_lease_restores_gemini_exposure_from_durable_usage_ledger(
         assert failed and failed["status"] == "failed"
         assert failed["attempt_count"] == 2
         assert failed["terminal_error_code"] == "provider_budget_exceeded"
-        assert seen_exposure == [pytest.approx(0.92)]
+        assert seen_exposure == [pytest.approx(restored_exposure)]
         usage = json.loads(str(failed["usage_json"] or "{}"))
         gemini_budget = usage["budget"]["gemini"]
-        assert gemini_budget["cost_exposure_usd"] == pytest.approx(0.92)
+        assert gemini_budget["cost_exposure_usd"] == pytest.approx(
+            restored_exposure
+        )
         assert gemini_budget["cost_exposure_usd"] <= gemini_budget["cost_limit_usd"]
         assert gemini_budget["lifetime_reserved_worst_case_cost_usd"] == pytest.approx(
-            0.95
+            1.45
         )
     finally:
         conn.close()
@@ -4279,6 +4798,22 @@ def test_reconciliation_tail_reorders_only_unseen_and_current_release_ids() -> N
         "prior-unseen",
         "current-practice",
     ]
+    assert main._apply_reconciliation_tail_order(
+        existing_ids,
+        {
+            "ordered_reel_ids": [],
+            "reconciliation_tail_reel_ids": [
+                "current-practice",
+                "prior-unseen",
+                "current-foundation",
+            ],
+        },
+    ) == [
+        "durably-seen",
+        "current-practice",
+        "prior-unseen",
+        "current-foundation",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -4297,10 +4832,6 @@ def test_reconciliation_tail_reorders_only_unseen_and_current_release_ids() -> N
             "reconciliation_tail_reel_ids": ["current", " "],
         },
         {"reconciliation_tail_reel_ids": ["current", "prior-unseen"]},
-        {
-            "ordered_reel_ids": [],
-            "reconciliation_tail_reel_ids": ["current", "prior-unseen"],
-        },
         {
             "ordered_reel_ids": ["current", "current"],
             "reconciliation_tail_reel_ids": ["current", "prior-unseen"],
@@ -7412,14 +7943,15 @@ def test_slow_generation_uses_one_deep_retrieval_with_three_source_cap(monkeypat
 
 
 @pytest.mark.parametrize(
-    ("mode", "expected_reel_cap", "expected_source_cap"),
-    [("fast", 9, 2), ("slow", 9, 3)],
+    ("mode", "expected_reel_cap", "expected_source_cap", "expected_failure_cap"),
+    [("fast", 9, 2, 3), ("slow", 9, 3, 5)],
 )
 def test_generation_mode_uses_one_deep_stage_and_mode_caps(
     monkeypatch,
     mode: str,
     expected_reel_cap: int,
     expected_source_cap: int,
+    expected_failure_cap: int,
 ) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
@@ -7497,7 +8029,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
         assert calls[0]["generation_context"].require_acoustic_boundaries is True
         gemini_budget = calls[0]["generation_context"].budget.snapshot()["gemini"]
         assert gemini_budget["flash_selector_calls"] == expected_source_cap
-        assert gemini_budget["flash_selector_limit"] == expected_source_cap
+        assert gemini_budget["flash_selector_limit"] == expected_failure_cap
         assert gemini_budget["pro_calls"] == 0
         assert gemini_budget["pro_call_limit"] == 0
         events = generation_jobs.replay_events(conn, job_id=job["id"])
@@ -8473,6 +9005,247 @@ def test_generate_exhausted_retry_stops_after_recovered_semantic_zero(
         assert conn.execute(
             "SELECT COUNT(*) FROM reel_generation_jobs"
         ).fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_manual_retry_reopens_only_empty_exhausted_job_and_reuses_active(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    payload = ReelsGenerateRequest(
+        material_id="m1",
+        concept_id="c1",
+        num_reels=3,
+    )
+    try:
+        first = asyncio.run(main.generate_reels(object(), payload))
+        first_id = json.loads(first.body)["job_id"]
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=first_id,
+            status="exhausted",
+            usage={},
+        )
+
+        ordinary = asyncio.run(main.generate_reels(object(), payload))
+        assert ordinary["terminal_status"] == "exhausted"
+        assert ordinary["batch_id"] == first_id
+
+        retry_payload = ReelsGenerateRequest(
+            material_id="m1",
+            concept_id="c1",
+            num_reels=3,
+            retry_terminal_job_id=first_id,
+        )
+        retry = asyncio.run(main.generate_reels(object(), retry_payload))
+        repeated = asyncio.run(main.generate_reels(object(), retry_payload))
+        assert isinstance(retry, JSONResponse)
+        retry_id = json.loads(retry.body)["job_id"]
+        assert retry_id != first_id
+        assert json.loads(repeated.body)["job_id"] == retry_id
+        assert generation_jobs.get_job(conn, retry_id)["source_generation_id"] == ""
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs"
+        ).fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_manual_retry_reopens_empty_exhausted_continuation_without_token(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    payload = ReelsGenerateRequest(
+        material_id="m1",
+        concept_id="c1",
+        num_reels=3,
+    )
+    try:
+        root = asyncio.run(main.generate_reels(object(), payload))
+        root_id = json.loads(root.body)["job_id"]
+        root_job = generation_jobs.get_job(conn, root_id)
+        assert root_job
+        root_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=str(root_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=root_id,
+            status="completed",
+            result_generation_id=root_generation_id,
+            usage={},
+        )
+
+        continuation = asyncio.run(main.generate_reels(
+            object(),
+            ReelsGenerateRequest(
+                material_id="m1",
+                concept_id="c1",
+                num_reels=3,
+                continuation_token=root_id,
+            ),
+        ))
+        continuation_id = json.loads(continuation.body)["job_id"]
+        continuation_job = generation_jobs.get_job(conn, continuation_id)
+        assert continuation_job
+        assert main._job_request_params(continuation_job)["continuation_token"] == root_id
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=continuation_id,
+            status="exhausted",
+            usage={},
+        )
+
+        retry_payload = ReelsGenerateRequest(
+            material_id="m1",
+            concept_id="c1",
+            num_reels=3,
+            retry_terminal_job_id=continuation_id,
+        )
+        retry = asyncio.run(main.generate_reels(object(), retry_payload))
+        repeated = asyncio.run(main.generate_reels(object(), retry_payload))
+        retry_id = json.loads(retry.body)["job_id"]
+        retry_job = generation_jobs.get_job(conn, retry_id)
+        assert retry_id not in {root_id, continuation_id}
+        assert json.loads(repeated.body)["job_id"] == retry_id
+        assert retry_job
+        assert retry_job["source_generation_id"] == ""
+        assert main._job_request_params(retry_job)["continuation_token"] is None
+
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=retry_id,
+            status="exhausted",
+            usage={},
+        )
+        with pytest.raises(main.HTTPException) as replaced:
+            asyncio.run(main.generate_reels(object(), retry_payload))
+        assert replaced.value.detail["code"] == "invalid_terminal_retry"
+        assert "replaced" in replaced.value.detail["message"].lower()
+    finally:
+        conn.close()
+
+
+def test_manual_retry_rejects_changed_request_and_continuation_combo(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    try:
+        first = asyncio.run(main.generate_reels(
+            object(),
+            ReelsGenerateRequest(material_id="m1", concept_id="c1"),
+        ))
+        first_id = json.loads(first.body)["job_id"]
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=first_id,
+            status="exhausted",
+            usage={},
+        )
+
+        with pytest.raises(main.HTTPException) as changed:
+            asyncio.run(main.generate_reels(
+                object(),
+                ReelsGenerateRequest(
+                    material_id="m1",
+                    concept_id="c1",
+                    min_relevance=0.9,
+                    retry_terminal_job_id=first_id,
+                ),
+            ))
+        assert changed.value.detail["code"] == "invalid_terminal_retry"
+
+        with pytest.raises(main.HTTPException) as combined:
+            asyncio.run(main.generate_reels(
+                object(),
+                ReelsGenerateRequest(
+                    material_id="m1",
+                    concept_id="c1",
+                    continuation_token=first_id,
+                    retry_terminal_job_id=first_id,
+                ),
+            ))
+        assert combined.value.detail["code"] == "invalid_terminal_retry"
+    finally:
+        conn.close()
+
+
+def test_manual_retry_rejects_exhausted_job_with_authoritative_release(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    try:
+        first = asyncio.run(main.generate_reels(
+            object(),
+            ReelsGenerateRequest(material_id="m1", concept_id="c1"),
+        ))
+        first_id = json.loads(first.body)["job_id"]
+        first_job = generation_jobs.get_job(conn, first_id)
+        generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=first_job["request_key"],
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        _insert_generation_reel(
+            conn,
+            generation_id=generation_id,
+            reel_id="released-reel",
+            video_id="released-video",
+            created_at=now,
+        )
+        main._persist_generation_lesson_order(
+            conn,
+            generation_id=generation_id,
+            metadata={"version": 2, "ordered_reel_ids": ["released-reel"]},
+        )
+        main._activate_generation(
+            conn,
+            material_id="m1",
+            request_key=first_job["request_key"],
+            generation_id=generation_id,
+            retrieval_profile="unified",
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=first_id,
+            status="exhausted",
+            result_generation_id=generation_id,
+            usage={},
+        )
+        _append_authoritative_release(
+            conn,
+            job_id=first_id,
+            reel_ids=["released-reel"],
+        )
+
+        with pytest.raises(main.HTTPException) as rejected:
+            asyncio.run(main.generate_reels(
+                object(),
+                ReelsGenerateRequest(
+                    material_id="m1",
+                    concept_id="c1",
+                    retry_terminal_job_id=first_id,
+                ),
+            ))
+        assert rejected.value.detail["code"] == "invalid_terminal_retry"
     finally:
         conn.close()
 

@@ -63,11 +63,11 @@ def test_public_selector_installs_a_local_cost_guard_for_direct_callers(monkeypa
     assert original_settings == {}
     assert callable(captured["_segment_budget_reserve"])
     assert callable(captured["_segment_budget_reconcile"])
-    with pytest.raises(ProviderBudgetExceededError, match=r"\$1\.00 maximum"):
+    with pytest.raises(ProviderBudgetExceededError, match=r"\$1\.50 maximum"):
         captured["_segment_budget_reserve"](
             operation="pro_authoritative",
             model="gemini-3.1-pro-preview",
-            estimated_input_tokens=250_001,
+            estimated_input_tokens=400_001,
             max_output_tokens=6_000,
         )
 
@@ -78,7 +78,7 @@ def test_direct_long_transcript_is_rejected_before_pro_dispatch(monkeypatch):
 
     def count_tokens(*args, **kwargs):
         count_calls.append((args, kwargs))
-        return 250_001
+        return 400_001
 
     def generate(*args, **kwargs):
         nonlocal dispatched
@@ -92,10 +92,10 @@ def test_direct_long_transcript_is_rejected_before_pro_dispatch(monkeypatch):
             "prompt_version": kwargs["prompt_version"],
             "thinking_level": kwargs["thinking_level"],
             "finish_reason": "STOP",
-            "prompt_tokens": 250_001,
+            "prompt_tokens": 400_001,
             "candidate_tokens": 10,
             "thought_tokens": 0,
-            "total_tokens": 250_011,
+            "total_tokens": 400_011,
         }
         kwargs["after_dispatch"](
             ticket,
@@ -796,6 +796,8 @@ def test_boundary_schema_retries_one_bad_topic_without_losing_valid_sibling(
             "constraint_id": "subject",
             "evidence_quote": "Alpha lesson defines the concept completely",
         }],
+        objective_constraint_ids=["subject"],
+        relationship_witnesses=[],
     ).model_dump(mode="json", by_alias=True)
     complementary = {
         **valid,
@@ -1099,6 +1101,8 @@ def test_live_pro_selector_retries_invalid_intent_contract_and_fails_closed(
             "id": "subject",
             "q": "Alpha lesson defines the concept completely",
         }],
+        objective_constraint_ids=["subject"],
+        relationship_witnesses=[],
     ).model_dump(mode="json", by_alias=True)
     valid_intent = {
         "exact_request": "alpha lesson",

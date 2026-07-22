@@ -27,6 +27,7 @@ from .provider_runtime import GenerationContext
 
 _TRANSCRIPT_PHASE_TIMEOUT_S = 75.0
 _SELECTOR_RESPONSE_VALIDATION_ERROR_TYPES = frozenset({
+    "GeminiAuditContractError",
     "GeminiSelectorContractError",
     "GeminiSelectorSchemaError",
     "_SchemaResponseError",
@@ -40,6 +41,7 @@ def _selector_response_validation_detail(
     """Return bounded internal reason codes without provider/user content."""
     reasons: list[str] = []
     for field_name in (
+        "audit_contract_rejection_reasons",
         "selector_contract_rejection_reasons",
         "schema_rejection_reasons",
     ):
@@ -341,7 +343,10 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
                     detail=error_type,
                 ) from exc
             if error_type in _SELECTOR_RESPONSE_VALIDATION_ERROR_TYPES:
-                contract_failure = error_type == "GeminiSelectorContractError"
+                contract_failure = error_type in {
+                    "GeminiAuditContractError",
+                    "GeminiSelectorContractError",
+                }
                 raise ProviderResponseValidationError(
                     (
                         "Gemini responded, but its clip plan did not satisfy "

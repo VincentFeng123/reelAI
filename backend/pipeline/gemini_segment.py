@@ -1778,7 +1778,8 @@ _BOUNDARY_OUTPUT_TOKENS = 6_400
 _PRO_BOUNDARY_OUTPUT_TOKENS = 12_288
 # The final audit may return 40 decisions plus repaired edges, and high
 # thinking tokens count against the same provider output ceiling.
-_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS = 19_200
+_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS = 22_528
+_PRO_BOUNDARY_AUDIT_MIN_OUTPUT_TOKENS = 8_192
 # Calls cheap enough under a byte-per-token upper bound may use the local
 # estimate. Anything larger gets the provider's free exact count first, so two
 # Fast or three Slow selectors cannot collectively under-reserve past the job
@@ -1797,9 +1798,9 @@ _SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
 _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
-_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v11"
+_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v12"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
-_UPSTREAM_INTENT_CONTRACT_VERSION = "expansion_intent_v1"
+_UPSTREAM_INTENT_CONTRACT_VERSION = "expansion_intent_v2"
 
 _PRICING_VERSION = "gemini-standard-2026-07-11"
 _PRICING_PER_MILLION = {
@@ -1848,15 +1849,18 @@ class _IntentRole(str, Enum):
 
 
 def _require_intent_source_occurrence_schema(schema: dict[str, object]) -> None:
-    """Require positioned source identity in live Gemini responses."""
+    """Require positioned source identity and topology in live responses."""
     required = schema.setdefault("required", [])
-    if isinstance(required, list) and "source_occurrence" not in required:
-        required.append("source_occurrence")
+    if isinstance(required, list):
+        for field_name in ("source_occurrence", "relationship_topology"):
+            if field_name not in required:
+                required.append(field_name)
     properties = schema.get("properties")
     if isinstance(properties, dict):
-        field_schema = properties.get("source_occurrence")
-        if isinstance(field_schema, dict):
-            field_schema.pop("default", None)
+        for field_name in ("source_occurrence", "relationship_topology"):
+            field_schema = properties.get(field_name)
+            if isinstance(field_schema, dict):
+                field_schema.pop("default", None)
 
 
 class _IntentConstraint(_StrictModel):
@@ -1891,9 +1895,18 @@ class _IntentConstraint(_StrictModel):
             "enumerate every governed member inside this requirement."
         )
     )
-
+    relationship_topology: Literal[
+        "directed",
+        "reciprocal",
+        "symmetric",
+        "ordered",
+        "unspecified",
+        "not_applicable",
+    ] = "not_applicable"
 
 class _IntentJointStructure(_StrictModel):
+    model_config = ConfigDict(extra="forbid")
+
     member_constraint_ids: list[_IntentConstraintId] = Field(
         min_length=2,
         max_length=16,
@@ -2116,16 +2129,180 @@ class _CompactIntentEvidence(_StrictModel):
     )
 
 
-def _require_compact_concept_family_schema(schema: dict[str, object]) -> None:
+class _CompactRelationshipMemberWitness(_StrictModel):
+    """One exact transcript-anchored participant/stage in a claimed relation."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    identity: _CompactFacet = Field(
+        alias="n",
+        description=(
+            "Exact member constraint ID when request_intent.joint_structures declares "
+            "this participant or stage; otherwise a canonical local identity for one "
+            "actual participant, stage, input, or outcome. For a relation between "
+            "bodies, name the bodies/bearers rather than the forces, values, or "
+            "adjectives being compared."
+        ),
+    )
+    identity_quote: _CompactEvidenceQuote = Field(
+        alias="q",
+        description=(
+            "Shortest exact consecutive transcript quote inside the final clip that "
+            "identifies this participant or stage."
+        ),
+    )
+    role_quote: _CompactEvidenceQuote = Field(
+        alias="r",
+        description=(
+            "Exact consecutive transcript quote inside the final clip establishing this "
+            "participant's distinct role in the claimed relation."
+        ),
+    )
+
+
+class _CompactRelationshipLinkWitness(_StrictModel):
+    """One grounded directed role-link in a claimed relationship."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    source_identity: _CompactFacet = Field(alias="f")
+    target_identity: _CompactFacet = Field(alias="t")
+    link_quote: _CompactEvidenceQuote = Field(
+        alias="q",
+        description=(
+            "Exact consecutive transcript clause establishing this directed role from "
+            "source member to target member."
+        ),
+    )
+
+
+class _CompactRelationshipWitness(_StrictModel):
+    """Transcript witnesses for a relation objective, never mere co-occurrence."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    constraint_id: _IntentConstraintId = Field(alias="id")
+    topology: Literal["directed", "reciprocal", "symmetric", "ordered"] = Field(
+        alias="k",
+        description=(
+            "Defining topology of the relationship. Reciprocal claims require grounded "
+            "inverse links; one unordered link may establish a symmetric claim; ordered "
+            "claims preserve member order."
+        ),
+    )
+    members: list[_CompactRelationshipMemberWitness] = Field(
+        alias="m",
+        min_length=2,
+        max_length=8,
+    )
+    links: list[_CompactRelationshipLinkWitness] = Field(
+        alias="l",
+        min_length=1,
+        max_length=16,
+    )
+    connection_quote: _CompactEvidenceQuote = Field(
+        alias="q",
+        description=(
+            "Exact consecutive transcript quote inside the final clip anchoring the "
+            "claimed relationship. Member roles and links may be grounded by separate "
+            "quotes elsewhere inside that same final clip."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _distinct_member_identities(self):
+        identities = [
+            " ".join(member.identity.split()).casefold()
+            for member in self.members
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError("relationship witness member identities must be distinct")
+        identity_quotes = [
+            " ".join(member.identity_quote.split()).casefold()
+            for member in self.members
+        ]
+        if len(identity_quotes) != len(set(identity_quotes)):
+            raise ValueError("relationship member identity quotes must be distinct")
+        if any(
+            not _contains_quote(member.role_quote, member.identity_quote)
+            for member in self.members
+        ):
+            raise ValueError(
+                "member identity quote must occur inside its grounded role"
+            )
+        identity_set = set(identities)
+        identity_quote_by_name = dict(zip(identities, identity_quotes, strict=True))
+        normalized_links = [
+            (
+                " ".join(link.source_identity.split()).casefold(),
+                " ".join(link.target_identity.split()).casefold(),
+            )
+            for link in self.links
+        ]
+        if (
+            len(normalized_links) != len(set(normalized_links))
+            or any(
+                source == target
+                or source not in identity_set
+                or target not in identity_set
+                for source, target in normalized_links
+            )
+            or set().union(*(set(link) for link in normalized_links)) != identity_set
+        ):
+            raise ValueError(
+                "relationship links must uniquely connect every distinct member"
+            )
+        if any(
+            not _contains_quote(
+                link.link_quote,
+                identity_quote_by_name[
+                    " ".join(link.source_identity.split()).casefold()
+                ],
+            )
+            or not _contains_quote(
+                link.link_quote,
+                identity_quote_by_name[
+                    " ".join(link.target_identity.split()).casefold()
+                ],
+            )
+            for link in self.links
+        ):
+            raise ValueError(
+                "relationship links must bind both member identities"
+            )
+        if self.topology == "reciprocal":
+            link_set = set(normalized_links)
+            if any((target, source) not in link_set for source, target in link_set):
+                raise ValueError(
+                    "reciprocal topology requires inverse grounded links"
+                )
+            link_quotes = [
+                " ".join(link.link_quote.split()).casefold()
+                for link in self.links
+            ]
+            if len(link_quotes) != len(set(link_quotes)):
+                raise ValueError(
+                    "inverse relationship links require distinct transcript clauses"
+                )
+        if self.topology == "ordered" and normalized_links != list(
+            zip(identities, identities[1:])
+        ):
+            raise ValueError(
+                "ordered topology requires the consecutive member chain"
+            )
+        return self
+
+
+def _require_compact_semantic_schema(schema: dict[str, object]) -> None:
     """Keep compatibility defaults out of the live Gemini response contract."""
     required = schema.setdefault("required", [])
     if isinstance(required, list):
-        for field_name in ("family", "aliases"):
+        for field_name in ("family", "aliases", "oi", "rw"):
             if field_name not in required:
                 required.append(field_name)
     properties = schema.get("properties")
     if isinstance(properties, dict):
-        for field_name in ("family", "aliases"):
+        for field_name in ("family", "aliases", "oi", "rw"):
             field_schema = properties.get(field_name)
             if isinstance(field_schema, dict):
                 field_schema.pop("default", None)
@@ -2137,7 +2314,7 @@ class _CompactBoundaryTopic(_StrictModel):
     model_config = ConfigDict(
         extra="forbid",
         populate_by_name=True,
-        json_schema_extra=_require_compact_concept_family_schema,
+        json_schema_extra=_require_compact_semantic_schema,
     )
     # Intentionally in-memory only: the final audit is converted immediately,
     # before finalized clip dictionaries (not this model) enter the cache.
@@ -2239,6 +2416,24 @@ class _CompactBoundaryTopic(_StrictModel):
             "substantive educational connection to a required non-scope constraint."
         ),
     )
+    objective_constraint_ids: list[_IntentConstraintId] = Field(
+        default_factory=list,
+        alias="oi",
+        max_length=16,
+        description=(
+            "Constraint IDs this single scalar objective actually fulfills. This is "
+            "separate from ie, which may contain supporting connection evidence."
+        ),
+    )
+    relationship_witnesses: list[_CompactRelationshipWitness] = Field(
+        default_factory=list,
+        alias="rw",
+        max_length=8,
+        description=(
+            "One transcript-anchored witness for every fulfilled relationship ID; [] "
+            "when this scalar objective fulfills no relationship constraint."
+        ),
+    )
 
 
 class _CompactBoundaryPlan(_StrictModel):
@@ -2295,6 +2490,9 @@ def _require_pro_audit_semantic_schema(schema: dict[str, object]) -> None:
             "a",
             "direct",
             "ie",
+            "oi",
+            "rw",
+            "ow",
         ):
             if field_name not in required:
                 required.append(field_name)
@@ -2307,6 +2505,9 @@ def _require_pro_audit_semantic_schema(schema: dict[str, object]) -> None:
             "a",
             "direct",
             "ie",
+            "oi",
+            "rw",
+            "ow",
         ):
             field_schema = properties.get(field_name)
             if isinstance(field_schema, dict):
@@ -2345,7 +2546,25 @@ class _ProCandidateAuditItem(_StrictModel):
         alias="ie",
         max_length=16,
     )
+    objective_constraint_ids: list[_IntentConstraintId] = Field(
+        default_factory=list,
+        alias="oi",
+        max_length=16,
+    )
+    relationship_witnesses: list[_CompactRelationshipWitness] = Field(
+        default_factory=list,
+        alias="rw",
+        max_length=8,
+    )
     evidence_quote: _ProAuditEvidenceQuote = Field(alias="ev")
+    objective_witness_quote: _ProAuditEvidenceQuote = Field(
+        default="",
+        alias="ow",
+        description=(
+            "Five to ten exact consecutive transcript words inside the final repaired "
+            "range that directly prove the scalar title, objective, facet, and family."
+        ),
+    )
     direct_start_line: int = Field(ge=0, strict=True, alias="ds")
     direct_start_quote: _ProAuditBoundaryQuote = Field(alias="dq")
     direct_start_context_resolved: bool = Field(strict=True, alias="dc")
@@ -2801,7 +3020,8 @@ def _selection_fields(*, enriched: bool, compact: bool = False) -> str:
             "family=concept_family, aliases=concept_aliases (always []), "
             "diff=difficulty, direct=directly_teaches_topic, sub=substantive, "
             "fact=factually_grounded, self=self_contained, stand=is_standalone, "
-            "ie=intent_evidence"
+            "ie=intent_evidence, oi=objective_constraint_ids, and "
+            "rw=relationship_witnesses"
         )
     if enriched:
         fields += (
@@ -2846,10 +3066,14 @@ def _compact_output_guide() -> str:
   "Shortest" describes only the quote used to locate that word; it never asks for a shorter
   semantic span or clip.
 - cq = claim_quote: 5-16 exact consecutive transcript words between the chosen semantic edges
-  containing the core educational claim, explanation, result, or answer. cq proves where the
-  teaching is; it does not define the start or end and cannot be mere agenda, topic mention, or
-  a claim from an earlier prerequisite/background lesson. sq, cq, title, obj, and facet must all
-  describe the same atomic educational unit.
+  directly proving the complete scalar title, obj, facet, and family—not merely setup for, a
+  prerequisite to, or one weaker property of that claim. cq proves where the teaching is; it
+  does not define the start or end and
+  cannot be an agenda, topic mention, or claim from an earlier lesson. If the named payoff,
+  application, mechanism, or defining property is spoken after the proposed end, extend e/eq
+  through that same-objective corridor; otherwise relabel title, obj, facet, and family to the
+  narrower claim cq actually proves. sq, cq, title, obj, facet, and family must all describe the
+  same atomic educational unit.
 - title = a clear viewer-facing title of at most 12 words.
 - obj = learning_objective: one precise sentence, at most 24 words, stating what the viewer
   will understand or be able to do after this clip. Give exactly one objective.
@@ -2923,9 +3147,36 @@ def _compact_output_guide() -> str:
   When a fulfilled format constraint spans multiple transformations, q anchors that sequence;
   verify every requested transformation across the entire sq-through-eq span. One q never
   replaces the whole-span completeness check.
-  For any relationship id, q must name every required participant or stage and the defining
-  connection between them; shared values, adjectives, symbols, or directions alone cannot
-  ground the relationship.
+  For any relationship id, q must anchor the defining connection. The matching rw member and
+  link quotes collectively name every required participant or stage; shared values, adjectives,
+  symbols, or directions alone cannot ground the relationship.
+- oi = objective_constraint_ids: the distinct constraint IDs this ONE scalar title/obj/facet/
+  family actually fulfills. oi is fulfillment; ie is the broader evidence lane and may also
+  contain IDs that only explain a supporting connection. oi may be [] for a useful supporting
+  unit. Every oi ID must also appear in ie. direct=true only when oi contains every required
+  non-scope ID. Never put several sibling subject or scope IDs in oi for an umbrella span unless
+  request_intent.joint_structures explicitly groups those exact members and oi also contains its
+  relation_constraint_id. Co-occurrence, sequence in a long source, or a survey is not synthesis.
+- rw = relationship_witnesses: one item for every relationship-kind ID in oi plus every fulfilled
+  joint_structure relation_constraint_id in oi, and no others; otherwise
+  []. Each item is {id,k,m,l,q}, where k is directed, reciprocal, symmetric, or ordered. m contains
+  at least two {n,q,r} members: n is the exact member constraint ID when the matching
+  joint_structure declares members, otherwise a distinct local member key. Member q is an exact
+  transcript phrase naming that participant/stage/input/outcome, and r is an exact
+  quote establishing its role. l contains grounded directed {f,t,q} links between those exact n
+  identities; every member must occur in a link, self-links are invalid, and a reciprocal claim
+  requires both inverse directions. The outer q is an exact quote explicitly establishing the
+  relationship anchor and must contain that relationship ID's 5-16-word ie q exactly. It need not
+  contain every role or link: member roles, directed links, and the outer anchor are grounded
+  independently anywhere inside sq-through-eq, and their links collectively establish the full
+  relationship. Role, link, and outer quotes must be uniquely anchored there; repeated short
+  identity phrases remain valid because their containing roles and links disambiguate them. For a
+  two-body interaction or action-reaction claim, bodies or
+  bearers are members and forces are roles/properties. For a vector-balance or force-comparison
+  objective, the force vectors themselves may be members. Distinct n values plus grounded roles
+  and a defining connection are mandatory. A same-body gravity/normal-force balance therefore
+  cannot witness a two-body action-reaction pair, while it may witness balanced forces; speech that
+  the skater pushes the wall and the wall pushes the skater back can witness action-reaction.
 
 Subject-anchor counterexamples — apply the same rule in every domain:
 - For a biology request about PCR, a general DNA-replication unit does not qualify merely
@@ -2950,7 +3201,7 @@ Example transcript:
 [19] 02:15 provides stronger evidence against the null hypothesis. Next, confidence intervals measure uncertainty.
 Example exact user request: Explain p-values
 Example output:
-{"request_intent":{"exact_request":"Explain p-values","constraints":[{"constraint_id":"subject","kind":"subject","source_phrase":"p-values","source_occurrence":0,"requirement":"Explain p-values"}],"joint_structures":[]},"topics":[{"id":"small-p-value-evidence","s":18,"e":19,"sq":"A small p value","eq":"against the null hypothesis.","cq":"small p value provides stronger evidence against the null hypothesis","title":"What a Small P-Value Means","obj":"Explain how a small p-value bears on the null hypothesis","facet":"small p-values","family":"statistical p-value interpretation","aliases":[],"info":0.95,"rel":0.99,"imp":0.93,"diff":0.42,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"subject","q":"small p value provides stronger evidence against the null hypothesis"}]}]}
+{"request_intent":{"exact_request":"Explain p-values","constraints":[{"constraint_id":"subject","kind":"subject","source_phrase":"p-values","source_occurrence":0,"requirement":"Explain p-values","relationship_topology":"not_applicable"}],"joint_structures":[]},"topics":[{"id":"small-p-value-evidence","s":18,"e":19,"sq":"A small p value","eq":"against the null hypothesis.","cq":"small p value provides stronger evidence against the null hypothesis","title":"What a Small P-Value Means","obj":"Explain how a small p-value bears on the null hypothesis","facet":"small p-values","family":"statistical p-value interpretation","aliases":[],"info":0.95,"rel":0.99,"imp":0.93,"diff":0.42,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"subject","q":"small p value provides stronger evidence against the null hypothesis"}],"oi":["subject"],"rw":[]}]}
 Why: s remains 18 even though sq starts after "Welcome back" inside line 18. e remains 19
 even though eq ends before "Next, confidence intervals" inside line 19. sq's first word "A"
 is the semantic start; eq's last word "hypothesis" is the semantic end; cq anchors the claim.
@@ -3022,7 +3273,7 @@ Example output boundaries: s=40, e=45, sq="So let's say if f of x is equal to x 
 eq="the derivative of x squared is two x". The topic's ie must evidence the named function,
 limit-definition task, algebra-step requirement, and final two-x outcome.
 Example compact output:
-{"request_intent":{"exact_request":"Use the limit definition to derive f of x equal x squared, include every algebra step, and finish at two x.","constraints":[{"constraint_id":"object","kind":"subject","source_phrase":"f of x equal x squared","source_occurrence":0,"requirement":"Derive f of x equal x squared"},{"constraint_id":"method","kind":"task","source_phrase":"Use the limit definition","source_occurrence":0,"requirement":"Use the limit definition"},{"constraint_id":"steps","kind":"format","source_phrase":"include every algebra step","source_occurrence":0,"requirement":"Include every spoken algebra step"},{"constraint_id":"result","kind":"outcome","source_phrase":"finish at two x","source_occurrence":0,"requirement":"Reach the final result two x"}],"joint_structures":[]},"topics":[{"id":"x-squared-limit-derivation","s":40,"e":45,"sq":"So let's say if f of x is equal to x squared","eq":"the derivative of x squared is two x","cq":"Taking h to zero gives two x","title":"Derive x Squared from the Limit Definition","obj":"Derive the derivative of x squared through every algebra step","facet":"x-squared limit derivation","family":"derivative of x squared","aliases":[],"info":0.99,"rel":1.0,"imp":0.99,"diff":0.45,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"object","q":"f of x is equal to x squared"},{"id":"method","q":"Use the limit definition of the derivative"},{"id":"steps","q":"Expand the square to x squared plus two x h"},{"id":"result","q":"Taking h to zero gives two x"}]}]}
+{"request_intent":{"exact_request":"Use the limit definition to derive f of x equal x squared, include every algebra step, and finish at two x.","constraints":[{"constraint_id":"object","kind":"subject","source_phrase":"f of x equal x squared","source_occurrence":0,"requirement":"Derive f of x equal x squared","relationship_topology":"not_applicable"},{"constraint_id":"method","kind":"task","source_phrase":"Use the limit definition","source_occurrence":0,"requirement":"Use the limit definition","relationship_topology":"not_applicable"},{"constraint_id":"steps","kind":"format","source_phrase":"include every algebra step","source_occurrence":0,"requirement":"Include every spoken algebra step","relationship_topology":"not_applicable"},{"constraint_id":"result","kind":"outcome","source_phrase":"finish at two x","source_occurrence":0,"requirement":"Reach the final result two x","relationship_topology":"not_applicable"}],"joint_structures":[]},"topics":[{"id":"x-squared-limit-derivation","s":40,"e":45,"sq":"So let's say if f of x is equal to x squared","eq":"the derivative of x squared is two x","cq":"Taking h to zero gives two x","title":"Derive x Squared from the Limit Definition","obj":"Derive the derivative of x squared through every algebra step","facet":"x-squared limit derivation","family":"derivative of x squared","aliases":[],"info":0.99,"rel":1.0,"imp":0.99,"diff":0.45,"direct":true,"sub":true,"fact":true,"self":true,"stand":true,"ie":[{"id":"object","q":"f of x is equal to x squared"},{"id":"method","q":"Use the limit definition of the derivative"},{"id":"steps","q":"Expand the square to x squared plus two x h"},{"id":"result","q":"Taking h to zero gives two x"}],"oi":["object","method","steps","result"],"rw":[]}]}
 
 Same-source breadth for that original prompt:
 If the same transcript also completely derives five x minus four, one over x, square root of
@@ -3127,6 +3378,10 @@ def _boundary_prompts(
             "constraints. Give every constraint a unique constraint_id, its kind, a concise "
             "requirement, source_phrase copied as exact consecutive words from that request, "
             "and source_occurrence equal to that phrase's zero-based occurrence in the request. "
+            "Set relationship_topology=not_applicable for non-relationship constraints. For a "
+            "relationship use reciprocal for explicit two-way interaction, symmetric for "
+            "balance/equivalence, directed for one-way causation/dependency, ordered for an "
+            "explicit sequence, and unspecified only when the request does not determine it. "
             "Use source_occurrence=0 normally and 1, 2, and so on only when the identical phrase "
             "appears earlier. This position, not constraint array order, identifies the source. "
             "Together the source phrases must cover every content-bearing request term. Preserve "
@@ -3373,7 +3628,9 @@ def _boundary_prompts(
         "include at least one non-scope id whose q grounds the substantive educational "
         "connection; it need not prove full fulfillment, but it must never falsely claim a "
         "mismatched object or outcome. Use direct=true for primary and direct=false for supporting. "
-        "Do not output a role. Omit scope constraints from ie unless the selected speech states "
+        "Do not output a role. Return oi separately for fulfilled IDs and rw for every fulfilled "
+        "relationship ID; a supporting ie ID is never automatically fulfilled. Omit scope "
+        "constraints from ie unless the selected speech states "
         "them exactly. cq independently proves that the candidate teaches a substantive atomic "
         "claim; ie proves its connection to the original prompt and must never substitute for "
         "cq. Learning details and "
@@ -3484,6 +3741,9 @@ def _pro_boundary_audit_prompts(
             f"concept family: {candidate.concept_family}\n"
             f"concept aliases: {candidate.concept_aliases}\n"
             f"directly teaches topic: {candidate.directly_teaches_topic}\n"
+            f"claimed fulfilled constraint ids: {candidate.objective_constraint_ids}\n"
+            f"claimed relationship witnesses: "
+            f"{candidate.model_dump(mode='json', by_alias=True).get('rw', [])}\n"
             + "\n".join(evidence_lines)
             + "\n"
             "</untrusted_selector_hypotheses>\n"
@@ -3495,6 +3755,7 @@ def _pro_boundary_audit_prompts(
 
     constraints = "\n".join(
         f"- {constraint.constraint_id} ({constraint.kind.value}): "
+        f"topology={constraint.relationship_topology}; "
         f"request words={constraint.source_phrase!r}; "
         f"interpreted requirement={constraint.requirement!r}"
         for constraint in plan.request_intent.constraints
@@ -3621,7 +3882,8 @@ def _pro_boundary_audit_prompts(
           "reference. If it is generic, requires outside inference to establish the "
           "rejection, or supports both related and unrelated readings, decision MUST be keep.\n\n"
           "SEMANTIC METADATA — derive it afresh from literal speech, not selector labels or "
-          "outside knowledge. title, obj, facet, family, aliases, direct, ie, and ev must all "
+          "outside knowledge. title, obj, facet, family, aliases, direct, ie, oi, rw, ow, "
+          "and ev must all "
           "describe the same atomic relationship actually established by the returned span. "
           "A defining relationship cannot be inferred merely because familiar adjectives, "
           "symbols, quantities, or neighboring concepts appear. If a concept requires "
@@ -3700,9 +3962,8 @@ def _pro_boundary_audit_prompts(
           "canonical family is the sole adaptive identity. For KEEP, correct title, facet, and "
           "family independently of selector hypotheses. For a rejection, name the literal "
           "rejected objective consistently.\n"
-          "4. direct and ie are a fresh intent audit against the constraints above. Set "
-          "direct=true only when the returned span fulfills every required non-scope "
-          "constraint. ie uses {id,q}; each q is 5-16 exact consecutive words inside the "
+          "4. direct, ie, oi, and rw are a fresh intent audit against the constraints above. "
+          "ie uses {id,q}; each q is 5-16 exact consecutive words inside the "
           "returned span that logically grounds that exact constraint for this same objective. "
           "For a teach or explain obligation, a title, agenda, outline, list, transition, or "
           "passing mention does not ground the item. Require substantive speech teaching that "
@@ -3712,23 +3973,56 @@ def _pro_boundary_audit_prompts(
           "mechanisms, and 'The elements are duty, breach, causation, and damages' teaches "
           "none of those elements. "
           "A shared word, equal/opposite wording without the defining participants, or evidence "
-          "for a different relationship cannot ground an id. KEEP requires at least one ie; "
-          "a rejection returns direct=false and ie=[].\n"
-          "5. ev=evidence_quote: copy 5-10 exact consecutive words proving obj. For KEEP it "
+          "for a different relationship cannot ground an id. KEEP requires at least one ie. "
+          "oi is the distinct subset of ie IDs this ONE scalar title/obj/facet/family actually "
+          "fulfills; ie may additionally ground supporting connections, and oi may be [] for "
+          "a supporting unit. Set direct=true only when oi fulfills every required non-scope "
+          "constraint. Several sibling subject/scope IDs require an immutable joint_structure "
+          "containing those exact members and its relation_constraint_id in oi. Otherwise "
+          "shrink or relabel the umbrella. rw contains exactly one {id,k,m,l,q} item for every "
+          "relationship-kind ID in oi plus every fulfilled joint_structure relation_constraint_id. "
+          "Each m item is {n,q,r}: use the exact member constraint ID "
+          "when the matching joint_structure declares members, otherwise one distinct actual "
+          "participant, stage, input, or outcome local key; include an exact identity q and a "
+          "role quote containing "
+          "that q. k is directed, reciprocal, symmetric, or ordered. Each l item is "
+          "a directed {f,t,q} link using exact member n identities and an exact grounding "
+          "clause containing both endpoint identity quotes. Every member must occur in a "
+          "non-self link; reciprocal claims require both inverse links with distinct clauses, "
+          "while one grounded unordered link may prove a symmetric proposition. Ordered links "
+          "must be the consecutive member chain in transcript order. The outer q anchors the "
+          "relationship and must contain this relationship ID's ie q exactly. It need not "
+          "contain every role or link: member roles, directed links, and the outer anchor are "
+          "grounded independently inside the final repaired span and collectively prove the "
+          "complete defining connection. Role quotes contain 2-16 words; link and outer quotes may contain up "
+          "to 32 words. For a two-body interaction/action-reaction claim, bodies or bearers "
+          "are members and forces are roles; for a vector-balance/comparison objective, force "
+          "vectors may be members. Thus gravity and normal force on one seated person cannot "
+          "witness a two-body third-law pair, though they may witness balanced forces; a skater "
+          "and wall with both push directions can witness action-reaction. A rejection returns "
+          "direct=false, ie=[], oi=[], and rw=[].\n"
+          "5. ev=evidence_quote: copy 5-10 exact consecutive words proving the admission or "
+          "rejection decision. For KEEP it "
           "must be inside the returned repaired span and may come from its immediately nearby "
           "contiguous continuation. For any rejection it must be inside the ORIGINAL "
           "current sq-through-eq speech and ground that rejection.\n"
-          "6. ds=direct_start_line and dq=direct_start_quote: independently locate the "
+          "6. ow=objective_witness_quote: for KEEP copy 5-10 exact consecutive words inside "
+          "the FINAL repaired s:e corridor that directly prove the complete scalar t/obj/f/"
+          "family claim. Setup or a weaker neighboring property is invalid. If a named payoff, "
+          "application, mechanism, or defining claim occurs immediately after current e, "
+          "extend e/eq through it; otherwise relabel every scalar field to the narrower claim "
+          "ow actually proves. For a rejection, repeat ev in ow.\n"
+          "7. ds=direct_start_line and dq=direct_start_quote: independently locate the "
           "earliest complete sentence or independent clause that DIRECTLY begins teaching obj. "
           "dq is a shortest unique 1-10-word exact quote beginning at that word. An agenda, "
           "preview, greeting, navigation, recap, completed prerequisite, or broad introduction "
           "that only mentions the target can never be dq. Do not reuse the supplied sq by "
           "default.\n"
-          "7. dc=direct_start_context_resolved: true only when a cold listener can begin at dq "
+          "8. dc=direct_start_context_resolved: true only when a cold listener can begin at dq "
           "and understand every referent, enumerated item, scenario object, given, comparison "
           "baseline, formula reference, and required prior result. A technical term explicitly "
           "named or defined at dq does not require an earlier standalone prerequisite.\n"
-          "8. s/e=start_line/end_line and sq/eq=start_quote/end_quote are the repaired final "
+          "9. s/e=start_line/end_line and sq/eq=start_quote/end_quote are the repaired final "
           "edges. If dc=true, sq MUST begin exactly at dq. If dc=false, sq MUST begin before dq "
           "at only the nearest indispensable spoken setup. Repair eq independently through the "
           "complete same-objective conclusion.\n"
@@ -12289,6 +12583,21 @@ def _validated_intent_constraints(
     }
     if len(constraints) != len(request_intent.constraints) or not constraints:
         return {}, "intent_contract_duplicate_or_empty_ids"
+    if any(
+        "relationship_topology" in constraint.model_fields_set
+        and (
+            (
+                constraint.kind is _IntentConstraintKind.RELATIONSHIP
+                and constraint.relationship_topology == "not_applicable"
+            )
+            or (
+                constraint.kind is not _IntentConstraintKind.RELATIONSHIP
+                and constraint.relationship_topology != "not_applicable"
+            )
+        )
+        for constraint in constraints.values()
+    ):
+        return {}, "intent_contract_relationship_topology_invalid"
     source_error = _intent_constraint_source_contract_error(
         expected_request,
         list(constraints.values()),
@@ -12351,8 +12660,8 @@ def _trusted_request_intent_from_settings(
 @dataclass(frozen=True)
 class _LiveSelectorContract:
     plan: _CompactBoundaryPlan
-    intent_signature: tuple[tuple[str, str, int, str], ...] | None
-    intent_ids_by_semantics: dict[tuple[str, str, int, str], str]
+    intent_signature: tuple[tuple[str, str, int, str, str], ...] | None
+    intent_ids_by_semantics: dict[tuple[str, str, int, str, str], str]
     intent_error: str | None
     candidate_rejections: tuple[str, ...]
 
@@ -12362,6 +12671,126 @@ class _LiveSelectorContract:
             *((self.intent_error,) if self.intent_error else ()),
             *self.candidate_rejections,
         )
+
+
+def _objective_fulfillment_contract_error(
+    request_intent: _RequestIntent,
+    proposal: _CompactBoundaryTopic | _ProCandidateAuditItem,
+) -> str | None:
+    """Validate explicit fulfillment independently from supporting evidence."""
+    if not {
+        "objective_constraint_ids",
+        "relationship_witnesses",
+    }.issubset(proposal.model_fields_set):
+        # Compatibility-only fixtures predate the live required fields. Every
+        # provider response has them because both response schemas require them.
+        return None
+
+    constraints = {
+        str(constraint.constraint_id): constraint
+        for constraint in request_intent.constraints
+    }
+    evidence_ids = [
+        str(item.constraint_id) for item in proposal.intent_evidence
+    ]
+    objective_ids = [
+        str(constraint_id)
+        for constraint_id in proposal.objective_constraint_ids
+    ]
+    if len(objective_ids) != len(set(objective_ids)):
+        return "objective_fulfillment_duplicate_id"
+    if any(
+        constraint_id not in constraints or constraint_id not in evidence_ids
+        for constraint_id in objective_ids
+    ):
+        return "objective_fulfillment_not_grounded_by_connection"
+
+    objective_set = set(objective_ids)
+    required_ids = {
+        constraint_id
+        for constraint_id, constraint in constraints.items()
+        if constraint.kind is not _IntentConstraintKind.SCOPE
+    }
+    if proposal.directly_teaches_topic and not required_ids.issubset(
+        objective_set
+    ):
+        return "direct_objective_fulfillment_incomplete"
+
+    # One scalar objective cannot claim several sibling subjects/scopes merely
+    # because a broad span mentions them. The trusted request contract must name
+    # their joint structure and this objective must also fulfill its relation.
+    for sibling_kind in (
+        _IntentConstraintKind.SUBJECT,
+        _IntentConstraintKind.SCOPE,
+    ):
+        sibling_ids = {
+            constraint_id
+            for constraint_id in objective_set
+            if constraints[constraint_id].kind is sibling_kind
+        }
+        if len(sibling_ids) <= 1:
+            continue
+        if not any(
+            sibling_ids.issubset({
+                str(member_id) for member_id in structure.member_constraint_ids
+            })
+            and str(structure.relation_constraint_id) in objective_set
+            for structure in request_intent.joint_structures
+        ):
+            return "objective_fulfillment_untrusted_sibling_umbrella"
+
+    required_relationship_ids = {
+        constraint_id
+        for constraint_id in objective_set
+        if constraints[constraint_id].kind is _IntentConstraintKind.RELATIONSHIP
+    }
+    required_relationship_ids.update(
+        str(structure.relation_constraint_id)
+        for structure in request_intent.joint_structures
+        if str(structure.relation_constraint_id) in objective_set
+    )
+    witness_ids = [
+        str(witness.constraint_id)
+        for witness in proposal.relationship_witnesses
+    ]
+    if (
+        len(witness_ids) != len(set(witness_ids))
+        or set(witness_ids) != required_relationship_ids
+    ):
+        return "objective_relationship_witness_mismatch"
+    for witness in proposal.relationship_witnesses:
+        expected_topology = constraints[
+            str(witness.constraint_id)
+        ].relationship_topology
+        if (
+            expected_topology not in {"unspecified", "not_applicable"}
+            and str(witness.topology) != expected_topology
+        ):
+            return "objective_relationship_topology_mismatch"
+        joint_structure = next(
+            (
+                structure
+                for structure in request_intent.joint_structures
+                if str(structure.relation_constraint_id)
+                == str(witness.constraint_id)
+            ),
+            None,
+        )
+        if joint_structure is not None:
+            expected_members = [
+                str(member_id)
+                for member_id in joint_structure.member_constraint_ids
+            ]
+            witness_members = [str(member.identity) for member in witness.members]
+            if (
+                set(witness_members) != set(expected_members)
+                or (
+                    str(witness.topology) == "ordered"
+                    and witness_members != expected_members
+                )
+            ):
+                return "objective_relationship_member_mismatch"
+    return None
 
 
 def _validate_live_pro_selector_contract(
@@ -12409,6 +12838,7 @@ def _validate_live_pro_selector_contract(
             ),
             canonical_sources[str(constraint.constraint_id)][1],
             _normalized_request_text(constraint.requirement),
+            constraint.relationship_topology,
         )
         for constraint in signature_constraints
     }
@@ -12423,6 +12853,7 @@ def _validate_live_pro_selector_contract(
             json.dumps(
                 constraint_signatures[str(structure.relation_constraint_id)]
             ),
+            "not_applicable",
         )
         for structure in plan.request_intent.joint_structures
     ]
@@ -12438,6 +12869,7 @@ def _validate_live_pro_selector_contract(
             ),
             canonical_sources[str(constraint.constraint_id)][1],
             _normalized_request_text(constraint.requirement),
+            constraint.relationship_topology,
         ): str(constraint.constraint_id)
         for constraint in signature_constraints
     }
@@ -12459,6 +12891,15 @@ def _validate_live_pro_selector_contract(
         if len(evidence_ids) != len(set(evidence_ids)):
             candidate_rejections.append(
                 f"candidate_{proposal.candidate_id}:intent_evidence_duplicate_id"
+            )
+            continue
+        objective_error = _objective_fulfillment_contract_error(
+            plan.request_intent,
+            proposal,
+        )
+        if objective_error is not None:
+            candidate_rejections.append(
+                f"candidate_{proposal.candidate_id}:{objective_error}"
             )
             continue
         family_payload, family_error = _validated_proposal_concept_family_payload(
@@ -12536,7 +12977,20 @@ def _remap_compact_plan_intent_evidence(
                     )
                 })
                 for evidence in proposal.intent_evidence
-            ]
+            ],
+            "objective_constraint_ids": [
+                id_map.get(str(constraint_id), str(constraint_id))
+                for constraint_id in proposal.objective_constraint_ids
+            ],
+            "relationship_witnesses": [
+                witness.model_copy(update={
+                    "constraint_id": id_map.get(
+                        str(witness.constraint_id),
+                        str(witness.constraint_id),
+                    ),
+                })
+                for witness in proposal.relationship_witnesses
+            ],
         })
         for proposal in plan.topics
     ]
@@ -17095,6 +17549,155 @@ def _trusted_authoritative_model_edges(
     )
 
 
+def _compact_intent_metadata(
+    plan: _CompactBoundaryPlan,
+    proposal: _CompactBoundaryTopic,
+    clip_text: str,
+    *,
+    topic: str,
+) -> tuple[set[str], dict[str, object]]:
+    """Separate grounded request connections from audited objective fulfillment."""
+    constraints_by_id = {
+        str(constraint.constraint_id): constraint
+        for constraint in plan.request_intent.constraints
+    }
+    canonical_sources = _canonical_intent_constraint_sources(
+        plan.request_intent.exact_request or topic,
+        plan.request_intent.constraints,
+    )
+    grounded_connection_ids = {
+        str(item.constraint_id)
+        for item in proposal.intent_evidence
+        if str(item.constraint_id) in constraints_by_id
+        and _contains_quote(clip_text, str(item.evidence_quote))
+    }
+    explicit_objectives = "objective_constraint_ids" in proposal.model_fields_set
+    grounded_objective_ids = (
+        grounded_connection_ids
+        & {str(value) for value in proposal.objective_constraint_ids}
+        if explicit_objectives
+        else set(grounded_connection_ids)
+    )
+
+    obligations_by_id: dict[str, dict[str, object]] = {}
+    for evidence in proposal.intent_evidence:
+        constraint_id = str(evidence.constraint_id)
+        constraint = constraints_by_id.get(constraint_id)
+        if constraint is None or constraint_id not in grounded_connection_ids:
+            continue
+        source_phrase, source_start = canonical_sources[constraint_id]
+        obligation = intent_obligation(
+            kind=constraint.kind.value,
+            source_phrase=source_phrase,
+            source_start=source_start,
+            requirement=constraint.requirement,
+            evidence_quote=evidence.evidence_quote,
+        )
+        if obligation is not None:
+            obligations_by_id[constraint_id] = obligation
+
+    intent_connections = normalize_intent_obligations(
+        list(obligations_by_id.values()),
+        require_evidence=True,
+    )
+    intent_obligations = normalize_intent_obligations(
+        [
+            obligations_by_id[constraint_id]
+            for constraint_id in constraints_by_id
+            if constraint_id in grounded_objective_ids
+            and constraint_id in obligations_by_id
+        ],
+        require_evidence=True,
+    )
+
+    relationship_witnesses: list[dict[str, object]] = []
+    for witness in proposal.relationship_witnesses:
+        constraint_id = str(witness.constraint_id)
+        obligation = obligations_by_id.get(constraint_id)
+        if constraint_id not in grounded_objective_ids or obligation is None:
+            continue
+        relationship_witnesses.append({
+            "obligation_key": str(obligation["key"]),
+            "constraint_id": constraint_id,
+            "topology": str(witness.topology),
+            "members": [
+                {
+                    "identity": str(member.identity),
+                    "identity_quote": str(member.identity_quote),
+                    "role_quote": str(member.role_quote),
+                }
+                for member in witness.members
+            ],
+            "links": [
+                {
+                    "source_identity": str(link.source_identity),
+                    "target_identity": str(link.target_identity),
+                    "link_quote": str(link.link_quote),
+                }
+                for link in witness.links
+            ],
+            "connection_quote": str(witness.connection_quote),
+        })
+
+    identity_keys: dict[str, str] = {}
+    for constraint_id, constraint in constraints_by_id.items():
+        source_phrase, source_start = canonical_sources[constraint_id]
+        identity = intent_obligation(
+            kind=constraint.kind.value,
+            source_phrase=source_phrase,
+            source_start=source_start,
+            requirement=constraint.requirement,
+        )
+        if identity is not None:
+            identity_keys[constraint_id] = str(identity["key"])
+    curriculum_edges: list[dict[str, str]] = []
+    for structure in plan.request_intent.joint_structures:
+        member_ids = [str(value) for value in structure.member_constraint_ids]
+        relation_id = str(structure.relation_constraint_id)
+        relation = constraints_by_id.get(relation_id)
+        if (
+            relation is None
+            or relation.relationship_topology != "ordered"
+        ):
+            continue
+        relation_key = identity_keys.get(relation_id, "")
+        for before_id, after_id in zip(member_ids, member_ids[1:]):
+            before_key = identity_keys.get(before_id, "")
+            after_key = identity_keys.get(after_id, "")
+            if before_key and after_key:
+                curriculum_edges.append({
+                    "before_key": before_key,
+                    "after_key": after_key,
+                    "relation_key": relation_key,
+                })
+
+    required_constraint_ids = {
+        constraint_id
+        for constraint_id, constraint in constraints_by_id.items()
+        if constraint.kind is not _IntentConstraintKind.SCOPE
+    }
+    coverage = (
+        len(grounded_objective_ids & required_constraint_ids)
+        / len(required_constraint_ids)
+        if required_constraint_ids
+        else 1.0
+    )
+    role = (
+        "primary"
+        if proposal.directly_teaches_topic is True
+        and required_constraint_ids.issubset(grounded_objective_ids)
+        else "supporting"
+    )
+    return grounded_connection_ids, {
+        "intent_obligations": intent_obligations,
+        "intent_connections": intent_connections,
+        "intent_relationship_witnesses": relationship_witnesses,
+        "intent_curriculum_edges": curriculum_edges,
+        "intent_role": role,
+        "intent_coverage": round(coverage, 6),
+    }
+
+
 def _trusted_universal_compact_plan_to_report(
     plan: _CompactBoundaryPlan,
     segments: list[dict],
@@ -17847,41 +18450,11 @@ def _trusted_universal_compact_plan_to_report(
             and _WORD_RE.search(end_text[end_span[1]:])
         )
 
-        grounded_constraint_ids = {
-            str(item.constraint_id)
-            for item in proposal.intent_evidence
-            if str(item.constraint_id) in all_constraint_ids
-            and _contains_quote(clip_text, str(item.evidence_quote))
-        }
-        intent_obligations = normalize_intent_obligations(
-            [
-                obligation
-                for item in proposal.intent_evidence
-                if (
-                    str(item.constraint_id) in grounded_constraint_ids
-                    and (
-                        constraint := constraints_by_id.get(
-                            str(item.constraint_id)
-                        )
-                    )
-                    is not None
-                    and (
-                        obligation := intent_obligation(
-                            kind=constraint.kind.value,
-                            source_phrase=canonical_constraint_sources[
-                                str(constraint.constraint_id)
-                            ][0],
-                            source_start=canonical_constraint_sources[
-                                str(constraint.constraint_id)
-                            ][1],
-                            requirement=constraint.requirement,
-                            evidence_quote=item.evidence_quote,
-                        )
-                    )
-                    is not None
-                )
-            ],
-            require_evidence=True,
+        grounded_constraint_ids, intent_metadata = _compact_intent_metadata(
+            plan,
+            proposal,
+            clip_text,
+            topic=topic,
         )
         if (
             proposal._pro_audit_start_authoritative
@@ -17900,20 +18473,6 @@ def _trusted_universal_compact_plan_to_report(
                 ),
                 _best_effort_evidence_quote(clip_text),
             )
-        intent_coverage = (
-            len(grounded_constraint_ids & required_constraint_ids)
-            / len(required_constraint_ids)
-            if required_constraint_ids
-            else 1.0
-        )
-        intent_role = (
-            "primary"
-            if (
-                proposal.directly_teaches_topic is True
-                and required_constraint_ids.issubset(grounded_constraint_ids)
-            )
-            else "supporting"
-        )
         if _claimed_worked_result_is_missing(
             clip_text,
             scope_text=" ".join(str(value or "") for value in (
@@ -17983,7 +18542,7 @@ def _trusted_universal_compact_plan_to_report(
             "intent_obligation_contract_version": (
                 INTENT_OBLIGATION_CONTRACT_VERSION
             ),
-            "intent_obligations": intent_obligations,
+            **intent_metadata,
             "surface_eligible": True,
             "selection_candidate_id": candidate_id,
             "cue_ids": cue_ids,
@@ -17994,8 +18553,6 @@ def _trusted_universal_compact_plan_to_report(
             "prerequisite_ids": [],
             "uncertainty": "low",
             "uncertainty_reasons": [],
-            "intent_role": intent_role,
-            "intent_coverage": round(intent_coverage, 6),
             "intent_evidence": [
                 {
                     "constraint_id": str(item.constraint_id),
@@ -19158,55 +19715,11 @@ def _trusted_compact_plan_to_report(
                 "quote": end_quote,
             }
 
-        grounded_constraint_ids = {
-            str(item.constraint_id)
-            for item in proposal.intent_evidence
-            if str(item.constraint_id) in all_constraint_ids
-            and _contains_quote(clip_text, str(item.evidence_quote))
-        }
-        intent_obligations = normalize_intent_obligations(
-            [
-                obligation
-                for item in proposal.intent_evidence
-                if (
-                    str(item.constraint_id) in grounded_constraint_ids
-                    and (
-                        constraint := constraints_by_id.get(
-                            str(item.constraint_id)
-                        )
-                    )
-                    is not None
-                    and (
-                        obligation := intent_obligation(
-                            kind=constraint.kind.value,
-                            source_phrase=canonical_constraint_sources[
-                                str(constraint.constraint_id)
-                            ][0],
-                            source_start=canonical_constraint_sources[
-                                str(constraint.constraint_id)
-                            ][1],
-                            requirement=constraint.requirement,
-                            evidence_quote=item.evidence_quote,
-                        )
-                    )
-                    is not None
-                )
-            ],
-            require_evidence=True,
-        )
-        intent_coverage = (
-            len(grounded_constraint_ids & required_constraint_ids)
-            / len(required_constraint_ids)
-            if required_constraint_ids
-            else 1.0
-        )
-        intent_role = (
-            "primary"
-            if (
-                proposal.directly_teaches_topic is True
-                and required_constraint_ids.issubset(grounded_constraint_ids)
-            )
-            else "supporting"
+        grounded_constraint_ids, intent_metadata = _compact_intent_metadata(
+            plan,
+            proposal,
+            clip_text,
+            topic=topic,
         )
 
         diagnostics = list(dict.fromkeys(diagnostics))
@@ -19238,7 +19751,7 @@ def _trusted_compact_plan_to_report(
             "intent_obligation_contract_version": (
                 INTENT_OBLIGATION_CONTRACT_VERSION
             ),
-            "intent_obligations": intent_obligations,
+            **intent_metadata,
             "surface_eligible": True,
             "selection_candidate_id": candidate_id,
             "cue_ids": cue_ids,
@@ -19249,8 +19762,6 @@ def _trusted_compact_plan_to_report(
             "prerequisite_ids": [],
             "uncertainty": "low",
             "uncertainty_reasons": [],
-            "intent_role": intent_role,
-            "intent_coverage": round(intent_coverage, 6),
             "intent_evidence": [
                 {
                     "constraint_id": str(item.constraint_id),
@@ -22335,6 +22846,18 @@ def _boundary_selector_content(
     return transcript_prompt, None, False
 
 
+def _pro_boundary_audit_output_tokens(candidate_count: int) -> int:
+    """Reserve audit output in proportion to the bounded decision inventory."""
+    bounded_count = max(1, min(_MAX_CLIPS, int(candidate_count)))
+    return min(
+        _PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS,
+        max(
+            _PRO_BOUNDARY_AUDIT_MIN_OUTPUT_TOKENS,
+            6_656 + 400 * bounded_count,
+        ),
+    )
+
+
 def _audit_pro_boundaries(
     plan: _CompactBoundaryPlan,
     segments: list[dict],
@@ -22347,7 +22870,7 @@ def _audit_pro_boundaries(
     _claim_logical_quota: bool = True,
     _remaining_physical_dispatches: int = _PRO_AUDIT_MAX_PHYSICAL_DISPATCHES,
 ) -> tuple[_CompactBoundaryPlan, list[dict], list[str]]:
-    """Let Pro independently audit admission and word edges; all failures retain."""
+    """Let Pro independently audit admission, fulfillment, and word edges."""
     if not plan.topics or not segments:
         return plan, [], []
     remaining_physical_dispatches = max(
@@ -22358,7 +22881,17 @@ def _audit_pro_boundaries(
         ),
     )
     if remaining_physical_dispatches == 0:
-        return plan, [], []
+        call = {
+            "model": config.SEGMENT_PRO_MODEL,
+            "operation": "pro_boundary_audit",
+            "prompt_version": _PRO_BOUNDARY_AUDIT_PROMPT_VERSION,
+            "error_type": "GeminiAuditContractError",
+            "retryable": True,
+            "dispatched": False,
+        }
+        exc = _ModelCallError("Gemini candidate audit budget exhausted", call)
+        exc.selection_attempt_calls = [call]
+        raise exc
 
     def consume_physical_dispatches(call: dict) -> None:
         nonlocal remaining_physical_dispatches
@@ -22382,12 +22915,17 @@ def _audit_pro_boundaries(
     )
     sink = settings.get("_segment_telemetry")
     calls: list[dict] = []
+    audit_output_tokens = _pro_boundary_audit_output_tokens(len(plan.topics))
     try:
         for structured_attempt in range(1, 3):
             try:
-                audit_initial_attempt_deadline = deadline
                 audit_retry_deadline = (
                     deadline + _PRO_AUDIT_RETRY_GRACE_S
+                )
+                audit_initial_attempt_deadline = (
+                    deadline
+                    if _retry_contract_once and structured_attempt == 1
+                    else audit_retry_deadline
                 )
                 audit, call = _call_model(
                     system,
@@ -22395,7 +22933,7 @@ def _audit_pro_boundaries(
                     _ProCandidateAuditPlan,
                     model=config.SEGMENT_PRO_MODEL,
                     thinking_level="high",
-                    max_output_tokens=_PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS,
+                    max_output_tokens=audit_output_tokens,
                     timeout_s=_PRO_TIMEOUT_S,
                     deadline_monotonic=audit_retry_deadline,
                     operation="pro_boundary_audit",
@@ -22428,12 +22966,19 @@ def _audit_pro_boundaries(
                         or remaining_physical_dispatches == 0
                     ),
                 })
+                if not _retry_contract_once:
+                    call["contract_retry_attempt"] = 2
                 calls.append(call)
                 if (
                     structured_attempt == 1
                     and remaining_physical_dispatches > 0
                     and not _cancel_requested(cancelled)
-                    and deadline - time.monotonic() >= 5.0
+                    and (
+                        deadline
+                        + _PRO_AUDIT_RETRY_GRACE_S
+                        - time.monotonic()
+                        >= 5.0
+                    )
                 ):
                     continue
                 raise
@@ -22444,6 +22989,8 @@ def _audit_pro_boundaries(
                     "structured_retry_attempt": 2,
                     "structured_retry_recovered": True,
                 })
+            if not _retry_contract_once:
+                call["contract_retry_attempt"] = 2
             calls.append(call)
             break
     except Exception as exc:
@@ -22462,10 +23009,37 @@ def _audit_pro_boundaries(
             applied_count=0,
             reason=f"request_failure:{type(exc).__name__}",
         )
-        return plan, calls, []
+        if not isinstance(exc, _SchemaResponseError):
+            # Preserve provider auth/quota/config/budget/transient taxonomy and
+            # retryability. Audit safety means the source returns no candidates;
+            # it does not justify relabeling an operational failure as transient.
+            exc.selection_attempt_calls = calls
+            raise
+        terminal = dict(calls[-1] if calls else telemetry)
+        terminal.update({
+            "error_type": "GeminiAuditContractError",
+            "audit_error_type": type(exc).__name__,
+            "retryable": True,
+        })
+        audit_exc = _ModelCallError(
+            "Gemini candidate audit did not resolve safely",
+            terminal,
+        )
+        audit_exc.selection_attempt_calls = [*calls[:-1], terminal]
+        raise audit_exc from exc
 
     if not isinstance(audit, _ProCandidateAuditPlan):
-        return plan, calls, []
+        terminal = dict(calls[-1] if calls else {})
+        terminal.update({
+            "error_type": "GeminiAuditContractError",
+            "retryable": True,
+        })
+        audit_exc = _ModelCallError(
+            "Gemini candidate audit returned no contract",
+            terminal,
+        )
+        audit_exc.selection_attempt_calls = [*calls[:-1], terminal]
+        raise audit_exc
 
     id_counts: dict[str, int] = {}
     for item in audit.items:
@@ -22480,10 +23054,25 @@ def _audit_pro_boundaries(
     audit_evidence_failures = 0
     semantic_repair_applied = 0
     semantic_repair_retained = 0
+    audit_contract_rejection_reasons: list[str] = []
+
+    def reject_contract(reason: str) -> None:
+        if (
+            reason
+            and reason not in audit_contract_rejection_reasons
+            and len(audit_contract_rejection_reasons) < 16
+        ):
+            audit_contract_rejection_reasons.append(reason)
+
     for item in audit.items:
         audit_id = str(item.candidate_id)
         index = allowed.get(audit_id)
         if index is None or id_counts.get(audit_id) != 1:
+            reject_contract(
+                "audit_candidate_unknown_id"
+                if index is None
+                else "audit_candidate_duplicate_id"
+            )
             continue
         returned_ids.add(audit_id)
         proposal = plan.topics[index]
@@ -22535,6 +23124,22 @@ def _audit_pro_boundaries(
                 )
                 else None
             )
+            live_rejection_semantics = {
+                "objective_constraint_ids",
+                "relationship_witnesses",
+                "objective_witness_quote",
+            }.issubset(item.model_fields_set)
+            rejection_semantics_valid = bool(
+                not live_rejection_semantics
+                or (
+                    item.directly_teaches_topic is False
+                    and not item.intent_evidence
+                    and not item.objective_constraint_ids
+                    and not item.relationship_witnesses
+                    and str(item.objective_witness_quote)
+                    == str(item.evidence_quote)
+                )
+            )
             if (
                 rejection_anchor is not None
                 and original_start_anchor is not None
@@ -22543,8 +23148,11 @@ def _audit_pro_boundaries(
                 <= rejection_anchor.first_word_position
                 and rejection_anchor.last_word_position
                 <= original_end_anchor.last_word_position
+                and rejection_semantics_valid
             ):
                 rejected[index] = item.decision
+            else:
+                reject_contract("audit_rejection_evidence_invalid")
             # A rejection item is not boundary authority. Invalid rejection
             # evidence fails open to the untouched original candidate; valid
             # rejection is applied independently of the repeated edge fields.
@@ -22569,6 +23177,7 @@ def _audit_pro_boundaries(
             or not 1 <= len(_toks(item.start_quote)) <= 10
             or not 1 <= len(_toks(item.end_quote)) <= 10
         ):
+            reject_contract("audit_boundary_range_invalid")
             continue
         start_anchor = _unique_boundary_anchor(
             segments,
@@ -22587,6 +23196,7 @@ def _audit_pro_boundaries(
             or end_anchor is None
             or start_anchor.first_word_position > end_anchor.last_word_position
         ):
+            reject_contract("audit_boundary_anchor_invalid")
             continue
         direct_start_anchor = _unique_boundary_anchor(
             segments,
@@ -22611,6 +23221,7 @@ def _audit_pro_boundaries(
         )
         if not direct_start_position_valid:
             start_diagnostic_failures += 1
+            reject_contract("audit_direct_start_invalid")
             continue
 
         audit_evidence_tokens = _toks(item.evidence_quote)
@@ -22632,12 +23243,43 @@ def _audit_pro_boundaries(
             <= end_anchor.last_word_position
         ):
             audit_evidence_failures += 1
+            reject_contract("audit_decision_evidence_invalid")
+            continue
+
+        objective_witness_quote = (
+            str(item.objective_witness_quote)
+            if "objective_witness_quote" in item.model_fields_set
+            else str(item.evidence_quote)
+        )
+        objective_witness_tokens = _toks(objective_witness_quote)
+        objective_witness_anchor = (
+            _unique_boundary_anchor(
+                segments,
+                objective_witness_quote,
+                item.start_line,
+                item.end_line,
+            )
+            if 5 <= len(objective_witness_tokens) <= 10
+            else None
+        )
+        if not (
+            objective_witness_anchor is not None
+            and start_anchor.first_word_position
+            <= objective_witness_anchor.first_word_position
+            and objective_witness_anchor.last_word_position
+            <= end_anchor.last_word_position
+        ):
+            audit_evidence_failures += 1
+            reject_contract("audit_objective_witness_invalid")
             continue
 
         # The Pro audit is the semantic authority. Its grounded evidence must
         # remain in the repaired unit; selector cq/ie fields are explicitly
         # untrusted hypotheses and may belong to a prerequisite or neighbor.
-        protected_quotes = [str(item.evidence_quote)]
+        protected_quotes = [
+            str(item.evidence_quote),
+            objective_witness_quote,
+        ]
         returned_text, _returned_spans = _semantic_clip_slice(
             segments,
             start_anchor.first_line,
@@ -22650,6 +23292,7 @@ def _audit_pro_boundaries(
             for quote in protected_quotes
         ):
             protected_boundary_failures += 1
+            reject_contract("audit_protected_quote_outside_range")
             continue
         semantic_updates: dict[str, object] = {}
         semantic_fields = {
@@ -22698,14 +23341,162 @@ def _audit_pro_boundaries(
                     <= end_anchor.last_word_position
                 ):
                     semantic_evidence_valid = False
+                    reject_contract("audit_intent_evidence_invalid")
                     break
                 grounded_audit_ids.add(constraint_id)
                 grounded_audit_intent.append(evidence)
+            live_semantic_contract = {
+                "objective_constraint_ids",
+                "relationship_witnesses",
+                "objective_witness_quote",
+            }.issubset(item.model_fields_set)
             if (
+                live_semantic_contract
+                and
                 item.directly_teaches_topic
-                and not required_constraint_ids.issubset(grounded_audit_ids)
+                and not required_constraint_ids.issubset({
+                    str(constraint_id)
+                    for constraint_id in item.objective_constraint_ids
+                })
             ):
                 semantic_evidence_valid = False
+                reject_contract("direct_objective_fulfillment_incomplete")
+            objective_contract_error = _objective_fulfillment_contract_error(
+                plan.request_intent,
+                item,
+            )
+            if objective_contract_error is not None:
+                semantic_evidence_valid = False
+                reject_contract(objective_contract_error)
+            intent_quote_by_id = {
+                str(evidence.constraint_id): str(evidence.evidence_quote)
+                for evidence in grounded_audit_intent
+            }
+            for witness in item.relationship_witnesses:
+                connection_quote = str(witness.connection_quote)
+                intent_anchor_quote = intent_quote_by_id.get(
+                    str(witness.constraint_id),
+                    "",
+                )
+                if not _contains_quote(connection_quote, intent_anchor_quote):
+                    semantic_evidence_valid = False
+                    reject_contract("audit_relationship_connection_ungrounded")
+                    break
+                relationship_quotes = [
+                    connection_quote,
+                    *(
+                        str(value)
+                        for member in witness.members
+                        for value in (
+                            member.identity_quote,
+                            member.role_quote,
+                        )
+                    ),
+                    *(str(link.link_quote) for link in witness.links),
+                ]
+                member_quotes = [
+                    str(member.identity_quote) for member in witness.members
+                ]
+                role_quotes = [
+                    str(member.role_quote) for member in witness.members
+                ]
+                link_quotes = [
+                    str(link.link_quote) for link in witness.links
+                ]
+                if (
+                    not 5 <= len(_toks(connection_quote)) <= 32
+                    or any(
+                        not 1 <= len(_toks(quote)) <= 8
+                        for quote in member_quotes
+                    )
+                    or any(
+                        not 2 <= len(_toks(quote)) <= 16
+                        for quote in role_quotes
+                    )
+                    or any(
+                        not 2 <= len(_toks(quote)) <= 32
+                        for quote in link_quotes
+                    )
+                    or any(
+                        not _contains_quote(returned_text, quote)
+                        for quote in relationship_quotes
+                    )
+                ):
+                    semantic_evidence_valid = False
+                    reject_contract("audit_relationship_quote_invalid")
+                    break
+                anchor_quotes = [
+                    connection_quote,
+                    *(str(member.role_quote) for member in witness.members),
+                    *(str(link.link_quote) for link in witness.links),
+                ]
+                relationship_anchors = [
+                    _unique_boundary_anchor(
+                        segments,
+                        quote,
+                        item.start_line,
+                        item.end_line,
+                    )
+                    for quote in anchor_quotes
+                ]
+                if any(
+                    anchor is None
+                    or anchor.first_word_position
+                    < start_anchor.first_word_position
+                    or anchor.last_word_position
+                    > end_anchor.last_word_position
+                    for anchor in relationship_anchors
+                ):
+                    semantic_evidence_valid = False
+                    reject_contract("audit_relationship_anchor_invalid")
+                    break
+                if witness.topology == "ordered":
+                    link_anchors = relationship_anchors[
+                        1 + len(witness.members):
+                    ]
+                    if any(
+                        current.first_word_position
+                        >= following.first_word_position
+                        for current, following in zip(
+                            link_anchors,
+                            link_anchors[1:],
+                        )
+                    ):
+                        semantic_evidence_valid = False
+                        reject_contract("audit_ordered_relationship_invalid")
+                        break
+                if witness.topology == "reciprocal":
+                    link_anchors = relationship_anchors[
+                        1 + len(witness.members):
+                    ]
+                    link_positions = {
+                        (
+                            " ".join(
+                                str(link.source_identity).split()
+                            ).casefold(),
+                            " ".join(
+                                str(link.target_identity).split()
+                            ).casefold(),
+                        ): anchor
+                        for link, anchor in zip(
+                            witness.links,
+                            link_anchors,
+                            strict=True,
+                        )
+                    }
+                    if any(
+                        anchor.first_word_position
+                        <= inverse.last_word_position
+                        and inverse.first_word_position
+                        <= anchor.last_word_position
+                        for (source, target), anchor in link_positions.items()
+                        if (
+                            inverse := link_positions.get((target, source))
+                        ) is not None
+                    ):
+                        semantic_evidence_valid = False
+                        reject_contract("audit_reciprocal_links_overlap")
+                        break
             # The Pro audit is the semantic authority for this repaired unit.
             # Code checks only its bounded/normalizable metadata and anchored
             # evidence; it must not re-decide meaning with token heuristics.
@@ -22714,19 +23505,37 @@ def _audit_pro_boundaries(
             )
             if semantic_evidence_valid and family_payload:
                 semantic_updates = {
-                    "claim_quote": str(item.evidence_quote),
+                    "claim_quote": objective_witness_quote,
                     "title": str(item.title),
                     "learning_objective": str(item.actual_objective),
                     "facet": str(item.facet),
                     **family_payload,
                     "directly_teaches_topic": bool(item.directly_teaches_topic),
                     "intent_evidence": grounded_audit_intent,
+                    **(
+                        {
+                            "objective_constraint_ids": list(
+                                item.objective_constraint_ids
+                            ),
+                            "relationship_witnesses": list(
+                                item.relationship_witnesses
+                            ),
+                        }
+                        if live_semantic_contract
+                        else {}
+                    ),
                 }
                 semantic_repair_applied += 1
             else:
                 semantic_repair_retained += 1
+                reject_contract(
+                    "audit_concept_family_invalid"
+                    if semantic_evidence_valid
+                    else "audit_semantic_contract_invalid"
+                )
         else:
             semantic_repair_retained += 1
+            reject_contract("audit_semantic_fields_missing")
         replacement = proposal.model_copy(update={
             "start_line": item.start_line,
             "end_line": item.end_line,
@@ -22735,7 +23544,9 @@ def _audit_pro_boundaries(
             **semantic_updates,
         })
         replacement._pro_audit_start_authoritative = True
-        replacement._pro_audit_evidence_quote = str(item.evidence_quote)
+        replacement._pro_audit_evidence_quote = str(
+            objective_witness_quote
+        )
         replacements[index] = replacement
 
     expected_ids = set(allowed)
@@ -22745,6 +23556,12 @@ def _audit_pro_boundaries(
         or set(id_counts) != expected_ids
         or any(id_counts.get(audit_id) != 1 for audit_id in expected_ids)
     )
+    if id_contract_invalid:
+        reject_contract("audit_candidate_id_contract_invalid")
+    if returned_ids != expected_ids:
+        reject_contract("audit_candidate_unresolved")
+    if len(resolved_indices) != len(plan.topics):
+        reject_contract("audit_decision_unresolved")
     contract_invalid = bool(
         id_contract_invalid
         or returned_ids != expected_ids
@@ -22755,6 +23572,9 @@ def _audit_pro_boundaries(
         if calls:
             calls[-1].update({
                 "contract_retry_reason": "invalid_audit_contract",
+                "audit_contract_rejection_reasons": list(
+                    audit_contract_rejection_reasons
+                ),
                 "contract_retry_exhausted": (
                     not _retry_contract_once
                     or remaining_physical_dispatches == 0
@@ -22764,23 +23584,46 @@ def _audit_pro_boundaries(
             _retry_contract_once
             and remaining_physical_dispatches > 0
             and not _cancel_requested(cancelled)
-            and deadline - time.monotonic() >= 5.0
+            and (
+                deadline
+                + _PRO_AUDIT_RETRY_GRACE_S
+                - time.monotonic()
+                >= 5.0
+            )
         ):
             if calls:
                 calls[-1]["contract_retry_attempt"] = 1
-            retried_plan, retry_calls, retry_rejections = _audit_pro_boundaries(
-                plan,
-                segments,
-                topic,
-                settings,
-                deadline=deadline,
-                cancelled=cancelled,
-                _retry_contract_once=False,
-                _claim_logical_quota=False,
-                _remaining_physical_dispatches=(
-                    remaining_physical_dispatches
-                ),
-            )
+            try:
+                retried_plan, retry_calls, retry_rejections = (
+                    _audit_pro_boundaries(
+                        plan,
+                        segments,
+                        topic,
+                        settings,
+                        deadline=deadline,
+                        cancelled=cancelled,
+                        _retry_contract_once=False,
+                        _claim_logical_quota=False,
+                        _remaining_physical_dispatches=(
+                            remaining_physical_dispatches
+                        ),
+                    )
+                )
+            except Exception as exc:
+                retry_attempt_calls = getattr(
+                    exc,
+                    "selection_attempt_calls",
+                    [],
+                )
+                exc.selection_attempt_calls = [
+                    *calls,
+                    *(
+                        retry_attempt_calls
+                        if isinstance(retry_attempt_calls, list)
+                        else []
+                    ),
+                ]
+                raise
             if retry_calls:
                 retry_calls[0].setdefault("contract_retry_attempt", 2)
             return retried_plan, [*calls, *retry_calls], retry_rejections
@@ -22800,7 +23643,21 @@ def _audit_pro_boundaries(
             rejected_count=0,
             reason="invalid_audit_contract",
         )
-        return plan, calls, []
+        terminal = dict(calls[-1] if calls else {})
+        terminal.update({
+            "error_type": "GeminiAuditContractError",
+            "retryable": True,
+            "contract_retry_exhausted": True,
+            "audit_contract_rejection_reasons": list(
+                audit_contract_rejection_reasons
+            ),
+        })
+        audit_exc = _ModelCallError(
+            "Gemini candidate audit contract retry exhausted",
+            terminal,
+        )
+        audit_exc.selection_attempt_calls = [*calls[:-1], terminal]
+        raise audit_exc
     if not _retry_contract_once and calls:
         calls[-1]["contract_retry_recovered"] = True
 
@@ -23377,6 +24234,19 @@ def _run_selection_profile(
             *clean_contract_rejections,
             *report.rejected_reasons,
         ]
+    audit_contract_rejections = call.get(
+        "audit_contract_rejection_reasons"
+    )
+    if isinstance(audit_contract_rejections, list):
+        clean_audit_rejections = [
+            str(reason)
+            for reason in audit_contract_rejections
+            if str(reason).strip()
+        ]
+        report.rejected_reasons = [
+            *clean_audit_rejections,
+            *report.rejected_reasons,
+        ]
     if (
         profile in {FLASH_SPLIT_PROFILE, PRO_BOUNDARY_PROFILE}
         and not conversion_settings.get("_segment_trust_gemini_semantics")
@@ -23598,6 +24468,7 @@ def run_segment_profile(
         contract_rejection_reasons: list[str] = []
         for attempt_call in calls:
             for field_name in (
+                "audit_contract_rejection_reasons",
                 "selector_contract_rejection_reasons",
                 "schema_rejection_reasons",
             ):

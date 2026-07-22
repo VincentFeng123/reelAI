@@ -15,6 +15,7 @@ from backend.app.clip_engine.errors import (
     ProviderQuotaError,
     ProviderRateLimitError,
     ProviderRequestError,
+    ProviderResponseValidationError,
     ProviderTransientError,
     TranscriptUnavailableError,
 )
@@ -7826,6 +7827,338 @@ def test_mode_source_budgets_are_analyzed_concurrently_without_backfill(
     assert discovery_calls == 1
     assert len(analyzed) == expected_sources
     assert max_active == expected_sources
+
+
+@pytest.mark.parametrize(
+    ("mode", "initial_count", "recovery_count"),
+    [("fast", 2, 1), ("slow", 3, 2)],
+)
+def test_zero_clip_batch_uses_bounded_novel_source_recovery(
+    monkeypatch,
+    mode: str,
+    initial_count: int,
+    recovery_count: int,
+) -> None:
+    topic = "Intro to Python"
+    tried_queries = [topic, "Python functions tutorial"]
+    initial_videos = [
+        {
+            **_video(),
+            "id": f"initial-{index}",
+            "url": f"https://youtu.be/initial-{index}",
+        }
+        for index in range(initial_count)
+    ]
+    recovery_videos = [
+        {
+            **_video(),
+            "id": f"recovery-{index}",
+            "url": f"https://youtu.be/recovery-{index}",
+        }
+        for index in range(recovery_count)
+    ]
+    discovery_calls: list[dict] = []
+
+    def discover(_topic, **kwargs):
+        discovery_calls.append(dict(kwargs))
+        if len(discovery_calls) == 1:
+            return {
+                **_discovery(),
+                "queries": tried_queries,
+                "videos": initial_videos,
+            }
+        assert kwargs["recovery_tried_queries"] == tried_queries
+        assert kwargs["recovery_reason"] == (
+            pipeline_module.clip_engine_expand.RECOVERY_REASON_ZERO_VALID_CLIPS
+        )
+        assert kwargs["recovery_rejected_video_ids"] == [
+            video["id"] for video in initial_videos
+        ]
+        assert set(kwargs["exclude_video_ids"]) >= {
+            video["id"] for video in initial_videos
+        }
+        return {
+            **_discovery(),
+            "queries": ["novel Python source"],
+            "videos": recovery_videos,
+        }
+
+    context = GenerationContext(mode)
+    analyzed: list[str] = []
+
+    def clip_and_filter(video, *_args, **_kwargs):
+        context.reserve("transcript")
+        context.reserve("segmentation")
+        analyzed.append(video["id"])
+        clips = (
+            [_quality_clip(candidate_id=f"clip-{video['id']}")]
+            if video["id"].startswith("recovery-")
+            else []
+        )
+        return video, clips, {"transcript": _transcript(), "clips": []}
+
+    pipeline = _pipeline()
+    monkeypatch.setattr(pipeline_module, "_discover", discover)
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        mock.Mock(side_effect=lambda **kwargs: (
+            f"reel-{kwargs['v']['id']}",
+            mock.sentinel.metadata,
+        )),
+    )
+
+    reels, resolved = pipeline.ingest_topic(
+        topic=topic,
+        material_id="material",
+        concept_id="concept",
+        max_videos=10,
+        max_reels=1,
+        generation_context=context,
+        retrieval_profile="deep",
+    )
+
+    assert len(discovery_calls) == 2
+    assert discovery_calls[0]["analysis_limit"] == initial_count
+    assert discovery_calls[1]["analysis_limit"] == recovery_count
+    assert len(analyzed) == initial_count + recovery_count
+    assert set(analyzed) == {
+        *[video["id"] for video in initial_videos],
+        *[video["id"] for video in recovery_videos],
+    }
+    assert reels == ["reel-recovery-0"]
+    assert resolved == [
+        *[video["id"] for video in initial_videos],
+        *[video["id"] for video in recovery_videos],
+    ]
+    assert context.budget.remaining("transcript") == 0
+    assert context.budget.remaining("segmentation") == 0
+
+
+def test_zero_clip_recovery_is_attempted_only_once_when_recovery_also_rejects(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("fast")
+    videos_by_pass = [
+        [{**_video(), "id": "initial-a"}, {**_video(), "id": "initial-b"}],
+        [{**_video(), "id": "recovery-a"}],
+    ]
+    discovery_calls: list[dict] = []
+
+    def discover(_topic, **kwargs):
+        discovery_calls.append(dict(kwargs))
+        return {
+            **_discovery(),
+            "queries": ["Intro to Python", "novel Python lesson"],
+            "videos": videos_by_pass[len(discovery_calls) - 1],
+        }
+
+    pipeline = _pipeline()
+    monkeypatch.setattr(pipeline_module, "_discover", discover)
+
+    def reject(video, *_args, **_kwargs):
+        context.reserve("transcript")
+        context.reserve("segmentation")
+        return video, [], {"transcript": _transcript(), "clips": []}
+
+    monkeypatch.setattr(pipeline, "_clip_and_filter", reject)
+
+    reels, resolved = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        max_videos=10,
+        generation_context=context,
+    )
+
+    assert reels == []
+    assert resolved == ["initial-a", "initial-b", "recovery-a"]
+    assert len(discovery_calls) == 2
+    assert not discovery_calls[0].get("recovery_tried_queries")
+    assert discovery_calls[1]["recovery_tried_queries"]
+
+
+@pytest.mark.parametrize("mixed_clean_rejection", [False, True])
+def test_source_scoped_audit_contract_failure_recovers_from_novel_source(
+    monkeypatch,
+    mixed_clean_rejection: bool,
+) -> None:
+    context = GenerationContext("fast")
+    initial_videos = [{**_video(), "id": "audit-failed"}]
+    if mixed_clean_rejection:
+        initial_videos.append({**_video(), "id": "clean-rejection"})
+    recovered_video = {**_video(), "id": "novel-recovery"}
+    discovery_calls = 0
+
+    def discover(_topic, **_kwargs):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        return {
+            **_discovery(),
+            "queries": ["Python functions explained"],
+            "videos": initial_videos if discovery_calls == 1 else [recovered_video],
+        }
+
+    def clip_and_filter(video, *_args, **_kwargs):
+        context.reserve("transcript")
+        context.reserve("segmentation")
+        if video["id"] == "audit-failed":
+            raise ProviderResponseValidationError(
+                "Gemini boundary audit rejected its response contract.",
+                provider="gemini",
+                operation="segmentation",
+            )
+        if video["id"] == "clean-rejection":
+            return video, [], {"transcript": _transcript(), "clips": []}
+        return (
+            video,
+            [_quality_clip(candidate_id="novel-recovery-clip")],
+            {"transcript": _transcript(), "clips": []},
+        )
+
+    pipeline = _pipeline()
+    monkeypatch.setattr(pipeline_module, "_discover", discover)
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        mock.Mock(return_value=("recovered-reel", mock.sentinel.metadata)),
+    )
+
+    reels, resolved = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        max_videos=len(initial_videos),
+        max_reels=1,
+        generation_context=context,
+    )
+
+    assert reels == ["recovered-reel"]
+    assert resolved == [
+        *[video["id"] for video in initial_videos],
+        "novel-recovery",
+    ]
+    assert discovery_calls == 2
+    assert context.counters()["provider_failures"] == 1
+
+
+def test_initial_source_error_is_raised_when_recovery_also_yields_no_clip(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("fast")
+    initial_video = {**_video(), "id": "audit-failed"}
+    recovery_video = {**_video(), "id": "novel-but-rejected"}
+    discovery_calls = 0
+
+    def discover(_topic, **_kwargs):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        return {
+            **_discovery(),
+            "queries": ["Python functions explained"],
+            "videos": [initial_video if discovery_calls == 1 else recovery_video],
+        }
+
+    def clip_and_filter(video, *_args, **_kwargs):
+        context.reserve("transcript")
+        context.reserve("segmentation")
+        if video["id"] == "audit-failed":
+            raise ProviderResponseValidationError(
+                "Gemini boundary audit rejected its response contract.",
+                provider="gemini",
+                operation="segmentation",
+            )
+        return video, [], {"transcript": _transcript(), "clips": []}
+
+    pipeline = _pipeline()
+    monkeypatch.setattr(pipeline_module, "_discover", discover)
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+
+    with pytest.raises(
+        ProviderResponseValidationError,
+        match="boundary audit rejected",
+    ):
+        pipeline.ingest_topic(
+            topic="Intro to Python",
+            material_id="material",
+            concept_id="concept",
+            max_videos=1,
+            generation_context=context,
+        )
+
+    assert discovery_calls == 2
+
+
+def test_job_global_provider_error_does_not_start_novel_source_recovery(
+    monkeypatch,
+) -> None:
+    discovery = mock.Mock(return_value={
+        **_discovery(),
+        "queries": ["Intro to Python"],
+    })
+    pipeline = _pipeline()
+    monkeypatch.setattr(pipeline_module, "_discover", discovery)
+    monkeypatch.setattr(
+        pipeline,
+        "_clip_and_filter",
+        mock.Mock(side_effect=ProviderQuotaError(
+            "Gemini quota is exhausted.",
+            provider="gemini",
+            operation="segmentation",
+        )),
+    )
+
+    with pytest.raises(ProviderQuotaError, match="quota is exhausted"):
+        pipeline.ingest_topic(
+            topic="Intro to Python",
+            material_id="material",
+            concept_id="concept",
+            max_videos=1,
+            generation_context=GenerationContext("fast"),
+        )
+
+    assert discovery.call_count == 1
+
+
+def test_healthy_clip_batch_does_not_enter_failure_recovery(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("fast")
+    discovery = mock.Mock(return_value={
+        **_discovery(),
+        "queries": ["Intro to Python"],
+    })
+    pipeline = _pipeline()
+    monkeypatch.setattr(pipeline_module, "_discover", discovery)
+    monkeypatch.setattr(
+        pipeline,
+        "_clip_and_filter",
+        lambda video, *_args, **_kwargs: (
+            video,
+            [_quality_clip(candidate_id="healthy")],
+            {"transcript": _transcript(), "clips": []},
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        mock.Mock(return_value=("healthy-reel", mock.sentinel.metadata)),
+    )
+
+    reels, _resolved = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        max_videos=10,
+        max_reels=1,
+        generation_context=context,
+    )
+
+    assert reels == ["healthy-reel"]
+    assert discovery.call_count == 1
+    assert discovery.call_args.kwargs["analysis_limit"] == 2
 
 
 def test_ingest_topic_distinguishes_unavailable_transcript_from_provider_failure(

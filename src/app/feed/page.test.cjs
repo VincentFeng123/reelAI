@@ -1190,7 +1190,10 @@ test("generation continuation stays server-owned while adaptive requests exclude
   const requestMoreStart = source.indexOf("const requestMore = useCallback(");
   const requestMoreEnd = source.indexOf("\n\n  useEffect(() => {", requestMoreStart);
   const callbackText = source.slice(requestMoreStart, requestMoreEnd);
-  assert.match(callbackText, /const continuationToken = continuationTokenByMaterialRef\.current\.get\(id\)/);
+  assert.match(
+    callbackText,
+    /const continuationToken = retryTerminal[\s\S]*?: continuationTokenByMaterialRef\.current\.get\(id\)/,
+  );
   assert.match(callbackText, /continuationToken,/);
   assert.match(
     callbackText,
@@ -1989,6 +1992,47 @@ test("bootstrap consumes duplicate persisted pages before considering generation
   assert.deepEqual(pageLoads.map((row) => row.targetPage), [2, 3]);
   assert.ok(pageLoads.every((row) => row.options.autofill === false));
   assert.equal(generationRequests, 0, "persisted inventory filled the reservoir");
+});
+
+test("manual empty-state retry reopens only the authoritative exhausted batch", async () => {
+  const searchScope = { key: "biology", seq: 1 };
+  const bootstrappingWrites = [];
+  const generationRequests = [];
+  const callback = compileUseCallback("bootstrapFirstReels", {
+    materialId: "biology",
+    isGeneratingRef: { current: false },
+    canRequestMore: false,
+    isIngestMaterial: false,
+    reelsRef: { current: [] },
+    getFeedMaterialIds: () => ["biology"],
+    lastTerminalStatusByMaterialRef: {
+      current: new Map([["biology", "exhausted"]]),
+    },
+    continuationTokenByMaterialRef: {
+      current: new Map([["biology", "exhausted-job"]]),
+    },
+    setBootstrappingFirstReels: (value) => bootstrappingWrites.push(value),
+    setCanRequestMore: () => {},
+    setFeedPagesExhausted: () => {},
+    activeSearchScopeRef: { current: searchScope },
+    readyReservoirTarget: () => 9,
+    generationMode: "slow",
+    requestMore: async (options) => {
+      generationRequests.push(options);
+      return [];
+    },
+    isSearchScopeActive: (scope) => scope === searchScope,
+  });
+
+  await callback(true);
+
+  assert.deepEqual(generationRequests, [{
+    surfaceError: true,
+    initialFill: true,
+    requestedCount: 9,
+    retryTerminal: true,
+  }]);
+  assert.deepEqual(bootstrappingWrites, [true, false]);
 });
 
 test("bootstrap continues partial initial inventory in bounded batches until nine are ready", async () => {

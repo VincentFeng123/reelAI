@@ -13,6 +13,7 @@ from backend.app.clip_engine.errors import (
     CancellationError,
     ProviderConfigurationError,
     ProviderRequestError,
+    ProviderTransientError,
 )
 from backend.app.clip_engine.provider_cache import MemoryProviderCache
 from backend.app.clip_engine.provider_runtime import GenerationContext
@@ -52,6 +53,7 @@ def _intent_expansion_json(
             "source_phrase": source_phrase,
             "source_occurrence": 0,
             "requirement": f"Teach {corrected}",
+            "relationship_topology": "not_applicable",
         }],
         "queries": [
             {
@@ -66,7 +68,15 @@ def _intent_expansion_json(
 def _expansion_payload_json(payload: dict) -> str:
     completed = dict(payload)
     completed["intent_constraints"] = [
-        {"source_occurrence": 0, **constraint}
+        {
+            "source_occurrence": 0,
+            "relationship_topology": (
+                "unspecified"
+                if constraint.get("kind") == "relationship"
+                else "not_applicable"
+            ),
+            **constraint,
+        }
         for constraint in completed.get("intent_constraints", [])
     ]
     completed.setdefault("joint_structures", [])
@@ -84,7 +94,7 @@ def _without_intent_contract(result: dict) -> dict:
     public = dict(result)
     intent_contract = public.pop("intent_contract", None)
     if public.get("provider_used") == "gemini":
-        assert intent_contract["version"] == "expansion_intent_v1"
+        assert intent_contract["version"] == "expansion_intent_v2"
         assert intent_contract["request_intent"]["constraints"]
     else:
         assert intent_contract is None
@@ -93,7 +103,7 @@ def _without_intent_contract(result: dict) -> dict:
 
 def _intent_contract(exact_request: str = "physics") -> dict:
     return {
-        "version": "expansion_intent_v1",
+        "version": "expansion_intent_v2",
         "request_intent": {
             "exact_request": exact_request,
             "constraints": [{
@@ -102,6 +112,7 @@ def _intent_contract(exact_request: str = "physics") -> dict:
                 "source_phrase": exact_request,
                 "source_occurrence": 0,
                 "requirement": f"Teach {exact_request}",
+                "relationship_topology": "not_applicable",
             }],
             "joint_structures": [],
         },
@@ -154,6 +165,9 @@ def _selector_constraint(
         "kind": kind,
         "source_phrase": source_phrase,
         "requirement": f"Preserve {constraint_id}",
+        "relationship_topology": (
+            "unspecified" if kind == "relationship" else "not_applicable"
+        ),
     }
     if source_occurrence is not None:
         constraint["source_occurrence"] = source_occurrence
@@ -224,7 +238,7 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
 def test_practice_fast_expansion_requests_focused_sources() -> None:
     prompt = " ".join(expand._PRACTICE_FAST_SYSTEM.casefold().split())
 
-    assert expand.PRACTICE_FAST_EXPAND_CACHE_VERSION == 12
+    assert expand.PRACTICE_FAST_EXPAND_CACHE_VERSION == 13
     assert expand.PRACTICE_FAST_EXPAND_OUTPUT_TOKENS == 2_048
     assert "one concise, standalone, intent-preserving learning summary" in prompt
     assert "must make sense without the original request" in prompt
@@ -247,6 +261,7 @@ def test_practice_fast_expansion_requests_focused_sources() -> None:
         "_PracticeFastIntentConstraint"
     ]
     assert "source_occurrence" in constraint_schema["required"]
+    assert "relationship_topology" in constraint_schema["required"]
     assert "default" not in constraint_schema["properties"]["source_occurrence"]
     assert summary_ids_schema["minItems"] == 1
     assert summary_ids_schema["maxItems"] == 16
@@ -481,6 +496,11 @@ def test_expansion_preserves_atomic_cross_domain_request_contracts(
                 "source_phrase": source_phrase,
                 "source_occurrence": 0,
                 "requirement": f"Preserve {source_phrase}",
+                "relationship_topology": (
+                    "unspecified"
+                    if kind == "relationship"
+                    else "not_applicable"
+                ),
             }
             for constraint_id, kind, source_phrase in constraints
         ],
@@ -504,7 +524,7 @@ def test_expansion_preserves_atomic_cross_domain_request_contracts(
 
     contract = result["intent_contract"]
     assert calls == 1
-    assert contract["version"] == "expansion_intent_v1"
+    assert contract["version"] == "expansion_intent_v2"
     assert contract["request_intent"]["exact_request"] == topic
     assert [
         item["constraint_id"]
@@ -1483,6 +1503,117 @@ def test_successful_expansion_dispatch_is_not_double_recorded(monkeypatch):
     assert str(config.thinking_config.thinking_level).casefold().endswith("low")
     assert config.temperature is None
     assert config.max_output_tokens == 2_048
+
+
+def test_zero_result_recovery_prompt_includes_exact_request_tried_queries_and_signal(
+    monkeypatch,
+):
+    from google import genai
+
+    seen: dict[str, object] = {}
+
+    class _Response:
+        text = '{"corrected":"Newton laws","queries":[]}'
+        model_version = "gemini-flash-test"
+        usage_metadata = {
+            "prompt_token_count": 10,
+            "candidates_token_count": 5,
+            "total_token_count": 15,
+        }
+
+    async def succeed(**kwargs):
+        seen.update(kwargs)
+        return _Response()
+
+    exact_request = "Newton's laws with free-body diagram problems"
+    tried_queries = ["Newton laws tutorial", "Newton laws explained"]
+    monkeypatch.setattr(expand.config, "require_gemini_key", lambda: "gemini-test")
+    monkeypatch.setattr(genai, "Client", lambda **_kwargs: _FakeGeminiClient(succeed))
+
+    asyncio.run(
+        expand._practice_fast_gemini_raw_async(
+            exact_request,
+            3,
+            model=expand.PRACTICE_FAST_EXPAND_MODEL,
+            level=None,
+            should_cancel=None,
+            tried_queries=tried_queries,
+            recovery_reason=expand.RECOVERY_REASON_ZERO_SEARCH_RESULTS,
+        )
+    )
+
+    prompt = str(seen["contents"])
+    assert exact_request in prompt
+    assert "ZERO_SEARCH_RESULT_RECOVERY" in prompt
+    assert "zero eligible YouTube videos" in prompt
+    assert json.dumps(tried_queries, ensure_ascii=True) in prompt
+
+
+def test_zero_clip_recovery_has_distinct_signal_rejected_ids_and_cache_key(
+    monkeypatch,
+) -> None:
+    from google import genai
+
+    prompts: list[str] = []
+
+    class _Response:
+        text = '{"corrected":"Circuits","queries":[]}'
+        model_version = "gemini-flash-test"
+        usage_metadata = {
+            "prompt_token_count": 10,
+            "candidates_token_count": 5,
+            "total_token_count": 15,
+        }
+
+    async def succeed(**kwargs):
+        prompts.append(str(kwargs["contents"]))
+        return _Response()
+
+    topic = "Explain current and voltage in series circuits"
+    tried_queries = ["series circuit current voltage tutorial"]
+    rejected_ids = ["video-rejected-b", "video-rejected-a"]
+    monkeypatch.setattr(expand.config, "require_gemini_key", lambda: "gemini-test")
+    monkeypatch.setattr(genai, "Client", lambda **_kwargs: _FakeGeminiClient(succeed))
+
+    for reason, ids in (
+        (expand.RECOVERY_REASON_ZERO_SEARCH_RESULTS, []),
+        (expand.RECOVERY_REASON_ZERO_VALID_CLIPS, rejected_ids),
+    ):
+        asyncio.run(
+            expand._practice_fast_gemini_raw_async(
+                topic,
+                2,
+                model=expand.PRACTICE_FAST_EXPAND_MODEL,
+                level=None,
+                should_cancel=None,
+                tried_queries=tried_queries,
+                recovery_reason=reason,
+                rejected_video_ids=ids,
+            )
+        )
+
+    assert "ZERO_SEARCH_RESULT_RECOVERY" in prompts[0]
+    assert "ZERO_VALID_CLIP_RECOVERY" not in prompts[0]
+    assert "ZERO_VALID_CLIP_RECOVERY" in prompts[1]
+    assert "transcript retrieval, selector/audit validation, or boundary" in prompts[1]
+    assert json.dumps(sorted(rejected_ids), ensure_ascii=True) in prompts[1]
+    assert prompts[0] != prompts[1]
+    search_key = expand._expansion_cache_key(
+        topic,
+        2,
+        None,
+        tried_queries=tried_queries,
+        recovery_reason=expand.RECOVERY_REASON_ZERO_SEARCH_RESULTS,
+    )
+    clip_key = expand._expansion_cache_key(
+        topic,
+        2,
+        None,
+        tried_queries=tried_queries,
+        recovery_reason=expand.RECOVERY_REASON_ZERO_VALID_CLIPS,
+        rejected_video_ids=rejected_ids,
+    )
+    assert search_key != clip_key
 
 
 def test_practice_fast_expansion_never_falls_back_to_pro(monkeypatch):
@@ -2812,15 +2943,26 @@ def test_literal_only_rejected_cursor_retries_with_fresh_grounded_branch(
     )
     context = GenerationContext("slow")
     calls: list[tuple[list[str], list[str] | None]] = []
-    monkeypatch.setattr(
-        search.expand,
-        "expand_query_practice_fast",
-        lambda *_args, **_kwargs: {
+    expansion_calls: list[tuple[str, int, list[str]]] = []
+
+    def fake_expand(request, count, **kwargs):
+        tried_queries = list(kwargs.get("tried_queries") or [])
+        expansion_calls.append((request, count, tried_queries))
+        if not tried_queries:
+            return {
+                "corrected": topic,
+                "queries": [topic],
+                "provider_used": "literal_fallback",
+            }
+        assert tried_queries == [topic]
+        return {
             "corrected": topic,
-            "queries": [topic],
-            "provider_used": "literal_fallback",
-        },
-    )
+            "queries": ["Newton's laws first-law inertia"],
+            "provider_used": "gemini",
+            "intent_contract": _intent_contract(topic),
+        }
+
+    monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
 
     def fake_search_all(queries, filters=None, **kwargs):
         del filters
@@ -2836,6 +2978,7 @@ def test_literal_only_rejected_cursor_retries_with_fresh_grounded_branch(
                 detail="Invalid or expired continuation token",
             )
         if queries == [topic]:
+            context.reserve("search")
             return {
                 "per_query": [{
                     "query": topic,
@@ -2872,65 +3015,513 @@ def test_literal_only_rejected_cursor_retries_with_fresh_grounded_branch(
         ([topic], ["bad-cursor"]),
         (["Newton's laws first-law inertia"], None),
     ]
+    assert expansion_calls == [
+        (topic, 3, []),
+        (topic, 4, [topic]),
+    ]
     assert [video["id"] for video in result["videos"]] == ["fresh-recovery"]
     assert "continued with another grounded search query" in str(result["warning"])
-    assert context.budget.remaining("search") == 3
-
-
-def test_cursor_recovery_components_remain_subject_grounded() -> None:
-    topic = (
-        "Newton's laws: begin with first-law inertia and balanced forces, then "
-        "net force and F=ma, then free-body diagrams"
-    )
-
-    assert search._grounded_cursor_recovery_queries(topic) == [
-        "Newton's laws first-law inertia",
-        "Newton's laws balanced forces",
-        "Newton's laws net force",
-        "Newton's laws F=ma",
-        "Newton's laws free-body diagrams",
-    ]
+    assert context.budget.remaining("search") == 2
 
 
 @pytest.mark.parametrize(
-    ("topic", "expected"),
+    ("exact_request", "tried_query", "novel_query"),
     [
         (
-            "Teach cellular respiration, begin with glycolysis, then the Krebs "
-            "cycle, then oxidative phosphorylation and ATP yield",
-            [
-                "cellular respiration glycolysis",
-                "cellular respiration the Krebs cycle",
-                "cellular respiration oxidative phosphorylation",
-                "cellular respiration ATP yield",
-            ],
+            "Newton's laws from inertia through free-body diagram problems",
+            "Newton laws tutorial",
+            "Newton laws free body diagram worked examples",
         ),
         (
-            "Explain Python generators; start with iterators, then generator "
-            "functions, then async generators",
-            [
-                "Python generators iterators",
-                "Python generators generator functions",
-                "Python generators async generators",
-            ],
+            "Cellular respiration from glycolysis through ATP yield",
+            "cellular respiration overview",
+            "cellular respiration ATP yield worked explanation",
         ),
         (
-            "Study negligence, begin with duty, then breach, then causation and damages",
-            [
-                "negligence duty",
-                "negligence breach",
-                "negligence causation",
-                "negligence damages",
-            ],
+            "Python generators from iterators through async generators",
+            "python generators tutorial",
+            "python async generators explained with examples",
         ),
-        ("photosynthesis", []),
+        (
+            "Negligence from duty through causation and damages",
+            "negligence law overview",
+            "negligence causation and damages worked fact pattern",
+        ),
     ],
 )
-def test_cursor_recovery_subject_grounding_is_prompt_shape_independent(
-    topic,
-    expected,
+def test_zero_result_recovery_preserves_cross_domain_request_shapes(
+    monkeypatch,
+    exact_request,
+    tried_query,
+    novel_query,
 ) -> None:
-    assert search._grounded_cursor_recovery_queries(topic) == expected
+    captured: dict[str, object] = {}
+
+    def fake_raw(topic, count, **kwargs):
+        captured.update(
+            topic=topic,
+            count=count,
+            tried_queries=list(kwargs.get("tried_queries") or []),
+        )
+        return _intent_expansion_json(
+            corrected=exact_request,
+            source_phrase=exact_request,
+            queries=[tried_query, novel_query],
+        )
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
+
+    result = expand.expand_query_practice_fast(
+        exact_request,
+        2,
+        tried_queries=[tried_query],
+    )
+
+    assert captured == {
+        "topic": exact_request,
+        "count": 2,
+        "tried_queries": [tried_query],
+    }
+    assert result["corrected"] == exact_request
+    assert result["queries"] == [novel_query]
+    assert result["provider_used"] == "gemini"
+    assert result["intent_contract"]["request_intent"]["exact_request"] == exact_request
+
+
+def test_zero_result_without_cursor_uses_one_ai_recovery_until_inventory_exists(
+    monkeypatch,
+) -> None:
+    exact_request = "Teach Newton's laws with progressively harder problems"
+    initial_query = "Newton laws tutorial"
+    recovery_queries = [
+        "Newton laws balanced forces worked problems",
+        "Newton laws free body diagram problem progression",
+    ]
+    context = GenerationContext("slow")
+    expansion_calls: list[
+        tuple[str, int, list[str], str | None, list[str]]
+    ] = []
+    search_calls: list[str] = []
+
+    def fake_expand(request, count, **kwargs):
+        tried_queries = list(kwargs.get("tried_queries") or [])
+        expansion_calls.append((request, count, tried_queries))
+        if not tried_queries:
+            return {
+                "corrected": exact_request,
+                "queries": [initial_query],
+                "provider_used": "gemini",
+                "intent_contract": _intent_contract(exact_request),
+            }
+        return {
+            "corrected": exact_request,
+            "queries": [initial_query, *recovery_queries],
+            "provider_used": "gemini",
+            "intent_contract": _intent_contract(exact_request),
+        }
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        del filters, kwargs
+        assert len(queries) == 1
+        query = queries[0]
+        search_calls.append(query)
+        context.reserve("search")
+        return {
+            "per_query": [{
+                "query": query,
+                "videos": (
+                    [{"id": "recovered-video"}]
+                    if query == recovery_queries[0]
+                    else []
+                ),
+                "next_page_token": None,
+            }],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        exact_request,
+        limit=1,
+        breadth=1,
+        retrieval_profile="deep",
+        context=context,
+    )
+
+    assert expansion_calls == [
+        (exact_request, 1, []),
+        (exact_request, 4, [initial_query]),
+    ]
+    assert search_calls == [initial_query, recovery_queries[0]]
+    assert result["queries"] == [initial_query, recovery_queries[0]]
+    assert [video["id"] for video in result["videos"]] == ["recovered-video"]
+    assert result["provider_exhausted"] is False
+    assert context.budget.remaining("search") == 3
+
+
+def test_zero_result_recovery_uses_exact_five_search_budget(monkeypatch) -> None:
+    exact_request = "Explain cellular respiration and ATP yield"
+    initial_query = "cellular respiration overview"
+    alternatives = [
+        "cellular respiration glycolysis ATP explanation",
+        "cellular respiration Krebs cycle ATP explanation",
+        "cellular respiration electron transport ATP explanation",
+        "cellular respiration ATP yield worked explanation",
+    ]
+    context = GenerationContext("slow")
+    expansion_calls: list[tuple[int, list[str]]] = []
+    search_calls: list[str] = []
+
+    def fake_expand(request, count, **kwargs):
+        assert request == exact_request
+        tried_queries = list(kwargs.get("tried_queries") or [])
+        expansion_calls.append((count, tried_queries))
+        return {
+            "corrected": exact_request,
+            "queries": alternatives if tried_queries else [initial_query],
+            "provider_used": "gemini",
+            "intent_contract": _intent_contract(exact_request),
+        }
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        del filters, kwargs
+        assert len(queries) == 1
+        query = queries[0]
+        search_calls.append(query)
+        context.reserve("search")
+        return {
+            "per_query": [{
+                "query": query,
+                "videos": [],
+                "next_page_token": None,
+            }],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        exact_request,
+        limit=1,
+        breadth=1,
+        retrieval_profile="deep",
+        context=context,
+    )
+
+    assert expansion_calls == [(1, []), (4, [initial_query])]
+    assert search_calls == [initial_query, *alternatives]
+    assert result["queries"] == search_calls
+    assert result["videos"] == []
+    assert result["provider_exhausted"] is True
+    assert context.budget.remaining("search") == 0
+
+
+def test_healthy_nonempty_discovery_does_not_call_recovery(monkeypatch) -> None:
+    exact_request = "Explain Python generators"
+    initial_query = "Python generators tutorial"
+    context = GenerationContext("slow")
+    expansion_calls: list[list[str]] = []
+    search_calls: list[list[str]] = []
+
+    def fake_expand(request, _count, **kwargs):
+        assert request == exact_request
+        expansion_calls.append(list(kwargs.get("tried_queries") or []))
+        return {
+            "corrected": exact_request,
+            "queries": [initial_query],
+            "provider_used": "gemini",
+            "intent_contract": _intent_contract(exact_request),
+        }
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        del filters, kwargs
+        search_calls.append(list(queries))
+        context.reserve("search")
+        return {
+            "per_query": [{
+                "query": initial_query,
+                "videos": [{"id": "healthy-video"}],
+                "next_page_token": None,
+            }],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        exact_request,
+        limit=1,
+        breadth=1,
+        retrieval_profile="deep",
+        context=context,
+    )
+
+    assert expansion_calls == [[]]
+    assert search_calls == [[initial_query]]
+    assert [video["id"] for video in result["videos"]] == ["healthy-video"]
+    assert context.budget.remaining("search") == 4
+
+
+def test_zero_result_recovery_duplicates_do_not_reserve_search(monkeypatch) -> None:
+    exact_request = "Explain C++ RAII ownership"
+    initial_query = "C++ RAII ownership tutorial"
+    novel_query = "C++ RAII destructor ownership example"
+    context = GenerationContext("slow")
+    search_calls: list[str] = []
+
+    def fake_expand(request, _count, **kwargs):
+        assert request == exact_request
+        if not kwargs.get("tried_queries"):
+            queries = [initial_query]
+        else:
+            queries = [
+                f"  {initial_query}  ",
+                f"{initial_query}!",
+                novel_query,
+                f" {novel_query} ",
+            ]
+        return {
+            "corrected": exact_request,
+            "queries": queries,
+            "provider_used": "gemini",
+            "intent_contract": _intent_contract(exact_request),
+        }
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        del filters, kwargs
+        assert len(queries) == 1
+        search_calls.append(queries[0])
+        context.reserve("search")
+        return {
+            "per_query": [{
+                "query": queries[0],
+                "videos": [],
+                "next_page_token": None,
+            }],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        exact_request,
+        limit=1,
+        breadth=1,
+        retrieval_profile="deep",
+        context=context,
+    )
+
+    assert search_calls == [initial_query, novel_query]
+    assert result["queries"] == search_calls
+    assert context.budget.remaining("search") == 3
+
+
+def test_explicit_clip_rejection_recovery_searches_only_novel_ai_queries(
+    monkeypatch,
+) -> None:
+    exact_request = "Explain series circuit current and voltage"
+    tried_queries = [
+        "series circuit current explained",
+        "series circuit voltage tutorial",
+        "series circuit current!",
+    ]
+    novel_queries = [
+        "series circuit current voltage worked example",
+        "series circuit voltage drops derivation",
+    ]
+    context = GenerationContext("slow")
+    for _ in range(3):
+        context.reserve("search")
+    expansion_calls: list[tuple[str, int, list[str]]] = []
+    search_calls: list[list[str]] = []
+
+    def fake_expand(topic, count, **kwargs):
+        expansion_calls.append(
+            (
+                topic,
+                count,
+                list(kwargs.get("tried_queries") or []),
+                kwargs.get("recovery_reason"),
+                list(kwargs.get("rejected_video_ids") or []),
+            )
+        )
+        return {
+            "corrected": exact_request,
+            "queries": [tried_queries[0], *novel_queries],
+            "provider_used": "gemini",
+            "intent_contract": _intent_contract(exact_request),
+        }
+
+    def fake_search_all(queries, filters=None, **_kwargs):
+        del filters
+        search_calls.append(list(queries))
+        context.budget.reserve("search", len(queries))
+        return {
+            "per_query": [
+                {
+                    "query": query,
+                    "videos": [{"id": f"recovered-{index}"}],
+                    "next_page_token": None,
+                }
+                for index, query in enumerate(queries)
+            ],
+            "credits_used": len(queries),
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+    monkeypatch.setattr(
+        search.rank,
+        "merge_and_rank",
+        lambda result_sets, **_kwargs: [
+            video
+            for result_set in result_sets
+            for video in result_set.get("videos") or []
+        ],
+    )
+
+    result = search.discover_practice_fast(
+        exact_request,
+        limit=2,
+        breadth=8,
+        literal_topic=exact_request,
+        retrieval_profile="bootstrap",
+        context=context,
+        recovery_tried_queries=tried_queries,
+        recovery_reason=expand.RECOVERY_REASON_ZERO_VALID_CLIPS,
+        recovery_rejected_video_ids=["rejected-a", "rejected-b"],
+    )
+
+    assert expansion_calls == [(
+        exact_request,
+        2,
+        tried_queries,
+        expand.RECOVERY_REASON_ZERO_VALID_CLIPS,
+        ["rejected-a", "rejected-b"],
+    )]
+    assert search_calls == [novel_queries]
+    assert result["queries"] == novel_queries
+    assert [video["id"] for video in result["videos"]] == [
+        "recovered-0",
+        "recovered-1",
+    ]
+    assert context.budget.remaining("search") == 0
+
+
+@pytest.mark.parametrize(("mode", "analysis_limit"), [("fast", 2), ("slow", 3)])
+def test_healthy_initial_analysis_target_does_not_page_into_recovery_capacity(
+    monkeypatch,
+    mode: str,
+    analysis_limit: int,
+) -> None:
+    context = GenerationContext(mode)
+    search_calls: list[tuple[list[str], list[str] | None]] = []
+    expansion_calls = 0
+
+    def fake_expand(topic, _count, **kwargs):
+        nonlocal expansion_calls
+        expansion_calls += 1
+        assert not kwargs.get("tried_queries")
+        return {
+            "corrected": topic,
+            "queries": [topic],
+            "provider_used": "gemini",
+            "intent_contract": _intent_contract(topic),
+        }
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        del filters
+        search_calls.append((list(queries), kwargs.get("page_tokens")))
+        assert kwargs.get("page_tokens") is None
+        context.budget.reserve("search", len(queries))
+        return {
+            "per_query": [{
+                "query": queries[0],
+                "videos": [
+                    {"id": f"healthy-{index}"}
+                    for index in range(analysis_limit)
+                ],
+                "next_page_token": "unused-open-cursor",
+            }],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+    monkeypatch.setattr(
+        search.rank,
+        "merge_and_rank",
+        lambda result_sets, **_kwargs: [
+            video
+            for result_set in result_sets
+            for video in result_set.get("videos") or []
+        ],
+    )
+
+    result = search.discover_practice_fast(
+        "physics",
+        limit=analysis_limit * 2,
+        breadth=8,
+        context=context,
+        retrieval_profile="deep",
+        analysis_limit=analysis_limit,
+    )
+
+    assert expansion_calls == 1
+    assert search_calls == [(["physics"], None)]
+    assert [video["id"] for video in result["videos"]][
+        :analysis_limit
+    ] == [f"healthy-{index}" for index in range(analysis_limit)]
+    assert result["provider_exhausted"] is False
+
+
+def test_initial_provider_transient_does_not_start_ai_recovery(monkeypatch) -> None:
+    context = GenerationContext("slow")
+    expansion_calls: list[list[str]] = []
+
+    def fake_expand(topic, _count, **kwargs):
+        expansion_calls.append(list(kwargs.get("tried_queries") or []))
+        return {
+            "corrected": topic,
+            "queries": [topic],
+            "provider_used": "gemini",
+            "intent_contract": _intent_contract(topic),
+        }
+
+    def fail_search(_queries, filters=None, **kwargs):
+        del filters, kwargs
+        context.reserve("search")
+        raise ProviderTransientError(
+            "Could not reach Supadata search.",
+            provider="supadata",
+            operation="search",
+        )
+
+    monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
+    monkeypatch.setattr(search.supadata_search, "search_all", fail_search)
+
+    with pytest.raises(ProviderTransientError):
+        search.discover_practice_fast(
+            "Study negligence",
+            limit=1,
+            breadth=1,
+            retrieval_profile="deep",
+            context=context,
+        )
+
+    assert expansion_calls == [[]]
+    assert context.budget.remaining("search") == 4
 
 
 @pytest.mark.parametrize(
@@ -3008,7 +3599,16 @@ def test_discover_practice_fast_limits_ai_queries_to_remaining_search_budget(mon
     def fake_search_all(queries, filters=None, **kwargs):
         seen["queries"].append(list(queries))
         return {
-            "per_query": [], "credits_used": 0, "warning": None,
+            "per_query": [
+                {
+                    "query": query,
+                    "videos": ([{"id": "healthy-video"}] if index == 0 else []),
+                    "next_page_token": None,
+                }
+                for index, query in enumerate(queries)
+            ],
+            "credits_used": 0,
+            "warning": None,
         }
 
     monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)

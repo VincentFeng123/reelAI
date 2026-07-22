@@ -5398,66 +5398,59 @@ class ReelService:
         cls,
         conn,
         material_id: str,
+        concept_ids: set[str] | None = None,
     ) -> dict[str, set[str]]:
-        """Read only trusted, versioned exact-equivalence labels for this material."""
-        profile_rows: dict[str, list[set[str]]] = defaultdict(list)
+        """Read one trusted, non-conflicted family profile per exact concept."""
+        profile_query = (
+            "SELECT concept_id, contract_version, selection_authority, "
+            "concept_family, family_identity "
+            "FROM concept_family_profiles "
+            "WHERE material_id = ? AND conflicted = 0"
+        )
+        profile_params: list[object] = [material_id]
+        if concept_ids is not None:
+            scoped_ids = sorted({
+                str(concept_id or "").strip()
+                for concept_id in concept_ids
+                if str(concept_id or "").strip()
+            })
+            if not scoped_ids:
+                return {}
+            profile_query += (
+                " AND concept_id IN ("
+                + ", ".join(["?"] * len(scoped_ids))
+                + ")"
+            )
+            profile_params.extend(scoped_ids)
+        profiles: dict[str, set[str]] = {}
         for row in fetch_all(
             conn,
-            "SELECT concept_id, search_context_json FROM reels WHERE material_id = ?",
-            (material_id,),
+            profile_query,
+            tuple(profile_params),
         ):
             concept_id = str(row.get("concept_id") or "")
             if not concept_id:
                 continue
-            try:
-                context = json.loads(str(row.get("search_context_json") or "{}"))
-            except (TypeError, json.JSONDecodeError):
-                continue
             if (
-                not isinstance(context, dict)
-                or context.get("concept_family_contract_version")
+                str(row.get("contract_version") or "").strip()
                 != cls.CONCEPT_FAMILY_CONTRACT_VERSION
-                or str(context.get("selection_authority") or "").strip().casefold()
+                or str(row.get("selection_authority") or "").strip().casefold()
                 != "gemini"
             ):
                 continue
-            aliases = context.get("concept_aliases")
-            if aliases != []:
+            concept_family = str(row.get("concept_family") or "")
+            if validate_concept_family_labels(concept_family, []) is not None:
                 continue
-            if validate_concept_family_labels(
-                context.get("concept_family"), aliases
-            ) is not None:
-                continue
-            family = cls._concept_family_identity(context.get("concept_family"))
-            if not family:
+            family = cls._concept_family_identity(concept_family)
+            if (
+                not family
+                or family != str(row.get("family_identity") or "")
+            ):
                 continue
             identities = {family}
             if len(cls._concept_family_ordinal_indexes(identities)) > 1:
                 continue
-            profile_rows[concept_id].append(identities)
-
-        profiles: dict[str, set[str]] = {}
-        for concept_id, rows in profile_rows.items():
-            connected = set(rows[0])
-            pending = [set(row) for row in rows[1:]]
-            while pending:
-                next_pending: list[set[str]] = []
-                changed = False
-                for identities in pending:
-                    if connected & identities:
-                        connected.update(identities)
-                        changed = True
-                    else:
-                        next_pending.append(identities)
-                if not changed:
-                    connected = set()
-                    break
-                pending = next_pending
-            if (
-                connected
-                and len(cls._concept_family_ordinal_indexes(connected)) <= 1
-            ):
-                profiles[concept_id] = connected
+            profiles[concept_id] = identities
         return profiles
 
     @classmethod
@@ -5784,6 +5777,7 @@ class ReelService:
         learner_id: str,
         *,
         propagate_concept_families: bool = False,
+        candidate_concept_ids: set[str] | None = None,
         remediation_concept_ids_out: list[str] | None = None,
     ) -> tuple[dict[str, dict[str, float]], dict[str, float], dict[str, Any] | None, float]:
         progress = self.learner_progress(conn, material_id, learner_id)
@@ -5832,12 +5826,46 @@ class ReelService:
             if "no such table: assessment_concept_outcomes" not in str(exc):
                 raise
             assessment_rows = []
-        try:
-            concept_rows = fetch_all(
-                conn,
-                "SELECT id, title FROM concepts WHERE material_id = ?",
-                (material_id,),
+        manual_signal_ids = {
+            str(row.get("concept_id") or "")
+            for row in rows
+            if str(row.get("concept_id") or "")
+            and (
+                int(row.get("helpful") or 0) > 0
+                or int(row.get("confusing") or 0) > 0
             )
+        }
+        assessment_signal_ids = {
+            str(row.get("concept_id") or "")
+            for row in assessment_rows
+            if str(row.get("concept_id") or "")
+            and float(row.get("adjustment") or 0.0) != 0.0
+        }
+        signal_concept_ids = manual_signal_ids | assessment_signal_ids
+        if propagate_concept_families and not signal_concept_ids:
+            # A fresh learner has no signal to propagate. Preserve the prior
+            # healthy-path query count until feedback or quiz evidence exists.
+            propagate_concept_families = False
+        profile_concept_ids = signal_concept_ids | {
+            str(concept_id or "").strip()
+            for concept_id in (candidate_concept_ids or set())
+            if str(concept_id or "").strip()
+        }
+        try:
+            if propagate_concept_families:
+                placeholders = ", ".join(["?"] * len(profile_concept_ids))
+                concept_rows = fetch_all(
+                    conn,
+                    "SELECT id, title FROM concepts WHERE material_id = ? "
+                    f"AND id IN ({placeholders})",
+                    (material_id, *sorted(profile_concept_ids)),
+                )
+            else:
+                concept_rows = fetch_all(
+                    conn,
+                    "SELECT id, title FROM concepts WHERE material_id = ?",
+                    (material_id,),
+                )
         except sqlite3.OperationalError as exc:
             if "no such table: concepts" not in str(exc):
                 raise
@@ -5846,7 +5874,11 @@ class ReelService:
         family_ids = (
             self._concept_family_ids(
                 concept_rows,
-                self._persisted_concept_family_profiles(conn, material_id),
+                self._persisted_concept_family_profiles(
+                    conn,
+                    material_id,
+                    profile_concept_ids,
+                ),
             )
             if propagate_concept_families
             else {
@@ -6280,6 +6312,46 @@ class ReelService:
             )
             if intent_obligations:
                 metadata["_selection_intent_obligations"] = intent_obligations
+            intent_connections = normalize_intent_obligations(
+                parsed.get("intent_connections"),
+                require_evidence=True,
+            )
+            if intent_connections:
+                metadata["_selection_intent_connections"] = intent_connections
+            fulfilled_relationship_keys = {
+                str(obligation["key"])
+                for obligation in intent_obligations
+                if obligation.get("kind") == "relationship"
+            }
+            relationship_witnesses = [
+                dict(witness)
+                for witness in (
+                    parsed.get("intent_relationship_witnesses") or []
+                )[:8]
+                if isinstance(witness, dict)
+                and str(witness.get("obligation_key") or "")
+                in fulfilled_relationship_keys
+                and isinstance(witness.get("members"), list)
+                and isinstance(witness.get("links"), list)
+            ]
+            if relationship_witnesses:
+                metadata["_selection_intent_relationship_witnesses"] = (
+                    relationship_witnesses
+                )
+            curriculum_edges = [
+                {
+                    "before_key": str(edge.get("before_key") or "")[:64],
+                    "after_key": str(edge.get("after_key") or "")[:64],
+                    "relation_key": str(edge.get("relation_key") or "")[:64],
+                }
+                for edge in (parsed.get("intent_curriculum_edges") or [])[:16]
+                if isinstance(edge, dict)
+                and str(edge.get("before_key") or "").startswith("io:")
+                and str(edge.get("after_key") or "").startswith("io:")
+                and str(edge.get("before_key")) != str(edge.get("after_key"))
+            ]
+            if curriculum_edges:
+                metadata["_selection_intent_curriculum_edges"] = curriculum_edges
         raw_aliases = parsed.get("concept_aliases")
         family_text = " ".join(
             str(parsed.get("concept_family") or "").split()
@@ -6651,7 +6723,15 @@ class ReelService:
             return list(items)
         try:
             coverage, adjustments, latest, level_target = self._learner_adaptation_context(
-                conn, material_id, learner_id
+                conn,
+                material_id,
+                learner_id,
+                propagate_concept_families=True,
+                candidate_concept_ids={
+                    str(item.get("concept_id") or "")
+                    for item in items
+                    if str(item.get("concept_id") or "")
+                },
             )
         except ValueError:
             return list(items)
@@ -7901,7 +7981,15 @@ class ReelService:
             for concept_id, totals in concept_signal_totals.items()
         }
         learner_coverage, concept_adjustments, _, _ = self._learner_adaptation_context(
-            conn, material_id, learner_id
+            conn,
+            material_id,
+            learner_id,
+            propagate_concept_families=True,
+            candidate_concept_ids={
+                str(row.get("concept_id") or "")
+                for row in reel_rows
+                if str(row.get("concept_id") or "")
+            },
         )
 
         concept_rows = fetch_all(

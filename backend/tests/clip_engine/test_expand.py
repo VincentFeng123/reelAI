@@ -140,7 +140,7 @@ def test_practice_fast_healthy_expansion_has_one_call_and_no_retry_wait(
         "queries": ["physics explained"],
         "provider_used": "gemini",
     }
-    assert intent_contract["version"] == "expansion_intent_v1"
+    assert intent_contract["version"] == "expansion_intent_v2"
     assert intent_contract["request_intent"]["exact_request"] == "physics"
 
 

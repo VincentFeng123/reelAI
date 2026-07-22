@@ -6,7 +6,7 @@ import re
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
-from ...concept_tokens import concept_semantic_tokens, semantic_tokens
+from ...concept_tokens import concept_semantic_tokens, semantic_key, semantic_tokens
 from . import expand, rank, supadata_search
 from .cancellation import raise_if_cancelled
 from .errors import ProviderBudgetExceededError, ProviderRequestError, SearchError
@@ -41,15 +41,6 @@ _LONG_TOPIC_LEAD = re.compile(
 )
 _LONG_TOPIC_RELATION = re.compile(
     r"\b(?:work together|interact|combine|to maintain|to preserve|to pass|across)\b",
-    re.IGNORECASE,
-)
-_RECOVERY_SEQUENCE_LEAD = re.compile(
-    r"^(?:(?:and\s+)?(?:begin|start|finish|end)(?:\s+with)?|then|next)\s+",
-    re.IGNORECASE,
-)
-_RECOVERY_SUBJECT_BREAK = re.compile(
-    r"\s*[,;]\s*(?=(?:(?:and\s+)?(?:begin|start|finish|end)(?:\s+with)?|"
-    r"then|next|before|after|followed\s+by)\b)",
     re.IGNORECASE,
 )
 _INVALID_PROVIDER_CURSOR = re.compile(
@@ -130,47 +121,6 @@ def _long_topic_component_queries(
         if len(components) >= max(1, int(limit)):
             break
     return components
-
-
-def _grounded_cursor_recovery_queries(topic: str, *, limit: int = 6) -> list[str]:
-    """Build literal, subject-anchored branches after one opaque cursor fails."""
-    literal = " ".join(str(topic or "").split())
-    raw_subject, separator, raw_body = literal.partition(":")
-    if not separator:
-        subject_break = _RECOVERY_SUBJECT_BREAK.search(literal)
-        if subject_break is not None:
-            raw_subject = literal[: subject_break.start()]
-            raw_body = literal[subject_break.end() :]
-            separator = ","
-    subject = (
-        _LONG_TOPIC_LEAD.sub("", raw_subject).strip(" ,:;-?.")
-        if separator
-        else ""
-    )
-    if not 1 <= len(_search_coverage_tokens(subject)) <= 6:
-        subject = ""
-    components = _long_topic_component_queries(
-        raw_body if separator else literal,
-        limit=max(1, int(limit)),
-        min_coverage_tokens=1 if subject else 2,
-    )
-    recovery: list[str] = []
-    seen = {literal.casefold()}
-    subject_tokens = _search_coverage_tokens(subject)
-    for component in components:
-        focused = _RECOVERY_SEQUENCE_LEAD.sub("", component).strip(" ,:;-?.")
-        if not focused:
-            continue
-        if subject and not subject_tokens.issubset(_search_coverage_tokens(focused)):
-            focused = f"{subject} {focused}"
-        key = " ".join(focused.casefold().split())
-        if not key or key in seen or len(_search_coverage_tokens(focused)) < 2:
-            continue
-        seen.add(key)
-        recovery.append(focused)
-        if len(recovery) >= max(1, int(limit)):
-            break
-    return recovery
 
 
 def _search_coverage_tokens(text: object) -> set[str]:
@@ -430,6 +380,8 @@ def _continue_provider_pages(
     enough: Callable[[], bool],
     annotate: Callable[[list[dict]], None],
     recovery_queries: Sequence[str] = (),
+    attempted_recovery_queries_out: list[str] | None = None,
+    initially_enough: bool | None = None,
 ) -> tuple[int, str | None, bool]:
     """Replay cached cursors and fetch only until useful unseen inventory exists.
 
@@ -446,17 +398,34 @@ def _continue_provider_pages(
     credits_used = 0
     warning: str | None = None
     existing_queries = {
-        " ".join(str(result_set.get("query") or "").split()).casefold()
+        semantic_key(result_set.get("query") or "")
         for result_set in result_sets
     }
-    pending_recovery = [
-        query
-        for raw_query in recovery_queries
-        if (query := " ".join(str(raw_query or "").split()))
-        and query.casefold() not in existing_queries
-    ]
+    pending_recovery: list[str] = []
+    recovery_keys: set[str] = set()
+    for raw_query in recovery_queries:
+        query = " ".join(str(raw_query or "").split())
+        query_key = semantic_key(query)
+        if not query or not query_key or query_key in existing_queries | recovery_keys:
+            continue
+        recovery_keys.add(query_key)
+        pending_recovery.append(query)
     recovery_enqueued = False
-    while frontier and not enough():
+    has_enough = enough() if initially_enough is None else bool(initially_enough)
+    while not has_enough:
+        if not frontier:
+            if recovery_enqueued or not pending_recovery:
+                break
+            # A successful zero-result response normally has no provider
+            # cursor. Seed the AI recovery branches even when there is no page
+            # frontier to enter the loop.
+            frontier.extend(
+                (recovery_query, "", filters)
+                for recovery_query in pending_recovery
+            )
+            recovery_enqueued = True
+        if not frontier:
+            break
         query, token, entry_filters = frontier.pop(0)
         try:
             request_options: dict[str, object] = {
@@ -486,14 +455,14 @@ def _continue_provider_pages(
                 or "A provider continuation cursor was rejected; continued with "
                 "another grounded search query."
             )
-            if pending_recovery and not recovery_enqueued:
-                frontier.extend(
-                    (recovery_query, "", filters)
-                    for recovery_query in pending_recovery
-                )
-                recovery_enqueued = True
             continue
 
+        if (
+            not token
+            and semantic_key(query) in recovery_keys
+            and attempted_recovery_queries_out is not None
+        ):
+            attempted_recovery_queries_out.append(query)
         page_sets = list(page_result.get("per_query") or [])
         credits_used += int(page_result.get("credits_used") or 0)
         warning = str(page_result.get("warning") or "").strip() or warning
@@ -508,6 +477,7 @@ def _continue_provider_pages(
                 seen=seen,
             )
         )
+        has_enough = enough()
         if page_result.get("warning"):
             break
 
@@ -550,7 +520,11 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
              consumed_video_ids: list[str] | None = None,
              practice_fast: bool = False,
              retrieval_profile: str = "deep",
-             deadline_monotonic: float | None = None) -> dict:
+             deadline_monotonic: float | None = None,
+             recovery_tried_queries: Sequence[str] = (),
+             recovery_reason: str | None = None,
+             recovery_rejected_video_ids: Sequence[str] = (),
+             analysis_limit: int | None = None) -> dict:
     if practice_fast:
         return discover_practice_fast(
             topic,
@@ -569,6 +543,10 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
             consumed_video_ids=consumed_video_ids,
             retrieval_profile=retrieval_profile,
             deadline_monotonic=deadline_monotonic,
+            recovery_tried_queries=recovery_tried_queries,
+            recovery_reason=recovery_reason,
+            recovery_rejected_video_ids=recovery_rejected_video_ids,
+            analysis_limit=analysis_limit,
         )
     topic = " ".join(str(topic or "").split())
     if not topic:
@@ -756,6 +734,13 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
     raise_if_cancelled(should_cancel)
     annotate_result_sets(res["per_query"])
     analysis_target = max(0, int(limit))
+    if analysis_limit is not None:
+        analysis_target = min(analysis_target, max(0, int(analysis_limit)))
+    elif context is not None:
+        analysis_target = min(
+            analysis_target,
+            2 if context.budget.mode == "fast" else 3,
+        )
     if context is not None:
         analysis_target = min(
             analysis_target,
@@ -791,11 +776,7 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
         ranked,
         limit=limit,
         excluded=exclude,
-        analysis_prefix=(
-            context.budget.remaining("segmentation")
-            if context is not None
-            else None
-        ),
+        analysis_prefix=analysis_target or None,
     )
     return {"corrected": topic, "videos": videos,
             "credits_used": int(res["credits_used"] or 0) + extra_credits,
@@ -822,6 +803,10 @@ def discover_practice_fast(
     consumed_video_ids: list[str] | None = None,
     retrieval_profile: str = "deep",
     deadline_monotonic: float | None = None,
+    recovery_tried_queries: Sequence[str] = (),
+    recovery_reason: str | None = None,
+    recovery_rejected_video_ids: Sequence[str] = (),
+    analysis_limit: int | None = None,
 ) -> dict:
     """Difficulty-first bootstrap or AI-expanded production search.
 
@@ -840,7 +825,19 @@ def discover_practice_fast(
         requested = int(breadth if breadth is not None else 8)
     except (TypeError, ValueError, OverflowError):
         requested = 8
-    bootstrap = str(retrieval_profile or "deep").strip().casefold() == "bootstrap"
+    normalized_recovery_tried = [
+        query
+        for raw_query in recovery_tried_queries
+        if (query := " ".join(str(raw_query or "").split()))
+    ]
+    recovery_mode = bool(normalized_recovery_tried)
+    # A failed bootstrap source still recovers through Gemini expansion. The
+    # caller retains bootstrap persistence/streaming behavior; only retrieval
+    # skips replaying the already-tried deterministic query.
+    bootstrap = (
+        str(retrieval_profile or "deep").strip().casefold() == "bootstrap"
+        and not recovery_mode
+    )
     expansion_count = min(3, max(1, requested))
     query_count = max(1, min(12, requested))
     if context is not None:
@@ -858,12 +855,31 @@ def discover_practice_fast(
     component_queries = _long_topic_component_queries(retrieval_query) if bootstrap else []
     initial_queries: list[str] = []
     seen_query_keys: set[str] = set()
+    recovery_tried_query_keys = {
+        semantic_key(query) for query in normalized_recovery_tried
+    }
     expansion: dict[str, object] = {
         "corrected": retrieval_query,
         "queries": [retrieval_query],
         "provider_used": "literal_fallback",
     }
-    if bootstrap:
+    if recovery_mode:
+        exact_request = (
+            " ".join(str(literal_topic or retrieval_query).split())
+            or retrieval_query
+        )
+        expansion = expand.expand_query_practice_fast(
+            exact_request,
+            query_count,
+            level=None,
+            should_cancel=should_cancel,
+            context=context,
+            tried_queries=normalized_recovery_tried,
+            recovery_reason=recovery_reason,
+            rejected_video_ids=recovery_rejected_video_ids,
+        )
+        planned_queries = list(expansion.get("queries") or [])
+    elif bootstrap:
         planned_queries = [_difficulty_bootstrap_query(retrieval_query, level)]
     else:
         expansion = expand.expand_query_practice_fast(
@@ -878,8 +894,10 @@ def discover_practice_fast(
         planned_queries = list(expansion.get("queries") or []) or [retrieval_query]
     for candidate in planned_queries:
         query = " ".join(str(candidate or "").split())
-        key = " ".join(query.casefold().split())
+        key = semantic_key(query) if recovery_mode else " ".join(query.casefold().split())
         if not key or key in seen_query_keys:
+            continue
+        if recovery_mode and key in recovery_tried_query_keys:
             continue
         seen_query_keys.add(key)
         initial_queries.append(query)
@@ -895,11 +913,15 @@ def discover_practice_fast(
     if deadline_monotonic is not None:
         search_runtime["deadline_monotonic"] = float(deadline_monotonic)
 
-    initial = supadata_search.search_all(
-        initial_queries,
-        filters,
-        parallel_prefix=len(initial_queries),
-        **search_runtime,
+    initial = (
+        supadata_search.search_all(
+            initial_queries,
+            filters,
+            parallel_prefix=len(initial_queries),
+            **search_runtime,
+        )
+        if initial_queries
+        else {"per_query": [], "credits_used": 0, "warning": None}
     )
     raise_if_cancelled(should_cancel)
 
@@ -907,7 +929,16 @@ def discover_practice_fast(
 
     root_family = semantic_query_family(retrieval_query)
 
-    def annotate(result_sets: list[dict], *, expanded: bool = False) -> None:
+    def annotate(
+        result_sets: list[dict],
+        *,
+        expanded: bool | None = None,
+    ) -> None:
+        if expanded is None:
+            expanded = bool(
+                not bootstrap
+                and str(expansion.get("provider_used") or "") == "gemini"
+            )
         for result_set in result_sets:
             query = " ".join(str(result_set.get("query") or "").split())
             is_literal = query.casefold() == retrieval_query.casefold()
@@ -931,17 +962,20 @@ def discover_practice_fast(
         for video_id in [*(exclude_video_ids or []), *(consumed_video_ids or [])]
     }
     analysis_target = max(0, int(limit))
+    if analysis_limit is not None:
+        analysis_target = min(analysis_target, max(0, int(analysis_limit)))
+    elif context is not None:
+        analysis_target = min(
+            analysis_target,
+            2 if context.budget.mode == "fast" else 3,
+        )
     if context is not None:
         analysis_target = min(
             analysis_target,
             max(0, context.budget.remaining("segmentation")),
         )
 
-    def enough_ranked_videos() -> bool:
-        ranked_now = rank.merge_and_rank(
-            per_query,
-            level=level if bootstrap else None,
-        )
+    def enough_from_ranked(ranked_now: list[dict]) -> bool:
         return len(
             _select_ranked_candidates(
                 ranked_now,
@@ -951,6 +985,65 @@ def discover_practice_fast(
             )[:analysis_target]
         ) >= analysis_target
 
+    def enough_ranked_videos() -> bool:
+        ranked_now = rank.merge_and_rank(
+            per_query,
+            level=level if bootstrap else None,
+        )
+        return enough_from_ranked(ranked_now)
+
+    ranked_before_recovery = rank.merge_and_rank(
+        per_query,
+        level=level if bootstrap else None,
+    )
+    eligible_before_recovery = [
+        video
+        for video in ranked_before_recovery
+        if video.get("id") not in excluded
+    ]
+    initially_enough = enough_from_ranked(ranked_before_recovery)
+    recovery_queries: list[str] = []
+    if (
+        not bootstrap
+        and not recovery_mode
+        and not eligible_before_recovery
+        and context is not None
+    ):
+        recovery_capacity = context.budget.remaining("search")
+        if recovery_capacity > 0:
+            exact_request = (
+                " ".join(str(literal_topic or retrieval_query).split())
+                or retrieval_query
+            )
+            recovery_expansion = expand.expand_query_practice_fast(
+                exact_request,
+                recovery_capacity,
+                level=None,
+                should_cancel=should_cancel,
+                context=context,
+                tried_queries=initial_queries,
+                recovery_reason=expand.RECOVERY_REASON_ZERO_SEARCH_RESULTS,
+            )
+            tried_query_keys = {
+                semantic_key(query) for query in initial_queries
+            }
+            for raw_query in recovery_expansion.get("queries") or []:
+                query = " ".join(str(raw_query or "").split())
+                query_key = semantic_key(query)
+                if (
+                    not query
+                    or not query_key
+                    or query_key in tried_query_keys
+                ):
+                    continue
+                tried_query_keys.add(query_key)
+                recovery_queries.append(query)
+                if len(recovery_queries) >= recovery_capacity:
+                    break
+            if recovery_queries:
+                expansion = recovery_expansion
+
+    attempted_recovery_queries: list[str] = []
     pagination_credits, pagination_warning, provider_exhausted = (
         _continue_provider_pages(
             per_query,
@@ -958,17 +1051,20 @@ def discover_practice_fast(
             search_runtime=search_runtime,
             enough=enough_ranked_videos,
             annotate=annotate,
-            recovery_queries=(
-                _grounded_cursor_recovery_queries(retrieval_query)
-                if str(expansion.get("provider_used") or "")
-                == "literal_fallback"
-                else ()
-            ),
+            recovery_queries=recovery_queries,
+            attempted_recovery_queries_out=attempted_recovery_queries,
+            initially_enough=initially_enough,
         )
     )
-    initial_ranked = rank.merge_and_rank(
-        per_query,
-        level=level if bootstrap else None,
+    initial_queries.extend(attempted_recovery_queries)
+    initial_ranked = (
+        ranked_before_recovery
+        if not attempted_recovery_queries
+        and len(per_query) == len(initial.get("per_query") or [])
+        else rank.merge_and_rank(
+            per_query,
+            level=level if bootstrap else None,
+        )
     )
     eligible_initial = [
         video for video in initial_ranked if video.get("id") not in excluded
@@ -1105,11 +1201,7 @@ def discover_practice_fast(
         ranked,
         limit=top_n,
         excluded=excluded,
-        analysis_prefix=(
-            context.budget.remaining("segmentation")
-            if context is not None
-            else None
-        ),
+        analysis_prefix=analysis_target or None,
     )
     corrected = (
         " ".join(str(expansion.get("corrected") or retrieval_query).split())

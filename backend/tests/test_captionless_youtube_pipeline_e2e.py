@@ -179,55 +179,96 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
         schema,
         **kwargs: Any,
     ):
-        gemini_calls.append({"system": system, "user": user, **kwargs})
-        assert schema is gemini_segment._CompactBoundaryPlan
-        plan = schema.model_validate(
-            {
-                "request_intent": {
+        gemini_calls.append({
+            "system": system,
+            "user": user,
+            "schema": schema,
+            **kwargs,
+        })
+        evidence_quote = (
+            "Python variables store values such as numbers and strings"
+        )
+        if schema in {
+            gemini_segment._CompactBoundaryPlan,
+            gemini_segment._ContractBoundCompactBoundaryPlan,
+        }:
+            topics = [{
+                "candidate_id": "python-variables",
+                "title": "Python variables and assignment",
+                "learning_objective": (
+                    "Understand how Python variables store and print values."
+                ),
+                "start_line": 0,
+                "end_line": 2,
+                "start_quote": "Python variables store values",
+                "end_quote": "first Python program easy to understand",
+                "claim_quote": evidence_quote,
+                "facet": "variables",
+                "concept_family": "Python variable assignment",
+                "concept_aliases": [],
+                "informativeness": 0.95,
+                "topic_relevance": 0.99,
+                "educational_importance": 0.97,
+                "directly_teaches_topic": True,
+                "substantive": True,
+                "factually_grounded": True,
+                "self_contained": True,
+                "is_standalone": True,
+                "difficulty": 0.1,
+                "intent_evidence": [{
+                    "constraint_id": "subject",
+                    "evidence_quote": evidence_quote,
+                }],
+                "objective_constraint_ids": ["subject"],
+                "relationship_witnesses": [],
+            }]
+            payload: dict[str, Any] = {"topics": topics}
+            if schema is gemini_segment._CompactBoundaryPlan:
+                payload["request_intent"] = {
                     "exact_request": TOPIC,
                     "constraints": [{
                         "constraint_id": "subject",
                         "kind": "subject",
                         "source_phrase": TOPIC,
+                        "source_occurrence": 0,
                         "requirement": "Teach an introduction to Python",
+                        "relationship_topology": "not_applicable",
                     }],
-                },
-                "topics": [
-                        {
-                            "candidate_id": "python-variables",
-                            "title": "Python variables and assignment",
-                            "learning_objective": (
-                                "Understand how Python variables store and print values."
-                            ),
-                        "start_line": 0,
-                        "end_line": 2,
-                        "start_quote": "Python variables store values",
-                        "end_quote": "first Python program easy to understand",
-                        "claim_quote": (
-                            "Python variables store values such as numbers and strings"
-                        ),
-                        "facet": "variables",
-                        "concept_family": "Python variable assignment",
-                        "concept_aliases": ["Python variables"],
-                            "informativeness": 0.95,
-                            "topic_relevance": 0.99,
-                                "educational_importance": 0.97,
-                                    "directly_teaches_topic": True,
-                                    "substantive": True,
-                                    "factually_grounded": True,
-                                    "self_contained": True,
-                                "is_standalone": True,
-                            "difficulty": 0.1,
-                            "intent_evidence": [{
-                                "constraint_id": "subject",
-                                "evidence_quote": (
-                                    "Python variables store values such as numbers and strings"
-                                ),
-                            }],
-                        }
-                ]
-            }
-        )
+                    "joint_structures": [],
+                }
+            plan = schema.model_validate(payload)
+        elif schema is gemini_segment._ProCandidateAuditPlan:
+            plan = schema.model_validate({
+                "items": [{
+                    "candidate_id": "candidate-1",
+                    "decision": "keep",
+                    "actual_objective": (
+                        "Understand how Python variables store and print values."
+                    ),
+                    "title": "Python variables and assignment",
+                    "facet": "variables",
+                    "concept_family": "Python variable assignment",
+                    "concept_aliases": [],
+                    "directly_teaches_topic": True,
+                    "intent_evidence": [{
+                        "constraint_id": "subject",
+                        "evidence_quote": evidence_quote,
+                    }],
+                    "objective_constraint_ids": ["subject"],
+                    "relationship_witnesses": [],
+                    "evidence_quote": evidence_quote,
+                    "objective_witness_quote": evidence_quote,
+                    "direct_start_line": 0,
+                    "direct_start_quote": "Python variables store values",
+                    "direct_start_context_resolved": True,
+                    "start_line": 0,
+                    "end_line": 2,
+                    "start_quote": "Python variables store values",
+                    "end_quote": "first Python program easy to understand",
+                }],
+            })
+        else:
+            raise AssertionError(f"unexpected Gemini schema: {schema}")
         return plan, {
             "model": kwargs["model"],
             "operation": kwargs["operation"],
@@ -298,6 +339,9 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
         assert gemini_calls[0]["media_resolution"] is None
         selector_text = gemini_calls[0]["user"]
         assert "[0] 00:05 Python variables store values" in selector_text
+        assert len(gemini_calls) == 2
+        assert gemini_calls[1]["schema"] is gemini_segment._ProCandidateAuditPlan
+        assert gemini_calls[1]["operation"] == "pro_boundary_audit"
 
         artifacts = list(cache.transcript_rows.values())
         assert len(artifacts) == 1

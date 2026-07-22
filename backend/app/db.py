@@ -331,6 +331,23 @@ CREATE TABLE IF NOT EXISTS reels (
 CREATE INDEX IF NOT EXISTS idx_reels_material_id ON reels(material_id);
 CREATE INDEX IF NOT EXISTS idx_reels_concept_id ON reels(concept_id);
 
+CREATE TABLE IF NOT EXISTS concept_family_profiles (
+    concept_id TEXT PRIMARY KEY,
+    material_id TEXT NOT NULL,
+    contract_version TEXT NOT NULL,
+    selection_authority TEXT NOT NULL,
+    concept_family TEXT NOT NULL,
+    family_identity TEXT NOT NULL,
+    conflicted INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(concept_id) REFERENCES concepts(id) ON DELETE CASCADE,
+    FOREIGN KEY(material_id) REFERENCES materials(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_concept_family_profiles_material_conflicted_concept
+ON concept_family_profiles(material_id, conflicted, concept_id);
+
 CREATE TABLE IF NOT EXISTS reel_feedback (
     id TEXT PRIMARY KEY,
     learner_id TEXT NOT NULL DEFAULT 'legacy',

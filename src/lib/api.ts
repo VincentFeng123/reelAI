@@ -1151,6 +1151,7 @@ type GenerateReelsParams = {
   numReels?: number;
   conceptId?: string;
   continuationToken?: string;
+  retryTerminalJobId?: string;
   excludeVideoIds?: string[];
   generationMode?: "slow" | "fast";
   minRelevance?: number;
@@ -1234,6 +1235,7 @@ function buildGenerateReelsRequestBody(params: GenerateReelsParams): Record<stri
     concept_id: params.conceptId,
     num_reels: requestedReelCount(params),
     continuation_token: String(params.continuationToken || "").trim() || undefined,
+    retry_terminal_job_id: String(params.retryTerminalJobId || "").trim() || undefined,
     ...(excludeVideoIds.length > 0 ? { exclude_video_ids: excludeVideoIds } : {}),
     creative_commons_only: params.creativeCommonsOnly === true,
     generation_mode: params.generationMode ?? "slow",
