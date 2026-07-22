@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from typing import Any
 
 
-INTENT_OBLIGATION_CONTRACT_VERSION = "intent_obligation_v1"
+INTENT_OBLIGATION_CONTRACT_VERSION = "intent_obligation_v2"
 INTENT_OBLIGATION_KINDS = frozenset({
     "subject",
     "task",

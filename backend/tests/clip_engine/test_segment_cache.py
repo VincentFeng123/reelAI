@@ -5,7 +5,10 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from backend.app.clip_engine import segment_cache
-from backend.intent_obligations import intent_obligation
+from backend.intent_obligations import (
+    INTENT_OBLIGATION_CONTRACT_VERSION,
+    intent_obligation,
+)
 
 
 VIDEO_ID = "dQw4w9WgXcQ"
@@ -348,7 +351,7 @@ def test_segment_cache_revalidates_gemini_intent_obligations() -> None:
         "selection_authority": "gemini",
         "concept_family": "Newtonian force and motion",
         "concept_aliases": [],
-        "intent_obligation_contract_version": "intent_obligation_v1",
+        "intent_obligation_contract_version": INTENT_OBLIGATION_CONTRACT_VERSION,
         "intent_obligations": [obligation],
     })
     assert segment_cache._valid_clips(
@@ -356,6 +359,10 @@ def test_segment_cache_revalidates_gemini_intent_obligations() -> None:
     ) == [authoritative]
 
     for invalid in (
+        {
+            **authoritative,
+            "intent_obligation_contract_version": "intent_obligation_v1",
+        },
         {
             **authoritative,
             "intent_obligation_contract_version": "intent_obligation_v0",

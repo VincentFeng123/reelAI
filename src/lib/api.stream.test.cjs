@@ -78,6 +78,39 @@ function queuedGenerationResponse() {
   });
 }
 
+test("manual terminal retry submits the exhausted job without a continuation token", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  const originalWindow = global.window;
+  installCommunitySessionTestWindow();
+  let body;
+  global.fetch = async (_url, init = {}) => {
+    body = JSON.parse(init.body);
+    return new Response(JSON.stringify({
+      reels: [],
+      batch_id: "new-batch",
+      batch_size: 0,
+      continuation_token: "new-batch",
+      terminal_status: "exhausted",
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  try {
+    await generateReels({
+      materialId: "biology",
+      generationMode: "slow",
+      retryTerminalJobId: "exhausted-job",
+    });
+    assert.equal(body.retry_terminal_job_id, "exhausted-job");
+    assert.equal(Object.hasOwn(body, "continuation_token"), false);
+  } finally {
+    global.fetch = originalFetch;
+    global.window = originalWindow;
+  }
+});
+
 test("token-only sessions restore an unverified account for the dedicated auth page", TEST_OPTIONS, async () => {
   const originalFetch = global.fetch;
   const originalWindow = global.window;

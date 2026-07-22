@@ -268,6 +268,34 @@ def _obligation(
     return item
 
 
+def _joint_witness(obligation: dict[str, str]) -> dict[str, Any]:
+    return {
+        "obligation_key": obligation["key"],
+        "constraint_id": "joint-relation",
+        "topology": "directed",
+        "members": [
+            {
+                "identity": "member-a",
+                "identity_quote": "member A",
+                "role_quote": "member A supplies the input",
+            },
+            {
+                "identity": "member-b",
+                "identity_quote": "member B",
+                "role_quote": "member B receives the result",
+            },
+        ],
+        "links": [
+            {
+                "source_identity": "member-a",
+                "target_identity": "member-b",
+                "link_quote": "member A supplies the result to member B",
+            }
+        ],
+        "connection_quote": "member A supplies the result to member B",
+    }
+
+
 def test_orders_every_clip_and_returns_organizer_checkpoints(monkeypatch) -> None:
     reels = [
         _reel("worked", video_id="worked-video", start=30, concept="worked example"),
@@ -698,7 +726,7 @@ def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_
 
     assert payload["concept_title"] == "How force and mass change acceleration"
     assert payload["concept_family"] == "force-mass-acceleration proportionality"
-    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v14"
+    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v15"
     assert "semantic restatements" in lesson_ordering._SYSTEM_PROMPT
     assert "concept, then explanation, then application or worked example" in (
         lesson_ordering._SYSTEM_PROMPT
@@ -1054,13 +1082,18 @@ def test_compact_clip_columns_reconstruct_every_organizer_value_without_shift() 
     columns = compact["columns"]
     [row] = compact["clips"]
 
-    assert len(columns) == len(set(columns)) == len(row) == 19
+    assert len(columns) == len(set(columns)) == len(row) == 24
     decoded = dict(zip(columns, row, strict=True))
     assert decoded["chain_position"] == 2
     assert decoded["prerequisite_candidate_refs"] == [1]
     assert decoded["concept_title"] == "net force vector sum"
     assert decoded["concept_family"] == "net force vector sum"
     assert decoded["intent_obligation_refs"] == []
+    assert decoded["intent_connection_refs"] == []
+    assert decoded["relationship_witness_obligation_refs"] == []
+    assert decoded["directly_teaches_topic"] is True
+    assert decoded["intent_role"] == "supporting"
+    assert decoded["intent_coverage"] is None
     assert decoded["learner_signal_hca"] == [1.0, 2.0, -0.08]
     assert decoded["summary_excerpt"] == "Explains how force vectors combine"
     assert decoded["takeaways_excerpt"] == "Add force vectors | Use direction signs"
@@ -1084,6 +1117,7 @@ def test_small_batch_keeps_the_full_object_prompt_byte_for_byte() -> None:
         "required_reel_ids": [],
         "prior_concept_coverage": [],
         "recent_prior_objective_coverage": [],
+        "intent_curriculum_edges": [],
         "available_intent_obligations": [],
         "prior_intent_obligation_keys": [],
     }
@@ -1345,10 +1379,13 @@ def test_max_candidate_prompt_keeps_every_clip_under_fixed_input_budget() -> Non
                 ]
             ),
             transcript_snippet=max_field("transcript", index, 1_000),
-            topic_relevance=0.91,
-            informativeness=0.92,
-            _selection_intent_obligations=obligations,
-        ))
+                topic_relevance=0.91,
+                informativeness=0.92,
+                _selection_intent_obligations=obligations,
+                _selection_intent_relationship_witnesses=[
+                    _joint_witness(obligations[0])
+                ],
+            ))
 
     prompt = lesson_ordering._user_prompt(
         reels,
@@ -2344,6 +2381,7 @@ def test_one_candidate_can_satisfy_multiple_grounded_request_facets(
             start=0,
             concept="time and space comparison",
             _selection_intent_obligations=[time, space],
+            _selection_intent_relationship_witnesses=[_joint_witness(time)],
         ),
         _reel(
             "space-only",
@@ -2370,6 +2408,68 @@ def test_one_candidate_can_satisfy_multiple_grounded_request_facets(
     )
 
     assert result.ordered_reel_ids == ["both", "recap"]
+
+
+@pytest.mark.parametrize(
+    ("topic", "foundation_name", "payoff_name"),
+    [
+        (
+            "Explain electric potential, then Ohm's law application.",
+            "electric potential",
+            "Ohm's law application",
+        ),
+        (
+            "State the duty rule, then fact pattern analysis.",
+            "duty rule",
+            "fact pattern analysis",
+        ),
+    ],
+)
+def test_mandatory_distinct_source_restoration_preserves_requested_sequence(
+    monkeypatch,
+    topic: str,
+    foundation_name: str,
+    payoff_name: str,
+) -> None:
+    foundation = _obligation(
+        foundation_name,
+        f"Teach {foundation_name}",
+        kind="subject",
+    )
+    payoff = _obligation(
+        payoff_name,
+        f"Teach {payoff_name}",
+        kind="outcome",
+    )
+    reels = [
+        _reel(
+            "payoff",
+            video_id="payoff-source",
+            start=0,
+            concept=payoff_name,
+            _selection_intent_obligations=[payoff],
+        ),
+        _reel(
+            "foundation",
+            video_id="foundation-source",
+            start=0,
+            concept=foundation_name,
+            _selection_intent_obligations=[foundation],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["payoff"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic=topic,
+        release_limit=2,
+    )
+
+    assert result.ordered_reel_ids == ["foundation", "payoff"]
 
 
 def test_complete_atomic_organizer_choice_is_not_replaced_by_umbrella(
@@ -2438,6 +2538,519 @@ def test_complete_atomic_organizer_choice_is_not_replaced_by_umbrella(
     ]
 
 
+@pytest.mark.parametrize(
+    ("topic", "prerequisite_name", "payoff_name"),
+    [
+        (
+            "Define electric potential before applying Ohm's law.",
+            "electric potential definition",
+            "Ohm's-law application",
+        ),
+        (
+            "Explain glycolysis before deriving its ATP payoff.",
+            "glycolysis mechanism",
+            "ATP-payoff derivation",
+        ),
+        (
+            "Define tangent before deriving the tangent formula.",
+            "tangent definition",
+            "tangent-formula derivation",
+        ),
+        (
+            "Explain finally before applying it to resource cleanup.",
+            "finally semantics",
+            "resource-cleanup application",
+        ),
+        (
+            "State the duty rule before applying it to a fact pattern.",
+            "duty rule",
+            "duty fact-pattern application",
+        ),
+    ],
+)
+def test_required_unseen_prerequisite_prefers_atomic_novel_payoff_over_umbrella(
+    monkeypatch,
+    topic: str,
+    prerequisite_name: str,
+    payoff_name: str,
+) -> None:
+    prerequisite = _obligation(
+        prerequisite_name,
+        f"Teach {prerequisite_name}",
+        kind="subject",
+    )
+    payoff = _obligation(
+        payoff_name,
+        f"Teach {payoff_name}",
+        kind="outcome",
+    )
+    reels = [
+        _reel(
+            "required-prerequisite",
+            video_id="required-source",
+            start=0,
+            concept=prerequisite_name,
+            _selection_intent_obligations=[prerequisite],
+        ),
+        _reel(
+            "broad-umbrella",
+            video_id="umbrella-source",
+            start=0,
+            concept=f"{prerequisite_name} and {payoff_name}",
+            _selection_intent_obligations=[prerequisite, payoff],
+        ),
+        _reel(
+            "atomic-payoff",
+            video_id="payoff-source",
+            start=0,
+            concept=payoff_name,
+            _selection_intent_obligations=[payoff],
+        ),
+    ]
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result([
+            "required-prerequisite",
+            "broad-umbrella",
+        ])
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic=topic,
+        release_limit=2,
+        required_reel_ids=["required-prerequisite"],
+    )
+
+    assert calls == 1
+    assert result.ordered_reel_ids == [
+        "required-prerequisite",
+        "atomic-payoff",
+    ]
+
+
+def test_audited_joint_synthesis_may_keep_required_prerequisite_umbrella(
+    monkeypatch,
+) -> None:
+    prerequisite = _obligation(
+        "tangent definition",
+        "Define tangent",
+        kind="subject",
+    )
+    payoff = _obligation(
+        "derive the tangent formula",
+        "Derive the tangent formula from the definition",
+        kind="outcome",
+    )
+    reels = [
+        _reel(
+            "required-prerequisite",
+            video_id="required-source",
+            start=0,
+            concept="tangent definition",
+            _selection_intent_obligations=[prerequisite],
+        ),
+        _reel(
+            "joint-synthesis",
+            video_id="synthesis-source",
+            start=0,
+            concept="derive tangent formula from its definition",
+            _selection_intent_obligations=[prerequisite, payoff],
+            _selection_intent_relationship_witnesses=[
+                _joint_witness(payoff)
+            ],
+        ),
+        _reel(
+            "atomic-payoff",
+            video_id="payoff-source",
+            start=0,
+            concept="tangent-formula derivation",
+            _selection_intent_obligations=[payoff],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result([
+            "required-prerequisite",
+            "joint-synthesis",
+        ]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="Define tangent and derive the tangent formula.",
+        release_limit=2,
+        required_reel_ids=["required-prerequisite"],
+    )
+
+    assert result.ordered_reel_ids == [
+        "required-prerequisite",
+        "joint-synthesis",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("topic", "prerequisite_name", "first_payoff", "second_payoff"),
+    [
+        (
+            "Explain voltage, then calculate current and power.",
+            "voltage definition",
+            "current calculation",
+            "power calculation",
+        ),
+        (
+            "Explain transcription, then identify the RNA product and mutation effect.",
+            "transcription mechanism",
+            "RNA product",
+            "mutation effect",
+        ),
+        (
+            "Define tangent, then derive its formula and solve an example.",
+            "tangent definition",
+            "tangent formula",
+            "worked tangent example",
+        ),
+        (
+            "Explain finally, then show cleanup and exception propagation.",
+            "finally semantics",
+            "resource cleanup",
+            "exception propagation",
+        ),
+        (
+            "State duty, then analyze breach and causation.",
+            "duty rule",
+            "breach analysis",
+            "causation analysis",
+        ),
+    ],
+)
+def test_required_unseen_prerequisite_uses_fitting_multi_clip_payoff_cover(
+    monkeypatch,
+    topic: str,
+    prerequisite_name: str,
+    first_payoff: str,
+    second_payoff: str,
+) -> None:
+    prerequisite = _obligation(
+        prerequisite_name,
+        f"Teach {prerequisite_name}",
+        kind="subject",
+    )
+    first = _obligation(first_payoff, f"Teach {first_payoff}", kind="task")
+    second = _obligation(
+        second_payoff,
+        f"Teach {second_payoff}",
+        kind="outcome",
+    )
+    reels = [
+        _reel(
+            "required-prerequisite",
+            video_id="required-source",
+            start=0,
+            concept=prerequisite_name,
+            _selection_intent_obligations=[prerequisite],
+        ),
+        _reel(
+            "broad-umbrella",
+            video_id="umbrella-source",
+            start=0,
+            concept=f"{prerequisite_name}, {first_payoff}, and {second_payoff}",
+            _selection_intent_obligations=[prerequisite, first, second],
+        ),
+        _reel(
+            "first-atomic-payoff",
+            video_id="first-payoff-source",
+            start=0,
+            concept=first_payoff,
+            _selection_intent_obligations=[first],
+        ),
+        _reel(
+            "second-atomic-payoff",
+            video_id="second-payoff-source",
+            start=0,
+            concept=second_payoff,
+            _selection_intent_obligations=[second],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result([
+            "required-prerequisite",
+            "broad-umbrella",
+        ]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic=topic,
+        release_limit=3,
+        required_reel_ids=["required-prerequisite"],
+    )
+
+    assert result.ordered_reel_ids == [
+        "required-prerequisite",
+        "first-atomic-payoff",
+        "second-atomic-payoff",
+    ]
+
+
+def test_multi_clip_payoff_cover_does_not_displace_umbrella_when_it_cannot_fit(
+    monkeypatch,
+) -> None:
+    prerequisite = _obligation(
+        "duty rule",
+        "Teach the duty rule",
+        kind="subject",
+    )
+    breach = _obligation("breach analysis", "Analyze breach", kind="task")
+    causation = _obligation(
+        "causation analysis",
+        "Analyze causation",
+        kind="outcome",
+    )
+    reels = [
+        _reel(
+            "required-duty",
+            video_id="duty-source",
+            start=0,
+            concept="duty rule",
+            _selection_intent_obligations=[prerequisite],
+        ),
+        _reel(
+            "umbrella",
+            video_id="umbrella-source",
+            start=0,
+            concept="duty, breach, and causation",
+            _selection_intent_obligations=[prerequisite, breach, causation],
+        ),
+        _reel(
+            "breach",
+            video_id="breach-source",
+            start=0,
+            concept="breach analysis",
+            _selection_intent_obligations=[breach],
+        ),
+        _reel(
+            "causation",
+            video_id="causation-source",
+            start=0,
+            concept="causation analysis",
+            _selection_intent_obligations=[causation],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result([
+            "required-duty",
+            "umbrella",
+        ]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="State duty, then analyze breach and causation.",
+        release_limit=2,
+        required_reel_ids=["required-duty"],
+    )
+
+    assert result.ordered_reel_ids == ["required-duty", "umbrella"]
+
+
+def test_atomic_payoff_preference_never_reduces_total_mandatory_coverage(
+    monkeypatch,
+) -> None:
+    prerequisite = _obligation(
+        "voltage definition",
+        "Teach voltage",
+        kind="subject",
+    )
+    current = _obligation(
+        "calculate current",
+        "Calculate current",
+        kind="task",
+    )
+    power = _obligation(
+        "calculate power",
+        "Calculate power",
+        kind="outcome",
+    )
+    safety = _obligation(
+        "include the safety limit",
+        "Include the circuit safety limit",
+        kind="format",
+    )
+    reels = [
+        _reel(
+            "required-voltage",
+            video_id="voltage-source",
+            start=0,
+            concept="voltage definition",
+            _selection_intent_obligations=[prerequisite],
+        ),
+        _reel(
+            "umbrella",
+            video_id="umbrella-source",
+            start=0,
+            concept="voltage, current, and power",
+            _selection_intent_obligations=[prerequisite, current, power],
+        ),
+        _reel(
+            "current",
+            video_id="current-source",
+            start=0,
+            concept="current calculation",
+            _selection_intent_obligations=[current],
+        ),
+        _reel(
+            "power",
+            video_id="power-source",
+            start=0,
+            concept="power calculation",
+            _selection_intent_obligations=[power],
+        ),
+        _reel(
+            "safety",
+            video_id="safety-source",
+            start=0,
+            concept="circuit safety limit",
+            _selection_intent_obligations=[safety],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result([
+            "required-voltage",
+            "umbrella",
+            "safety",
+        ]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="Define voltage, calculate current and power, and include the safety limit.",
+        release_limit=3,
+        required_reel_ids=["required-voltage"],
+    )
+
+    assert result.ordered_reel_ids == [
+        "required-voltage",
+        "umbrella",
+        "safety",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("topic", "concept_name", "application_name"),
+    [
+        ("Electric fields then circuit analysis", "electric field", "circuit analysis"),
+        ("DNA replication then mutation case", "DNA replication", "mutation case"),
+        ("Define derivative then solve a tangent problem", "derivative", "tangent problem"),
+        ("Explain try/finally then show cleanup code", "try/finally", "cleanup code"),
+        ("State duty then analyze a fact pattern", "duty rule", "fact pattern"),
+    ],
+)
+def test_trusted_curriculum_edge_orders_application_after_concept_across_domains(
+    monkeypatch,
+    topic: str,
+    concept_name: str,
+    application_name: str,
+) -> None:
+    concept = _obligation(
+        concept_name,
+        f"Teach {concept_name}",
+        kind="subject",
+    )
+    application = _obligation(
+        application_name,
+        f"Apply {concept_name} in {application_name}",
+        kind="outcome",
+    )
+    edge = {
+        "before_key": concept["key"],
+        "after_key": application["key"],
+    }
+    reels = [
+        _reel(
+            "concept",
+            video_id="concept-source",
+            start=0,
+            concept=concept_name,
+            _selection_intent_obligations=[concept],
+            _selection_intent_curriculum_edges=[edge],
+        ),
+        _reel(
+            "application",
+            video_id="application-source",
+            start=0,
+            concept=application_name,
+            _selection_intent_obligations=[application],
+            _selection_intent_curriculum_edges=[edge],
+        ),
+    ]
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result(["application", "concept"])
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic=topic,
+        release_limit=2,
+    )
+
+    assert calls == 1
+    assert result.ordered_reel_ids == ["concept", "application"]
+
+
+def test_curriculum_edge_with_missing_inventory_endpoint_is_soft(
+    monkeypatch,
+) -> None:
+    concept = _obligation("duty rule", "Teach the duty rule", kind="subject")
+    missing_application = _obligation(
+        "fact pattern",
+        "Apply the duty rule to a fact pattern",
+        kind="outcome",
+    )
+    reels = [
+        _reel(
+            "available-concept",
+            video_id="concept-source",
+            start=0,
+            concept="duty rule",
+            _selection_intent_obligations=[concept],
+            _selection_intent_curriculum_edges=[{
+                "before_key": concept["key"],
+                "after_key": missing_application["key"],
+            }],
+        )
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["available-concept"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="State duty then analyze a fact pattern.",
+        release_limit=1,
+    )
+
+    assert result.ordered_reel_ids == ["available-concept"]
+
+
 def test_unique_indivisible_long_clip_remains_eligible(monkeypatch) -> None:
     proof = _reel(
         "long-proof",
@@ -2476,6 +3089,9 @@ def test_obligation_search_finds_complete_nongreedy_release(monkeypatch) -> None
             _selection_intent_obligations=[
                 obligations[key] for key in "abcd"
             ],
+            _selection_intent_relationship_witnesses=[
+                _joint_witness(obligations["a"])
+            ],
         ),
         _reel(
             "y",
@@ -2485,6 +3101,9 @@ def test_obligation_search_finds_complete_nongreedy_release(monkeypatch) -> None
             _selection_intent_obligations=[
                 obligations[key] for key in "abe"
             ],
+            _selection_intent_relationship_witnesses=[
+                _joint_witness(obligations["a"])
+            ],
         ),
         _reel(
             "z",
@@ -2493,6 +3112,9 @@ def test_obligation_search_finds_complete_nongreedy_release(monkeypatch) -> None
             concept="facets c d f",
             _selection_intent_obligations=[
                 obligations[key] for key in "cdf"
+            ],
+            _selection_intent_relationship_witnesses=[
+                _joint_witness(obligations["c"])
             ],
         ),
     ]
@@ -2634,6 +3256,7 @@ def test_complete_cover_prefers_organizer_selected_tie(
             difficulty=0.2,
             selection_candidate_id="a0",
             _selection_intent_obligations=facets[2:5],
+            _selection_intent_relationship_witnesses=[_joint_witness(facets[2])],
         ),
         _reel(
             "r1",
@@ -2644,6 +3267,7 @@ def test_complete_cover_prefers_organizer_selected_tie(
             difficulty=0.2,
             selection_candidate_id="a1",
             _selection_intent_obligations=facets[3:5],
+            _selection_intent_relationship_witnesses=[_joint_witness(facets[3])],
         ),
         _reel(
             "r2",
@@ -2654,6 +3278,7 @@ def test_complete_cover_prefers_organizer_selected_tie(
             difficulty=0.2,
             selection_candidate_id="a2",
             _selection_intent_obligations=facets[:4],
+            _selection_intent_relationship_witnesses=[_joint_witness(facets[0])],
         ),
         _reel(
             "r3",
@@ -2668,6 +3293,7 @@ def test_complete_cover_prefers_organizer_selected_tie(
                 facets[3],
                 facets[4],
             ],
+            _selection_intent_relationship_witnesses=[_joint_witness(facets[0])],
         ),
         _reel(
             "r4",
@@ -2699,6 +3325,7 @@ def test_complete_cover_prefers_organizer_selected_tie(
             difficulty=0.1,
             selection_candidate_id="a6",
             _selection_intent_obligations=facets[2:4],
+            _selection_intent_relationship_witnesses=[_joint_witness(facets[2])],
         ),
     ]
     monkeypatch.setattr(
@@ -2814,6 +3441,11 @@ def test_complete_cover_compression_preserves_organizer_exact_option(
             selection_candidate_id=f"a{index}",
             prerequisite_ids=prerequisites[index],
             _selection_intent_obligations=obligations[index],
+            _selection_intent_relationship_witnesses=(
+                [_joint_witness(obligations[index][0])]
+                if len(obligations[index]) > 1
+                else []
+            ),
         )
         for index in range(8)
     ]
@@ -2921,6 +3553,7 @@ def test_partial_dependency_state_keeps_easier_smaller_remediation(
             difficulty=0.4,
             selection_candidate_id="joint-candidate",
             _selection_intent_obligations=facets[:2],
+            _selection_intent_relationship_witnesses=[_joint_witness(facets[0])],
         ),
         _reel(
             "wrapper",
@@ -3031,6 +3664,9 @@ def test_maximum_obligation_matrix_stays_below_release_latency_guard(
             _selection_intent_obligations=[
                 obligations[item] for item in combination
             ],
+            _selection_intent_relationship_witnesses=[
+                _joint_witness(obligations[combination[0]])
+            ],
         )
         for index, combination in enumerate(combinations)
     ]
@@ -3106,6 +3742,9 @@ def test_maximum_exact_dependency_matrix_stays_below_release_latency_guard(
                 obligations[left],
                 obligations[right],
             ],
+            _selection_intent_relationship_witnesses=[
+                _joint_witness(obligations[left])
+            ],
         )
         for index, (left, right) in enumerate(
             itertools.islice(itertools.combinations(range(16), 2), 85)
@@ -3177,6 +3816,9 @@ def test_unavailable_dependency_matrix_stays_below_release_latency_guard(
             concept=f"facets {' '.join(str(item) for item in combination)}",
             _selection_intent_obligations=[
                 obligations[item] for item in combination
+            ],
+            _selection_intent_relationship_witnesses=[
+                _joint_witness(obligations[combination[0]])
             ],
         )
         for index, combination in enumerate(
@@ -4385,8 +5027,8 @@ def test_lesson_order_cache_round_trips_validated_restatements(
     assert cached.prior_restatement_reel_ids == ["repeat"]
     assert cached.current_restatement_reel_ids == ["current-subset"]
     response_payload = json.loads(stored["response_json"])
-    assert response_payload["prompt_version"] == "lesson_order_v14"
-    assert response_payload["cache_version"] == 12
+    assert response_payload["prompt_version"] == "lesson_order_v15"
+    assert response_payload["cache_version"] == 13
     assert _REAL_READ_CACHED_LESSON_ORDER(
         "cache-key",
         original=reels,

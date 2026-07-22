@@ -30,7 +30,10 @@ from backend.app.ingestion.models import (  # noqa: E402
     IngestTranscriptCue,
     YouTubeSourceRef,
 )
-from backend.intent_obligations import intent_obligation  # noqa: E402
+from backend.intent_obligations import (  # noqa: E402
+    INTENT_OBLIGATION_CONTRACT_VERSION,
+    intent_obligation,
+)
 from backend.pipeline import gemini_segment  # noqa: E402
 
 
@@ -94,6 +97,21 @@ def _transcript_boundary_context(
                 "final_range": [start, end],
             },
         },
+    }
+
+
+def _family_profile_context(
+    family: str,
+    *,
+    contract_version: str = "concept_family_v3",
+    selection_authority: str = "gemini",
+) -> dict:
+    return {
+        "selection_contract_version": "quality_silence_v40",
+        "selection_authority": selection_authority,
+        "concept_family_contract_version": contract_version,
+        "concept_family": family,
+        "concept_aliases": [],
     }
 
 
@@ -252,18 +270,29 @@ class PersistenceIntegrityTests(unittest.TestCase):
         self.assertIsNotNone(obligation)
         authoritative = {
             "selection_authority": "gemini",
-            "intent_obligation_contract_version": "intent_obligation_v1",
+            "intent_obligation_contract_version": (
+                INTENT_OBLIGATION_CONTRACT_VERSION
+            ),
             "intent_obligations": [obligation],
         }
         self.assertEqual(
             pipeline_module._intent_obligation_search_context(authoritative),
             {
-                "intent_obligation_contract_version": "intent_obligation_v1",
+                "intent_obligation_contract_version": (
+                    INTENT_OBLIGATION_CONTRACT_VERSION
+                ),
                 "intent_obligations": [obligation],
+                "intent_connections": [],
+                "intent_relationship_witnesses": [],
+                "intent_curriculum_edges": [],
             },
         )
         for changed in (
             {**authoritative, "selection_authority": "local"},
+            {
+                **authoritative,
+                "intent_obligation_contract_version": "intent_obligation_v1",
+            },
             {
                 **authoritative,
                 "intent_obligation_contract_version": "intent_obligation_v0",
@@ -315,6 +344,45 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "created_at": db_module.now_iso(),
             },
         )
+
+    @staticmethod
+    def _seed_video(conn, video_id: str) -> None:
+        db_module.insert(
+            conn,
+            "videos",
+            {
+                "id": video_id,
+                "title": video_id,
+                "channel_title": "channel",
+                "duration_sec": 600,
+                "created_at": db_module.now_iso(),
+            },
+        )
+
+    def _insert_profile_reel(
+        self,
+        conn,
+        *,
+        reel_id: str,
+        material_id: str,
+        concept_id: str,
+        video_id: str,
+        start: float,
+        search_context: dict,
+    ) -> None:
+        self.assertTrue(persistence_module.upsert_reel_row(
+            conn,
+            reel_id=reel_id,
+            material_id=material_id,
+            concept_id=concept_id,
+            video_id=video_id,
+            video_url=f"https://www.youtube.com/embed/{video_id}",
+            t_start=start,
+            t_end=start + 20.0,
+            transcript_snippet="profile teaching",
+            takeaways=[],
+            search_context=search_context,
+        ))
 
     def _boundary_persistence_fixture(self):
         with db_module.get_conn(transactional=True) as conn:
@@ -896,6 +964,233 @@ class PersistenceIntegrityTests(unittest.TestCase):
 
         self.assertEqual((material_id, concept_id), ("material-a", "concept-a"))
 
+    def test_reel_writes_persist_one_idempotent_family_profile(self) -> None:
+        family_context = _family_profile_context("Newton's second law of motion")
+        with db_module.get_conn(transactional=True) as conn:
+            self._seed_identity(conn, "material-a", "concept-a")
+            self._seed_video(conn, "video-a")
+            self._insert_profile_reel(
+                conn,
+                reel_id="profile-reel-a",
+                material_id="material-a",
+                concept_id="concept-a",
+                video_id="video-a",
+                start=1.0,
+                search_context=family_context,
+            )
+            self._insert_profile_reel(
+                conn,
+                reel_id="profile-reel-b",
+                material_id="material-a",
+                concept_id="concept-a",
+                video_id="video-a",
+                start=31.0,
+                search_context=family_context,
+            )
+            profiles = db_module.fetch_all(
+                conn,
+                "SELECT * FROM concept_family_profiles WHERE concept_id = ?",
+                ("concept-a",),
+            )
+
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0]["material_id"], "material-a")
+        self.assertEqual(profiles[0]["contract_version"], "concept_family_v3")
+        self.assertEqual(profiles[0]["selection_authority"], "gemini")
+        self.assertEqual(
+            profiles[0]["concept_family"],
+            "Newton's second law of motion",
+        )
+        self.assertEqual(profiles[0]["conflicted"], 0)
+
+    def test_family_profile_mismatches_are_sticky_and_preserve_identity(self) -> None:
+        trusted_context = _family_profile_context("Newton's first law of motion")
+        cases = (
+            (
+                "family",
+                "material-a",
+                _family_profile_context("Newton's second law of motion"),
+            ),
+            (
+                "contract",
+                "material-a",
+                _family_profile_context(
+                    "Newton's first law of motion",
+                    contract_version="concept_family_v2",
+                ),
+            ),
+            (
+                "authority",
+                "material-a",
+                _family_profile_context(
+                    "Newton's first law of motion",
+                    selection_authority="local",
+                ),
+            ),
+            (
+                "material",
+                "material-b",
+                trusted_context,
+            ),
+        )
+        with db_module.get_conn(transactional=True) as conn:
+            self._seed_identity(conn, "material-a", "concept-a")
+            self._seed_identity(conn, "material-b", "concept-b")
+            for label, material_id, changed_context in cases:
+                with self.subTest(label=label):
+                    db_module.execute_modify(
+                        conn,
+                        "DELETE FROM concept_family_profiles WHERE concept_id = ?",
+                        ("concept-a",),
+                    )
+                    persistence_module._record_concept_family_profile(
+                        conn,
+                        material_id="material-a",
+                        concept_id="concept-a",
+                        search_context=trusted_context,
+                    )
+                    original = db_module.fetch_one(
+                        conn,
+                        "SELECT * FROM concept_family_profiles WHERE concept_id = ?",
+                        ("concept-a",),
+                    )
+                    persistence_module._record_concept_family_profile(
+                        conn,
+                        material_id=material_id,
+                        concept_id="concept-a",
+                        search_context=changed_context,
+                    )
+                    conflicted = db_module.fetch_one(
+                        conn,
+                        "SELECT * FROM concept_family_profiles WHERE concept_id = ?",
+                        ("concept-a",),
+                    )
+                    self.assertEqual(conflicted["conflicted"], 1)
+                    for field in (
+                        "material_id",
+                        "contract_version",
+                        "selection_authority",
+                        "concept_family",
+                        "family_identity",
+                        "created_at",
+                    ):
+                        self.assertEqual(conflicted[field], original[field])
+
+    def test_boundary_profile_promotion_is_idempotent_then_conflicts(self) -> None:
+        trusted_context = _family_profile_context("Newton's first law of motion")
+        with db_module.get_conn(transactional=True) as conn:
+            self._seed_identity(conn, "material-a", "concept-a")
+            self._seed_video(conn, "video-a")
+            self._insert_profile_reel(
+                conn,
+                reel_id="promotion-reel",
+                material_id="material-a",
+                concept_id="concept-a",
+                video_id="video-a",
+                start=1.0,
+                search_context=trusted_context,
+            )
+            stored_context = db_module.fetch_one(
+                conn,
+                "SELECT search_context_json FROM reels WHERE id = ?",
+                ("promotion-reel",),
+            )["search_context_json"]
+            same_family_context = {**trusted_context, "boundary_status": "verified"}
+            self.assertTrue(persistence_module.update_reel_boundary_state(
+                conn,
+                reel_id="promotion-reel",
+                material_id="material-a",
+                concept_id="concept-a",
+                video_url="https://www.youtube.com/embed/video-a",
+                t_start=0.9,
+                t_end=21.1,
+                transcript_snippet="verified",
+                selected_cue_ids=["cue-1"],
+                search_context=same_family_context,
+                expected_search_context_json=stored_context,
+            ))
+            profile = db_module.fetch_one(
+                conn,
+                "SELECT * FROM concept_family_profiles WHERE concept_id = ?",
+                ("concept-a",),
+            )
+            self.assertEqual(profile["conflicted"], 0)
+
+            promoted_context = db_module.fetch_one(
+                conn,
+                "SELECT search_context_json FROM reels WHERE id = ?",
+                ("promotion-reel",),
+            )["search_context_json"]
+            conflicting_context = _family_profile_context(
+                "Newton's second law of motion"
+            )
+            self.assertTrue(persistence_module.update_reel_boundary_state(
+                conn,
+                reel_id="promotion-reel",
+                material_id="material-a",
+                concept_id="concept-a",
+                video_url="https://www.youtube.com/embed/video-a",
+                t_start=0.8,
+                t_end=21.2,
+                transcript_snippet="conflicting",
+                selected_cue_ids=["cue-1"],
+                search_context=conflicting_context,
+                expected_search_context_json=promoted_context,
+            ))
+            conflicted = db_module.fetch_one(
+                conn,
+                "SELECT * FROM concept_family_profiles WHERE concept_id = ?",
+                ("concept-a",),
+            )
+
+        self.assertEqual(conflicted["conflicted"], 1)
+        self.assertEqual(
+            conflicted["concept_family"],
+            "Newton's first law of motion",
+        )
+
+    def test_failed_boundary_cas_does_not_change_family_profile(self) -> None:
+        trusted_context = _family_profile_context("Newton's first law of motion")
+        with db_module.get_conn(transactional=True) as conn:
+            self._seed_identity(conn, "material-a", "concept-a")
+            self._seed_video(conn, "video-a")
+            self._insert_profile_reel(
+                conn,
+                reel_id="failed-cas-reel",
+                material_id="material-a",
+                concept_id="concept-a",
+                video_id="video-a",
+                start=1.0,
+                search_context=trusted_context,
+            )
+            before = db_module.fetch_one(
+                conn,
+                "SELECT * FROM concept_family_profiles WHERE concept_id = ?",
+                ("concept-a",),
+            )
+            self.assertFalse(persistence_module.update_reel_boundary_state(
+                conn,
+                reel_id="failed-cas-reel",
+                material_id="material-a",
+                concept_id="concept-a",
+                video_url="https://www.youtube.com/embed/video-a",
+                t_start=0.8,
+                t_end=21.2,
+                transcript_snippet="stale writer",
+                selected_cue_ids=["cue-1"],
+                search_context=_family_profile_context(
+                    "Newton's second law of motion"
+                ),
+                expected_search_context_json="stale-context",
+            ))
+            after = db_module.fetch_one(
+                conn,
+                "SELECT * FROM concept_family_profiles WHERE concept_id = ?",
+                ("concept-a",),
+            )
+
+        self.assertEqual(after, before)
+
     def test_unexpected_reel_insert_error_propagates(self) -> None:
         with mock.patch.object(
             persistence_module, "insert", side_effect=RuntimeError("database unavailable")
@@ -1060,6 +1355,84 @@ class PersistenceIntegrityTests(unittest.TestCase):
         context = json.loads(rows[0]["search_context_json"])
         self.assertTrue(context["surface_eligible"])
         self.assertEqual(context["boundary_status"], "verified")
+
+    def test_boundary_promotion_conflicts_only_the_clip_specific_profile(self) -> None:
+        pipeline, adapter, metadata = self._boundary_persistence_fixture()
+        candidate_id = "video-a::clip-specific-profile"
+        clip_concept = "inertia under net force"
+
+        def details(*, family: str, verified: bool) -> dict:
+            context = {
+                "selection_candidate_id": candidate_id,
+                "surface_eligible": verified,
+                "boundary_status": "verified" if verified else "unavailable",
+            }
+            if verified:
+                context.update({
+                    "selection_contract_version": "quality_silence_v40",
+                    "speech_corridor_verified": True,
+                    "boundary_diagnostics": {
+                        "acoustic_verified": True,
+                        "acoustic": {"threshold_dbfs": -38.0},
+                    },
+                })
+            return {
+                "selection_authority": "gemini",
+                "concept": clip_concept,
+                "concept_family": family,
+                "concept_aliases": [],
+                "learning_objective": "Explain inertia under a net force",
+                "topic_evidence_quote": "A net force changes the object's motion",
+                "cue_ids": ["cue-1"],
+                "search_context": context,
+            }
+
+        deferred = pipeline._persist_ingest(
+            adapter_result=adapter,
+            metadata=metadata,
+            cues=[],
+            chosen=IngestSegment(t_start=10.0, t_end=20.0, text="snippet"),
+            snippet="rough snippet",
+            material_id="material-a",
+            concept_id="concept-a",
+            clip_window=(10.0, 20.0),
+            target_max=60,
+            generation_id="generation-a",
+            clip_details=details(
+                family="Newton's first law of motion",
+                verified=False,
+            ),
+        )
+        promoted = pipeline._persist_ingest(
+            adapter_result=adapter,
+            metadata=metadata,
+            cues=[],
+            chosen=IngestSegment(t_start=9.9, t_end=20.2, text="snippet"),
+            snippet="verified snippet",
+            material_id="material-a",
+            concept_id="concept-a",
+            clip_window=(9.9, 20.2),
+            target_max=60,
+            generation_id="generation-a",
+            clip_details=details(
+                family="Newton's second law of motion",
+                verified=True,
+            ),
+        )
+
+        self.assertEqual(promoted.reel_id, deferred.reel_id)
+        self.assertNotEqual(promoted.concept_id, "concept-a")
+        with db_module.get_conn() as conn:
+            profiles = db_module.fetch_all(
+                conn,
+                "SELECT concept_id, concept_family, conflicted "
+                "FROM concept_family_profiles ORDER BY concept_id",
+            )
+        self.assertEqual(profiles, [{
+            "concept_id": promoted.concept_id,
+            "concept_family": "Newton's first law of motion",
+            "conflicted": 1,
+        }])
 
     def test_transcript_retry_never_downgrades_verified_boundary_or_return_value(self) -> None:
         pipeline, adapter, metadata = self._boundary_persistence_fixture()

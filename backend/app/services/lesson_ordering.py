@@ -45,14 +45,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-LESSON_ORDER_PROMPT_VERSION = "lesson_order_v14"
+LESSON_ORDER_PROMPT_VERSION = "lesson_order_v15"
 LESSON_ORDER_TIMEOUT_S = 10.0
 # Even an invalid worst-case schema payload with four bounded UUID lists and a
 # terminal marker fits this ceiling. Actual
 # generated length, not this ceiling, drives latency.
 LESSON_ORDER_MAX_OUTPUT_TOKENS = 10_240
 LESSON_ORDER_ATTEMPTS = 2
-LESSON_ORDER_CACHE_VERSION = 12
+LESSON_ORDER_CACHE_VERSION = 13
 LESSON_ORDER_CACHE_TTL_SEC = 30 * 24 * 60 * 60
 LESSON_ORDER_MAX_CLIPS = 200
 LESSON_ORDER_MAX_USER_PROMPT_CHARS = 64_000
@@ -206,12 +206,27 @@ LEARNING_REQUEST_JSON.prior_concept_coverage may use the same compact-row format
 its concept_ref values share the CLIPS_JSON concept-ref namespace.
 recent_prior_objective_coverage may also use compact rows with columns
 [concept_ref, concept_family, concept_title, learning_objective_excerpt].
-Each available_intent_obligation is a request facet grounded by Gemini in both the
-learner request and at least one clip. Select a supplied clip for every obligation not
-listed in prior_intent_obligation_keys whenever the candidates and release limit permit.
+Each available_intent_obligation is a request-facet dictionary entry grounded by Gemini in
+the learner request and at least one clip. Only facet refs appearing in a clip's
+intent_obligation_refs are audited fulfillment and mandatory coverage; select a supplied clip
+for every such fulfilled facet not listed in prior_intent_obligation_keys whenever the
+candidates and release limit permit. Entries referenced only by intent_connection_refs are
+support/relevance, not fulfillment.
 In compact_rows_v1, intent_obligation_refs point to the obligation_ref values in
 LEARNING_REQUEST_JSON.available_intent_obligations, and
 prior_intent_obligation_refs identifies already released obligation_ref values.
+intent_obligation_refs are audited FULFILLMENT. intent_connection_refs are only grounded
+support/relevance and never prove coverage by themselves. directly_teaches_topic,
+intent_role, and intent_coverage report the same audited distinction. A selected clip with
+several fulfilled sibling facets may replace atomic clips only when its
+relationship_witness_obligation_refs certify a genuinely new indivisible relationship.
+Otherwise prefer the novel atomic explanation/application/payoff, especially when a mandatory
+unseen clip already supplies its prerequisite; never repeat that prerequisite inside a broad
+umbrella merely to reach the new payoff. intent_curriculum_edges (or compact
+intent_curriculum_edge_refs) are trusted request-order edges: whenever both endpoint facets have
+selected clips, place the before endpoint before the after endpoint. Missing endpoint inventory
+is soft and never makes the lesson empty. Applications and fact patterns follow the selected
+concept/definition/rule they use.
 
 terminal_summary_start_reel_id is null unless the selected lesson has a backward-looking
 recap, review, or whole-lesson summary. Otherwise it is the exact selected reel_id of the
@@ -427,12 +442,82 @@ def _effective_release_limit(value: object, available: int) -> int:
     return max(1, min(max(1, int(available)), requested))
 
 
+def _trusted_relationship_witness_keys(reel: Mapping[str, Any]) -> set[str]:
+    """Return fulfilled relation keys carrying a final-audit witness."""
+    raw = reel.get("_selection_intent_relationship_witnesses")
+    if not isinstance(raw, list):
+        return set()
+    return {
+        key
+        for witness in raw[:8]
+        if isinstance(witness, Mapping)
+        and (key := _clean_text(witness.get("obligation_key"), 64))
+        and isinstance(witness.get("members"), list)
+        and len(witness["members"]) >= 2
+        and isinstance(witness.get("links"), list)
+        and bool(witness["links"])
+    }
+
+
 def _trusted_intent_obligations(reel: Mapping[str, Any]) -> list[dict[str, str]]:
-    """Read only upstream-validated, evidence-grounded private metadata."""
-    return normalize_intent_obligations(
+    """Read only upstream-validated objective fulfillment metadata."""
+    obligations = normalize_intent_obligations(
         reel.get("_selection_intent_obligations"),
         require_evidence=True,
     )
+    witness_keys = _trusted_relationship_witness_keys(reel)
+    fulfilled_keys = {
+        str(obligation["key"])
+        for obligation in obligations
+    }
+    has_joint_witness = bool(witness_keys & fulfilled_keys)
+    if has_joint_witness:
+        return obligations
+
+    # Fail closed for legacy/bad scalar umbrellas: more than one sibling
+    # subject or scope cannot become mandatory coverage without an audited
+    # joint-relation witness. Other orthogonal task/outcome constraints remain.
+    sibling_keys: set[str] = set()
+    for kind in ("subject", "scope"):
+        same_kind = [
+            obligation
+            for obligation in obligations
+            if obligation.get("kind") == kind
+        ]
+        if len(same_kind) > 1:
+            sibling_keys.update(
+                str(obligation["key"]) for obligation in same_kind
+            )
+    return [
+        obligation
+        for obligation in obligations
+        if str(obligation["key"]) not in sibling_keys
+    ]
+
+
+def _trusted_intent_connections(reel: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Read grounded relevance/support evidence; never mandatory coverage."""
+    return normalize_intent_obligations(
+        reel.get("_selection_intent_connections"),
+        require_evidence=True,
+    )
+
+
+def _trusted_curriculum_edges(
+    reel: Mapping[str, Any],
+) -> list[tuple[str, str]]:
+    raw = reel.get("_selection_intent_curriculum_edges")
+    if not isinstance(raw, list):
+        return []
+    edges: list[tuple[str, str]] = []
+    for edge in raw[:16]:
+        if not isinstance(edge, Mapping):
+            continue
+        before = _clean_text(edge.get("before_key"), 64)
+        after = _clean_text(edge.get("after_key"), 64)
+        if before.startswith("io:") and after.startswith("io:") and before != after:
+            edges.append((before, after))
+    return list(dict.fromkeys(edges))
 
 
 def _clip_payload(
@@ -503,7 +588,25 @@ def _clip_payload(
             if reel.get("informativeness") is not None
             else reel.get("_selection_informativeness")
         ),
+        "directly_teaches_topic": bool(
+            reel.get("_selection_directly_teaches_topic", True)
+        ),
+        "intent_role": _clean_text(
+            reel.get("_selection_intent_role") or "supporting",
+            16,
+        ).lower(),
+        "intent_coverage": _unit_number(
+            reel.get("_selection_intent_coverage")
+        ),
         "intent_obligations": _trusted_intent_obligations(reel),
+        "intent_connections": _trusted_intent_connections(reel),
+        "relationship_witness_obligation_keys": sorted(
+            _trusted_relationship_witness_keys(reel)
+        ),
+        "intent_curriculum_edges": [
+            {"before_key": before, "after_key": after}
+            for before, after in _trusted_curriculum_edges(reel)
+        ],
     }
 
 
@@ -520,6 +623,11 @@ _COMPACT_CLIP_COLUMNS = (
     "concept_title",
     "concept_family",
     "intent_obligation_refs",
+    "intent_connection_refs",
+    "relationship_witness_obligation_refs",
+    "directly_teaches_topic",
+    "intent_role",
+    "intent_coverage",
     "learner_signal_hca",
     "summary_excerpt",
     "takeaways_excerpt",
@@ -602,6 +710,25 @@ def _compact_clip_payload(
                     )
                 ) is not None
             ],
+            [
+                ref
+                for obligation in clip.get("intent_connections") or ()
+                if isinstance(obligation, Mapping)
+                and (
+                    ref := _compact_ref(
+                        shared_obligation_refs,
+                        obligation.get("key"),
+                    )
+                ) is not None
+            ],
+            [
+                ref
+                for key in clip.get("relationship_witness_obligation_keys") or ()
+                if (ref := _compact_ref(shared_obligation_refs, key)) is not None
+            ],
+            bool(clip.get("directly_teaches_topic")),
+            _clean_text(clip.get("intent_role"), 16),
+            clip.get("intent_coverage"),
             [
                 signal.get("helpful", 0.0),
                 signal.get("confusing", 0.0),
@@ -747,6 +874,24 @@ def _compact_learning_request(
         for key in compact.pop("prior_intent_obligation_keys", [])
         if (ref := _compact_ref(obligation_refs, key)) is not None
     ]
+    compact["intent_curriculum_edge_refs"] = [
+        [before_ref, after_ref]
+        for edge in compact.pop("intent_curriculum_edges", [])
+        if isinstance(edge, Mapping)
+        and (
+            before_ref := _compact_ref(
+                obligation_refs,
+                edge.get("before_key"),
+            )
+        ) is not None
+        and (
+            after_ref := _compact_ref(
+                obligation_refs,
+                edge.get("after_key"),
+            )
+        ) is not None
+        and before_ref != after_ref
+    ]
     return compact
 
 
@@ -891,19 +1036,20 @@ def _available_intent_obligations(
     available: list[dict[str, str]] = []
     seen: set[str] = set()
     for clip in clips:
-        raw = clip.get("intent_obligations")
-        if not isinstance(raw, list):
-            continue
-        for obligation in raw:
-            if not isinstance(obligation, Mapping):
+        for field_name in ("intent_obligations", "intent_connections"):
+            raw = clip.get(field_name)
+            if not isinstance(raw, list):
                 continue
-            key = _clean_text(obligation.get("key"), 64)
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            available.append(dict(obligation))
-            if len(available) >= MAX_INTENT_OBLIGATIONS:
-                return available
+            for obligation in raw:
+                if not isinstance(obligation, Mapping):
+                    continue
+                key = _clean_text(obligation.get("key"), 64)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                available.append(dict(obligation))
+                if len(available) >= MAX_INTENT_OBLIGATIONS:
+                    return available
     return available
 
 
@@ -1114,6 +1260,29 @@ def _user_prompt(
             for obligation in clip.get("intent_obligations") or ()
             if obligation.get("key") in available_keys
         ]
+        clip["intent_connections"] = [
+            obligation
+            for obligation in clip.get("intent_connections") or ()
+            if obligation.get("key") in available_keys
+        ]
+        clip["relationship_witness_obligation_keys"] = [
+            key
+            for key in clip.get("relationship_witness_obligation_keys") or ()
+            if key in available_keys
+        ]
+    learning_request["intent_curriculum_edges"] = [
+        {"before_key": before, "after_key": after}
+        for before, after in dict.fromkeys(
+            (
+                _clean_text(edge.get("before_key"), 64),
+                _clean_text(edge.get("after_key"), 64),
+            )
+            for clip in clips
+            for edge in clip.get("intent_curriculum_edges") or ()
+            if isinstance(edge, Mapping)
+        )
+        if before in available_keys and after in available_keys and before != after
+    ][:16]
     learning_request["available_intent_obligations"] = available_obligations
     learning_request["prior_intent_obligation_keys"] = (
         _prior_intent_obligation_keys(
@@ -1527,6 +1696,30 @@ def _constraint_safe_fallback_order(
             if prerequisite_reel_id:
                 add_edge(prerequisite_reel_id, reel_id)
 
+    fulfilled_keys_by_reel = {
+        reel_id: intent_obligation_keys(_trusted_intent_obligations(reel))
+        for reel_id, reel in reels_by_id.items()
+    }
+    curriculum_edges = list(dict.fromkeys(
+        edge
+        for reel in reels_by_id.values()
+        for edge in _trusted_curriculum_edges(reel)
+    ))
+    for before_key, after_key in curriculum_edges:
+        before_ids = [
+            reel_id
+            for reel_id, keys in fulfilled_keys_by_reel.items()
+            if before_key in keys and after_key not in keys
+        ]
+        after_ids = [
+            reel_id
+            for reel_id, keys in fulfilled_keys_by_reel.items()
+            if after_key in keys and before_key not in keys
+        ]
+        for before_id in before_ids:
+            for after_id in after_ids:
+                add_edge(before_id, after_id)
+
     remaining = set(reel_ids)
     ordered_ids: list[str] = []
     while remaining:
@@ -1754,6 +1947,7 @@ def _enforce_mandatory_selection(
     result: LessonOrderResult,
     *,
     original: Sequence[dict[str, Any]],
+    topic: str,
     remediation_concept_ids: Sequence[str] | None,
     release_limit: int | None,
     required_reel_ids: Sequence[str] | None,
@@ -1820,6 +2014,138 @@ def _enforce_mandatory_selection(
         if obligations_by_reel
         else set()
     )
+    required_identity_obligation_keys = (
+        set().union(*(
+            obligations_by_reel.get(reel_id, set())
+            for reel_id in required_identity_ids
+        ))
+        if required_identity_ids
+        else set()
+    )
+    required_release_closure = set().union(*(
+        _selection_dependency_closure(reel_id, reels_by_id)
+        for reel_id in required_identity_ids
+    )) if required_identity_ids else set()
+    reel_input_position = {
+        reel_id: index for index, reel_id in enumerate(reels_by_id)
+    }
+
+    def atomic_payoff_cover(
+        umbrella_id: str,
+        novel_keys: set[str],
+    ) -> tuple[str, ...]:
+        """Find a fitting exact cover made only from narrower payoff clips."""
+        if not novel_keys or len(required_release_closure) > effective_release_limit:
+            return ()
+        options: list[tuple[str, frozenset[str], frozenset[str]]] = []
+        for candidate_id, candidate_keys in obligations_by_reel.items():
+            if (
+                candidate_id == umbrella_id
+                or candidate_id in required_identity_ids
+                or not candidate_keys
+                or not candidate_keys.issubset(novel_keys)
+            ):
+                continue
+            closure = frozenset(_selection_dependency_closure(
+                candidate_id,
+                reels_by_id,
+            ))
+            if (
+                umbrella_id in closure
+                or len(required_release_closure | set(closure))
+                > effective_release_limit
+            ):
+                continue
+            covered = frozenset(
+                key
+                for reel_id in closure
+                for key in obligations_by_reel.get(reel_id, ())
+                if key in novel_keys
+            )
+            if covered:
+                options.append((candidate_id, covered, closure))
+        options_by_key = {
+            key: sorted(
+                (option for option in options if key in option[1]),
+                key=lambda option: (
+                    len(option[2] - required_release_closure),
+                    -len(option[1]),
+                    reel_input_position[option[0]],
+                ),
+            )
+            for key in novel_keys
+        }
+        if any(not candidates for candidates in options_by_key.values()):
+            return ()
+
+        failed_states: set[tuple[frozenset[str], frozenset[str]]] = set()
+
+        def search(
+            uncovered: frozenset[str],
+            selected_closure: frozenset[str],
+            roots: tuple[str, ...],
+        ) -> tuple[str, ...]:
+            if not uncovered:
+                return roots
+            state = (uncovered, selected_closure)
+            if state in failed_states:
+                return ()
+            pivot = min(
+                uncovered,
+                key=lambda key: len(options_by_key[key]),
+            )
+            for candidate_id, covered, closure in options_by_key[pivot]:
+                next_closure = selected_closure | closure
+                if (
+                    next_closure == selected_closure
+                    or len(next_closure) > effective_release_limit
+                ):
+                    continue
+                result = search(
+                    uncovered - covered,
+                    next_closure,
+                    (*roots, candidate_id),
+                )
+                if result:
+                    return result
+            failed_states.add(state)
+            return ()
+
+        return search(
+            frozenset(novel_keys),
+            frozenset(required_release_closure),
+            (),
+        )
+
+    atomic_payoff_ids: set[str] = set()
+    atomic_preference_tokens_by_reel: dict[str, set[tuple[str, str]]] = {}
+    repeated_prerequisite_umbrella_ids: set[str] = set()
+    if required_identity_obligation_keys:
+        for reel_id, keys in obligations_by_reel.items():
+            if reel_id in required_identity_ids:
+                continue
+            novel_keys = keys - required_identity_obligation_keys
+            if not novel_keys or not keys & required_identity_obligation_keys:
+                continue
+            if _trusted_relationship_witness_keys(reels_by_id[reel_id]):
+                continue
+            narrower_ids = atomic_payoff_cover(reel_id, novel_keys)
+            if narrower_ids:
+                repeated_prerequisite_umbrella_ids.add(reel_id)
+                atomic_payoff_ids.update(narrower_ids)
+                for candidate_id in narrower_ids:
+                    for covered_reel_id in _selection_dependency_closure(
+                        candidate_id,
+                        reels_by_id,
+                    ):
+                        for key in (
+                            obligations_by_reel.get(covered_reel_id, set())
+                            & novel_keys
+                        ):
+                            atomic_preference_tokens_by_reel.setdefault(
+                                covered_reel_id,
+                                set(),
+                            ).add((reel_id, key))
 
     strongest_concept_id = next(
         (
@@ -1864,6 +2190,7 @@ def _enforce_mandatory_selection(
         and required_identity_ids.issubset(selected_set)
         and required_obligation_keys.issubset(selected_obligation_keys)
         and organizer_has_preferred_exact
+        and not selected_set & repeated_prerequisite_umbrella_ids
         and all(
             _selection_dependency_closure(reel_id, reels_by_id).issubset(
                 selected_set
@@ -1883,6 +2210,29 @@ def _enforce_mandatory_selection(
     }
     obligation_mask = (1 << len(obligation_keys)) - 1
     exact_bit = 1 << len(obligation_keys) if exact_candidates else 0
+    required_identity_bit_by_reel = {
+        reel_id: 1 << (
+            len(obligation_keys)
+            + (1 if exact_candidates else 0)
+            + index
+        )
+        for index, reel_id in enumerate(sorted(required_identity_ids))
+    }
+    required_identity_mask = sum(required_identity_bit_by_reel.values())
+    atomic_preference_bit_by_token = {
+        token: 1 << (
+            len(obligation_keys)
+            + (1 if exact_candidates else 0)
+            + len(required_identity_bit_by_reel)
+            + index
+        )
+        for index, token in enumerate(sorted({
+            token
+            for tokens in atomic_preference_tokens_by_reel.values()
+            for token in tokens
+        }))
+    }
+    atomic_preference_mask = sum(atomic_preference_bit_by_token.values())
 
     def closure_mask(closure: set[str]) -> int:
         mask = 0
@@ -1891,6 +2241,10 @@ def _enforce_mandatory_selection(
                 mask |= obligation_bits.get(key, 0)
         if exact_bit and closure & exact_candidates:
             mask |= exact_bit
+        for reel_id in closure:
+            mask |= required_identity_bit_by_reel.get(reel_id, 0)
+            for token in atomic_preference_tokens_by_reel.get(reel_id, ()):
+                mask |= atomic_preference_bit_by_token[token]
         return mask
 
     dependency_closures = {
@@ -1905,6 +2259,9 @@ def _enforce_mandatory_selection(
     for reel_id in reels_by_id:
         closure = dependency_closures[reel_id]
         mask = closure_mask(closure)
+        if reel_id in repeated_prerequisite_umbrella_ids:
+            for key in required_identity_obligation_keys:
+                mask &= ~obligation_bits.get(key, 0)
         closure_bits = sum(1 << reel_indexes[item] for item in closure)
         option = (closure_bits, mask)
         if closure and len(closure) <= effective_release_limit and mask:
@@ -1931,6 +2288,14 @@ def _enforce_mandatory_selection(
         for reel_id in selected_set
         if reel_id in reel_indexes
     )
+    repeated_prerequisite_umbrella_bits = sum(
+        1 << reel_indexes[reel_id]
+        for reel_id in repeated_prerequisite_umbrella_ids
+    )
+    atomic_payoff_bits = sum(
+        1 << reel_indexes[reel_id]
+        for reel_id in atomic_payoff_ids
+    )
     difficulty_by_index = {
         reel_indexes[reel_id]: difficulty
         for reel_id in exact_candidates
@@ -1956,6 +2321,8 @@ def _enforce_mandatory_selection(
             remaining_bits ^= lowest_bit
         quality = (
             min(exact_difficulties, default=math.inf),
+            (selected_bits & repeated_prerequisite_umbrella_bits).bit_count(),
+            -(selected_bits & atomic_payoff_bits).bit_count(),
             (
                 0
                 if not exact_bit
@@ -1984,6 +2351,7 @@ def _enforce_mandatory_selection(
             compressed_options[signature] = (closure_bits, option_mask)
     options = list(compressed_options.values())
     options.sort(key=lambda option: (
+        -(option[1] & required_identity_mask).bit_count(),
         0 if not exact_bit or option[1] & exact_bit else 1,
         selection_quality(option[0])[0],
         -(option[1] & obligation_mask).bit_count(),
@@ -2011,6 +2379,9 @@ def _enforce_mandatory_selection(
     ) -> tuple[Any, ...]:
         quality = selection_quality(selected_bits)
         return (
+            -(
+                covered_mask & required_identity_mask
+            ).bit_count(),
             (
                 0
                 if not required_exact_bit or covered_mask & required_exact_bit
@@ -2023,9 +2394,16 @@ def _enforce_mandatory_selection(
             quality[1],
             quality[2],
             quality[3],
+            quality[4],
+            quality[5],
         )
 
-    target_mask = available_obligation_mask | required_exact_bit
+    target_mask = (
+        available_obligation_mask
+        | required_exact_bit
+        | required_identity_mask
+        | atomic_preference_mask
+    )
     options_by_bit = {
         bit: [
             option
@@ -2313,6 +2691,7 @@ def _enforce_mandatory_selection(
         eligible_selected_bits = 0
         for closure_bits, _option_mask in options:
             eligible_selected_bits |= closure_bits
+        eligible_selected_bits &= ~repeated_prerequisite_umbrella_bits
         maximum_organizer_count = min(
             selected_limit,
             (
@@ -2386,6 +2765,9 @@ def _enforce_mandatory_selection(
                         best_mask = covered_mask
                         best_depth = root_count
                     if (
+                        covered_mask & required_identity_mask
+                        == required_identity_mask
+                        and
                         (
                             not required_exact_bit
                             or covered_mask & required_exact_bit
@@ -2510,6 +2892,9 @@ def _enforce_mandatory_selection(
                     return cached
                 quality = selection_quality(selected_bits)
                 rank = (
+                    -(
+                        covered_mask & required_identity_mask
+                    ).bit_count(),
                     (
                         0
                         if not required_exact_bit
@@ -2524,6 +2909,8 @@ def _enforce_mandatory_selection(
                     quality[1],
                     quality[2],
                     quality[3],
+                    quality[4],
+                    quality[5],
                 )
                 threshold_rank_cache[cache_key] = rank
                 return rank
@@ -2726,6 +3113,8 @@ def _enforce_mandatory_selection(
     # lesson only when their complete dependency closure still fits.
     retained = set(mandatory_ids)
     for reel_id in selected_ids:
+        if reel_id in repeated_prerequisite_umbrella_ids:
+            continue
         closure = dependency_closures[reel_id]
         if len(retained | closure) <= effective_release_limit:
             retained.update(closure)
@@ -2784,9 +3173,33 @@ def _enforce_mandatory_selection(
     retained_input_ids = [
         reel_id for reel_id in reels_by_id if reel_id in retained
     ]
+    reconciliation_topic = ""
+    if added_ids and _EXPLICIT_CONCEPT_SEQUENCE.search(str(topic or "")):
+        topic_tokens = _sequence_tokens(topic)
+        added_has_position = any(
+            _requested_concept_position(
+                reels_by_id[reel_id],
+                topic_tokens=topic_tokens,
+            )
+            is not None
+            for reel_id in added_ids
+            if reel_id in retained
+        )
+        selected_has_position = any(
+            _requested_concept_position(
+                reels_by_id[reel_id],
+                topic_tokens=topic_tokens,
+            )
+            is not None
+            for reel_id in selected_ids
+            if reel_id in retained
+        )
+        if added_has_position and selected_has_position:
+            reconciliation_topic = topic
     ordered_reels, ordered_ids = _constraint_safe_fallback_order(
         [reels_by_id[reel_id] for reel_id in retained_input_ids],
         retained_input_ids,
+        topic=reconciliation_topic,
         preferred_ids=preferred_ids,
     )
     ordered_ids, _ = _filter_same_source_overlaps(
@@ -3885,15 +4298,36 @@ def _order_lesson_batch(
                 before_ids=before_overlap_ids,
                 after_ids=filtered_ids,
             )
+            if not _preserves_source_chronology(filtered_ids, reels_by_id):
+                validation_failures.append("source_chronology_invalid")
+            if not _preserves_declared_dependencies(filtered_ids, reels_by_id):
+                validation_failures.append("dependencies_invalid")
+            _, constraint_ordered_ids = _constraint_safe_fallback_order(
+                [reels_by_id[reel_id] for reel_id in filtered_ids],
+                filtered_ids,
+                preferred_ids=filtered_ids,
+            )
+            if constraint_ordered_ids != filtered_ids:
+                validation_repairs.append("trusted_curriculum_order")
+                filtered_checkpoint_set = set(filtered_checkpoint_ids)
+                filtered_checkpoint_ids = [
+                    reel_id
+                    for reel_id in constraint_ordered_ids
+                    if reel_id in filtered_checkpoint_set
+                ]
+                filtered_terminal_summary_start = (
+                    _surviving_terminal_summary_start(
+                        filtered_terminal_summary_start,
+                        before_ids=filtered_ids,
+                        after_ids=constraint_ordered_ids,
+                    )
+                )
+                filtered_ids = constraint_ordered_ids
             if (
                 set(normalized_required_reel_ids).issubset(ordered_ids)
                 and not set(normalized_required_reel_ids).issubset(filtered_ids)
             ):
                 validation_failures.append("required_ids_removed_by_overlap")
-            if not _preserves_source_chronology(filtered_ids, reels_by_id):
-                validation_failures.append("source_chronology_invalid")
-            if not _preserves_declared_dependencies(filtered_ids, reels_by_id):
-                validation_failures.append("dependencies_invalid")
             if not validation_failures:
                 ordered_ids = filtered_ids
                 checkpoint_ids = filtered_checkpoint_ids
@@ -4053,6 +4487,7 @@ def order_lesson_batch(
     return _enforce_mandatory_selection(
         result,
         original=list(reels),
+        topic=topic,
         remediation_concept_ids=remediation_concept_ids,
         release_limit=release_limit,
         required_reel_ids=required_reel_ids,

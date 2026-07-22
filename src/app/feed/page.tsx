@@ -2649,13 +2649,29 @@ function FeedPageInner() {
     surfaceError?: boolean;
     initialFill?: boolean;
     requestedCount?: number;
+    retryTerminal?: boolean;
   }): Promise<Reel[]> => {
     const allFeedMaterialIds = getFeedMaterialIds();
+    const terminalRetryJobIds = new Map<string, string>();
+    if (options?.retryTerminal) {
+      for (const id of allFeedMaterialIds) {
+        const terminalJobId = String(
+          continuationTokenByMaterialRef.current.get(id) || "",
+        ).trim();
+        if (
+          terminalJobId
+          && lastTerminalStatusByMaterialRef.current.get(id) === "exhausted"
+        ) {
+          terminalRetryJobIds.set(id, terminalJobId);
+        }
+      }
+    }
+    const retryTerminal = terminalRetryJobIds.size > 0;
     if (
       !settingsScopeReady
       || allFeedMaterialIds.length === 0
       || isGeneratingRef.current
-      || !canRequestMore
+      || (!canRequestMore && !retryTerminal)
       || billingWorkBlockedRef.current
     ) {
       return [];
@@ -2667,10 +2683,18 @@ function FeedPageInner() {
       setFeedPagesExhausted(true);
       return [];
     }
-    const feedMaterialIds = allFeedMaterialIds.filter((id) => !isGenerationFinished(id));
+    const feedMaterialIds = retryTerminal
+      ? allFeedMaterialIds.filter((id) => terminalRetryJobIds.has(id))
+      : allFeedMaterialIds.filter((id) => !isGenerationFinished(id));
     if (feedMaterialIds.length === 0) {
       setCanRequestMore(false);
       return [];
+    }
+    if (retryTerminal) {
+      for (const id of feedMaterialIds) {
+        generationFinishedRef.current.delete(id);
+      }
+      setCanRequestMore(true);
     }
     const searchScope = activeSearchScopeRef.current;
     const tuning = getFeedTuningSettings();
@@ -2704,8 +2728,13 @@ function FeedPageInner() {
       const generatedRows = await Promise.all(
         generationPlan.map(async ({ id, batchSize }) => {
           const streamedReels: Reel[] = [];
-          const activeGenerationJob = generationJobByMaterialRef.current.get(id);
-          const continuationToken = continuationTokenByMaterialRef.current.get(id);
+          const activeGenerationJob = retryTerminal
+            ? undefined
+            : generationJobByMaterialRef.current.get(id);
+          const continuationToken = retryTerminal
+            ? undefined
+            : continuationTokenByMaterialRef.current.get(id);
+          const retryTerminalJobId = terminalRetryJobIds.get(id);
           const existingMaterialReels = reelsRef.current.reduce((count, reel) => (
             reel.material_id === id ? count + 1 : count
           ), 0);
@@ -2721,6 +2750,7 @@ function FeedPageInner() {
                 : Math.min(INITIAL_READY_REEL_TARGET, existingMaterialReels + batchSize),
               generationJobId: activeGenerationJob?.jobId,
               continuationToken,
+              retryTerminalJobId,
               ...(adaptiveExcludeVideoIds.length > 0
                 ? { excludeVideoIds: adaptiveExcludeVideoIds }
                 : {}),
@@ -3495,7 +3525,20 @@ function FeedPageInner() {
 
   const bootstrapFirstReels = useCallback(
     async (manual = false) => {
-      if (!materialId || isGeneratingRef.current || !canRequestMore || billingWorkBlockedRef.current) {
+      const terminalRetryAvailable = Boolean(
+        manual
+        && reelsRef.current.length === 0
+        && getFeedMaterialIds().some((id) => (
+          lastTerminalStatusByMaterialRef.current.get(id) === "exhausted"
+          && Boolean(continuationTokenByMaterialRef.current.get(id))
+        )),
+      );
+      if (
+        !materialId
+        || isGeneratingRef.current
+        || (!canRequestMore && !terminalRetryAvailable)
+        || billingWorkBlockedRef.current
+      ) {
         return;
       }
       // Ingest materials: feed is pre-populated via the primed session snapshot.
@@ -3511,6 +3554,15 @@ function FeedPageInner() {
       const reservoirTarget = readyReservoirTarget(generationMode);
       setBootstrappingFirstReels(true);
       try {
+        if (terminalRetryAvailable) {
+          await requestMore({
+            surfaceError: true,
+            initialFill: true,
+            requestedCount: reservoirTarget,
+            retryTerminal: true,
+          });
+          return;
+        }
         // A restored/current session can already contain rows from later
         // durable pages. Walk every still-available persisted page before
         // asking the backend to generate a larger inventory; a duplicate-only

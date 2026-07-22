@@ -162,6 +162,8 @@ def _compact_custom_plan(
                 "id": "subject",
                 "q": claim_quote,
             }],
+            objective_constraint_ids=["subject"],
+            relationship_witnesses=[],
         )],
     )
 
@@ -767,7 +769,7 @@ def test_production_preserves_every_schema_valid_gemini_candidate() -> None:
     assert all(clip["selection_authority"] == "gemini" for clip in report.clips)
 
 
-def test_production_labels_partial_gemini_intent_without_dropping_candidate() -> None:
+def test_support_connection_does_not_claim_objective_coverage() -> None:
     plan = _compact_custom_plan(
         request="derive x squared with the limit definition and finish at two x",
         start_quote="A derivative measures",
@@ -822,7 +824,9 @@ def test_production_labels_partial_gemini_intent_without_dropping_candidate() ->
     assert report.accepted_count == report.proposed_count == 1
     [clip] = report.clips
     assert clip["intent_role"] == "supporting"
-    assert clip["intent_coverage"] == pytest.approx(1 / 3, abs=1e-6)
+    assert clip["intent_coverage"] == 0.0
+    assert clip["intent_obligations"] == []
+    assert len(clip["intent_connections"]) == 1
 
 
 def test_production_keeps_direct_false_topic_supporting_at_full_coverage() -> None:
@@ -2033,6 +2037,8 @@ def test_pro_profile_preserves_audited_split_copula_repair(
                 id="net-force",
                 q=claim,
             )],
+            "objective_constraint_ids": ["net-force"],
+            "relationship_witnesses": [],
         })],
     })
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
@@ -4096,7 +4102,7 @@ def test_trusted_live_units_candidate_advances_to_acceleration_handoff(
     )
 
 
-def test_pro_boundary_route_preserves_model_start_when_claim_is_unanchored(
+def test_pro_boundary_route_fails_closed_without_a_valid_final_audit(
     monkeypatch,
 ) -> None:
     segments = [
@@ -4212,16 +4218,8 @@ def test_pro_boundary_route_preserves_model_start_when_claim_is_unanchored(
         topic="Explain acceleration and its units",
     )
 
-    assert result.error is None
-    assert result.proposed_count == result.accepted_count == 1
-    assert result.rejection_reasons == []
-    [clip] = result.clips
-    assert clip["start_cue_id"] == "Jyiw6KkedDY:cue:1"
-    assert clip["start_quote"] == "units for speed so if you're"
-    assert clip["model_claim_quote"] == raw_claim
-    assert clip["topic_evidence_quote"] == (
-        "acceleration which is simply the rate at which velocity changes"
-    )
+    assert result.error == "GeminiAuditContractError: Gemini model call failed"
+    assert result.clips == []
 
 
 def test_trusted_claim_handoff_requires_the_whole_subject_to_match() -> None:
@@ -8745,6 +8743,13 @@ def test_trusted_candidate_recovers_same_cue_downward_scenario_start() -> None:
                     id="format", q="So let's get the answer for part b",
                 ),
             ],
+            "objective_constraint_ids": [
+                "accel",
+                "units",
+                "mass",
+                "format",
+            ],
+            "relationship_witnesses": [],
         })],
     })
 
@@ -12303,7 +12308,7 @@ def test_pro_audit_shrinks_an_umbrella_to_one_atomic_objective_in_one_call(
     assert rejections == []
     assert len(dispatches) == len(calls) == 1
     assert dispatches[0]["operation"] == "pro_boundary_audit"
-    assert dispatches[0]["prompt_version"] == "pro_candidate_audit_v11"
+    assert dispatches[0]["prompt_version"] == "pro_candidate_audit_v12"
     [topic] = audited.topics
     assert (topic.start_line, topic.end_line) == (0, 0)
     assert topic.end_quote == "and produces ATP"
@@ -12443,6 +12448,15 @@ def _pro_audit_semantic_defaults(
             "id": str(plan.request_intent.constraints[0].constraint_id),
             "q": evidence_quote,
         }]
+    objective_constraint_ids = [
+        str(constraint_id)
+        for constraint_id in proposal.objective_constraint_ids
+    ]
+    if not objective_constraint_ids and proposal.directly_teaches_topic:
+        objective_constraint_ids = [
+            str(item["id"])
+            for item in intent_evidence
+        ]
     return {
         "t": proposal.title,
         "f": proposal.facet,
@@ -12450,6 +12464,26 @@ def _pro_audit_semantic_defaults(
         "a": list(proposal.concept_aliases),
         "direct": proposal.directly_teaches_topic,
         "ie": intent_evidence,
+        "oi": objective_constraint_ids,
+        "rw": [
+            witness.model_dump(mode="json", by_alias=True)
+            for witness in proposal.relationship_witnesses
+        ],
+        "ow": evidence_quote or str(proposal.claim_quote),
+    }
+
+
+def _pro_audit_rejection_defaults(evidence_quote: str) -> dict:
+    return {
+        "t": "Rejected candidate",
+        "f": "rejected candidate",
+        "family": "rejected candidate",
+        "a": [],
+        "direct": False,
+        "ie": [],
+        "oi": [],
+        "rw": [],
+        "ow": evidence_quote,
     }
 
 
@@ -12474,9 +12508,33 @@ def _run_stubbed_pro_candidate_audit(
             "a": "concept_aliases",
             "direct": "directly_teaches_topic",
             "ie": "intent_evidence",
+            "oi": "objective_constraint_ids",
+            "rw": "relationship_witnesses",
+            "ow": "objective_witness_quote",
         }[key]
         if key not in prepared_item and canonical not in prepared_item:
             prepared_item[key] = value
+    if (
+        "oi" not in item
+        and "objective_constraint_ids" not in item
+        and (
+            "direct" in item
+            or "directly_teaches_topic" in item
+        )
+    ):
+        direct = bool(
+            item.get("direct", item.get("directly_teaches_topic", False))
+        )
+        intent_evidence = prepared_item.get("ie") or []
+        prepared_item["oi"] = (
+            [
+                str(evidence["id"])
+                for evidence in intent_evidence
+                if isinstance(evidence, dict) and evidence.get("id")
+            ]
+            if direct
+            else []
+        )
     audit = gemini_segment._ProCandidateAuditPlan(items=[prepared_item])
     monkeypatch.setattr(
         gemini_segment,
@@ -12494,6 +12552,112 @@ def _run_stubbed_pro_candidate_audit(
         deadline=time.monotonic() + 10.0,
         cancelled=None,
     )
+
+
+def _chair_third_law_audit_fixture() -> tuple[
+    gemini_segment._CompactBoundaryPlan,
+    list[dict],
+    str,
+]:
+    request = "Explain Newton's third-law action-reaction pairs"
+    transcript = (
+        "The learner sits in a chair. Gravity pulls the learner downward while "
+        "the normal force pushes the learner upward with equal magnitude. These "
+        "opposite forces balance, so the learner remains still."
+    )
+    connection = "Gravity pulls the learner downward while the normal force"
+    segments = [{
+        "cue_id": "cue-chair-force-balance",
+        "start": 0.0,
+        "end": 12.0,
+        "text": transcript,
+    }]
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": [{
+                "constraint_id": "third-law",
+                "kind": "relationship",
+                "source_phrase": "third-law action-reaction pairs",
+                "requirement": "Explain Newton's third-law action-reaction pairs",
+                "relationship_topology": "reciprocal",
+            }],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="chair-force-pair",
+            start_line=0,
+            end_line=0,
+            start_quote="Gravity pulls the learner downward",
+            end_quote="so the learner remains still",
+            claim_quote=connection,
+            title="Chair Force Pair",
+            learning_objective="Identify the forces acting on a seated learner",
+            facet="forces on a seated learner",
+            concept_family="Newton's third law of motion",
+            concept_aliases=[],
+            informativeness=0.9,
+            topic_relevance=0.9,
+            educational_importance=0.9,
+            difficulty=0.2,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[{"id": "third-law", "q": connection}],
+        )],
+    )
+    return plan, segments, connection
+
+
+def _chair_third_law_audit_item(
+    *,
+    topology: str,
+    links: list[dict],
+) -> dict:
+    connection = "Gravity pulls the learner downward while the normal force"
+    decision_evidence = (
+        "normal force pushes the learner upward with equal magnitude"
+    )
+    return {
+        "id": "candidate-1",
+        "d": "keep",
+        "obj": "Identify reciprocal forces acting on a seated learner",
+        "t": "Chair Force Pair",
+        "f": "forces on a seated learner",
+        "family": "Newton's third law of motion",
+        "a": [],
+        "direct": True,
+        "ie": [{"id": "third-law", "q": connection}],
+        "oi": ["third-law"],
+        "rw": [{
+            "id": "third-law",
+            "k": topology,
+            "m": [
+                {
+                    "n": "gravity force",
+                    "q": "Gravity",
+                    "r": "Gravity pulls the learner downward",
+                },
+                {
+                    "n": "normal force",
+                    "q": "normal force",
+                    "r": "normal force pushes the learner upward",
+                },
+            ],
+            "l": links,
+            "q": connection,
+        }],
+        "ow": decision_evidence,
+        "ev": decision_evidence,
+        "ds": 0,
+        "dq": "Gravity pulls the learner downward",
+        "dc": True,
+        "s": 0,
+        "e": 0,
+        "sq": "Gravity pulls the learner downward",
+        "eq": "so the learner remains still",
+    }
 
 
 def test_pro_candidate_audit_reclassifies_same_body_balanced_forces(
@@ -12524,12 +12688,14 @@ def test_pro_candidate_audit_reclassifies_same_body_balanced_forces(
                     "kind": "relationship",
                     "source_phrase": "balanced forces",
                     "requirement": "Explain balanced forces",
+                    "relationship_topology": "symmetric",
                 },
                 {
                     "constraint_id": "third-law",
                     "kind": "relationship",
                     "source_phrase": "third-law action-reaction pairs",
                     "requirement": "Explain Newton's third-law action-reaction pairs",
+                    "relationship_topology": "reciprocal",
                 },
             ],
         },
@@ -12602,6 +12768,42 @@ def test_pro_candidate_audit_reclassifies_same_body_balanced_forces(
             "ie": [{
                 "id": "balanced",
                 "q": "normal force points straight up with the same magnitude",
+            }],
+            "oi": ["balanced"],
+            "rw": [{
+                "id": "balanced",
+                "k": "symmetric",
+                "m": [
+                    {
+                        "n": "gravity",
+                        "q": "force of gravity",
+                        "r": (
+                            "force of gravity is pulling you down towards the center "
+                            "of the earth"
+                        ),
+                    },
+                    {
+                        "n": "normal",
+                        "q": "normal force",
+                        "r": (
+                            "normal force points straight up with the same magnitude"
+                        ),
+                    },
+                ],
+                "l": [{
+                    "f": "gravity",
+                    "t": "normal",
+                    "q": (
+                        "force of gravity is pulling you down towards the center of "
+                        "the earth, but something called the normal force points "
+                        "straight up with the same magnitude"
+                    ),
+                }],
+                "q": (
+                    "force of gravity is pulling you down towards the center of the "
+                    "earth, but something called the normal force points straight "
+                    "up with the same magnitude"
+                ),
             }],
             "ev": "normal force points straight up with the same magnitude",
             "ds": 0,
@@ -12680,8 +12882,9 @@ def test_pro_candidate_audit_keeps_spoken_two_object_third_law_pair(
             "constraints": [{
                 "constraint_id": "third-law",
                 "kind": "relationship",
-                "source_phrase": "third-law action-reaction pairs",
-                "requirement": "Explain Newton's third-law action-reaction pairs",
+                    "source_phrase": "third-law action-reaction pairs",
+                    "requirement": "Explain Newton's third-law action-reaction pairs",
+                    "relationship_topology": "reciprocal",
             }],
         },
         topics=[gemini_segment._CompactBoundaryTopic(
@@ -12723,6 +12926,23 @@ def test_pro_candidate_audit_keeps_spoken_two_object_third_law_pair(
             "a": ["action-reaction law"],
             "direct": True,
             "ie": [{"id": "third-law", "q": evidence}],
+            "oi": ["third-law"],
+            "rw": [{
+                "id": "third-law",
+                "k": "reciprocal",
+                "m": [
+                    {"n": "skater", "q": "skater", "r": "The skater pushes the wall"},
+                    {"n": "wall", "q": "wall", "r": "the wall pushes the skater back"},
+                ],
+                "l": [
+                    {"f": "skater", "t": "wall", "q": "The skater pushes the wall"},
+                    {"f": "wall", "t": "skater", "q": "the wall pushes the skater back"},
+                ],
+                "q": (
+                    "The skater pushes the wall, and the wall pushes the skater "
+                    "back with equal force in the opposite direction"
+                ),
+            }],
             "ev": evidence,
             "ds": 0,
             "dq": "The skater pushes the wall",
@@ -12740,6 +12960,398 @@ def test_pro_candidate_audit_keeps_spoken_two_object_third_law_pair(
     assert proposal.concept_aliases == []
     assert proposal.directly_teaches_topic is True
     assert proposal.claim_quote == evidence
+
+
+def test_pro_candidate_audit_retries_wrong_relationship_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, segments, _connection = _chair_third_law_audit_fixture()
+    item = _chair_third_law_audit_item(
+        topology="symmetric",
+        links=[{
+            "f": "gravity force",
+            "t": "normal force",
+            "q": (
+                "Gravity pulls the learner downward while the normal force pushes "
+                "the learner upward"
+            ),
+        }],
+    )
+
+    with pytest.raises(gemini_segment._ModelCallError) as exc_info:
+        _run_stubbed_pro_candidate_audit(
+            monkeypatch,
+            plan=plan,
+            segments=segments,
+            item=item,
+        )
+
+    assert len(exc_info.value.selection_attempt_calls) == 2
+    assert "objective_relationship_topology_mismatch" in (
+        exc_info.value.telemetry["audit_contract_rejection_reasons"]
+    )
+    assert exc_info.value.telemetry["error_type"] == "GeminiAuditContractError"
+
+
+def test_pro_candidate_audit_rejects_overlapping_inverse_links_after_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, segments, _connection = _chair_third_law_audit_fixture()
+    item = _chair_third_law_audit_item(
+        topology="reciprocal",
+        links=[
+            {
+                "f": "GRAVITY   FORCE",
+                "t": "normal force",
+                "q": (
+                    "Gravity pulls the learner downward while the normal force"
+                ),
+            },
+            {
+                "f": " Normal   Force ",
+                "t": "gravity  force",
+                "q": (
+                    "Gravity pulls the learner downward while the normal force pushes "
+                    "the learner upward"
+                ),
+            },
+        ],
+    )
+
+    with pytest.raises(gemini_segment._ModelCallError) as exc_info:
+        _run_stubbed_pro_candidate_audit(
+            monkeypatch,
+            plan=plan,
+            segments=segments,
+            item=item,
+        )
+
+    assert len(exc_info.value.selection_attempt_calls) == 2
+    assert "audit_reciprocal_links_overlap" in (
+        exc_info.value.telemetry["audit_contract_rejection_reasons"]
+    )
+
+
+def test_relationship_witness_must_bind_declared_joint_members() -> None:
+    request_intent = gemini_segment._RequestIntent.model_validate({
+        "exact_request": "Compare mitosis and meiosis",
+        "constraints": [
+            {
+                "constraint_id": "mitosis",
+                "kind": "subject",
+                "source_phrase": "mitosis",
+                "source_occurrence": 0,
+                "requirement": "Explain mitosis",
+                "relationship_topology": "not_applicable",
+            },
+            {
+                "constraint_id": "meiosis",
+                "kind": "subject",
+                "source_phrase": "meiosis",
+                "source_occurrence": 0,
+                "requirement": "Explain meiosis",
+                "relationship_topology": "not_applicable",
+            },
+            {
+                "constraint_id": "comparison",
+                "kind": "relationship",
+                "source_phrase": "Compare",
+                "source_occurrence": 0,
+                "requirement": "Compare mitosis and meiosis",
+                "relationship_topology": "symmetric",
+            },
+        ],
+        "joint_structures": [{
+            "member_constraint_ids": ["mitosis", "meiosis"],
+            "relation_constraint_id": "comparison",
+        }],
+    })
+    connection = (
+        "Mitosis produces two similar daughter cells while meiosis produces four "
+        "genetically varied cells"
+    )
+    proposal = gemini_segment._ProCandidateAuditItem.model_validate({
+        "id": "candidate-1",
+        "d": "keep",
+        "obj": "Compare the cell products of mitosis and meiosis",
+        "t": "Mitosis and Meiosis Products",
+        "f": "mitosis versus meiosis products",
+        "family": "mitosis and meiosis comparison",
+        "a": [],
+        "direct": True,
+        "ie": [
+            {"id": "mitosis", "q": "Mitosis produces two similar daughter cells"},
+            {"id": "meiosis", "q": "meiosis produces four genetically varied cells"},
+            {"id": "comparison", "q": connection},
+        ],
+        "oi": ["mitosis", "meiosis", "comparison"],
+        "rw": [{
+            "id": "comparison",
+            "k": "symmetric",
+            "m": [
+                {
+                    "n": "daughter-side",
+                    "q": "daughter cells",
+                    "r": "Mitosis produces two similar daughter cells",
+                },
+                {
+                    "n": "varied-side",
+                    "q": "varied cells",
+                    "r": "meiosis produces four genetically varied cells",
+                },
+            ],
+            "l": [{
+                "f": "daughter-side",
+                "t": "varied-side",
+                "q": connection,
+            }],
+            "q": connection,
+        }],
+        "ow": "Mitosis produces two similar daughter cells",
+        "ev": "Mitosis produces two similar daughter cells",
+        "ds": 0,
+        "dq": "Mitosis produces two similar daughter cells",
+        "dc": True,
+        "s": 0,
+        "e": 0,
+        "sq": "Mitosis produces two similar daughter cells",
+        "eq": "meiosis produces four genetically varied cells",
+    })
+
+    assert gemini_segment._objective_fulfillment_contract_error(
+        request_intent,
+        proposal,
+    ) == "objective_relationship_member_mismatch"
+
+
+@pytest.mark.parametrize("relation_kind", ["task", "outcome"])
+def test_fulfilled_fluid_joint_relation_requires_and_accepts_witness(
+    relation_kind: str,
+) -> None:
+    request_intent = gemini_segment._RequestIntent.model_validate({
+        "exact_request": "Compare caching and batching",
+        "constraints": [
+            {
+                "constraint_id": "caching",
+                "kind": "subject",
+                "source_phrase": "caching",
+                "source_occurrence": 0,
+                "requirement": "Explain caching",
+                "relationship_topology": "not_applicable",
+            },
+            {
+                "constraint_id": "batching",
+                "kind": "subject",
+                "source_phrase": "batching",
+                "source_occurrence": 0,
+                "requirement": "Explain batching",
+                "relationship_topology": "not_applicable",
+            },
+            {
+                "constraint_id": "comparison",
+                "kind": relation_kind,
+                "source_phrase": "Compare",
+                "source_occurrence": 0,
+                "requirement": "Compare caching and batching",
+                "relationship_topology": "not_applicable",
+            },
+        ],
+        "joint_structures": [{
+            "member_constraint_ids": ["caching", "batching"],
+            "relation_constraint_id": "comparison",
+        }],
+    })
+    connection = (
+        "Caching reuses earlier results while batching combines several operations"
+    )
+    payload = {
+        "id": "candidate-1",
+        "d": "keep",
+        "obj": "Compare caching with batching",
+        "t": "Caching and Batching",
+        "f": "caching versus batching",
+        "family": "caching and batching comparison",
+        "a": [],
+        "direct": True,
+        "ie": [
+            {"id": "caching", "q": "Caching reuses earlier results"},
+            {"id": "batching", "q": "batching combines several operations"},
+            {"id": "comparison", "q": connection},
+        ],
+        "oi": ["caching", "batching", "comparison"],
+        "rw": [],
+        "ow": "Caching reuses earlier results while batching",
+        "ev": "Caching reuses earlier results while batching",
+        "ds": 0,
+        "dq": "Caching reuses earlier results",
+        "dc": True,
+        "s": 0,
+        "e": 0,
+        "sq": "Caching reuses earlier results",
+        "eq": "batching combines several operations",
+    }
+    missing = gemini_segment._ProCandidateAuditItem.model_validate(payload)
+    assert gemini_segment._objective_fulfillment_contract_error(
+        request_intent,
+        missing,
+    ) == "objective_relationship_witness_mismatch"
+
+    witnessed = gemini_segment._ProCandidateAuditItem.model_validate({
+        **payload,
+        "rw": [{
+            "id": "comparison",
+            "k": "symmetric",
+            "m": [
+                {
+                    "n": "caching",
+                    "q": "Caching",
+                    "r": "Caching reuses earlier results",
+                },
+                {
+                    "n": "batching",
+                    "q": "batching",
+                    "r": "batching combines several operations",
+                },
+            ],
+            "l": [{
+                "f": "caching",
+                "t": "batching",
+                "q": connection,
+            }],
+            "q": connection,
+        }],
+    })
+    assert gemini_segment._objective_fulfillment_contract_error(
+        request_intent,
+        witnessed,
+    ) is None
+
+
+def test_pro_candidate_audit_accepts_multi_sentence_ordered_circuit_witness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain the ordered current path through a series circuit"
+    transcript = (
+        "The battery drives current into the series circuit. That current reaches "
+        "the first resistor, where part of the voltage drops. The remaining current "
+        "reaches the second resistor, where the next voltage drop occurs."
+    )
+    evidence = "current reaches the first resistor, where part of the voltage drops"
+    segments = [{
+        "cue_id": "cue-series-path",
+        "start": 0.0,
+        "end": 16.0,
+        "text": transcript,
+    }]
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": [{
+                "constraint_id": "path",
+                "kind": "relationship",
+                "source_phrase": "ordered current path",
+                "requirement": "Explain the ordered current path through a series circuit",
+                "relationship_topology": "ordered",
+            }],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="series-current-path",
+            start_line=0,
+            end_line=0,
+            start_quote="The battery drives current into the series circuit",
+            end_quote="where the next voltage drop occurs",
+            claim_quote=evidence,
+            title="Current Through a Series Circuit",
+            learning_objective="Trace current from the battery through consecutive resistors",
+            facet="ordered series-circuit current path",
+            concept_family="series-circuit current path",
+            concept_aliases=[],
+            informativeness=0.94,
+            topic_relevance=0.99,
+            educational_importance=0.93,
+            difficulty=0.3,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[{"id": "path", "q": evidence}],
+        )],
+    )
+
+    audited, _calls, rejections = _run_stubbed_pro_candidate_audit(
+        monkeypatch,
+        plan=plan,
+        segments=segments,
+        item={
+            "id": "candidate-1",
+            "d": "keep",
+            "obj": "Trace current from the battery through consecutive resistors",
+            "t": "Current Through a Series Circuit",
+            "f": "ordered series-circuit current path",
+            "family": "series-circuit current path",
+            "a": [],
+            "direct": True,
+            "ie": [{"id": "path", "q": evidence}],
+            "oi": ["path"],
+            "rw": [{
+                "id": "path",
+                "k": "ordered",
+                "m": [
+                    {
+                        "n": "battery",
+                        "q": "battery",
+                        "r": "The battery drives current into the series circuit",
+                    },
+                    {
+                        "n": "first resistor",
+                        "q": "first resistor",
+                        "r": "current reaches the first resistor",
+                    },
+                    {
+                        "n": "second resistor",
+                        "q": "second resistor",
+                        "r": "current reaches the second resistor",
+                    },
+                ],
+                "l": [
+                    {
+                        "f": "battery",
+                        "t": "first resistor",
+                        "q": (
+                            "The battery drives current into the series circuit. That "
+                            "current reaches the first resistor"
+                        ),
+                    },
+                    {
+                        "f": "first resistor",
+                        "t": "second resistor",
+                        "q": (
+                            "first resistor, where part of the voltage drops. The remaining "
+                            "current reaches the second resistor"
+                        ),
+                    },
+                ],
+                # This local relationship anchor deliberately does not contain either
+                # multi-sentence link or all three role quotes.
+                "q": evidence,
+            }],
+            "ow": "first resistor, where part of the voltage drops",
+            "ev": "first resistor, where part of the voltage drops",
+            "ds": 0,
+            "dq": "The battery drives current into the series circuit",
+            "dc": True,
+            "s": 0,
+            "e": 0,
+            "sq": "The battery drives current into the series circuit",
+            "eq": "where the next voltage drop occurs",
+        },
+    )
+
+    assert rejections == []
+    [proposal] = audited.topics
+    assert proposal.objective_constraint_ids == ["path"]
+    assert proposal.relationship_witnesses[0].topology == "ordered"
 
 
 def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
@@ -12901,6 +13513,9 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
         "a",
         "direct",
         "ie",
+        "oi",
+        "rw",
+        "ow",
         "ev",
         "ds",
         "dq",
@@ -12911,7 +13526,7 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
         "eq",
     } <= audit_required
     assert gemini_segment._PRO_BOUNDARY_AUDIT_PROMPT_VERSION == (
-        "pro_candidate_audit_v11"
+        "pro_candidate_audit_v12"
     )
 
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
@@ -12959,16 +13574,16 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
             {"model": "gemini-3.1-pro-preview", "operation": "pro_boundary_audit"},
         ),
     )
-    retained, _calls, rejection_reasons = gemini_segment._audit_pro_boundaries(
-        plan,
-        segments,
-        request,
-        {},
-        deadline=time.monotonic() + 10.0,
-        cancelled=None,
-    )
-    assert retained == plan
-    assert rejection_reasons == []
+    with pytest.raises(gemini_segment._ModelCallError) as exc_info:
+        gemini_segment._audit_pro_boundaries(
+            plan,
+            segments,
+            request,
+            {},
+            deadline=time.monotonic() + 10.0,
+            cancelled=None,
+        )
+    assert exc_info.value.telemetry["error_type"] == "GeminiAuditContractError"
 
 
 def test_pro_candidate_audit_advances_past_completed_prior_lesson(
@@ -13650,7 +14265,7 @@ def test_pro_candidate_audit_keeps_clean_opening_without_prerequisite(
         (False, "Direct calculation begins here"),
     ],
 )
-def test_pro_candidate_audit_inconsistent_direct_start_commitment_fails_open(
+def test_pro_candidate_audit_inconsistent_direct_start_commitment_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     direct_context_resolved: bool,
     returned_start: str,
@@ -13668,30 +14283,31 @@ def test_pro_candidate_audit_inconsistent_direct_start_commitment_fails_open(
         claim_quote=claim,
     )
 
-    audited, _calls, rejections = _run_stubbed_pro_candidate_audit(
-        monkeypatch,
-        plan=plan,
-        segments=segments,
-        item={
-            "candidate_id": "candidate-1",
-            "decision": "keep",
-            "actual_objective": "Solve for acceleration from net force and mass",
-            "evidence_quote": claim,
-            "direct_start_line": 0,
-            "direct_start_quote": "Direct calculation begins here",
-            "direct_start_context_resolved": direct_context_resolved,
-            "start_line": 0,
-            "end_line": 0,
-            "start_quote": returned_start,
-            "end_quote": "acceleration from net force and mass",
-        },
+    with pytest.raises(gemini_segment._ModelCallError) as exc_info:
+        _run_stubbed_pro_candidate_audit(
+            monkeypatch,
+            plan=plan,
+            segments=segments,
+            item={
+                "candidate_id": "candidate-1",
+                "decision": "keep",
+                "actual_objective": "Solve for acceleration from net force and mass",
+                "evidence_quote": claim,
+                "direct_start_line": 0,
+                "direct_start_quote": "Direct calculation begins here",
+                "direct_start_context_resolved": direct_context_resolved,
+                "start_line": 0,
+                "end_line": 0,
+                "start_quote": returned_start,
+                "end_quote": "acceleration from net force and mass",
+            },
+        )
+    assert "audit_direct_start_invalid" in (
+        exc_info.value.telemetry["audit_contract_rejection_reasons"]
     )
 
-    assert audited == plan
-    assert rejections == []
 
-
-def test_pro_candidate_audit_ungrounded_audit_evidence_retains_original(
+def test_pro_candidate_audit_ungrounded_audit_evidence_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cases = [{
@@ -13717,27 +14333,28 @@ def test_pro_candidate_audit_ungrounded_audit_evidence_retains_original(
             end_quote=case["end_quote"],
             claim_quote=case["claim"],
         )
-        audited, _calls, rejections = _run_stubbed_pro_candidate_audit(
-            monkeypatch,
-            plan=plan,
-            segments=segments,
-            item={
-                "candidate_id": "candidate-1",
-                "decision": "keep",
-                "actual_objective": "Explain the requested relationship",
-                "evidence_quote": case["audit_evidence"],
-                "direct_start_line": 0,
-                "direct_start_quote": case["returned_start"],
-                "direct_start_context_resolved": True,
-                "start_line": 0,
-                "end_line": 0,
-                "start_quote": case["returned_start"],
-                "end_quote": case["end_quote"],
-            },
+        with pytest.raises(gemini_segment._ModelCallError) as exc_info:
+            _run_stubbed_pro_candidate_audit(
+                monkeypatch,
+                plan=plan,
+                segments=segments,
+                item={
+                    "candidate_id": "candidate-1",
+                    "decision": "keep",
+                    "actual_objective": "Explain the requested relationship",
+                    "evidence_quote": case["audit_evidence"],
+                    "direct_start_line": 0,
+                    "direct_start_quote": case["returned_start"],
+                    "direct_start_context_resolved": True,
+                    "start_line": 0,
+                    "end_line": 0,
+                    "start_quote": case["returned_start"],
+                    "end_quote": case["end_quote"],
+                },
+            )
+        assert "audit_decision_evidence_invalid" in (
+            exc_info.value.telemetry["audit_contract_rejection_reasons"]
         )
-
-        assert audited == plan
-        assert rejections == []
 
 
 def test_pro_candidate_audit_untrusted_selector_claim_does_not_block_repair(
@@ -13833,7 +14450,10 @@ def test_pro_boundary_audit_retries_one_schema_failure(
                 "id": "subject",
                 "q": "Bayes' theorem updates a prior probability using the likelihood",
             }],
+            "oi": ["subject"],
+            "rw": [],
             "ev": "Bayes' theorem updates a prior probability using the likelihood",
+            "ow": "Bayes' theorem updates a prior probability using the likelihood",
             "ds": 0,
             "dq": "Bayes' theorem updates a prior probability",
             "dc": True,
@@ -13844,14 +14464,28 @@ def test_pro_boundary_audit_retries_one_schema_failure(
         }]), telemetry
 
     monkeypatch.setattr(gemini_segment, "_call_model", fail_then_recover)
-    retained, calls, rejections = gemini_segment._audit_pro_boundaries(
-        plan,
-        segments,
-        "Bayes' theorem",
-        {},
-        deadline=time.monotonic() + 10.0,
-        cancelled=None,
-    )
+    if retry_recovers:
+        retained, calls, rejections = gemini_segment._audit_pro_boundaries(
+            plan,
+            segments,
+            "Bayes' theorem",
+            {},
+            deadline=time.monotonic() + 10.0,
+            cancelled=None,
+        )
+    else:
+        with pytest.raises(gemini_segment._ModelCallError) as exc_info:
+            gemini_segment._audit_pro_boundaries(
+                plan,
+                segments,
+                "Bayes' theorem",
+                {},
+                deadline=time.monotonic() + 10.0,
+                cancelled=None,
+            )
+        calls = exc_info.value.selection_attempt_calls
+        retained = plan
+        rejections = []
 
     assert attempted == 2
     assert retained.topics[0].concept_family == (
@@ -13911,17 +14545,16 @@ def test_pro_boundary_audit_schema_recovery_cannot_compose_past_three_dispatches
         "generate_json_v3",
         exhausted_transport_then_invalid_schema,
     )
-    retained, calls, rejections = gemini_segment._audit_pro_boundaries(
-        plan,
-        segments,
-        request,
-        {},
-        deadline=time.monotonic() + 10.0,
-        cancelled=None,
-    )
-
-    assert retained == plan
-    assert rejections == []
+    with pytest.raises(gemini_segment._ModelCallError) as exc_info:
+        gemini_segment._audit_pro_boundaries(
+            plan,
+            segments,
+            request,
+            {},
+            deadline=time.monotonic() + 10.0,
+            cancelled=None,
+        )
+    calls = exc_info.value.selection_attempt_calls
     assert configured_retries == [2]
     assert provider_dispatches == 3
     assert [call["physical_dispatches"] for call in calls] == [3]
@@ -13971,23 +14604,109 @@ def test_pro_boundary_audit_recursive_contract_recovery_shares_dispatch_budget(
         "generate_json_v3",
         contract_then_schema_failure,
     )
-    retained, calls, rejections = gemini_segment._audit_pro_boundaries(
-        plan,
-        segments,
-        request,
-        {},
-        deadline=time.monotonic() + 10.0,
-        cancelled=None,
-    )
-
-    assert retained == plan
-    assert rejections == []
+    with pytest.raises(gemini_segment._ModelCallError) as exc_info:
+        gemini_segment._audit_pro_boundaries(
+            plan,
+            segments,
+            request,
+            {},
+            deadline=time.monotonic() + 10.0,
+            cancelled=None,
+        )
+    calls = exc_info.value.selection_attempt_calls
     assert configured_retries == [2, 0]
     assert provider_dispatches == 3
     assert [call["physical_dispatches"] for call in calls] == [2, 1]
     assert calls[0]["contract_retry_attempt"] == 1
     assert calls[1]["contract_retry_attempt"] == 2
     assert calls[1]["structured_retry_exhausted"] is True
+
+
+def test_pro_boundary_audit_contract_retry_uses_grace_after_original_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Bayes' theorem"
+    claim = (
+        "Bayes' theorem updates a prior probability using the observed evidence"
+    )
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="Bayes' theorem updates a prior probability",
+        end_quote="using the observed evidence",
+        claim_quote=claim,
+    )
+    segments = [{
+        "cue_id": "cue-audit-grace",
+        "start": 0.0,
+        "end": 8.0,
+        "text": f"{claim}.",
+    }]
+    valid = gemini_segment._ProCandidateAuditPlan(items=[{
+        **_pro_audit_semantic_defaults(plan, evidence_quote=claim),
+        "id": "candidate-1",
+        "d": "keep",
+        "obj": "Explain how Bayes' theorem updates a prior probability",
+        "ev": claim,
+        "ds": 0,
+        "dq": "Bayes' theorem updates a prior probability",
+        "dc": True,
+        "s": 0,
+        "e": 0,
+        "sq": "Bayes' theorem updates a prior probability",
+        "eq": "using the observed evidence",
+    }])
+    clock = [100.0]
+    deadlines: list[tuple[float, float]] = []
+    attempts = 0
+
+    def invalid_then_valid(_system, _user, _schema, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        deadlines.append((
+            kwargs["deadline_monotonic"],
+            kwargs["initial_attempt_deadline_monotonic"],
+        ))
+        if attempts == 1:
+            clock[0] = 102.0
+            return (
+                gemini_segment._ProCandidateAuditPlan(items=[]),
+                {
+                    "model": "gemini-3.1-pro-preview",
+                    "operation": "pro_boundary_audit",
+                    "physical_dispatches": 1,
+                },
+            )
+        return valid, {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_boundary_audit",
+            "physical_dispatches": 1,
+        }
+
+    monkeypatch.setattr(gemini_segment.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(gemini_segment, "_call_model", invalid_then_valid)
+    audited, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=101.0,
+        cancelled=None,
+    )
+
+    assert attempts == 2
+    assert deadlines == [
+        (101.0 + gemini_segment._PRO_AUDIT_RETRY_GRACE_S, 101.0),
+        (
+            101.0 + gemini_segment._PRO_AUDIT_RETRY_GRACE_S,
+            101.0 + gemini_segment._PRO_AUDIT_RETRY_GRACE_S,
+        ),
+    ]
+    assert len(calls) == 2
+    assert calls[0]["contract_retry_attempt"] == 1
+    assert calls[1]["contract_retry_attempt"] == 2
+    assert calls[1]["contract_retry_recovered"] is True
+    assert len(audited.topics) == 1
+    assert rejections == []
 
 
 def test_pro_boundary_audit_can_repair_beyond_two_coarse_cues(
@@ -14086,7 +14805,7 @@ def test_pro_candidate_audit_can_reject_grounded_unrelated_or_filler(
             claim_quote=evidence,
         )
         audit = gemini_segment._ProCandidateAuditPlan(items=[{
-            **_pro_audit_semantic_defaults(plan),
+            **_pro_audit_rejection_defaults(evidence),
             "candidate_id": "candidate-1",
             "decision": decision,
             "actual_objective": (
@@ -14318,7 +15037,7 @@ def test_pro_candidate_audit_rejects_explicit_newton_law_conflation(
         claim_quote=evidence,
     )
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
-        **_pro_audit_semantic_defaults(plan),
+        **_pro_audit_rejection_defaults(evidence),
         "candidate_id": "candidate-1",
         "decision": "reject_factually_incorrect",
         "actual_objective": "Misidentify action-reaction as Newton's second law",
@@ -14429,7 +15148,7 @@ def test_pro_candidate_audit_factual_uncertainty_fails_open(
     assert dispatches == len(calls) == 1
 
 
-def test_pro_candidate_audit_invalid_or_duplicate_rejection_retains_original(
+def test_pro_candidate_audit_invalid_or_duplicate_rejection_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = "Explain Newton's second law F=ma"
@@ -14457,6 +15176,9 @@ def test_pro_candidate_audit_invalid_or_duplicate_rejection_retains_original(
         claim_quote=claim,
     )
     invalid_reject = {
+        **_pro_audit_rejection_defaults(
+            "Momentum equals mass times velocity in classical mechanics"
+        ),
         "candidate_id": "candidate-1",
         "decision": "reject_unrelated",
         "actual_objective": "Define momentum as mass times velocity",
@@ -14480,17 +15202,16 @@ def test_pro_candidate_audit_invalid_or_duplicate_rejection_retains_original(
                 {"model": "gemini-3.1-pro-preview", "operation": "pro_boundary_audit"},
             ),
         )
-        retained, calls, rejections = gemini_segment._audit_pro_boundaries(
-            plan,
-            segments,
-            request,
-            {},
-            deadline=time.monotonic() + 10.0,
-            cancelled=None,
-        )
-
-        assert retained == plan
-        assert rejections == []
+        with pytest.raises(gemini_segment._ModelCallError) as exc_info:
+            gemini_segment._audit_pro_boundaries(
+                plan,
+                segments,
+                request,
+                {},
+                deadline=time.monotonic() + 10.0,
+                cancelled=None,
+            )
+        calls = exc_info.value.selection_attempt_calls
         assert len(calls) == 2
         assert calls[0]["contract_retry_attempt"] == 1
         assert calls[1]["contract_retry_exhausted"] is True
@@ -14596,18 +15317,18 @@ def test_pro_candidate_audit_retries_extra_unknown_id_then_exhausts(
         }
 
     monkeypatch.setattr(gemini_segment, "_call_model", extra_id_audit)
-    retained, calls, rejections = gemini_segment._audit_pro_boundaries(
-        plan,
-        segments,
-        request,
-        {},
-        deadline=time.monotonic() + 10.0,
-        cancelled=None,
-    )
+    with pytest.raises(gemini_segment._ModelCallError) as exc_info:
+        gemini_segment._audit_pro_boundaries(
+            plan,
+            segments,
+            request,
+            {},
+            deadline=time.monotonic() + 10.0,
+            cancelled=None,
+        )
+    calls = exc_info.value.selection_attempt_calls
 
     assert attempts == 2
-    assert retained == plan
-    assert rejections == []
     assert calls[0]["contract_retry_attempt"] == 1
     assert calls[1]["contract_retry_attempt"] == 2
     assert calls[1]["contract_retry_exhausted"] is True
@@ -15004,7 +15725,7 @@ def test_numeric_prose_is_ignored_and_aliases_are_dropped():
     assert payload["concept_aliases"] == []
 
 
-def test_pro_candidate_audit_cannot_reject_from_unrelated_coarse_cue_tail(
+def test_pro_candidate_audit_invalid_rejection_from_coarse_tail_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = "Explain Newton's second law F=ma"
@@ -15025,7 +15746,9 @@ def test_pro_candidate_audit_cannot_reject_from_unrelated_coarse_cue_tail(
         claim_quote=claim,
     )
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
-        **_pro_audit_semantic_defaults(plan),
+        **_pro_audit_rejection_defaults(
+            "momentum equals mass times velocity in classical mechanics"
+        ),
         "candidate_id": "candidate-1",
         "decision": "reject_unrelated",
         "actual_objective": "Define momentum as mass times velocity",
@@ -15047,17 +15770,18 @@ def test_pro_candidate_audit_cannot_reject_from_unrelated_coarse_cue_tail(
         ),
     )
 
-    retained, _calls, rejections = gemini_segment._audit_pro_boundaries(
-        plan,
-        segments,
-        request,
-        {},
-        deadline=time.monotonic() + 10.0,
-        cancelled=None,
+    with pytest.raises(gemini_segment._ModelCallError) as exc_info:
+        gemini_segment._audit_pro_boundaries(
+            plan,
+            segments,
+            request,
+            {},
+            deadline=time.monotonic() + 10.0,
+            cancelled=None,
+        )
+    assert "audit_rejection_evidence_invalid" in (
+        exc_info.value.telemetry["audit_contract_rejection_reasons"]
     )
-
-    assert retained == plan
-    assert rejections == []
 
 
 def test_pro_candidate_audit_may_drop_untrusted_selector_context_evidence(
@@ -16187,7 +16911,7 @@ def test_exact_preflight_prevents_high_entropy_text_from_exceeding_fast_ceiling(
     monkeypatch.setattr(
         gemini_client,
         "count_request_tokens",
-        lambda *_args, **_kwargs: 250_001,
+        lambda *_args, **_kwargs: 350_001,
     )
 
     def generate(*_args, **kwargs):
@@ -19774,7 +20498,7 @@ def test_live_selector_keeps_case_sensitive_single_letter_joint_members_distinct
     assert contract.intent_signature is not None
     positioned_subject_sources = {
         (source_phrase, source_start)
-        for kind, source_phrase, source_start, _requirement
+        for kind, source_phrase, source_start, _requirement, _topology
         in contract.intent_signature
         if kind == "subject"
     }
@@ -25199,7 +25923,7 @@ def test_trusted_evidence_anchoring_is_stable_under_appended_duplicates() -> Non
 
 def _af169_intent_contract() -> dict:
     return {
-        "version": "expansion_intent_v1",
+        "version": "expansion_intent_v2",
         "request_intent": {
             "exact_request": "Teach glycolysis and the Krebs cycle.",
             "constraints": [
@@ -25209,6 +25933,7 @@ def _af169_intent_contract() -> dict:
                     "source_phrase": "Teach",
                     "source_occurrence": 0,
                     "requirement": "Teach the requested stages",
+                    "relationship_topology": "not_applicable",
                 },
                 {
                     "constraint_id": "glycolysis",
@@ -25216,6 +25941,7 @@ def _af169_intent_contract() -> dict:
                     "source_phrase": "glycolysis",
                     "source_occurrence": 0,
                     "requirement": "Teach glycolysis",
+                    "relationship_topology": "not_applicable",
                 },
                 {
                     "constraint_id": "krebs",
@@ -25223,6 +25949,7 @@ def _af169_intent_contract() -> dict:
                     "source_phrase": "the Krebs cycle",
                     "source_occurrence": 0,
                     "requirement": "Teach the Krebs cycle",
+                    "relationship_topology": "not_applicable",
                 },
             ],
             "joint_structures": [],
@@ -25313,6 +26040,152 @@ def test_bound_selector_keeps_healthy_provider_call_count_unchanged(monkeypatch)
     assert len(calls) == 1
     assert report.clips == []
     assert classification.status == "invalid"
+
+
+def test_healthy_relationship_selector_and_audit_use_exactly_two_calls_no_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain Newton's third-law action-reaction pairs"
+    transcript = (
+        "The skater pushes the wall, and the wall pushes the skater back with "
+        "equal force in the opposite direction."
+    )
+    evidence = "skater pushes the wall, and the wall pushes the skater"
+    witness = {
+        "id": "third-law",
+        "k": "reciprocal",
+        "m": [
+            {"n": "skater", "q": "skater", "r": "The skater pushes the wall"},
+            {"n": "wall", "q": "wall", "r": "the wall pushes the skater back"},
+        ],
+        "l": [
+            {"f": "skater", "t": "wall", "q": "The skater pushes the wall"},
+            {"f": "wall", "t": "skater", "q": "the wall pushes the skater back"},
+        ],
+        "q": (
+            "The skater pushes the wall, and the wall pushes the skater back "
+            "with equal force in the opposite direction"
+        ),
+    }
+    selector_plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": [{
+                "constraint_id": "third-law",
+                "kind": "relationship",
+                "source_phrase": "third-law action-reaction pairs",
+                "source_occurrence": 0,
+                "requirement": "Explain Newton's third-law action-reaction pairs",
+                "relationship_topology": "reciprocal",
+            }],
+            "joint_structures": [],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="skater-wall-pair",
+            start_line=0,
+            end_line=0,
+            start_quote="The skater pushes the wall",
+            end_quote="equal force in the opposite direction",
+            claim_quote=evidence,
+            title="Skater and Wall Force Pair",
+            learning_objective="Identify reciprocal forces between a skater and wall",
+            facet="two-object reciprocal forces",
+            concept_family="Newton's third law of motion",
+            concept_aliases=[],
+            informativeness=0.95,
+            topic_relevance=1.0,
+            educational_importance=0.95,
+            difficulty=0.2,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[{"id": "third-law", "q": evidence}],
+            objective_constraint_ids=["third-law"],
+            relationship_witnesses=[witness],
+        )],
+    )
+    audit_plan = gemini_segment._ProCandidateAuditPlan(items=[{
+        "id": "candidate-1",
+        "d": "keep",
+        "obj": "Identify reciprocal forces between a skater and wall",
+        "t": "Skater and Wall Force Pair",
+        "f": "two-object reciprocal forces",
+        "family": "Newton's third law of motion",
+        "a": [],
+        "direct": True,
+        "ie": [{"id": "third-law", "q": evidence}],
+        "oi": ["third-law"],
+        "rw": [witness],
+        "ow": evidence,
+        "ev": evidence,
+        "ds": 0,
+        "dq": "The skater pushes the wall",
+        "dc": True,
+        "s": 0,
+        "e": 0,
+        "sq": "The skater pushes the wall",
+        "eq": "equal force in the opposite direction",
+    }])
+    schemas: list[type] = []
+
+    def healthy_call(_system, _user, schema, **_kwargs):
+        schemas.append(schema)
+        telemetry = {
+            "model": "gemini-3.1-pro-preview",
+            "operation": (
+                "pro_boundary_audit"
+                if schema is gemini_segment._ProCandidateAuditPlan
+                else "pro_fallback"
+            ),
+            "physical_dispatches": 1,
+            "retries": 0,
+        }
+        if schema is gemini_segment._CompactBoundaryPlan:
+            return selector_plan, telemetry
+        if schema is gemini_segment._ProCandidateAuditPlan:
+            return audit_plan, telemetry
+        raise AssertionError(f"unexpected healthy schema: {schema}")
+
+    def fail_sleep(*_args, **_kwargs) -> None:
+        raise AssertionError("healthy selector and audit must not sleep")
+
+    monkeypatch.setattr(gemini_segment, "_call_model", healthy_call)
+    monkeypatch.setattr(gemini_segment.time, "sleep", fail_sleep)
+    report, classification, calls = gemini_segment._run_selection_profile(
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        {
+            "segments": [{
+                "cue_id": "cue-healthy-third-law",
+                "start": 0.0,
+                "end": 8.0,
+                "text": transcript,
+            }],
+            "words": [],
+            "source": "supadata",
+        },
+        request,
+        {},
+        deadline=time.monotonic() + 120.0,
+        cancelled=lambda: False,
+    )
+
+    assert schemas == [
+        gemini_segment._CompactBoundaryPlan,
+        gemini_segment._ProCandidateAuditPlan,
+    ]
+    assert len(calls) == 2
+    assert [call["physical_dispatches"] for call in calls] == [1, 1]
+    assert [call["retries"] for call in calls] == [0, 0]
+    assert not any(
+        value
+        for call in calls
+        for key, value in call.items()
+        if "retry_" in key
+    )
+    assert report.accepted_count == 1
+    assert classification.status == "green"
 
 
 def test_invalid_upstream_contract_preserves_same_call_interpretation(monkeypatch) -> None:

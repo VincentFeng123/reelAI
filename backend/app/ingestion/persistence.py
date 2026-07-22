@@ -31,7 +31,11 @@ import unicodedata
 import uuid
 from typing import Any
 
-from ...concept_families import concept_family_identity_key
+from ...concept_families import (
+    CONCEPT_FAMILY_CONTRACT_VERSION,
+    concept_family_identity_key,
+    validate_concept_family_labels,
+)
 from ...concept_tokens import semantic_tokens
 from .. import db as db_module
 from ..db import (
@@ -464,6 +468,8 @@ def update_reel_boundary_state(
     conn: Any,
     *,
     reel_id: str,
+    material_id: str,
+    concept_id: str,
     video_url: str,
     t_start: float,
     t_end: float,
@@ -503,7 +509,86 @@ def update_reel_boundary_state(
         """,
         params,
     )
-    return bool(changed)
+    if not changed:
+        return False
+    _record_concept_family_profile(
+        conn,
+        material_id=material_id,
+        concept_id=concept_id,
+        search_context=search_context,
+    )
+    return True
+
+
+def _record_concept_family_profile(
+    conn: Any,
+    *,
+    material_id: str,
+    concept_id: str,
+    search_context: dict[str, Any] | None,
+) -> None:
+    """Persist one fail-closed Gemini family identity per exact concept ID."""
+    context = dict(search_context or {})
+    contract_version = str(
+        context.get("concept_family_contract_version") or ""
+    ).strip()
+    selection_authority = str(
+        context.get("selection_authority") or ""
+    ).strip().casefold()
+    concept_family = " ".join(
+        unicodedata.normalize(
+            "NFC",
+            str(context.get("concept_family") or ""),
+        ).split()
+    ).strip()
+    aliases = context.get("concept_aliases")
+    family_identity = concept_family_identity_key(concept_family)
+    valid_profile = bool(
+        contract_version == CONCEPT_FAMILY_CONTRACT_VERSION
+        and selection_authority == "gemini"
+        and aliases == []
+        and validate_concept_family_labels(concept_family, aliases) is None
+        and family_identity
+    )
+    timestamp = now_iso()
+    if not valid_profile:
+        execute_modify(
+            conn,
+            "UPDATE concept_family_profiles "
+            "SET conflicted = 1, updated_at = ? WHERE concept_id = ?",
+            (timestamp, concept_id),
+        )
+        return
+
+    execute_modify(
+        conn,
+        """
+        INSERT INTO concept_family_profiles (
+            concept_id, material_id, contract_version, selection_authority,
+            concept_family, family_identity, conflicted, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+        ON CONFLICT(concept_id) DO UPDATE SET
+            conflicted = CASE
+                WHEN concept_family_profiles.material_id = excluded.material_id
+                 AND concept_family_profiles.contract_version = excluded.contract_version
+                 AND concept_family_profiles.selection_authority = excluded.selection_authority
+                 AND concept_family_profiles.family_identity = excluded.family_identity
+                THEN concept_family_profiles.conflicted
+                ELSE 1
+            END,
+            updated_at = excluded.updated_at
+        """,
+        (
+            concept_id,
+            material_id,
+            contract_version,
+            selection_authority,
+            concept_family,
+            family_identity,
+            timestamp,
+            timestamp,
+        ),
+    )
 
 
 def upsert_reel_row(
@@ -557,9 +642,15 @@ def upsert_reel_row(
     }
     try:
         insert(conn, "reels", row)
-        return True
     except DatabaseIntegrityError:
         return False
+    _record_concept_family_profile(
+        conn,
+        material_id=material_id,
+        concept_id=concept_id,
+        search_context=search_context,
+    )
+    return True
 
 
 def load_reel_row_by_id(conn: Any, reel_id: str) -> dict[str, Any] | None:

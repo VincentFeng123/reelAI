@@ -140,8 +140,8 @@ class GenerationBudget:
         # distinct named facets. Keep two additional logical reservations so a
         # rejected provider cursor can be isolated and discovery can continue
         # through one independent query branch.
-        "fast": {"search": 5, "transcript": 2, "segmentation": 2},
-        "slow": {"search": 5, "transcript": 3, "segmentation": 3},
+        "fast": {"search": 5, "transcript": 3, "segmentation": 3},
+        "slow": {"search": 5, "transcript": 5, "segmentation": 5},
     }
     _PASS_LIMITS: dict[GenerationMode, tuple[int, int]] = {
         "fast": (1, 0),
@@ -155,12 +155,12 @@ class GenerationBudget:
         # Each source may use one medium-thinking Pro selector plus one
         # high-thinking transcript-only final audit. Keep enough headroom for
         # both bounded calls without allowing an audit to disappear at release.
-        "fast": 1.00,
-        "slow": 1.50,
+        "fast": 1.50,
+        "slow": 2.50,
     }
     _SELECTOR_CALL_LIMIT: dict[GenerationMode, int] = {
-        "fast": 2,
-        "slow": 3,
+        "fast": 3,
+        "slow": 5,
     }
     _BOUNDARY_AUDIT_CALL_LIMIT = _SELECTOR_CALL_LIMIT
     # Compatibility alias for older diagnostics/tests.  The active production

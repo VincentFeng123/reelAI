@@ -60,6 +60,7 @@ class ReelsGenerateRequest(BaseModel):
     num_reels: int = Field(default=20, ge=1, le=300)
     exclude_video_ids: list[str] = Field(default_factory=list, max_length=500)
     continuation_token: str | None = Field(default=None, max_length=128)
+    retry_terminal_job_id: str | None = Field(default=None, max_length=128)
     creative_commons_only: bool = False
     generation_mode: Literal["slow", "fast"] = "slow"
     min_relevance: float | None = Field(default=None, ge=-1.0, le=1.2)

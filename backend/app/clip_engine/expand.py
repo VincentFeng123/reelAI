@@ -11,7 +11,7 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Literal
@@ -43,24 +43,46 @@ PRACTICE_FAST_EXPAND_MODEL = "gemini-3.1-flash-lite"
 PRACTICE_FAST_EXPAND_TIMEOUT_MS = 10_000
 PRACTICE_FAST_EXPAND_OUTPUT_TOKENS = 2_048
 PRACTICE_FAST_EXPAND_ATTEMPTS = 2
-PRACTICE_FAST_EXPAND_CACHE_VERSION = 12
-PRACTICE_FAST_INTENT_CONTRACT_VERSION = "expansion_intent_v1"
+PRACTICE_FAST_EXPAND_CACHE_VERSION = 13
+PRACTICE_FAST_INTENT_CONTRACT_VERSION = "expansion_intent_v2"
 # An expansion can be nearly one segment-cache lifetime old when it discovers a
 # newly analyzed source. Keeping it for two lifetimes guarantees that source's
 # subsequent valid segment-cache lifetime never triggers another expansion call.
 PRACTICE_FAST_EXPAND_CACHE_TTL_SEC = 2 * SEGMENT_CACHE_TTL_SEC
+RECOVERY_REASON_ZERO_SEARCH_RESULTS = "zero_search_results"
+RECOVERY_REASON_ZERO_VALID_CLIPS = "zero_valid_clips"
+
+
+def _normalized_recovery_reason(value: object) -> str:
+    return (
+        RECOVERY_REASON_ZERO_VALID_CLIPS
+        if str(value or "").strip().casefold()
+        == RECOVERY_REASON_ZERO_VALID_CLIPS
+        else RECOVERY_REASON_ZERO_SEARCH_RESULTS
+    )
+
+
+def _normalized_rejected_video_ids(values: Sequence[str]) -> list[str]:
+    return sorted({
+        video_id
+        for raw_value in values
+        if (video_id := " ".join(str(raw_value or "").split()))
+    })
 
 
 def _require_source_occurrence_schema(schema: dict[str, object]) -> None:
-    """Keep old fixtures readable while requiring positioned live output."""
+    """Keep old fixtures readable while requiring live intent identity fields."""
     required = schema.setdefault("required", [])
-    if isinstance(required, list) and "source_occurrence" not in required:
-        required.append("source_occurrence")
+    if isinstance(required, list):
+        for field_name in ("source_occurrence", "relationship_topology"):
+            if field_name not in required:
+                required.append(field_name)
     properties = schema.get("properties")
     if isinstance(properties, dict):
-        field_schema = properties.get("source_occurrence")
-        if isinstance(field_schema, dict):
-            field_schema.pop("default", None)
+        for field_name in ("source_occurrence", "relationship_topology"):
+            field_schema = properties.get(field_name)
+            if isinstance(field_schema, dict):
+                field_schema.pop("default", None)
 
 
 def _require_joint_structures_schema(schema: dict[str, object]) -> None:
@@ -93,7 +115,14 @@ class _PracticeFastIntentConstraint(BaseModel):
     source_phrase: str = Field(min_length=1, max_length=160)
     source_occurrence: int = Field(default=0, ge=0, strict=True)
     requirement: str = Field(min_length=1, max_length=240)
-
+    relationship_topology: Literal[
+        "directed",
+        "reciprocal",
+        "symmetric",
+        "ordered",
+        "unspecified",
+        "not_applicable",
+    ] = "not_applicable"
 
 class _PracticeFastJointStructure(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -151,6 +180,20 @@ class _PracticeFastExpansion(BaseModel):
 
     @model_validator(mode="after")
     def _unique_intent_ids(self):
+        if any(
+            (
+                constraint.kind == "relationship"
+                and constraint.relationship_topology == "not_applicable"
+            )
+            or (
+                constraint.kind != "relationship"
+                and constraint.relationship_topology != "not_applicable"
+            )
+            for constraint in self.intent_constraints
+        ):
+            raise ValueError(
+                "relationship topology must match the relationship constraint kind"
+            )
         ids = [constraint.constraint_id for constraint in self.intent_constraints]
         if len(set(ids)) != len(ids):
             raise ValueError("intent constraint ids must be unique")
@@ -219,7 +262,7 @@ class _PracticeFastRequestIntent(BaseModel):
 class _PracticeFastIntentContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    version: Literal["expansion_intent_v1"]
+    version: Literal["expansion_intent_v2"]
     request_intent: _PracticeFastRequestIntent
 
 
@@ -275,10 +318,15 @@ Do this:
    each variable," Newton's second law F=ma is SUBJECT,
    Explain is TASK, net force, mass, acceleration, and units are four separate SCOPE constraints,
    and solving for each variable is OUTCOME.
-7. Return joint_structures=[] when no explicit comparison, contrast, transition, or ordered
-   relationship is requested. Otherwise return one item per relationship: member_constraint_ids
-   names its separately declared sides or stages and relation_constraint_id names its separately
-   declared relationship constraint. Never bundle named members merely to make this graph.
+7. Every intent constraint sets relationship_topology. Use not_applicable for every
+   non-relationship constraint. For a relationship constraint use reciprocal for explicit two-way
+   interactions such as action-reaction, symmetric for balance/equivalence/undirected comparison,
+   directed for one-way causal or dependency relationships, ordered for explicit stage/curriculum
+   sequences, and unspecified only when the request does not determine a direction class. Return
+   joint_structures=[] when no explicit comparison, contrast, transition, or ordered relationship
+   is requested. Otherwise return one item per relationship: member_constraint_ids names its
+   separately declared sides or stages and relation_constraint_id names its separately declared
+   relationship constraint. Never bundle named members merely to make this graph.
 8. For corrected, return summary_preserved_constraint_ids containing exactly every intent
    constraint ID that corrected preserves. corrected must preserve all of them. List each ID
    exactly once, with no omissions, duplicates, or unknown IDs; if any requirement is absent,
@@ -306,7 +354,15 @@ def literal_fallback(topic: str, n: int) -> dict:
     }
 
 
-def _expansion_cache_key(topic: str, n: int, level: str | None) -> str:
+def _expansion_cache_key(
+    topic: str,
+    n: int,
+    level: str | None,
+    *,
+    tried_queries: Sequence[str] = (),
+    recovery_reason: str | None = None,
+    rejected_video_ids: Sequence[str] = (),
+) -> str:
     contract = {
         "version": PRACTICE_FAST_EXPAND_CACHE_VERSION,
         "topic": topic,
@@ -316,6 +372,20 @@ def _expansion_cache_key(topic: str, n: int, level: str | None) -> str:
         "prompt_sha256": hashlib.sha256(_PRACTICE_FAST_SYSTEM.encode("utf-8")).hexdigest(),
         "schema": _PracticeFastExpansion.model_json_schema(),
     }
+    normalized_tried = _normalize(list(tried_queries), len(tried_queries))
+    if normalized_tried:
+        # A recovery must not reuse the healthy-path expansion or another
+        # recovery whose search/clip evidence rejected different inputs.
+        contract["zero_result_recovery"] = True
+        contract["recovery_reason"] = _normalized_recovery_reason(
+            recovery_reason
+        )
+        contract["tried_queries"] = normalized_tried
+        normalized_rejected_ids = _normalized_rejected_video_ids(
+            rejected_video_ids
+        )
+        if normalized_rejected_ids:
+            contract["rejected_video_ids"] = normalized_rejected_ids
     encoded = json.dumps(
         contract,
         ensure_ascii=True,
@@ -657,6 +727,9 @@ async def _practice_fast_gemini_raw_async(
     level: str | None,
     should_cancel: Callable[[], bool] | None,
     context: "GenerationContext | None" = None,
+    tried_queries: Sequence[str] = (),
+    recovery_reason: str | None = None,
+    rejected_video_ids: Sequence[str] = (),
 ) -> str:
     """Make the path's single provider call. There is intentionally no model fallback."""
     raise_if_cancelled(should_cancel)
@@ -678,6 +751,33 @@ async def _practice_fast_gemini_raw_async(
         "Return corrected, intent_constraints, joint_structures, "
         "summary_preserved_constraint_ids, and queries as JSON."
     )
+    normalized_tried = _normalize(list(tried_queries), len(tried_queries))
+    if normalized_tried:
+        normalized_reason = _normalized_recovery_reason(recovery_reason)
+        if normalized_reason == RECOVERY_REASON_ZERO_VALID_CLIPS:
+            normalized_rejected_ids = _normalized_rejected_video_ids(
+                rejected_video_ids
+            )
+            user += (
+                "\nZERO_VALID_CLIP_RECOVERY: YouTube videos were found, but "
+                "transcript retrieval, selector/audit validation, or boundary "
+                "validation produced zero valid educational clips. Return N "
+                "novel, concise, intent-grounded alternatives aimed at different "
+                "sources; do not repeat the failed search wording or rejected "
+                "videos.\nPreviously tried queries: "
+                + json.dumps(normalized_tried, ensure_ascii=True)
+                + "\nRejected video IDs: "
+                + json.dumps(normalized_rejected_ids, ensure_ascii=True)
+            )
+        else:
+            user += (
+                "\nZERO_SEARCH_RESULT_RECOVERY: Supadata returned zero eligible "
+                "YouTube videos for every previously tried query. Return N novel, "
+                "concise, intent-grounded alternatives and do not repeat or "
+                "paraphrase only the same failed search wording.\nPreviously "
+                "tried queries: "
+                + json.dumps(normalized_tried, ensure_ascii=True)
+            )
     reservation: dict[str, object] = {}
     try:
         if context is not None:
@@ -767,6 +867,9 @@ def _practice_fast_gemini_raw(
     level: str | None = None,
     should_cancel: Callable[[], bool] | None = None,
     context: "GenerationContext | None" = None,
+    tried_queries: Sequence[str] = (),
+    recovery_reason: str | None = None,
+    rejected_video_ids: Sequence[str] = (),
 ) -> str:
     return run_cancellable(
         lambda: _practice_fast_gemini_raw_async(
@@ -776,6 +879,9 @@ def _practice_fast_gemini_raw(
             level=level,
             should_cancel=should_cancel,
             context=context,
+            tried_queries=tried_queries,
+            recovery_reason=recovery_reason,
+            rejected_video_ids=rejected_video_ids,
         ),
         should_cancel,
     )
@@ -834,6 +940,9 @@ def expand_query_practice_fast(
     should_cancel: Callable[[], bool] | None = None,
     *,
     context: "GenerationContext | None" = None,
+    tried_queries: Sequence[str] = (),
+    recovery_reason: str | None = None,
+    rejected_video_ids: Sequence[str] = (),
 ) -> dict:
     """Return cached Flash search terms, failing safely to the literal request.
 
@@ -844,9 +953,35 @@ def expand_query_practice_fast(
     count = max(0, int(n))
     if not topic or count == 0:
         return literal_fallback(topic, count)
+    normalized_tried = _normalize(list(tried_queries), len(tried_queries))
+    tried_keys = {_key(query) for query in normalized_tried}
+    recovering_zero_results = bool(normalized_tried)
     raise_if_cancelled(should_cancel)
-    cache_key = _expansion_cache_key(topic, count, level) if context is not None else ""
+    cache_key = (
+        _expansion_cache_key(
+            topic,
+            count,
+            level,
+            tried_queries=normalized_tried,
+            recovery_reason=recovery_reason,
+            rejected_video_ids=rejected_video_ids,
+        )
+        if context is not None
+        else ""
+    )
     cached = _read_cached_expansion(cache_key, count) if cache_key else None
+    if cached is not None:
+        if recovering_zero_results:
+            cached = {
+                **cached,
+                "queries": [
+                    query
+                    for query in cached["queries"]
+                    if _key(query) not in tried_keys
+                ],
+            }
+            if not cached["queries"]:
+                cached = None
     if cached is not None:
         context.increment_counter("expansion_cache_hits")
         context.record_cache_hit(
@@ -859,6 +994,18 @@ def expand_query_practice_fast(
     errors: list[str] = []
     with singleflight(cache_key, should_cancel) if cache_key else nullcontext():
         cached = _read_cached_expansion(cache_key, count) if cache_key else None
+        if cached is not None:
+            if recovering_zero_results:
+                cached = {
+                    **cached,
+                    "queries": [
+                        query
+                        for query in cached["queries"]
+                        if _key(query) not in tried_keys
+                    ],
+                }
+                if not cached["queries"]:
+                    cached = None
         if cached is not None:
             context.increment_counter("expansion_cache_hits")
             context.record_cache_hit(
@@ -877,14 +1024,31 @@ def expand_query_practice_fast(
                 }
                 if context is not None:
                     kwargs["context"] = context
+                if recovering_zero_results:
+                    kwargs["tried_queries"] = normalized_tried
+                    kwargs["recovery_reason"] = _normalized_recovery_reason(
+                        recovery_reason
+                    )
+                    kwargs["rejected_video_ids"] = (
+                        _normalized_rejected_video_ids(rejected_video_ids)
+                    )
                 raw = _practice_fast_gemini_raw(topic, count, **kwargs)
                 parsed = _PracticeFastExpansion.model_validate_json(raw)
                 corrected = " ".join(str(parsed.corrected or topic).split()) or topic
                 queries = _validated_ai_queries(topic, parsed, count)
+                if recovering_zero_results:
+                    queries = [
+                        query
+                        for query in queries
+                        if _key(query) not in tried_keys
+                    ]
                 if not queries:
                     raise ValueError(
-                        "Gemini returned no search query preserving the exact intent "
-                        "contract"
+                        "Gemini returned no novel search query preserving the exact "
+                        "intent contract"
+                        if recovering_zero_results
+                        else "Gemini returned no search query preserving the exact "
+                        "intent contract"
                     )
                 raise_if_cancelled(should_cancel)
                 intent_contract_model = _PracticeFastIntentContract(
@@ -927,6 +1091,16 @@ def expand_query_practice_fast(
                     or not _practice_fast_failure_is_retryable(exc)
                 ):
                     break
+    if recovering_zero_results:
+        logger.info(
+            "practice-fast Gemini zero-result recovery unavailable: %s",
+            "; ".join(errors),
+        )
+        return {
+            "corrected": topic,
+            "queries": [],
+            "provider_used": "gemini_recovery_unavailable",
+        }
     logger.info(
         "practice-fast Gemini expansion unavailable; using literal fallback: %s",
         "; ".join(errors),

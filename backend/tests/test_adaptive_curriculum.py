@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -13,7 +14,9 @@ if str(ROOT) not in sys.path:
 
 from backend.app.db import SCHEMA, _migrate_reel_feedback_uniqueness_sqlite
 from backend.app.db import now_iso
+from backend.app.ingestion import persistence as persistence_module
 from backend.app.ingestion.persistence import ensure_clip_concept
+from backend.app.services import reels as reels_module
 from backend.app.services.reels import ReelService
 
 
@@ -77,6 +80,35 @@ class AdaptiveCurriculumTests(unittest.TestCase):
             ),
         )
 
+    def _set_family_context(
+        self,
+        *,
+        reel_id: str,
+        concept_id: str,
+        family: str,
+        aliases: list[str] | None = None,
+        contract_version: str = "concept_family_v3",
+        selection_authority: str = "gemini",
+    ) -> dict:
+        context = {
+            "selection_contract_version": "quality_silence_v40",
+            "selection_authority": selection_authority,
+            "concept_family_contract_version": contract_version,
+            "concept_family": family,
+            "concept_aliases": [] if aliases is None else aliases,
+        }
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = ?",
+            (json.dumps(context), reel_id),
+        )
+        persistence_module._record_concept_family_profile(
+            self.conn,
+            material_id=self.MATERIAL,
+            concept_id=concept_id,
+            search_context=context,
+        )
+        return context
+
     @staticmethod
     def _item(
         reel_id: str,
@@ -127,6 +159,142 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         )
         self.assertEqual([row["reel_id"] for row in ordered], ["A1", "B1", "A2", "B2"])
 
+    def test_fresh_learner_family_adaptation_adds_no_profile_query(self) -> None:
+        items = [
+            self._item("fresh-a", "c1", "va", 10, 10, 0.2),
+            self._item("fresh-b", "c2", "vb", 10, 9, 0.2),
+        ]
+        with mock.patch.object(
+            self.svc,
+            "_persisted_concept_family_profiles",
+            side_effect=AssertionError("fresh feeds must not load family profiles"),
+        ):
+            ordered = self.svc.adaptive_curriculum_order(
+                self.conn,
+                self.MATERIAL,
+                self.LEARNER,
+                items,
+            )
+        self.assertEqual([row["reel_id"] for row in ordered], ["fresh-a", "fresh-b"])
+
+    def test_post_feedback_family_profile_query_is_one_row_per_relevant_concept(
+        self,
+    ) -> None:
+        for concept_id, title in (
+            ("c1", "formula and units"),
+            ("c2", "force calculation and units"),
+            ("other", "Newton's first-law inertia"),
+        ):
+            if concept_id in {"c1", "c2"}:
+                self.conn.execute(
+                    "UPDATE concepts SET title = ? WHERE id = ?",
+                    (title, concept_id),
+                )
+            else:
+                self.conn.execute(
+                    "INSERT INTO concepts "
+                    "(id, material_id, title, keywords_json, summary, "
+                    "embedding_json, created_at) "
+                    "VALUES (?, ?, ?, '[]', '', NULL, "
+                    "'2026-07-09T00:00:01+00:00')",
+                    (concept_id, self.MATERIAL, title),
+                )
+        family_context = {
+            "selection_contract_version": "quality_silence_v40",
+            "selection_authority": "gemini",
+            "concept_family_contract_version": "concept_family_v3",
+            "concept_family": "Newton's second law of motion",
+            "concept_aliases": [],
+            "irrelevant_payload": "x" * 512,
+        }
+        self.assertTrue(persistence_module.upsert_reel_row(
+            self.conn,
+            reel_id="family-signal",
+            material_id=self.MATERIAL,
+            concept_id="c1",
+            video_id="va",
+            video_url="https://youtube.test/va",
+            t_start=1.0,
+            t_end=21.0,
+            transcript_snippet="signal",
+            takeaways=[],
+            difficulty=0.4,
+            search_context=family_context,
+        ))
+        for index in range(400):
+            start = 31.0 + index * 25.0
+            self.assertTrue(persistence_module.upsert_reel_row(
+                self.conn,
+                reel_id=f"same-concept-history-{index}",
+                material_id=self.MATERIAL,
+                concept_id="c2",
+                video_id="vb",
+                video_url="https://youtube.test/vb",
+                t_start=start,
+                t_end=start + 20.0,
+                transcript_snippet="same relevant concept",
+                takeaways=[],
+                difficulty=0.4,
+                search_context=family_context,
+            ))
+        profile_counts = self.conn.execute(
+            "SELECT concept_id, COUNT(*) AS profile_count "
+            "FROM concept_family_profiles GROUP BY concept_id ORDER BY concept_id"
+        ).fetchall()
+        self.assertEqual(
+            [(row["concept_id"], row["profile_count"]) for row in profile_counts],
+            [("c1", 1), ("c2", 1)],
+        )
+
+        self.svc.record_feedback(
+            self.conn,
+            "family-signal",
+            helpful=True,
+            confusing=False,
+            rating=None,
+            saved=False,
+            learner_id=self.LEARNER,
+        )
+
+        original_fetch_all = reels_module.fetch_all
+        profile_reads: list[tuple[str, tuple[object, ...], int]] = []
+        reel_json_profile_reads: list[str] = []
+
+        def traced_fetch_all(conn, query, params=()):
+            result = original_fetch_all(conn, query, params)
+            normalized_query = " ".join(query.split())
+            if "FROM concept_family_profiles" in normalized_query:
+                profile_reads.append((query, tuple(params), len(result)))
+            if (
+                "SELECT concept_id, search_context_json FROM reels"
+                in normalized_query
+            ):
+                reel_json_profile_reads.append(query)
+            return result
+
+        with mock.patch.object(
+            reels_module,
+            "fetch_all",
+            side_effect=traced_fetch_all,
+        ):
+            ordered = self.svc.adaptive_curriculum_order(
+                self.conn,
+                self.MATERIAL,
+                self.LEARNER,
+                [
+                    self._item("same-family", "c2", "vb", 80, 10, 0.4),
+                    self._item("different", "other", "vc", 80, 1, 0.4),
+                ],
+            )
+
+        self.assertEqual(ordered[0]["reel_id"], "different")
+        self.assertEqual(reel_json_profile_reads, [])
+        self.assertEqual(len(profile_reads), 1)
+        query, params, row_count = profile_reads[0]
+        self.assertIn("concept_id IN", " ".join(query.split()))
+        self.assertEqual(set(params), {self.MATERIAL, "c1", "c2", "other"})
+        self.assertEqual(row_count, 2)
+
     def test_unseen_tail_starts_from_another_source_when_available(self) -> None:
         items = [
             self._item("same-source", "c1", "va", 10, 10, 0.2),
@@ -160,7 +328,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         )[1]
         self.assertAlmostEqual(adjustments["c1"], 0.04)
 
-    def test_semantic_family_does_not_propagate_exact_thumb_signals(self) -> None:
+    def test_adaptive_order_propagates_only_trusted_family_thumb_signals(self) -> None:
         family = {
             "action": "action-reaction pairs",
             "identify": "identifying action-reaction pairs",
@@ -189,18 +357,10 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                     30 + index * 20,
                     0.4,
                 )
-            self.conn.execute(
-                "UPDATE reels SET search_context_json = ? WHERE id = ?",
-                (
-                    json.dumps({
-                        "selection_contract_version": "quality_silence_v39",
-                        "selection_authority": "gemini",
-                        "concept_family_contract_version": "concept_family_v3",
-                        "concept_family": "Newton's third law of motion",
-                        "concept_aliases": [],
-                    }),
-                    reel_id,
-                ),
+            self._set_family_context(
+                reel_id=reel_id,
+                concept_id=concept_id,
+                family="Newton's third law of motion",
             )
 
         self.svc.record_feedback(
@@ -231,7 +391,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                 self._item("different", "c2", "vc", 10, 1, 0.3),
             ],
         )
-        self.assertEqual(helpful_order[0]["reel_id"], "family-repeat")
+        self.assertEqual(helpful_order[0]["reel_id"], "different")
 
         self.svc.record_feedback(
             self.conn,
@@ -261,7 +421,87 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                 self._item("different", "c2", "vc", 10, 10, 0.3),
             ],
         )
-        self.assertEqual(confusing_order[0]["reel_id"], "different")
+        self.assertEqual(confusing_order[0]["reel_id"], "family-remediation")
+
+    def test_adaptive_order_propagates_trusted_family_quiz_outcomes(self) -> None:
+        for concept_id, title in (
+            ("quiz-source", "formula and units"),
+            ("quiz-variant", "force calculation and units"),
+        ):
+            self.conn.execute(
+                "INSERT INTO concepts "
+                "(id, material_id, title, keywords_json, summary, embedding_json, created_at) "
+                "VALUES (?, ?, ?, '[]', '', NULL, '2026-07-09T00:00:01+00:00')",
+                (concept_id, self.MATERIAL, title),
+            )
+        for reel_id, concept_id, video_id, start in (
+            ("quiz-source-reel", "quiz-source", "va", 1),
+            ("quiz-variant-reel", "quiz-variant", "vb", 30),
+        ):
+            self._insert_reel(reel_id, concept_id, video_id, start, 0.4)
+            self._set_family_context(
+                reel_id=reel_id,
+                concept_id=concept_id,
+                family="Newton's second law of motion",
+            )
+
+        self._insert_assessment_outcome(
+            session_id="quiz-correct",
+            concept_id="quiz-source",
+            adjustment=0.10,
+            source_reel_id="quiz-source-reel",
+        )
+        correct_coverage, correct_adjustments, _, _ = (
+            self.svc._learner_adaptation_context(
+                self.conn,
+                self.MATERIAL,
+                self.LEARNER,
+                propagate_concept_families=True,
+                candidate_concept_ids={"quiz-variant"},
+            )
+        )
+        self.assertEqual(correct_coverage["quiz-variant"]["helpful"], 1.0)
+        self.assertGreater(correct_adjustments["quiz-variant"], 0.0)
+        correct_order = self.svc.adaptive_curriculum_order(
+            self.conn,
+            self.MATERIAL,
+            self.LEARNER,
+            [
+                self._item("quiz-family-repeat", "quiz-variant", "vb", 80, 10, 0.4),
+                self._item("quiz-different", "c2", "vc", 80, 1, 0.4),
+            ],
+        )
+        self.assertEqual(correct_order[0]["reel_id"], "quiz-different")
+
+        self.conn.execute("DELETE FROM assessment_concept_outcomes")
+        self.conn.execute("DELETE FROM assessment_sessions")
+        self._insert_assessment_outcome(
+            session_id="quiz-wrong",
+            concept_id="quiz-source",
+            adjustment=-0.10,
+            source_reel_id="quiz-source-reel",
+        )
+        wrong_coverage, wrong_adjustments, _, _ = (
+            self.svc._learner_adaptation_context(
+                self.conn,
+                self.MATERIAL,
+                self.LEARNER,
+                propagate_concept_families=True,
+                candidate_concept_ids={"quiz-variant"},
+            )
+        )
+        self.assertEqual(wrong_coverage["quiz-variant"]["confusing"], 1.0)
+        self.assertLess(wrong_adjustments["quiz-variant"], 0.0)
+        wrong_order = self.svc.adaptive_curriculum_order(
+            self.conn,
+            self.MATERIAL,
+            self.LEARNER,
+            [
+                self._item("quiz-family-remediation", "quiz-variant", "vb", 80, 1, 0.3),
+                self._item("quiz-different", "c2", "vc", 80, 10, 0.5),
+            ],
+        )
+        self.assertEqual(wrong_order[0]["reel_id"], "quiz-family-remediation")
 
     def test_ai_canonical_family_profiles_do_not_merge_untrusted_titles(self) -> None:
         self.assertEqual(
@@ -409,18 +649,11 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         ):
             reel_id = f"connected-family-{index}"
             self._insert_reel(reel_id, "c1", video_id, index * 30 + 1, 0.4)
-            self.conn.execute(
-                "UPDATE reels SET search_context_json = ? WHERE id = ?",
-                (
-                    json.dumps({
-                        "selection_contract_version": "quality_silence_v39",
-                        "selection_authority": "gemini",
-                        "concept_family_contract_version": "concept_family_v3",
-                        "concept_family": family,
-                        "concept_aliases": aliases,
-                    }),
-                    reel_id,
-                ),
+            self._set_family_context(
+                reel_id=reel_id,
+                concept_id="c1",
+                family=family,
+                aliases=aliases,
             )
 
         profiles = self.svc._persisted_concept_family_profiles(
@@ -433,18 +666,11 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         )
 
         self._insert_reel("corrupt-alias-profile", "c2", "va", 120, 0.4)
-        self.conn.execute(
-            "UPDATE reels SET search_context_json = ? WHERE id = ?",
-            (
-                json.dumps({
-                    "selection_contract_version": "quality_silence_v39",
-                    "selection_authority": "gemini",
-                    "concept_family_contract_version": "concept_family_v3",
-                    "concept_family": "Newton's first law",
-                    "concept_aliases": ["photosynthesis"],
-                }),
-                "corrupt-alias-profile",
-            ),
+        self._set_family_context(
+            reel_id="corrupt-alias-profile",
+            concept_id="c2",
+            family="Newton's first law",
+            aliases=["photosynthesis"],
         )
         profiles = self.svc._persisted_concept_family_profiles(
             self.conn,
@@ -680,9 +906,10 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         for index, (video_id, context) in enumerate(zip(("va", "vb"), contexts)):
             reel_id = f"conflicting-family-{index}"
             self._insert_reel(reel_id, "c1", video_id, index * 30 + 1, 0.4)
-            self.conn.execute(
-                "UPDATE reels SET search_context_json = ? WHERE id = ?",
-                (json.dumps(context), reel_id),
+            self._set_family_context(
+                reel_id=reel_id,
+                concept_id="c1",
+                family=str(context["concept_family"]),
             )
 
         profiles = self.svc._persisted_concept_family_profiles(
@@ -1321,7 +1548,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
 
         self.assertEqual([row["id"] for row in ordered], ["c2", "c1"])
 
-    def test_quiz_signals_target_only_the_exact_adaptive_concept(self) -> None:
+    def test_quiz_attribution_stays_exact_but_trusted_family_order_adapts(self) -> None:
         for concept_id, title in (
             ("action", "action-reaction pairs"),
             ("identify", "identifying action-reaction pairs"),
@@ -1342,18 +1569,10 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                 1 + index * 30,
                 0.4,
             )
-            self.conn.execute(
-                "UPDATE reels SET search_context_json = ? WHERE id = ?",
-                (
-                    json.dumps({
-                        "selection_contract_version": "quality_silence_v39",
-                        "selection_authority": "gemini",
-                        "concept_family_contract_version": "concept_family_v3",
-                        "concept_family": "Newton's third law of motion",
-                        "concept_aliases": [],
-                    }),
-                    reel_id,
-                ),
+            self._set_family_context(
+                reel_id=reel_id,
+                concept_id=concept_id,
+                family="Newton's third law of motion",
             )
         self.conn.execute(
             "UPDATE learner_material_progress SET difficulty_reset_at = '' "
@@ -1406,7 +1625,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                 self._item("different", "c2", "vc", 10, 10, 0.3),
             ],
         )
-        self.assertEqual(remediation[0]["reel_id"], "different")
+        self.assertEqual(remediation[0]["reel_id"], "related-easier")
 
     def test_incorrect_assessment_prefers_easier_alternative_source(self) -> None:
         self.conn.execute(

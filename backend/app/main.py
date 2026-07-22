@@ -3004,7 +3004,7 @@ def _stored_generation_lesson_order_ids(
     conn,
     generation_id: str | None,
 ) -> list[str] | None:
-    """Return a release order, None for legacy, or [] for invalid metadata."""
+    """Return a release order, None for legacy, or [] for organizer-only/invalid."""
     payload = _stored_generation_lesson_order_metadata(conn, generation_id)
     if payload is None:
         return None
@@ -3012,6 +3012,8 @@ def _stored_generation_lesson_order_ids(
     if not isinstance(values, list):
         return []
     ordered_ids = [value if isinstance(value, str) else "" for value in values]
+    if not ordered_ids and _lesson_reconciliation_tail_ids(payload):
+        return []
     if (
         not ordered_ids
         or any(not reel_id for reel_id in ordered_ids)
@@ -3040,7 +3042,6 @@ def _lesson_reconciliation_tail_ids(
         or any(not reel_id.strip() for reel_id in tail_ids)
         or len(set(tail_ids)) != len(tail_ids)
         or not isinstance(current_ids, list)
-        or not current_ids
         or any(
             not isinstance(reel_id, str) or not reel_id.strip()
             for reel_id in current_ids
@@ -3347,6 +3348,12 @@ _LESSON_ORDER_SELECTION_FIELDS = frozenset({
     "_selection_concept_family",
     "_selection_concept_aliases",
     "_selection_intent_obligations",
+    "_selection_intent_connections",
+    "_selection_intent_relationship_witnesses",
+    "_selection_intent_curriculum_edges",
+    "_selection_intent_role",
+    "_selection_intent_coverage",
+    "_selection_directly_teaches_topic",
 })
 
 
@@ -3886,7 +3893,7 @@ def _filter_continuation_release_temporal_overlaps(
     prior_reel_ids_out: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Remove child clips already covered by an authoritative source release."""
-    if not source_generation_id or not reels:
+    if not source_generation_id:
         return reels
     generation_rows = _generation_chain_rows_snapshot(
         conn,
@@ -3917,6 +3924,8 @@ def _filter_continuation_release_temporal_overlaps(
             for reel_id in prior_reel_ids
             if reel_id not in prior_reel_ids_out
         )
+    if not reels:
+        return reels
     prior_reel_id_set = set(prior_reel_ids)
     current_by_id = {
         reel_id: reel
@@ -4358,6 +4367,50 @@ def _canonical_excluded_video_id_set(values: object) -> set[str]:
     }
 
 
+def _generation_job_matches_request_params(
+    job_row: dict[str, Any],
+    request_params: dict[str, Any],
+) -> bool:
+    """Match the immutable dimensions of one learner generation stream."""
+    prior_params = _job_request_params(job_row)
+    expected_exclusions = _canonical_excluded_video_id_set(
+        request_params.get("exclude_video_ids")
+    )
+    expected_relevance = _normalize_min_relevance(
+        request_params.get("min_relevance")
+    )
+    expected_adaptation_fingerprint = str(
+        request_params.get("adaptation_fingerprint")
+        or GENERATION_EMPTY_ADAPTATION_FINGERPRINT
+    )
+    return bool(
+        str(prior_params.get("request_schema_version") or "")
+        == GENERATION_REQUEST_SCHEMA_VERSION
+        and str(prior_params.get("knowledge_level") or "beginner")
+        == str(request_params.get("knowledge_level") or "beginner")
+        and str(prior_params.get("generation_mode") or "slow")
+        == str(request_params.get("generation_mode") or "slow")
+        and bool(prior_params.get("creative_commons_only"))
+        == bool(request_params.get("creative_commons_only"))
+        and _normalize_preferred_video_duration(
+            str(prior_params.get("preferred_video_duration") or "any")
+        )
+        == _normalize_preferred_video_duration(
+            str(request_params.get("preferred_video_duration") or "any")
+        )
+        and str(prior_params.get("language") or "en").strip().lower()
+        == str(request_params.get("language") or "en").strip().lower()
+        and str(prior_params.get("adaptation_fingerprint") or "")
+        == expected_adaptation_fingerprint
+        and _canonical_excluded_video_id_set(
+            prior_params.get("exclude_video_ids")
+        )
+        == expected_exclusions
+        and _normalize_min_relevance(prior_params.get("min_relevance"))
+        == expected_relevance
+    )
+
+
 def _latest_compatible_generation_job(
     conn,
     *,
@@ -4392,40 +4445,8 @@ def _latest_compatible_generation_job(
         """,
         query_params,
     )
-    expected_exclusions = _canonical_excluded_video_id_set(
-        request_params.get("exclude_video_ids")
-    )
-    expected_relevance = _normalize_min_relevance(request_params.get("min_relevance"))
-    expected_adaptation_fingerprint = str(
-        request_params.get("adaptation_fingerprint")
-        or GENERATION_EMPTY_ADAPTATION_FINGERPRINT
-    )
     for row in rows:
-        prior_params = _job_request_params(row)
-        if (
-            str(prior_params.get("request_schema_version") or "")
-            != GENERATION_REQUEST_SCHEMA_VERSION
-            or str(prior_params.get("knowledge_level") or "beginner")
-            != str(request_params.get("knowledge_level") or "beginner")
-            or str(prior_params.get("generation_mode") or "slow")
-            != str(request_params.get("generation_mode") or "slow")
-            or bool(prior_params.get("creative_commons_only"))
-            != bool(request_params.get("creative_commons_only"))
-            or _normalize_preferred_video_duration(
-                str(prior_params.get("preferred_video_duration") or "any")
-            ) != _normalize_preferred_video_duration(
-                str(request_params.get("preferred_video_duration") or "any")
-            )
-            or str(prior_params.get("language") or "en").strip().lower()
-            != str(request_params.get("language") or "en").strip().lower()
-            or str(prior_params.get("adaptation_fingerprint") or "")
-            != expected_adaptation_fingerprint
-            or _canonical_excluded_video_id_set(
-                prior_params.get("exclude_video_ids")
-            ) != expected_exclusions
-            or _normalize_min_relevance(prior_params.get("min_relevance"))
-            != expected_relevance
-        ):
+        if not _generation_job_matches_request_params(row, request_params):
             continue
         return row
     return None
@@ -5266,6 +5287,22 @@ def _generation_job_reels(
         conn,
         continuation_token,
     )
+    source_release_reel_ids: list[str] = []
+    if prior_unseen_reels_out is not None:
+        generation_row = _fetch_generation_row(conn, generation_id) or {}
+        source_generation_id = str(
+            generation_row.get("source_generation_id") or ""
+        ).strip()
+        if source_generation_id:
+            # A release is not a view. Preserve its recursive editorial plan;
+            # ranked loading below removes only durable progress and exclusions.
+            source_release_reel_ids = list(
+                _authoritative_release_reel_ids(conn, source_generation_id) or ()
+            )
+    prior_release_reel_ids = list(dict.fromkeys([
+        *delivered_reel_ids,
+        *source_release_reel_ids,
+    ]))
     editorial_excluded_ids = list(dict.fromkeys(
         reel_id
         for value in editorial_excluded_reel_ids
@@ -5362,19 +5399,23 @@ def _generation_job_reels(
             if str(reel.get("reel_id") or "").strip()
             not in editorial_excluded_id_set
         ]
-    if prior_unseen_reels_out is not None and delivered_reel_ids:
-        delivered_reel_id_set = set(delivered_reel_ids)
-        prior_unseen_reels_out.extend(
-            reel
+    if prior_unseen_reels_out is not None and prior_release_reel_ids:
+        prior_release_reel_id_set = set(prior_release_reel_ids)
+        valid_reels_by_id = {
+            reel_id: reel
             for reel in valid_reels
-            if str(reel.get("reel_id") or "").strip()
-            in delivered_reel_id_set
+            if (reel_id := str(reel.get("reel_id") or "").strip())
+        }
+        prior_unseen_reels_out.extend(
+            valid_reels_by_id[reel_id]
+            for reel_id in prior_release_reel_ids
+            if reel_id in valid_reels_by_id
         )
         valid_reels = [
             reel
             for reel in valid_reels
             if str(reel.get("reel_id") or "").strip()
-            not in delivered_reel_id_set
+            not in prior_release_reel_id_set
         ]
     ordered_reels = (
         _apply_generation_lesson_order(
@@ -5663,6 +5704,7 @@ def _learner_concept_signals(
     material_id: str,
     learner_id: str,
     propagate_concept_families: bool = False,
+    candidate_concept_ids: set[str] | None = None,
     remediation_concept_ids_out: list[str] | None = None,
 ) -> dict[str, dict[str, float]]:
     exact_remediation_ids = (
@@ -5673,6 +5715,7 @@ def _learner_concept_signals(
         material_id,
         learner_id,
         propagate_concept_families=propagate_concept_families,
+        candidate_concept_ids=candidate_concept_ids,
         remediation_concept_ids_out=exact_remediation_ids,
     )
     if remediation_concept_ids_out is not None:
@@ -6512,7 +6555,7 @@ def _run_leased_generation_job(
             )
             prior_unseen_reels: list[dict[str, Any]] = []
             collect_prior_unseen = bool(
-                is_continuation and stored_order_ids is None
+                source_generation_id and stored_order_ids is None
             )
             rankable_fallback = (
                 []
@@ -6567,7 +6610,7 @@ def _run_leased_generation_job(
                             prior_reel_ids_out=authoritative_prior_reel_ids,
                         )
                     )
-            if candidate_final_reels:
+            if candidate_final_reels or prior_unseen_reels:
                 final_reels = candidate_final_reels
                 if stored_order_ids is None:
                     surfaceable_candidate_ids = {
@@ -6580,7 +6623,14 @@ def _run_leased_generation_job(
                         conn,
                         material_id=material_id,
                         learner_id=learner_id,
-                        propagate_concept_families=False,
+                        propagate_concept_families=True,
+                        candidate_concept_ids={
+                            str(reel.get("concept_id") or "")
+                            for reel in (
+                                candidate_final_reels + prior_unseen_reels
+                            )
+                            if str(reel.get("concept_id") or "")
+                        },
                         remediation_concept_ids_out=remediation_concept_ids,
                     )
                     prior_reel_ids = (
@@ -8698,6 +8748,15 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
     safe_video_duration_pref = _normalize_preferred_video_duration(payload.preferred_video_duration)
     excluded_video_ids = _normalize_excluded_video_ids(payload.exclude_video_ids)
     continuation_token = str(payload.continuation_token or "").strip() or None
+    retry_terminal_job_id = str(payload.retry_terminal_job_id or "").strip() or None
+    if continuation_token and retry_terminal_job_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "invalid_terminal_retry",
+                "message": "A terminal retry cannot also continue the exhausted batch.",
+            },
+        )
     requested_num_reels = max(
         1,
         min(
@@ -8791,6 +8850,79 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             learner_id=learner_id,
             adaptation_fingerprint=adaptation_fingerprint,
         )
+        terminal_retry_job: dict[str, Any] | None = None
+        terminal_retry_active_job: dict[str, Any] | None = None
+        if retry_terminal_job_id:
+            terminal_retry_job = get_generation_job(conn, retry_terminal_job_id)
+            retry_matches = bool(
+                terminal_retry_job
+                and str(terminal_retry_job.get("status") or "") == "exhausted"
+                and str(terminal_retry_job.get("material_id") or "")
+                == payload.material_id
+                and (str(terminal_retry_job.get("concept_id") or "") or None)
+                == payload.concept_id
+                and str(terminal_retry_job.get("learner_id") or "") == learner_id
+                and str(terminal_retry_job.get("content_fingerprint") or "")
+                == content_fingerprint
+                and _generation_job_matches_request_params(
+                    terminal_retry_job,
+                    request_params,
+                )
+            )
+            if retry_matches and terminal_retry_job is not None:
+                retry_generation_id = str(
+                    terminal_retry_job.get("result_generation_id") or ""
+                ).strip()
+                released_reel_ids = (
+                    _authoritative_generation_release_reel_ids(
+                        conn,
+                        retry_generation_id,
+                    )
+                    if retry_generation_id
+                    else None
+                )
+                retry_matches = not released_reel_ids
+            if not retry_matches:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "invalid_terminal_retry",
+                        "message": (
+                            "Only the current empty exhausted reel batch can be retried."
+                        ),
+                    },
+                )
+            latest_retry_job = _latest_compatible_generation_job(
+                conn,
+                material_id=payload.material_id,
+                learner_id=learner_id,
+                concept_id=payload.concept_id,
+                content_fingerprint=content_fingerprint,
+                request_params=request_params,
+            )
+            latest_retry_job_id = str(
+                (latest_retry_job or {}).get("id") or ""
+            ).strip()
+            if latest_retry_job_id != retry_terminal_job_id:
+                latest_retry_status = str(
+                    (latest_retry_job or {}).get("status") or ""
+                ).strip()
+                if (
+                    latest_retry_status in {"queued", "running"}
+                    and str((latest_retry_job or {}).get("request_key") or "")
+                    == request_key
+                ):
+                    terminal_retry_active_job = latest_retry_job
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "invalid_terminal_retry",
+                            "message": (
+                                "A newer reel batch has replaced the exhausted batch."
+                            ),
+                        },
+                    )
         source_generation_id: str | None = None
         continuation_job: dict[str, Any] | None = None
         fresh_root_recovery = False
@@ -8866,7 +8998,20 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 )
         completed_job = find_completed_generation_job(conn, request_key)
         active_job = find_active_generation_job(conn, request_key)
-        if continuation_job is None:
+        if terminal_retry_job is not None:
+            active_job = terminal_retry_active_job
+            completed_job = None
+            if active_job is None:
+                if _generation_job_has_retryable_source_work(
+                    conn,
+                    terminal_retry_job,
+                ):
+                    source_generation_id = str(
+                        terminal_retry_job.get("result_generation_id") or ""
+                    ).strip() or None
+                else:
+                    fresh_root_recovery = True
+        elif continuation_job is None:
             latest_compatible_job = _latest_compatible_generation_job(
                 conn,
                 material_id=payload.material_id,

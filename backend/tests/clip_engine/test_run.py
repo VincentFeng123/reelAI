@@ -593,6 +593,12 @@ def test_selector_outage_preserves_transcript_success_and_typed_failure(
     ("error_type", "reason_field", "reason", "message_fragment"),
     [
         (
+            "GeminiAuditContractError",
+            "audit_contract_rejection_reasons",
+            "objective_relationship_topology_mismatch",
+            "learning-request contract",
+        ),
+        (
             "GeminiSelectorContractError",
             "selector_contract_rejection_reasons",
             "intent_contract_incomplete_joint_structure",

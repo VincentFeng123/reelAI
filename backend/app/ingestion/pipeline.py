@@ -105,6 +105,7 @@ from .persistence import (
 from ..clip_engine import (  # noqa: F401
     bridge as clip_engine_bridge,
     config as clip_engine_config,
+    expand as clip_engine_expand,
     groq_boundary_asr as clip_engine_groq_boundary_asr,
     metadata as clip_engine_meta,
     run as clip_engine_run,
@@ -320,6 +321,10 @@ def _discover(
     breadth: int | None = None,
     retrieval_profile: str = "deep",
     deadline_monotonic: float | None = None,
+    recovery_tried_queries: list[str] | None = None,
+    recovery_reason: str | None = None,
+    recovery_rejected_video_ids: list[str] | None = None,
+    analysis_limit: int | None = None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "limit": limit,
@@ -336,6 +341,14 @@ def _discover(
         "practice_fast": True,
         "retrieval_profile": retrieval_profile,
     }
+    if analysis_limit is not None:
+        kwargs["analysis_limit"] = max(0, int(analysis_limit))
+    if recovery_tried_queries:
+        kwargs["recovery_tried_queries"] = list(recovery_tried_queries)
+        kwargs["recovery_reason"] = recovery_reason
+        kwargs["recovery_rejected_video_ids"] = list(
+            recovery_rejected_video_ids or []
+        )
     if consumed_video_ids:
         kwargs["consumed_video_ids"] = consumed_video_ids
     if deadline_monotonic is not None:
@@ -576,7 +589,7 @@ def _concept_family_search_context(clip: dict[str, Any]) -> dict[str, Any]:
 def _intent_obligation_search_context(
     clip: dict[str, Any],
 ) -> dict[str, Any]:
-    """Return only versioned, Gemini-grounded request obligations."""
+    """Return versioned Gemini-grounded fulfillment and support metadata."""
     if (
         not _gemini_selection_is_authoritative(clip)
         or str(
@@ -589,13 +602,45 @@ def _intent_obligation_search_context(
         clip.get("intent_obligations"),
         require_evidence=True,
     )
-    if not obligations:
+    connections = normalize_intent_obligations(
+        clip.get("intent_connections"),
+        require_evidence=True,
+    )
+    if not obligations and not connections:
         return {}
+    fulfilled_by_key = {
+        str(obligation["key"]): obligation for obligation in obligations
+    }
+    relationship_witnesses = [
+        dict(witness)
+        for witness in (clip.get("intent_relationship_witnesses") or [])[:8]
+        if isinstance(witness, dict)
+        and str(witness.get("obligation_key") or "") in fulfilled_by_key
+        and fulfilled_by_key[str(witness.get("obligation_key"))].get("kind")
+        == "relationship"
+        and isinstance(witness.get("members"), list)
+        and isinstance(witness.get("links"), list)
+    ]
+    curriculum_edges = [
+        {
+            "before_key": str(edge.get("before_key") or "")[:64],
+            "after_key": str(edge.get("after_key") or "")[:64],
+            "relation_key": str(edge.get("relation_key") or "")[:64],
+        }
+        for edge in (clip.get("intent_curriculum_edges") or [])[:16]
+        if isinstance(edge, dict)
+        and str(edge.get("before_key") or "").startswith("io:")
+        and str(edge.get("after_key") or "").startswith("io:")
+        and str(edge.get("before_key")) != str(edge.get("after_key"))
+    ]
     return {
         "intent_obligation_contract_version": (
             INTENT_OBLIGATION_CONTRACT_VERSION
         ),
         "intent_obligations": obligations,
+        "intent_connections": connections,
+        "intent_relationship_witnesses": relationship_witnesses,
+        "intent_curriculum_edges": curriculum_edges,
     }
 
 
@@ -4854,6 +4899,10 @@ class IngestionPipeline:
         retrieved_video_ids: set[str] | None = None,
         attempted_video_ids: set[str] | None = None,
         capacity_deferred_video_ids: set[str] | None = None,
+        recovery_tried_queries: list[str] | None = None,
+        recovery_reason: str | None = None,
+        recovery_rejected_video_ids: list[str] | None = None,
+        _recovery_attempted: bool = False,
     ) -> tuple[list[ReelOutWithAttribution], list[str]]:
         """
         Route ONE study concept through the clip engine and persist EVERY
@@ -4882,6 +4931,8 @@ class IngestionPipeline:
         if generation_context is not None and not dry_run:
             provider_analysis_limit = min(
                 provider_analysis_limit,
+                2 if generation_context.budget.mode == "fast" else 3,
+                generation_context.budget.remaining("transcript"),
                 generation_context.budget.remaining("segmentation"),
             )
         analysis_limit = max(
@@ -4936,6 +4987,10 @@ class IngestionPipeline:
                 breadth=clip_engine_config.SEARCH_BREADTH,
                 retrieval_profile=retrieval_profile,
                 deadline_monotonic=bootstrap_deadline,
+                recovery_tried_queries=recovery_tried_queries,
+                recovery_reason=recovery_reason,
+                recovery_rejected_video_ids=recovery_rejected_video_ids,
+                analysis_limit=analysis_limit,
             )
         except _ClipProviderError:
             if generation_context is not None:
@@ -6340,6 +6395,86 @@ class IngestionPipeline:
             for index in range(len(videos))
             for reel in reels_by_video.get(index, [])
         ]
+        tried_queries = [
+            query
+            for raw_query in (disc.get("queries") or [])
+            if (query := " ".join(str(raw_query or "").split()))
+        ]
+        blocking_provider_error = next(
+            (
+                error
+                for error in provider_errors
+                if error.code in _JOB_GLOBAL_PROVIDER_ERROR_CODES
+            ),
+            None,
+        )
+        if (
+            not reels
+            and blocking_provider_error is None
+            and not _recovery_attempted
+            and generation_context is not None
+            and resolved_video_ids
+            and tried_queries
+            and generation_context.budget.remaining("search") > 0
+        ):
+            recovery_source_limit = min(
+                1 if generation_context.budget.mode == "fast" else 2,
+                generation_context.budget.remaining("transcript"),
+                generation_context.budget.remaining("segmentation"),
+            )
+            if recovery_source_limit > 0:
+                recovery_exclusions = list(dict.fromkeys([
+                    *(exclude_video_ids or []),
+                    *resolved_video_ids,
+                ]))
+                recovered_reels, recovered_video_ids = self.ingest_topic(
+                    topic=topic,
+                    material_id=material_id,
+                    concept_id=concept_id,
+                    generation_id=generation_id,
+                    exclude_video_ids=recovery_exclusions,
+                    consumed_video_ids=consumed_video_ids,
+                    target_clip_duration_sec=target_clip_duration_sec,
+                    target_clip_duration_min_sec=target_clip_duration_min_sec,
+                    target_clip_duration_max_sec=target_clip_duration_max_sec,
+                    language=language,
+                    knowledge_level=knowledge_level,
+                    max_videos=recovery_source_limit,
+                    max_reels=max_reels,
+                    max_persisted_reels=max_persisted_reels,
+                    on_reel_created=on_reel_created,
+                    dry_run=False,
+                    should_cancel=should_cancel,
+                    creative_commons_only=creative_commons_only,
+                    preferred_video_duration=preferred_video_duration,
+                    generation_context=generation_context,
+                    literal_topic=literal_topic,
+                    retrieval_profile=retrieval_profile,
+                    analyzed_video_ids=analyzed_video_ids,
+                    retrieved_video_ids=retrieved_video_ids,
+                    attempted_video_ids=attempted_video_ids,
+                    capacity_deferred_video_ids=capacity_deferred_video_ids,
+                    recovery_tried_queries=tried_queries,
+                    recovery_reason=(
+                        clip_engine_expand.RECOVERY_REASON_ZERO_VALID_CLIPS
+                    ),
+                    recovery_rejected_video_ids=resolved_video_ids,
+                    _recovery_attempted=True,
+                )
+                combined_resolved_video_ids = list(dict.fromkeys([
+                    *resolved_video_ids,
+                    *recovered_video_ids,
+                ]))
+                if recovered_reels or not provider_errors:
+                    return recovered_reels, combined_resolved_video_ids
+                raise next(
+                    (
+                        error
+                        for error in provider_errors
+                        if error.retryable
+                    ),
+                    provider_errors[0],
+                )
         if not reels and provider_errors:
             job_global_error = next(
                 (
@@ -7224,6 +7359,8 @@ class IngestionPipeline:
                     if update_reel_boundary_state(
                         conn,
                         reel_id=reel_id,
+                        material_id=effective_material_id,
+                        concept_id=effective_concept_id,
                         video_url=video_url,
                         t_start=clip_start,
                         t_end=clip_end,
