@@ -8653,6 +8653,261 @@ def test_generate_continuation_queues_one_new_batch_from_the_previous_job(monkey
         conn.close()
 
 
+@pytest.mark.parametrize(
+    ("retry_mode", "failed_attempts", "expected_error"),
+    [
+        pytest.param("stale_parent", 1, None, id="stale-parent-retryable"),
+        pytest.param("tokenless", 1, None, id="tokenless-control"),
+        pytest.param(
+            "stale_parent",
+            main.SOURCE_ANALYSIS_MAX_ATTEMPTS,
+            "source_retry_exhausted",
+            id="stale-parent-exhausted",
+        ),
+    ],
+)
+def test_failed_continuation_retry_uses_failed_child_lineage(
+    monkeypatch,
+    retry_mode: str,
+    failed_attempts: int,
+    expected_error: str | None,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    wake = mock.Mock()
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    root_payload = ReelsGenerateRequest(
+        material_id="m1",
+        concept_id="c1",
+        num_reels=3,
+    )
+    failed_video_id = "AAAAAAAAAAA"
+    try:
+        root = asyncio.run(main.generate_reels(object(), root_payload))
+        root_id = json.loads(root.body)["job_id"]
+        root_job = generation_jobs.get_job(conn, root_id)
+        assert root_job
+        root_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=str(root_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=root_id,
+            status="completed",
+            result_generation_id=root_generation_id,
+            usage={
+                "counters": {
+                    "analyzed_sources": main.GENERATION_SOURCE_BUDGETS["slow"],
+                },
+            },
+        )
+
+        continuation_payload = ReelsGenerateRequest(
+            material_id="m1",
+            concept_id="c1",
+            num_reels=3,
+            continuation_token=root_id,
+        )
+        continuation = asyncio.run(
+            main.generate_reels(object(), continuation_payload)
+        )
+        continuation_id = json.loads(continuation.body)["job_id"]
+        continuation_job = generation_jobs.get_job(conn, continuation_id)
+        assert continuation_job
+        continuation_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=str(continuation_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+            source_generation_id=root_generation_id,
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=continuation_id,
+            status="failed",
+            result_generation_id=continuation_generation_id,
+            error_code="generation_failed",
+            usage={
+                "counters": {"provider_cursor_open": 0},
+                "consumed_video_ids": [],
+                "failed_source_attempts": {
+                    failed_video_id: failed_attempts,
+                },
+            },
+        )
+        retry_payload = (
+            continuation_payload
+            if retry_mode == "stale_parent"
+            else root_payload
+        )
+        jobs_before_retry = conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs"
+        ).fetchone()[0]
+        wake_before_retry = wake.call_count
+
+        if expected_error is not None:
+            with pytest.raises(main.HTTPException) as exhausted:
+                asyncio.run(main.generate_reels(object(), retry_payload))
+            assert exhausted.value.status_code == 409
+            assert exhausted.value.detail["code"] == expected_error
+            assert conn.execute(
+                "SELECT COUNT(*) FROM reel_generation_jobs"
+            ).fetchone()[0] == jobs_before_retry
+            assert wake.call_count == wake_before_retry
+            return
+
+        retry = asyncio.run(main.generate_reels(object(), retry_payload))
+        retry_id = json.loads(retry.body)["job_id"]
+        assert retry.status_code == 202
+        repeated = asyncio.run(main.generate_reels(object(), retry_payload))
+        assert json.loads(repeated.body)["job_id"] == retry_id
+        assert retry_id not in {root_id, continuation_id}
+        retry_job = generation_jobs.get_job(conn, retry_id)
+        assert retry_job
+        assert retry_job["source_generation_id"] == continuation_generation_id
+        retry_params = main._job_request_params(retry_job)
+        assert retry_params["continuation_token"] == (
+            root_id if retry_mode == "stale_parent" else None
+        )
+        assert bool(retry_params.get("fresh_source_budget")) is (
+            retry_mode == "tokenless"
+        )
+        assert main._response_generation_ids(
+            conn,
+            continuation_generation_id,
+        ) == [root_generation_id, continuation_generation_id]
+        assert main._generation_chain_failed_source_attempts(
+            conn,
+            generation_id=continuation_generation_id,
+        ) == {failed_video_id: failed_attempts}
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs"
+        ).fetchone()[0] == jobs_before_retry + 1
+
+        retrieval_calls: list[dict] = []
+        monkeypatch.setattr(
+            main.reel_service,
+            "generate_reels",
+            lambda _worker_conn, **kwargs: retrieval_calls.append(kwargs),
+        )
+        leased = generation_jobs.lease_job(
+            conn,
+            job_id=retry_id,
+            lease_owner=f"worker-{retry_mode}",
+            now=datetime.now(timezone.utc),
+        )
+        assert leased
+        main._run_leased_generation_job(leased, threading.Event())
+        assert len(retrieval_calls) == 1
+        assert retrieval_calls[0]["max_generation_videos"] == (
+            main.GENERATION_SOURCE_BUDGETS["slow"]
+        )
+        assert continuation_generation_id in retrieval_calls[0][
+            "exclude_generation_ids"
+        ]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "terminal_error_code"),
+    [
+        pytest.param("failed", "generation_failed", id="generic-failed"),
+        pytest.param("cancelled", "cancelled", id="cancelled"),
+    ],
+)
+def test_repeated_parent_continuation_reuses_recovery_after_empty_child_terminal(
+    monkeypatch,
+    terminal_status: str,
+    terminal_error_code: str,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    wake = mock.Mock()
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    root_payload = ReelsGenerateRequest(
+        material_id="m1",
+        concept_id="c1",
+        num_reels=3,
+    )
+    try:
+        root = asyncio.run(main.generate_reels(object(), root_payload))
+        root_id = json.loads(root.body)["job_id"]
+        root_job = generation_jobs.get_job(conn, root_id)
+        assert root_job
+        root_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=str(root_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=root_id,
+            status="completed",
+            result_generation_id=root_generation_id,
+            usage={},
+        )
+
+        continuation_payload = ReelsGenerateRequest(
+            material_id="m1",
+            concept_id="c1",
+            num_reels=3,
+            continuation_token=root_id,
+        )
+        child = asyncio.run(main.generate_reels(object(), continuation_payload))
+        child_id = json.loads(child.body)["job_id"]
+        child_job = generation_jobs.get_job(conn, child_id)
+        assert child_job
+        child_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=str(child_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+            source_generation_id=root_generation_id,
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=child_id,
+            status=terminal_status,
+            result_generation_id=child_generation_id,
+            error_code=terminal_error_code,
+            usage={"counters": {"provider_cursor_open": 0}},
+        )
+
+        recovery = asyncio.run(
+            main.generate_reels(object(), continuation_payload)
+        )
+        repeated = asyncio.run(
+            main.generate_reels(object(), continuation_payload)
+        )
+        recovery_id = json.loads(recovery.body)["job_id"]
+        assert recovery.status_code == repeated.status_code == 202
+        assert json.loads(repeated.body)["job_id"] == recovery_id
+        assert recovery_id not in {root_id, child_id}
+        recovery_job = generation_jobs.get_job(conn, recovery_id)
+        assert recovery_job
+        assert recovery_job["source_generation_id"] == root_generation_id
+        assert main._job_request_params(recovery_job)["continuation_token"] == root_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs"
+        ).fetchone()[0] == 3
+        assert wake.call_count == 4
+    finally:
+        conn.close()
+
+
 def test_generate_implicit_retry_carries_failed_source_attempts_and_stops_at_bound(
     monkeypatch,
 ) -> None:
@@ -8733,13 +8988,23 @@ def test_generate_implicit_retry_carries_failed_source_attempts_and_stops_at_bou
         conn.close()
 
 
-def test_global_provider_failure_allows_explicit_root_but_suppresses_feed_retry(
+def test_global_provider_failure_requires_explicit_root_and_suppresses_feed_retry(
     monkeypatch,
 ) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
     wake = mock.Mock()
+    rate_limit = mock.Mock()
+    verified_account = mock.Mock(return_value={"id": "account-1"})
+    attach_reservation = mock.Mock()
     monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    monkeypatch.setattr(main, "_enforce_rate_limit", rate_limit)
+    monkeypatch.setattr(
+        main,
+        "_require_verified_provider_account",
+        verified_account,
+    )
+    monkeypatch.setattr(main, "attach_reservation_to_job", attach_reservation)
     monkeypatch.setattr(main, "_ranked_request_reels", lambda *_args, **_kwargs: [])
     direct_payload = ReelsGenerateRequest(
         material_id="m1",
@@ -8784,7 +9049,64 @@ def test_global_provider_failure_allows_explicit_root_but_suppresses_feed_retry(
             "_verified_cross_request_source_generation",
             cross_request_lookup,
         )
-        direct_retry = asyncio.run(main.generate_reels(object(), direct_payload))
+        jobs_before_retry = conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs"
+        ).fetchone()[0]
+        events_before_retry = conn.execute(
+            "SELECT COUNT(*) FROM generation_job_events"
+        ).fetchone()[0]
+        quota_before_retry = conn.execute(
+            "SELECT COUNT(*) FROM search_quota_reservations"
+        ).fetchone()[0]
+        quota_jobs_before_retry = conn.execute(
+            "SELECT COUNT(*) FROM search_quota_reservation_jobs"
+        ).fetchone()[0]
+        wake_before_retry = wake.call_count
+        rate_before_retry = rate_limit.call_count
+        account_before_retry = verified_account.call_count
+        reservation_before_retry = attach_reservation.call_count
+
+        with pytest.raises(main.HTTPException) as retry_required:
+            asyncio.run(main.generate_reels(object(), direct_payload))
+        assert retry_required.value.status_code == 409
+        assert retry_required.value.detail == {
+            "code": "terminal_retry_required",
+            "message": (
+                "Retry this failed reel batch explicitly before starting another "
+                "generation."
+            ),
+            "terminal_job_id": direct_job_id,
+        }
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs"
+        ).fetchone()[0] == jobs_before_retry
+        assert conn.execute(
+            "SELECT COUNT(*) FROM generation_job_events"
+        ).fetchone()[0] == events_before_retry
+        assert conn.execute(
+            "SELECT COUNT(*) FROM search_quota_reservations"
+        ).fetchone()[0] == quota_before_retry
+        assert conn.execute(
+            "SELECT COUNT(*) FROM search_quota_reservation_jobs"
+        ).fetchone()[0] == quota_jobs_before_retry
+        assert wake.call_count == wake_before_retry
+        assert rate_limit.call_count == rate_before_retry
+        assert verified_account.call_count == account_before_retry
+        assert attach_reservation.call_count == reservation_before_retry
+        assert cross_request_lookup.call_count == 0
+
+        explicit_retry_payload = ReelsGenerateRequest(
+            material_id="m1",
+            concept_id="c1",
+            num_reels=3,
+            retry_terminal_job_id=direct_job_id,
+        )
+        rate_before_explicit = rate_limit.call_count
+        account_before_explicit = verified_account.call_count
+        reservation_before_explicit = attach_reservation.call_count
+        direct_retry = asyncio.run(
+            main.generate_reels(object(), explicit_retry_payload)
+        )
         assert direct_retry.status_code == 202
         direct_retry_job_id = json.loads(direct_retry.body)["job_id"]
         assert direct_retry_job_id != direct_job_id
@@ -8794,12 +9116,15 @@ def test_global_provider_failure_allows_explicit_root_but_suppresses_feed_retry(
         assert cross_request_lookup.call_count == 0
 
         repeated_direct_retry = asyncio.run(
-            main.generate_reels(object(), direct_payload)
+            main.generate_reels(object(), explicit_retry_payload)
         )
         assert json.loads(repeated_direct_retry.body)["job_id"] == direct_retry_job_id
         assert conn.execute(
             "SELECT COUNT(*) FROM reel_generation_jobs WHERE concept_id = 'c1'"
         ).fetchone()[0] == 2
+        assert rate_limit.call_count == rate_before_explicit + 1
+        assert verified_account.call_count == account_before_explicit + 1
+        assert attach_reservation.call_count == reservation_before_explicit + 1
         generation_jobs.transition_terminal(
             conn,
             job_id=direct_retry_job_id,
@@ -8807,6 +9132,12 @@ def test_global_provider_failure_allows_explicit_root_but_suppresses_feed_retry(
             error_code="generation_failed",
             error_message="test recovery released the active queue slot",
         )
+        with pytest.raises(main.HTTPException) as replaced_direct_retry:
+            asyncio.run(
+                main.generate_reels(object(), explicit_retry_payload)
+            )
+        assert replaced_direct_retry.value.detail["code"] == "invalid_terminal_retry"
+        assert "replaced" in replaced_direct_retry.value.detail["message"].lower()
 
         cross_request_lookup.return_value = None
         first_feed = main.feed(object(), material_id="m1", autofill=True)
@@ -8846,6 +9177,176 @@ def test_global_provider_failure_allows_explicit_root_but_suppresses_feed_retry(
         ).fetchone()[0] == 1
         assert cross_request_lookup.call_count == 0
         assert wake.call_count == wake_before_repeat
+
+        with pytest.raises(main.HTTPException) as feed_retry_required:
+            asyncio.run(main.generate_reels(
+                object(),
+                ReelsGenerateRequest(material_id="m1", num_reels=9),
+            ))
+        assert feed_retry_required.value.detail["code"] == "terminal_retry_required"
+        assert feed_retry_required.value.detail["terminal_job_id"] == feed_job_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs WHERE concept_id IS NULL"
+        ).fetchone()[0] == 1
+        assert wake.call_count == wake_before_repeat
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("released_child", [False, True])
+def test_failed_global_continuation_requires_explicit_child_retry(
+    monkeypatch,
+    released_child: bool,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    wake = mock.Mock()
+    rate_limit = mock.Mock()
+    verified_account = mock.Mock(return_value={"id": "account-1"})
+    attach_reservation = mock.Mock()
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    monkeypatch.setattr(main, "_enforce_rate_limit", rate_limit)
+    monkeypatch.setattr(
+        main,
+        "_require_verified_provider_account",
+        verified_account,
+    )
+    monkeypatch.setattr(main, "attach_reservation_to_job", attach_reservation)
+    payload = ReelsGenerateRequest(material_id="m1", concept_id="c1", num_reels=3)
+    try:
+        root = asyncio.run(main.generate_reels(object(), payload))
+        root_id = json.loads(root.body)["job_id"]
+        root_job = generation_jobs.get_job(conn, root_id)
+        assert root_job
+        root_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=str(root_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=root_id,
+            status="completed",
+            result_generation_id=root_generation_id,
+            usage={},
+        )
+
+        continuation_payload = ReelsGenerateRequest(
+            material_id="m1",
+            concept_id="c1",
+            num_reels=3,
+            continuation_token=root_id,
+        )
+        continuation = asyncio.run(
+            main.generate_reels(object(), continuation_payload)
+        )
+        continuation_id = json.loads(continuation.body)["job_id"]
+        continuation_job = generation_jobs.get_job(conn, continuation_id)
+        assert continuation_job
+        assert continuation_job["source_generation_id"] == root_generation_id
+        continuation_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=str(continuation_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+            source_generation_id=root_generation_id,
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=continuation_id,
+            status="failed",
+            result_generation_id=continuation_generation_id,
+            error_code="provider_budget_exceeded",
+            usage={"counters": {"provider_cursor_open": 0}},
+        )
+        if released_child:
+            _append_authoritative_release(
+                conn,
+                job_id=continuation_id,
+                reel_ids=["released-child-reel"],
+            )
+
+        jobs_before_repeat = conn.execute(
+            "SELECT id, status, request_key, source_generation_id, updated_at "
+            "FROM reel_generation_jobs ORDER BY created_at, id"
+        ).fetchall()
+        events_before_repeat = conn.execute(
+            "SELECT COUNT(*) FROM generation_job_events"
+        ).fetchone()[0]
+        quota_before_repeat = conn.execute(
+            "SELECT COUNT(*) FROM search_quota_reservations"
+        ).fetchone()[0]
+        quota_jobs_before_repeat = conn.execute(
+            "SELECT COUNT(*) FROM search_quota_reservation_jobs"
+        ).fetchone()[0]
+        wake_before_repeat = wake.call_count
+        rate_before_repeat = rate_limit.call_count
+        account_before_repeat = verified_account.call_count
+        reservation_before_repeat = attach_reservation.call_count
+
+        with pytest.raises(main.HTTPException) as guarded:
+            asyncio.run(main.generate_reels(object(), continuation_payload))
+        expected_code = (
+            "invalid_terminal_retry"
+            if released_child
+            else "terminal_retry_required"
+        )
+        assert guarded.value.status_code == 409
+        assert guarded.value.detail["code"] == expected_code
+        assert guarded.value.detail["terminal_job_id"] == continuation_id
+        assert conn.execute(
+            "SELECT id, status, request_key, source_generation_id, updated_at "
+            "FROM reel_generation_jobs ORDER BY created_at, id"
+        ).fetchall() == jobs_before_repeat
+        assert conn.execute(
+            "SELECT COUNT(*) FROM generation_job_events"
+        ).fetchone()[0] == events_before_repeat
+        assert conn.execute(
+            "SELECT COUNT(*) FROM search_quota_reservations"
+        ).fetchone()[0] == quota_before_repeat
+        assert conn.execute(
+            "SELECT COUNT(*) FROM search_quota_reservation_jobs"
+        ).fetchone()[0] == quota_jobs_before_repeat
+        assert wake.call_count == wake_before_repeat
+        assert rate_limit.call_count == rate_before_repeat
+        assert verified_account.call_count == account_before_repeat
+        assert attach_reservation.call_count == reservation_before_repeat
+
+        retry_payload = ReelsGenerateRequest(
+            material_id="m1",
+            concept_id="c1",
+            num_reels=3,
+            retry_terminal_job_id=continuation_id,
+        )
+        if released_child:
+            with pytest.raises(main.HTTPException) as retry_rejected:
+                asyncio.run(main.generate_reels(object(), retry_payload))
+            assert retry_rejected.value.detail["code"] == "invalid_terminal_retry"
+            assert conn.execute(
+                "SELECT COUNT(*) FROM reel_generation_jobs"
+            ).fetchone()[0] == 2
+            return
+
+        retry = asyncio.run(main.generate_reels(object(), retry_payload))
+        repeated_retry = asyncio.run(main.generate_reels(object(), retry_payload))
+        retry_id = json.loads(retry.body)["job_id"]
+        assert retry_id not in {root_id, continuation_id}
+        assert json.loads(repeated_retry.body)["job_id"] == retry_id
+        retry_job = generation_jobs.get_job(conn, retry_id)
+        assert retry_job
+        assert retry_job["source_generation_id"] == ""
+        assert main._job_request_params(retry_job)["continuation_token"] is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs"
+        ).fetchone()[0] == 3
+        assert rate_limit.call_count == rate_before_repeat + 1
+        assert verified_account.call_count == account_before_repeat + 1
+        assert attach_reservation.call_count == reservation_before_repeat + 1
     finally:
         conn.close()
 
@@ -9136,8 +9637,134 @@ def test_manual_retry_reopens_empty_exhausted_continuation_without_token(
         conn.close()
 
 
+def test_manual_retry_of_retryable_continuation_gets_fresh_source_budget(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    root_payload = ReelsGenerateRequest(
+        material_id="m1",
+        concept_id="c1",
+        num_reels=3,
+    )
+    failed_video_id = "DDDDDDDDDDD"
+    try:
+        root = asyncio.run(main.generate_reels(object(), root_payload))
+        root_id = json.loads(root.body)["job_id"]
+        root_job = generation_jobs.get_job(conn, root_id)
+        assert root_job
+        root_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=str(root_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=root_id,
+            status="completed",
+            result_generation_id=root_generation_id,
+            usage={
+                "counters": {
+                    "analyzed_sources": main.GENERATION_SOURCE_BUDGETS["slow"],
+                },
+            },
+        )
+
+        continuation = asyncio.run(
+            main.generate_reels(
+                object(),
+                ReelsGenerateRequest(
+                    material_id="m1",
+                    concept_id="c1",
+                    num_reels=3,
+                    continuation_token=root_id,
+                ),
+            )
+        )
+        continuation_id = json.loads(continuation.body)["job_id"]
+        continuation_job = generation_jobs.get_job(conn, continuation_id)
+        assert continuation_job
+        continuation_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=str(continuation_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+            source_generation_id=root_generation_id,
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=continuation_id,
+            status="exhausted",
+            result_generation_id=continuation_generation_id,
+            usage={
+                "counters": {"provider_cursor_open": 0},
+                "failed_source_attempts": {failed_video_id: 1},
+            },
+        )
+
+        retry_payload = ReelsGenerateRequest(
+            material_id="m1",
+            concept_id="c1",
+            num_reels=3,
+            retry_terminal_job_id=continuation_id,
+        )
+        retry = asyncio.run(main.generate_reels(object(), retry_payload))
+        repeated = asyncio.run(main.generate_reels(object(), retry_payload))
+        retry_id = json.loads(retry.body)["job_id"]
+        assert json.loads(repeated.body)["job_id"] == retry_id
+        retry_job = generation_jobs.get_job(conn, retry_id)
+        assert retry_job
+        assert retry_job["source_generation_id"] == continuation_generation_id
+        retry_params = main._job_request_params(retry_job)
+        assert retry_params["continuation_token"] is None
+        assert retry_params["fresh_source_budget"] is True
+        assert main._generation_chain_failed_source_attempts(
+            conn,
+            generation_id=continuation_generation_id,
+        ) == {failed_video_id: 1}
+
+        retrieval_calls: list[dict] = []
+        monkeypatch.setattr(
+            main.reel_service,
+            "generate_reels",
+            lambda _worker_conn, **kwargs: retrieval_calls.append(kwargs),
+        )
+        leased = generation_jobs.lease_job(
+            conn,
+            job_id=retry_id,
+            lease_owner="worker-explicit-source-retry",
+            now=datetime.now(timezone.utc),
+        )
+        assert leased
+        main._run_leased_generation_job(leased, threading.Event())
+        assert len(retrieval_calls) == 1
+        assert retrieval_calls[0]["max_generation_videos"] == (
+            main.GENERATION_SOURCE_BUDGETS["slow"]
+        )
+        assert continuation_generation_id in retrieval_calls[0][
+            "exclude_generation_ids"
+        ]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "terminal_error_code"),
+    [
+        ("exhausted", None),
+        ("failed", "provider_budget_exceeded"),
+    ],
+)
 def test_manual_retry_rejects_changed_request_and_continuation_combo(
     monkeypatch,
+    terminal_status: str,
+    terminal_error_code: str | None,
 ) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
@@ -9151,8 +9778,9 @@ def test_manual_retry_rejects_changed_request_and_continuation_combo(
         generation_jobs.transition_terminal(
             conn,
             job_id=first_id,
-            status="exhausted",
+            status=terminal_status,
             usage={},
+            error_code=terminal_error_code,
         )
 
         with pytest.raises(main.HTTPException) as changed:
@@ -9182,8 +9810,17 @@ def test_manual_retry_rejects_changed_request_and_continuation_combo(
         conn.close()
 
 
-def test_manual_retry_rejects_exhausted_job_with_authoritative_release(
+@pytest.mark.parametrize(
+    ("terminal_status", "terminal_error_code"),
+    [
+        ("exhausted", None),
+        ("failed", "provider_budget_exceeded"),
+    ],
+)
+def test_manual_retry_rejects_terminal_job_with_authoritative_release(
     monkeypatch,
+    terminal_status: str,
+    terminal_error_code: str | None,
 ) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
@@ -9226,9 +9863,10 @@ def test_manual_retry_rejects_exhausted_job_with_authoritative_release(
         generation_jobs.transition_terminal(
             conn,
             job_id=first_id,
-            status="exhausted",
+            status=terminal_status,
             result_generation_id=generation_id,
             usage={},
+            error_code=terminal_error_code,
         )
         _append_authoritative_release(
             conn,
@@ -9246,6 +9884,26 @@ def test_manual_retry_rejects_exhausted_job_with_authoritative_release(
                 ),
             ))
         assert rejected.value.detail["code"] == "invalid_terminal_retry"
+        if terminal_status == "failed":
+            jobs_before_plain_submit = conn.execute(
+                "SELECT COUNT(*) FROM reel_generation_jobs"
+            ).fetchone()[0]
+            with pytest.raises(main.HTTPException) as plain_rejected:
+                asyncio.run(main.generate_reels(
+                    object(),
+                    ReelsGenerateRequest(material_id="m1", concept_id="c1"),
+                ))
+            assert plain_rejected.value.detail == {
+                "code": "invalid_terminal_retry",
+                "message": (
+                    "The failed reel batch has an authoritative release and cannot "
+                    "be restarted."
+                ),
+                "terminal_job_id": first_id,
+            }
+            assert conn.execute(
+                "SELECT COUNT(*) FROM reel_generation_jobs"
+            ).fetchone()[0] == jobs_before_plain_submit
     finally:
         conn.close()
 
@@ -10646,21 +11304,55 @@ def test_feed_reload_queues_bounded_retry_from_failed_source_state(monkeypatch) 
     monkeypatch.setattr(main, "_ranked_request_reels", lambda *_args, **_kwargs: [])
     try:
         first = main.feed(object(), material_id="m1", autofill=True)
-        first_job = generation_jobs.get_job(conn, first["generation_job_id"])
-        assert first_job
-        first_generation_id = main._create_generation_row(
+        root_job = generation_jobs.get_job(conn, first["generation_job_id"])
+        assert root_job
+        root_generation_id = main._create_generation_row(
             conn,
             material_id="m1",
             concept_id=None,
-            request_key=str(first_job["request_key"]),
+            request_key=str(root_job["request_key"]),
             generation_mode="slow",
             retrieval_profile="unified",
         )
         generation_jobs.transition_terminal(
             conn,
-            job_id=str(first_job["id"]),
+            job_id=str(root_job["id"]),
+            status="completed",
+            result_generation_id=root_generation_id,
+            usage={
+                "counters": {
+                    "analyzed_sources": main.GENERATION_SOURCE_BUDGETS["slow"],
+                },
+            },
+        )
+        child_job, _ = generation_jobs.submit_or_get_active(
+            conn,
+            material_id="m1",
+            concept_id=None,
+            request_key="feed-failed-continuation-request",
+            content_fingerprint=str(root_job["content_fingerprint"]),
+            learner_id="learner-1",
+            request_params={
+                **main._job_request_params(root_job),
+                "continuation_token": root_job["id"],
+            },
+            source_generation_id=root_generation_id,
+            now=datetime.now(timezone.utc),
+        )
+        child_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id=None,
+            request_key=str(child_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+            source_generation_id=root_generation_id,
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=str(child_job["id"]),
             status="failed",
-            result_generation_id=first_generation_id,
+            result_generation_id=child_generation_id,
             usage={
                 "counters": {"provider_cursor_open": 0},
                 "consumed_video_ids": [],
@@ -10671,14 +11363,42 @@ def test_feed_reload_queues_bounded_retry_from_failed_source_state(monkeypatch) 
         recovered = main.feed(object(), material_id="m1", autofill=True)
 
         assert recovered["generation_job_status"] == "queued"
-        assert recovered["generation_job_id"] != first_job["id"]
+        assert recovered["generation_job_id"] not in {
+            root_job["id"],
+            child_job["id"],
+        }
         retry_job = generation_jobs.get_job(conn, recovered["generation_job_id"])
         assert retry_job
-        assert retry_job["source_generation_id"] == first_generation_id
+        assert retry_job["source_generation_id"] == child_generation_id
+        assert main._job_request_params(retry_job)["fresh_source_budget"] is True
+        repeated = main.feed(object(), material_id="m1", autofill=True)
+        assert repeated["generation_job_id"] == retry_job["id"]
         assert conn.execute(
             "SELECT COUNT(*) FROM reel_generation_jobs"
-        ).fetchone()[0] == 2
+        ).fetchone()[0] == 3
         assert wake.call_count == 2
+
+        retrieval_calls: list[dict] = []
+        monkeypatch.setattr(
+            main.reel_service,
+            "generate_reels",
+            lambda _worker_conn, **kwargs: retrieval_calls.append(kwargs),
+        )
+        leased = generation_jobs.lease_job(
+            conn,
+            job_id=str(retry_job["id"]),
+            lease_owner="worker-feed-source-retry",
+            now=datetime.now(timezone.utc),
+        )
+        assert leased
+        main._run_leased_generation_job(leased, threading.Event())
+        assert len(retrieval_calls) == 1
+        assert retrieval_calls[0]["max_generation_videos"] == (
+            main.GENERATION_SOURCE_BUDGETS["slow"]
+        )
+        assert child_generation_id in retrieval_calls[0][
+            "exclude_generation_ids"
+        ]
     finally:
         conn.close()
 
