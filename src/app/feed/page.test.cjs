@@ -4088,6 +4088,8 @@ test("every adaptive rerank invalidates old generation before changing inventory
       return null;
     },
     getAdaptiveExcludeVideoIds: () => ["dQw4w9WgXcQ"],
+    sourceVideoIdForReel: () => "",
+    reelClipKey: (row) => String(row.reel_id || ""),
     dedupeByIdentity,
     mergeReelBatchesInServerOrder: (batches) => batches.flat(),
     adaptiveExcludeReelIdsRef: { current: [] },
@@ -4107,10 +4109,241 @@ test("every adaptive rerank invalidates old generation before changing inventory
     "renew",
     "can-request:true",
     "fetch:2",
-    "inventory:watched",
+    "inventory:watched,old-unseen",
     "remember:adaptive-job",
     "consume:adaptive-job:2",
   ]);
+});
+
+test("an adaptive rerank response cannot cross the live watched frontier", async () => {
+  const videoUrl = (videoId) => `https://www.youtube.com/watch?v=${videoId}`;
+  const reel = (reelId, videoId, start = 0) => ({
+    reel_id: reelId,
+    material_id: "material-a",
+    video_id: `yt:${videoId}`,
+    video_url: videoUrl(videoId),
+    t_start: start,
+    t_end: start + 10,
+  });
+  const reelsRef = {
+    current: [
+      reel("A", "aaaaaaaaaaa"),
+      reel("B", "bbbbbbbbbbb"),
+      reel("C", "ccccccccccc"),
+      reel("D", "ddddddddddd"),
+    ],
+  };
+  const activeIndexRef = { current: 0 };
+  const watchedFrontierIndexRef = { current: 0 };
+  const adaptiveExcludeReelIdsRef = { current: [] };
+  const oldScope = { key: "material-a", seq: 1, controller: new AbortController() };
+  const activeSearchScopeRef = { current: oldScope };
+  let resolveFeed;
+  const deferredFeed = new Promise((resolve) => {
+    resolveFeed = resolve;
+  });
+  let renderedReels = reelsRef.current;
+  let renderedActiveIndex = activeIndexRef.current;
+  const consumed = [];
+  const sourceVideoIdForReel = (row) => String(row.video_id || "").replace(/^yt:/, "");
+  const dedupeByIdentity = (rows, existing = []) => {
+    const seenIds = new Set();
+    const seenClips = new Set();
+    const result = [];
+    for (const row of [...existing, ...rows]) {
+      const clip = `${sourceVideoIdForReel(row)}:${row.t_start}:${row.t_end}`;
+      if (seenIds.has(row.reel_id) || seenClips.has(clip)) continue;
+      seenIds.add(row.reel_id);
+      seenClips.add(clip);
+      result.push(row);
+    }
+    return result;
+  };
+  const rerank = compileUseCallback("rerankUnseenTail", {
+    getFeedMaterialIds: () => ["material-a"],
+    reelsRef,
+    settingsScopeReady: true,
+    activeSearchScopeRef,
+    activeIndexRef,
+    watchedFrontierIndexRef,
+    clamp: (value, min, max) => Math.max(min, Math.min(max, value)),
+    MAX_REELS_PER_FEED_SESSION: 50,
+    getFeedTuningSettings: () => ({
+      minRelevance: 0.75,
+      creativeCommonsOnly: false,
+      preferredVideoDuration: "any",
+    }),
+    fetchAdaptiveFeedPageWithRetry: async ({ excludeReelIds, excludeVideoIds }) => {
+      assert.deepEqual(excludeReelIds, ["A"], "the request must retain its immutable input snapshot");
+      assert.deepEqual(excludeVideoIds, ["aaaaaaaaaaa"]);
+      return deferredFeed;
+    },
+    generationMode: "slow",
+    isSearchScopeActive: (scope) => scope === activeSearchScopeRef.current && !scope.controller.signal.aborted,
+    knowledgeLevelByMaterialRef: { current: new Map() },
+    clearGenerationTracking: () => {},
+    setAssessmentPreparingFeed: () => {},
+    renewActiveSearchScope: () => {
+      activeSearchScopeRef.current.controller.abort();
+      activeSearchScopeRef.current = {
+        key: "material-a",
+        seq: activeSearchScopeRef.current.seq + 1,
+        controller: new AbortController(),
+      };
+    },
+    rememberFeedContinuationToken: () => {},
+    rememberFeedGenerationJob: () => {},
+    consumeFeedGenerationJob: (...args) => {
+      consumed.push(args);
+      return null;
+    },
+    getAdaptiveExcludeVideoIds: () => adaptiveExcludeReelIdsRef.current
+      .map((reelId) => reelsRef.current.find((row) => row.reel_id === reelId))
+      .filter(Boolean)
+      .map(sourceVideoIdForReel),
+    sourceVideoIdForReel,
+    reelClipKey: (row) => `${sourceVideoIdForReel(row)}:${row.t_start}:${row.t_end}`,
+    dedupeByIdentity,
+    mergeReelBatchesInServerOrder: (batches) => batches.flat(),
+    adaptiveExcludeReelIdsRef,
+    updateSessionReels: (rows) => {
+      reelsRef.current = rows;
+      renderedReels = rows;
+    },
+    setActiveIndex: (index) => {
+      renderedActiveIndex = index;
+    },
+    setTotal: () => {},
+    setPage: () => {},
+    setCanRequestMore: () => {},
+    setFeedPagesExhausted: () => {},
+    setKnowledgeLevel: () => {},
+  });
+
+  const pendingRerank = rerank();
+  activeIndexRef.current = 2;
+  watchedFrontierIndexRef.current = 2;
+  resolveFeed({
+    reels: [
+      reel("B-stale-source", "bbbbbbbbbbb", 20),
+      reel("X", "xxxxxxxxxxx"),
+      reel("C-stale-source", "ccccccccccc", 20),
+      reel("Y", "yyyyyyyyyyy"),
+    ],
+    total: 4,
+    knowledge_level: "beginner",
+    generation_job_id: "adaptive-job",
+    generation_job_status: "queued",
+  });
+  await pendingRerank;
+
+  assert.deepEqual(
+    renderedReels.map((row) => row.reel_id),
+    ["A", "B", "C", "X", "Y", "D"],
+    "A-C must stay fixed, stale B/C-source results must be rejected, and released unseen D must survive",
+  );
+  assert.equal(activeIndexRef.current, 2);
+  assert.equal(renderedActiveIndex, 2, "the deferred response must not snap C back to A");
+  assert.deepEqual(adaptiveExcludeReelIdsRef.current, ["A", "B", "C"]);
+  assert.equal(consumed.length, 1);
+});
+
+test("adaptive rerank preserves every released identity at full and near-full capacity", async () => {
+  const reel = (reelId) => ({
+    reel_id: reelId,
+    material_id: "material-a",
+    video_id: `video-${reelId}`,
+    video_url: `https://example.test/${reelId}`,
+    t_start: 0,
+    t_end: 10,
+  });
+  const reelClipKey = (row) => `${row.video_id}:${row.t_start}:${row.t_end}`;
+  const sourceVideoIdForReel = (row) => row.video_id;
+  const dedupeByIdentity = (rows, existing = []) => {
+    const seenIds = new Set();
+    const seenClips = new Set();
+    const result = [];
+    for (const row of [...existing, ...rows]) {
+      const clipKey = reelClipKey(row);
+      if (seenIds.has(row.reel_id) || seenClips.has(clipKey)) continue;
+      seenIds.add(row.reel_id);
+      seenClips.add(clipKey);
+      result.push(row);
+    }
+    return result;
+  };
+
+  const runCase = async (maxReels) => {
+    const reelsRef = { current: ["A", "B", "C", "D", "E"].map(reel) };
+    const activeIndexRef = { current: 0 };
+    const watchedFrontierIndexRef = { current: 0 };
+    const oldScope = { key: "material-a", seq: 1, controller: new AbortController() };
+    const activeSearchScopeRef = { current: oldScope };
+    const rerank = compileUseCallback("rerankUnseenTail", {
+      getFeedMaterialIds: () => ["material-a"],
+      reelsRef,
+      settingsScopeReady: true,
+      activeSearchScopeRef,
+      activeIndexRef,
+      watchedFrontierIndexRef,
+      clamp: (value, min, max) => Math.max(min, Math.min(max, value)),
+      MAX_REELS_PER_FEED_SESSION: maxReels,
+      getFeedTuningSettings: () => ({
+        minRelevance: 0.75,
+        creativeCommonsOnly: false,
+        preferredVideoDuration: "any",
+      }),
+      fetchAdaptiveFeedPageWithRetry: async () => ({
+        reels: ["C", "X", "B", "Y"].map(reel),
+        total: 4,
+        knowledge_level: "beginner",
+        generation_job_status: "completed",
+      }),
+      generationMode: "slow",
+      isSearchScopeActive: (scope) => scope === activeSearchScopeRef.current && !scope.controller.signal.aborted,
+      knowledgeLevelByMaterialRef: { current: new Map() },
+      clearGenerationTracking: () => {},
+      setAssessmentPreparingFeed: () => {},
+      renewActiveSearchScope: () => {
+        activeSearchScopeRef.current.controller.abort();
+        activeSearchScopeRef.current = {
+          key: "material-a",
+          seq: activeSearchScopeRef.current.seq + 1,
+          controller: new AbortController(),
+        };
+      },
+      rememberFeedContinuationToken: () => {},
+      rememberFeedGenerationJob: () => {},
+      consumeFeedGenerationJob: () => null,
+      getAdaptiveExcludeVideoIds: () => ["video-A"],
+      sourceVideoIdForReel,
+      reelClipKey,
+      dedupeByIdentity,
+      mergeReelBatchesInServerOrder: (batches) => batches.flat(),
+      adaptiveExcludeReelIdsRef: { current: [] },
+      updateSessionReels: (rows) => { reelsRef.current = rows; },
+      setActiveIndex: () => {},
+      setTotal: () => {},
+      setPage: () => {},
+      setCanRequestMore: () => {},
+      setFeedPagesExhausted: () => {},
+      setKnowledgeLevel: () => {},
+    });
+
+    await rerank();
+    return reelsRef.current.map((row) => row.reel_id);
+  };
+
+  assert.deepEqual(
+    await runCase(5),
+    ["A", "C", "B", "D", "E"],
+    "a full feed may be reorganized but cannot replace any released identity",
+  );
+  assert.deepEqual(
+    await runCase(6),
+    ["A", "C", "X", "B", "D", "E"],
+    "a near-full feed must admit only the first genuinely new row in organizer order",
+  );
 });
 
 test("adaptive generation excludes source videos from the watched prefix", () => {

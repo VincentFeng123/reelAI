@@ -13,6 +13,7 @@ from backend.app.clip_engine.errors import (
     CancellationError,
     ProviderConfigurationError,
     ProviderRequestError,
+    ProviderResponseValidationError,
     ProviderTransientError,
 )
 from backend.app.clip_engine.provider_cache import MemoryProviderCache
@@ -222,8 +223,10 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
     )
 
     assert expand.PRACTICE_FAST_EXPAND_MODEL == "gemini-3.1-flash-lite"
+    assert expand.PRACTICE_FAST_EXPAND_FALLBACK_MODEL == "gemini-3.6-flash"
     assert expand.PRACTICE_FAST_EXPAND_TIMEOUT_MS == 10_000
-    assert expand.PRACTICE_FAST_EXPAND_ATTEMPTS == 2
+    assert expand.PRACTICE_FAST_EXPAND_ATTEMPTS == 3
+    assert expand.PRACTICE_FAST_EXPAND_FALLBACK_OUTPUT_TOKENS == 4_096
     assert _without_intent_contract(result) == {
         "corrected": "Calculus",
         "queries": ["calculus spoken lecture", "Derivatives", "Limits"],
@@ -278,6 +281,69 @@ def test_practice_fast_expansion_requests_focused_sources() -> None:
         prompt
     )
     assert "net force, mass, acceleration, and units are four separate scope" in prompt
+
+
+def test_expansion_joint_structure_drops_only_redundant_relation_member() -> None:
+    structure = expand._PracticeFastJointStructure.model_validate({
+        "member_constraint_ids": ["stage-a", "sequence", "stage-b"],
+        "relation_constraint_id": "sequence",
+    })
+
+    assert structure.member_constraint_ids == ["stage-a", "stage-b"]
+
+    with pytest.raises(ValueError, match="at least two non-relation side or stage"):
+        expand._PracticeFastJointStructure.model_validate({
+            "member_constraint_ids": ["stage-a", "sequence"],
+            "relation_constraint_id": "sequence",
+        })
+
+    schema = expand._PracticeFastJointStructure.model_json_schema()["properties"]
+    assert "Never include relation_constraint_id" in schema[
+        "member_constraint_ids"
+    ]["description"]
+    assert "not a member_constraint_id" in schema[
+        "relation_constraint_id"
+    ]["description"]
+
+
+def test_expansion_rejects_every_kind_topology_mismatch() -> None:
+    with pytest.raises(ValueError, match="relationship topology must match"):
+        expand._PracticeFastExpansion.model_validate({
+            "corrected": "Teach alpha, then beta",
+            "intent_constraints": [{
+                "constraint_id": "sequence",
+                "kind": "format",
+                "source_phrase": "then",
+                "source_occurrence": 0,
+                "requirement": "Teach alpha before beta",
+                "relationship_topology": "ordered",
+            }],
+            "joint_structures": [],
+            "summary_preserved_constraint_ids": ["sequence"],
+            "queries": [{
+                "text": "alpha then beta lesson",
+                "preserved_constraint_ids": ["sequence"],
+            }],
+        })
+
+    with pytest.raises(ValueError, match="relationship topology must match"):
+        expand._PracticeFastExpansion.model_validate({
+            "corrected": "Compare alpha and beta",
+            "intent_constraints": [{
+                "constraint_id": "relation",
+                "kind": "relationship",
+                "source_phrase": "Compare",
+                "source_occurrence": 0,
+                "requirement": "Compare alpha and beta",
+                "relationship_topology": "not_applicable",
+            }],
+            "joint_structures": [],
+            "summary_preserved_constraint_ids": ["relation"],
+            "queries": [{
+                "text": "alpha beta comparison",
+                "preserved_constraint_ids": ["relation"],
+            }],
+        })
 
 
 @pytest.mark.parametrize(
@@ -344,15 +410,15 @@ def test_expansion_retries_selector_rejected_contract_before_cache_or_return(
         lambda *args: cache_writes.append(args),
     )
 
-    result = expand.expand_query_practice_fast(
-        topic,
-        1,
-        context=GenerationContext("fast"),
-    )
+    with pytest.raises(ProviderResponseValidationError):
+        expand.expand_query_practice_fast(
+            topic,
+            1,
+            context=GenerationContext("fast"),
+        )
 
     assert provider_calls == expand.PRACTICE_FAST_EXPAND_ATTEMPTS
     assert cache_writes == []
-    assert result == expand.literal_fallback(topic, 1)
 
 
 @pytest.mark.parametrize(
@@ -1236,11 +1302,7 @@ def test_practice_fast_expansion_keeps_partial_focus_beside_complete_broad_query
                 "text": "chain rule worked example",
                 "preserved_constraint_ids": ["request"],
             }],
-            {
-                "corrected": "chain rule worked example",
-                "queries": ["chain rule worked example"],
-                "provider_used": "literal_fallback",
-            },
+            None,
         ),
         (
             [
@@ -1301,9 +1363,12 @@ def test_practice_fast_expansion_requires_subject_and_accepts_focused_queries(
         lambda *_args, **_kwargs: _expansion_payload_json(payload),
     )
 
-    result = expand.expand_query_practice_fast("chain rule worked example", 3)
-
-    assert _without_intent_contract(result) == expected
+    if expected is None:
+        with pytest.raises(ProviderResponseValidationError):
+            expand.expand_query_practice_fast("chain rule worked example", 3)
+    else:
+        result = expand.expand_query_practice_fast("chain rule worked example", 3)
+        assert _without_intent_contract(result) == expected
 
 
 def test_practice_fast_expansion_trusts_grounded_ai_retrieval_branch_when_plan_is_sparse(
@@ -1365,13 +1430,8 @@ def test_practice_fast_expansion_rejects_ungrounded_ai_subject(monkeypatch):
         lambda *_args, **_kwargs: _expansion_payload_json(payload),
     )
 
-    result = expand.expand_query_practice_fast("chain rule worked example", 3)
-
-    assert _without_intent_contract(result) == {
-        "corrected": "chain rule worked example",
-        "queries": ["chain rule worked example"],
-        "provider_used": "literal_fallback",
-    }
+    with pytest.raises(ProviderResponseValidationError):
+        expand.expand_query_practice_fast("chain rule worked example", 3)
 
 
 @pytest.mark.parametrize(
@@ -1423,13 +1483,8 @@ def test_practice_fast_expansion_rejects_unbound_corrected_summary(
         lambda *_args, **_kwargs: json.dumps(payload),
     )
 
-    result = expand.expand_query_practice_fast("chain rule worked example", 3)
-
-    assert _without_intent_contract(result) == {
-        "corrected": "chain rule worked example",
-        "queries": ["chain rule worked example"],
-        "provider_used": "literal_fallback",
-    }
+    with pytest.raises(ProviderResponseValidationError):
+        expand.expand_query_practice_fast("chain rule worked example", 3)
 
 
 def test_failed_expansion_dispatch_is_recorded_once(monkeypatch):
@@ -1462,6 +1517,37 @@ def test_failed_expansion_dispatch_is_recorded_once(monkeypatch):
     summary = context.usage_payload()["summary"]
     assert summary["billing_unknown_calls"] == 1
     assert summary["reserved_worst_case_cost_usd"] > 0
+
+
+def test_failed_expansion_dispatch_records_typed_provider_status(monkeypatch):
+    from google import genai
+
+    class _ClientError(RuntimeError):
+        code = 400
+
+    async def fail(**_kwargs):
+        raise _ClientError("invalid structured-output schema")
+
+    monkeypatch.setattr(expand.config, "require_gemini_key", lambda: "gemini-test")
+    monkeypatch.setattr(genai, "Client", lambda **_kwargs: _FakeGeminiClient(fail))
+    context = GenerationContext("fast")
+
+    with pytest.raises(_ClientError):
+        asyncio.run(
+            expand._practice_fast_gemini_raw_async(
+                "physics",
+                3,
+                model=expand.PRACTICE_FAST_EXPAND_MODEL,
+                level=None,
+                should_cancel=None,
+                context=context,
+            )
+        )
+
+    assert len(context.usage()) == 1
+    usage = context.usage()[0]
+    assert usage["status_code"] == 400
+    assert usage["error_code"] == "dispatch_failed:_ClientError"
 
 
 def test_successful_expansion_dispatch_is_not_double_recorded(monkeypatch):
@@ -1503,6 +1589,49 @@ def test_successful_expansion_dispatch_is_not_double_recorded(monkeypatch):
     assert str(config.thinking_config.thinking_level).casefold().endswith("low")
     assert config.temperature is None
     assert config.max_output_tokens == 2_048
+    schema = config.response_json_schema
+    serialized_schema = json.dumps(schema)
+    assert "additionalProperties" not in serialized_schema
+    assert "minLength" not in serialized_schema
+    assert "maxLength" not in serialized_schema
+    assert set(schema["properties"]) == {
+        "corrected",
+        "intent_constraints",
+        "joint_structures",
+        "summary_preserved_constraint_ids",
+        "queries",
+    }
+    assert set(schema["required"]) == set(schema["properties"])
+
+
+def test_fallback_expansion_gets_failure_only_output_headroom(monkeypatch):
+    from google import genai
+
+    seen = {}
+
+    class _Response:
+        text = '{"corrected":"Physics","queries":["Physics"]}'
+        model_version = expand.PRACTICE_FAST_EXPAND_FALLBACK_MODEL
+        usage_metadata = {}
+
+    async def succeed(**kwargs):
+        seen["config"] = kwargs["config"]
+        return _Response()
+
+    monkeypatch.setattr(expand.config, "require_gemini_key", lambda: "gemini-test")
+    monkeypatch.setattr(genai, "Client", lambda **_kwargs: _FakeGeminiClient(succeed))
+
+    asyncio.run(
+        expand._practice_fast_gemini_raw_async(
+            "physics",
+            1,
+            model=expand.PRACTICE_FAST_EXPAND_FALLBACK_MODEL,
+            level=None,
+            should_cancel=None,
+        )
+    )
+
+    assert seen["config"].max_output_tokens == 4_096
 
 
 def test_zero_result_recovery_prompt_includes_exact_request_tried_queries_and_signal(
@@ -1616,7 +1745,9 @@ def test_zero_clip_recovery_has_distinct_signal_rejected_ids_and_cache_key(
     assert search_key != clip_key
 
 
-def test_practice_fast_expansion_never_falls_back_to_pro(monkeypatch):
+def test_practice_fast_expansion_uses_configured_flash_on_final_attempt(
+    monkeypatch,
+):
     calls = []
 
     def flash_then_pro(*args, model, **kwargs):
@@ -1630,18 +1761,29 @@ def test_practice_fast_expansion_never_falls_back_to_pro(monkeypatch):
         )
 
     monkeypatch.setattr(expand, "_practice_fast_gemini_raw", flash_then_pro)
+    monkeypatch.setattr(
+        expand.config,
+        "GEMINI_MODEL",
+        "gemini-3.1-pro-preview",
+    )
 
     result = expand.expand_query_practice_fast("physics", 3)
 
-    assert calls == ["gemini-3.1-flash-lite", "gemini-3.1-flash-lite"]
+    assert calls == [
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-flash-lite",
+        expand.PRACTICE_FAST_EXPAND_FALLBACK_MODEL,
+    ]
     assert _without_intent_contract(result) == {
-        "corrected": "physics",
-        "queries": ["physics"],
-        "provider_used": "literal_fallback",
+        "corrected": "Physics",
+        "queries": ["Physics", "mechanics", "waves"],
+        "provider_used": "gemini",
     }
 
 
-def test_practice_fast_expansion_uses_literal_fallback_after_flash(monkeypatch):
+def test_practice_fast_expansion_raises_typed_failure_after_all_models(
+    monkeypatch,
+):
     calls = []
 
     def failed_models(*args, model, **kwargs):
@@ -1649,15 +1791,16 @@ def test_practice_fast_expansion_uses_literal_fallback_after_flash(monkeypatch):
         raise RuntimeError("unavailable")
 
     monkeypatch.setattr(expand, "_practice_fast_gemini_raw", failed_models)
+    monkeypatch.setattr(expand.config, "GEMINI_MODEL", "gemini-3.1-pro-preview")
 
-    result = expand.expand_query_practice_fast("physics", 3)
+    with pytest.raises(ProviderTransientError):
+        expand.expand_query_practice_fast("physics", 3)
 
-    assert calls == ["gemini-3.1-flash-lite", "gemini-3.1-flash-lite"]
-    assert _without_intent_contract(result) == {
-        "corrected": "physics",
-        "queries": ["physics"],
-        "provider_used": "literal_fallback",
-    }
+    assert calls == [
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-flash-lite",
+        expand.PRACTICE_FAST_EXPAND_FALLBACK_MODEL,
+    ]
 
 
 def test_practice_fast_expansion_retries_failed_flash_step_once(monkeypatch):
@@ -1702,14 +1845,10 @@ def test_practice_fast_expansion_does_not_retry_permanent_configuration(
 
     monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fail_configuration)
 
-    result = expand.expand_query_practice_fast("physics", 3)
+    with pytest.raises(ProviderConfigurationError):
+        expand.expand_query_practice_fast("physics", 3)
 
     assert calls == 1
-    assert _without_intent_contract(result) == {
-        "corrected": "physics",
-        "queries": ["physics"],
-        "provider_used": "literal_fallback",
-    }
 
 
 def test_practice_fast_expansion_cache_hit_skips_gemini(monkeypatch):
@@ -2928,8 +3067,66 @@ def test_rejected_provider_cursor_continues_through_another_query_branch(monkeyp
     assert calls == [None, ["bad-cursor"], ["good-cursor"]]
     assert [video["id"] for video in result["videos"]] == ["fresh-focused"]
     assert result["provider_exhausted"] is False
-    assert "continued with another grounded search query" in str(result["warning"])
+    assert "unusable cursor branch was skipped" in str(result["warning"])
     assert context.budget.remaining("search") == 0
+
+
+def test_rejected_sole_provider_cursor_does_not_claim_another_search(
+    monkeypatch,
+    caplog,
+):
+    topic = "LEARNER_CURSOR_SECRET cell membrane transport"
+    calls: list[list[str] | None] = []
+    caplog.set_level("WARNING", logger=search.__name__)
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda *_args, **_kwargs: {
+            "corrected": topic,
+            "queries": [topic],
+            "provider_used": "gemini",
+            "intent_contract": _intent_contract(topic),
+        },
+    )
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        del filters
+        page_tokens = kwargs.get("page_tokens")
+        calls.append(page_tokens)
+        if page_tokens:
+            raise ProviderRequestError(
+                "Supadata rejected the search request (400).",
+                provider="supadata",
+                operation="search",
+                status_code=400,
+                detail="Invalid or expired continuation token",
+            )
+        return {
+            "per_query": [{
+                "query": queries[0],
+                "videos": [{"id": "already-consumed"}],
+                "next_page_token": "bad-cursor",
+            }],
+            "credits_used": 0,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        topic,
+        limit=1,
+        breadth=1,
+        consumed_video_ids=["already-consumed"],
+        retrieval_profile="deep",
+    )
+
+    assert calls == [None, ["bad-cursor"]]
+    assert result["videos"] == []
+    assert "unusable cursor branch was skipped" in str(result["warning"])
+    assert "continued" not in str(result["warning"])
+    assert "skipping unusable cursor branch" in caplog.text
+    assert "LEARNER_CURSOR_SECRET" not in caplog.text
 
 
 def test_literal_only_rejected_cursor_retries_with_fresh_grounded_branch(
@@ -3020,7 +3217,7 @@ def test_literal_only_rejected_cursor_retries_with_fresh_grounded_branch(
         (topic, 4, [topic]),
     ]
     assert [video["id"] for video in result["videos"]] == ["fresh-recovery"]
-    assert "continued with another grounded search query" in str(result["warning"])
+    assert "unusable cursor branch was skipped" in str(result["warning"])
     assert context.budget.remaining("search") == 2
 
 

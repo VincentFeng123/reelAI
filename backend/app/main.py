@@ -7030,6 +7030,9 @@ def _run_leased_generation_job(
 
             usage_records = context.usage()
             usage_payload = generation_usage_payload()
+            terminal_counters = dict(
+                usage_payload.get("counters") or stage_counters
+            )
             model_records = [
                 row
                 for row in usage_records
@@ -7094,12 +7097,12 @@ def _run_leased_generation_job(
                         else None
                     ),
                     error_message=(
-                        _generation_exhaustion_message(stage_counters)
+                        _generation_exhaustion_message(terminal_counters)
                         if terminal_status == "exhausted"
                         else None
                     ),
                     error_detail=(
-                        {"counters": stage_counters}
+                        {"counters": terminal_counters}
                         if terminal_status == "exhausted"
                         else None
                     ),
@@ -7148,6 +7151,9 @@ def _run_leased_generation_job(
             provider_exc.as_dict(),
         )
         provider_usage = generation_usage_payload(retry_error=provider_exc.as_dict())
+        provider_counters = dict(
+            provider_usage.get("counters") or context.counters()
+        )
         attempt_count = durable_attempt_count
         if provider_exc.retryable:
             retry_state = _run_generation_db_transaction(
@@ -7187,7 +7193,7 @@ def _run_leased_generation_job(
                     error_message=str(provider_exc),
                     error_detail={
                         **provider_exc.as_dict(),
-                        "counters": context.counters(),
+                        "counters": provider_counters,
                     },
                 ),
                 retry_should_stop=db_retry_should_stop,

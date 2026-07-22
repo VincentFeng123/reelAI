@@ -1,6 +1,7 @@
 """Supadata YouTube search with truthful filters, caching, budgets, and retries."""
 from __future__ import annotations
 
+import re
 import time  # compatibility surface retained for callers that import it
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -28,6 +29,21 @@ from .provider_cache import (
     search_cache_key,
 )
 from .provider_runtime import GenerationContext, MAX_PROVIDER_RETRIES, bounded_retry_after
+
+
+_INVALID_PROVIDER_CURSOR = re.compile(
+    r"\b(?:"
+    r"(?:invalid|expired)(?:\s+or\s+(?:invalid|expired))?\s+"
+    r"(?:continuation\s+token|page\s+token|nextpagetoken|cursor)"
+    r"|(?:continuation\s+token|page\s+token|nextpagetoken|cursor)\s+"
+    r"(?:is\s+)?(?:invalid|expired)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def is_invalid_cursor_detail(value: object) -> bool:
+    return bool(_INVALID_PROVIDER_CURSOR.search(str(value or "")))
 
 
 def _remaining_seconds(deadline_monotonic: float | None) -> float | None:
@@ -244,7 +260,24 @@ async def _search_one_async(
                     continue
                 raise _failure(response, retry_after=retry_after)
             if status >= 300:
-                raise _failure(response)
+                failure = _failure(response)
+                if (
+                    page_token
+                    and status == 400
+                    and is_invalid_cursor_detail(failure.detail)
+                ):
+                    store.put_search(
+                        cache_key,
+                        {"videos": [], "next_page_token": None},
+                        {
+                            "normalized_query": normalize_query(query),
+                            "filters": normalized_filters,
+                            "language": normalized_language,
+                            "page_token": str(page_token).strip(),
+                            "invalid_cursor": True,
+                        },
+                    )
+                raise failure
             if payload_error is not None:
                 if retry_index < MAX_PROVIDER_RETRIES:
                     await _sleep_before_retry(
