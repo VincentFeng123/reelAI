@@ -3808,34 +3808,44 @@ def _authoritative_generation_release_reel_ids(
         (generation_id,),
     )
     for job in jobs:
-        authoritative_payload: dict[str, Any] | None = None
-        events = replay_generation_events(
+        released_reel_ids = _authoritative_job_release_reel_ids(
             conn,
-            job_id=str(job.get("id") or ""),
+            str(job.get("id") or ""),
         )
-        for event in reversed(events):
-            if str(event.get("type") or "") != "final":
-                continue
-            payload = event.get("payload")
-            if isinstance(payload, dict) and payload.get("authoritative") is True:
-                authoritative_payload = payload
-                break
-        if authoritative_payload is None:
+        if released_reel_ids is None:
             continue
-        ordered_ids: list[str] = []
-        seen_ids: set[str] = set()
-        reels = authoritative_payload.get("reels")
-        if isinstance(reels, list):
-            for reel in reels:
-                if not isinstance(reel, dict):
-                    continue
-                reel_id = str(reel.get("reel_id") or "").strip()
-                if not reel_id or reel_id in seen_ids:
-                    continue
-                seen_ids.add(reel_id)
-                ordered_ids.append(reel_id)
-        return ordered_ids
+        return released_reel_ids
     return None
+
+
+def _authoritative_job_release_reel_ids(
+    conn,
+    job_id: str,
+) -> list[str] | None:
+    """Return one job's authoritative release, including an explicit empty release."""
+    authoritative_payload: dict[str, Any] | None = None
+    for event in reversed(replay_generation_events(conn, job_id=job_id)):
+        if str(event.get("type") or "") != "final":
+            continue
+        payload = event.get("payload")
+        if isinstance(payload, dict) and payload.get("authoritative") is True:
+            authoritative_payload = payload
+            break
+    if authoritative_payload is None:
+        return None
+    ordered_ids: list[str] = []
+    seen_ids: set[str] = set()
+    reels = authoritative_payload.get("reels")
+    if isinstance(reels, list):
+        for reel in reels:
+            if not isinstance(reel, dict):
+                continue
+            reel_id = str(reel.get("reel_id") or "").strip()
+            if not reel_id or reel_id in seen_ids:
+                continue
+            seen_ids.add(reel_id)
+            ordered_ids.append(reel_id)
+    return ordered_ids
 
 
 def _remove_authoritative_release_temporal_overlaps(
@@ -4342,6 +4352,58 @@ def _generation_job_has_failed_source_attempts(
     )
 
 
+def _generation_job_allows_terminal_retry(
+    conn,
+    job_row: dict[str, Any] | None,
+) -> bool:
+    """Allow an explicit retry only for an unreleased terminal-empty batch."""
+    if not job_row:
+        return False
+    status = str(job_row.get("status") or "").strip()
+    error_code = str(job_row.get("terminal_error_code") or "").strip()
+    if status != "exhausted" and not (
+        status == "failed" and error_code in JOB_GLOBAL_PROVIDER_ERROR_CODES
+    ):
+        return False
+    job_id = str(job_row.get("id") or "").strip()
+    if job_id and _authoritative_job_release_reel_ids(conn, job_id):
+        return False
+    generation_id = str(job_row.get("result_generation_id") or "").strip()
+    return not (
+        generation_id
+        and _authoritative_generation_release_reel_ids(conn, generation_id)
+    )
+
+
+def _failed_global_provider_terminal_retry_detail(
+    conn,
+    job_row: dict[str, Any] | None,
+) -> dict[str, str] | None:
+    if (
+        str((job_row or {}).get("status") or "").strip() != "failed"
+        or str((job_row or {}).get("terminal_error_code") or "").strip()
+        not in JOB_GLOBAL_PROVIDER_ERROR_CODES
+    ):
+        return None
+    job_id = str((job_row or {}).get("id") or "")
+    if _generation_job_allows_terminal_retry(conn, job_row):
+        return {
+            "code": "terminal_retry_required",
+            "message": (
+                "Retry this failed reel batch explicitly before starting another "
+                "generation."
+            ),
+            "terminal_job_id": job_id,
+        }
+    return {
+        "code": "invalid_terminal_retry",
+        "message": (
+            "The failed reel batch has an authoritative release and cannot be restarted."
+        ),
+        "terminal_job_id": job_id,
+    }
+
+
 def _generation_chain_meets_source_budget(
     conn,
     *,
@@ -4450,6 +4512,30 @@ def _latest_compatible_generation_job(
             continue
         return row
     return None
+
+
+def _latest_exact_generation_job(
+    conn,
+    *,
+    material_id: str,
+    learner_id: str,
+    request_key: str,
+) -> dict[str, Any] | None:
+    """Return the latest non-cancelled job for one exact durable request."""
+    return fetch_one(
+        conn,
+        """
+        SELECT *
+        FROM reel_generation_jobs
+        WHERE material_id = ?
+          AND learner_id = ?
+          AND request_key = ?
+          AND status IN ('queued', 'running', 'completed', 'partial', 'exhausted', 'failed')
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (material_id, learner_id, request_key),
+    )
 
 
 def _verified_cross_request_source_generation(
@@ -8856,7 +8942,6 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             terminal_retry_job = get_generation_job(conn, retry_terminal_job_id)
             retry_matches = bool(
                 terminal_retry_job
-                and str(terminal_retry_job.get("status") or "") == "exhausted"
                 and str(terminal_retry_job.get("material_id") or "")
                 == payload.material_id
                 and (str(terminal_retry_job.get("concept_id") or "") or None)
@@ -8868,27 +8953,15 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                     terminal_retry_job,
                     request_params,
                 )
+                and _generation_job_allows_terminal_retry(conn, terminal_retry_job)
             )
-            if retry_matches and terminal_retry_job is not None:
-                retry_generation_id = str(
-                    terminal_retry_job.get("result_generation_id") or ""
-                ).strip()
-                released_reel_ids = (
-                    _authoritative_generation_release_reel_ids(
-                        conn,
-                        retry_generation_id,
-                    )
-                    if retry_generation_id
-                    else None
-                )
-                retry_matches = not released_reel_ids
             if not retry_matches:
                 raise HTTPException(
                     status_code=409,
                     detail={
                         "code": "invalid_terminal_retry",
                         "message": (
-                            "Only the current empty exhausted reel batch can be retried."
+                            "Only the current empty retryable reel batch can be retried."
                         ),
                     },
                 )
@@ -8919,13 +8992,14 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                         detail={
                             "code": "invalid_terminal_retry",
                             "message": (
-                                "A newer reel batch has replaced the exhausted batch."
+                                "A newer reel batch has replaced the terminal batch."
                             ),
                         },
                     )
         source_generation_id: str | None = None
         continuation_job: dict[str, Any] | None = None
         fresh_root_recovery = False
+        fresh_retry_source_budget = False
         if continuation_token:
             continuation_job = get_generation_job(conn, continuation_token)
             continuation_status = str((continuation_job or {}).get("status") or "")
@@ -8998,6 +9072,45 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 )
         completed_job = find_completed_generation_job(conn, request_key)
         active_job = find_active_generation_job(conn, request_key)
+        if (
+            continuation_job is not None
+            and completed_job is None
+            and active_job is None
+        ):
+            exact_terminal = _latest_exact_generation_job(
+                conn,
+                material_id=payload.material_id,
+                learner_id=learner_id,
+                request_key=request_key,
+            )
+            terminal_retry_detail = _failed_global_provider_terminal_retry_detail(
+                conn,
+                exact_terminal,
+            )
+            if terminal_retry_detail is not None:
+                raise HTTPException(status_code=409, detail=terminal_retry_detail)
+            if str((exact_terminal or {}).get("status") or "") == "failed":
+                if _generation_job_has_retryable_source_work(
+                    conn,
+                    exact_terminal,
+                ):
+                    source_generation_id = str(
+                        exact_terminal.get("result_generation_id") or ""
+                    ).strip()
+                elif _generation_job_has_failed_source_attempts(
+                    conn,
+                    exact_terminal,
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "source_retry_exhausted",
+                            "message": (
+                                "The failed video sources exhausted their bounded "
+                                "analysis retries."
+                            ),
+                        },
+                    )
         if terminal_retry_job is not None:
             active_job = terminal_retry_active_job
             completed_job = None
@@ -9009,6 +9122,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                     source_generation_id = str(
                         terminal_retry_job.get("result_generation_id") or ""
                     ).strip() or None
+                    fresh_retry_source_budget = source_generation_id is not None
                 else:
                     fresh_root_recovery = True
         elif continuation_job is None:
@@ -9025,6 +9139,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             )
             if latest_status in {"queued", "running"}:
                 active_job = latest_compatible_job
+                completed_job = None
             elif latest_status in {"completed", "partial"}:
                 completed_job = latest_compatible_job
                 active_job = None
@@ -9038,19 +9153,20 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                     source_generation_id = str(
                         latest_compatible_job.get("result_generation_id") or ""
                     ).strip() or None
+                    fresh_retry_source_budget = source_generation_id is not None
                 else:
                     completed_job = latest_compatible_job
                     active_job = None
             elif latest_status == "failed":
-                latest_error_code = str(
-                    (latest_compatible_job or {}).get("terminal_error_code") or ""
-                ).strip()
-                if latest_error_code in JOB_GLOBAL_PROVIDER_ERROR_CODES:
-                    completed_job = None
-                    active_job = None
-                    source_generation_id = None
-                    fresh_root_recovery = True
-                elif _generation_job_has_retryable_source_work(
+                terminal_retry_detail = (
+                    _failed_global_provider_terminal_retry_detail(
+                        conn,
+                        latest_compatible_job,
+                    )
+                )
+                if terminal_retry_detail is not None:
+                    raise HTTPException(status_code=409, detail=terminal_retry_detail)
+                if _generation_job_has_retryable_source_work(
                     conn,
                     latest_compatible_job,
                 ):
@@ -9059,6 +9175,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                     source_generation_id = str(
                         latest_compatible_job.get("result_generation_id") or ""
                     ).strip() or None
+                    fresh_retry_source_budget = source_generation_id is not None
                 elif _generation_job_has_failed_source_attempts(
                     conn,
                     latest_compatible_job,
@@ -9120,6 +9237,8 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 )
             ):
                 request_params["fresh_source_budget"] = True
+        if fresh_retry_source_budget:
+            request_params["fresh_source_budget"] = True
         quota_account: dict[str, str] = {}
         quota_operation_key = f"material:{payload.material_id}"
 
@@ -10306,7 +10425,9 @@ def feed(
                     request_params={
                         **request_params,
                         "num_reels": target_total,
-                        "fresh_source_budget": fresh_cross_request_budget,
+                        "fresh_source_budget": bool(
+                            retry_source_job or fresh_cross_request_budget
+                        ),
                     },
                     source_generation_id=generation_id,
                     job_id=feed_submission_job_id,

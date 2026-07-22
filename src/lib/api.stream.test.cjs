@@ -78,6 +78,32 @@ function queuedGenerationResponse() {
   });
 }
 
+function directGenerationResponse(batchId = "direct-batch") {
+  return new Response(JSON.stringify({
+    reels: [],
+    batch_id: batchId,
+    batch_size: 0,
+    continuation_token: batchId,
+    terminal_status: "completed",
+  }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function apiErrorResponse(status, code, details = {}) {
+  return new Response(JSON.stringify({
+    detail: {
+      code,
+      message: code,
+      ...details,
+    },
+  }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
 test("manual terminal retry submits the exhausted job without a continuation token", TEST_OPTIONS, async () => {
   const originalFetch = global.fetch;
   const originalWindow = global.window;
@@ -105,6 +131,142 @@ test("manual terminal retry submits the exhausted job without a continuation tok
     });
     assert.equal(body.retry_terminal_job_id, "exhausted-job");
     assert.equal(Object.hasOwn(body, "continuation_token"), false);
+  } finally {
+    global.fetch = originalFetch;
+    global.window = originalWindow;
+  }
+});
+
+test("an explicit failed retry follows one server-authoritative terminal handshake", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  const originalWindow = global.window;
+  installCommunitySessionTestWindow();
+  const bodies = [];
+  global.fetch = async (_url, init = {}) => {
+    bodies.push(JSON.parse(init.body));
+    if (bodies.length === 1) {
+      return apiErrorResponse(409, "terminal_retry_required", {
+        terminal_job_id: "failed-server-job",
+      });
+    }
+    return directGenerationResponse("retried-batch");
+  };
+
+  try {
+    const response = await generateReelsStream({
+      materialId: "physics",
+      continuationToken: "stale-continuation",
+      explicitUserRetry: true,
+    });
+    assert.equal(response.batch_id, "retried-batch");
+    assert.equal(bodies.length, 2);
+    assert.equal(bodies[0].continuation_token, "stale-continuation");
+    assert.equal(Object.hasOwn(bodies[0], "retry_terminal_job_id"), false);
+    assert.equal(bodies[1].retry_terminal_job_id, "failed-server-job");
+    assert.equal(Object.hasOwn(bodies[1], "continuation_token"), false);
+  } finally {
+    global.fetch = originalFetch;
+    global.window = originalWindow;
+  }
+});
+
+test("passive and unrelated failures never enter the terminal handshake", TEST_OPTIONS, async (t) => {
+  const scenarios = [
+    {
+      name: "passive terminal conflict",
+      explicitUserRetry: false,
+      code: "terminal_retry_required",
+      details: { terminal_job_id: "failed-server-job" },
+    },
+    {
+      name: "invalid terminal identity",
+      explicitUserRetry: true,
+      code: "invalid_terminal_retry",
+      details: { terminal_job_id: "stale-server-job" },
+    },
+    {
+      name: "non-global generation failure",
+      explicitUserRetry: true,
+      code: "provider_temporarily_unavailable",
+      details: {},
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const originalFetch = global.fetch;
+      const originalWindow = global.window;
+      installCommunitySessionTestWindow();
+      let generateCalls = 0;
+      let requestBody;
+      global.fetch = async (_url, init = {}) => {
+        generateCalls += 1;
+        requestBody = JSON.parse(init.body);
+        return apiErrorResponse(409, scenario.code, scenario.details);
+      };
+      try {
+        await assert.rejects(
+          generateReelsStream({
+            materialId: "biology",
+            continuationToken: "lineage-token",
+            explicitUserRetry: scenario.explicitUserRetry,
+          }),
+          (error) => error?.code === scenario.code,
+        );
+        assert.equal(generateCalls, 1);
+        assert.equal(requestBody.continuation_token, "lineage-token");
+      } finally {
+        global.fetch = originalFetch;
+        global.window = originalWindow;
+      }
+    });
+  }
+});
+
+test("the terminal handshake never recurses when the directed retry is rejected", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  const originalWindow = global.window;
+  installCommunitySessionTestWindow();
+  let generateCalls = 0;
+  global.fetch = async () => {
+    generateCalls += 1;
+    return generateCalls === 1
+      ? apiErrorResponse(409, "terminal_retry_required", { terminal_job_id: "failed-server-job" })
+      : apiErrorResponse(409, "invalid_terminal_retry", { terminal_job_id: "failed-server-job" });
+  };
+
+  try {
+    await assert.rejects(
+      generateReelsStream({ materialId: "law", explicitUserRetry: true }),
+      (error) => error?.code === "invalid_terminal_retry",
+    );
+    assert.equal(generateCalls, 2);
+  } finally {
+    global.fetch = originalFetch;
+    global.window = originalWindow;
+  }
+});
+
+test("a successful explicit continuation remains a single lineage-preserving POST", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  const originalWindow = global.window;
+  installCommunitySessionTestWindow();
+  let generateCalls = 0;
+  let requestBody;
+  global.fetch = async (_url, init = {}) => {
+    generateCalls += 1;
+    requestBody = JSON.parse(init.body);
+    return directGenerationResponse();
+  };
+
+  try {
+    await generateReelsStream({
+      materialId: "software",
+      continuationToken: "stale-success-token",
+      explicitUserRetry: true,
+    });
+    assert.equal(generateCalls, 1);
+    assert.equal(requestBody.continuation_token, "stale-success-token");
   } finally {
     global.fetch = originalFetch;
     global.window = originalWindow;
@@ -899,6 +1061,7 @@ test("terminal stream events cancel and release an unfinished response body", TE
   let cancelCount = 0;
   let streamBody;
   let streamRequestSignal;
+  const observedTerminals = [];
 
   global.fetch = async (url, init = {}) => {
     if (String(url).includes("/reels/generate")) {
@@ -940,8 +1103,12 @@ test("terminal stream events cancel and release an unfinished response body", TE
   };
 
   try {
-    const response = await generateReelsStream({ materialId: "material-stream-test" });
+    const response = await generateReelsStream({
+      materialId: "material-stream-test",
+      onTerminal: (status) => observedTerminals.push(status),
+    });
     assert.deepEqual(response.reels, []);
+    assert.deepEqual(observedTerminals, ["completed"]);
     assert.equal(cancelCount, 1);
     assert.equal(streamRequestSignal.aborted, true);
   } finally {

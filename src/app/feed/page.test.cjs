@@ -314,7 +314,9 @@ function compileUseCallback(name, bindings) {
     isDailySearchLimitError: () => false,
     isVerifiedAccountRequiredError: () => false,
     isTransportError: () => false,
+    isGenerationTerminalConflictError: () => false,
     getAdaptiveExcludeVideoIds: () => [],
+    lastTerminalStatusByMaterialRef: { current: new Map() },
     ...bindings,
   };
   const names = Object.keys(effectiveBindings);
@@ -812,6 +814,98 @@ test("a recovered generation stream failure clears pending tail advance", async 
   assert.equal(clearedTailAdvance, 1);
 });
 
+test("a feed-owned failed terminal closes passive bootstrap before releasing its consumer", async () => {
+  const jobId = "failed-feed-job";
+  const generationJobByMaterialRef = {
+    current: new Map([["material-a", { jobId, status: "running" }]]),
+  };
+  const lastTerminalStatusByMaterialRef = { current: new Map() };
+  const bootstrapAttemptedRef = { current: false };
+  const noteGenerationTerminal = compileUseCallback("noteGenerationTerminal", {
+    generationJobByMaterialRef,
+    lastTerminalStatusByMaterialRef,
+    bootstrapAttemptedRef,
+    markGenerationFinished: () => {
+      throw new Error("a failed terminal is not inventory exhaustion");
+    },
+  });
+  const consumerToken = Symbol(jobId);
+  const isGeneratingRef = { current: true };
+  const streamCalls = [];
+  let passiveLatchAtRelease = null;
+  let visibleFailure = null;
+  const callback = compileUseCallback("consumeFeedGenerationJob", {
+    claimGenerationConsumer: () => consumerToken,
+    releaseGenerationConsumer: () => {
+      passiveLatchAtRelease = bootstrapAttemptedRef.current;
+      isGeneratingRef.current = false;
+    },
+    isGeneratingRef,
+    clearPendingTailAdvance: () => {},
+    GENERATION_STREAM_IDLE_TIMEOUT_MS: 35_000,
+    generateReelsStream: async (params) => {
+      streamCalls.push(params);
+      params.onTerminal("failed");
+      throw new Error("provider budget exhausted");
+    },
+    isSearchScopeActive: () => true,
+    isRequestInterruptedError: () => false,
+    noteFeedFailure: (failure) => {
+      visibleFailure = failure instanceof Error ? failure.message : String(failure);
+    },
+    noteGenerationTerminal,
+    settleGenerationContinuation: () => {},
+    appendGeneratedReels: () => ({ reels: [], addedReels: [], addedCount: 0, updatedCount: 0 }),
+    markRecoveryProgress: () => {},
+    reconcileGeneratedReels: () => ({ reels: [], addedReels: [], addedCount: 0, updatedCount: 0 }),
+    console: { warn: () => {} },
+  });
+
+  await callback(
+    "material-a",
+    { generation_job_id: jobId, generation_job_status: "running" },
+    { key: "material", seq: 1, controller: new AbortController() },
+  );
+
+  assert.equal(streamCalls.length, 1);
+  assert.equal(streamCalls[0].generationJobId, jobId, "the existing durable job must be resumed");
+  assert.equal(passiveLatchAtRelease, true, "the passive bootstrap must close before the global lock releases");
+  assert.equal(bootstrapAttemptedRef.current, true);
+  assert.equal(generationJobByMaterialRef.current.has("material-a"), false);
+  assert.equal(lastTerminalStatusByMaterialRef.current.get("material-a"), "failed");
+  assert.equal(visibleFailure, "provider budget exhausted");
+});
+
+test("a reloaded failed terminal closes passive bootstrap", () => {
+  const generationJobByMaterialRef = { current: new Map() };
+  const lastTerminalStatusByMaterialRef = { current: new Map() };
+  const bootstrapAttemptedRef = { current: false };
+  const noteGenerationTerminal = compileUseCallback("noteGenerationTerminal", {
+    generationJobByMaterialRef,
+    lastTerminalStatusByMaterialRef,
+    bootstrapAttemptedRef,
+    markGenerationFinished: () => {
+      throw new Error("a failed terminal is not inventory exhaustion");
+    },
+  });
+  const canRequestMoreWrites = [];
+  const callback = compileUseCallback("rememberFeedGenerationJob", {
+    generationJobByMaterialRef,
+    lastTerminalStatusByMaterialRef,
+    setCanRequestMore: (value) => canRequestMoreWrites.push(value),
+    noteGenerationTerminal,
+  });
+
+  callback("material-a", {
+    generation_job_id: "failed-reload-job",
+    generation_job_status: "failed",
+  });
+
+  assert.equal(bootstrapAttemptedRef.current, true);
+  assert.equal(lastTerminalStatusByMaterialRef.current.get("material-a"), "failed");
+  assert.deepEqual(canRequestMoreWrites, [], "the terminal reload must not masquerade as an active job");
+});
+
 test("failed empty generation reattaches through the authoritative feed", async () => {
   const searchScope = { key: "material", seq: 1, controller: new AbortController() };
   const isGeneratingRef = { current: false };
@@ -910,7 +1004,7 @@ test("failed empty generation reattaches through the authoritative feed", async 
   assert.equal(clearedTailAdvance, 0, "an attached durable job must retain pending tail advance");
 });
 
-test("background zero-growth partial keeps an existing reel playable without a fatal error", async () => {
+test("background nonterminal failure and zero-growth partial keep an existing reel playable", async () => {
   const searchScope = { key: "material", seq: 1, controller: new AbortController() };
   const isGeneratingRef = { current: false };
   const reelsRef = {
@@ -919,6 +1013,7 @@ test("background zero-growth partial keeps an existing reel playable without a f
   const generationBatchTokensRef = { current: new Set() };
   const generationConsumerByMaterialRef = { current: new Map() };
   const surfacedErrors = [];
+  let generationCalls = 0;
   const callback = compileUseCallback("requestMore", {
     getFeedMaterialIds: () => ["material-a"],
     settingsScopeReady: true,
@@ -945,16 +1040,23 @@ test("background zero-growth partial keeps an existing reel playable without a f
     progressClearTimerRef: { current: null },
     setGenerationProgress: () => {},
     generationJobByMaterialRef: { current: new Map() },
+    lastTerminalStatusByMaterialRef: { current: new Map() },
     continuationTokenByMaterialRef: { current: new Map([["material-a", "previous-job"]]) },
     claimGenerationConsumer: () => Symbol("consumer"),
     GENERATION_STREAM_IDLE_TIMEOUT_MS: 35_000,
-    generateReelsStream: async () => ({
-      reels: [],
-      batch_id: "next-job",
-      batch_size: 0,
-      continuation_token: "next-job",
-      terminal_status: "partial",
-    }),
+    generateReelsStream: async () => {
+      generationCalls += 1;
+      if (generationCalls === 1) {
+        throw new Error("temporary transport failure");
+      }
+      return {
+        reels: [],
+        batch_id: "next-job",
+        batch_size: 0,
+        continuation_token: "next-job",
+        terminal_status: "partial",
+      };
+    },
     isSearchScopeActive: (scope) => scope === searchScope,
     noteGenerationTerminal: () => {},
     settleGenerationContinuation: () => {},
@@ -971,7 +1073,7 @@ test("background zero-growth partial keeps an existing reel playable without a f
     loadPage: async () => ({ addedCount: 0, exhausted: false }),
     markRecoveryProgress: () => {},
     clearPendingTailAdvance: () => {},
-    isTransportError: () => false,
+    isTransportError: (error) => /temporary transport failure/.test(error?.message || ""),
     noteFeedTransportFailure: (error) => surfacedErrors.push(error),
     noteFeedFailure: (error) => surfacedErrors.push(error),
     setRecoveryPhase: () => {},
@@ -1134,6 +1236,7 @@ test("only an authoritative exhausted terminal stops continuation", async () => 
   const generationFinishedRef = { current: new Set() };
   const canRequestMoreWrites = [];
   const lastTerminalStatusByMaterialRef = { current: new Map() };
+  const bootstrapAttemptedRef = { current: false };
   const isGenerationFinished = compileUseCallback("isGenerationFinished", {
     generationFinishedRef,
   });
@@ -1150,6 +1253,7 @@ test("only an authoritative exhausted terminal stops continuation", async () => 
   const callback = compileUseCallback("noteGenerationTerminal", {
     generationJobByMaterialRef,
     lastTerminalStatusByMaterialRef,
+    bootstrapAttemptedRef,
     markGenerationFinished,
   });
 
@@ -1166,6 +1270,7 @@ test("only an authoritative exhausted terminal stops continuation", async () => 
   assert.equal(generationJobByMaterialRef.current.size, 0);
   assert.equal(isGenerationFinished("failed-material"), false);
   assert.equal(lastTerminalStatusByMaterialRef.current.get("failed-material"), "failed");
+  assert.equal(bootstrapAttemptedRef.current, true);
   assert.equal(isGenerationFinished("cancelled-material"), false);
   assert.deepEqual(
     ["failed-material", "cancelled-material"].filter((id) => !isGenerationFinished(id)),
@@ -1186,14 +1291,41 @@ test("terminal copy is hidden until the viewer reaches the last visible reel", (
   );
 });
 
+test("only known generation-terminal conflicts override stale local status", () => {
+  class TestApiError extends Error {
+    constructor(status, code) {
+      super(code);
+      this.status = status;
+      this.code = code;
+    }
+  }
+  const callback = compileFunctionDeclaration("isGenerationTerminalConflictError", {
+    ApiError: TestApiError,
+  });
+
+  for (const code of [
+    "terminal_retry_required",
+    "source_retry_exhausted",
+    "invalid_terminal_retry",
+  ]) {
+    assert.equal(callback(new TestApiError(409, code)), true, code);
+  }
+  assert.equal(callback(new TestApiError(409, "unrelated_conflict")), false);
+  assert.equal(callback(new TestApiError(503, "terminal_retry_required")), false);
+  assert.equal(callback(new Error("plain failure")), false);
+});
+
 test("generation continuation stays server-owned while adaptive requests exclude watched sources", () => {
   const requestMoreStart = source.indexOf("const requestMore = useCallback(");
   const requestMoreEnd = source.indexOf("\n\n  useEffect(() => {", requestMoreStart);
   const callbackText = source.slice(requestMoreStart, requestMoreEnd);
   assert.match(
     callbackText,
-    /const continuationToken = retryTerminal[\s\S]*?: continuationTokenByMaterialRef\.current\.get\(id\)/,
+    /const continuationToken = retryTerminal\s*\? undefined\s*: continuationTokenByMaterialRef\.current\.get\(id\)/,
   );
+  assert.match(callbackText, /const explicitUserProbe = options\?\.explicitUserRetry === true/);
+  assert.match(callbackText, /explicitUserRetry: explicitUserProbe/);
+  assert.doesNotMatch(callbackText, /retryTerminal \|\| explicitUserProbe/);
   assert.match(callbackText, /continuationToken,/);
   assert.match(
     callbackText,
@@ -2015,6 +2147,11 @@ test("manual empty-state retry reopens only the authoritative exhausted batch", 
     setCanRequestMore: () => {},
     setFeedPagesExhausted: () => {},
     activeSearchScopeRef: { current: searchScope },
+    page: 1,
+    hasMore: false,
+    total: 0,
+    PAGE_SIZE: 9,
+    activeIndexRef: { current: 0 },
     readyReservoirTarget: () => 9,
     generationMode: "slow",
     requestMore: async (options) => {
@@ -2031,8 +2168,367 @@ test("manual empty-state retry reopens only the authoritative exhausted batch", 
     initialFill: true,
     requestedCount: 9,
     retryTerminal: true,
+    explicitUserRetry: true,
   }]);
   assert.deepEqual(bootstrappingWrites, [true, false]);
+});
+
+test("manual empty-state failed retry marks only its first generation probe as explicit", async () => {
+  const searchScope = { key: "chemistry", seq: 1 };
+  const reelsRef = { current: [] };
+  const generationRequests = [];
+  const callback = compileUseCallback("bootstrapFirstReels", {
+    materialId: "chemistry",
+    isGeneratingRef: { current: false },
+    canRequestMore: true,
+    isIngestMaterial: false,
+    reelsRef,
+    getFeedMaterialIds: () => ["chemistry"],
+    lastTerminalStatusByMaterialRef: {
+      current: new Map([["chemistry", "failed"]]),
+    },
+    continuationTokenByMaterialRef: {
+      current: new Map([["chemistry", "stale-continuation"]]),
+    },
+    setBootstrappingFirstReels: () => {},
+    setCanRequestMore: () => {},
+    setFeedPagesExhausted: () => {},
+    activeSearchScopeRef: { current: searchScope },
+    page: 1,
+    hasMore: false,
+    total: 0,
+    PAGE_SIZE: 9,
+    activeIndexRef: { current: 0 },
+    readyReservoirTarget: () => 9,
+    generationMode: "slow",
+    MAX_GENERATION_ATTEMPTS_PER_FILL: 5,
+    MAX_ZERO_GROWTH_CONTINUATIONS: 3,
+    REEL_BATCH_SIZE: 3,
+    isGenerationFinished: () => false,
+    isSearchScopeActive: (scope) => scope === searchScope,
+    loadPage: async () => {
+      throw new Error("an empty failed session has no persisted page");
+    },
+    requestMore: async (options) => {
+      generationRequests.push(options);
+      const before = reelsRef.current.length;
+      reelsRef.current = [
+        ...reelsRef.current,
+        ...Array.from({ length: 3 }, (_, index) => ({ reel_id: `fresh-${before + index}` })),
+      ];
+      return reelsRef.current.slice(-3);
+    },
+  });
+
+  await callback(true);
+
+  assert.deepEqual(
+    generationRequests.map((options) => options.explicitUserRetry),
+    [true, false, false],
+  );
+  assert.ok(generationRequests.every((options) => options.surfaceError === true));
+  assert.equal(reelsRef.current.length, 9);
+});
+
+test("an explicit failed probe preserves continuation until the server directs a terminal retry", async () => {
+  const searchScope = { key: "circuits", seq: 1, controller: new AbortController() };
+  const isGeneratingRef = { current: false };
+  const generationBatchTokensRef = { current: new Set() };
+  const generationFinishedRef = { current: new Set() };
+  const lastTerminalStatusByMaterialRef = {
+    current: new Map([["circuits", "failed"]]),
+  };
+  const submittedParams = [];
+  const requestMore = compileUseCallback("requestMore", {
+    getFeedMaterialIds: () => ["circuits"],
+    lastTerminalStatusByMaterialRef,
+    settingsScopeReady: true,
+    isGeneratingRef,
+    canRequestMore: true,
+    isIngestMaterial: false,
+    setCanRequestMore: () => {},
+    setFeedPagesExhausted: () => {},
+    isGenerationFinished: () => false,
+    generationFinishedRef,
+    activeSearchScopeRef: { current: searchScope },
+    getFeedTuningSettings: () => ({
+      minRelevance: 0.3,
+      creativeCommonsOnly: false,
+      preferredVideoDuration: "any",
+    }),
+    reelsRef: { current: [] },
+    REEL_BATCH_SIZE: 3,
+    INITIAL_READY_REEL_TARGET: 9,
+    generationMode: "slow",
+    generationBatchTokensRef,
+    syncGenerationLockState: () => {
+      isGeneratingRef.current = generationBatchTokensRef.current.size > 0;
+    },
+    armActiveRecoveryRequest: () => {},
+    setVisibleFeedError: () => {},
+    progressClearTimerRef: { current: null },
+    setGenerationProgress: () => {},
+    generationJobByMaterialRef: { current: new Map() },
+    continuationTokenByMaterialRef: {
+      current: new Map([["circuits", "failed-child-continuation"]]),
+    },
+    claimGenerationConsumer: () => Symbol("consumer"),
+    GENERATION_STREAM_IDLE_TIMEOUT_MS: 35_000,
+    generateReelsStream: async (params) => {
+      submittedParams.push(params);
+      return {
+        reels: [{ reel_id: "manual-retry-reel", material_id: "circuits" }],
+        batch_id: "manual-retry-job",
+        batch_size: 1,
+        continuation_token: "manual-retry-job",
+        terminal_status: "completed",
+      };
+    },
+    isSearchScopeActive: (scope) => scope === searchScope,
+    noteGenerationTerminal: () => {},
+    settleGenerationContinuation: () => {},
+    appendGeneratedReels: () => ({ reels: [], addedReels: [], addedCount: 0, updatedCount: 0 }),
+    dedupeByIdentity: (rows) => rows,
+    reconcileGeneratedReels: (_streamed, finalRows) => ({
+      reels: finalRows,
+      addedReels: finalRows,
+      addedCount: finalRows.length,
+      updatedCount: 0,
+    }),
+    isRequestInterruptedError: () => false,
+    releaseGenerationConsumer: () => {},
+    materialId: "circuits",
+    mergeReelBatchesInServerOrder: (batches) => batches.flat(),
+    markRecoveryProgress: () => {},
+    clearPendingTailAdvance: () => {},
+    noteFeedTransportFailure: () => {},
+    noteFeedFailure: () => {},
+    clearRecoveredTransportError: () => {},
+    setRecoveryPhase: () => {},
+    finishActiveRecoveryRequest: () => {},
+    showSavedSessionUnavailable: () => {},
+    console: { warn: () => {} },
+  });
+  await requestMore({
+    surfaceError: true,
+    initialFill: true,
+    requestedCount: 9,
+    explicitUserRetry: true,
+  });
+  await requestMore({ initialFill: true, requestedCount: 9 });
+
+  assert.equal(submittedParams.length, 2);
+  assert.equal(submittedParams[0].explicitUserRetry, true);
+  assert.equal(submittedParams[0].continuationToken, "failed-child-continuation");
+  assert.equal(submittedParams[0].retryTerminalJobId, undefined);
+  assert.equal(submittedParams[0].generationJobId, undefined);
+  assert.equal(submittedParams[1].explicitUserRetry, false);
+  assert.equal(submittedParams[1].continuationToken, "failed-child-continuation");
+});
+
+test("passive populated-tail terminals expose one explicit retry even after provisional clips", async (t) => {
+  class TestApiError extends Error {
+    constructor(message, status, code) {
+      super(message);
+      this.status = status;
+      this.code = code;
+    }
+  }
+  const isGenerationTerminalConflictError = compileFunctionDeclaration(
+    "isGenerationTerminalConflictError",
+    { ApiError: TestApiError },
+  );
+  const scenarios = [
+    { name: "failed without a candidate", terminalStatus: "failed", provisionalCount: 0 },
+    { name: "failed after a candidate", terminalStatus: "failed", provisionalCount: 1 },
+    { name: "cancelled after a candidate", terminalStatus: "cancelled", provisionalCount: 1 },
+    {
+      name: "restored failed before a new terminal callback",
+      terminalStatus: "failed",
+      provisionalCount: 0,
+      restoredTerminal: true,
+    },
+    {
+      name: "restored cancelled before a new terminal callback",
+      terminalStatus: "cancelled",
+      provisionalCount: 0,
+      restoredTerminal: true,
+    },
+    {
+      name: "cross-tab terminal conflict with local partial state",
+      terminalStatus: "failed",
+      recordedStatus: "partial",
+      provisionalCount: 0,
+      skipTerminalCallback: true,
+      conflictCode: "terminal_retry_required",
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const searchScope = { key: scenario.name, seq: 1, controller: new AbortController() };
+      const reelsRef = {
+        current: Array.from({ length: 3 }, (_, index) => ({
+          reel_id: `existing-${index}`,
+          material_id: "tail-material",
+        })),
+      };
+      const isGeneratingRef = { current: false };
+      const generationBatchTokensRef = { current: new Set() };
+      const initialTerminalStatus = scenario.recordedStatus
+        ?? (scenario.restoredTerminal ? scenario.terminalStatus : "partial");
+      const lastTerminalStatusByMaterialRef = {
+        current: new Map([["tail-material", initialTerminalStatus]]),
+      };
+      const continuationTokenByMaterialRef = {
+        current: new Map([["tail-material", "prior-continuation"]]),
+      };
+      const submittedParams = [];
+      let visibleError = null;
+
+      const appendRows = (rows) => {
+        const existingIds = new Set(reelsRef.current.map((reel) => reel.reel_id));
+        const addedReels = rows.filter((reel) => !existingIds.has(reel.reel_id));
+        reelsRef.current = [...reelsRef.current, ...addedReels];
+        return {
+          reels: reelsRef.current,
+          addedReels,
+          addedCount: addedReels.length,
+          updatedCount: 0,
+        };
+      };
+      const requestMore = compileUseCallback("requestMore", {
+        getFeedMaterialIds: () => ["tail-material"],
+        lastTerminalStatusByMaterialRef,
+        settingsScopeReady: true,
+        isGeneratingRef,
+        canRequestMore: true,
+        isIngestMaterial: false,
+        setCanRequestMore: () => {},
+        setFeedPagesExhausted: () => {},
+        isGenerationFinished: () => false,
+        generationFinishedRef: { current: new Set() },
+        activeSearchScopeRef: { current: searchScope },
+        getFeedTuningSettings: () => ({
+          minRelevance: 0.3,
+          creativeCommonsOnly: false,
+          preferredVideoDuration: "any",
+        }),
+        reelsRef,
+        REEL_BATCH_SIZE: 3,
+        INITIAL_READY_REEL_TARGET: 9,
+        generationMode: "slow",
+        generationBatchTokensRef,
+        syncGenerationLockState: () => {
+          isGeneratingRef.current = generationBatchTokensRef.current.size > 0;
+        },
+        armActiveRecoveryRequest: () => {},
+        setVisibleFeedError: (message) => { visibleError = message; },
+        progressClearTimerRef: { current: null },
+        setGenerationProgress: () => {},
+        generationJobByMaterialRef: { current: new Map() },
+        continuationTokenByMaterialRef,
+        claimGenerationConsumer: () => Symbol("tail-consumer"),
+        GENERATION_STREAM_IDLE_TIMEOUT_MS: 35_000,
+        generateReelsStream: async (params) => {
+          submittedParams.push(params);
+          if (submittedParams.length === 1) {
+            for (let index = 0; index < scenario.provisionalCount; index += 1) {
+              params.onCandidate({
+                reel_id: `provisional-${index}`,
+                material_id: "tail-material",
+              });
+            }
+            if (!scenario.restoredTerminal && !scenario.skipTerminalCallback) {
+              params.onTerminal(scenario.terminalStatus);
+            }
+            if (scenario.conflictCode) {
+              throw new TestApiError(
+                `${scenario.terminalStatus} later batch`,
+                409,
+                scenario.conflictCode,
+              );
+            }
+            throw new Error(`${scenario.terminalStatus} later batch`);
+          }
+          return {
+            reels: Array.from({ length: 3 }, (_, index) => ({
+              reel_id: `recovered-${index}`,
+              material_id: "tail-material",
+            })),
+            batch_id: "recovered-batch",
+            batch_size: 3,
+            continuation_token: "recovered-batch",
+            terminal_status: "completed",
+          };
+        },
+        isSearchScopeActive: (scope) => scope === searchScope,
+        noteGenerationTerminal: (_id, status) => {
+          lastTerminalStatusByMaterialRef.current.set("tail-material", status);
+        },
+        settleGenerationContinuation: () => {},
+        appendGeneratedReels: appendRows,
+        dedupeByIdentity: (rows) => [...new Map(rows.map((row) => [row.reel_id, row])).values()],
+        reconcileGeneratedReels: (_streamed, finalRows) => appendRows(finalRows),
+        isRequestInterruptedError: () => false,
+        releaseGenerationConsumer: () => {},
+        generationConsumerByMaterialRef: { current: new Map() },
+        materialId: "tail-material",
+        mergeReelBatchesInServerOrder: (batches) => batches.flat(),
+        markRecoveryProgress: () => {},
+        clearPendingTailAdvance: () => {},
+        noteFeedTransportFailure: (failure) => {
+          visibleError = failure instanceof Error ? failure.message : String(failure);
+        },
+        noteFeedFailure: (failure) => {
+          visibleError = failure instanceof Error ? failure.message : String(failure);
+        },
+        isGenerationTerminalConflictError,
+        clearRecoveredTransportError: () => {},
+        setRecoveryPhase: () => {},
+        finishActiveRecoveryRequest: () => {},
+        showSavedSessionUnavailable: () => {},
+        loadPage: async () => {
+          throw new Error("a populated tail must not run empty-feed recovery");
+        },
+        setTimeout: () => 1,
+        console: { warn: () => {} },
+      });
+
+      const passiveResult = await requestMore({ requestedCount: 3 });
+
+      assert.equal(submittedParams.length, 1);
+      assert.equal(submittedParams[0].explicitUserRetry, false);
+      assert.equal(submittedParams[0].continuationToken, "prior-continuation");
+      assert.equal(
+        lastTerminalStatusByMaterialRef.current.get("tail-material"),
+        scenario.restoredTerminal || scenario.skipTerminalCallback
+          ? initialTerminalStatus
+          : scenario.terminalStatus,
+      );
+      assert.match(visibleError, new RegExp(`^${scenario.terminalStatus} later batch$`));
+      assert.equal(passiveResult.length, scenario.provisionalCount);
+
+      const requestReadyBatch = compileUseCallback("requestReadyBatch", {
+        REEL_BATCH_SIZE: 3,
+        MAX_ZERO_GROWTH_CONTINUATIONS: 3,
+        MAX_GENERATION_ATTEMPTS_PER_FILL: 5,
+        getFeedMaterialIds: () => ["tail-material"],
+        isGenerationFinished: () => false,
+        isGeneratingRef,
+        reelsRef,
+        lastTerminalStatusByMaterialRef,
+        requestMore,
+      });
+
+      assert.equal(await requestReadyBatch(3, true, true), 3);
+      assert.equal(submittedParams.length, 2);
+      assert.equal(submittedParams[1].explicitUserRetry, true);
+      assert.equal(submittedParams[1].continuationToken, "prior-continuation");
+      assert.equal(submittedParams[1].retryTerminalJobId, undefined);
+      assert.equal(visibleError, null);
+    });
+  }
 });
 
 test("bootstrap continues partial initial inventory in bounded batches until nine are ready", async () => {
@@ -2082,6 +2578,11 @@ test("bootstrap continues partial initial inventory in bounded batches until nin
   await callback(false);
 
   assert.deepEqual(generationRequests.map((options) => options.requestedCount), [3, 3]);
+  assert.deepEqual(
+    generationRequests.map((options) => options.explicitUserRetry),
+    [false, false],
+    "passive startup must never opt into the terminal retry handshake",
+  );
   assert.equal(reelsRef.current.length, 9);
   const bootstrapEffectStart = source.indexOf("useEffect(() => {", source.indexOf("const bootstrapFirstReels"));
   const bootstrapEffectEnd = source.indexOf("const maybeLoadMore", bootstrapEffectStart);
@@ -2391,7 +2892,7 @@ test("a ready-batch refill crosses two zero-growth partials before adding the ne
 
 test("a ready-batch refill bounds repeated zero-growth partials", async () => {
   const reelsRef = { current: Array.from({ length: 9 }, (_, index) => ({ reel_id: String(index) })) };
-  let generationRequests = 0;
+  const generationRequests = [];
   const callback = compileUseCallback("requestReadyBatch", {
     REEL_BATCH_SIZE: 3,
     MAX_ZERO_GROWTH_CONTINUATIONS: 3,
@@ -2401,14 +2902,25 @@ test("a ready-batch refill bounds repeated zero-growth partials", async () => {
     isGeneratingRef: { current: false },
     reelsRef,
     lastTerminalStatusByMaterialRef: { current: new Map([["material-a", "partial"]]) },
-    requestMore: async () => {
-      generationRequests += 1;
+    requestMore: async (options) => {
+      generationRequests.push(options);
       return [];
     },
   });
 
+  assert.equal(await callback(3, true, true), 0);
+  assert.deepEqual(
+    generationRequests.map((options) => options.explicitUserRetry),
+    [true, false, false, false],
+    "the nonempty error retry must authorize only the first probe",
+  );
+  generationRequests.length = 0;
   assert.equal(await callback(), 0);
-  assert.equal(generationRequests, 4);
+  assert.ok(
+    generationRequests.every((options) => options.explicitUserRetry === false),
+    "passive tail refill must never opt into the terminal retry handshake",
+  );
+  assert.equal(generationRequests.length, 4);
   assert.equal(reelsRef.current.length, 9);
 });
 
@@ -2442,7 +2954,10 @@ test("a settled duplicate-only batch clears the pending tail spinner and exposes
   assert.match(callbackText, /const batchAddedReels = dedupeByIdentity\(\[\.\.\.streamedReels, \.\.\.reconciled\.addedReels\]\)/);
   assert.match(callbackText, /if \(generated\.length === 0\) \{[\s\S]*clearPendingTailAdvance\(\)/);
   assert.match(callbackText, /No new clips arrived\. Retry to continue searching\./);
-  assert.match(source, /onClick=\{\(\) => void requestReadyBatch\(REEL_BATCH_SIZE, true\)\}/);
+  assert.match(
+    source,
+    /reels\.length === 0[\s\S]*bootstrapFirstReels\(true\)[\s\S]*requestReadyBatch\(REEL_BATCH_SIZE, true, true\)/,
+  );
 });
 
 test("pagination remains available while background generation is active", () => {

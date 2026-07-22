@@ -1152,6 +1152,7 @@ type GenerateReelsParams = {
   conceptId?: string;
   continuationToken?: string;
   retryTerminalJobId?: string;
+  explicitUserRetry?: boolean;
   excludeVideoIds?: string[];
   generationMode?: "slow" | "fast";
   minRelevance?: number;
@@ -1631,14 +1632,37 @@ export async function generateReelsStream(
   },
 ): Promise<ReelsGenerateResponse> {
   const resumeJobId = String(params.generationJobId || "").trim();
-  const submission: ReelsGenerateSubmission = resumeJobId
-    ? {
-        job_id: resumeJobId,
-        status: "running",
-        status_url: `/reels/generation-status/${encodeURIComponent(resumeJobId)}`,
-        stream_url: `/reels/generation-stream/${encodeURIComponent(resumeJobId)}`,
+  let submission: ReelsGenerateSubmission;
+  if (resumeJobId) {
+    submission = {
+      job_id: resumeJobId,
+      status: "running",
+      status_url: `/reels/generation-status/${encodeURIComponent(resumeJobId)}`,
+      stream_url: `/reels/generation-stream/${encodeURIComponent(resumeJobId)}`,
+    };
+  } else {
+    try {
+      submission = await generateReels(params);
+    } catch (error) {
+      const terminalJobId = (
+        params.explicitUserRetry === true
+        && error instanceof ApiError
+        && error.status === 409
+        && error.code === "terminal_retry_required"
+        && typeof error.payload?.details?.terminal_job_id === "string"
+      )
+        ? error.payload.details.terminal_job_id.trim()
+        : "";
+      if (!terminalJobId) {
+        throw error;
       }
-    : await generateReels(params);
+      submission = await generateReels({
+        ...params,
+        continuationToken: undefined,
+        retryTerminalJobId: terminalJobId,
+      });
+    }
+  }
   if (!isQueuedGeneration(submission)) {
     return submission;
   }

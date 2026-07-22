@@ -115,6 +115,16 @@ function shouldRetryAdaptiveFeedRefresh(error: unknown, signal?: AbortSignal): b
     && (error.status === 408 || error.status === 429 || (error.status >= 500 && error.status <= 599));
 }
 
+function isGenerationTerminalConflictError(error: unknown): boolean {
+  return error instanceof ApiError
+    && error.status === 409
+    && [
+      "terminal_retry_required",
+      "source_retry_exhausted",
+      "invalid_terminal_retry",
+    ].includes(error.code || "");
+}
+
 async function fetchAdaptiveFeedPageWithRetry(
   request: Parameters<typeof fetchFeed>[0],
 ): Promise<Awaited<ReturnType<typeof fetchFeed>>> {
@@ -1555,6 +1565,11 @@ function FeedPageInner() {
   const noteGenerationTerminal = useCallback((materialIdValue: string, status: GenerationTerminalStatus) => {
     generationJobByMaterialRef.current.delete(materialIdValue);
     lastTerminalStatusByMaterialRef.current.set(materialIdValue, status);
+    if (status === "failed" || status === "cancelled") {
+      // The server-owned job already consumed this scope's automatic startup
+      // attempt. Wait for explicit learner intent before opening a fresh root.
+      bootstrapAttemptedRef.current = true;
+    }
     if (status === "exhausted") {
       markGenerationFinished(materialIdValue);
     }
@@ -2332,6 +2347,7 @@ function FeedPageInner() {
 
     const streamedReels: Reel[] = [];
     let madeProgress = false;
+    let terminalFailed = false;
     return (async () => {
       try {
         const data = await generateReelsStream({
@@ -2344,6 +2360,7 @@ function FeedPageInner() {
               isSearchScopeActive(searchScope)
               && (terminalStatus === "failed" || terminalStatus === "cancelled")
             ) {
+              terminalFailed = true;
               noteGenerationTerminal(materialIdValue, terminalStatus);
             }
           },
@@ -2383,6 +2400,8 @@ function FeedPageInner() {
         if (isSearchScopeActive(searchScope) && !isRequestInterruptedError(error)) {
           console.warn(`Feed generation stream failed for topic material ${materialIdValue}:`, error);
           if (isDailySearchLimitError(error) || isVerifiedAccountRequiredError(error)) {
+            noteFeedFailure(error);
+          } else if (terminalFailed) {
             noteFeedFailure(error);
           }
         }
@@ -2650,6 +2669,7 @@ function FeedPageInner() {
     initialFill?: boolean;
     requestedCount?: number;
     retryTerminal?: boolean;
+    explicitUserRetry?: boolean;
   }): Promise<Reel[]> => {
     const allFeedMaterialIds = getFeedMaterialIds();
     const terminalRetryJobIds = new Map<string, string>();
@@ -2728,9 +2748,11 @@ function FeedPageInner() {
       const generatedRows = await Promise.all(
         generationPlan.map(async ({ id, batchSize }) => {
           const streamedReels: Reel[] = [];
+          let terminalFailed = false;
           const activeGenerationJob = retryTerminal
             ? undefined
             : generationJobByMaterialRef.current.get(id);
+          const explicitUserProbe = options?.explicitUserRetry === true;
           const continuationToken = retryTerminal
             ? undefined
             : continuationTokenByMaterialRef.current.get(id);
@@ -2740,7 +2762,7 @@ function FeedPageInner() {
           ), 0);
           const consumerToken = claimGenerationConsumer(id, activeGenerationJob?.jobId || "new-generation");
           if (!consumerToken) {
-            return { materialId: id, data: null, streamedReels, error: null };
+            return { materialId: id, data: null, streamedReels, error: null, terminalFailed };
           }
           try {
             const data = await generateReelsStream({
@@ -2758,6 +2780,7 @@ function FeedPageInner() {
               minRelevance: tuning.minRelevance,
               creativeCommonsOnly: tuning.creativeCommonsOnly,
               preferredVideoDuration: tuning.preferredVideoDuration,
+              explicitUserRetry: explicitUserProbe,
               signal: searchScope.controller.signal,
               idleTimeoutMs: GENERATION_STREAM_IDLE_TIMEOUT_MS,
               onActivity: () => {
@@ -2775,6 +2798,7 @@ function FeedPageInner() {
                   isSearchScopeActive(searchScope)
                   && (status === "failed" || status === "cancelled")
                 ) {
+                  terminalFailed = true;
                   noteGenerationTerminal(id, status);
                 }
               },
@@ -2791,7 +2815,7 @@ function FeedPageInner() {
               },
             });
             if (!isSearchScopeActive(searchScope)) {
-              return { materialId: id, data: null, streamedReels, error: null };
+              return { materialId: id, data: null, streamedReels, error: null, terminalFailed };
             }
             const reconciled = reconcileGeneratedReels(
               streamedReels,
@@ -2811,12 +2835,12 @@ function FeedPageInner() {
             settleGenerationContinuation(id, data);
             const batchAddedReels = dedupeByIdentity([...streamedReels, ...reconciled.addedReels]);
             armActiveRecoveryRequest(searchScope, "generating");
-            return { materialId: id, data, streamedReels: batchAddedReels, error: null };
+            return { materialId: id, data, streamedReels: batchAddedReels, error: null, terminalFailed };
           } catch (e) {
             if (!isRequestInterruptedError(e)) {
               console.warn(`Background reel generation failed for topic material ${id}:`, e);
             }
-            return { materialId: id, data: null, streamedReels, error: e };
+            return { materialId: id, data: null, streamedReels, error: e, terminalFailed };
           } finally {
             if (isSearchScopeActive(searchScope)) {
               releaseGenerationConsumer(id, consumerToken);
@@ -2831,6 +2855,18 @@ function FeedPageInner() {
         isDailySearchLimitError(row?.error) || isVerifiedAccountRequiredError(row?.error)
       ));
       const firstFailedRow = billingFailureRow ?? generatedRows.find((row) => row?.error);
+      const terminalFailureRow = generatedRows.find((row) => {
+        if (!row.error) {
+          return false;
+        }
+        const recordedStatus = lastTerminalStatusByMaterialRef.current.get(row.materialId);
+        return Boolean(
+          row.terminalFailed
+          || recordedStatus === "failed"
+          || recordedStatus === "cancelled"
+          || isGenerationTerminalConflictError(row.error)
+        );
+      });
       const firstFailureMessage =
         firstFailedRow?.error instanceof Error ? firstFailedRow.error.message : "";
       if (isRequestInterruptedError(firstFailedRow?.error)) {
@@ -2854,6 +2890,10 @@ function FeedPageInner() {
         showSavedSessionUnavailable(missingMaterialId);
         clearPendingTailAdvance();
         return [];
+      }
+      const terminalFailureWasSurfaced = Boolean(terminalFailureRow?.error);
+      if (terminalFailureRow?.error) {
+        noteFeedFailure(terminalFailureRow.error);
       }
       const generated = dedupeByIdentity(
         mergeReelBatchesInServerOrder(generatedRows.map((row) => row.streamedReels ?? [])),
@@ -2894,7 +2934,10 @@ function FeedPageInner() {
         markRecoveryProgress(0);
         if (authoritativeExhausted) {
           clearRecoveredTransportError();
-        } else if (options?.surfaceError || reelsRef.current.length === 0) {
+        } else if (
+          !terminalFailureWasSurfaced
+          && (options?.surfaceError || reelsRef.current.length === 0)
+        ) {
           if (isTransportError(firstFailedRow?.error)) {
             noteFeedTransportFailure(firstFailedRow?.error, { forceVisible: true });
           } else if (firstFailedRow?.error) {
@@ -2982,10 +3025,12 @@ function FeedPageInner() {
   const requestReadyBatch = useCallback(async (
     requestedCount = REEL_BATCH_SIZE,
     surfaceError = false,
+    explicitUserRetry = false,
   ): Promise<number> => {
     const targetCount = Math.max(1, Math.min(REEL_BATCH_SIZE, Math.floor(requestedCount)));
     let addedTotal = 0;
     let consecutiveZeroGrowthContinuations = 0;
+    let explicitRetryPending = explicitUserRetry;
     const maxAttempts = Math.min(
       MAX_GENERATION_ATTEMPTS_PER_FILL,
       targetCount + MAX_ZERO_GROWTH_CONTINUATIONS,
@@ -3002,7 +3047,9 @@ function FeedPageInner() {
       await requestMore({
         surfaceError,
         requestedCount: targetCount - addedTotal,
+        explicitUserRetry: explicitRetryPending,
       });
+      explicitRetryPending = false;
       const addedCount = Math.max(0, reelsRef.current.length - countBeforeRequest);
       if (addedCount > 0) {
         addedTotal += Math.min(targetCount - addedTotal, addedCount);
@@ -3560,6 +3607,7 @@ function FeedPageInner() {
             initialFill: true,
             requestedCount: reservoirTarget,
             retryTerminal: true,
+            explicitUserRetry: true,
           });
           return;
         }
@@ -3586,6 +3634,7 @@ function FeedPageInner() {
           nextPersistedPage += 1;
         }
         let consecutiveZeroGrowthContinuations = 0;
+        let explicitRetryPending = manual;
         for (let attempt = 0; attempt < MAX_GENERATION_ATTEMPTS_PER_FILL; attempt += 1) {
           const startupMaterialIds = getFeedMaterialIds();
           if (
@@ -3608,7 +3657,9 @@ function FeedPageInner() {
             requestedCount: countBeforeRequest === 0
               ? startupShortfall
               : Math.min(REEL_BATCH_SIZE, startupShortfall),
+            explicitUserRetry: explicitRetryPending,
           });
+          explicitRetryPending = false;
           if (!isSearchScopeActive(searchScope)) {
             return;
           }
@@ -5193,7 +5244,11 @@ function FeedPageInner() {
             <span>{error}</span>
             <button
               type="button"
-              onClick={() => void requestReadyBatch(REEL_BATCH_SIZE, true)}
+              onClick={() => void (
+                reels.length === 0
+                  ? bootstrapFirstReels(true)
+                  : requestReadyBatch(REEL_BATCH_SIZE, true, true)
+              )}
               className="rounded-full bg-white/12 px-2.5 py-1 font-semibold transition-colors hover:bg-white hover:text-black focus-visible:bg-white focus-visible:text-black"
             >
               Retry
