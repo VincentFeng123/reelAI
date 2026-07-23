@@ -6093,7 +6093,7 @@ def test_gemini_clip_persists_when_caption_boundary_mapping_is_missing(
     assert context.counters()["permanently_rejected_clips"] == 0
 
 
-def test_gemini_clip_uses_coarse_boundary_when_refinement_is_unsafe(
+def test_af_220_best_effort_only_structurally_playable_gemini_clip_remains_nonempty(
     monkeypatch,
 ) -> None:
     engine_out = {
@@ -6137,6 +6137,7 @@ def test_gemini_clip_uses_coarse_boundary_when_refinement_is_unsafe(
         max_reels=1,
     )
 
+    assert reels
     assert reels == ["gemini-fallback-reel"]
     assert len(stored) == 1
     boundary = stored[0]["search_context"]
@@ -6147,6 +6148,156 @@ def test_gemini_clip_uses_coarse_boundary_when_refinement_is_unsafe(
     assert boundary["surface_eligible"] is True
     assert context.counters()["stored_clips"] == 1
     assert context.counters()["permanently_rejected_clips"] == 0
+
+
+@pytest.mark.parametrize("stronger_status", ["verified", "context_aligned"])
+@pytest.mark.parametrize(
+    ("fallback_delay_sec", "stronger_delay_sec", "expected_completion_order"),
+    [
+        (0.0, 0.08, ["fallback", "stronger"]),
+        (0.08, 0.0, ["stronger", "fallback"]),
+    ],
+)
+def test_af_220_stronger_boundary_wins_before_best_effort_regardless_of_completion_order(
+    monkeypatch,
+    stronger_status: str,
+    fallback_delay_sec: float,
+    stronger_delay_sec: float,
+    expected_completion_order: list[str],
+) -> None:
+    transcript = _transcript()
+    transcript["artifact_key"] = "supadata-transcript:v2:af-220-boundary-order"
+    transcript["segments"][0].update({
+        "cue_id": "fallback",
+        "text": "A function maps each input to one output under its stated rule.",
+    })
+    transcript["segments"][1].update({
+        "cue_id": "stronger",
+        "text": "This worked example evaluates the function at a concrete input.",
+    })
+    engine_out = {
+        "clips": [
+            _quality_clip(
+                cue_id="fallback",
+                start=0.0,
+                end=10.0,
+                quote=transcript["segments"][0]["text"],
+                candidate_id="fallback",
+                difficulty=0.1,
+                selection_authority="gemini",
+            ),
+            _quality_clip(
+                cue_id="stronger",
+                start=10.0,
+                end=20.0,
+                quote=transcript["segments"][1]["text"],
+                candidate_id="stronger",
+                difficulty=0.9,
+                selection_authority="gemini",
+            ),
+        ],
+        "transcript": transcript,
+        "notes": "",
+    }
+    monkeypatch.setattr(pipeline_module, "_discover", lambda *_a, **_k: _discovery())
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_a, **_k: engine_out)
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=mock.sentinel.prepared_audio),
+    )
+
+    started: set[str] = set()
+    completed: list[str] = []
+    completion_lock = threading.Lock()
+    all_started = threading.Event()
+
+    def verify_audio(_source, start_sec, end_sec, **_kwargs):
+        candidate = "fallback" if float(start_sec) < 5.0 else "stronger"
+        with completion_lock:
+            started.add(candidate)
+            if len(started) == 2:
+                all_started.set()
+        assert all_started.wait(timeout=1.0)
+        delay = fallback_delay_sec if candidate == "fallback" else stronger_delay_sec
+        time.sleep(delay)
+        with completion_lock:
+            completed.append(candidate)
+        if candidate == "stronger" and stronger_status == "verified":
+            return pipeline_module.clip_engine_silence.SilenceVerificationResult(
+                "verified",
+                float(start_sec),
+                float(end_sec),
+                {
+                    "threshold_dbfs": -38.0,
+                    "start_quiet": [float(start_sec), float(start_sec) + 0.2],
+                    "end_quiet": [float(end_sec) - 0.2, float(end_sec)],
+                },
+            )
+        return pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "unavailable",
+            float(start_sec),
+            float(end_sec),
+            {"stage": "analyze", "reason": "start_silence_not_found"},
+        )
+
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        mock.Mock(side_effect=verify_audio),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_acoustic_range_is_safe",
+        lambda **kwargs: float(kwargs["start_sec"]) >= 5.0,
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_acoustic_observation_shift_is_safe", lambda *_a, **_k: True
+    )
+    original_context_range_is_safe = pipeline_module._context_result_range_is_safe
+
+    def context_range_is_safe(result, **kwargs):
+        if float(result.start_sec) < 5.0:
+            return False
+        return original_context_range_is_safe(result, **kwargs)
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_context_result_range_is_safe",
+        context_range_is_safe,
+    )
+    stored: list[dict] = []
+    pipeline = _pipeline()
+
+    def persist(*, clip, **_kwargs):
+        stored.append(clip)
+        candidate_id = str(clip["selection_candidate_id"]).split("::")[-1]
+        return f"reel-{candidate_id}", mock.sentinel.metadata
+
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Functions and worked examples",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext("slow", require_acoustic_boundaries=True),
+        retrieval_profile="deep",
+        knowledge_level="beginner",
+        max_videos=1,
+        max_reels=2,
+        max_persisted_reels=1,
+    )
+
+    assert completed == expected_completion_order
+    assert reels == ["reel-stronger"]
+    stored_statuses = {
+        str(clip["selection_candidate_id"]).split("::")[-1]: clip[
+            "search_context"
+        ]["boundary_status"]
+        for clip in stored
+    }
+    assert stored_statuses.get("stronger") == stronger_status
+    assert stored_statuses.get("fallback") in {None, "best_effort"}
 
 
 def test_gemini_clip_rejects_only_structurally_unplayable_boundary(
@@ -6845,7 +6996,7 @@ def test_candidate_plan_prioritizes_nearest_level_by_difficulty(
     ] == expected_deferred
 
 
-def test_all_off_level_source_fills_current_batch_with_nearest_valid_clip(
+def test_af_220_off_level_only_valid_clip_remains_nonempty(
     monkeypatch,
 ) -> None:
     engine_out = {
@@ -6893,6 +7044,7 @@ def test_all_off_level_source_fills_current_batch_with_nearest_valid_clip(
         on_reel_created=emitted.append,
     )
 
+    assert reels
     assert reels == ["nearest-level-reel"]
     assert emitted == ["nearest-level-reel"]
     assert stored[0]["search_context"]["deferred_level"] is True

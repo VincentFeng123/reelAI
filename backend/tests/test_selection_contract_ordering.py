@@ -1162,6 +1162,80 @@ class SelectionContractOrderingTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_difficulty_fallback_prefers_current_band_and_keeps_off_level_inventory(
+        self,
+    ) -> None:
+        def item(reel_id: str, difficulty: float) -> dict:
+            return {
+                "reel_id": reel_id,
+                "difficulty": difficulty,
+                "selection_contract_version": "quality_silence_v39",
+            }
+
+        easy = item("easy", 0.15)
+        intermediate = item("intermediate", 0.50)
+        advanced = item("advanced", 0.85)
+        cases = (
+            ("beginner", ["easy", "intermediate", "advanced"]),
+            ("intermediate", ["intermediate", "easy", "advanced"]),
+            ("advanced", ["advanced", "intermediate", "easy"]),
+        )
+        inventory_by_id = {
+            row["reel_id"]: row
+            for row in (easy, intermediate, advanced)
+        }
+        for level, expected in cases:
+            with self.subTest(level=level, inventory="all"):
+                ordered = self.service.select_difficulty_inventory(
+                    [advanced, intermediate, easy],
+                    level,
+                )
+                self.assertEqual(
+                    [row["reel_id"] for row in ordered],
+                    expected,
+                )
+
+            off_level = [
+                row
+                for reel_id, row in inventory_by_id.items()
+                if reel_id != expected[0]
+            ]
+            with self.subTest(level=level, inventory="off-level-only"):
+                ordered = self.service.select_difficulty_inventory(
+                    off_level,
+                    level,
+                )
+                self.assertEqual(
+                    [row["reel_id"] for row in ordered],
+                    expected[1:],
+                )
+                self.assertEqual(len(ordered), len(off_level))
+                self.assertTrue(ordered)
+
+    def test_best_effort_boundary_cannot_displace_stronger_off_level_inventory(
+        self,
+    ) -> None:
+        ordered = self.service.select_difficulty_inventory(
+            [
+                {
+                    "reel_id": "coarse-current",
+                    "difficulty": 0.15,
+                    "_selection_boundary_status": "best_effort",
+                },
+                {
+                    "reel_id": "grounded-adjacent",
+                    "difficulty": 0.50,
+                    "_selection_boundary_status": "context_aligned",
+                },
+            ],
+            "beginner",
+        )
+
+        self.assertEqual(
+            [row["reel_id"] for row in ordered],
+            ["grounded-adjacent", "coarse-current"],
+        )
+
     def test_same_nearest_level_uses_quality_source_and_timestamp_tiebreaks(self) -> None:
         def item(
             reel_id: str,

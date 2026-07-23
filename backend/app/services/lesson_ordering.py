@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-LESSON_ORDER_PROMPT_VERSION = "lesson_order_v15"
+LESSON_ORDER_PROMPT_VERSION = "lesson_order_v16"
 LESSON_ORDER_TIMEOUT_S = 10.0
 # Even an invalid worst-case schema payload with four bounded UUID lists and a
 # terminal marker fits this ceiling. Actual
@@ -137,6 +137,17 @@ still return a nonempty coherent lesson.
 Within a progression, prefer easier or foundational material before harder material.
 Feedback remediation, required prerequisites, and lesson coherence may override the
 nominal band preference. Never return zero clips solely because of difficulty.
+Do not add a farther difficulty band merely to fill a clip count when the closest
+available band already supplies a coherent lesson. A farther clip remains appropriate
+when it supplies a missing prerequisite, requested concept, remediation, or application.
+
+Each clip's boundary_evidence describes cut proof, not speech intelligibility:
+verified means measured acoustic edges, context_aligned means a complete transcript-
+grounded interval when acoustic refinement was unavailable, and best_effort means a
+structurally playable Gemini-grounded coarse fallback. Prefer verified or
+context_aligned inventory. Include best_effort only when no stronger supplied clip can
+provide the needed nonempty lesson contribution; never return zero when best_effort is
+the only valid related inventory.
 
 Omit semantic restatements even when they come from different sources or use different
 titles. Keep multiple clips about one concept only when each contributes a genuinely new
@@ -576,6 +587,12 @@ def _clip_payload(
             reel.get("transcript_snippet"), 1_000
         ),
         "difficulty": _finite_number(reel.get("difficulty")),
+        "boundary_evidence": _clean_text(
+            reel.get("_selection_boundary_status")
+            or reel.get("boundary_status")
+            or "unknown",
+            32,
+        ).lower(),
         "score": _unit_number(reel.get("score")),
         "relevance_score": _unit_number(reel.get("relevance_score")),
         "topic_relevance": _unit_number(
@@ -633,6 +650,7 @@ _COMPACT_CLIP_COLUMNS = (
     "takeaways_excerpt",
     "transcript_excerpt",
     "difficulty",
+    "boundary_evidence",
     "topic_relevance",
     "informativeness",
 )
@@ -741,6 +759,7 @@ def _compact_clip_payload(
                 semantic_text_limit,
             ),
             clip.get("difficulty"),
+            clip.get("boundary_evidence"),
             clip.get("topic_relevance"),
             clip.get("informativeness"),
         ])

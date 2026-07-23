@@ -54,6 +54,7 @@ from ...intent_obligations import (
 from ..db import (
     DatabaseIntegrityError,
     dumps_json,
+    fetch_all,
     fetch_one,
     get_conn,
     is_transient_postgres_transaction_error,
@@ -92,6 +93,7 @@ from .models import (
     YouTubeSourceRef,
 )
 from .persistence import (
+    build_video_id,
     ensure_clip_concept,
     load_existing_reel,
     load_reel_by_selection_candidate,
@@ -5325,13 +5327,86 @@ class IngestionPipeline:
             })
 
         surfaceable_candidate_ids_by_video: dict[str, set[str]] = {}
+        stronger_surface_count = 0
+        deferred_best_effort_sequence = 0
+        deferred_best_effort_candidates: list[
+            tuple[
+                int,
+                int,
+                int,
+                dict[str, Any],
+                dict[str, Any],
+                dict[str, Any],
+                bool,
+                ReelOutWithAttribution | None,
+            ]
+        ] = []
+
+        def persist_prepared_candidate(
+            *,
+            v: dict[str, Any],
+            clip: dict[str, Any],
+            engine_out: dict[str, Any],
+            surface_eligible: bool,
+            boundary_verified_for_storage: bool,
+        ) -> tuple[ReelOutWithAttribution, str] | None:
+            """Persist one prepared interval and report its retained evidence grade."""
+
+            nonlocal stored_count
+            if not surface_eligible and persistence_cap is not None:
+                if generation_context is not None:
+                    generation_context.increment_counter("deferred_clips")
+                return None
+            if persistence_cap is not None and stored_count >= persistence_cap:
+                return None
+            created_new_reel = True
+
+            def record_persistence_result(created: bool) -> None:
+                nonlocal created_new_reel
+                created_new_reel = created
+
+            reel, _ = self._persist_engine_clip(
+                v=v,
+                clip=clip,
+                engine_out=engine_out,
+                material_id=material_id,
+                concept_id=concept_id,
+                target_max=0,
+                generation_id=generation_id,
+                on_persistence_result=record_persistence_result,
+                should_cancel=should_cancel,
+            )
+            if created_new_reel:
+                stored_count += 1
+            if generation_context is not None:
+                if created_new_reel:
+                    generation_context.increment_counter("stored_clips")
+                if boundary_verified_for_storage:
+                    generation_context.increment_counter("verified_clips")
+            candidate_id = str(
+                clip.get("selection_candidate_id") or ""
+            ).strip()
+            if candidate_id and surface_eligible:
+                surfaceable_candidate_ids_by_video.setdefault(
+                    str(v.get("id") or ""), set()
+                ).add(candidate_id)
+            if not surface_eligible:
+                if generation_context is not None:
+                    generation_context.increment_counter("deferred_clips")
+                return None
+            retained_boundary_status = str(
+                getattr(reel, "boundary_status", "")
+                or (clip.get("search_context") or {}).get("boundary_status")
+                or ""
+            ).strip().casefold()
+            return reel, retained_boundary_status
 
         def persist_result(
             result: tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]],
             *,
             limit: int | None = None,
         ) -> list[ReelOutWithAttribution]:
-            nonlocal stored_count
+            nonlocal deferred_best_effort_sequence, stronger_surface_count
             v, kept, engine_out = result
             persisted_by_index: dict[int, ReelOutWithAttribution] = {}
             callback_indices: set[int] = set()
@@ -5842,8 +5917,6 @@ class IngestionPipeline:
                 speech_bounds,
             ) in resolved_boundary_results:
                 raise_if_cancelled(should_cancel)
-                if persistence_cap is not None and stored_count >= persistence_cap:
-                    break
                 raw_clip = candidate_clips[candidate_index]
                 clip = dict(raw_clip)
                 search_context = dict(clip.get("search_context") or {})
@@ -6061,6 +6134,9 @@ class IngestionPipeline:
 
                 search_context["surface_eligible"] = bool(surface_eligible)
                 clip["search_context"] = search_context
+                prepared_boundary_status = str(
+                    search_context.get("boundary_status") or ""
+                ).strip().casefold()
                 if permanently_rejected:
                     if generation_context is not None:
                         # ``deferred_clips`` remains the backward-compatible
@@ -6072,38 +6148,58 @@ class IngestionPipeline:
                             "permanently_rejected_clips"
                         )
                     continue
-                created_new_reel = True
-
-                def record_persistence_result(created: bool) -> None:
-                    nonlocal created_new_reel
-                    created_new_reel = created
-
-                reel, _ = self._persist_engine_clip(
+                if not surface_eligible:
+                    persist_prepared_candidate(
+                        v=v,
+                        clip=clip,
+                        engine_out=engine_out,
+                        surface_eligible=False,
+                        boundary_verified_for_storage=(
+                            boundary_verified_for_storage
+                        ),
+                    )
+                    continue
+                try:
+                    source_index = max(
+                        0, int(v.get("_segment_candidate_rank") or 0)
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    source_index = 0
+                if prepared_boundary_status == "best_effort":
+                    deferred_best_effort_candidates.append((
+                        source_index,
+                        preferred_candidate_rank[candidate_index],
+                        deferred_best_effort_sequence,
+                        v,
+                        clip,
+                        engine_out,
+                        boundary_verified_for_storage,
+                        None,
+                    ))
+                    deferred_best_effort_sequence += 1
+                    continue
+                persisted = persist_prepared_candidate(
                     v=v,
                     clip=clip,
                     engine_out=engine_out,
-                    material_id=material_id,
-                    concept_id=concept_id,
-                    target_max=0,
-                    generation_id=generation_id,
-                    on_persistence_result=record_persistence_result,
-                    should_cancel=should_cancel,
+                    surface_eligible=True,
+                    boundary_verified_for_storage=boundary_verified_for_storage,
                 )
-                if created_new_reel:
-                    stored_count += 1
-                if generation_context is not None:
-                    if created_new_reel:
-                        generation_context.increment_counter("stored_clips")
-                    if boundary_verified_for_storage:
-                        generation_context.increment_counter("verified_clips")
-                candidate_id = str(
-                    clip.get("selection_candidate_id") or ""
-                ).strip()
-                if candidate_id and surface_eligible:
-                    surfaceable_candidate_ids.add(candidate_id)
-                if not surface_eligible:
-                    if generation_context is not None:
-                        generation_context.increment_counter("deferred_clips")
+                if persisted is None:
+                    continue
+                reel, retained_boundary_status = persisted
+                if retained_boundary_status == "best_effort":
+                    deferred_best_effort_candidates.append((
+                        source_index,
+                        preferred_candidate_rank[candidate_index],
+                        deferred_best_effort_sequence,
+                        v,
+                        clip,
+                        engine_out,
+                        boundary_verified_for_storage,
+                        reel,
+                    ))
+                    deferred_best_effort_sequence += 1
                     continue
                 persisted_by_index[candidate_index] = reel
                 if on_reel_created is not None and (
@@ -6113,8 +6209,8 @@ class IngestionPipeline:
                     on_reel_created(reel)
                     callback_indices.add(candidate_index)
 
-            # Difficulty is advisory: keep every otherwise-valid clip in the
-            # organizer pool and order the nearest learner level first.
+            # Difficulty is advisory. Coarse boundary fallbacks wait across the
+            # whole already-started source batch, not merely this one source.
             selected_reels = persisted_by_index
             selected_indices = sorted(
                 selected_reels,
@@ -6137,6 +6233,7 @@ class IngestionPipeline:
                 generation_context.increment_counter(
                     "persisted_clips", len(selected_indices)
                 )
+            stronger_surface_count += len(selected_indices)
             return [selected_reels[index] for index in selected_indices]
 
         reels_by_video: dict[int, list[ReelOutWithAttribution]] = {}
@@ -6151,6 +6248,228 @@ class IngestionPipeline:
         bootstrap_attempted_indices: set[int] = set()
         useful_inventory_idle_deadline: float | None = None
         useful_inventory_threshold = min(3, inventory_cap)
+
+        def available_surface_inventory_count() -> int:
+            """Count usable inventory without storing the degraded lane early."""
+
+            if stronger_surface_count:
+                return min(inventory_cap, persisted_count)
+            retained_count = sum(
+                1 for item in deferred_best_effort_candidates if item[7] is not None
+            )
+            unpersisted_count = len(deferred_best_effort_candidates) - retained_count
+            if persistence_cap is None:
+                persistable_count = unpersisted_count
+            else:
+                persistable_count = min(
+                    unpersisted_count,
+                    max(0, persistence_cap - stored_count),
+                )
+            return min(
+                inventory_cap,
+                persisted_count + retained_count + persistable_count,
+            )
+
+        def arm_useful_inventory_idle_deadline() -> None:
+            """Bound pending-source wait after valid surface inventory exists."""
+
+            nonlocal useful_inventory_idle_deadline
+            if retrieval_profile != "deep" or not pending:
+                return
+            available_count = available_surface_inventory_count()
+            if available_count <= 0:
+                return
+            if (
+                persisted_count < useful_inventory_threshold
+                and stronger_surface_count > 0
+            ):
+                useful_inventory_idle_deadline = None
+                return
+            candidate_deadline = min(
+                deadline,
+                time.monotonic()
+                + max(
+                    0.0,
+                    INGEST_TOPIC_USEFUL_INVENTORY_IDLE_TIMEOUT_SEC,
+                ),
+            )
+            if stronger_surface_count > 0:
+                useful_inventory_idle_deadline = candidate_deadline
+            elif useful_inventory_idle_deadline is None:
+                useful_inventory_idle_deadline = candidate_deadline
+            else:
+                useful_inventory_idle_deadline = min(
+                    useful_inventory_idle_deadline,
+                    candidate_deadline,
+                )
+
+        def persist_deferred_best_effort_if_needed() -> None:
+            """Surface the coarse lane only after the normal source batch is empty."""
+
+            nonlocal persisted_count, stronger_surface_count
+            if stronger_surface_count or not deferred_best_effort_candidates:
+                return
+
+            def has_persisted_selection_candidate(
+                v: dict[str, Any],
+                clip: dict[str, Any],
+            ) -> bool:
+                """Read retained state without creating a row or consuming the cap."""
+
+                candidate_id = str(
+                    clip.get("selection_candidate_id") or ""
+                ).strip()
+                source_id = str(v.get("id") or "").strip()
+                if not candidate_id or not source_id:
+                    return False
+                resolved_material_id = str(material_id or "").strip()
+                resolved_concept_id = str(concept_id or "").strip()
+                try:
+                    with get_conn() as conn:
+                        if not resolved_material_id and resolved_concept_id:
+                            concept_row = fetch_one(
+                                conn,
+                                "SELECT material_id FROM concepts WHERE id = ?",
+                                (resolved_concept_id,),
+                            )
+                            resolved_material_id = str(
+                                (concept_row or {}).get("material_id") or ""
+                            ).strip()
+                        if not resolved_material_id:
+                            return False
+
+                        clip_concept_title, clip_concept_key = (
+                            normalize_clip_concept(clip.get("concept"))
+                        )
+                        if clip_concept_title and clip_concept_key:
+                            resolved_concept_id = ""
+                            for concept_row in fetch_all(
+                                conn,
+                                """
+                                SELECT id, title
+                                  FROM concepts
+                                 WHERE material_id = ?
+                                 ORDER BY created_at, id
+                                """,
+                                (resolved_material_id,),
+                            ):
+                                _title, existing_key = normalize_clip_concept(
+                                    concept_row.get("title")
+                                )
+                                if existing_key == clip_concept_key:
+                                    resolved_concept_id = str(
+                                        concept_row.get("id") or ""
+                                    ).strip()
+                                    break
+                            if not resolved_concept_id:
+                                resolved_concept_id = str(
+                                    uuid.uuid5(
+                                        uuid.NAMESPACE_URL,
+                                        (
+                                            "reelai:clip-concept:"
+                                            f"{resolved_material_id}:"
+                                            f"{clip_concept_key}"
+                                        ),
+                                    )
+                                )
+                        if not resolved_concept_id:
+                            return False
+                        return load_reel_by_selection_candidate(
+                            conn,
+                            material_id=resolved_material_id,
+                            concept_id=resolved_concept_id,
+                            video_id=build_video_id("yt", source_id),
+                            generation_id=generation_id,
+                            selection_candidate_id=candidate_id,
+                        ) is not None
+                except Exception:
+                    logger.debug(
+                        "retained selection candidate preflight failed",
+                        exc_info=True,
+                    )
+                    return False
+
+            retained_candidate_sequences = {
+                item[2]
+                for item in deferred_best_effort_candidates
+                if item[7] is not None
+                or has_persisted_selection_candidate(item[3], item[4])
+            }
+            fallback_reels: list[tuple[int, ReelOutWithAttribution]] = []
+            retained_stronger_reels: list[
+                tuple[int, ReelOutWithAttribution]
+            ] = []
+            for (
+                source_index,
+                _preferred_rank,
+                _sequence,
+                v,
+                clip,
+                engine_out,
+                boundary_verified_for_storage,
+                retained_reel,
+            ) in sorted(
+                deferred_best_effort_candidates,
+                key=lambda item: (
+                    item[2] not in retained_candidate_sequences,
+                    item[0],
+                    item[1],
+                    item[2],
+                ),
+            ):
+                is_retained_candidate = (
+                    _sequence in retained_candidate_sequences
+                )
+                if len(retained_stronger_reels) >= inventory_cap:
+                    break
+                if retained_stronger_reels and not is_retained_candidate:
+                    break
+                if (
+                    len(fallback_reels) >= inventory_cap
+                    and not is_retained_candidate
+                ):
+                    break
+                if retained_reel is None:
+                    persisted = persist_prepared_candidate(
+                        v=v,
+                        clip=clip,
+                        engine_out=engine_out,
+                        surface_eligible=True,
+                        boundary_verified_for_storage=(
+                            boundary_verified_for_storage
+                        ),
+                    )
+                    if persisted is None:
+                        continue
+                    reel, retained_boundary_status = persisted
+                else:
+                    reel = retained_reel
+                    retained_boundary_status = str(
+                        getattr(reel, "boundary_status", "")
+                        or (clip.get("search_context") or {}).get(
+                            "boundary_status"
+                        )
+                        or ""
+                    ).strip().casefold()
+                if retained_boundary_status != "best_effort":
+                    retained_stronger_reels.append((source_index, reel))
+                elif (
+                    not retained_stronger_reels
+                    and len(fallback_reels) < inventory_cap
+                ):
+                    fallback_reels.append((source_index, reel))
+
+            selected_reels = retained_stronger_reels or fallback_reels
+            stronger_surface_count += len(retained_stronger_reels)
+            persisted_count += len(selected_reels)
+            for source_index, reel in selected_reels:
+                reels_by_video.setdefault(source_index, []).append(reel)
+                if on_reel_created is not None:
+                    on_reel_created(reel)
+            if generation_context is not None and selected_reels:
+                generation_context.increment_counter(
+                    "persisted_clips", len(selected_reels)
+                )
 
         def persist_bootstrap_sources() -> None:
             """Persist at most one best clip per completed source before reuse.
@@ -6199,10 +6518,11 @@ class IngestionPipeline:
                         source_result[1][:1],
                         source_result[2],
                     )
+                    stronger_before = stronger_surface_count
                     persisted = persist_result(one_clip_result, limit=1)
                     mark_analyzed(source_result[0])
                     reels_by_video.setdefault(source_index, []).extend(persisted)
-                    persisted_count += len(persisted)
+                    persisted_count += stronger_surface_count - stronger_before
                 if persisted_count >= inventory_cap:
                     break
         pending = {
@@ -6289,39 +6609,30 @@ class IngestionPipeline:
                     elif retrieval_profile == "bootstrap":
                         persist_bootstrap_sources()
                     else:
+                        stronger_before = stronger_surface_count
                         persisted = persist_result(
                             result,
                             limit=max(0, inventory_cap - persisted_count),
                         )
                         mark_analyzed(v)
                         reels_by_video[index] = persisted
-                        persisted_count += len(persisted)
-                        if (
-                            retrieval_profile == "deep"
-                            and pending
-                            and persisted_count >= useful_inventory_threshold
-                        ):
-                            useful_inventory_idle_deadline = min(
-                                deadline,
-                                time.monotonic()
-                                + max(
-                                    0.0,
-                                    INGEST_TOPIC_USEFUL_INVENTORY_IDLE_TIMEOUT_SEC,
-                                ),
-                            )
+                        persisted_count += stronger_surface_count - stronger_before
+                        arm_useful_inventory_idle_deadline()
 
                 if retrieval_profile == "bootstrap":
                     persist_bootstrap_sources()
+                available_count = available_surface_inventory_count()
                 if (
                     not pending
-                    and persisted_count < minimum_valid
-                    and persisted_count < inventory_cap
+                    and available_count < minimum_valid
+                    and available_count < inventory_cap
                     and next_index < min(len(videos), analysis_limit)
                 ):
                     future = submit_video(next_index)
                     pending[future] = (next_index, videos[next_index])
                     all_futures.append(future)
                     next_index += 1
+                    arm_useful_inventory_idle_deadline()
         finally:
             batch_cancelled.set()
             for future in all_futures:
@@ -6365,9 +6676,12 @@ class IngestionPipeline:
                     source_result[1][clip_index : clip_index + 1],
                     source_result[2],
                 )
+                stronger_before = stronger_surface_count
                 persisted = persist_result(extra_result, limit=1)
                 reels_by_video.setdefault(source_index, []).extend(persisted)
-                persisted_count += len(persisted)
+                persisted_count += stronger_surface_count - stronger_before
+
+        persist_deferred_best_effort_if_needed()
 
         if (
             retrieval_profile == "bootstrap"
@@ -7143,8 +7457,6 @@ class IngestionPipeline:
             or clip_end > source_end + 1e-3
         ):
             raise SegmentationError("Clip timestamps must be ordered and within the source.")
-        from .persistence import build_video_id  # local import to avoid cycle surprises
-
         video_id = build_video_id(adapter_result.platform, adapter_result.source_id)
 
         # Build the client-facing YouTube embed URL. floor(start)/ceil(end) with
