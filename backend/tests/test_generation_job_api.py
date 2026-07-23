@@ -3707,6 +3707,9 @@ def test_generation_worker_retries_transient_provider_twice_then_succeeds_same_j
             if attempt < 3:
                 assert current["status"] == "queued"
                 usage = json.loads(str(current["usage_json"] or "{}"))
+                assert usage["summary"]["completion_cost_limit_usd"] == (
+                    usage["budget"]["gemini"]["completion_cost_limit_usd"]
+                )
                 assert usage["failed_source_attempts"] == {
                     "AAAAAAAAAAA": attempt,
                 }
@@ -3740,6 +3743,9 @@ def test_generation_worker_retries_transient_provider_twice_then_succeeds_same_j
         assert attempt_exposures[1] < final_budget["cost_exposure_usd"]
         assert final_budget["cost_exposure_usd"] <= final_budget["cost_limit_usd"]
         assert final_budget["selector_calls"] == 1
+        assert usage["summary"]["completion_cost_limit_usd"] == (
+            final_budget["completion_cost_limit_usd"]
+        )
         assert usage["summary"]["lifetime_reserved_worst_case_cost_usd"] == (
             final_budget["lifetime_reserved_worst_case_cost_usd"]
         )

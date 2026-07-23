@@ -10,6 +10,7 @@ import pytest
 
 from backend import gemini_client
 from backend.app.clip_engine import expand
+from backend.app.clip_engine.errors import ProviderBudgetExceededError
 from backend.app.clip_engine.provider_runtime import GenerationContext
 from backend.pipeline import gemini_segment
 
@@ -625,7 +626,7 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     assert audit_call["schema"] is gemini_segment._ProCandidateAuditPlan
     assert audit_call["operation"] == "pro_boundary_audit"
     assert audit_call["prompt_version"] == "pro_candidate_audit_v12"
-    assert audit_call["thinking_level"] == "high"
+    assert audit_call["thinking_level"] == "medium"
     assert audit_call["media_resolution"] is None
     assert gemini_segment._PRO_FINAL_AUDIT_RESERVED_S >= 60.0
     assert (
@@ -668,7 +669,7 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
 def test_text_only_pro_retries_one_malformed_structured_response(
     monkeypatch,
 ) -> None:
-    """A billable malformed Pro response gets one identical text-only retry."""
+    """A malformed Pro response gets one bounded high-reasoning correction."""
     plan = _newton_plan()
     context = GenerationContext("fast", generation_id="pro-schema-retry")
     generated: list[dict] = []
@@ -742,12 +743,19 @@ def test_text_only_pro_retries_one_malformed_structured_response(
         gemini_segment._CompactBoundaryPlan,
         gemini_segment._ProCandidateAuditPlan,
     ]
-    assert generated[0]["user"] == generated[1]["user"]
+    assert generated[0]["user"] != generated[1]["user"]
+    assert generated[1]["user"].startswith(generated[0]["user"])
+    assert "invalid_structured_response" in generated[1]["user"]
     assert isinstance(generated[0]["user"], str)
     assert generated[0]["media_resolution"] is None
     assert generated[1]["media_resolution"] is None
     assert generated[0]["max_retries"] == 1
     assert generated[1]["max_retries"] == 1
+    assert [call["thinking_level"] for call in generated] == [
+        "medium",
+        "high",
+        "medium",
+    ]
     assert result.calls[0]["error_type"] == "_SchemaResponseError"
     assert result.calls[0]["schema_retry_attempt"] == 1
     assert result.calls[0]["video_grounded"] is False
@@ -973,7 +981,7 @@ def test_pro_selector_and_audit_retry_headroom_stays_within_job_cost_ceiling(
     assert budget["cost_limit_usd"] == pytest.approx(cost_limit)
 
 
-def test_retry_waits_for_physical_capacity_then_dispatches_exactly_once(
+def test_retry_uses_bounded_completion_capacity_without_admitting_new_source(
     monkeypatch,
 ) -> None:
     context = GenerationContext("fast", generation_id="retry-physical-cap")
@@ -992,11 +1000,14 @@ def test_retry_waits_for_physical_capacity_then_dispatches_exactly_once(
     retry_admission_started = threading.Event()
     finished = threading.Event()
     outcome: dict[str, object] = {}
+    retry_admission_budgets: list[dict[str, object]] = []
 
     def reserve(**kwargs):
+        ticket = context.reserve_gemini_call(**kwargs)
         if kwargs["count_logical_call"] is False:
+            retry_admission_budgets.append(context.budget.snapshot()["gemini"])
             retry_admission_started.set()
-        return context.reserve_gemini_call(**kwargs)
+        return ticket
 
     def run() -> None:
         try:
@@ -1032,15 +1043,13 @@ def test_retry_waits_for_physical_capacity_then_dispatches_exactly_once(
     worker = threading.Thread(target=run, daemon=True)
     worker.start()
     assert retry_admission_started.wait(timeout=1.0)
-    assert len(fake.calls) == 1
-    blocked_budget = context.budget.snapshot()["gemini"]
-    assert blocked_budget["cost_exposure_usd"] <= blocked_budget["cost_limit_usd"]
-    assert finished.is_set() is False
-
-    assert context.budget.reconcile_gemini(
-        peer_ticket,
-        actual_cost_usd=0.0,
-    ) is True
+    admitted_retry_budget = retry_admission_budgets[0]
+    assert admitted_retry_budget["cost_exposure_usd"] > admitted_retry_budget[
+        "cost_limit_usd"
+    ]
+    assert admitted_retry_budget["cost_exposure_usd"] <= admitted_retry_budget[
+        "completion_cost_limit_usd"
+    ]
     assert finished.wait(timeout=1.0)
     worker.join(timeout=1.0)
 
@@ -1050,8 +1059,34 @@ def test_retry_waits_for_physical_capacity_then_dispatches_exactly_once(
     assert parsed.topics == []
     assert telemetry["physical_dispatches"] == 2
     assert telemetry["billing_unknown_attempts"] == 1
+    completion_budget = context.budget.snapshot()["gemini"]
+    assert completion_budget["selector_calls"] == 1
+    assert completion_budget["inflight_reserved_cost_usd"] == pytest.approx(1.00)
+    assert completion_budget["cost_exposure_usd"] <= completion_budget[
+        "completion_cost_limit_usd"
+    ]
+
+    with pytest.raises(ProviderBudgetExceededError, match="cost budget"):
+        context.reserve_gemini_call(
+            operation="flash_boundary_selector",
+            model="gemini-3.5-flash",
+            estimated_input_tokens=100,
+            max_output_tokens=40_000,
+        )
+    with pytest.raises(ProviderBudgetExceededError, match="cost budget"):
+        context.reserve_gemini_call(
+            operation="flash_boundary_selector",
+            model="gemini-3.5-flash",
+            estimated_input_tokens=100,
+            max_output_tokens=100_000,
+            count_logical_call=False,
+        )
+
+    assert context.budget.reconcile_gemini(
+        peer_ticket,
+        actual_cost_usd=0.0,
+    ) is True
     final_budget = context.budget.snapshot()["gemini"]
-    assert final_budget["selector_calls"] == 1
     assert final_budget["inflight_reserved_cost_usd"] == 0.0
     assert final_budget["cost_exposure_usd"] <= final_budget["cost_limit_usd"]
 

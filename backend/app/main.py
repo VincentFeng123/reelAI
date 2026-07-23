@@ -6199,6 +6199,7 @@ def _run_leased_generation_job(
         if isinstance(previous_summary, dict):
             summary = dict(payload.get("summary") or {})
             non_additive_summary_fields = {
+                "completion_cost_limit_usd",
                 "cost_limit_usd",
                 "cost_per_accepted_clip_usd",
                 "current_cost_exposure_usd",

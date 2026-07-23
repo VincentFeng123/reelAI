@@ -73,6 +73,8 @@ def test_generation_budgets_match_fast_and_slow_contracts() -> None:
     assert (fast.max_passes, fast.max_no_growth_passes) == (1, 0)
     assert slow.snapshot()["limits"] == {"search": 5, "transcript": 5, "segmentation": 5}
     assert (slow.max_passes, slow.max_no_growth_passes) == (1, 0)
+    assert fast.snapshot()["gemini"]["completion_cost_limit_usd"] == 2.00
+    assert slow.snapshot()["gemini"]["completion_cost_limit_usd"] == 3.00
     for _ in range(5):
         fast.reserve("search")
     with pytest.raises(ProviderBudgetExceededError):
@@ -492,6 +494,138 @@ def test_durable_retry_counts_unsettled_prior_reservation_against_cost_ceiling()
             max_output_tokens=6_000,
             max_physical_attempts=1,
         )
+
+
+def test_completion_cost_envelope_only_admits_required_same_source_work() -> None:
+    context = GenerationContext("slow", generation_id="job-completion-envelope")
+    context.budget.restore_gemini_retry_exposure({
+        "mode": "slow",
+        "gemini": {
+            "committed_cost_usd": 2.3799052,
+            "cost_exposure_usd": 2.3799052,
+            "billing_unknown_cost_exposure_usd": 1.246309,
+            "lifetime_reserved_worst_case_cost_usd": 2.9017975,
+        },
+    })
+
+    with pytest.raises(
+        ProviderBudgetExceededError,
+        match="requires a prior logical selector",
+    ):
+        context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
+            count_logical_call=False,
+        )
+
+    with pytest.raises(ProviderBudgetExceededError, match="cost budget") as orphan_audit:
+        context.reserve_gemini_call(
+            operation="pro_boundary_audit",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=13_319,
+            max_output_tokens=8_256,
+        )
+    assert "lane=normal" in str(orphan_audit.value.detail)
+
+    initial_selector = context.reserve_gemini_call(
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=1_000,
+        max_output_tokens=100,
+    )
+
+    with pytest.raises(ProviderBudgetExceededError, match="cost budget") as selector:
+        context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=15_926,
+            max_output_tokens=12_288,
+        )
+    assert "lane=normal" in str(selector.value.detail)
+
+    with pytest.raises(ProviderBudgetExceededError, match="cost budget") as expansion:
+        context.reserve_gemini_call(
+            operation="expansion",
+            model="gemini-3.1-flash-lite",
+            estimated_input_tokens=100_000,
+            max_output_tokens=70_000,
+        )
+    assert "lane=normal" in str(expansion.value.detail)
+
+    boundary_audit = context.reserve_gemini_call(
+        operation="pro_boundary_audit",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=13_319,
+        max_output_tokens=8_256,
+    )
+    selector_repair = context.reserve_gemini_call(
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=15_926,
+        max_output_tokens=12_288,
+        count_logical_call=False,
+    )
+
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["selector_calls"] == 1
+    assert budget["boundary_audit_calls"] == 1
+    assert budget["cost_limit_usd"] == pytest.approx(2.50)
+    assert budget["completion_cost_limit_usd"] == pytest.approx(3.00)
+    assert budget["cost_exposure_usd"] > budget["cost_limit_usd"]
+    assert budget["cost_exposure_usd"] <= budget["completion_cost_limit_usd"]
+
+    with pytest.raises(ProviderBudgetExceededError, match="cost budget") as new_source:
+        context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
+        )
+    assert "lane=normal" in str(new_source.value.detail)
+
+    before_hard_cap_rejection = context.budget.snapshot()["gemini"][
+        "cost_exposure_usd"
+    ]
+    with pytest.raises(ProviderBudgetExceededError, match="cost budget") as hard_cap:
+        context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=100_000,
+            max_output_tokens=20_000,
+            count_logical_call=False,
+        )
+    assert "lane=completion" in str(hard_cap.value.detail)
+    assert context.budget.snapshot()["gemini"]["cost_exposure_usd"] == pytest.approx(
+        before_hard_cap_rejection
+    )
+
+    for ticket, input_tokens, output_tokens in (
+        (initial_selector, 1_000, 100),
+        (boundary_audit, 13_319, 8_256),
+        (selector_repair, 15_926, 12_288),
+    ):
+        assert context.reconcile_gemini_call(
+            model_used="gemini-3.1-pro-preview",
+            usage={
+                **ticket,
+                "prompt_tokens": input_tokens,
+                "candidate_tokens": output_tokens,
+                "thought_tokens": 0,
+                "dispatched": True,
+            },
+        ) is True
+
+    settled = context.budget.snapshot()["gemini"]
+    assert settled["inflight_reserved_cost_usd"] == 0.0
+    assert settled["cost_exposure_usd"] == pytest.approx(
+        before_hard_cap_rejection
+    )
+    assert settled["cost_exposure_usd"] <= settled["completion_cost_limit_usd"]
+    assert context.usage_payload()["summary"][
+        "completion_cost_limit_usd"
+    ] == pytest.approx(3.00)
 
 
 @pytest.mark.parametrize(

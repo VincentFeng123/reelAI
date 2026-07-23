@@ -12554,6 +12554,186 @@ def _run_stubbed_pro_candidate_audit(
     )
 
 
+def test_six_sibling_selector_overclaims_flow_to_correcting_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    siblings = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+    request = "Teach alpha, beta, gamma, delta, epsilon, and zeta"
+    constraints = [{
+        "constraint_id": sibling,
+        "kind": "scope",
+        "source_phrase": sibling,
+        "source_occurrence": 0,
+        "requirement": f"Teach {sibling}",
+    } for sibling in siblings]
+    overclaimed_evidence = [{
+        "id": sibling,
+        "q": f"{sibling} principle explains one distinct grounded mechanism",
+    } for sibling in siblings]
+    segments: list[dict] = []
+    topics: list[gemini_segment._CompactBoundaryTopic] = []
+    audit_items: list[dict] = []
+    for index, sibling in enumerate(siblings):
+        evidence = (
+            f"{sibling} principle explains one distinct grounded mechanism"
+        )
+        segments.append({
+            "cue_id": f"cue-{index}",
+            "start": float(index * 10),
+            "end": float(index * 10 + 8),
+            "text": f"{evidence} with a concrete example",
+        })
+        topics.append(gemini_segment._CompactBoundaryTopic(
+            candidate_id=f"{sibling}-lesson",
+            start_line=index,
+            end_line=index,
+            start_quote=f"{sibling} principle explains",
+            end_quote="with a concrete example",
+            claim_quote=evidence,
+            title=f"{sibling.title()} mechanism",
+            learning_objective=f"Explain the {sibling} mechanism",
+            facet=f"{sibling} mechanism",
+            concept_family=f"{sibling} domain mechanism",
+            concept_aliases=[],
+            informativeness=0.9,
+            topic_relevance=0.9,
+            educational_importance=0.9,
+            difficulty=0.4,
+            directly_teaches_topic=False,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=overclaimed_evidence,
+            objective_constraint_ids=siblings,
+            relationship_witnesses=[],
+        ))
+        audit_items.append({
+            "id": f"candidate-{index + 1}",
+            "d": "keep",
+            "obj": f"Explain the {sibling} mechanism",
+            "t": f"{sibling.title()} mechanism",
+            "f": f"{sibling} mechanism",
+            "family": f"{sibling} domain mechanism",
+            "a": [],
+            "direct": False,
+            "ie": [{"id": sibling, "q": evidence}],
+            "oi": [sibling],
+            "rw": [],
+            "ow": evidence,
+            "ev": evidence,
+            "ds": index,
+            "dq": f"{sibling} principle explains",
+            "dc": True,
+            "s": index,
+            "e": index,
+            "sq": f"{sibling} principle explains",
+            "eq": "with a concrete example",
+        })
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": constraints,
+            "joint_structures": [],
+        },
+        topics=topics,
+    )
+
+    contract = gemini_segment._validate_live_pro_selector_contract(plan, request)
+
+    assert len(contract.plan.topics) == 6
+    assert contract.candidate_rejections == ()
+    assert len(contract.audit_repair_reasons) == 6
+    assert all(
+        reason.endswith("objective_fulfillment_untrusted_sibling_umbrella")
+        for reason in contract.audit_repair_reasons
+    )
+
+    audit_plan = gemini_segment._ProCandidateAuditPlan(items=audit_items)
+    schemas: list[type] = []
+    users: list[str] = []
+    audit_kwargs: list[dict] = []
+
+    def selector_then_correcting_audit(_system, user, schema, **kwargs):
+        schemas.append(schema)
+        users.append(user)
+        audit_kwargs.append(kwargs)
+        if schema is gemini_segment._CompactBoundaryPlan:
+            return plan, {
+                "model": "gemini-3.1-pro-preview",
+                "operation": "pro_fallback",
+                "physical_dispatches": 1,
+            }
+        assert schema is gemini_segment._ProCandidateAuditPlan
+        return audit_plan, {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_boundary_audit",
+            "physical_dispatches": 1,
+        }
+
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        selector_then_correcting_audit,
+    )
+    report, _classification, calls = gemini_segment._run_selection_profile(
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        {"segments": segments, "words": [], "source": "supadata"},
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=lambda: False,
+    )
+
+    assert schemas == [
+        gemini_segment._CompactBoundaryPlan,
+        gemini_segment._ProCandidateAuditPlan,
+    ]
+    assert [kwargs["thinking_level"] for kwargs in audit_kwargs] == [
+        "medium",
+        "medium",
+    ]
+    assert "objective_fulfillment_untrusted_sibling_umbrella" in users[1]
+    assert len(calls) == 2
+    assert report.accepted_count == 6
+    assert not any(
+        key.startswith("selector_contract_retry")
+        for call in calls
+        for key in call
+    )
+
+
+def test_logical_correction_prompt_is_bounded_and_payload_free() -> None:
+    prior_payload = "TOP_SECRET_PRIOR_RESPONSE_PAYLOAD"
+    reasons = [
+        (
+            f"candidate_{prior_payload}_{index}:"
+            "objective_fulfillment_untrusted_sibling_umbrella"
+        )
+        for index in range(20)
+    ]
+    reasons.extend(
+        f"audit_contract_failure_{index}:candidate_{prior_payload}"
+        for index in range(20)
+    )
+
+    corrected = gemini_segment._logical_correction_user_content(
+        "original prompt",
+        stage="selector",
+        rejection_reasons=reasons,
+    )
+
+    assert isinstance(corrected, str)
+    correction = corrected.removeprefix("original prompt")
+    assert prior_payload not in correction
+    assert "objective_fulfillment_untrusted_sibling_umbrella" in correction
+    assert len(correction) <= gemini_segment._LOGICAL_CORRECTION_MAX_SUFFIX_CHARS
+    assert (
+        correction.count("\n- ")
+        == gemini_segment._LOGICAL_CORRECTION_MAX_CODES
+    )
+
+
 def _chair_third_law_audit_fixture() -> tuple[
     gemini_segment._CompactBoundaryPlan,
     list[dict],
@@ -14419,10 +14599,14 @@ def test_pro_boundary_audit_retries_one_schema_failure(
         ),
     }]
     attempted = 0
+    attempted_levels: list[str] = []
+    attempted_users: list[str] = []
 
-    def fail_then_recover(*_args, **kwargs):
+    def fail_then_recover(_system, user, _schema, **kwargs):
         nonlocal attempted
         attempted += 1
+        attempted_levels.append(kwargs["thinking_level"])
+        attempted_users.append(user)
         assert kwargs["operation"] == "pro_boundary_audit"
         assert kwargs["max_retries"] == (2 if attempted == 1 else 1)
         assert kwargs["use_full_transient_retry_budget"] is True
@@ -14488,6 +14672,9 @@ def test_pro_boundary_audit_retries_one_schema_failure(
         rejections = []
 
     assert attempted == 2
+    assert attempted_levels == ["medium", "high"]
+    assert "invalid_structured_response" not in attempted_users[0]
+    assert "invalid_structured_response" in attempted_users[1]
     assert retained.topics[0].concept_family == (
         "Bayes' theorem" if retry_recovers else plan.topics[0].concept_family
     )
@@ -14582,11 +14769,15 @@ def test_pro_boundary_audit_recursive_contract_recovery_shares_dispatch_budget(
     }]
     invalid_contract = gemini_segment._ProCandidateAuditPlan(items=[])
     configured_retries: list[int] = []
+    thinking_levels: list[str] = []
+    users: list[str] = []
     provider_dispatches = 0
 
-    def contract_then_schema_failure(_system, _user, _schema, **kwargs):
+    def contract_then_schema_failure(_system, user, _schema, **kwargs):
         nonlocal provider_dispatches
         configured_retries.append(kwargs["max_retries"])
+        thinking_levels.append(kwargs["thinking_level"])
+        users.append(user)
         dispatch_count = 2 if len(configured_retries) == 1 else 1
         provider_dispatches += dispatch_count
         telemetry = _settle_mock_dispatches(kwargs, dispatch_count)
@@ -14615,6 +14806,9 @@ def test_pro_boundary_audit_recursive_contract_recovery_shares_dispatch_budget(
         )
     calls = exc_info.value.selection_attempt_calls
     assert configured_retries == [2, 0]
+    assert thinking_levels == ["medium", "high"]
+    assert "audit_candidate_id_contract_invalid" not in users[0]
+    assert "audit_candidate_id_contract_invalid" in users[1]
     assert provider_dispatches == 3
     assert [call["physical_dispatches"] for call in calls] == [2, 1]
     assert calls[0]["contract_retry_attempt"] == 1
@@ -16173,10 +16367,14 @@ def test_invalid_selector_contract_with_failed_retry_is_operational_failure(
         }),
     })
     attempts = 0
+    attempted_levels: list[str] = []
+    attempted_users: list[str] = []
 
-    def fail_contract_retry(*_args, **_kwargs):
+    def fail_contract_retry(_system, user, _schema, **kwargs):
         nonlocal attempts
         attempts += 1
+        attempted_levels.append(kwargs["thinking_level"])
+        attempted_users.append(user)
         if attempts == 1:
             return invalid_plan, {
                 "model": "gemini-3.1-pro-preview",
@@ -16210,6 +16408,10 @@ def test_invalid_selector_contract_with_failed_retry_is_operational_failure(
     )
 
     assert attempts == 2
+    assert attempted_levels == ["medium", "high"]
+    assert "intent_contract_request_mismatch" not in attempted_users[0]
+    assert "intent_contract_request_mismatch" in attempted_users[1]
+    assert "an unrelated request" not in attempted_users[1]
     assert result.clips == []
     assert result.error == (
         "GeminiTransportError: Gemini model call failed; status 503"
@@ -16222,6 +16424,65 @@ def test_invalid_selector_contract_with_failed_retry_is_operational_failure(
     assert result.calls[1]["selector_contract_retry_attempt"] == 2
     assert result.calls[1]["selector_contract_retry_exhausted"] is True
     assert result.calls[1]["retryable"] is True
+
+
+def test_audit_failure_preserves_preceding_selector_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "photosynthesis"
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="Plants convert light",
+        end_quote="stored chemical energy",
+        claim_quote="Plants convert light into stored chemical energy",
+    )
+    selector_call = {
+        "model": "gemini-3.1-pro-preview",
+        "operation": "pro_fallback",
+        "physical_dispatches": 1,
+    }
+    audit_call = {
+        "model": "gemini-3.1-pro-preview",
+        "operation": "pro_boundary_audit",
+        "error_type": "GeminiTransportError",
+        "provider_status_code": 503,
+        "retryable": True,
+        "physical_dispatches": 1,
+    }
+
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        lambda *_args, **_kwargs: (plan, dict(selector_call)),
+    )
+
+    def fail_audit(*_args, **_kwargs):
+        exc = gemini_segment._ModelCallError("audit unavailable", dict(audit_call))
+        exc.selection_attempt_calls = [dict(audit_call)]
+        raise exc
+
+    monkeypatch.setattr(gemini_segment, "_audit_pro_boundaries", fail_audit)
+    with pytest.raises(gemini_segment._ModelCallError) as exc_info:
+        gemini_segment._run_selection_profile(
+            gemini_segment.PRO_BOUNDARY_PROFILE,
+            {
+                "segments": [{
+                    "cue_id": "cue-0",
+                    "start": 0.0,
+                    "end": 5.0,
+                    "text": "Plants convert light into stored chemical energy.",
+                }],
+                "words": [],
+            },
+            request,
+            {},
+            deadline=time.monotonic() + 30.0,
+            cancelled=lambda: False,
+        )
+
+    assert [
+        call["operation"] for call in exc_info.value.selection_attempt_calls
+    ] == ["pro_fallback", "pro_boundary_audit"]
 
 
 def test_invalid_selector_contract_without_retry_time_is_operational_failure(
@@ -26129,9 +26390,11 @@ def test_healthy_relationship_selector_and_audit_use_exactly_two_calls_no_retry(
         "eq": "equal force in the opposite direction",
     }])
     schemas: list[type] = []
+    thinking_levels: list[str] = []
 
-    def healthy_call(_system, _user, schema, **_kwargs):
+    def healthy_call(_system, _user, schema, **kwargs):
         schemas.append(schema)
+        thinking_levels.append(kwargs["thinking_level"])
         telemetry = {
             "model": "gemini-3.1-pro-preview",
             "operation": (
@@ -26175,6 +26438,7 @@ def test_healthy_relationship_selector_and_audit_use_exactly_two_calls_no_retry(
         gemini_segment._CompactBoundaryPlan,
         gemini_segment._ProCandidateAuditPlan,
     ]
+    assert thinking_levels == ["medium", "medium"]
     assert len(calls) == 2
     assert [call["physical_dispatches"] for call in calls] == [1, 1]
     assert [call["retries"] for call in calls] == [0, 0]

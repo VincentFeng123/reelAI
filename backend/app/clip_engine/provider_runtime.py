@@ -153,10 +153,17 @@ class GenerationBudget:
         # for each source. These are ceilings, not expected spend; billed usage
         # comes from provider telemetry and is normally much lower.
         # Each source may use one medium-thinking Pro selector plus one
-        # high-thinking transcript-only final audit. Keep enough headroom for
+        # medium-thinking transcript-only final audit. Keep enough headroom for
         # both bounded calls without allowing an audit to disappear at release.
         "fast": 1.50,
         "slow": 2.50,
+    }
+    _GEMINI_COMPLETION_COST_LIMIT_USD: dict[GenerationMode, float] = {
+        # Completion-only headroom cannot start expansion or a new source. It
+        # exists solely so an admitted source can finish its bounded selector
+        # repair and mandatory Pro boundary audit near the normal ceiling.
+        "fast": 2.00,
+        "slow": 3.00,
     }
     _SELECTOR_CALL_LIMIT: dict[GenerationMode, int] = {
         "fast": 3,
@@ -226,7 +233,11 @@ class GenerationBudget:
             if math.isnan(value):
                 return 0.0
             if math.isinf(value):
-                return self._GEMINI_COST_LIMIT_USD[self.mode] if value > 0 else 0.0
+                return (
+                    self._GEMINI_COMPLETION_COST_LIMIT_USD[self.mode]
+                    if value > 0
+                    else 0.0
+                )
             return max(0.0, value)
 
         with self._gemini_condition:
@@ -334,7 +345,9 @@ class GenerationBudget:
             max_physical_attempts=max(1, int(max_physical_attempts)),
         )
         admitted_cost = reservation.admitted_cost_usd
-        cost_limit = self._GEMINI_COST_LIMIT_USD[self.mode]
+        normal_cost_limit = self._GEMINI_COST_LIMIT_USD[self.mode]
+        completion_cost_limit = self._GEMINI_COMPLETION_COST_LIMIT_USD[self.mode]
+        is_same_source_selector_retry = is_selector and not count_logical_call
 
         def cancellation_requested() -> bool:
             if callable(cancelled):
@@ -380,6 +393,12 @@ class GenerationBudget:
                         provider="gemini",
                         operation=operation,
                     )
+                if is_same_source_selector_retry and self._selector_calls <= 0:
+                    raise ProviderBudgetExceededError(
+                        "Gemini selector cost-only retry requires a prior logical selector.",
+                        provider="gemini",
+                        operation=operation,
+                    )
                 if (
                     count_logical_call
                     and is_selector
@@ -404,6 +423,19 @@ class GenerationBudget:
                         provider="gemini",
                         operation=operation,
                     )
+                uses_completion_lane = (
+                    (
+                        is_pro_boundary_audit
+                        and self._selector_calls > 0
+                    )
+                    or is_same_source_selector_retry
+                )
+                cost_lane = "completion" if uses_completion_lane else "normal"
+                cost_limit = (
+                    completion_cost_limit
+                    if uses_completion_lane
+                    else normal_cost_limit
+                )
                 inflight_cost = sum(
                     item.admitted_cost_usd for item in self._gemini_inflight.values()
                 )
@@ -436,6 +468,9 @@ class GenerationBudget:
                         provider="gemini",
                         operation=operation,
                         detail=(
+                            f"lane={cost_lane}, "
+                            f"normal_limit=${normal_cost_limit:.2f}, "
+                            f"completion_limit=${completion_cost_limit:.2f}, "
                             f"committed=${self._gemini_committed_cost_usd:.6f}, "
                             f"inflight=${inflight_cost:.6f}, "
                             f"requested=${admitted_cost:.6f}"
@@ -447,6 +482,9 @@ class GenerationBudget:
                         provider="gemini",
                         operation=operation,
                         detail=(
+                            f"lane={cost_lane}, "
+                            f"normal_limit=${normal_cost_limit:.2f}, "
+                            f"completion_limit=${completion_cost_limit:.2f}, "
                             f"committed=${self._gemini_committed_cost_usd:.6f}, "
                             f"inflight=${inflight_cost:.6f}, "
                             f"requested=${admitted_cost:.6f}"
@@ -519,6 +557,9 @@ class GenerationBudget:
                 "max_no_growth_passes": self.max_no_growth_passes,
                 "gemini": {
                     "cost_limit_usd": self._GEMINI_COST_LIMIT_USD[self.mode],
+                    "completion_cost_limit_usd": (
+                        self._GEMINI_COMPLETION_COST_LIMIT_USD[self.mode]
+                    ),
                     "lifetime_reserved_worst_case_cost_usd": round(
                         self._gemini_reserved_cost_usd, 8
                     ),
@@ -1451,6 +1492,9 @@ class GenerationContext:
                 "cost_exposure_usd"
             ],
             "cost_limit_usd": budget_snapshot["cost_limit_usd"],
+            "completion_cost_limit_usd": budget_snapshot[
+                "completion_cost_limit_usd"
+            ],
             # Compatibility alias for lifetime reservation history. It can
             # exceed the job ceiling after sequential calls and is not spend;
             # current_cost_exposure_usd is the active bounded value.
