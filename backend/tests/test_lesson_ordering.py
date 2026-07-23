@@ -135,6 +135,9 @@ def test_required_unseen_clip_dominates_optional_cross_source_strict_restatement
             video_id="rich-source",
             start=0,
             concept="finally cleanup",
+            selection_contract_version=lesson_ordering.SELECTION_CONTRACT_VERSION,
+            _selection_self_contained=False,
+            _selection_is_standalone=False,
             transcript_snippet=(
                 "The finally block always executes after success or failure, so use it "
                 "to close files, database connections, and other resources."
@@ -753,11 +756,27 @@ def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_
     assert payload["concept_title"] == "How force and mass change acceleration"
     assert payload["concept_family"] == "force-mass-acceleration proportionality"
     assert payload["clip_duration_seconds"] == 20.0
-    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v18"
+    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v20"
     policy = " ".join(lesson_ordering._SYSTEM_PROMPT.split())
     assert "semantic restatements" in policy
     assert "concept, then explanation, then application or worked example" in policy
     assert "release_limit is a ceiling, not a target" in policy
+    assert "Use the trusted structural completeness fields" in policy
+    assert "Tier B has the current contract" in policy
+    assert "Tier C has false or missing self_contained" in policy
+    assert "A lower tier is availability fallback, not extra breadth" in policy
+    assert "required_reel_ids override every tier" in policy
+    assert "still select the strongest coherent nonempty lesson" in policy
+    assert "A distinct supplied contribution is not automatically required" in policy
+    assert "connection does not create a coverage requirement" in policy
+    assert "fulfilled Tier A/B facets as mandatory coverage" in policy
+    assert "no Tier A/B clip fulfills any facet" in policy
+    assert "locked_prefix_reel_ids" in policy
+    assert "already began playing" in policy
+    assert "forward continuation" in policy
+    assert "already-past learner history" in policy
+    assert "unlocked dependent clip" in policy
+    assert "Your selection alone is not an exception" in policy
     assert "shortest context-complete clip" in policy
     assert "only supplied way to keep the lesson nonempty" in policy
     assert "closest adjacent band" in policy
@@ -765,6 +784,225 @@ def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_
     assert "after learner feedback and quiz adjustment" in policy
     assert "learner_level" not in payload
     assert "difficulty" in payload
+
+
+def test_locked_live_prefix_reaches_one_ai_order_call_exactly(monkeypatch) -> None:
+    late_application = _trusted_independent_reel(
+        "late-active",
+        video_id="late-active-source",
+        start=0,
+        concept="proximate-cause application",
+    )
+    forward_nuance = _trusted_independent_reel(
+        "forward-nuance",
+        video_id="forward-nuance-source",
+        start=0,
+        concept="intervening-cause nuance",
+    )
+    calls = 0
+
+    def fake_generate(
+        _system_prompt,
+        user_prompt,
+        *,
+        dispatch_state,
+        **_kwargs,
+    ):
+        nonlocal calls
+        calls += 1
+        dispatch_state.dispatched = True
+        learning_request = json.loads(
+            user_prompt.split("LEARNING_REQUEST_JSON:\n", 1)[1].split(
+                "\n\nCLIPS_JSON:\n", 1
+            )[0]
+        )
+        assert learning_request["locked_prefix_reel_ids"] == ["late-active"]
+        assert learning_request["required_reel_ids"] == ["late-active"]
+        return _generation_result(["late-active", "forward-nuance"])
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        fake_generate,
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [late_application, forward_nuance],
+        topic="Teach negligence through proximate cause and later nuance.",
+        release_limit=2,
+        required_reel_ids=["late-active"],
+        locked_prefix_reel_ids=["late-active"],
+    )
+
+    assert calls == 1
+    assert result.provider_called is True
+    assert result.degraded is False
+    assert result.ordered_reel_ids == ["late-active", "forward-nuance"]
+
+
+def test_locked_dependent_treats_its_prerequisite_as_already_past(
+    monkeypatch,
+) -> None:
+    prerequisite = _trusted_independent_reel(
+        "earlier-foundation",
+        video_id="foundation-source",
+        start=0,
+        concept="earlier foundation",
+        selection_candidate_id="foundation-candidate",
+    )
+    locked_dependent = _reel(
+        "locked-dependent",
+        video_id="dependent-source",
+        start=0,
+        concept="active application",
+        prerequisite_ids=["foundation-candidate"],
+    )
+    forward_tail = _trusted_independent_reel(
+        "forward-tail",
+        video_id="tail-source",
+        start=0,
+        concept="later synthesis",
+    )
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result([
+            "locked-dependent",
+            "earlier-foundation",
+            "forward-tail",
+        ])
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        fake_generate,
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [prerequisite, locked_dependent, forward_tail],
+        topic="Teach the application and continue to synthesis.",
+        release_limit=3,
+        locked_prefix_reel_ids=["locked-dependent"],
+    )
+
+    assert calls == 1
+    assert result.degraded is False
+    assert result.ordered_reel_ids == ["locked-dependent", "forward-tail"]
+
+
+def test_locked_chain_member_treats_earlier_same_source_member_as_past(
+    monkeypatch,
+) -> None:
+    chain_one = _reel(
+        "chain-one",
+        video_id="shared-source",
+        start=0,
+        concept="earlier derivation setup",
+        chain_id="derivation",
+        chain_position=1,
+    )
+    locked_chain_two = _reel(
+        "locked-chain-two",
+        video_id="shared-source",
+        start=20,
+        concept="active derivation step",
+        chain_id="derivation",
+        chain_position=2,
+    )
+    chain_three = _reel(
+        "chain-three",
+        video_id="shared-source",
+        start=40,
+        concept="forward derivation conclusion",
+        chain_id="derivation",
+        chain_position=3,
+    )
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result([
+            "locked-chain-two",
+            "chain-one",
+            "chain-three",
+        ])
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        fake_generate,
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [chain_one, locked_chain_two, chain_three],
+        topic="Continue the derivation from the active step.",
+        release_limit=3,
+        locked_prefix_reel_ids=["locked-chain-two"],
+    )
+
+    assert calls == 1
+    assert result.degraded is False
+    assert result.ordered_reel_ids == ["locked-chain-two", "chain-three"]
+
+
+def test_independently_required_prelocked_context_may_follow_locked_prefix(
+    monkeypatch,
+) -> None:
+    prerequisite = _trusted_independent_reel(
+        "required-foundation",
+        video_id="foundation-source",
+        start=0,
+        concept="required foundation recap",
+        selection_candidate_id="foundation-candidate",
+    )
+    locked_dependent = _reel(
+        "locked-dependent",
+        video_id="dependent-source",
+        start=0,
+        concept="active application",
+        prerequisite_ids=["foundation-candidate"],
+    )
+    forward_tail = _trusted_independent_reel(
+        "forward-tail",
+        video_id="tail-source",
+        start=0,
+        concept="later synthesis",
+    )
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result([
+            "locked-dependent",
+            "required-foundation",
+            "forward-tail",
+        ])
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        fake_generate,
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [prerequisite, locked_dependent, forward_tail],
+        topic="Continue the application while retaining the required recap.",
+        release_limit=3,
+        required_reel_ids=["required-foundation"],
+        locked_prefix_reel_ids=["locked-dependent"],
+    )
+
+    assert calls == 1
+    assert result.degraded is False
+    assert result.ordered_reel_ids == [
+        "locked-dependent",
+        "required-foundation",
+        "forward-tail",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1014,6 +1252,307 @@ def test_healthy_organizer_prefers_concise_nonredundant_subset_across_domains(
     ]
     assert result.current_restatement_reel_ids == ["long-repeat"]
     assert result.degraded is False
+
+
+@pytest.mark.parametrize(
+    ("topic", "requested_unit", "supporting_unit"),
+    [
+        ("electric circuits", "Ohm's law worked example", "resistor power"),
+        ("cellular respiration", "ATP synthase mechanism", "proton transport"),
+        ("eigenvalues", "characteristic-polynomial example", "matrix review"),
+        ("database isolation", "phantom-read example", "transaction logging"),
+        ("negligence", "proximate-cause application", "damages review"),
+    ],
+)
+def test_organizer_uses_completeness_tiers_for_requested_coverage_across_domains(
+    monkeypatch,
+    topic: str,
+    requested_unit: str,
+    supporting_unit: str,
+) -> None:
+    requested = _obligation(
+        requested_unit,
+        f"Teach {requested_unit}",
+        kind="task",
+    )
+    strong = _trusted_independent_reel(
+        "tier-a-requested",
+        video_id=f"{topic}-tier-a",
+        start=0,
+        concept=requested_unit,
+        _selection_intent_obligations=[requested],
+    )
+    tier_b_duplicate = _reel(
+        "tier-b-duplicate",
+        video_id=f"{topic}-tier-b",
+        start=0,
+        concept=f"{requested_unit} with source context",
+        selection_contract_version=lesson_ordering.SELECTION_CONTRACT_VERSION,
+        _selection_self_contained=True,
+        _selection_is_standalone=False,
+        _selection_intent_obligations=[requested],
+    )
+    connection_only = _trusted_independent_reel(
+        "connection-only",
+        video_id=f"{topic}-connection",
+        start=0,
+        concept=supporting_unit,
+        _selection_intent_connections=[requested],
+    )
+    optional_tier_c = _reel(
+        "optional-tier-c",
+        video_id=f"{topic}-tier-c",
+        start=0,
+        concept=f"incomplete {supporting_unit}",
+        selection_contract_version=lesson_ordering.SELECTION_CONTRACT_VERSION,
+        _selection_self_contained=False,
+        _selection_is_standalone=False,
+    )
+    reels = [
+        tier_b_duplicate,
+        connection_only,
+        optional_tier_c,
+        strong,
+    ]
+    calls = 0
+
+    def fake_generate(
+        _system_prompt,
+        user_prompt,
+        *,
+        dispatch_state,
+        **_kwargs,
+    ):
+        nonlocal calls
+        calls += 1
+        dispatch_state.dispatched = True
+        clips = json.loads(
+            user_prompt.split("CLIPS_JSON:\n", 1)[1].split(
+                "\n\nFinal request:", 1
+            )[0]
+        )["clips"]
+        by_id = {clip["reel_id"]: clip for clip in clips}
+        assert set(by_id) == {reel["reel_id"] for reel in reels}
+        assert by_id["tier-a-requested"]["self_contained"] is True
+        assert by_id["tier-a-requested"]["is_standalone"] is True
+        assert by_id["tier-b-duplicate"]["self_contained"] is True
+        assert by_id["tier-b-duplicate"]["is_standalone"] is False
+        assert by_id["optional-tier-c"]["self_contained"] is False
+        assert by_id["optional-tier-c"]["is_standalone"] is False
+        assert by_id["connection-only"]["intent_obligations"] == []
+        assert by_id["connection-only"]["intent_connections"] == [requested]
+        return _generation_result(["tier-a-requested"])
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        fake_generate,
+    )
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic=f"Teach {topic} through {requested_unit}.",
+        release_limit=len(reels),
+    )
+
+    assert calls == 1
+    assert result.provider_called is True
+    assert result.degraded is False
+    assert result.ordered_reel_ids == ["tier-a-requested"]
+
+
+@pytest.mark.parametrize(
+    ("topic", "strong_is_standalone", "strong_unit", "weak_unit"),
+    [
+        ("electric circuits", True, "Ohm's law", "resistor color codes"),
+        ("cell biology", False, "ATP synthase", "mitochondrial staining"),
+        ("linear algebra", True, "eigenvalues", "matrix software history"),
+        ("database isolation", False, "phantom reads", "log file rotation"),
+        ("negligence", True, "proximate cause", "court filing procedure"),
+    ],
+)
+def test_distinct_tier_c_obligation_is_not_readded_when_strong_coverage_exists(
+    monkeypatch,
+    topic: str,
+    strong_is_standalone: bool,
+    strong_unit: str,
+    weak_unit: str,
+) -> None:
+    strong_obligation = _obligation(strong_unit, f"Teach {strong_unit}")
+    weak_obligation = _obligation(weak_unit, f"Teach {weak_unit}")
+    strong = _reel(
+        "strong",
+        video_id="strong-source",
+        start=0,
+        concept=strong_unit,
+        selection_contract_version=lesson_ordering.SELECTION_CONTRACT_VERSION,
+        _selection_self_contained=True,
+        _selection_is_standalone=strong_is_standalone,
+        _selection_intent_obligations=[strong_obligation],
+    )
+    weak = _reel(
+        "weak-distinct",
+        video_id="weak-source",
+        start=0,
+        concept=weak_unit,
+        selection_contract_version=lesson_ordering.SELECTION_CONTRACT_VERSION,
+        _selection_self_contained=False,
+        _selection_is_standalone=False,
+        _selection_intent_obligations=[weak_obligation],
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["strong"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [weak, strong],
+        topic=f"Teach {topic}.",
+        release_limit=2,
+    )
+
+    assert result.ordered_reel_ids == ["strong"]
+
+
+def test_tier_c_obligation_remains_mandatory_when_strong_rows_are_tangents(
+    monkeypatch,
+) -> None:
+    requested = _obligation(
+        "requested mechanism",
+        "Teach the requested mechanism",
+    )
+    tangent = _trusted_independent_reel(
+        "strong-tangent",
+        video_id="tangent-source",
+        start=0,
+        concept="supporting tangent",
+        _selection_intent_connections=[requested],
+    )
+    weak_requested = _reel(
+        "weak-requested",
+        video_id="requested-source",
+        start=0,
+        concept="requested mechanism",
+        _selection_intent_obligations=[requested],
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(["strong-tangent"]),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [tangent, weak_requested],
+        topic="Teach the requested mechanism.",
+        release_limit=2,
+    )
+
+    assert "weak-requested" in result.ordered_reel_ids
+    assert result.ordered_reel_ids
+
+
+def test_required_tier_c_identity_still_overrides_strong_inventory(
+    monkeypatch,
+) -> None:
+    requested = _obligation("core rule", "Teach the core rule")
+    strong = _trusted_independent_reel(
+        "strong",
+        video_id="strong-source",
+        start=0,
+        concept="core rule",
+        _selection_intent_obligations=[requested],
+    )
+    required_weak = _reel(
+        "required-weak",
+        video_id="weak-source",
+        start=0,
+        concept="required prior clip",
+        _selection_self_contained=False,
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(
+            ["strong", "required-weak"]
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [required_weak, strong],
+        topic="Teach the core rule.",
+        release_limit=2,
+        required_reel_ids=["required-weak"],
+    )
+
+    assert set(result.ordered_reel_ids) == {"strong", "required-weak"}
+
+
+@pytest.mark.parametrize(
+    ("contract_current", "self_contained", "is_standalone"),
+    [
+        (True, True, False),
+        (True, False, False),
+        (False, None, None),
+    ],
+)
+def test_organizer_keeps_weaker_only_inventory_nonempty(
+    monkeypatch,
+    contract_current: bool,
+    self_contained: bool | None,
+    is_standalone: bool | None,
+) -> None:
+    extra: dict[str, Any] = {}
+    if contract_current:
+        extra.update(
+            selection_contract_version=lesson_ordering.SELECTION_CONTRACT_VERSION,
+            _selection_self_contained=self_contained,
+            _selection_is_standalone=is_standalone,
+        )
+    weak = _reel(
+        "only-related",
+        video_id="only-related-source",
+        start=0,
+        concept="only supplied related explanation",
+        **extra,
+    )
+    calls = 0
+
+    def fake_generate(
+        _system_prompt,
+        user_prompt,
+        *,
+        dispatch_state,
+        **_kwargs,
+    ):
+        nonlocal calls
+        calls += 1
+        dispatch_state.dispatched = True
+        [clip] = json.loads(
+            user_prompt.split("CLIPS_JSON:\n", 1)[1].split(
+                "\n\nFinal request:", 1
+            )[0]
+        )["clips"]
+        assert clip["selection_contract_current"] is contract_current
+        assert clip["self_contained"] is self_contained
+        assert clip["is_standalone"] is is_standalone
+        return _generation_result(["only-related"])
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        fake_generate,
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [weak],
+        topic="Teach the only supplied related explanation.",
+        release_limit=1,
+    )
+
+    assert calls == 1
+    assert result.provider_called is True
+    assert result.degraded is False
+    assert result.ordered_reel_ids == ["only-related"]
 
 
 def test_provider_failure_keeps_only_valid_long_related_clip_nonempty(
@@ -5759,8 +6298,8 @@ def test_lesson_order_cache_round_trips_validated_restatements(
     assert cached.prior_restatement_reel_ids == ["repeat"]
     assert cached.current_restatement_reel_ids == ["current-subset"]
     response_payload = json.loads(stored["response_json"])
-    assert response_payload["prompt_version"] == "lesson_order_v18"
-    assert response_payload["cache_version"] == 15
+    assert response_payload["prompt_version"] == "lesson_order_v20"
+    assert response_payload["cache_version"] == 17
     for equivalent_model in (
         f"models/{config.LESSON_ORDER_MODEL}",
         f"{config.LESSON_ORDER_MODEL}-001",

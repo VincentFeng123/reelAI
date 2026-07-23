@@ -121,6 +121,7 @@ from .models import (
 )
 from .services import llm_router
 from .services.assessments import (
+    ACTIVE_REEL_OPEN_FRACTION,
     AssessmentCancelledError,
     AssessmentService,
     assessment_checkpoint_reel_ids,
@@ -438,6 +439,10 @@ LESSON_ORDER_CANDIDATE_LIMITS = {
     )
     for mode, source_budget in GENERATION_SOURCE_BUDGETS.items()
 }
+# Keep raw learner-signal evidence bounded before the organizer applies its
+# existing tighter prompt limits. This lane lets Gemini compare semantically
+# equivalent concepts even when separate valid calls use different family text.
+LESSON_SIGNAL_HISTORY_LIMIT = 80
 SOURCE_ANALYSIS_MAX_ATTEMPTS = 2
 SELECTION_CONTRACT_VERSION = "quality_silence_v41"
 
@@ -4786,6 +4791,60 @@ def _learner_seen_reel_ids(conn, *, material_id: str, learner_id: str) -> set[st
     }
 
 
+def _live_candidate_locked_prefix_ids(
+    conn,
+    *,
+    material_id: str,
+    learner_id: str,
+    candidate_reel_ids: Iterable[str],
+    job_started_at: object,
+) -> list[str]:
+    """Project current-job active/open membership onto durable emission order."""
+    started_at = str(job_started_at or "").strip()
+    emitted_ids = list(dict.fromkeys(
+        reel_id
+        for value in candidate_reel_ids
+        if (reel_id := str(value or "").strip())
+    ))[:LESSON_ORDER_MAX_CLIPS]
+    if not started_at or not emitted_ids:
+        return []
+    placeholders = ", ".join("?" for _reel_id in emitted_ids)
+    opened_ids = {
+        str(row.get("reel_id") or "").strip()
+        for row in fetch_all(
+            conn,
+            f"""
+            SELECT reel_id
+            FROM learner_reel_progress
+            WHERE learner_id = ?
+              AND material_id = ?
+              AND updated_at >= ?
+              AND max_fraction >= ?
+              AND reel_id IN ({placeholders})
+            """,
+            (
+                str(learner_id or LEGACY_LEARNER_ID),
+                material_id,
+                started_at,
+                ACTIVE_REEL_OPEN_FRACTION,
+                *emitted_ids,
+            ),
+        )
+        if str(row.get("reel_id") or "").strip()
+    }
+    if not opened_ids:
+        return []
+    # Forward feed navigation is sequential. The furthest opened candidate proves
+    # every earlier emitted candidate reached the immutable client prefix, even
+    # when its fire-and-forget write committed later or was interrupted.
+    last_opened_index = max(
+        index
+        for index, reel_id in enumerate(emitted_ids)
+        if reel_id in opened_ids
+    )
+    return emitted_ids[: last_opened_index + 1]
+
+
 def _generation_cursor_reel_count(
     conn,
     *,
@@ -6567,6 +6626,69 @@ def _learner_concept_signals(
     }
 
 
+def _learner_signal_reel_ids(
+    conn,
+    *,
+    material_id: str,
+    learner_id: str,
+) -> list[str]:
+    """Return recent reel evidence behind nonzero feedback and quiz signals."""
+    clean_learner_id = str(learner_id or LEGACY_LEARNER_ID)
+    signal_rows: list[tuple[str, int, str]] = []
+    for row in fetch_all(
+        conn,
+        """
+        SELECT f.reel_id,
+               COALESCE(f.mastery_updated_at, f.updated_at, f.created_at, '') AS signal_at
+        FROM reel_feedback f
+        JOIN reels r ON r.id = f.reel_id
+        WHERE f.learner_id = ?
+          AND r.material_id = ?
+          AND (f.helpful <> 0 OR f.confusing <> 0)
+        ORDER BY signal_at DESC
+        LIMIT ?
+        """,
+        (clean_learner_id, material_id, LESSON_SIGNAL_HISTORY_LIMIT),
+    ):
+        reel_id = str(row.get("reel_id") or "").strip()
+        if reel_id:
+            signal_rows.append((str(row.get("signal_at") or ""), 0, reel_id))
+    try:
+        assessment_rows = fetch_all(
+            conn,
+            """
+            SELECT source_reel_id AS reel_id,
+                   COALESCE(created_at, '') AS signal_at
+            FROM assessment_concept_outcomes
+            WHERE learner_id = ?
+              AND material_id = ?
+              AND adjustment <> 0
+              AND source_reel_id IS NOT NULL
+            ORDER BY signal_at DESC
+            LIMIT ?
+            """,
+            (clean_learner_id, material_id, LESSON_SIGNAL_HISTORY_LIMIT),
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table: assessment_concept_outcomes" not in str(exc):
+            raise
+        assessment_rows = []
+    for row in assessment_rows:
+        reel_id = str(row.get("reel_id") or "").strip()
+        if reel_id:
+            signal_rows.append((str(row.get("signal_at") or ""), 1, reel_id))
+    latest_signal_by_reel: dict[str, tuple[str, int]] = {}
+    for signal_at, source_rank, reel_id in signal_rows:
+        signal_key = (signal_at, source_rank)
+        if signal_key > latest_signal_by_reel.get(reel_id, ("", -1)):
+            latest_signal_by_reel[reel_id] = signal_key
+    ordered = sorted(
+        latest_signal_by_reel,
+        key=lambda reel_id: (*latest_signal_by_reel[reel_id], reel_id),
+    )
+    return ordered[-LESSON_SIGNAL_HISTORY_LIMIT:]
+
+
 def _lesson_prior_coverage(
     conn,
     *,
@@ -7546,6 +7668,7 @@ def _run_leased_generation_job(
                 # drained, so playback never waits on Gemini after clip three.
                 remaining_source_budget = 0
             emitted_reel_ids: set[str] = set()
+            emitted_reel_order: list[str] = []
             emitted_clip_keys: set[str] = set()
             emitted_count = 0
             if durable_attempt_count > 1:
@@ -7580,6 +7703,7 @@ def _run_leased_generation_job(
                     ):
                         continue
                     emitted_reel_ids.add(reel_id)
+                    emitted_reel_order.append(reel_id)
                     if meaningful_clip_key:
                         emitted_clip_keys.add(meaningful_clip_key)
                     emitted_count += 1
@@ -7655,6 +7779,7 @@ def _run_leased_generation_job(
                         replay_after_unknown_commit=True,
                     )
                 emitted_reel_ids.add(reel_id)
+                emitted_reel_order.append(reel_id)
                 if meaningful_clip_key:
                     emitted_clip_keys.add(meaningful_clip_key)
                 emitted_count += 1
@@ -7741,6 +7866,7 @@ def _run_leased_generation_job(
             current_count = source_reel_count + _count_generation_surfaceable_reels(
                 conn, generation_id
             )
+            retrieval_provider_error: ClipEngineProviderError | None = None
             if (
                 not generation_has_lesson_order
                 and current_count < requested_count
@@ -7749,17 +7875,64 @@ def _run_leased_generation_job(
                 context.budget.reserve_pass()
                 if should_cancel():
                     raise GenerationCancelledError("Generation cancelled.")
-                run_retrieval_stage(
-                    retrieval_profile="deep",
-                    video_budget=remaining_source_budget,
-                    new_reel_cap=requested_count - current_count,
-                    excluded_video_ids=base_exclusions,
-                    consumed_video_ids=prior_consumed_video_ids,
-                    analyzed_video_ids=completed_source_ids,
-                    attempted_video_ids=attempted_source_ids,
-                    capacity_deferred_video_ids=capacity_deferred_source_ids,
-                    retrieved_video_ids=retrieved_video_ids,
-                )
+                try:
+                    run_retrieval_stage(
+                        retrieval_profile="deep",
+                        video_budget=remaining_source_budget,
+                        new_reel_cap=requested_count - current_count,
+                        excluded_video_ids=base_exclusions,
+                        consumed_video_ids=prior_consumed_video_ids,
+                        analyzed_video_ids=completed_source_ids,
+                        attempted_video_ids=attempted_source_ids,
+                        capacity_deferred_video_ids=capacity_deferred_source_ids,
+                        retrieved_video_ids=retrieved_video_ids,
+                    )
+                except ClipEngineProviderError as exc:
+                    current_count = (
+                        source_reel_count
+                        + _count_generation_surfaceable_reels(conn, generation_id)
+                    )
+                    fallback_job = {
+                        **(get_generation_job(conn, job_id) or job_row),
+                        "result_generation_id": generation_id,
+                    }
+                    fallback_prior_unseen: list[dict[str, Any]] = []
+                    fallback_reels = _generation_job_reels(
+                        conn,
+                        fallback_job,
+                        organizer_candidate_limit=lesson_candidate_limit,
+                        apply_release_order=False,
+                        preserve_lesson_order_metadata=True,
+                        prior_unseen_reels_out=(
+                            fallback_prior_unseen
+                            if source_generation_id
+                            and _stored_generation_lesson_order_ids(
+                                conn,
+                                generation_id,
+                            )
+                            is None
+                            else None
+                        ),
+                        editorial_excluded_reel_ids=(
+                            same_adaptation_restatement_ids
+                        ),
+                        editorial_guard_reel_ids=(
+                            same_adaptation_restatement_guard_ids
+                        ),
+                    )
+                    reusable_inventory_count = len(
+                        fallback_reels
+                    ) + len(fallback_prior_unseen)
+                    if reusable_inventory_count <= 0:
+                        raise
+                    retrieval_provider_error = exc
+                    logger.warning(
+                        "fresh retrieval failed; reusing validated inventory "
+                        "job_id=%s inventory_count=%d error=%s",
+                        job_id,
+                        reusable_inventory_count,
+                        exc.as_dict(),
+                    )
                 current_count = (
                     source_reel_count
                     + _count_generation_surfaceable_reels(conn, generation_id)
@@ -7830,6 +8003,7 @@ def _run_leased_generation_job(
             recall_preparation: dict[str, int] | None = None
             activate_generation = False
             reconciliation_tail_reel_ids: list[str] | None = None
+            locked_prefix_reel_ids: list[str] = []
             candidate_final_reels: list[dict[str, Any]] = []
             authoritative_prior_reel_ids: list[str] = []
             editorial_reacquisition_available = False
@@ -7865,6 +8039,19 @@ def _run_leased_generation_job(
                         for reel in final_reels
                         if str(reel.get("reel_id") or "")
                     }
+                    locked_prefix_reel_ids = (
+                        _live_candidate_locked_prefix_ids(
+                            conn,
+                            material_id=material_id,
+                            learner_id=learner_id,
+                            candidate_reel_ids=[
+                                reel_id
+                                for reel_id in emitted_reel_order
+                                if reel_id in surfaceable_candidate_ids
+                            ],
+                            job_started_at=refreshed_job.get("started_at"),
+                        )
+                    )
                     remediation_concept_ids: list[str] = []
                     concept_signals = _learner_concept_signals(
                         conn,
@@ -7908,6 +8095,10 @@ def _run_leased_generation_job(
                         str(reel.get("reel_id") or "")
                         for reel in ordered_prior_unseen_reels
                     ]
+                    required_organizer_reel_ids = list(dict.fromkeys([
+                        *locked_prefix_reel_ids,
+                        *required_prior_unseen_ids,
+                    ]))
                     prior_history_ids = (
                         [
                             reel_id
@@ -7917,6 +8108,14 @@ def _run_leased_generation_job(
                         if is_continuation
                         else prior_reel_ids
                     )
+                    prior_history_ids = list(dict.fromkeys([
+                        *prior_history_ids,
+                        *_learner_signal_reel_ids(
+                            conn,
+                            material_id=material_id,
+                            learner_id=learner_id,
+                        ),
+                    ]))
                     (
                         prior_concept_coverage,
                         recent_prior_objective_coverage,
@@ -7947,7 +8146,8 @@ def _run_leased_generation_job(
                         # candidate in this bounded pool may be included or
                         # omitted without adding provider or boundary work.
                         release_limit=len(organizer_candidates),
-                        required_reel_ids=required_prior_unseen_ids,
+                        required_reel_ids=required_organizer_reel_ids,
+                        locked_prefix_reel_ids=locked_prefix_reel_ids,
                         prior_concept_coverage=prior_concept_coverage,
                         recent_prior_objective_coverage=(
                             recent_prior_objective_coverage
@@ -7961,8 +8161,26 @@ def _run_leased_generation_job(
                         if str(reel.get("reel_id") or "")
                         in surfaceable_candidate_ids
                     ]
+                    selected_current_by_id = {
+                        str(reel.get("reel_id") or ""): reel
+                        for reel in final_reels
+                    }
+                    selected_current_ids = [
+                        str(reel.get("reel_id") or "")
+                        for reel in final_reels
+                    ]
                     released_ordered_ids = [
-                        str(reel.get("reel_id") or "") for reel in final_reels
+                        reel_id
+                        for reel_id in locked_prefix_reel_ids
+                        if reel_id in selected_current_by_id
+                    ] + [
+                        reel_id
+                        for reel_id in selected_current_ids
+                        if reel_id not in locked_prefix_reel_ids
+                    ]
+                    final_reels = [
+                        selected_current_by_id[reel_id]
+                        for reel_id in released_ordered_ids
                     ]
                     organizer_ordered_ids = getattr(
                         ordering,
@@ -7974,6 +8192,15 @@ def _run_leased_generation_job(
                             str(reel.get("reel_id") or "")
                             for reel in ordering.reels
                         ]
+                    organizer_ordered_ids = [
+                        reel_id
+                        for reel_id in locked_prefix_reel_ids
+                        if reel_id in organizer_ordered_ids
+                    ] + [
+                        reel_id
+                        for reel_id in organizer_ordered_ids
+                        if reel_id not in locked_prefix_reel_ids
+                    ]
                     reconciliation_tail_reel_ids = (
                         organizer_ordered_ids
                         if required_prior_unseen_ids
@@ -8089,6 +8316,7 @@ def _run_leased_generation_job(
                         "reconciliation_tail_reel_ids": (
                             reconciliation_tail_reel_ids
                         ),
+                        "locked_prefix_reel_ids": locked_prefix_reel_ids,
                         "assessment_checkpoint_reel_ids": checkpoint_ids,
                         "prior_restatement_reel_ids": (
                             organizer_prior_restatement_ids
@@ -8263,7 +8491,14 @@ def _run_leased_generation_job(
             )
 
             usage_records = context.usage()
-            usage_payload = generation_usage_payload(terminal=True)
+            usage_payload = generation_usage_payload(
+                retry_error=(
+                    retrieval_provider_error.as_dict()
+                    if retrieval_provider_error is not None
+                    else None
+                ),
+                terminal=True,
+            )
             usage_payload = _generation_usage_with_authoritative_release_count(
                 usage_payload,
                 released_reels=len(final_reels),

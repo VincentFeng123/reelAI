@@ -15959,6 +15959,480 @@ def test_pro_audit_keeps_complete_candidate_when_sibling_semantics_are_invalid(
     assert result.calls[1]["audit_partial_contract_discarded_count"] == 1
 
 
+def _two_objective_audit_fixture(
+    *,
+    first_subject: str,
+    second_subject: str,
+    first_claim: str,
+    second_claim: str,
+    first_family: str,
+    second_family: str,
+) -> tuple[
+    str,
+    gemini_segment._CompactBoundaryPlan,
+    list[dict],
+    list[dict],
+]:
+    request = (
+        f"Teach {first_subject} and {second_subject}. Teach in sequence."
+    )
+    constraints = [
+        {
+            "constraint_id": "first-objective",
+            "kind": "subject",
+            "source_phrase": first_subject,
+            "requirement": f"Teach {first_subject}",
+        },
+        {
+            "constraint_id": "second-objective",
+            "kind": "subject",
+            "source_phrase": second_subject,
+            "requirement": f"Teach {second_subject}",
+        },
+        {
+            "constraint_id": "sequence",
+            "kind": "task",
+            "source_phrase": "Teach in sequence",
+            "requirement": "Teach the requested concepts in sequence",
+        },
+    ]
+    topics = []
+    segments = []
+    audit_items = []
+    for index, (
+        constraint_id,
+        subject,
+        claim,
+        family,
+    ) in enumerate((
+        (
+            "first-objective",
+            first_subject,
+            first_claim,
+            first_family,
+        ),
+        (
+            "second-objective",
+            second_subject,
+            second_claim,
+            second_family,
+        ),
+    )):
+        words = claim.split()
+        start_quote = " ".join(words[:4])
+        end_quote = " ".join(words[-4:])
+        topics.append(gemini_segment._CompactBoundaryTopic(
+            candidate_id=f"{constraint_id}-candidate",
+            start_line=index,
+            end_line=index,
+            start_quote=start_quote,
+            end_quote=end_quote,
+            claim_quote=claim,
+            title=f"Understanding {subject}",
+            learning_objective=f"Explain {subject}",
+            facet=subject,
+            concept_family=family,
+            concept_aliases=[],
+            informativeness=0.9,
+            topic_relevance=0.95,
+            educational_importance=0.9,
+            difficulty=0.4,
+            directly_teaches_topic=False,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[{"id": constraint_id, "q": claim}],
+            objective_constraint_ids=[constraint_id],
+            relationship_witnesses=[],
+        ))
+        segments.append({
+            "cue_id": f"cue-{index}",
+            "start": float(index * 10),
+            "end": float((index + 1) * 10),
+            "text": f"{claim}.",
+        })
+        audit_items.append({
+            "id": f"candidate-{index + 1}",
+            "d": "keep",
+            "obj": f"Explain {subject}",
+            "t": f"Understanding {subject}",
+            "f": subject,
+            "family": family,
+            "a": [],
+            "direct": False,
+            "self": True,
+            "stand": True,
+            "ie": [{"id": constraint_id, "q": claim}],
+            "oi": [constraint_id],
+            "rw": [],
+            "ow": claim,
+            "ev": claim,
+            "ds": index,
+            "dq": start_quote,
+            "dc": True,
+            "s": index,
+            "e": index,
+            "sq": start_quote,
+            "eq": end_quote,
+        })
+    return (
+        request,
+        gemini_segment._CompactBoundaryPlan(
+            request_intent={
+                "exact_request": request,
+                "constraints": constraints,
+            },
+            topics=topics,
+        ),
+        segments,
+        audit_items,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "first_subject",
+        "second_subject",
+        "first_claim",
+        "second_claim",
+        "first_family",
+        "second_family",
+    ),
+    [
+        (
+            "series circuits",
+            "parallel circuits",
+            "Series circuits carry the same current through every component",
+            "Parallel circuits place equal voltage across every branch",
+            "series circuit current distribution",
+            "parallel circuit voltage distribution",
+        ),
+        (
+            "glycolysis",
+            "the Krebs cycle",
+            "Glycolysis splits glucose and produces ATP before respiration continues",
+            "The Krebs cycle releases carbon dioxide while transferring chemical energy",
+            "glycolysis energy metabolism",
+            "Krebs cycle carbon metabolism",
+        ),
+        (
+            "Python try blocks",
+            "Python except handlers",
+            "Python try blocks enclose operations that may raise exceptions",
+            "Python except handlers catch matching exceptions and enable recovery",
+            "Python try block exception handling",
+            "Python except handler exception handling",
+        ),
+    ],
+)
+def test_pro_audit_retries_for_uniquely_uncovered_grounded_objective(
+    monkeypatch: pytest.MonkeyPatch,
+    first_subject: str,
+    second_subject: str,
+    first_claim: str,
+    second_claim: str,
+    first_family: str,
+    second_family: str,
+) -> None:
+    request, plan, segments, valid_items = _two_objective_audit_fixture(
+        first_subject=first_subject,
+        second_subject=second_subject,
+        first_claim=first_claim,
+        second_claim=second_claim,
+        first_family=first_family,
+        second_family=second_family,
+    )
+    invalid_second = {
+        **valid_items[1],
+        "ow": "These ungrounded witness words never occur inside the transcript",
+    }
+    responses = iter([
+        gemini_segment._ProCandidateAuditPlan(
+            items=[valid_items[0], invalid_second],
+        ),
+        gemini_segment._ProCandidateAuditPlan(items=valid_items),
+    ])
+    audit_attempts = 0
+
+    def invalid_then_corrected(*_args, **_kwargs):
+        nonlocal audit_attempts
+        audit_attempts += 1
+        return next(responses), {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_boundary_audit",
+            "physical_dispatches": 1,
+        }
+
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        invalid_then_corrected,
+    )
+    audited, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert audit_attempts == 2
+    assert [topic.candidate_id for topic in audited.topics] == [
+        "first-objective-candidate",
+        "second-objective-candidate",
+    ]
+    assert rejections == []
+    assert calls[0]["contract_retry_attempt"] == 1
+    assert calls[0]["audit_coverage_retry_objective_ids"] == [
+        "second-objective",
+    ]
+    assert "sequence" not in calls[0]["audit_coverage_retry_objective_ids"]
+    assert calls[1]["contract_retry_recovered"] is True
+
+
+@pytest.mark.parametrize(
+    "retry_failure",
+    ["transport", "invalid_contract"],
+)
+def test_pro_audit_preserves_valid_sibling_when_coverage_retry_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_failure: str,
+) -> None:
+    request, plan, segments, valid_items = _two_objective_audit_fixture(
+        first_subject="kinetic energy",
+        second_subject="potential energy",
+        first_claim="Kinetic energy is energy an object has because it moves",
+        second_claim="Potential energy is stored because of an object's position",
+        first_family="kinetic energy of moving objects",
+        second_family="potential energy from position",
+    )
+    invalid_first = {
+        **valid_items[0],
+        "ow": "These first ungrounded witness words never occur in the transcript",
+    }
+    invalid_second = {
+        **valid_items[1],
+        "ow": "These second ungrounded witness words never occur in the transcript",
+    }
+    audit_attempts = 0
+
+    def partial_then_failed_retry(*_args, **_kwargs):
+        nonlocal audit_attempts
+        audit_attempts += 1
+        if audit_attempts == 1:
+            return (
+                gemini_segment._ProCandidateAuditPlan(
+                    items=[valid_items[0], invalid_second],
+                ),
+                {
+                    "model": "gemini-3.1-pro-preview",
+                    "operation": "pro_boundary_audit",
+                    "physical_dispatches": 1,
+                },
+            )
+        if retry_failure == "transport":
+            raise gemini_segment._ModelCallError(
+                "provider unavailable",
+                {
+                    "model": "gemini-3.1-pro-preview",
+                    "operation": "pro_boundary_audit",
+                    "error_type": "GeminiTransportError",
+                    "provider_status_code": 503,
+                    "retryable": True,
+                    "physical_dispatches": 1,
+                },
+            )
+        return (
+            gemini_segment._ProCandidateAuditPlan(
+                items=[invalid_first, invalid_second],
+            ),
+            {
+                "model": "gemini-3.1-pro-preview",
+                "operation": "pro_boundary_audit",
+                "physical_dispatches": 1,
+            },
+        )
+
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        partial_then_failed_retry,
+    )
+    audited, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert audit_attempts == 2
+    assert [topic.candidate_id for topic in audited.topics] == [
+        "first-objective-candidate",
+    ]
+    assert rejections == ["gemini_audit:candidate-2:invalid_contract"]
+    assert len(calls) == 2
+    assert sum(
+        int(call.get("physical_dispatches") or 0)
+        for call in calls
+    ) == 2
+    assert calls[0]["audit_coverage_retry_objective_ids"] == [
+        "second-objective",
+    ]
+    assert calls[0]["contract_retry_attempt"] == 1
+    assert calls[1]["contract_retry_attempt"] == 2
+    if retry_failure == "transport":
+        assert calls[1]["error_type"] == "GeminiTransportError"
+        assert calls[1]["provider_status_code"] == 503
+        assert calls[1]["retryable"] is True
+    else:
+        assert calls[1]["error_type"] == "GeminiAuditContractError"
+        assert calls[1]["contract_retry_exhausted"] is True
+        assert "audit_objective_witness_invalid" in (
+            calls[1]["audit_contract_rejection_reasons"]
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_shape",
+    ["malformed_schema", "missing_fields", "duplicate"],
+)
+def test_pro_audit_does_not_retry_unique_objective_from_invalid_sibling_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_shape: str,
+) -> None:
+    request, plan, segments, valid_items = _two_objective_audit_fixture(
+        first_subject="duty",
+        second_subject="causation",
+        first_claim="A negligence claim begins with a legally recognized duty",
+        second_claim="Factual causation asks whether the breach caused the injury",
+        first_family="negligence duty element",
+        second_family="negligence factual causation",
+    )
+    missing_fields = {
+        key: value
+        for key, value in valid_items[1].items()
+        if key not in {
+            "t",
+            "f",
+            "family",
+            "a",
+            "direct",
+            "self",
+            "stand",
+            "ie",
+            "oi",
+            "rw",
+            "ow",
+        }
+    }
+    response = gemini_segment._ProCandidateAuditPlan(items=[
+        valid_items[0],
+        *(
+            [valid_items[1], valid_items[1]]
+            if invalid_shape == "duplicate"
+            else (
+                [missing_fields]
+                if invalid_shape == "missing_fields"
+                else []
+            )
+        ),
+    ])
+    audit_attempts = 0
+
+    def invalid_sibling_shape(*_args, **_kwargs):
+        nonlocal audit_attempts
+        audit_attempts += 1
+        call = {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_boundary_audit",
+            "physical_dispatches": 1,
+        }
+        if invalid_shape == "malformed_schema":
+            call["schema_rejection_reasons"] = [
+                "audit_item_1:schema_invalid:semantic_fields:missing",
+            ]
+        return response, call
+
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        invalid_sibling_shape,
+    )
+    audited, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert audit_attempts == 1
+    assert [topic.candidate_id for topic in audited.topics] == [
+        "first-objective-candidate",
+    ]
+    assert rejections == ["gemini_audit:candidate-2:invalid_contract"]
+    assert "contract_retry_attempt" not in calls[0]
+    assert "audit_coverage_retry_objective_ids" not in calls[0]
+
+
+def test_pro_audit_does_not_retry_optional_unresolved_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, plan, segments, valid_items = _two_objective_audit_fixture(
+        first_subject="derivative rules",
+        second_subject="worked examples",
+        first_claim="The power rule multiplies by the exponent before subtracting one",
+        second_claim="This optional example applies the same derivative rule correctly",
+        first_family="calculus derivative power rule",
+        second_family="calculus derivative worked example",
+    )
+    optional = plan.topics[1].model_copy(update={
+        "objective_constraint_ids": [],
+    })
+    plan = plan.model_copy(update={"topics": [plan.topics[0], optional]})
+    invalid_optional = {
+        **valid_items[1],
+        "oi": [],
+        "ow": "These ungrounded witness words never occur inside the transcript",
+    }
+    response = gemini_segment._ProCandidateAuditPlan(
+        items=[valid_items[0], invalid_optional],
+    )
+    audit_attempts = 0
+
+    def optional_sibling(*_args, **_kwargs):
+        nonlocal audit_attempts
+        audit_attempts += 1
+        return response, {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_boundary_audit",
+            "physical_dispatches": 1,
+        }
+
+    monkeypatch.setattr(gemini_segment, "_call_model", optional_sibling)
+    audited, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert audit_attempts == 1
+    assert [topic.candidate_id for topic in audited.topics] == [
+        "first-objective-candidate",
+    ]
+    assert rejections == ["gemini_audit:candidate-2:invalid_contract"]
+    assert "contract_retry_attempt" not in calls[0]
+    assert "audit_coverage_retry_objective_ids" not in calls[0]
+
+
 def test_pro_candidate_audit_uses_ai_family_without_semantic_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -17400,6 +17874,527 @@ def test_valid_selector_candidate_skips_malformed_sibling_recovery(
         gemini_segment._ProCandidateAuditPlan,
     ]
     assert "partial_schema_retry_attempt" not in result.calls[0]
+
+
+_AF280_RELATIONSHIP_CASES = (
+    pytest.param(
+        {
+            "request": "Explain reciprocal skater-wall forces",
+            "source_phrase": "reciprocal",
+            "topology": "reciprocal",
+            "transcript": (
+                "The skater pushes the wall, and the wall pushes the skater "
+                "back with equal force."
+            ),
+            "start_quote": "The skater pushes the wall",
+            "end_quote": "skater back with equal force",
+            "evidence_quote": (
+                "skater pushes the wall and the wall pushes"
+            ),
+            "title": "Skater and Wall Force Pair",
+            "objective": "Explain reciprocal forces between a skater and wall",
+            "facet": "reciprocal skater-wall forces",
+            "family": "Newton's third law of motion",
+            "members": [
+                {
+                    "n": "skater",
+                    "q": "skater",
+                    "r": "The skater pushes the wall",
+                },
+                {
+                    "n": "wall",
+                    "q": "wall",
+                    "r": "the wall pushes the skater back",
+                },
+            ],
+            "links": [
+                {
+                    "f": "skater",
+                    "t": "wall",
+                    "q": "The skater pushes the wall",
+                },
+                {
+                    "f": "wall",
+                    "t": "skater",
+                    "q": "the wall pushes the skater back",
+                },
+            ],
+            "connection_quote": (
+                "The skater pushes the wall and the wall pushes the skater back"
+            ),
+        },
+        id="physics-reciprocal",
+    ),
+    pytest.param(
+        {
+            "request": "Compare mitosis and meiosis products",
+            "source_phrase": "Compare",
+            "topology": "symmetric",
+            "transcript": (
+                "Mitosis produces two similar daughter cells, while meiosis "
+                "produces four genetically varied daughter cells."
+            ),
+            "start_quote": "Mitosis produces two similar daughter cells",
+            "end_quote": "four genetically varied daughter cells",
+            "evidence_quote": (
+                "Mitosis produces two similar daughter cells while meiosis produces"
+            ),
+            "title": "Mitosis and Meiosis Products",
+            "objective": "Compare the products of mitosis and meiosis",
+            "facet": "mitosis versus meiosis products",
+            "family": "mitosis and meiosis comparison",
+            "members": [
+                {
+                    "n": "mitosis",
+                    "q": "Mitosis",
+                    "r": "Mitosis produces two similar daughter cells",
+                },
+                {
+                    "n": "meiosis",
+                    "q": "meiosis",
+                    "r": "meiosis produces four genetically varied daughter cells",
+                },
+            ],
+            "links": [{
+                "f": "mitosis",
+                "t": "meiosis",
+                "q": (
+                    "Mitosis produces two similar daughter cells while meiosis "
+                    "produces four genetically varied daughter cells"
+                ),
+            }],
+            "connection_quote": (
+                "Mitosis produces two similar daughter cells while meiosis "
+                "produces four genetically varied daughter cells"
+            ),
+        },
+        id="biology-symmetric",
+    ),
+    pytest.param(
+        {
+            "request": "Trace parsing through validation into persistence",
+            "source_phrase": "through",
+            "topology": "ordered",
+            "transcript": (
+                "The parser hands structured data to the validator, then the "
+                "validator sends approved records to persistent storage."
+            ),
+            "start_quote": "The parser hands structured data",
+            "end_quote": "approved records to persistent storage",
+            "evidence_quote": (
+                "parser hands structured data to the validator then"
+            ),
+            "title": "Parsing, Validation, and Persistence",
+            "objective": "Trace data from parsing through validation to persistence",
+            "facet": "ordered data processing stages",
+            "family": "data processing pipeline",
+            "members": [
+                {
+                    "n": "parser",
+                    "q": "parser",
+                    "r": "The parser hands structured data",
+                },
+                {
+                    "n": "validator",
+                    "q": "validator",
+                    "r": "the validator sends approved records",
+                },
+                {
+                    "n": "persistent storage",
+                    "q": "persistent storage",
+                    "r": "approved records to persistent storage",
+                },
+            ],
+            "links": [
+                {
+                    "f": "parser",
+                    "t": "validator",
+                    "q": "The parser hands structured data to the validator",
+                },
+                {
+                    "f": "validator",
+                    "t": "persistent storage",
+                    "q": (
+                        "the validator sends approved records to persistent storage"
+                    ),
+                },
+            ],
+            "connection_quote": (
+                "The parser hands structured data to the validator then the "
+                "validator sends approved records to persistent storage"
+            ),
+        },
+        id="software-ordered",
+    ),
+    pytest.param(
+        {
+            "request": (
+                "Explain how a court directs a company to compensate a claimant"
+            ),
+            "source_phrase": "directs",
+            "topology": "directed",
+            "transcript": (
+                "The court orders the company to compensate the claimant for "
+                "the documented financial loss."
+            ),
+            "start_quote": "The court orders the company",
+            "end_quote": "the documented financial loss",
+            "evidence_quote": (
+                "court orders the company to compensate the claimant"
+            ),
+            "title": "Court-Ordered Compensation",
+            "objective": "Explain a court's compensation order to a company",
+            "facet": "court-directed compensation",
+            "family": "civil damages remedy",
+            "members": [
+                {
+                    "n": "court",
+                    "q": "court",
+                    "r": "The court orders the company",
+                },
+                {
+                    "n": "company",
+                    "q": "company",
+                    "r": "company to compensate the claimant",
+                },
+            ],
+            "links": [{
+                "f": "court",
+                "t": "company",
+                "q": "The court orders the company to compensate the claimant",
+            }],
+            "connection_quote": (
+                "The court orders the company to compensate the claimant"
+            ),
+        },
+        id="law-directed",
+    ),
+)
+
+
+@pytest.mark.parametrize("case", _AF280_RELATIONSHIP_CASES)
+def test_malformed_selector_relationship_witness_flows_directly_to_one_audit(
+    monkeypatch: pytest.MonkeyPatch,
+    case: dict,
+) -> None:
+    valid_witness = {
+        "id": "relation",
+        "k": case["topology"],
+        "m": case["members"],
+        "l": case["links"],
+        "q": case["connection_quote"],
+    }
+    malformed_witness = json.loads(json.dumps(valid_witness))
+    malformed_witness["m"][1]["n"] = malformed_witness["m"][0]["n"]
+    selector_payload = {
+        "request_intent": {
+            "exact_request": case["request"],
+            "constraints": [{
+                "constraint_id": "relation",
+                "kind": "relationship",
+                "source_phrase": case["source_phrase"],
+                "source_occurrence": 0,
+                "requirement": case["request"],
+                "relationship_topology": case["topology"],
+            }],
+            "joint_structures": [],
+        },
+        "topics": [{
+            "id": "selector-candidate",
+            "s": 0,
+            "e": 0,
+            "sq": case["start_quote"],
+            "eq": case["end_quote"],
+            "cq": case["evidence_quote"],
+            "title": case["title"],
+            "obj": case["objective"],
+            "facet": case["facet"],
+            "family": case["family"],
+            "aliases": [],
+            "info": 0.95,
+            "rel": 0.98,
+            "imp": 0.95,
+            "diff": 0.5,
+            "direct": True,
+            "sub": True,
+            "fact": True,
+            "self": True,
+            "stand": True,
+            "ie": [{
+                "id": "relation",
+                "q": case["evidence_quote"],
+            }],
+            "oi": ["relation"],
+            "rw": [malformed_witness],
+        }],
+    }
+    audit_payload = {
+        "items": [{
+            "id": "candidate-1",
+            "d": "keep",
+            "obj": case["objective"],
+            "t": case["title"],
+            "f": case["facet"],
+            "family": case["family"],
+            "a": [],
+            "direct": True,
+            "self": True,
+            "stand": True,
+            "ie": [{
+                "id": "relation",
+                "q": case["evidence_quote"],
+            }],
+            "oi": ["relation"],
+            "rw": [valid_witness],
+            "ow": case["evidence_quote"],
+            "ev": case["evidence_quote"],
+            "ds": 0,
+            "dq": case["start_quote"],
+            "dc": True,
+            "s": 0,
+            "e": 0,
+            "sq": case["start_quote"],
+            "eq": case["end_quote"],
+        }],
+    }
+    context = GenerationContext(
+        "slow",
+        generation_id=f"af280-{case['topology']}",
+    )
+    dispatched_schemas: list[type[object]] = []
+
+    def selector_then_audit(_system, _user, schema, **kwargs):
+        dispatched_schemas.append(schema)
+        telemetry = {
+            "model": kwargs["model"],
+            "operation": kwargs["operation"],
+            "prompt_tokens": 1_000,
+            "candidate_tokens": 100,
+            "thought_tokens": 100,
+            "total_tokens": 1_200,
+        }
+        _settle_mock_dispatch(kwargs, telemetry)
+        return SimpleNamespace(
+            text=json.dumps(
+                selector_payload
+                if schema is gemini_segment._CompactBoundaryPlan
+                else audit_payload
+            ),
+            telemetry=telemetry,
+        )
+
+    monkeypatch.setattr(gemini_client, "generate_json_v3", selector_then_audit)
+    monkeypatch.setattr(
+        gemini_client,
+        "count_request_tokens",
+        lambda *_args, **_kwargs: 1_000,
+    )
+
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "cue-0",
+                "start": 0.0,
+                "end": 12.0,
+                "text": case["transcript"],
+            }],
+            "words": [],
+            "source": "supadata",
+        },
+        {
+            "_segment_operation": "pro_authoritative",
+            "_segment_budget_reserve": context.reserve_gemini_call,
+            "_segment_budget_reconcile": context.reconcile_gemini_call,
+        },
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic=case["request"],
+    )
+
+    assert result.error is None
+    assert result.accepted_count == 1
+    assert dispatched_schemas == [
+        gemini_segment._CompactBoundaryPlan,
+        gemini_segment._ProCandidateAuditPlan,
+    ]
+    assert len(result.calls) == 2
+    assert [call["operation"] for call in result.calls] == [
+        "pro_authoritative",
+        "pro_boundary_audit",
+    ]
+    assert sum(
+        int(call.get("physical_dispatches") or 0)
+        for call in result.calls
+    ) == 2
+    assert result.calls[0]["schema_rejection_reasons"] == [
+        "proposal_0:schema_invalid:rw.0:value_error",
+    ]
+    assert result.calls[0]["selector_audit_repair_reasons"] == [
+        "candidate_selector-candidate:objective_relationship_witness_mismatch",
+    ]
+    assert "partial_schema_retry_attempt" not in result.calls[0]
+    [clip] = result.clips
+    assert clip["intent_relationship_witnesses"][0]["topology"] == (
+        case["topology"]
+    )
+    gemini_budget = context.budget.snapshot()["gemini"]
+    assert gemini_budget["selector_calls"] == 1
+    assert gemini_budget["pro_selector_calls"] == 1
+    assert gemini_budget["boundary_audit_calls"] == 1
+
+
+def test_salvaged_relationship_candidate_still_fails_closed_on_invalid_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain directed record transfer from sender to receiver"
+    transcript = (
+        "The sender transfers the validated record to the receiver for permanent "
+        "storage."
+    )
+    evidence = "sender transfers the validated record to the receiver"
+    selector_payload = {
+        "request_intent": {
+            "exact_request": request,
+            "constraints": [{
+                "constraint_id": "relation",
+                "kind": "relationship",
+                "source_phrase": "directed",
+                "source_occurrence": 0,
+                "requirement": request,
+                "relationship_topology": "directed",
+            }],
+            "joint_structures": [],
+        },
+        "topics": [{
+            "id": "record-transfer",
+            "s": 0,
+            "e": 0,
+            "sq": "The sender transfers the validated record",
+            "eq": "receiver for permanent storage",
+            "cq": evidence,
+            "title": "Directed Record Transfer",
+            "obj": "Explain a sender transferring a record to a receiver",
+            "facet": "directed record transfer",
+            "family": "message delivery pipeline",
+            "aliases": [],
+            "info": 0.95,
+            "rel": 0.98,
+            "imp": 0.95,
+            "diff": 0.4,
+            "direct": True,
+            "sub": True,
+            "fact": True,
+            "self": True,
+            "stand": True,
+            "ie": [{"id": "relation", "q": evidence}],
+            "oi": ["relation"],
+            "rw": [{
+                "id": "relation",
+                "k": "directed",
+                "m": [
+                    {
+                        "n": "sender",
+                        "q": "sender",
+                        "r": "The sender transfers the validated record",
+                    },
+                    {
+                        "n": "sender",
+                        "q": "receiver",
+                        "r": "record to the receiver",
+                    },
+                ],
+                "l": [{
+                    "f": "sender",
+                    "t": "receiver",
+                    "q": evidence,
+                }],
+                "q": evidence,
+            }],
+        }],
+    }
+    parsed, schema_rejections = gemini_segment._validate_model_response(
+        gemini_segment._CompactBoundaryPlan,
+        json.dumps(selector_payload),
+    )
+    assert isinstance(parsed, gemini_segment._CompactBoundaryPlan)
+    assert parsed.topics[0].relationship_witnesses == []
+    assert schema_rejections == [
+        "proposal_0:schema_invalid:rw.0:value_error",
+    ]
+
+    invalid_audit = gemini_segment._ProCandidateAuditPlan(items=[{
+        "id": "candidate-1",
+        "d": "keep",
+        "obj": "Explain a sender transferring a record to a receiver",
+        "t": "Directed Record Transfer",
+        "f": "directed record transfer",
+        "family": "message delivery pipeline",
+        "a": [],
+        "direct": True,
+        "self": True,
+        "stand": True,
+        "ie": [{"id": "relation", "q": evidence}],
+        "oi": ["relation"],
+        "rw": [],
+        "ow": evidence,
+        "ev": evidence,
+        "ds": 0,
+        "dq": "The sender transfers the validated record",
+        "dc": True,
+        "s": 0,
+        "e": 0,
+        "sq": "The sender transfers the validated record",
+        "eq": "receiver for permanent storage",
+    }])
+    dispatched_schemas: list[type[object]] = []
+
+    def selector_then_invalid_audit(_system, _user, schema, **_kwargs):
+        dispatched_schemas.append(schema)
+        if schema is gemini_segment._CompactBoundaryPlan:
+            return parsed, {
+                "model": "gemini-3.1-pro-preview",
+                "operation": "pro_authoritative",
+                "physical_dispatches": 1,
+                "schema_rejection_reasons": schema_rejections,
+            }
+        return invalid_audit, {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_boundary_audit",
+            "physical_dispatches": 1,
+        }
+
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        selector_then_invalid_audit,
+    )
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "cue-0",
+                "start": 0.0,
+                "end": 10.0,
+                "text": transcript,
+            }],
+            "words": [],
+            "source": "supadata",
+        },
+        {},
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic=request,
+    )
+
+    assert result.clips == []
+    assert result.error == (
+        "GeminiAuditContractError: Gemini model call failed"
+    )
+    assert dispatched_schemas == [
+        gemini_segment._CompactBoundaryPlan,
+        gemini_segment._ProCandidateAuditPlan,
+        gemini_segment._ProCandidateAuditPlan,
+    ]
+    assert "objective_relationship_witness_mismatch" in (
+        result.calls[-1]["audit_contract_rejection_reasons"]
+    )
 
 
 def test_repeated_invalid_selector_contract_is_operational_failure(

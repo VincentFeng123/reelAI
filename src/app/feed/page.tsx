@@ -76,6 +76,8 @@ const MAX_ZERO_GROWTH_CONTINUATIONS = 3;
 // Leave one slot in the backend's six-request window for the feed's initial autofill.
 const MAX_GENERATION_ATTEMPTS_PER_FILL = 5;
 const PAGE_SIZE = INITIAL_READY_REEL_TARGET;
+const ACTIVE_REEL_OPEN_FRACTION = 0.001;
+const ACTIVE_REEL_OPEN_MAX_ATTEMPTS = 3;
 
 function readyReservoirTarget(_mode: GenerationMode): number {
   return INITIAL_READY_REEL_TARGET;
@@ -1306,6 +1308,7 @@ function FeedPageInner() {
   const activeRecoveryRequestRef = useRef<ActiveRecoveryRequest | null>(null);
   const chatAbortControllerRef = useRef<AbortController | null>(null);
   const assessmentProgressMaxRef = useRef<Map<string, number>>(new Map());
+  const activeOpenSignalRef = useRef<Set<string>>(new Set());
   const reportedForwardScrollKeysRef = useRef<Set<string>>(new Set());
   const assessmentStartRequestRef = useRef<AssessmentGateRequest | null>(null);
   const unavailableMaterialIdRef = useRef<string | null>(null);
@@ -2376,6 +2379,7 @@ function FeedPageInner() {
             if (!isSearchScopeActive(searchScope)) {
               return;
             }
+            activeOpenSignalRef.current.delete(String(reel.reel_id || "").trim());
             const appended = appendGeneratedReels([reel]);
             if (appended.addedCount > 0) {
               madeProgress = true;
@@ -2814,6 +2818,7 @@ function FeedPageInner() {
                 if (!isSearchScopeActive(searchScope)) {
                   return;
                 }
+                activeOpenSignalRef.current.delete(String(reel.reel_id || "").trim());
                 setGenerationProgress((prev) => (prev ? { ...prev, received: prev.received + 1 } : null));
                 const appended = appendGeneratedReels([reel]);
                 if (appended.addedCount > 0) {
@@ -3322,6 +3327,7 @@ function FeedPageInner() {
 
   useEffect(() => {
     assessmentProgressMaxRef.current.clear();
+    activeOpenSignalRef.current.clear();
     reportedForwardScrollKeysRef.current.clear();
     assessmentStartRequestRef.current = null;
     setAssessmentSession(null);
@@ -3939,6 +3945,59 @@ function FeedPageInner() {
     resumeAppliedRef.current = true;
   }, [hasMore, loadPage, materialId, page, reels]);
 
+  const reportActiveReelOpened = useCallback((reel: Reel) => {
+    const reelId = String(reel.reel_id || "").trim();
+    const progressMaterialId = String(reel.material_id || materialId || "").trim();
+    if (
+      !reelId
+      || !progressMaterialId
+      || reelId.startsWith("community:")
+      || activeOpenSignalRef.current.has(reelId)
+    ) {
+      return;
+    }
+    activeOpenSignalRef.current.add(reelId);
+    const searchScope = activeSearchScopeRef.current;
+    void (async () => {
+      let lastError: unknown = null;
+      for (
+        let attempt = 1;
+        attempt <= ACTIVE_REEL_OPEN_MAX_ATTEMPTS;
+        attempt += 1
+      ) {
+        if (!isSearchScopeActive(searchScope)) {
+          return;
+        }
+        try {
+          await reportReelProgress({
+            reelId,
+            maxFraction: ACTIVE_REEL_OPEN_FRACTION,
+            signal: searchScope.controller.signal,
+          });
+          return;
+        } catch (error) {
+          lastError = error;
+          if (
+            !isSearchScopeActive(searchScope)
+            || !shouldRetryAdaptiveFeedRefresh(
+              error,
+              searchScope.controller.signal,
+            )
+          ) {
+            break;
+          }
+        }
+      }
+      if (
+        lastError
+        && isSearchScopeActive(searchScope)
+        && !isRequestInterruptedError(lastError)
+      ) {
+        console.warn(`Could not save active reel opening for ${reelId}:`, lastError);
+      }
+    })();
+  }, [isSearchScopeActive, materialId]);
+
   useEffect(() => {
     maybeResumeProgress();
   }, [maybeResumeProgress]);
@@ -3970,12 +4029,13 @@ function FeedPageInner() {
     if (!activeReel?.reel_id) {
       return;
     }
+    reportActiveReelOpened(activeReel);
     persistFeedProgressSnapshot(materialId, {
       index,
       reelId: activeReel.reel_id,
       updatedAt: Date.now(),
     });
-  }, [activeIndex, materialId, reels]);
+  }, [activeIndex, materialId, reels, reportActiveReelOpened]);
 
   useEffect(() => {
     return () => {

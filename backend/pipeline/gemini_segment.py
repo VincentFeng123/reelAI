@@ -12978,6 +12978,7 @@ def _objective_fulfillment_contract_error(
 _AUDIT_REPAIRABLE_SELECTOR_OBJECTIVE_ERRORS = frozenset({
     "direct_objective_fulfillment_incomplete",
     "objective_fulfillment_untrusted_sibling_umbrella",
+    "objective_relationship_witness_mismatch",
     "objective_relationship_topology_mismatch",
     "objective_relationship_member_mismatch",
 })
@@ -22364,7 +22365,48 @@ def _validate_model_response(
                     )
                 )
                 continue
-            first_error = exc.errors(include_url=False)[0]
+            errors = exc.errors(include_url=False)
+            invalid_relationship_witness_indices = {
+                location[1]
+                for error in errors
+                if (
+                    (location := tuple(error.get("loc", ())))
+                    and len(location) >= 2
+                    and location[0] == "rw"
+                    and isinstance(location[1], int)
+                )
+            }
+            if (
+                topic_schema is _CompactBoundaryTopic
+                and isinstance(raw_topic, dict)
+                and isinstance(raw_topic.get("rw"), list)
+                and invalid_relationship_witness_indices
+                and all(
+                    len(location := tuple(error.get("loc", ()))) >= 2
+                    and location[0] == "rw"
+                    and location[1] in invalid_relationship_witness_indices
+                    for error in errors
+                )
+            ):
+                repaired_topic = dict(raw_topic)
+                repaired_topic["rw"] = [
+                    witness
+                    for witness_index, witness in enumerate(raw_topic["rw"])
+                    if witness_index not in invalid_relationship_witness_indices
+                ]
+                try:
+                    topics.append(topic_schema.model_validate(repaired_topic))
+                except (ValidationError, ValueError):
+                    pass
+                else:
+                    rejection_reasons.extend(
+                        f"proposal_{index}:schema_invalid:rw.{witness_index}:value_error"
+                        for witness_index in sorted(
+                            invalid_relationship_witness_indices
+                        )
+                    )
+                    continue
+            first_error = errors[0]
             location = ".".join(str(part) for part in first_error.get("loc", ()))
             rejection_reasons.append(
                 (
@@ -23381,6 +23423,61 @@ def _physical_dispatch_count(call: dict) -> int:
     return 0 if call.get("dispatched") is False else 1
 
 
+def _grounded_candidate_objective_ids(
+    plan: _CompactBoundaryPlan,
+    candidate: _CompactBoundaryTopic,
+    segments: list[dict],
+) -> set[str]:
+    """Return only explicitly fulfilled request IDs grounded in this candidate."""
+    if "objective_constraint_ids" not in candidate.model_fields_set:
+        return set()
+    known_ids = {
+        str(constraint.constraint_id)
+        for constraint in plan.request_intent.constraints
+    }
+    objective_ids = [
+        str(constraint_id)
+        for constraint_id in candidate.objective_constraint_ids
+    ]
+    evidence_ids = [
+        str(evidence.constraint_id)
+        for evidence in candidate.intent_evidence
+    ]
+    if (
+        len(objective_ids) != len(set(objective_ids))
+        or len(evidence_ids) != len(set(evidence_ids))
+        or any(
+            constraint_id not in known_ids
+            for constraint_id in objective_ids
+        )
+    ):
+        return set()
+    if not (
+        0
+        <= candidate.start_line
+        <= candidate.end_line
+        < len(segments)
+    ):
+        return set()
+    grounded_evidence_ids = {
+        str(evidence.constraint_id)
+        for evidence in candidate.intent_evidence
+        if (
+            str(evidence.constraint_id) in known_ids
+            and 5 <= len(_toks(evidence.evidence_quote)) <= 16
+            and _unique_boundary_anchor(
+                segments,
+                evidence.evidence_quote,
+                candidate.start_line,
+                candidate.end_line,
+                allow_timing_gaps=True,
+            )
+            is not None
+        )
+    }
+    return set(objective_ids) & grounded_evidence_ids
+
+
 def _audit_pro_boundaries(
     plan: _CompactBoundaryPlan,
     segments: list[dict],
@@ -24139,7 +24236,40 @@ def _audit_pro_boundaries(
         or unresolved_indices
     )
     if contract_invalid:
+        retained_objective_ids = {
+            constraint_id
+            for replacement in replacements.values()
+            for constraint_id in _grounded_candidate_objective_ids(
+                plan,
+                replacement,
+                segments,
+            )
+        }
+        unresolved_objective_ids = {
+            constraint_id
+            for index in unresolved_indices
+            for constraint_id in _grounded_candidate_objective_ids(
+                plan,
+                plan.topics[index],
+                segments,
+            )
+        }
+        coverage_retry_objective_ids = (
+            unresolved_objective_ids - retained_objective_ids
+            if (
+                replacements
+                and not id_contract_invalid
+                and returned_ids == expected_ids
+                and not calls[-1].get("schema_rejection_reasons")
+                and "audit_semantic_fields_missing"
+                not in audit_contract_rejection_reasons
+            )
+            else set()
+        )
         must_recover = bool(unresolved_indices and not replacements)
+        should_recover = bool(
+            must_recover or coverage_retry_objective_ids
+        )
         if calls:
             calls[-1].update({
                 "contract_retry_reason": "invalid_audit_contract",
@@ -24147,7 +24277,7 @@ def _audit_pro_boundaries(
                     audit_contract_rejection_reasons
                 ),
                 "contract_retry_exhausted": (
-                    must_recover
+                    should_recover
                     and (
                         not _retry_contract_once
                         or not _allow_contract_correction
@@ -24160,8 +24290,12 @@ def _audit_pro_boundaries(
                     unresolved_indices
                 ),
             })
+            if coverage_retry_objective_ids:
+                calls[-1]["audit_coverage_retry_objective_ids"] = sorted(
+                    coverage_retry_objective_ids
+                )
         if (
-            must_recover
+            should_recover
             and _retry_contract_once
             and _allow_contract_correction
             and remaining_physical_dispatches > 0
@@ -24170,6 +24304,7 @@ def _audit_pro_boundaries(
         ):
             if calls:
                 calls[-1]["contract_retry_attempt"] = 1
+            coverage_retry_failed = False
             try:
                 retried_plan, retry_calls, retry_rejections = (
                     _audit_pro_boundaries(
@@ -24199,18 +24334,65 @@ def _audit_pro_boundaries(
                     "selection_attempt_calls",
                     [],
                 )
-                exc.selection_attempt_calls = [
-                    *calls,
-                    *(
-                        retry_attempt_calls
-                        if isinstance(retry_attempt_calls, list)
-                        else []
-                    ),
-                ]
-                raise
-            if retry_calls:
-                retry_calls[0].setdefault("contract_retry_attempt", 2)
-            return retried_plan, [*calls, *retry_calls], retry_rejections
+                normalized_retry_calls = (
+                    retry_attempt_calls
+                    if isinstance(retry_attempt_calls, list)
+                    else []
+                )
+                if (
+                    coverage_retry_objective_ids
+                    and replacements
+                    and isinstance(exc, _ModelCallError)
+                    and not _cancel_requested(cancelled)
+                ):
+                    if normalized_retry_calls:
+                        normalized_retry_calls[0].setdefault(
+                            "contract_retry_attempt",
+                            2,
+                        )
+                    calls.extend(normalized_retry_calls)
+                    coverage_retry_failed = True
+                else:
+                    exc.selection_attempt_calls = [
+                        *calls,
+                        *normalized_retry_calls,
+                    ]
+                    raise
+            if not coverage_retry_failed:
+                if retry_calls:
+                    retry_calls[0].setdefault("contract_retry_attempt", 2)
+                if coverage_retry_objective_ids:
+                    retried_by_candidate_id = {
+                        str(candidate.candidate_id): candidate
+                        for candidate in retried_plan.topics
+                    }
+                    merged_topics = [
+                        corrected
+                        for index, original in enumerate(plan.topics)
+                        if (
+                            corrected := retried_by_candidate_id.get(
+                                str(original.candidate_id)
+                            )
+                            or replacements.get(index)
+                        )
+                        is not None
+                    ]
+                    retained_rejection_prefixes = tuple(
+                        f"gemini_audit:candidate-{index + 1}:"
+                        for index in replacements
+                    )
+                    return (
+                        plan.model_copy(update={"topics": merged_topics}),
+                        [*calls, *retry_calls],
+                        [
+                            reason
+                            for reason in retry_rejections
+                            if not reason.startswith(
+                                retained_rejection_prefixes
+                            )
+                        ],
+                    )
+                return retried_plan, [*calls, *retry_calls], retry_rejections
         if must_recover:
             _emit(
                 sink,

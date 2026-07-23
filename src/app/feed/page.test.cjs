@@ -311,6 +311,7 @@ function compileUseCallback(name, bindings) {
     assessmentSession: null,
     assessmentSlideActive: false,
     setAssessmentSlideActive: () => {},
+    activeOpenSignalRef: { current: new Set() },
     isDailySearchLimitError: () => false,
     isVerifiedAccountRequiredError: () => false,
     isTransportError: () => false,
@@ -1671,6 +1672,163 @@ test("a reel that becomes active while the organizer runs stays locked ahead of 
   assert.equal(renderedRows[1], currentRows[1], "the active reel object must remain in the locked prefix");
   assert.equal(activeIndexRef.current, 1);
   assert.equal(renderedActiveIndex, 1, "settlement must not move the active viewport");
+});
+
+test("active reel opening is reported once without awaiting the progress request", () => {
+  const activeOpenSignalRef = { current: new Set() };
+  const activeSearchScopeRef = {
+    current: { key: "material-a", seq: 3, controller: new AbortController() },
+  };
+  const progressCalls = [];
+  let settleProgress;
+  const callback = compileUseCallback("reportActiveReelOpened", {
+    ACTIVE_REEL_OPEN_FRACTION: 0.001,
+    ACTIVE_REEL_OPEN_MAX_ATTEMPTS: 3,
+    activeOpenSignalRef,
+    activeSearchScopeRef,
+    materialId: "material-a",
+    reportReelProgress: (params) => {
+      progressCalls.push(params);
+      return new Promise((resolve) => {
+        settleProgress = resolve;
+      });
+    },
+    isSearchScopeActive: () => true,
+    isRequestInterruptedError: () => false,
+    shouldRetryAdaptiveFeedRefresh: () => true,
+    console: { warn: () => {} },
+  });
+
+  assert.equal(
+    callback({ reel_id: "active-provisional", material_id: "material-a" }),
+    undefined,
+    "the UI must not await the active/open write before rendering playback",
+  );
+  callback({ reel_id: "active-provisional", material_id: "material-a" });
+
+  assert.equal(progressCalls.length, 1);
+  assert.equal(progressCalls[0].reelId, "active-provisional");
+  assert.equal(progressCalls[0].maxFraction, 0.001);
+  assert.equal(progressCalls[0].signal, activeSearchScopeRef.current.controller.signal);
+  settleProgress({});
+});
+
+test("active reel opening retries a transient write and then succeeds", async () => {
+  const activeSearchScopeRef = {
+    current: { key: "material-a", seq: 3, controller: new AbortController() },
+  };
+  const transientError = new Error("temporary transport failure");
+  let progressCalls = 0;
+  let warnings = 0;
+  const callback = compileUseCallback("reportActiveReelOpened", {
+    ACTIVE_REEL_OPEN_FRACTION: 0.001,
+    ACTIVE_REEL_OPEN_MAX_ATTEMPTS: 3,
+    activeOpenSignalRef: { current: new Set() },
+    activeSearchScopeRef,
+    materialId: "material-a",
+    reportReelProgress: () => {
+      progressCalls += 1;
+      return progressCalls === 1
+        ? Promise.reject(transientError)
+        : Promise.resolve({});
+    },
+    isSearchScopeActive: (scope) => !scope.controller.signal.aborted,
+    isRequestInterruptedError: () => false,
+    shouldRetryAdaptiveFeedRefresh: (error) => error === transientError,
+    console: { warn: () => { warnings += 1; } },
+  });
+
+  assert.equal(
+    callback({ reel_id: "active-provisional", material_id: "material-a" }),
+    undefined,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(progressCalls, 2);
+  assert.equal(warnings, 0);
+});
+
+test("active reel opening stops after three transient failures", async () => {
+  const activeSearchScopeRef = {
+    current: { key: "material-a", seq: 3, controller: new AbortController() },
+  };
+  let progressCalls = 0;
+  let warnings = 0;
+  const callback = compileUseCallback("reportActiveReelOpened", {
+    ACTIVE_REEL_OPEN_FRACTION: 0.001,
+    ACTIVE_REEL_OPEN_MAX_ATTEMPTS: 3,
+    activeOpenSignalRef: { current: new Set() },
+    activeSearchScopeRef,
+    materialId: "material-a",
+    reportReelProgress: () => {
+      progressCalls += 1;
+      return Promise.reject(new Error(`temporary failure ${progressCalls}`));
+    },
+    isSearchScopeActive: (scope) => !scope.controller.signal.aborted,
+    isRequestInterruptedError: () => false,
+    shouldRetryAdaptiveFeedRefresh: () => true,
+    console: { warn: () => { warnings += 1; } },
+  });
+
+  callback({ reel_id: "active-provisional", material_id: "material-a" });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(progressCalls, 3);
+  assert.equal(warnings, 1);
+});
+
+test("active reel opening does not retry after its search scope aborts", async () => {
+  const controller = new AbortController();
+  const activeSearchScopeRef = {
+    current: { key: "material-a", seq: 3, controller },
+  };
+  let progressCalls = 0;
+  let retryChecks = 0;
+  let warnings = 0;
+  const callback = compileUseCallback("reportActiveReelOpened", {
+    ACTIVE_REEL_OPEN_FRACTION: 0.001,
+    ACTIVE_REEL_OPEN_MAX_ATTEMPTS: 3,
+    activeOpenSignalRef: { current: new Set() },
+    activeSearchScopeRef,
+    materialId: "material-a",
+    reportReelProgress: () => {
+      progressCalls += 1;
+      controller.abort();
+      return Promise.reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+    },
+    isSearchScopeActive: (scope) => !scope.controller.signal.aborted,
+    isRequestInterruptedError: (error) => error?.name === "AbortError",
+    shouldRetryAdaptiveFeedRefresh: () => {
+      retryChecks += 1;
+      return true;
+    },
+    console: { warn: () => { warnings += 1; } },
+  });
+
+  callback({ reel_id: "active-provisional", material_id: "material-a" });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(progressCalls, 1);
+  assert.equal(retryChecks, 0);
+  assert.equal(warnings, 0);
+});
+
+test("each provisional arrival can refresh its active/open membership signal", () => {
+  assert.match(source, /const ACTIVE_REEL_OPEN_FRACTION = 0\.001;/);
+  assert.match(source, /const ACTIVE_REEL_OPEN_MAX_ATTEMPTS = 3;/);
+  assert.match(
+    source,
+    /const reportActiveReelOpened = useCallback\([\s\S]*?\}, \[isSearchScopeActive, materialId\]\);/,
+  );
+  assert.match(
+    source,
+    /useEffect\(\(\) => \{[\s\S]*?reportActiveReelOpened\(activeReel\);[\s\S]*?\}, \[activeIndex, materialId, reels, reportActiveReelOpened\]\);/,
+  );
+  assert.equal(
+    [...source.matchAll(/activeOpenSignalRef\.current\.delete\(String\(reel\.reel_id \|\| ""\)\.trim\(\)\);/g)].length,
+    2,
+    "feed-owned and directly submitted generation streams must both refresh active membership",
+  );
 });
 
 test("reconciliation that commits first makes the inserted prerequisite the next scroll target", () => {

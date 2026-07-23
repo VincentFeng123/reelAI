@@ -46,14 +46,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-LESSON_ORDER_PROMPT_VERSION = "lesson_order_v18"
+LESSON_ORDER_PROMPT_VERSION = "lesson_order_v20"
 LESSON_ORDER_TIMEOUT_S = 10.0
 # Even an invalid worst-case schema payload with four bounded UUID lists and a
 # terminal marker fits this ceiling. Actual
 # generated length, not this ceiling, drives latency.
 LESSON_ORDER_MAX_OUTPUT_TOKENS = 10_240
 LESSON_ORDER_ATTEMPTS = 2
-LESSON_ORDER_CACHE_VERSION = 15
+LESSON_ORDER_CACHE_VERSION = 17
 LESSON_ORDER_CACHE_TTL_SEC = 30 * 24 * 60 * 60
 LESSON_ORDER_MAX_CLIPS = 200
 LESSON_ORDER_MAX_USER_PROMPT_CHARS = 64_000
@@ -114,9 +114,9 @@ class _DispatchState:
     dispatched: bool = False
 
 
-_SYSTEM_PROMPT = """You are ReelAI's lesson editor. Select and order an already-valid
-batch of short educational clips into the clearest possible mini-lesson. You may omit
-clips, but never add, merge, rewrite, or rename one.
+_SYSTEM_PROMPT = """You are ReelAI's lesson editor. Select and order a Gemini-audited
+candidate inventory of short educational clips into the clearest possible mini-lesson.
+You may omit clips, but never add, merge, rewrite, or rename one.
 
 Use each clip's narrow concept and learner_signal when deciding inclusion:
 - Helpful responses and positive adjustment indicate growing mastery. Prefer omitting
@@ -125,6 +125,31 @@ Use each clip's narrow concept and learner_signal when deciding inclusion:
   complete, easier explanation or worked example for that concept, without adding
   near-duplicate repetition.
 - A zero signal is neutral. Never omit an essential prerequisite solely due to mastery.
+
+Use the trusted structural completeness fields as optional-inventory tiers:
+- Tier A has selection_contract_current=true, self_contained=true, and
+  is_standalone=true. Prefer suitable Tier A clips.
+- Tier B has the current contract and self_contained=true but is_standalone=false.
+  Include an optional Tier B clip only when it supplies an essential requested
+  contribution that no suitable Tier A clip supplies, or Tier A alone cannot form a
+  nonempty coherent lesson.
+- Tier C has false or missing self_contained, or lacks current trusted completeness
+  metadata. Include an optional Tier C clip only when no suitable Tier A or Tier B
+  inventory can keep the lesson nonempty.
+A lower tier is availability fallback, not extra breadth. Never select a lower-tier clip
+merely because its contribution is distinct. If every supplied related clip is weaker,
+still select the strongest coherent nonempty lesson from that weaker inventory.
+LEARNING_REQUEST_JSON.required_reel_ids override every tier: each required unseen clip
+must remain selected exactly once regardless of completeness metadata.
+LEARNING_REQUEST_JSON.locked_prefix_reel_ids are a special ordered subset of required
+IDs whose clips already began playing while this organizer call was pending. They are
+immutable learner history: return them first in the exact supplied order, then build only
+a forward continuation from what that prefix already taught. Never schedule an
+orientation, prerequisite, definition, or easier foundation after the locked prefix when
+doing so would move the learner backward. Instead omit that now-regressive optional clip
+and continue with a coherent explanation, reasoning step, application, nuance, synthesis,
+or recap supported by the remaining inventory. Do not omit a forward-useful tail merely
+because a prefix exists.
 
 Treat difficulty as a soft ordering preference, never an eligibility rule.
 LEARNING_REQUEST_JSON.learner_level is the selected base level. When
@@ -155,19 +180,21 @@ titles. Keep multiple clips about one concept only when each contributes a genui
 explanation, reasoning step, application, misconception, or worked-example step.
 
 LEARNING_REQUEST_JSON.release_limit is a ceiling, not a target. Select the smallest
-coherent subset that covers every distinct supplied educational contribution and grounded
-request facet; never include a clip merely to fill the ceiling. When two optional clips are
-semantically equivalent or one is a strict subset of the other, prefer the shortest
-context-complete clip. clip_duration_seconds is advisory cadence evidence, never an
-eligibility threshold. Prefer a longer equivalent clip only when it adds indispensable
-setup, reasoning, conclusion, remediation, application, or another distinct requested
-facet. Repeated setup, pacing, or paraphrase is not a distinct contribution. A long or
-repetitive valid related clip remains eligible when it is the only supplied way to keep the
-lesson nonempty or when it uniquely supplies an essential contribution. If all supplied
-clips restate one contribution, select one strongest context-complete clip and list the
-omitted optional repeats in current_restatement_reel_ids; never return zero. Required reel
-IDs remain mandatory regardless of duration or repetition. Before returning, compare every
-selected optional pair and remove the weaker equivalent or strict-subset clip.
+coherent subset that covers the grounded request facets and only the educational
+contributions needed to teach the learner's request coherently. A distinct supplied
+contribution is not automatically required. Never include a clip merely to fill the ceiling.
+When two optional clips are semantically equivalent or one is a strict subset of the other,
+prefer the shortest context-complete clip. clip_duration_seconds is advisory cadence
+evidence, never an eligibility threshold. Prefer a longer equivalent clip only when it adds
+indispensable setup, reasoning, conclusion, remediation, application, or another distinct
+requested facet. Repeated setup, pacing, or paraphrase is not a distinct contribution. A
+long or repetitive valid related clip remains eligible when it is the only supplied way to
+keep the lesson nonempty or when it uniquely supplies an essential requested contribution.
+If all supplied clips restate one contribution, select one strongest context-complete clip
+and list the omitted optional repeats in current_restatement_reel_ids; never return zero.
+Required reel IDs remain mandatory regardless of duration, repetition, completeness tier,
+or connection-only status. Before returning, compare every selected optional pair and remove
+the weaker equivalent or strict-subset clip.
 
 Treat multi-part requests as curricula of atomic units. Prefer an equivalent coherent
 atomic set over an umbrella and never choose both it and nested restatements; keep a
@@ -237,18 +264,27 @@ relationships, but output only the exact reel_id strings. learner_signal_hca is
 content excerpts; reason from all of them and never treat truncation as missing quality.
 clip_duration_seconds is the explicit selected interval length.
 selection_contract_current, self_contained, and is_standalone are trusted structural
-metadata. A false or missing value means same-source chronology remains hard; never infer
-independence from transcript wording, titles, concepts, or timestamps.
+metadata. A false or missing value places optional inventory in the weaker tiers above and
+means same-source chronology remains hard; never infer independence from transcript wording,
+titles, concepts, or timestamps.
 LEARNING_REQUEST_JSON.prior_concept_coverage may use the same compact-row format;
 its concept_ref values share the CLIPS_JSON concept-ref namespace.
 recent_prior_objective_coverage may also use compact rows with columns
 [concept_ref, concept_family, concept_title, learning_objective_excerpt].
 Each available_intent_obligation is a request-facet dictionary entry grounded by Gemini in
 the learner request and at least one clip. Only facet refs appearing in a clip's
-intent_obligation_refs are audited fulfillment and mandatory coverage; select a supplied clip
-for every such fulfilled facet not listed in prior_intent_obligation_keys whenever the
-candidates and release limit permit. Entries referenced only by intent_connection_refs are
+intent_obligation_refs are audited fulfillment. Treat fulfilled Tier A/B facets as mandatory
+coverage. If no Tier A/B clip fulfills any facet, use the fulfilled Tier C facets as mandatory
+fallback coverage so the lesson remains relevant and nonempty. Do not add a Tier C clip merely
+for its distinct facet when obligation-bearing Tier A/B inventory exists. Required IDs still
+override this tier rule. Entries referenced only by intent_connection_refs are
 support/relevance, not fulfillment.
+An optional clip with no intent_obligation_refs but one or more intent_connection_refs is
+connection-only. Its connection does not create a coverage requirement, and its uniqueness
+alone never requires inclusion. Use it only as supporting fallback when it supplies
+indispensable coherence, prerequisite explanation, remediation, or application that suitable
+obligation-fulfilling inventory does not supply, or when it is needed to keep the lesson
+nonempty. Required reel IDs still remain mandatory.
 In compact_rows_v1, intent_obligation_refs point to the obligation_ref values in
 LEARNING_REQUEST_JSON.available_intent_obligations, and
 prior_intent_obligation_refs identifies already released obligation_ref values.
@@ -292,10 +328,16 @@ Hard output rules:
 - Return one or more supplied reel_ids in ordered_reel_ids. You may omit a supplied ID.
 - Include every exact LEARNING_REQUEST_JSON.required_reel_ids value once in
   ordered_reel_ids. They may be reordered but never omitted.
+- Put every LEARNING_REQUEST_JSON.locked_prefix_reel_ids value first in
+  ordered_reel_ids, in the exact supplied order. These IDs may never be reordered.
 - Return no more than LEARNING_REQUEST_JSON.release_limit reel_ids.
 - Return no unknown reel_id and no duplicate reel_id.
-- Never include a dependent clip without its supplied prerequisite. If a later member
-  of a chain is included, include every earlier supplied member of that chain.
+- Never include an unlocked dependent clip without its supplied prerequisite. If an
+  unlocked later member of a chain is included, include every earlier supplied member
+  that is not already-past locked-prefix context. A prerequisite or earlier chain member
+  required only by locked_prefix_reel_ids is already-past learner history: do not append
+  it to the future tail unless that context clip is independently listed in
+  required_reel_ids outside the locked prefix. Your selection alone is not an exception.
 - assessment_checkpoint_reel_ids must contain only supplied reel_ids, with no
   duplicates, in the same relative order as ordered_reel_ids.
 - prior_restatement_reel_ids must contain only supplied reel_ids omitted from
@@ -578,6 +620,18 @@ def _trusted_independence_metadata(
         self_contained if isinstance(self_contained, bool) else None,
         is_standalone if isinstance(is_standalone, bool) else None,
     )
+
+
+def _selection_inventory_tier(reel: Mapping[str, Any]) -> int:
+    """Return the trusted optional-inventory tier used by the organizer."""
+    contract_current, self_contained, is_standalone = (
+        _trusted_independence_metadata(reel)
+    )
+    if contract_current and self_contained is True:
+        return 1 if is_standalone is True else (
+            2 if is_standalone is False else 3
+        )
+    return 3
 
 
 def _source_requires_hard_chronology(
@@ -1248,6 +1302,7 @@ def _user_prompt(
     concept_signals: Mapping[str, Mapping[str, Any]] | None = None,
     release_limit: int | None = None,
     required_reel_ids: Sequence[str] | None = None,
+    locked_prefix_reel_ids: Sequence[str] | None = None,
     prior_concept_coverage: Sequence[Mapping[str, Any]] | None = None,
     recent_prior_objective_coverage: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
@@ -1374,15 +1429,29 @@ def _user_prompt(
             >= LESSON_ORDER_RECENT_PRIOR_OBJECTIVE_LIMIT
         ):
             break
+    normalized_locked_prefix_reel_ids = list(dict.fromkeys(
+        reel_id
+        for value in locked_prefix_reel_ids or ()
+        if (reel_id := _opaque_id(value)) in candidate_reel_ids
+    ))
+    normalized_required_reel_ids = list(dict.fromkeys([
+        *(
+            reel_id
+            for value in required_reel_ids or ()
+            if (reel_id := _opaque_id(value)) in candidate_reel_ids
+        ),
+        *normalized_locked_prefix_reel_ids,
+    ]))
     learning_request = {
         "topic": _clean_text(topic, 500),
         "learner_level": _clean_text(learner_level, 80) or None,
         "release_limit": effective_release_limit,
-        "required_reel_ids": list(dict.fromkeys(
-            reel_id
-            for value in required_reel_ids or ()
-            if (reel_id := _opaque_id(value)) in candidate_reel_ids
-        )),
+        "required_reel_ids": normalized_required_reel_ids,
+        **(
+            {"locked_prefix_reel_ids": normalized_locked_prefix_reel_ids}
+            if normalized_locked_prefix_reel_ids
+            else {}
+        ),
         "prior_concept_coverage": normalized_prior_coverage,
         "recent_prior_objective_coverage": normalized_recent_coverage,
     }
@@ -1758,6 +1827,7 @@ def _constraint_safe_fallback_order(
     *,
     topic: str = "",
     preferred_ids: Sequence[str] = (),
+    locked_prefix_reel_ids: Sequence[str] = (),
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Keep every fallback clip while honoring all satisfiable order edges."""
     if (
@@ -1768,6 +1838,12 @@ def _constraint_safe_fallback_order(
         return reels, reel_ids
 
     input_position = {reel_id: index for index, reel_id in enumerate(reel_ids)}
+    normalized_locked_prefix_ids = list(dict.fromkeys(
+        reel_id
+        for value in locked_prefix_reel_ids
+        if (reel_id := _opaque_id(value)) in input_position
+    ))
+    locked_prefix_set = set(normalized_locked_prefix_ids)
     preferred_position = {
         reel_id: index
         for index, reel_id in enumerate(dict.fromkeys(preferred_ids))
@@ -1792,9 +1868,21 @@ def _constraint_safe_fallback_order(
     successors = {reel_id: set() for reel_id in reel_ids}
     indegree = dict.fromkeys(reel_ids, 0)
     fallback_position = dict(input_position)
+    satisfied_context_ids = {
+        *locked_prefix_set,
+        *_selection_prelocked_context(
+            normalized_locked_prefix_ids,
+            reels_by_id,
+        ),
+    }
 
     def add_edge(before: str, after: str) -> None:
-        if before == after or after in successors[before]:
+        if (
+            before == after
+            or before in satisfied_context_ids
+            or after in satisfied_context_ids
+            or after in successors[before]
+        ):
             return
         successors[before].add(after)
         indegree[after] += 1
@@ -1875,8 +1963,8 @@ def _constraint_safe_fallback_order(
             for after_id in after_ids:
                 add_edge(before_id, after_id)
 
-    remaining = set(reel_ids)
-    ordered_ids: list[str] = []
+    remaining = set(reel_ids) - locked_prefix_set
+    ordered_ids = list(normalized_locked_prefix_ids)
     while remaining:
         ready = [reel_id for reel_id in remaining if indegree[reel_id] == 0]
         # Conflicting metadata can form an impossible cycle. Break it by original
@@ -1991,8 +2079,11 @@ def _filter_same_source_overlaps(
 def _selection_dependency_closure(
     target_reel_id: str,
     reels_by_id: Mapping[str, Mapping[str, Any]],
+    *,
+    satisfied_reel_ids: Sequence[str] = (),
 ) -> set[str]:
     """Return the supplied prerequisite/chain prefix required by one clip."""
+    satisfied = set(satisfied_reel_ids)
     candidate_aliases = {reel_id: reel_id for reel_id in reels_by_id}
     chains: dict[str, list[tuple[float, str]]] = {}
     for reel_id, reel in reels_by_id.items():
@@ -2019,7 +2110,11 @@ def _selection_dependency_closure(
     def collect(reel_id: str) -> None:
         if reel_id in required or reel_id not in reels_by_id:
             return
+        if reel_id != target_reel_id and reel_id in satisfied:
+            return
         required.add(reel_id)
+        if reel_id in satisfied:
+            return
         reel = reels_by_id[reel_id]
         for prerequisite in _id_list(
             reel.get("prerequisite_ids")
@@ -2045,6 +2140,61 @@ def _selection_dependency_closure(
 
     collect(target_reel_id)
     return required
+
+
+def _selection_prelocked_context(
+    locked_prefix_reel_ids: Sequence[str],
+    reels_by_id: Mapping[str, Mapping[str, Any]],
+) -> set[str]:
+    """Return declared context that necessarily preceded the immutable prefix."""
+    locked = {
+        reel_id
+        for value in locked_prefix_reel_ids
+        if (reel_id := _opaque_id(value)) in reels_by_id
+    }
+    if not locked:
+        return set()
+    context = set().union(*(
+        _selection_dependency_closure(reel_id, reels_by_id)
+        for reel_id in locked
+    ))
+    return context - locked
+
+
+def _forbidden_prelocked_tail_ids(
+    locked_prefix_reel_ids: Sequence[str],
+    required_reel_ids: Sequence[str],
+    reels_by_id: Mapping[str, Mapping[str, Any]],
+) -> set[str]:
+    """Return already-past context that is not independently required."""
+    locked = {
+        reel_id
+        for value in locked_prefix_reel_ids
+        if (reel_id := _opaque_id(value)) in reels_by_id
+    }
+    independently_required = {
+        reel_id
+        for value in required_reel_ids
+        if (
+            (reel_id := _opaque_id(value)) in reels_by_id
+            and reel_id not in locked
+        )
+    }
+    return (
+        _selection_prelocked_context(
+            list(locked),
+            reels_by_id,
+        )
+        - independently_required
+    )
+
+
+def _has_exact_locked_prefix(
+    ordered_reel_ids: Sequence[str],
+    locked_prefix_reel_ids: Sequence[str],
+) -> bool:
+    locked = list(dict.fromkeys(locked_prefix_reel_ids))
+    return list(ordered_reel_ids[: len(locked)]) == locked
 
 
 def _selection_obligation_state(
@@ -2106,6 +2256,7 @@ def _enforce_mandatory_selection(
     remediation_concept_ids: Sequence[str] | None,
     release_limit: int | None,
     required_reel_ids: Sequence[str] | None,
+    locked_prefix_reel_ids: Sequence[str] | None,
     prior_concept_coverage: Sequence[Mapping[str, Any]] | None,
     recent_prior_objective_coverage: Sequence[Mapping[str, Any]] | None,
 ) -> LessonOrderResult:
@@ -2126,11 +2277,38 @@ def _enforce_mandatory_selection(
         if reel_id in reels_by_id
     ]
     selected_set = set(selected_ids)
+    normalized_locked_prefix_ids = list(dict.fromkeys(
+        reel_id
+        for value in locked_prefix_reel_ids or ()
+        if (reel_id := _opaque_id(value)) in reels_by_id
+    ))
     required_identity_ids = {
         reel_id
-        for value in required_reel_ids or ()
+        for value in [
+            *(required_reel_ids or ()),
+            *normalized_locked_prefix_ids,
+        ]
         if (reel_id := _opaque_id(value)) in reels_by_id
     }
+    prelocked_context_ids = _selection_prelocked_context(
+        normalized_locked_prefix_ids,
+        reels_by_id,
+    )
+    satisfied_context_ids = {
+        *prelocked_context_ids,
+        *normalized_locked_prefix_ids,
+    }
+    forbidden_prelocked_ids = _forbidden_prelocked_tail_ids(
+        normalized_locked_prefix_ids,
+        required_reel_ids or (),
+        reels_by_id,
+    )
+    selected_ids = [
+        reel_id
+        for reel_id in selected_ids
+        if reel_id not in forbidden_prelocked_ids
+    ]
+    selected_set = set(selected_ids)
     effective_release_limit = _effective_release_limit(
         release_limit,
         len(reels_by_id),
@@ -2161,8 +2339,25 @@ def _enforce_mandatory_selection(
         if current_restatement_ids
         else set()
     )
+    eligible_obligations_by_reel = {
+        reel_id: keys
+        for reel_id, keys in obligations_by_reel.items()
+        if reel_id not in prelocked_context_ids
+    }
+    strong_obligation_keys = set().union(*(
+        keys
+        for reel_id, keys in eligible_obligations_by_reel.items()
+        if _selection_inventory_tier(reels_by_id[reel_id]) <= 2
+    )) if eligible_obligations_by_reel else set()
+    available_mandatory_obligation_keys = (
+        strong_obligation_keys
+        if strong_obligation_keys
+        else set().union(*eligible_obligations_by_reel.values())
+        if eligible_obligations_by_reel
+        else set()
+    )
     required_obligation_keys = (
-        set().union(*obligations_by_reel.values())
+        available_mandatory_obligation_keys
         - prior_obligation_keys
         - prior_restatement_obligation_keys
         - current_restatement_obligation_keys
@@ -2178,7 +2373,11 @@ def _enforce_mandatory_selection(
         else set()
     )
     required_release_closure = set().union(*(
-        _selection_dependency_closure(reel_id, reels_by_id)
+        _selection_dependency_closure(
+            reel_id,
+            reels_by_id,
+            satisfied_reel_ids=satisfied_context_ids,
+        )
         for reel_id in required_identity_ids
     )) if required_identity_ids else set()
     reel_input_position = {
@@ -2196,6 +2395,7 @@ def _enforce_mandatory_selection(
         for candidate_id, candidate_keys in obligations_by_reel.items():
             if (
                 candidate_id == umbrella_id
+                or candidate_id in forbidden_prelocked_ids
                 or candidate_id in required_identity_ids
                 or not candidate_keys
                 or not candidate_keys.issubset(novel_keys)
@@ -2204,6 +2404,7 @@ def _enforce_mandatory_selection(
             closure = frozenset(_selection_dependency_closure(
                 candidate_id,
                 reels_by_id,
+                satisfied_reel_ids=satisfied_context_ids,
             ))
             if (
                 umbrella_id in closure
@@ -2292,6 +2493,7 @@ def _enforce_mandatory_selection(
                     for covered_reel_id in _selection_dependency_closure(
                         candidate_id,
                         reels_by_id,
+                        satisfied_reel_ids=satisfied_context_ids,
                     ):
                         for key in (
                             obligations_by_reel.get(covered_reel_id, set())
@@ -2314,6 +2516,7 @@ def _enforce_mandatory_selection(
         reel_id
         for reel_id, reel in reels_by_id.items()
         if strongest_concept_id
+        and reel_id not in forbidden_prelocked_ids
         and _opaque_id(reel.get("concept_id")) == strongest_concept_id
     }
     exact_difficulties = {
@@ -2346,10 +2549,16 @@ def _enforce_mandatory_selection(
         and required_obligation_keys.issubset(selected_obligation_keys)
         and organizer_has_preferred_exact
         and not selected_set & repeated_prerequisite_umbrella_ids
+        and _has_exact_locked_prefix(
+            selected_ids,
+            normalized_locked_prefix_ids,
+        )
         and all(
-            _selection_dependency_closure(reel_id, reels_by_id).issubset(
-                selected_set
-            )
+            _selection_dependency_closure(
+                reel_id,
+                reels_by_id,
+                satisfied_reel_ids=satisfied_context_ids,
+            ).issubset(selected_set)
             for reel_id in selected_ids
         )
     )
@@ -2403,7 +2612,11 @@ def _enforce_mandatory_selection(
         return mask
 
     dependency_closures = {
-        reel_id: frozenset(_selection_dependency_closure(reel_id, reels_by_id))
+        reel_id: frozenset(_selection_dependency_closure(
+            reel_id,
+            reels_by_id,
+            satisfied_reel_ids=satisfied_context_ids,
+        ))
         for reel_id in reels_by_id
     }
     reel_ids = list(reels_by_id)
@@ -2412,6 +2625,8 @@ def _enforce_mandatory_selection(
     seen_options: set[tuple[int, int]] = set()
     dependency_reel_bits = 0
     for reel_id in reels_by_id:
+        if reel_id in forbidden_prelocked_ids:
+            continue
         closure = dependency_closures[reel_id]
         mask = closure_mask(closure)
         if reel_id in repeated_prerequisite_umbrella_ids:
@@ -3356,6 +3571,7 @@ def _enforce_mandatory_selection(
         retained_input_ids,
         topic=reconciliation_topic,
         preferred_ids=preferred_ids,
+        locked_prefix_reel_ids=normalized_locked_prefix_ids,
     )
     ordered_ids, _ = _filter_same_source_overlaps(
         ordered_ids,
@@ -3439,6 +3655,7 @@ def _fallback(
     preferred_ids: Sequence[str] = (),
     release_limit: int | None = None,
     required_reel_ids: Sequence[str] = (),
+    locked_prefix_reel_ids: Sequence[str] = (),
 ) -> LessonOrderResult:
     if required_reel_ids:
         # A failed cross-batch organizer must degrade to the existing unseen
@@ -3450,15 +3667,45 @@ def _fallback(
             ordered_reel_ids = list(reel_ids)
         else:
             required_id_set = set(required_reel_ids)
+            reels_by_id = dict(zip(reel_ids, reels, strict=True))
+            normalized_locked_prefix_ids = list(dict.fromkeys(
+                reel_id
+                for value in locked_prefix_reel_ids
+                if (reel_id := _opaque_id(value)) in reels_by_id
+            ))
+            forbidden_prelocked_ids = _forbidden_prelocked_tail_ids(
+                normalized_locked_prefix_ids,
+                required_reel_ids,
+                reels_by_id,
+            )
             pairs = list(zip(reels, reel_ids, strict=True))
-            required_pairs = [
+            eligible_pairs = [
                 (reel, reel_id)
                 for reel, reel_id in pairs
-                if reel_id in required_id_set
+                if (
+                    reel_id not in forbidden_prelocked_ids
+                    or reel_id in required_id_set
+                )
+            ]
+            eligible_by_id = {
+                reel_id: reel for reel, reel_id in eligible_pairs
+            }
+            locked_pairs = [
+                (eligible_by_id[reel_id], reel_id)
+                for reel_id in normalized_locked_prefix_ids
+                if reel_id in eligible_by_id
+            ]
+            nonlocked_required_pairs = [
+                (reel, reel_id)
+                for reel, reel_id in eligible_pairs
+                if (
+                    reel_id in required_id_set
+                    and reel_id not in normalized_locked_prefix_ids
+                )
             ]
             delta_pairs = [
                 (reel, reel_id)
-                for reel, reel_id in pairs
+                for reel, reel_id in eligible_pairs
                 if reel_id not in required_id_set
             ]
             delta_reels, delta_reel_ids = _constraint_safe_fallback_order(
@@ -3468,10 +3715,14 @@ def _fallback(
                 preferred_ids=preferred_ids,
             )
             ordered_reels = [
-                reel for reel, _reel_id in required_pairs
+                reel for reel, _reel_id in locked_pairs
+            ] + [
+                reel for reel, _reel_id in nonlocked_required_pairs
             ] + delta_reels
             ordered_reel_ids = [
-                reel_id for _reel, reel_id in required_pairs
+                reel_id for _reel, reel_id in locked_pairs
+            ] + [
+                reel_id for _reel, reel_id in nonlocked_required_pairs
             ] + delta_reel_ids
     else:
         ordered_reels, ordered_reel_ids = _constraint_safe_fallback_order(
@@ -3479,6 +3730,7 @@ def _fallback(
             reel_ids,
             topic=topic,
             preferred_ids=preferred_ids,
+            locked_prefix_reel_ids=locked_prefix_reel_ids,
         )
     if (
         len(ordered_reels) == len(ordered_reel_ids)
@@ -3605,6 +3857,8 @@ def _model_order_validation_failures(
     required_reel_ids: Sequence[str],
     release_limit: int,
     has_prior_objective_evidence: bool,
+    locked_prefix_reel_ids: Sequence[str] = (),
+    forbidden_prelocked_tail_ids: Sequence[str] = (),
 ) -> list[str]:
     """Return privacy-safe predicate names for a parsed model response."""
     failures: list[str] = []
@@ -3620,6 +3874,13 @@ def _model_order_validation_failures(
         failures.append("selected_unknown_ids")
     if not set(required_reel_ids).issubset(selected_set):
         failures.append("required_ids_missing")
+    if not _has_exact_locked_prefix(
+        ordered_ids,
+        locked_prefix_reel_ids,
+    ):
+        failures.append("locked_prefix_invalid")
+    if selected_set & set(forbidden_prelocked_tail_ids):
+        failures.append("prelocked_context_in_future_tail")
 
     checkpoint_set = set(checkpoint_ids)
     if len(checkpoint_set) != len(checkpoint_ids):
@@ -3675,6 +3936,7 @@ def _salvage_model_order(
     release_limit: int,
     required_reel_ids: Sequence[str],
     has_prior_objective_evidence: bool,
+    locked_prefix_reel_ids: Sequence[str] = (),
 ) -> tuple[list[str], list[str], list[str], list[str], str | None] | None:
     """Repair local constraints while retaining Gemini's selected subset.
 
@@ -3690,16 +3952,46 @@ def _salvage_model_order(
     ):
         return None
 
+    normalized_locked_prefix_ids = list(dict.fromkeys(
+        reel_id
+        for value in locked_prefix_reel_ids
+        if (reel_id := _opaque_id(value)) in reels_by_id
+    ))
+    satisfied_context_ids = {
+        *normalized_locked_prefix_ids,
+        *_selection_prelocked_context(
+            normalized_locked_prefix_ids,
+            reels_by_id,
+        ),
+    }
+    forbidden_prelocked_ids = _forbidden_prelocked_tail_ids(
+        normalized_locked_prefix_ids,
+        required_reel_ids,
+        reels_by_id,
+    )
+    candidate_ordered_ids = [
+        reel_id
+        for reel_id in ordered_ids
+        if reel_id not in forbidden_prelocked_ids
+    ]
     retained: set[str] = set()
     protected: set[str] = set()
     for reel_id in required_reel_ids:
-        closure = _selection_dependency_closure(reel_id, reels_by_id)
+        closure = _selection_dependency_closure(
+            reel_id,
+            reels_by_id,
+            satisfied_reel_ids=satisfied_context_ids,
+        )
         retained.update(closure)
         protected.update(closure)
     if len(retained) > release_limit:
         return None
-    for reel_id in ordered_ids:
-        closure = _selection_dependency_closure(reel_id, reels_by_id)
+    for reel_id in candidate_ordered_ids:
+        closure = _selection_dependency_closure(
+            reel_id,
+            reels_by_id,
+            satisfied_reel_ids=satisfied_context_ids,
+        )
         if len(retained | closure) > release_limit:
             return None
         retained.update(closure)
@@ -3712,7 +4004,8 @@ def _salvage_model_order(
     _, repaired_ids = _constraint_safe_fallback_order(
         [reels_by_id[reel_id] for reel_id in retained_input_ids],
         retained_input_ids,
-        preferred_ids=[*ordered_ids, *required_reel_ids],
+        preferred_ids=[*candidate_ordered_ids, *required_reel_ids],
+        locked_prefix_reel_ids=normalized_locked_prefix_ids,
     )
     repaired_ids, _ = _filter_same_source_overlaps(
         repaired_ids,
@@ -3724,8 +4017,21 @@ def _salvage_model_order(
         not repaired_ids
         or len(repaired_ids) > release_limit
         or not set(required_reel_ids).issubset(repaired_ids)
-        or not _preserves_source_chronology(repaired_ids, reels_by_id)
-        or not _preserves_declared_dependencies(repaired_ids, reels_by_id)
+        or bool(set(repaired_ids) & forbidden_prelocked_ids)
+        or not _has_exact_locked_prefix(
+            repaired_ids,
+            normalized_locked_prefix_ids,
+        )
+        or not _preserves_source_chronology(
+            repaired_ids,
+            reels_by_id,
+            locked_prefix_reel_ids=normalized_locked_prefix_ids,
+        )
+        or not _preserves_declared_dependencies(
+            repaired_ids,
+            reels_by_id,
+            locked_prefix_reel_ids=normalized_locked_prefix_ids,
+        )
     ):
         return None
 
@@ -3755,12 +4061,12 @@ def _salvage_model_order(
     ]
     if (
         repaired_current_restatement_ids
-        and not set(ordered_ids).issubset(repaired_id_set)
+        and not set(candidate_ordered_ids).issubset(repaired_id_set)
     ):
         repaired_current_restatement_ids = []
     repaired_terminal_summary_start = _surviving_terminal_summary_start(
         terminal_summary_start_reel_id,
-        before_ids=ordered_ids,
+        before_ids=candidate_ordered_ids,
         after_ids=repaired_ids,
     )
     return (
@@ -3775,7 +4081,21 @@ def _salvage_model_order(
 def _preserves_source_chronology(
     ordered_ids: Sequence[str],
     reels_by_id: Mapping[str, Mapping[str, Any]],
+    *,
+    locked_prefix_reel_ids: Sequence[str] = (),
 ) -> bool:
+    normalized_locked_prefix_ids = list(dict.fromkeys(
+        reel_id
+        for value in locked_prefix_reel_ids
+        if (reel_id := _opaque_id(value)) in reels_by_id
+    ))
+    satisfied_context_ids = {
+        *normalized_locked_prefix_ids,
+        *_selection_prelocked_context(
+            normalized_locked_prefix_ids,
+            reels_by_id,
+        ),
+    }
     by_source: dict[str, list[tuple[float, int, str]]] = {}
     for input_index, (reel_id, reel) in enumerate(reels_by_id.items()):
         source_id = _source_video_id(reel)
@@ -3789,7 +4109,12 @@ def _preserves_source_chronology(
     selected = set(ordered_ids)
     for source_reels in by_source.values():
         expected = [
-            item[2] for item in sorted(source_reels) if item[2] in selected
+            item[2]
+            for item in sorted(source_reels)
+            if (
+                item[2] in selected
+                and item[2] not in satisfied_context_ids
+            )
         ]
         if not _source_requires_hard_chronology(expected, reels_by_id):
             continue
@@ -3802,7 +4127,21 @@ def _preserves_source_chronology(
 def _preserves_declared_dependencies(
     ordered_ids: Sequence[str],
     reels_by_id: Mapping[str, Mapping[str, Any]],
+    *,
+    locked_prefix_reel_ids: Sequence[str] = (),
 ) -> bool:
+    normalized_locked_prefix_ids = list(dict.fromkeys(
+        reel_id
+        for value in locked_prefix_reel_ids
+        if (reel_id := _opaque_id(value)) in reels_by_id
+    ))
+    satisfied_context_ids = {
+        *normalized_locked_prefix_ids,
+        *_selection_prelocked_context(
+            normalized_locked_prefix_ids,
+            reels_by_id,
+        ),
+    }
     output_position = {reel_id: index for index, reel_id in enumerate(ordered_ids)}
     candidate_aliases = {
         candidate_id: reel_id
@@ -3830,7 +4169,7 @@ def _preserves_declared_dependencies(
         )
         if chain_id and chain_position is not None:
             chains.setdefault(chain_id, []).append((chain_position, reel_id))
-        if reel_id not in selected:
+        if reel_id not in selected or reel_id in satisfied_context_ids:
             continue
         for prerequisite in _id_list(
             reel.get("prerequisite_ids")
@@ -3839,6 +4178,7 @@ def _preserves_declared_dependencies(
             prerequisite_reel_id = candidate_aliases.get(prerequisite)
             if (
                 prerequisite_reel_id
+                and prerequisite_reel_id not in satisfied_context_ids
                 and (
                     prerequisite_reel_id not in selected
                     or output_position[prerequisite_reel_id]
@@ -3848,7 +4188,11 @@ def _preserves_declared_dependencies(
                 return False
 
     for members in chains.values():
-        expected = [item[1] for item in sorted(members, key=lambda item: item[0])]
+        expected = [
+            item[1]
+            for item in sorted(members, key=lambda item: item[0])
+            if item[1] not in satisfied_context_ids
+        ]
         selected_members = [reel_id for reel_id in expected if reel_id in selected]
         if selected_members and selected_members != expected[: len(selected_members)]:
             return False
@@ -3928,6 +4272,7 @@ def _read_cached_lesson_order(
     has_prior_objective_evidence: bool,
     release_limit: int | None = None,
     required_reel_ids: Sequence[str] | None = None,
+    locked_prefix_reel_ids: Sequence[str] | None = None,
 ) -> LessonOrderResult | None:
     try:
         with get_conn() as conn:
@@ -3990,10 +4335,20 @@ def _read_cached_lesson_order(
         return None
     terminal_summary_start = raw_terminal_summary_start
     reels_by_id = dict(zip(reel_ids, original, strict=True))
+    forbidden_prelocked_tail_ids = _forbidden_prelocked_tail_ids(
+        locked_prefix_reel_ids or (),
+        required_reel_ids or (),
+        reels_by_id,
+    )
     if (
         len(ordered_ids) > _effective_release_limit(release_limit, len(original))
         or not _valid_selected_order(ordered_ids, reel_ids)
         or not set(required_reel_ids or ()).issubset(ordered_ids)
+        or not _has_exact_locked_prefix(
+            ordered_ids,
+            locked_prefix_reel_ids or (),
+        )
+        or bool(set(ordered_ids) & forbidden_prelocked_tail_ids)
         or not _valid_assessment_checkpoints(checkpoint_ids, ordered_ids)
         or not _valid_prior_restatements(
             prior_restatement_ids,
@@ -4033,8 +4388,21 @@ def _read_cached_lesson_order(
     )
     if (
         not set(required_reel_ids or ()).issubset(ordered_ids)
-        or not _preserves_source_chronology(ordered_ids, reels_by_id)
-        or not _preserves_declared_dependencies(ordered_ids, reels_by_id)
+        or not _has_exact_locked_prefix(
+            ordered_ids,
+            locked_prefix_reel_ids or (),
+        )
+        or bool(set(ordered_ids) & forbidden_prelocked_tail_ids)
+        or not _preserves_source_chronology(
+            ordered_ids,
+            reels_by_id,
+            locked_prefix_reel_ids=locked_prefix_reel_ids or (),
+        )
+        or not _preserves_declared_dependencies(
+            ordered_ids,
+            reels_by_id,
+            locked_prefix_reel_ids=locked_prefix_reel_ids or (),
+        )
     ):
         return None
     record_cache_hit = getattr(generation_context, "record_cache_hit", None)
@@ -4117,6 +4485,7 @@ def _order_lesson_batch(
     concept_signals: Mapping[str, Mapping[str, Any]] | None = None,
     release_limit: int | None = None,
     required_reel_ids: Sequence[str] | None = None,
+    locked_prefix_reel_ids: Sequence[str] | None = None,
     prior_concept_coverage: Sequence[Mapping[str, Any]] | None = None,
     recent_prior_objective_coverage: Sequence[Mapping[str, Any]] | None = None,
     should_cancel: Callable[[], bool] | None = None,
@@ -4144,13 +4513,22 @@ def _order_lesson_batch(
             provider_called=False,
             topic=topic,
             release_limit=release_limit,
+            locked_prefix_reel_ids=locked_prefix_reel_ids or (),
         )
-    normalized_required_reel_ids = list(dict.fromkeys(
-        _opaque_id(value) for value in required_reel_ids or ()
+    normalized_locked_prefix_reel_ids = list(dict.fromkeys(
+        _opaque_id(value) for value in locked_prefix_reel_ids or ()
     ))
+    normalized_required_reel_ids = list(dict.fromkeys([
+        *(_opaque_id(value) for value in required_reel_ids or ()),
+        *normalized_locked_prefix_reel_ids,
+    ]))
     if (
         any(not reel_id for reel_id in normalized_required_reel_ids)
         or not set(normalized_required_reel_ids).issubset(reel_ids)
+        or any(not reel_id for reel_id in normalized_locked_prefix_reel_ids)
+        or not set(normalized_locked_prefix_reel_ids).issubset(
+            normalized_required_reel_ids
+        )
     ):
         return _fallback(
             original,
@@ -4160,6 +4538,7 @@ def _order_lesson_batch(
             provider_called=False,
             topic=topic,
             release_limit=release_limit,
+            locked_prefix_reel_ids=normalized_locked_prefix_reel_ids,
         )
     effective_release_limit = _effective_release_limit(
         release_limit,
@@ -4175,6 +4554,7 @@ def _order_lesson_batch(
             concept_signals=concept_signals,
             release_limit=effective_release_limit,
             required_reel_ids=normalized_required_reel_ids,
+            locked_prefix_reel_ids=normalized_locked_prefix_reel_ids,
             prior_concept_coverage=prior_concept_coverage,
             recent_prior_objective_coverage=recent_prior_objective_coverage,
         )
@@ -4194,6 +4574,7 @@ def _order_lesson_batch(
             has_prior_objective_evidence=has_prior_objective_evidence,
             release_limit=effective_release_limit,
             required_reel_ids=normalized_required_reel_ids,
+            locked_prefix_reel_ids=normalized_locked_prefix_reel_ids,
         )
         raise_if_cancelled(should_cancel)
         if cached is not None:
@@ -4221,6 +4602,7 @@ def _order_lesson_batch(
                 has_prior_objective_evidence=has_prior_objective_evidence,
                 release_limit=effective_release_limit,
                 required_reel_ids=normalized_required_reel_ids,
+                locked_prefix_reel_ids=normalized_locked_prefix_reel_ids,
             )
             raise_if_cancelled(should_cancel)
             if cached is not None:
@@ -4233,6 +4615,7 @@ def _order_lesson_batch(
                 concept_signals=concept_signals,
                 release_limit=effective_release_limit,
                 required_reel_ids=normalized_required_reel_ids,
+                locked_prefix_reel_ids=normalized_locked_prefix_reel_ids,
                 prior_concept_coverage=prior_concept_coverage,
                 recent_prior_objective_coverage=(
                     recent_prior_objective_coverage
@@ -4247,6 +4630,11 @@ def _order_lesson_batch(
                 ),
             )
     reels_by_id = dict(zip(reel_ids, original, strict=True))
+    forbidden_prelocked_tail_ids = _forbidden_prelocked_tail_ids(
+        normalized_locked_prefix_reel_ids,
+        normalized_required_reel_ids,
+        reels_by_id,
+    )
     last_reason = "provider_call_failed"
     last_model_used = config.LESSON_ORDER_MODEL
     last_telemetry: gemini_client.GeminiCallTelemetry | None = None
@@ -4488,6 +4876,8 @@ def _order_lesson_batch(
             required_reel_ids=normalized_required_reel_ids,
             release_limit=effective_release_limit,
             has_prior_objective_evidence=has_prior_objective_evidence,
+            locked_prefix_reel_ids=normalized_locked_prefix_reel_ids,
+            forbidden_prelocked_tail_ids=forbidden_prelocked_tail_ids,
         )
         validation_repairs: list[str] = []
         selection_shape_valid = (
@@ -4504,14 +4894,23 @@ def _order_lesson_batch(
                 before_ids=before_overlap_ids,
                 after_ids=filtered_ids,
             )
-            if not _preserves_source_chronology(filtered_ids, reels_by_id):
+            if not _preserves_source_chronology(
+                filtered_ids,
+                reels_by_id,
+                locked_prefix_reel_ids=normalized_locked_prefix_reel_ids,
+            ):
                 validation_failures.append("source_chronology_invalid")
-            if not _preserves_declared_dependencies(filtered_ids, reels_by_id):
+            if not _preserves_declared_dependencies(
+                filtered_ids,
+                reels_by_id,
+                locked_prefix_reel_ids=normalized_locked_prefix_reel_ids,
+            ):
                 validation_failures.append("dependencies_invalid")
             _, constraint_ordered_ids = _constraint_safe_fallback_order(
                 [reels_by_id[reel_id] for reel_id in filtered_ids],
                 filtered_ids,
                 preferred_ids=filtered_ids,
+                locked_prefix_reel_ids=normalized_locked_prefix_reel_ids,
             )
             if constraint_ordered_ids != filtered_ids:
                 validation_repairs.append("trusted_curriculum_order")
@@ -4556,6 +4955,7 @@ def _order_lesson_batch(
                 release_limit=effective_release_limit,
                 required_reel_ids=normalized_required_reel_ids,
                 has_prior_objective_evidence=has_prior_objective_evidence,
+                locked_prefix_reel_ids=normalized_locked_prefix_reel_ids,
             )
             if salvaged is not None:
                 validation_repairs = list(dict.fromkeys(validation_failures))
@@ -4668,6 +5068,7 @@ def _order_lesson_batch(
         preferred_ids=(preferred_ids if not normalized_required_reel_ids else ()),
         release_limit=effective_release_limit,
         required_reel_ids=normalized_required_reel_ids,
+        locked_prefix_reel_ids=normalized_locked_prefix_reel_ids,
     )
 
 
@@ -4681,6 +5082,7 @@ def order_lesson_batch(
     remediation_concept_ids: Sequence[str] | None = None,
     release_limit: int | None = None,
     required_reel_ids: Sequence[str] | None = None,
+    locked_prefix_reel_ids: Sequence[str] | None = None,
     prior_concept_coverage: Sequence[Mapping[str, Any]] | None = None,
     recent_prior_objective_coverage: Sequence[Mapping[str, Any]] | None = None,
     should_cancel: Callable[[], bool] | None = None,
@@ -4694,6 +5096,7 @@ def order_lesson_batch(
         concept_signals=concept_signals,
         release_limit=release_limit,
         required_reel_ids=required_reel_ids,
+        locked_prefix_reel_ids=locked_prefix_reel_ids,
         prior_concept_coverage=prior_concept_coverage,
         recent_prior_objective_coverage=recent_prior_objective_coverage,
         should_cancel=should_cancel,
@@ -4706,6 +5109,7 @@ def order_lesson_batch(
         remediation_concept_ids=remediation_concept_ids,
         release_limit=release_limit,
         required_reel_ids=required_reel_ids,
+        locked_prefix_reel_ids=locked_prefix_reel_ids,
         prior_concept_coverage=prior_concept_coverage,
         recent_prior_objective_coverage=recent_prior_objective_coverage,
     )

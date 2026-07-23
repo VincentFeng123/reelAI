@@ -26,6 +26,10 @@ from ..db import (
 from ..clip_engine.errors import CancellationError, ProviderError
 
 
+# A rendered reel can report this tiny, non-completion fraction asynchronously so
+# the running lesson organizer knows which streamed candidates may already be in
+# the immutable viewport prefix. Quiz cadence still uses scrolls and completion.
+ACTIVE_REEL_OPEN_FRACTION = 0.001
 COMPLETION_FRACTION = 0.80
 # Compatibility for reels with no version-2 organizer metadata at all.
 LEGACY_CADENCE_TARGET = 3

@@ -19,6 +19,7 @@ from backend.app import main
 from backend.app.clip_engine import segment_cache
 from backend.app.clip_engine import silence as clip_engine_silence
 from backend.app.clip_engine.errors import (
+    ProviderBudgetExceededError,
     ProviderQuotaError,
     ProviderRateLimitError,
     ProviderResponseValidationError,
@@ -1726,6 +1727,300 @@ def test_semantic_family_metadata_keeps_fingerprint_exact_but_propagates_to_orga
         conn.close()
 
 
+def test_af_281_feedback_and_quiz_source_reels_reach_organizer_history() -> None:
+    conn = _conn()
+    learner_id = "owner:semantic-signal-history"
+    try:
+        db._migrate_reel_feedback_uniqueness_sqlite(conn)
+        for concept_id, title in (
+            ("c2", "Duty and breach"),
+            ("c3", "Proximate cause in tort law"),
+        ):
+            conn.execute(
+                "INSERT INTO concepts "
+                "(id, material_id, title, keywords_json, summary, created_at) "
+                "VALUES (?, 'm1', ?, '[]', ?, '2026-07-10T00:00:00+00:00')",
+                (concept_id, title, title),
+            )
+
+        source_rows = (
+            (
+                "helpful-remoteness",
+                "helpful-video",
+                "c1",
+                "proximate causation",
+                "remoteness and reasonable foreseeability",
+                (
+                    "Proximate causation limits liability to consequences that "
+                    "were reasonably foreseeable rather than too remote."
+                ),
+            ),
+            (
+                "quiz-breach",
+                "quiz-video",
+                "c2",
+                "breach of duty",
+                "reasonable-person breach analysis",
+                (
+                    "Breach asks whether the defendant fell below the care a "
+                    "reasonable person would exercise in the circumstances."
+                ),
+            ),
+        )
+        for (
+            reel_id,
+            video_id,
+            concept_id,
+            concept_family,
+            clip_concept,
+            objective,
+        ) in source_rows:
+            conn.execute(
+                "INSERT INTO videos "
+                "(id, title, channel_title, duration_sec, created_at) "
+                "VALUES (?, ?, 'Law channel', 300, '2026-07-10T00:00:01+00:00')",
+                (video_id, clip_concept),
+            )
+            conn.execute(
+                "INSERT INTO reels "
+                "(id, material_id, concept_id, video_id, video_url, t_start, "
+                "t_end, transcript_snippet, ai_summary, takeaways_json, "
+                "base_score, difficulty, search_context_json, created_at) "
+                "VALUES (?, 'm1', ?, ?, '', 10, 40, ?, ?, '[]', 1.0, 0.5, ?, "
+                "'2026-07-10T00:00:02+00:00')",
+                (
+                    reel_id,
+                    concept_id,
+                    video_id,
+                    objective,
+                    objective,
+                    json.dumps({
+                        "selection_contract_version": "quality_silence_v41",
+                        "selection_authority": "gemini",
+                        "concept_family_contract_version": "concept_family_v3",
+                        "concept_family": concept_family,
+                        "concept_aliases": [],
+                        "clip_concept_raw": clip_concept,
+                    }),
+                ),
+            )
+
+        main.reel_service.record_feedback(
+            conn,
+            "helpful-remoteness",
+            helpful=True,
+            confusing=False,
+            rating=None,
+            saved=False,
+            learner_id=learner_id,
+        )
+        conn.execute(
+            "UPDATE reel_feedback SET mastery_updated_at = ?, updated_at = ? "
+            "WHERE learner_id = ? AND reel_id = 'helpful-remoteness'",
+            (
+                "2026-07-20T00:00:00+00:00",
+                "2026-07-20T00:00:00+00:00",
+                learner_id,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO assessment_sessions "
+            "(id, learner_id, material_id, status, current_index, "
+            "question_count, correct_count, information_units, "
+            "readiness_threshold, created_at, updated_at, completed_at) "
+            "VALUES ('semantic-signal-quiz', ?, 'm1', 'completed', 1, 1, 0, "
+            "3.5, 3.5, ?, ?, ?)",
+            (
+                learner_id,
+                "2026-07-21T00:00:00+00:00",
+                "2026-07-21T00:00:00+00:00",
+                "2026-07-21T00:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO assessment_concept_outcomes "
+            "(learner_id, session_id, material_id, concept_id, question_count, "
+            "correct_count, accuracy, adjustment, source_reel_id, "
+            "source_video_id, source_difficulty, created_at) "
+            "VALUES (?, 'semantic-signal-quiz', 'm1', 'c2', 1, 0, 0.0, "
+            "-0.12, 'quiz-breach', 'quiz-video', 0.5, ?)",
+            (learner_id, "2026-07-21T00:00:00+00:00"),
+        )
+
+        assert main._learner_signal_reel_ids(
+            conn,
+            material_id="m1",
+            learner_id=learner_id,
+        ) == ["helpful-remoteness", "quiz-breach"]
+
+        prior_coverage, recent_coverage = main._lesson_prior_coverage(
+            conn,
+            material_id="m1",
+            reel_ids=main._learner_signal_reel_ids(
+                conn,
+                material_id="m1",
+                learner_id=learner_id,
+            ),
+        )
+        concept_signals = main._learner_concept_signals(
+            conn,
+            material_id="m1",
+            learner_id=learner_id,
+        )
+        prompt = lesson_ordering._user_prompt(
+            [{
+                "reel_id": "new-proximate-candidate",
+                "concept_id": "c3",
+                "_selection_concept": "proximate cause in tort law",
+                "_selection_concept_family": "proximate cause in tort law",
+                "ai_summary": (
+                    "Explains the foreseeability limit on proximate cause."
+                ),
+            }],
+            topic="Teach negligence from duty through proximate causation.",
+            learner_level="beginner",
+            concept_signals=concept_signals,
+            prior_concept_coverage=prior_coverage,
+            recent_prior_objective_coverage=recent_coverage,
+        )
+        learning_payload = json.loads(
+            prompt.split("LEARNING_REQUEST_JSON:\n", 1)[1].split(
+                "\n\nCLIPS_JSON:\n", 1
+            )[0]
+        )
+        prior_by_family = {
+            item["concept_family"]: item
+            for item in learning_payload["prior_concept_coverage"]
+        }
+        assert prior_by_family["proximate causation"]["learner_signal"] == {
+            "helpful": 1.0,
+            "confusing": 0.0,
+            "adjustment": 0.0,
+        }
+        assert (
+            prior_by_family["proximate causation"]["learning_objective_excerpts"]
+            == [
+                "Proximate causation limits liability to consequences that "
+                "were reasonably foreseeable rather than too remote."
+            ]
+        )
+        assert prior_by_family["breach of duty"]["learner_signal"] == {
+            "helpful": 0.0,
+            "confusing": 1.0,
+            "adjustment": 0.0,
+        }
+        clips_payload = json.loads(
+            prompt.split("CLIPS_JSON:\n", 1)[1].split(
+                "\n\nFinal request:", 1
+            )[0]
+        )
+        assert clips_payload["clips"][0]["concept_title"] == (
+            "proximate cause in tort law"
+        )
+        assert clips_payload["clips"][0]["learner_signal"] == {
+            "helpful": 0.0,
+            "confusing": 0.0,
+            "adjustment": 0.0,
+        }
+    finally:
+        conn.close()
+
+
+def test_af_281_recent_quiz_refreshes_same_reel_inside_bounded_history() -> None:
+    conn = _conn()
+    learner_id = "owner:bounded-semantic-signal-history"
+    try:
+        db._migrate_reel_feedback_uniqueness_sqlite(conn)
+        base_time = datetime(2026, 7, 20, tzinfo=timezone.utc)
+        reel_ids = [
+            f"bounded-signal-reel-{index}"
+            for index in range(main.LESSON_SIGNAL_HISTORY_LIMIT + 1)
+        ]
+        conn.executemany(
+            "INSERT INTO videos "
+            "(id, title, channel_title, duration_sec, created_at) "
+            "VALUES (?, ?, 'Test', 120, ?)",
+            [
+                (
+                    f"bounded-signal-video-{index}",
+                    f"Bounded signal video {index}",
+                    (base_time + timedelta(seconds=index)).isoformat(),
+                )
+                for index, _reel_id in enumerate(reel_ids)
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO reels "
+            "(id, material_id, concept_id, video_id, video_url, t_start, "
+            "t_end, transcript_snippet, takeaways_json, base_score, "
+            "difficulty, created_at) "
+            "VALUES (?, 'm1', 'c1', ?, '', 0, 20, 'Learning evidence', "
+            "'[]', 1.0, 0.5, ?)",
+            [
+                (
+                    reel_id,
+                    f"bounded-signal-video-{index}",
+                    (base_time + timedelta(seconds=index)).isoformat(),
+                )
+                for index, reel_id in enumerate(reel_ids)
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO reel_feedback "
+            "(id, learner_id, reel_id, helpful, confusing, rating, saved, "
+            "mastery_updated_at, updated_at, created_at) "
+            "VALUES (?, ?, ?, 1, 0, NULL, 0, ?, ?, ?)",
+            [
+                (
+                    f"bounded-feedback-{index}",
+                    learner_id,
+                    reel_id,
+                    signal_at,
+                    signal_at,
+                    signal_at,
+                )
+                for index, reel_id in enumerate(reel_ids)
+                for signal_at in [
+                    (base_time + timedelta(seconds=index)).isoformat()
+                ]
+            ],
+        )
+        quiz_time = (
+            base_time + timedelta(seconds=len(reel_ids) + 10)
+        ).isoformat()
+        conn.execute(
+            "INSERT INTO assessment_sessions "
+            "(id, learner_id, material_id, status, current_index, "
+            "question_count, correct_count, information_units, "
+            "readiness_threshold, created_at, updated_at, completed_at) "
+            "VALUES ('bounded-signal-quiz', ?, 'm1', 'completed', 1, 1, 1, "
+            "3.5, 3.5, ?, ?, ?)",
+            (learner_id, quiz_time, quiz_time, quiz_time),
+        )
+        conn.execute(
+            "INSERT INTO assessment_concept_outcomes "
+            "(learner_id, session_id, material_id, concept_id, question_count, "
+            "correct_count, accuracy, adjustment, source_reel_id, "
+            "source_video_id, source_difficulty, created_at) "
+            "VALUES (?, 'bounded-signal-quiz', 'm1', 'c1', 1, 1, 1.0, 0.08, "
+            "?, 'bounded-signal-video-0', 0.5, ?)",
+            (learner_id, reel_ids[0], quiz_time),
+        )
+
+        bounded = main._learner_signal_reel_ids(
+            conn,
+            material_id="m1",
+            learner_id=learner_id,
+        )
+
+        assert len(bounded) == main.LESSON_SIGNAL_HISTORY_LIMIT
+        assert reel_ids[0] == bounded[-1]
+        assert reel_ids[1] not in bounded
+        assert bounded[0] == reel_ids[2]
+    finally:
+        conn.close()
+
+
 def test_organizer_adaptation_ignores_explicit_stale_family_provenance() -> None:
     conn = _conn()
     learner_id = "owner:family-rollout"
@@ -2292,6 +2587,192 @@ def test_persisted_lesson_order_projects_onto_remaining_unseen_reels() -> None:
         conn.close()
 
 
+def test_active_open_fraction_does_not_change_seen_quiz_or_mastery_state() -> None:
+    conn = _conn()
+    learner_id = "owner:active-open-invariants"
+    try:
+        generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key="active-open-invariants",
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        _insert_generation_reel(
+            conn,
+            generation_id=generation_id,
+            reel_id="active-open-reel",
+            video_id="active-open-video",
+            created_at="2026-07-23T12:00:00+00:00",
+        )
+        before = dict(
+            main.reel_service.learner_progress(conn, "m1", learner_id)
+        )
+
+        result = main.assessment_service.record_progress(
+            conn,
+            learner_id=learner_id,
+            reel_id="active-open-reel",
+            max_fraction=main.ACTIVE_REEL_OPEN_FRACTION,
+        )
+
+        row = conn.execute(
+            "SELECT max_fraction, scrolled_at, completed_at "
+            "FROM learner_reel_progress "
+            "WHERE learner_id = ? AND reel_id = 'active-open-reel'",
+            (learner_id,),
+        ).fetchone()
+        after = dict(
+            main.reel_service.learner_progress(conn, "m1", learner_id)
+        )
+        readiness = main.assessment_service._readiness_state(
+            conn,
+            learner_id,
+            "m1",
+        )
+        assert float(row["max_fraction"]) == pytest.approx(
+            main.ACTIVE_REEL_OPEN_FRACTION
+        )
+        assert row["scrolled_at"] is None
+        assert row["completed_at"] is None
+        assert result["completed"] is False
+        assert result["assessment_ready"] is False
+        assert readiness["scroll_count"] == 0
+        assert readiness["assessment_ready"] is False
+        assert main._learner_seen_reel_ids(
+            conn,
+            material_id="m1",
+            learner_id=learner_id,
+        ) == set()
+        assert after["feedback_revision"] == before["feedback_revision"] == 0
+        assert float(after["global_adjustment"]) == pytest.approx(
+            float(before["global_adjustment"])
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_feedback WHERE learner_id = ?",
+            (learner_id,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM assessment_concept_outcomes "
+            "WHERE learner_id = ?",
+            (learner_id,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_live_candidate_prefix_uses_job_scoped_membership_and_emission_order() -> None:
+    conn = _conn()
+    learner_id = "owner:active-prefix"
+    job_started_at = "2026-07-23T12:00:00+00:00"
+    try:
+        generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key="active-prefix-membership",
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        for index, reel_id in enumerate(
+            ("late-first", "foundation-second", "other-generation")
+        ):
+            _insert_generation_reel(
+                conn,
+                generation_id=generation_id,
+                reel_id=reel_id,
+                video_id=f"active-prefix-video-{index}",
+                created_at=f"2026-07-23T12:00:0{index}+00:00",
+            )
+
+        # The second request may commit before the first; reconstruction must
+        # still follow the server's durable candidate emission order.
+        for reel_id, updated_at in (
+            ("late-first", "2026-07-23T12:00:04+00:00"),
+            ("foundation-second", "2026-07-23T12:00:03+00:00"),
+            ("other-generation", "2026-07-23T12:00:05+00:00"),
+        ):
+            conn.execute(
+                "INSERT INTO learner_reel_progress "
+                "(learner_id, reel_id, material_id, max_fraction, "
+                "scrolled_at, completed_at, created_at, updated_at) "
+                "VALUES (?, ?, 'm1', ?, NULL, NULL, ?, ?)",
+                (
+                    learner_id,
+                    reel_id,
+                    main.ACTIVE_REEL_OPEN_FRACTION,
+                    updated_at,
+                    updated_at,
+                ),
+            )
+
+        assert main._live_candidate_locked_prefix_ids(
+            conn,
+            material_id="m1",
+            learner_id=learner_id,
+            candidate_reel_ids=["late-first", "foundation-second"],
+            job_started_at=job_started_at,
+        ) == ["late-first", "foundation-second"]
+
+        conn.execute(
+            "UPDATE learner_reel_progress SET updated_at = ? "
+            "WHERE learner_id = ? AND reel_id = 'foundation-second'",
+            ("2026-07-23T11:59:59+00:00", learner_id),
+        )
+        assert main._live_candidate_locked_prefix_ids(
+            conn,
+            material_id="m1",
+            learner_id=learner_id,
+            candidate_reel_ids=["late-first", "foundation-second"],
+            job_started_at=job_started_at,
+        ) == ["late-first"]
+        conn.execute(
+            "UPDATE learner_reel_progress SET updated_at = ? "
+            "WHERE learner_id = ? AND reel_id = 'foundation-second'",
+            ("2026-07-23T12:00:03+00:00", learner_id),
+        )
+
+        # A signal for the second member proves the sequential client reached
+        # the whole emitted prefix even if the first async write was lost.
+        conn.execute(
+            "DELETE FROM learner_reel_progress "
+            "WHERE learner_id = ? AND reel_id = 'late-first'",
+            (learner_id,),
+        )
+        assert main._live_candidate_locked_prefix_ids(
+            conn,
+            material_id="m1",
+            learner_id=learner_id,
+            candidate_reel_ids=["late-first", "foundation-second"],
+            job_started_at=job_started_at,
+        ) == ["late-first", "foundation-second"]
+
+        # Progress before this job and a current-time signal for an ID outside
+        # this job's candidate set are both ignored.
+        conn.execute(
+            "UPDATE learner_reel_progress SET updated_at = ? "
+            "WHERE learner_id = ? AND reel_id = 'foundation-second'",
+            ("2026-07-23T11:59:59+00:00", learner_id),
+        )
+        assert main._live_candidate_locked_prefix_ids(
+            conn,
+            material_id="m1",
+            learner_id=learner_id,
+            candidate_reel_ids=["late-first", "foundation-second"],
+            job_started_at=job_started_at,
+        ) == []
+        assert main._live_candidate_locked_prefix_ids(
+            conn,
+            material_id="m1",
+            learner_id=learner_id,
+            candidate_reel_ids=["late-first", "foundation-second"],
+            job_started_at="",
+        ) == []
+    finally:
+        conn.close()
+
+
 def _released_empty_generation_chain(
     conn: sqlite3.Connection,
     *,
@@ -2419,6 +2900,19 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
         "_selection_intent_coverage": 0.9,
         "_selection_directly_teaches_topic": True,
     }
+    signal_history = [{
+        "concept_id": "feedback-concept",
+        "concept_family": "feedback family",
+        "concept_title": "Feedback source concept",
+        "learning_objective_excerpts": ["Previously rated learning objective."],
+        "delivered_count": 1,
+    }]
+    locked_prefix_ids = (
+        ["release-reel-0", "release-reel-1"]
+        if suffix == "selected"
+        else []
+    )
+    lesson_history_reel_ids: list[list[str]] = []
     signal_propagation_calls: list[bool] = []
     adaptation_fingerprint = hashlib.sha256(
         json.dumps(concept_signals, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -2460,12 +2954,18 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
                 reel.update(trusted_organizer_fields)
                 reel["_selection_untrusted_private_field"] = "strip-me"
             generated.append(reel)
+            if locked_prefix_ids:
+                kwargs["on_reel_created"](reel)
 
     def order_batch(reels, **kwargs):
         assert kwargs["topic"] == "Cell biology"
         assert kwargs["concept_signals"] == {
             "c1": {"helpful": 1.0, "confusing": 0.0, "adjustment": 0.04}
         }
+        assert kwargs["prior_concept_coverage"] == signal_history
+        assert kwargs["recent_prior_objective_coverage"] == []
+        assert kwargs["locked_prefix_reel_ids"] == locked_prefix_ids
+        assert kwargs["required_reel_ids"] == locked_prefix_ids
         organizer_reel = next(
             reel for reel in reels if reel["reel_id"] == "release-reel-0"
         )
@@ -2494,7 +2994,14 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
         preparation_calls.append(kwargs)
         assert kwargs["reel_ids"] == ["release-reel-1"]
         assert kwargs["use_model"] is False
-        assert generation_jobs.replay_events(conn, job_id=job["id"]) == []
+        events_before_release = generation_jobs.replay_events(
+            conn, job_id=job["id"]
+        )
+        assert [event["type"] for event in events_before_release] == (
+            ["candidate", "candidate", "candidate"]
+            if locked_prefix_ids
+            else []
+        )
         assert conn.execute(
             "SELECT COUNT(*) FROM reel_generation_heads"
         ).fetchone()[0] == 0
@@ -2505,7 +3012,11 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
     original_append = main.append_generation_event
 
     def append_after_preparation(worker_conn, **kwargs):
-        if checkpoint_ids and preparation_complete:
+        if (
+            kwargs["event_type"] == "final"
+            and checkpoint_ids
+            and preparation_complete
+        ):
             assert conn.execute(
                 "SELECT COUNT(*) FROM reel_assessment_questions"
             ).fetchone()[0] == 1
@@ -2529,6 +3040,35 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
         "_ranked_request_reels",
         lambda *_args, **_kwargs: list(generated),
     )
+    monkeypatch.setattr(
+        main,
+        "_learner_signal_reel_ids",
+        lambda *_args, **_kwargs: ["feedback-signal-reel"],
+    )
+
+    def lesson_history(*_args, **kwargs):
+        assert kwargs["material_id"] == "m1"
+        current_ids = list(kwargs["reel_ids"])
+        lesson_history_reel_ids.append(current_ids)
+        if not current_ids:
+            return [], []
+        assert current_ids == ["feedback-signal-reel"]
+        return signal_history, []
+
+    monkeypatch.setattr(main, "_lesson_prior_coverage", lesson_history)
+    monkeypatch.setattr(
+        main,
+        "_live_candidate_locked_prefix_ids",
+        lambda *_args, **kwargs: (
+            locked_prefix_ids
+            if kwargs["candidate_reel_ids"] == [
+                "release-reel-0",
+                "release-reel-1",
+                "release-reel-2",
+            ]
+            else []
+        ),
+    )
     monkeypatch.setattr(main, "order_lesson_batch", order_batch)
     monkeypatch.setattr(
         main.assessment_service,
@@ -2543,17 +3083,24 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
         completed = generation_jobs.get_job(conn, job["id"])
         assert completed is not None
         assert completed["status"] == "completed"
+        assert ["feedback-signal-reel"] in lesson_history_reel_ids
         assert True in signal_propagation_calls
         assert len(preparation_calls) == (1 if checkpoint_ids else 0)
         generation_row = main._fetch_generation_row(
             conn, str(completed["result_generation_id"])
         )
         metadata = json.loads(str(generation_row["lesson_order_json"]))
-        assert metadata["ordered_reel_ids"] == [
-            "release-reel-2",
-            "release-reel-1",
-            "release-reel-0",
-        ]
+        expected_order = (
+            ["release-reel-0", "release-reel-1", "release-reel-2"]
+            if locked_prefix_ids
+            else [
+                "release-reel-2",
+                "release-reel-1",
+                "release-reel-0",
+            ]
+        )
+        assert metadata["ordered_reel_ids"] == expected_order
+        assert metadata["locked_prefix_reel_ids"] == locked_prefix_ids
         assert metadata["assessment_checkpoint_reel_ids"] == (
             checkpoint_ids if preparation_complete else None
         )
@@ -2570,11 +3117,9 @@ def test_generation_prepares_only_organizer_checkpoints_before_release(
             for event in generation_jobs.replay_events(conn, job_id=job["id"])
             if event["type"] == "final"
         )
-        assert [reel["reel_id"] for reel in final["payload"]["reels"]] == [
-            "release-reel-2",
-            "release-reel-1",
-            "release-reel-0",
-        ]
+        assert [
+            reel["reel_id"] for reel in final["payload"]["reels"]
+        ] == expected_order
         public_reel = next(
             reel
             for reel in final["payload"]["reels"]
@@ -5545,9 +6090,18 @@ def test_reclaimed_lease_restores_gemini_exposure_from_durable_usage_ledger(
         failed = generation_jobs.get_job(conn, str(job["id"]))
         assert failed and failed["status"] == "failed"
         assert failed["attempt_count"] == 2
+        assert failed["max_attempts"] == 3
         assert failed["terminal_error_code"] == "provider_budget_exceeded"
+        assert generation_jobs.lease_job(
+            conn,
+            job_id=str(job["id"]),
+            lease_owner="provider-ledger-third-worker",
+            now=now + timedelta(seconds=3),
+        ) is None
         assert seen_exposure == [pytest.approx(restored_exposure)]
         usage = json.loads(str(failed["usage_json"] or "{}"))
+        assert usage["retry_errors"][-1]["code"] == "provider_budget_exceeded"
+        assert usage["retry_errors"][-1]["retryable"] is False
         gemini_budget = usage["budget"]["gemini"]
         assert gemini_budget["cost_exposure_usd"] == pytest.approx(
             restored_exposure
@@ -8888,6 +9442,252 @@ def test_partial_cross_request_startup_uses_fresh_bounded_source_budget(
         assert calls[0]["max_generation_videos"] == main.GENERATION_SOURCE_BUDGETS["fast"]
         assert calls[0]["max_new_reels"] == 6
         assert generation_jobs.get_job(conn, job["id"])["status"] == "partial"
+    finally:
+        conn.close()
+
+
+def test_provider_failure_reuses_valid_prior_unseen_inventory(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="provider-fallback-source",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    source_reel = _insert_generation_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel_id="provider-fallback-source-reel",
+        video_id="provider-fallback-source-video",
+        created_at=now.isoformat(),
+    )
+    _mark_generation_reel_as_gemini(
+        conn,
+        str(source_reel["reel_id"]),
+    )
+    source_job = _terminal_job_for_generation(
+        conn,
+        request_key="provider-fallback-source",
+        generation_id=source_generation_id,
+        completed_at=now.isoformat(),
+        request_params={"generation_mode": "slow", "num_reels": 1},
+    )
+    _append_authoritative_release(
+        conn,
+        job_id=str(source_job["id"]),
+        reel_ids=[str(source_reel["reel_id"])],
+    )
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="provider-fallback-current",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={
+            "generation_mode": "slow",
+            "num_reels": 2,
+            "fresh_source_budget": True,
+        },
+        source_generation_id=source_generation_id,
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=str(job["id"]),
+        lease_owner="provider-fallback-worker",
+        now=now,
+    )
+    assert leased
+    provider_error = ProviderBudgetExceededError(
+        "Clip selection budget was exhausted before dispatch.",
+        provider="gemini",
+        operation="segmentation",
+    )
+    retrieval = mock.Mock(side_effect=provider_error)
+    organizer_calls: list[list[str]] = []
+
+    def order_batch(reels, **kwargs):
+        reel_ids = [str(reel["reel_id"]) for reel in reels]
+        organizer_calls.append(reel_ids)
+        assert kwargs["required_reel_ids"] == [
+            "provider-fallback-source-reel"
+        ]
+        return mock.Mock(
+            reels=list(reels),
+            ordered_reel_ids=reel_ids,
+            assessment_checkpoint_reel_ids=[],
+            prior_restatement_reel_ids=[],
+            current_restatement_reel_ids=[],
+            terminal_summary_start_reel_id=None,
+            model_used=None,
+            degraded=True,
+            fallback_reason="provider_budget_exceeded",
+            provider_called=False,
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", retrieval)
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        completed = generation_jobs.get_job(conn, str(job["id"]))
+        assert completed is not None
+        assert completed["status"] == "partial"
+        assert completed["attempt_count"] == 1
+        assert completed["max_attempts"] == 3
+        assert completed["terminal_error_code"] is None
+        retrieval.assert_called_once()
+        assert organizer_calls == [["provider-fallback-source-reel"]]
+        usage = json.loads(str(completed["usage_json"] or "{}"))
+        assert usage["retry_errors"][-1] == provider_error.as_dict()
+        final = next(
+            event
+            for event in generation_jobs.replay_events(
+                conn,
+                job_id=str(job["id"]),
+            )
+            if event["type"] == "final"
+        )
+        assert final["payload"]["reels"] == []
+        assert final["payload"]["reconciliation_tail_reel_ids"] == [
+            "provider-fallback-source-reel"
+        ]
+        assert [
+            reel["reel_id"]
+            for reel in main._generation_job_reels(conn, completed)
+        ] == ["provider-fallback-source-reel"]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("selection_contract_version", "expected_status"),
+    [
+        (main.SELECTION_CONTRACT_VERSION, "partial"),
+        ("quality_silence_v40", "failed"),
+    ],
+)
+def test_provider_failure_reuses_only_current_contract_authoritative_inventory(
+    monkeypatch,
+    selection_contract_version: str,
+    expected_status: str,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key=f"provider-contract-fallback-{selection_contract_version}",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "slow", "num_reels": 2},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=str(job["id"]),
+        lease_owner=f"provider-contract-worker-{selection_contract_version}",
+        now=now,
+    )
+    assert leased
+    provider_error = ProviderBudgetExceededError(
+        "Clip selection budget was exhausted before dispatch.",
+        provider="gemini",
+        operation="segmentation",
+    )
+    organizer_calls: list[list[str]] = []
+
+    def fail_after_persisting_authoritative_reel(
+        worker_conn,
+        **kwargs,
+    ) -> None:
+        reel_id = f"provider-contract-reel-{selection_contract_version}"
+        reel = _insert_generation_reel(
+            worker_conn,
+            generation_id=str(kwargs["generation_id"]),
+            reel_id=reel_id,
+            video_id=f"provider-contract-video-{selection_contract_version}",
+            created_at=now.isoformat(),
+        )
+        _mark_generation_reel_as_gemini(
+            worker_conn,
+            str(reel["reel_id"]),
+        )
+        context = json.loads(str(worker_conn.execute(
+            "SELECT search_context_json FROM reels WHERE id = ?",
+            (reel_id,),
+        ).fetchone()[0]))
+        context["selection_contract_version"] = selection_contract_version
+        worker_conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = ?",
+            (json.dumps(context), reel_id),
+        )
+        raise provider_error
+
+    def order_batch(reels, **_kwargs):
+        reel_ids = [str(reel["reel_id"]) for reel in reels]
+        organizer_calls.append(reel_ids)
+        return mock.Mock(
+            reels=list(reels),
+            ordered_reel_ids=reel_ids,
+            assessment_checkpoint_reel_ids=[],
+            prior_restatement_reel_ids=[],
+            current_restatement_reel_ids=[],
+            terminal_summary_start_reel_id=None,
+            model_used=None,
+            degraded=True,
+            fallback_reason="provider_budget_exceeded",
+            provider_called=False,
+        )
+
+    retrieval = mock.Mock(side_effect=fail_after_persisting_authoritative_reel)
+    monkeypatch.setattr(main.reel_service, "generate_reels", retrieval)
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        terminal = generation_jobs.get_job(conn, str(job["id"]))
+        assert terminal is not None
+        assert terminal["status"] == expected_status
+        assert terminal["attempt_count"] == 1
+        assert terminal["max_attempts"] == 3
+        retrieval.assert_called_once()
+        generation_id = str(terminal["result_generation_id"])
+        assert main._count_generation_surfaceable_reels(
+            conn,
+            generation_id,
+        ) == 1
+        usage = json.loads(str(terminal["usage_json"] or "{}"))
+        assert usage["retry_errors"][-1] == provider_error.as_dict()
+        if selection_contract_version == main.SELECTION_CONTRACT_VERSION:
+            assert terminal["terminal_error_code"] is None
+            assert organizer_calls == [[
+                f"provider-contract-reel-{selection_contract_version}"
+            ]]
+            assert [
+                reel["reel_id"]
+                for reel in main._generation_job_reels(conn, terminal)
+            ] == [f"provider-contract-reel-{selection_contract_version}"]
+        else:
+            assert terminal["terminal_error_code"] == provider_error.code
+            assert organizer_calls == []
+            assert main._generation_job_reels(conn, terminal) == []
+            assert not any(
+                event["type"] == "final"
+                for event in generation_jobs.replay_events(
+                    conn,
+                    job_id=str(job["id"]),
+                )
+            )
     finally:
         conn.close()
 
