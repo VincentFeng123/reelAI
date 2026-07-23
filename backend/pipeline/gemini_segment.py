@@ -1813,6 +1813,7 @@ _PRICING_PER_MILLION = {
     "flash_lite": {"input": 0.25, "output": 1.50},
     "flash_preview": {"input": 0.50, "output": 3.00},
     "pro": {"input": 2.00, "output": 12.00},
+    "pro_25": {"input": 1.25, "output": 10.00},
 }
 _PRO_PRIORITY_BILLING_MULTIPLIER = 1.8
 
@@ -22236,6 +22237,11 @@ class GeminiTokenPreflightError(RuntimeError):
         thinking_level: str,
         retryable: bool,
         status_code: int | None,
+        dispatched: bool = False,
+        token_preflight_model: str | None = None,
+        failover_from_model: str | None = None,
+        failover_model: str | None = None,
+        failover_reason: str | None = None,
     ):
         super().__init__("Gemini token preflight was unavailable")
         self.telemetry = {
@@ -22246,11 +22252,20 @@ class GeminiTokenPreflightError(RuntimeError):
             "prompt_version": prompt_version,
             "thinking_level": thinking_level,
             "retryable": bool(retryable),
-            "dispatched": False,
+            "dispatched": bool(dispatched),
             "token_preflight_failed": True,
         }
         if status_code is not None:
             self.telemetry["provider_status_code"] = int(status_code)
+        if token_preflight_model:
+            self.telemetry["token_preflight_model"] = str(token_preflight_model)
+        if failover_from_model and failover_model and failover_reason:
+            self.telemetry.update({
+                "failover_from_model": str(failover_from_model),
+                "failover_model": str(failover_model),
+                "failover_reason": str(failover_reason),
+                "quality_degraded": True,
+            })
 
 
 def _telemetry_dict(value: object) -> dict:
@@ -22544,6 +22559,7 @@ def _call_model(
     use_full_transient_retry_budget: bool = False,
     retry_status_codes: frozenset[int] | set[int] | None = None,
     retry_service_tier: str | None = None,
+    transient_retry_model: str | None = None,
     failover_model: str | None = None,
     media_resolution=None,
     estimated_media_tokens: int = 0,
@@ -22551,7 +22567,7 @@ def _call_model(
 ) -> tuple[BaseModel, dict]:
     from ..gemini_client import (
         _gemini_status_code,
-        _transient_gemini_error,
+        _transient_token_count_error,
         count_request_tokens,
         generate_json_v3,
     )
@@ -22579,8 +22595,38 @@ def _call_model(
         cancelled=cancelled,
     )
     try:
+        primary_model = model
+        generation_model = model
+        generation_transient_retry_model = transient_retry_model
+        preflight_failover_fields: dict[str, object] = {}
         reservation: dict[str, object] = {}
         estimated_input_tokens: int | None = None
+        estimated_input_tokens_by_model: dict[str, int] = {}
+        exact_token_preflight_required = False
+
+        def model_identity(value: object) -> str:
+            return str(value or "").strip().rsplit("/", 1)[-1].casefold()
+
+        def exact_input_tokens(
+            candidate_model: str,
+            *,
+            count_deadline: float,
+        ) -> int:
+            remaining_s = max(0.0, count_deadline - time.monotonic())
+            if remaining_s < 1.0 or _cancel_requested(cancelled):
+                raise TimeoutError("token preflight deadline unavailable")
+            return count_request_tokens(
+                system,
+                prompt_user_text,
+                schema,
+                model=candidate_model,
+                timeout_s=min(10.0, remaining_s),
+                thinking_level=thinking_level,
+                max_output_tokens=max_output_tokens,
+                deadline_monotonic=count_deadline,
+                cancelled=cancelled,
+            )
+
         if callable(budget_reserve):
             schema_bytes = len(json.dumps(
                 schema.model_json_schema(),
@@ -22601,54 +22647,79 @@ def _call_model(
                 "candidate_tokens": max_output_tokens,
             })
             if conservative_uncomputed_cost > _MAX_UNCOUNTED_SELECTOR_COST_USD:
-                remaining_s = max(0.0, admission_deadline - time.monotonic())
-                if remaining_s >= 1.0 and not _cancel_requested(cancelled):
-                    try:
-                        estimated_text_tokens = count_request_tokens(
-                            system,
-                            prompt_user_text,
-                            schema,
-                            model=model,
-                            timeout_s=min(10.0, remaining_s),
-                            thinking_level=thinking_level,
-                            max_output_tokens=max_output_tokens,
-                            deadline_monotonic=admission_deadline,
-                            cancelled=cancelled,
-                        )
-                    except Exception as exc:
+                exact_token_preflight_required = True
+                try:
+                    estimated_text_tokens = exact_input_tokens(
+                        primary_model,
+                        count_deadline=admission_deadline,
+                    )
+                except Exception as exc:
+                    fallback_candidate = str(
+                        generation_transient_retry_model or ""
+                    ).strip()
+                    if (
+                        not fallback_candidate
+                        or not _transient_token_count_error(exc)
+                        or _cancel_requested(cancelled)
+                    ):
                         # Raw UTF-8 bytes are not tokens. Treating them as such
                         # can fabricate a >200k long-context price tier for an
                         # ordinary English transcript. Fail before generation
                         # with an explicit, retryable preflight error instead.
                         raise GeminiTokenPreflightError(
                             exc,
-                            model=model,
+                            model=primary_model,
                             operation=operation,
                             prompt_version=prompt_version,
                             thinking_level=thinking_level,
-                            retryable=_transient_gemini_error(exc),
+                            retryable=_transient_token_count_error(exc),
                             status_code=_gemini_status_code(exc),
+                            token_preflight_model=primary_model,
                         ) from exc
-                    # CountTokens receives the complete GenerateContentRequest,
-                    # including its system instruction and response schema. Its
-                    # server-side count chooses the price tier without a local
-                    # byte/token guess or an artificial post-count buffer.
-                    estimate_buffer_tokens = 0
-                else:
-                    raise GeminiTokenPreflightError(
-                        TimeoutError("token preflight deadline unavailable"),
-                        model=model,
-                        operation=operation,
-                        prompt_version=prompt_version,
-                        thinking_level=thinking_level,
-                        retryable=True,
-                        status_code=None,
-                    )
+                    try:
+                        estimated_text_tokens = exact_input_tokens(
+                            fallback_candidate,
+                            count_deadline=admission_deadline,
+                        )
+                    except Exception as fallback_exc:
+                        raise GeminiTokenPreflightError(
+                            fallback_exc,
+                            model=primary_model,
+                            operation=operation,
+                            prompt_version=prompt_version,
+                            thinking_level=thinking_level,
+                            retryable=_transient_token_count_error(fallback_exc),
+                            status_code=_gemini_status_code(fallback_exc),
+                            token_preflight_model=fallback_candidate,
+                            failover_from_model=primary_model,
+                            failover_model=fallback_candidate,
+                            failover_reason=(
+                                "primary_transient_token_preflight_error"
+                            ),
+                        ) from fallback_exc
+                    generation_model = fallback_candidate
+                    generation_transient_retry_model = None
+                    preflight_failover_fields = {
+                        "failover_from_model": primary_model,
+                        "failover_model": fallback_candidate,
+                        "failover_reason": (
+                            "primary_transient_token_preflight_error"
+                        ),
+                        "quality_degraded": True,
+                    }
+                # CountTokens receives the complete GenerateContentRequest,
+                # including its system instruction and response schema. Its
+                # server-side count chooses the price tier without a local
+                # byte/token guess or an artificial post-count buffer.
+                estimate_buffer_tokens = 0
             estimated_input_tokens = (
                 estimated_text_tokens
                 + estimate_buffer_tokens
                 + max(0, int(estimated_media_tokens))
             )
+            estimated_input_tokens_by_model[
+                model_identity(generation_model)
+            ] = estimated_input_tokens
 
         # A schema/contract retry is still the same logical selector for one
         # source.  Its caller can therefore request a cost-only ticket while
@@ -22663,12 +22734,66 @@ def _call_model(
             nonlocal logical_quota_reserved, reservation
             if not callable(budget_reserve):
                 return None
+            dispatch_estimated_input_tokens = estimated_input_tokens
+            model_key = model_identity(model)
+            if (
+                exact_token_preflight_required
+                and model_key not in estimated_input_tokens_by_model
+            ):
+                try:
+                    dispatch_estimated_input_tokens = (
+                        exact_input_tokens(
+                            model,
+                            count_deadline=(
+                                admission_deadline
+                                if attempt == 1
+                                else deadline_monotonic
+                            ),
+                        )
+                        + max(0, int(estimated_media_tokens))
+                    )
+                except Exception as exc:
+                    last_dispatched_model = str(
+                        last_physical_telemetry.get("model")
+                        or primary_model
+                    )
+                    is_model_failover = (
+                        model_identity(model)
+                        != model_identity(primary_model)
+                    )
+                    raise GeminiTokenPreflightError(
+                        exc,
+                        model=last_dispatched_model,
+                        operation=operation,
+                        prompt_version=prompt_version,
+                        thinking_level=thinking_level,
+                        retryable=_transient_token_count_error(exc),
+                        status_code=_gemini_status_code(exc),
+                        dispatched=physical_dispatches > 0,
+                        token_preflight_model=model,
+                        failover_from_model=(
+                            primary_model if is_model_failover else None
+                        ),
+                        failover_model=model if is_model_failover else None,
+                        failover_reason=(
+                            "primary_transient_transport_error"
+                            if is_model_failover
+                            else None
+                        ),
+                    ) from exc
+                estimated_input_tokens_by_model[model_key] = int(
+                    dispatch_estimated_input_tokens
+                )
+            elif model_key in estimated_input_tokens_by_model:
+                dispatch_estimated_input_tokens = (
+                    estimated_input_tokens_by_model[model_key]
+                )
             reserved = budget_reserve(
                 operation=operation,
                 model=model,
                 max_output_tokens=max_output_tokens,
                 prompt_text=prompt_text,
-                estimated_input_tokens=estimated_input_tokens,
+                estimated_input_tokens=dispatch_estimated_input_tokens,
                 max_physical_attempts=1,
                 count_logical_call=not logical_quota_reserved,
                 billing_cost_multiplier=(
@@ -22799,7 +22924,7 @@ def _call_model(
                     system,
                     user,
                     schema,
-                    model=model,
+                    model=generation_model,
                     thinking_level=thinking_level,
                     max_output_tokens=max_output_tokens,
                     timeout_s=timeout_s,
@@ -22815,6 +22940,7 @@ def _call_model(
                     ),
                     retry_status_codes=retry_status_codes,
                     retry_service_tier=retry_service_tier,
+                    transient_retry_model=generation_transient_retry_model,
                     cancelled=cancelled,
                     media_resolution=media_resolution,
                     before_dispatch=before_provider_dispatch,
@@ -22827,7 +22953,7 @@ def _call_model(
                 failover_reason = _flash_failover_reason(
                     primary_telemetry,
                     primary_exception=primary_exc,
-                    primary_model=model,
+                    primary_model=generation_model,
                     failover_model=failover_model,
                     operation=operation,
                     deadline_monotonic=deadline_monotonic,
@@ -22865,7 +22991,7 @@ def _call_model(
                         # not synthesize a fallback retry in the ledger.
                         failure_telemetry_override = {
                             **primary_telemetry,
-                            "failover_from_model": str(model),
+                            "failover_from_model": str(generation_model),
                             "failover_model": str(failover_model),
                             "failover_reason": failover_reason,
                             "failover_pre_dispatch_error": type(
@@ -22876,7 +23002,7 @@ def _call_model(
                         failure_telemetry_override = _merge_failover_telemetry(
                             primary_telemetry,
                             failover_telemetry,
-                            primary_model=model,
+                            primary_model=generation_model,
                             failover_model=str(failover_model),
                             failover_reason=failover_reason,
                             started=call_started,
@@ -22885,17 +23011,27 @@ def _call_model(
                 successful_telemetry = _merge_failover_telemetry(
                     primary_telemetry,
                     _telemetry_dict(result.telemetry),
-                    primary_model=model,
+                    primary_model=generation_model,
                     failover_model=str(failover_model),
                     failover_reason=failover_reason,
                     started=call_started,
                 )
+            if preflight_failover_fields and successful_telemetry is None:
+                successful_telemetry = {
+                    **_telemetry_dict(result.telemetry),
+                    **preflight_failover_fields,
+                }
         except Exception as exc:
             provider_telemetry = (
                 failure_telemetry_override
                 or _telemetry_dict(getattr(exc, "telemetry", None))
                 or dict(last_physical_telemetry)
             )
+            if preflight_failover_fields:
+                provider_telemetry = {
+                    **provider_telemetry,
+                    **preflight_failover_fields,
+                }
             provider_dispatched = provider_telemetry.get(
                 "dispatched", physical_dispatches > 0,
             )
@@ -22963,12 +23099,18 @@ def _model_cost(call: dict) -> float:
         tier = "flash_lite"
     elif "gemini-3-flash" in model and "gemini-3.5-flash" not in model:
         tier = "flash_preview"
+    elif "gemini-2.5-pro" in model:
+        tier = "pro_25"
     else:
         tier = "flash" if "flash" in model else "pro"
     rates = _PRICING_PER_MILLION[tier]
     prompt = int(call.get("prompt_tokens") or call.get("prompt_token_count") or 0)
-    if tier == "pro" and prompt > 200_000:
-        rates = {"input": 4.0, "output": 18.0}
+    if tier in {"pro", "pro_25"} and prompt > 200_000:
+        rates = (
+            {"input": 2.5, "output": 15.0}
+            if tier == "pro_25"
+            else {"input": 4.0, "output": 18.0}
+        )
     candidate = int(
         call.get("candidate_tokens") or call.get("candidates_token_count") or 0
     )
@@ -23357,6 +23499,7 @@ def _audit_pro_boundaries(
                     ),
                     use_full_transient_retry_budget=True,
                     retry_service_tier="priority",
+                    transient_retry_model=config.SEGMENT_PRO_FALLBACK_MODEL,
                     claim_logical_quota=(
                         _claim_logical_quota and structured_attempt == 1
                     ),
@@ -24338,6 +24481,11 @@ def _run_selection_profile(
             ),
             retry_service_tier=(
                 "priority" if profile == PRO_BOUNDARY_PROFILE else None
+            ),
+            transient_retry_model=(
+                config.SEGMENT_PRO_FALLBACK_MODEL
+                if profile == PRO_BOUNDARY_PROFILE
+                else None
             ),
             failover_model=(
                 config.SEGMENT_FLASH_FALLBACK_MODEL

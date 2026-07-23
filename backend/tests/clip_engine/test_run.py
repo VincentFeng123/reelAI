@@ -917,6 +917,32 @@ def test_flash_lite_failover_usage_preserves_attempts_and_degraded_status():
     assert usage["metadata"]["failover_reason"] == "primary_503_retry_exhausted"
 
 
+def test_stable_pro_failover_usage_is_marked_degraded():
+    context = GenerationContext("slow")
+    settings = {"generation_context": context}
+    run._wire_segment_runtime(settings, "video")
+
+    settings["_segment_telemetry"]({
+        "event": "model_call",
+        "operation": "pro_authoritative",
+        "model": "gemini-2.5-pro",
+        "prompt_tokens": 1_000,
+        "candidate_tokens": 100,
+        "thought_tokens": 20,
+        "total_tokens": 1_120,
+        "retries": 1,
+        "quality_degraded": True,
+        "failover_from_model": "gemini-3.1-pro-preview",
+        "failover_model": "gemini-2.5-pro",
+        "failover_reason": "primary_transient_transport_error",
+    })
+
+    usage = context.usage()[0]
+    assert usage["model_used"] == "gemini-2.5-pro"
+    assert usage["quality_degraded"] is True
+    assert usage["metadata"]["failover_model"] == "gemini-2.5-pro"
+
+
 def test_shadow_routing_bypasses_segment_cache(monkeypatch):
     transcript = {
         "segments": [{"start": 0.0, "end": 5.0, "text": "hello world"}],

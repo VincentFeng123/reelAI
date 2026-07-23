@@ -50,15 +50,15 @@ def test_lesson_order_model_never_consumes_pro_selector_budget(monkeypatch):
     with monkeypatch.context() as patch:
         patch.delenv("LESSON_ORDER_MODEL", raising=False)
         cfg = importlib.reload(importlib.import_module("backend.app.clip_engine.config"))
-        assert cfg.LESSON_ORDER_MODEL == "gemini-2.5-flash-lite"
+        assert cfg.LESSON_ORDER_MODEL == "gemini-2.5-flash"
 
         patch.setenv("LESSON_ORDER_MODEL", "gemini-3.1-pro-preview")
         cfg = importlib.reload(cfg)
-        assert cfg.LESSON_ORDER_MODEL == "gemini-2.5-flash-lite"
+        assert cfg.LESSON_ORDER_MODEL == "gemini-2.5-flash"
 
         patch.setenv("LESSON_ORDER_MODEL", "gemini-3.1-flash-lite")
         cfg = importlib.reload(cfg)
-        assert cfg.LESSON_ORDER_MODEL == "gemini-2.5-flash-lite"
+        assert cfg.LESSON_ORDER_MODEL == "gemini-2.5-flash"
 
         patch.setenv("LESSON_ORDER_MODEL", "gemini-2.5-flash")
         cfg = importlib.reload(cfg)
@@ -71,12 +71,12 @@ def test_lesson_order_retry_uses_a_distinct_non_pro_25_model(monkeypatch):
     with monkeypatch.context() as patch:
         patch.delenv("LESSON_ORDER_MODEL", raising=False)
         cfg = importlib.reload(importlib.import_module("backend.app.clip_engine.config"))
-        assert cfg.LESSON_ORDER_MODEL == "gemini-2.5-flash-lite"
-        assert cfg.LESSON_ORDER_FALLBACK_MODEL == "gemini-2.5-flash"
+        assert cfg.LESSON_ORDER_MODEL == "gemini-2.5-flash"
+        assert cfg.LESSON_ORDER_FALLBACK_MODEL == "gemini-2.5-flash-lite"
 
         patch.setenv("LESSON_ORDER_MODEL", "gemini-3.1-pro-preview")
         cfg = importlib.reload(cfg)
-        assert cfg.LESSON_ORDER_FALLBACK_MODEL == "gemini-2.5-flash"
+        assert cfg.LESSON_ORDER_FALLBACK_MODEL == "gemini-2.5-flash-lite"
 
         patch.setenv("LESSON_ORDER_MODEL", "gemini-2.5-flash")
         cfg = importlib.reload(cfg)

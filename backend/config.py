@@ -89,6 +89,10 @@ _SEGMENT_PRO_MODEL_RE = re.compile(
     r"^(?:models/)?gemini-\d+(?:\.\d+)*-pro(?:-[a-z0-9]+)*$",
     re.IGNORECASE,
 )
+_SEGMENT_STABLE_PRO_MODEL_RE = re.compile(
+    r"^(?:models/)?gemini-2\.5-pro$",
+    re.IGNORECASE,
+)
 SEGMENT_PRO_MODEL = next(
     model
     for model in (
@@ -97,6 +101,18 @@ SEGMENT_PRO_MODEL = next(
         "gemini-3.1-pro-preview",
     )
     if _SEGMENT_PRO_MODEL_RE.fullmatch(model)
+)
+_segment_pro_fallback_model = os.environ.get(
+    "SEGMENT_PRO_FALLBACK_MODEL", "gemini-2.5-pro",
+).strip()
+SEGMENT_PRO_FALLBACK_MODEL = (
+    _segment_pro_fallback_model
+    if (
+        _SEGMENT_STABLE_PRO_MODEL_RE.fullmatch(_segment_pro_fallback_model)
+        and _segment_pro_fallback_model.rsplit("/", 1)[-1].casefold()
+        != SEGMENT_PRO_MODEL.rsplit("/", 1)[-1].casefold()
+    )
+    else ""
 )
 SEGMENT_MODEL = SEGMENT_PRO_MODEL
 try:

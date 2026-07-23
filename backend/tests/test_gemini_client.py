@@ -138,6 +138,39 @@ def test_count_text_tokens_uses_one_bounded_non_generation_request(monkeypatch):
     assert calls[0]["timeout"] == 4.0
 
 
+def test_count_request_tokens_supports_stable_pro_dynamic_thinking(monkeypatch):
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"totalTokens": 124}
+
+    def post(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return Response()
+
+    monkeypatch.setattr(gc.config, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(gc.httpx, "post", post)
+
+    assert gc.count_request_tokens(
+        "system",
+        "long transcript",
+        _Schema,
+        model="models/gemini-2.5-pro",
+        timeout_s=4.0,
+        thinking_level="medium",
+        max_output_tokens=6_000,
+    ) == 124
+    request = calls[0]["json"]["generateContentRequest"]
+    assert request["model"] == "models/gemini-2.5-pro"
+    assert request["generationConfig"]["thinkingConfig"] == {
+        "thinkingBudget": -1,
+    }
+
+
 def test_count_request_tokens_uses_generate_content_request_not_plain_contents(
     monkeypatch,
 ):
@@ -171,8 +204,10 @@ def test_count_request_tokens_uses_generate_content_request_not_plain_contents(
     assert request["generationConfig"]["responseMimeType"] == "application/json"
 
 
+@pytest.mark.parametrize("status_code", [499, 503])
 def test_count_request_tokens_retries_one_transient_failure_and_honors_retry_after(
     monkeypatch,
+    status_code,
 ):
     calls = []
     sleeps = []
@@ -187,7 +222,7 @@ def test_count_request_tokens_retries_one_transient_failure_and_honors_retry_aft
     def post(_url, **kwargs):
         calls.append(kwargs)
         if len(calls) == 1:
-            raise _HTTPError(503, retry_after="0.6")
+            raise _HTTPError(status_code, retry_after="0.6")
         return Response()
 
     monkeypatch.setattr(gc.config, "GEMINI_API_KEY", "test-key")
@@ -457,6 +492,190 @@ def test_gemini3_retries_one_transient_error_with_short_jitter(
                for call in fake.models.calls)
 
 
+def test_pro_transient_retry_slot_switches_to_stable_pro(monkeypatch):
+    fake = _FakeClient(_HTTPError(504), _FakeResponse())
+    dispatched = []
+    monkeypatch.setattr(gc, "_sleep_before_retry", lambda *_args: True)
+
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        model="gemini-3.1-pro-preview",
+        thinking_level="medium",
+        max_retries=1,
+        retry_service_tier="priority",
+        transient_retry_model="gemini-2.5-pro",
+        before_dispatch=lambda **kwargs: dispatched.append(kwargs),
+    )
+
+    assert [call["model"] for call in fake.models.calls] == [
+        "gemini-3.1-pro-preview",
+        "gemini-2.5-pro",
+    ]
+    assert [call["model"] for call in dispatched] == [
+        "gemini-3.1-pro-preview",
+        "gemini-2.5-pro",
+    ]
+    primary, fallback = [call["config"] for call in fake.models.calls]
+    assert primary.thinking_config.thinking_budget is None
+    assert _enum_value(primary.thinking_config.thinking_level).endswith("medium")
+    assert fallback.thinking_config.thinking_budget == -1
+    assert fallback.thinking_config.thinking_level is None
+    assert _enum_value(fallback.service_tier) == "priority"
+    assert result.telemetry.model == "gemini-2.5-pro"
+    assert result.telemetry.thinking_level == "dynamic"
+    assert result.telemetry.retries == 1
+    assert result.telemetry.failover_from_model == "gemini-3.1-pro-preview"
+    assert result.telemetry.failover_model == "gemini-2.5-pro"
+    assert result.telemetry.failover_reason == "primary_transient_transport_error"
+    assert result.telemetry.quality_degraded is True
+
+
+def test_pro_healthy_path_never_dispatches_stable_pro(monkeypatch):
+    fake = _FakeClient(_FakeResponse())
+
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        model="gemini-3.1-pro-preview",
+        thinking_level="medium",
+        max_retries=1,
+        transient_retry_model="gemini-2.5-pro",
+    )
+
+    assert [call["model"] for call in fake.models.calls] == [
+        "gemini-3.1-pro-preview",
+    ]
+    assert result.telemetry.model == "gemini-3.1-pro-preview"
+    assert result.telemetry.failover_model is None
+    assert "failover_from_model" not in result.telemetry.as_dict()
+    assert "failover_model" not in result.telemetry.as_dict()
+    assert "failover_reason" not in result.telemetry.as_dict()
+
+
+def test_pro_failover_reuses_only_remaining_physical_retry_slots(monkeypatch):
+    fake = _FakeClient(
+        _HTTPError(503),
+        _HTTPError(503),
+        _FakeResponse(),
+    )
+    monkeypatch.setattr(gc, "_sleep_before_retry", lambda *_args: True)
+
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        model="gemini-3.1-pro-preview",
+        thinking_level="high",
+        max_retries=2,
+        transient_retry_model="gemini-2.5-pro",
+    )
+
+    assert [call["model"] for call in fake.models.calls] == [
+        "gemini-3.1-pro-preview",
+        "gemini-2.5-pro",
+        "gemini-2.5-pro",
+    ]
+    assert result.telemetry.retries == 2
+    assert len(result.telemetry.error_history) == 2
+
+
+def test_provider_side_499_switches_to_stable_pro_when_application_is_active(
+    monkeypatch,
+):
+    fake = _FakeClient(_HTTPError(499), _FakeResponse())
+    monkeypatch.setattr(gc, "_sleep_before_retry", lambda *_args: True)
+
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        model="gemini-3.1-pro-preview",
+        thinking_level="medium",
+        max_retries=1,
+        transient_retry_model="gemini-2.5-pro",
+        cancelled=lambda: False,
+    )
+
+    assert [call["model"] for call in fake.models.calls] == [
+        "gemini-3.1-pro-preview",
+        "gemini-2.5-pro",
+    ]
+    assert result.telemetry.provider_status_code is None
+    assert result.telemetry.failover_reason == "primary_transient_transport_error"
+
+
+def test_cancellation_before_fallback_dispatch_reports_last_physical_model(
+    monkeypatch,
+):
+    fake = _FakeClient(_HTTPError(503), _FakeResponse())
+    state = {"cancelled": False}
+
+    def cancel_after_backoff(*_args):
+        state["cancelled"] = True
+        return True
+
+    monkeypatch.setattr(gc, "_sleep_before_retry", cancel_after_backoff)
+
+    with pytest.raises(gc.GeminiCancelledError) as exc_info:
+        _call_v3(
+            monkeypatch,
+            fake,
+            model="gemini-3.1-pro-preview",
+            thinking_level="medium",
+            max_retries=1,
+            transient_retry_model="gemini-2.5-pro",
+            cancelled=lambda: state["cancelled"],
+        )
+
+    assert [call["model"] for call in fake.models.calls] == [
+        "gemini-3.1-pro-preview",
+    ]
+    assert exc_info.value.telemetry.model == "gemini-3.1-pro-preview"
+    assert exc_info.value.telemetry.failover_model is None
+
+
+@pytest.mark.parametrize("status_code", [400, 403, 404])
+def test_pro_permanent_error_never_dispatches_stable_pro(
+    monkeypatch, status_code,
+):
+    fake = _FakeClient(_HTTPError(status_code), _FakeResponse())
+
+    with pytest.raises(gc.GeminiTransportError):
+        _call_v3(
+            monkeypatch,
+            fake,
+            model="gemini-3.1-pro-preview",
+            thinking_level="medium",
+            max_retries=1,
+            transient_retry_model="gemini-2.5-pro",
+        )
+
+    assert [call["model"] for call in fake.models.calls] == [
+        "gemini-3.1-pro-preview",
+    ]
+
+
+def test_pro_invalid_success_retry_stays_on_primary_model(monkeypatch):
+    fake = _FakeClient(
+        _FakeResponse("partial", finish_reason="MAX_TOKENS"),
+        _FakeResponse(),
+    )
+
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        model="gemini-3.1-pro-preview",
+        thinking_level="medium",
+        max_retries=1,
+        transient_retry_model="gemini-2.5-pro",
+    )
+
+    assert [call["model"] for call in fake.models.calls] == [
+        "gemini-3.1-pro-preview",
+        "gemini-3.1-pro-preview",
+    ]
+    assert result.telemetry.failover_model is None
+
+
 def test_gemini3_uses_priority_only_for_a_transient_retry(monkeypatch):
     fake = _FakeClient(
         _HTTPError(504),
@@ -700,9 +919,11 @@ def test_gemini3_application_cancellation_wins_over_provider_499(
         _call_v3(
             monkeypatch,
             fake,
+            model="gemini-3.1-pro-preview",
             timeout_s=60.0,
             deadline_monotonic=gc.time.monotonic() + 120.0,
             max_retries=1,
+            transient_retry_model="gemini-2.5-pro",
             cancelled=lambda: state["cancelled"],
         )
 

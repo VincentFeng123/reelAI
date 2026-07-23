@@ -50,9 +50,22 @@ class GeminiCallTelemetry:
     error_history: tuple[dict[str, object], ...] = ()
     service_tier_requested: Optional[str] = None
     service_tier_used: Optional[str] = None
+    quality_degraded: Optional[bool] = None
+    failover_from_model: Optional[str] = None
+    failover_model: Optional[str] = None
+    failover_reason: Optional[str] = None
 
     def as_dict(self) -> dict:
-        return asdict(self)
+        payload = asdict(self)
+        for key in (
+            "failover_from_model",
+            "failover_model",
+            "failover_reason",
+            "quality_degraded",
+        ):
+            if payload[key] is None:
+                payload.pop(key)
+        return payload
 
 
 class _TokenCountResponseError(RuntimeError):
@@ -201,6 +214,10 @@ def _is_gemini3_model(model: str) -> bool:
     return name == "gemini-3" or name.startswith(("gemini-3.", "gemini-3-"))
 
 
+def _is_gemini25_pro_model(model: str) -> bool:
+    return str(model or "").rsplit("/", 1)[-1].casefold() == "gemini-2.5-pro"
+
+
 def _default_gemini3_thinking_level(model: str) -> str:
     return "high" if "pro" in str(model or "").lower() else "medium"
 
@@ -226,8 +243,10 @@ def count_request_tokens(
     """Count the exact structured request with one bounded transient retry."""
     mdl = str(model or "").strip()
     timeout = float(timeout_s)
-    if not _is_gemini3_model(mdl):
-        raise ValueError("count_request_tokens requires an explicit Gemini 3 model")
+    if not (_is_gemini3_model(mdl) or _is_gemini25_pro_model(mdl)):
+        raise ValueError(
+            "count_request_tokens requires an explicit Gemini 3 or Gemini 2.5 Pro model"
+        )
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout_s must be positive")
     if (
@@ -248,6 +267,9 @@ def count_request_tokens(
     if level:
         if level.casefold() not in _GEMINI3_THINKING_LEVELS:
             raise ValueError(f"unsupported Gemini 3 thinking level: {thinking_level}")
+    if _is_gemini25_pro_model(mdl):
+        generation_config["thinkingConfig"] = {"thinkingBudget": -1}
+    elif level:
         generation_config["thinkingConfig"] = {"thinkingLevel": level}
     request_body = {
         "generateContentRequest": {
@@ -367,6 +389,9 @@ def _call_telemetry(*, model: str, operation: str, prompt_version: str,
                     retryable: bool | None = None,
                     error_history=(),
                     service_tier_requested: str | None = None,
+                    failover_from_model: str | None = None,
+                    failover_model: str | None = None,
+                    failover_reason: str | None = None,
                     ) -> GeminiCallTelemetry:
     usage = _field(response, "usage_metadata") if response is not None else None
     return GeminiCallTelemetry(
@@ -397,6 +422,10 @@ def _call_telemetry(*, model: str, operation: str, prompt_version: str,
             if response is not None
             else None
         ),
+        failover_from_model=failover_from_model,
+        failover_model=failover_model,
+        failover_reason=failover_reason,
+        quality_degraded=True if failover_model else None,
     )
 
 
@@ -468,7 +497,7 @@ def _transient_token_count_error(error: Exception) -> bool:
         return True
     status = _gemini_status_code(error)
     if status is not None:
-        return status in {408, 429} or 500 <= status <= 599
+        return status in {408, 429, 499} or 500 <= status <= 599
     return _transient_gemini_error(error)
 
 
@@ -580,12 +609,13 @@ def generate_json_v3(
     use_full_transient_retry_budget: bool = False,
     retry_status_codes: frozenset[int] | set[int] | None = None,
     retry_service_tier: str | None = None,
+    transient_retry_model: str | None = None,
     cancelled=None,
     media_resolution=None,
     before_dispatch: Callable[..., object] | None = None,
     after_dispatch: Callable[..., object] | None = None,
 ) -> GenerationResult:
-    """Run one Gemini 3 structured call with bounded transport behavior.
+    """Run one Gemini structured call with bounded transport behavior.
 
     SDK retries are disabled so ``max_retries`` is the application-controlled
     retry ceiling. ``retry_status_codes`` optionally narrows typed HTTP retries
@@ -597,17 +627,31 @@ def generate_json_v3(
     still allowing a transient retry to use the full operation deadline.
     ``retry_service_tier="priority"`` upgrades only physical retries after a
     transient failure; the healthy first attempt remains Standard.
+    ``transient_retry_model`` replaces, rather than adds to, the remaining
+    retry slots after a transient primary transport failure.
     Cancellation is cooperative between in-flight HTTP requests. Optional
     dispatch hooks run once around every physical provider attempt, including
     retries, so callers can admit and settle attempt-scoped resources.
     """
     _reject_video_content(user)
     mdl = str(model or "").strip()
+    retry_mdl = str(transient_retry_model or "").strip()
     level = str(thinking_level or "").strip().lower()
-    if not _is_gemini3_model(mdl):
-        raise ValueError("generate_json_v3 requires an explicit Gemini 3 model")
+    if not (_is_gemini3_model(mdl) or _is_gemini25_pro_model(mdl)):
+        raise ValueError(
+            "generate_json_v3 requires an explicit Gemini 3 or Gemini 2.5 Pro model"
+        )
     if level not in _GEMINI3_THINKING_LEVELS:
         raise ValueError(f"Unsupported Gemini 3 thinking level: {thinking_level!r}")
+    if retry_mdl and (
+        not _is_gemini25_pro_model(retry_mdl)
+        or retry_mdl.rsplit("/", 1)[-1].casefold()
+        == mdl.rsplit("/", 1)[-1].casefold()
+        or "pro" not in mdl.casefold()
+    ):
+        raise ValueError(
+            "transient_retry_model must be a distinct Gemini 2.5 Pro fallback"
+        )
     if int(max_output_tokens) <= 0:
         raise ValueError("max_output_tokens must be positive")
     if not math.isfinite(float(timeout_s)) or float(timeout_s) <= 0:
@@ -659,20 +703,36 @@ def generate_json_v3(
     requests_started = 0
     error_history: list[dict[str, object]] = []
     last_failure_telemetry: GeminiCallTelemetry | None = None
+    retry_model_active = False
 
     for attempt in range(max_attempts):
+        attempt_model = retry_mdl if retry_model_active else mdl
+        attempt_thinking_level = (
+            "dynamic" if _is_gemini25_pro_model(attempt_model) else level
+        )
+        failover_fields = (
+            {
+                "failover_from_model": mdl,
+                "failover_model": retry_mdl,
+                "failover_reason": "primary_transient_transport_error",
+            }
+            if retry_model_active
+            else {}
+        )
         attempt_service_tier = (
             normalized_retry_service_tier
             if attempt > 0 and normalized_retry_service_tier
             else None
         )
         if _cancel_requested(cancelled):
-            telemetry = _call_telemetry(
-                model=mdl, operation=operation, prompt_version=prompt_version,
-                thinking_level=level, started=started,
+            telemetry = last_failure_telemetry or _call_telemetry(
+                model=attempt_model, operation=operation,
+                prompt_version=prompt_version,
+                thinking_level=attempt_thinking_level, started=started,
                 retries=max(0, requests_started - 1),
                 error_history=error_history,
                 service_tier_requested=attempt_service_tier,
+                **failover_fields,
             )
             raise GeminiCancelledError("Gemini call cancelled", telemetry)
 
@@ -682,11 +742,13 @@ def generate_json_v3(
         remaining_s = attempt_deadline - time.monotonic()
         if remaining_s <= 0 or (attempt > 0 and remaining_s < 5.0):
             telemetry = last_failure_telemetry or _call_telemetry(
-                model=mdl, operation=operation, prompt_version=prompt_version,
-                thinking_level=level, started=started,
+                model=attempt_model, operation=operation,
+                prompt_version=prompt_version,
+                thinking_level=attempt_thinking_level, started=started,
                 retries=max(0, requests_started - 1),
                 error_history=error_history,
                 service_tier_requested=attempt_service_tier,
+                **failover_fields,
             )
             raise GeminiDeadlineExceededError("Gemini call deadline exceeded", telemetry)
         if client is None:
@@ -695,21 +757,25 @@ def generate_json_v3(
         # not acquire an attempt ticket if the call became ineligible before a
         # provider dispatch was possible.
         if _cancel_requested(cancelled):
-            telemetry = _call_telemetry(
-                model=mdl, operation=operation, prompt_version=prompt_version,
-                thinking_level=level, started=started,
+            telemetry = last_failure_telemetry or _call_telemetry(
+                model=attempt_model, operation=operation,
+                prompt_version=prompt_version,
+                thinking_level=attempt_thinking_level, started=started,
                 retries=max(0, requests_started - 1),
                 error_history=error_history,
                 service_tier_requested=attempt_service_tier,
+                **failover_fields,
             )
             raise GeminiCancelledError("Gemini call cancelled", telemetry)
         if time.monotonic() >= attempt_deadline:
             telemetry = last_failure_telemetry or _call_telemetry(
-                model=mdl, operation=operation, prompt_version=prompt_version,
-                thinking_level=level, started=started,
+                model=attempt_model, operation=operation,
+                prompt_version=prompt_version,
+                thinking_level=attempt_thinking_level, started=started,
                 retries=max(0, requests_started - 1),
                 error_history=error_history,
                 service_tier_requested=attempt_service_tier,
+                **failover_fields,
             )
             raise GeminiDeadlineExceededError(
                 "Gemini call deadline exceeded", telemetry,
@@ -717,23 +783,26 @@ def generate_json_v3(
 
         dispatch_ticket = None
         if before_dispatch is not None:
-            dispatch_ticket = before_dispatch(model=mdl, attempt=attempt + 1)
+            dispatch_ticket = before_dispatch(
+                model=attempt_model, attempt=attempt + 1,
+            )
         application_cancelled = _cancel_requested(cancelled)
         if application_cancelled or time.monotonic() >= attempt_deadline:
             telemetry = last_failure_telemetry or _call_telemetry(
-                model=mdl,
+                model=attempt_model,
                 operation=operation,
                 prompt_version=prompt_version,
-                thinking_level=level,
+                thinking_level=attempt_thinking_level,
                 started=started,
                 retries=max(0, requests_started - 1),
                 error_history=error_history,
                 service_tier_requested=attempt_service_tier,
+                **failover_fields,
             )
             if after_dispatch is not None:
                 after_dispatch(
                     dispatch_ticket,
-                    model=mdl,
+                    model=attempt_model,
                     attempt=attempt + 1,
                     telemetry=telemetry,
                     dispatched=False,
@@ -757,7 +826,11 @@ def generate_json_v3(
                 response_mime_type="application/json",
                 response_json_schema=_gemini3_json_schema(schema),
                 max_output_tokens=int(max_output_tokens),
-                thinking_config=types.ThinkingConfig(thinking_level=level),
+                thinking_config=(
+                    types.ThinkingConfig(thinking_budget=-1)
+                    if _is_gemini25_pro_model(attempt_model)
+                    else types.ThinkingConfig(thinking_level=level)
+                ),
                 http_options=http_options,
             )
             if media_resolution is not None:
@@ -767,20 +840,21 @@ def generate_json_v3(
             request_config = types.GenerateContentConfig(**config_kwargs)
         except Exception as error:  # noqa: BLE001
             telemetry = _call_telemetry(
-                model=mdl,
+                model=attempt_model,
                 operation=operation,
                 prompt_version=prompt_version,
-                thinking_level=level,
+                thinking_level=attempt_thinking_level,
                 started=started,
                 retries=max(0, requests_started - 1),
                 error=error,
                 error_history=error_history,
                 service_tier_requested=attempt_service_tier,
+                **failover_fields,
             )
             if after_dispatch is not None:
                 after_dispatch(
                     dispatch_ticket,
-                    model=mdl,
+                    model=attempt_model,
                     attempt=attempt + 1,
                     telemetry=telemetry,
                     dispatched=False,
@@ -789,7 +863,7 @@ def generate_json_v3(
         requests_started += 1
         try:
             response = client.models.generate_content(
-                model=mdl, contents=user, config=request_config,
+                model=attempt_model, contents=user, config=request_config,
             )
         except Exception as error:  # noqa: BLE001
             application_cancelled = _cancel_requested(cancelled)
@@ -803,19 +877,21 @@ def generate_json_v3(
                 "retryable": retryable,
             })
             telemetry = _call_telemetry(
-                model=mdl, operation=operation, prompt_version=prompt_version,
-                thinking_level=level, started=started,
+                model=attempt_model, operation=operation,
+                prompt_version=prompt_version,
+                thinking_level=attempt_thinking_level, started=started,
                 retries=max(0, requests_started - 1),
                 error=error,
                 retryable=retryable,
                 error_history=error_history,
                 service_tier_requested=attempt_service_tier,
+                **failover_fields,
             )
             last_failure_telemetry = telemetry
             if after_dispatch is not None:
                 after_dispatch(
                     dispatch_ticket,
-                    model=mdl,
+                    model=attempt_model,
                     attempt=attempt + 1,
                     telemetry=telemetry,
                 )
@@ -842,6 +918,11 @@ def generate_json_v3(
                 )
             if not retryable or attempt >= retry_limit:
                 raise GeminiTransportError(str(error), telemetry) from error
+            if (
+                retry_mdl
+                and attempt_model.casefold() == mdl.casefold()
+            ):
+                retry_model_active = True
 
             delay_floor_s = 2.0 ** attempt
             wait_s = max(
@@ -862,16 +943,18 @@ def generate_json_v3(
             continue
 
         telemetry = _call_telemetry(
-            model=mdl, operation=operation, prompt_version=prompt_version,
-            thinking_level=level, started=started,
+            model=attempt_model, operation=operation,
+            prompt_version=prompt_version,
+            thinking_level=attempt_thinking_level, started=started,
             retries=max(0, requests_started - 1), response=response,
             error_history=error_history,
             service_tier_requested=attempt_service_tier,
+            **failover_fields,
         )
         if after_dispatch is not None:
             after_dispatch(
                 dispatch_ticket,
-                model=mdl,
+                model=attempt_model,
                 attempt=attempt + 1,
                 telemetry=telemetry,
             )
@@ -906,16 +989,17 @@ def generate_json_v3(
                 "retryable": True,
             })
             telemetry = _call_telemetry(
-                model=mdl,
+                model=attempt_model,
                 operation=operation,
                 prompt_version=prompt_version,
-                thinking_level=level,
+                thinking_level=attempt_thinking_level,
                 started=started,
                 retries=max(0, requests_started - 1),
                 response=response,
                 retryable=True,
                 error_history=error_history,
                 service_tier_requested=attempt_service_tier,
+                **failover_fields,
             )
             last_failure_telemetry = telemetry
             if _cancel_requested(cancelled):

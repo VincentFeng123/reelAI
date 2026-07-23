@@ -3908,6 +3908,17 @@ def _record_gemini(
         logger.warning("Lesson-order usage accounting failed: %s", type(exc).__name__)
 
 
+def _lesson_order_model_identity(value: object) -> str:
+    leaf = str(value or "").strip().rsplit("/", 1)[-1].casefold()
+    for stable_model in ("gemini-2.5-flash-lite", "gemini-2.5-flash"):
+        suffix = leaf.removeprefix(stable_model)
+        if leaf.startswith(stable_model) and (
+            not suffix or (suffix.startswith("-") and suffix[1:].isdigit())
+        ):
+            return stable_model
+    return leaf
+
+
 def _read_cached_lesson_order(
     cache_key: str,
     *,
@@ -3943,6 +3954,8 @@ def _read_cached_lesson_order(
         or payload.get("cache_version") != LESSON_ORDER_CACHE_VERSION
         or payload.get("prompt_version") != LESSON_ORDER_PROMPT_VERSION
         or payload.get("model") != config.LESSON_ORDER_MODEL
+        or _lesson_order_model_identity(payload.get("model_used"))
+        != _lesson_order_model_identity(config.LESSON_ORDER_MODEL)
     ):
         return None
     raw_ordered_ids = payload.get("ordered_reel_ids")
@@ -4239,12 +4252,13 @@ def _order_lesson_batch(
     last_telemetry: gemini_client.GeminiCallTelemetry | None = None
     preferred_ids: list[str] = []
     provider_called = False
+    use_availability_fallback = False
 
     for attempt in range(1, LESSON_ORDER_ATTEMPTS + 1):
         attempt_model = (
-            config.LESSON_ORDER_MODEL
-            if attempt == 1
-            else config.LESSON_ORDER_FALLBACK_MODEL
+            config.LESSON_ORDER_FALLBACK_MODEL
+            if use_availability_fallback
+            else config.LESSON_ORDER_MODEL
         )
         reservation: dict[str, Any] = {}
         if generation_context is not None:
@@ -4386,6 +4400,14 @@ def _order_lesson_batch(
                 attempt < LESSON_ORDER_ATTEMPTS
                 and _ordering_failure_is_retryable(exc)
             ):
+                if isinstance(
+                    exc,
+                    (
+                        gemini_client.GeminiDeadlineExceededError,
+                        gemini_client.GeminiTransportError,
+                    ),
+                ):
+                    use_availability_fallback = True
                 continue
             break
         except Exception as exc:
@@ -4577,15 +4599,24 @@ def _order_lesson_batch(
                 dispatched=True,
             )
             raise
-        _write_cached_lesson_order(
-            cache_key,
-            ordered_ids=ordered_ids,
-            checkpoint_ids=checkpoint_ids,
-            prior_restatement_ids=prior_restatement_ids,
-            current_restatement_ids=current_restatement_ids,
-            terminal_summary_start_reel_id=terminal_summary_start,
-            model_used=last_model_used,
+        availability_degraded = (
+            _lesson_order_model_identity(attempt_model)
+            != _lesson_order_model_identity(config.LESSON_ORDER_MODEL)
         )
+        if (
+            not availability_degraded
+            and _lesson_order_model_identity(last_model_used)
+            == _lesson_order_model_identity(config.LESSON_ORDER_MODEL)
+        ):
+            _write_cached_lesson_order(
+                cache_key,
+                ordered_ids=ordered_ids,
+                checkpoint_ids=checkpoint_ids,
+                prior_restatement_ids=prior_restatement_ids,
+                current_restatement_ids=current_restatement_ids,
+                terminal_summary_start_reel_id=terminal_summary_start,
+                model_used=last_model_used,
+            )
         try:
             raise_if_cancelled(should_cancel)
         except CancellationError:
@@ -4605,7 +4636,7 @@ def _order_lesson_batch(
             attempt=attempt,
             telemetry=generated.telemetry,
             reservation=reservation,
-            quality_degraded=False,
+            quality_degraded=availability_degraded,
             status_code=200,
             dispatched=True,
             validation_repairs=validation_repairs,
@@ -4614,8 +4645,8 @@ def _order_lesson_batch(
             reels=[reels_by_id[reel_id] for reel_id in ordered_ids],
             ordered_reel_ids=ordered_ids,
             model_used=last_model_used,
-            degraded=False,
-            fallback_reason=None,
+            degraded=availability_degraded,
+            fallback_reason=last_reason if availability_degraded else None,
             provider_called=provider_called,
             latency_ms=generated.telemetry.latency_ms,
             input_tokens=generated.telemetry.prompt_tokens,

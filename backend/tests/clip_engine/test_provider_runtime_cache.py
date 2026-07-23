@@ -8,6 +8,7 @@ import pytest
 from backend import config as backend_config
 from backend.app.clip_engine import expand
 from backend.app.clip_engine import config as clip_engine_config
+from backend.app.clip_engine import provider_runtime
 from backend.app.clip_engine.errors import ProviderBudgetExceededError
 from backend.app.clip_engine.provider_cache import (
     MemoryProviderCache,
@@ -84,6 +85,97 @@ def test_generation_budgets_match_fast_and_slow_contracts() -> None:
     fast.reserve_pass()
     with pytest.raises(ProviderBudgetExceededError):
         fast.reserve_pass()
+
+
+@pytest.mark.parametrize(
+    ("input_tokens", "expected_rates"),
+    [
+        (200_000, (1.25, 0.125, 10.00)),
+        (200_001, (2.50, 0.25, 15.00)),
+    ],
+)
+def test_stable_pro_rates_follow_the_2_5_context_tiers(
+    input_tokens,
+    expected_rates,
+) -> None:
+    assert provider_runtime._gemini_token_rates(
+        "gemini-2.5-pro",
+        input_tokens=input_tokens,
+    ) == expected_rates
+    standard = gemini_segment._model_cost({
+        "model": "gemini-2.5-pro",
+        "prompt_tokens": input_tokens,
+        "candidate_tokens": 10,
+        "thought_tokens": 5,
+    })
+    priority = gemini_segment._model_cost({
+        "model": "gemini-2.5-pro",
+        "prompt_tokens": input_tokens,
+        "candidate_tokens": 10,
+        "thought_tokens": 5,
+        "billing_cost_multiplier": (
+            gemini_segment._PRO_PRIORITY_BILLING_MULTIPLIER
+        ),
+    })
+    assert standard == pytest.approx(
+        (
+            input_tokens * expected_rates[0]
+            + 15 * expected_rates[2]
+        ) / 1_000_000.0
+    )
+    assert priority == pytest.approx(
+        standard * gemini_segment._PRO_PRIORITY_BILLING_MULTIPLIER
+    )
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_rates"),
+    [
+        ("gemini-2.5-flash", (0.30, 0.03, 2.50)),
+        ("models/gemini-2.5-flash-001", (0.30, 0.03, 2.50)),
+        ("gemini-2.5-flash-lite", (0.10, 0.01, 0.40)),
+        ("models/gemini-2.5-flash-lite-001", (0.10, 0.01, 0.40)),
+    ],
+)
+def test_lesson_order_models_use_exact_2_5_reservation_and_usage_rates(
+    model,
+    expected_rates,
+) -> None:
+    assert provider_runtime._gemini_token_rates(model) == expected_rates
+    context = GenerationContext("slow", generation_id=f"job-order-rate-{model}")
+    reservation = context.reserve_gemini_call(
+        operation="ordering",
+        model=model,
+        estimated_input_tokens=12_079,
+        max_output_tokens=10_240,
+    )
+    context.record_gemini(
+        operation="ordering",
+        attempt=1,
+        model_used=model,
+        quality_degraded=False,
+        stage="lesson_ordering",
+        usage={
+            **reservation,
+            "prompt_tokens": 12_079,
+            "candidate_tokens": 331,
+            "thought_tokens": 0,
+            "cached_content_token_count": 2_000,
+            "total_tokens": 12_410,
+        },
+    )
+
+    input_rate, cached_rate, output_rate = expected_rates
+    assert reservation["reserved_cost_usd"] == pytest.approx(
+        (12_079 * input_rate + 10_240 * output_rate) / 1_000_000.0
+    )
+    assert context.usage_payload()["summary"]["estimated_cost_usd"] == pytest.approx(
+        (
+            10_079 * input_rate
+            + 2_000 * cached_rate
+            + 331 * output_rate
+        ) / 1_000_000.0
+    )
 
 
 def test_retry_after_is_parsed_and_bounded() -> None:

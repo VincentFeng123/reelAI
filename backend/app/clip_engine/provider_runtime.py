@@ -922,10 +922,31 @@ def _gemini_token_rates(
 ) -> tuple[float, float, float]:
     """Return current per-million uncached/cached-input/output rates."""
     normalized = str(model or "").casefold()
+    model_name = normalized.rsplit("/", 1)[-1]
+    if (
+        model_name == "gemini-2.5-flash-lite"
+        or (
+            model_name.startswith("gemini-2.5-flash-lite-")
+            and model_name.removeprefix("gemini-2.5-flash-lite-").isdigit()
+        )
+    ):
+        return 0.10, 0.01, 0.40
+    if (
+        model_name == "gemini-2.5-flash"
+        or (
+            model_name.startswith("gemini-2.5-flash-")
+            and model_name.removeprefix("gemini-2.5-flash-").isdigit()
+        )
+    ):
+        return 0.30, 0.03, 2.50
     if "flash-lite" in normalized:
         return 0.25, 0.025, 1.50
     if "gemini-3-flash" in normalized and "gemini-3.5-flash" not in normalized:
         return 0.50, 0.05, 3.00
+    if "gemini-2.5-pro" in normalized:
+        if max(0, int(input_tokens)) > 200_000:
+            return 2.50, 0.25, 15.00
+        return 1.25, 0.125, 10.00
     if "pro" in normalized:
         if max(0, int(input_tokens)) > 200_000:
             return 4.00, 0.40, 18.00
@@ -1615,6 +1636,7 @@ class GenerationContext:
             "provider_status_code",
             "retryable",
             "token_preflight_failed",
+            "token_preflight_model",
             "error_history",
             "failover_from_model",
             "failover_model",

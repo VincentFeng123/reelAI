@@ -544,10 +544,12 @@ def test_missing_required_foundation_retries_before_accepting_application(
         _generation_result(["required-foundation", "application"]),
     ])
     calls = 0
+    models: list[str] = []
 
-    def fake_generate(*_args, **_kwargs):
+    def fake_generate(*_args, **kwargs):
         nonlocal calls
         calls += 1
+        models.append(kwargs["model"])
         return next(responses)
 
     monkeypatch.setattr(
@@ -564,6 +566,7 @@ def test_missing_required_foundation_retries_before_accepting_application(
     )
 
     assert calls == 2
+    assert models == [config.LESSON_ORDER_MODEL, config.LESSON_ORDER_MODEL]
     assert result.degraded is False
     assert result.ordered_reel_ids == ["required-foundation", "application"]
 
@@ -2724,10 +2727,12 @@ def test_restatement_contract_retries_missing_shape_and_repairs_ids(
         _reel("repeat", video_id="repeat", start=0, concept="prior restatement"),
     ]
     calls = 0
+    models: list[str] = []
 
-    def fake_generate(*_args, **_kwargs):
+    def fake_generate(*_args, **kwargs):
         nonlocal calls
         calls += 1
+        models.append(kwargs["model"])
         return replace(
             _generation_result(["selected"]),
             text=json.dumps(payload),
@@ -2747,6 +2752,10 @@ def test_restatement_contract_retries_missing_shape_and_repairs_ids(
 
     if expected_reason == "invalid_model_response":
         assert calls == lesson_ordering.LESSON_ORDER_ATTEMPTS == 2
+        assert models == [
+            config.LESSON_ORDER_MODEL,
+            config.LESSON_ORDER_MODEL,
+        ]
         assert result.degraded is True
         assert result.fallback_reason == expected_reason
     else:
@@ -5445,17 +5454,58 @@ def test_provider_failure_degrades_without_dropping_clips(monkeypatch) -> None:
         _reel("one", video_id="a", start=0, concept="one"),
         _reel("two", video_id="b", start=0, concept="two"),
     ]
-    monkeypatch.setattr(
-        lesson_ordering,
-        "_generate_lesson_order",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
-    )
+    models: list[str] = []
+
+    def fail_locally(*_args, **kwargs):
+        models.append(kwargs["model"])
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fail_locally)
 
     result = lesson_ordering.order_lesson_batch(reels, topic="topic")
 
+    assert models == [config.LESSON_ORDER_MODEL, config.LESSON_ORDER_MODEL]
     assert result.reels == reels
     assert result.degraded is True
     assert result.assessment_checkpoint_reel_ids is None
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        gemini_client.GeminiEmptyResponseError,
+        gemini_client.GeminiTruncatedResponseError,
+    ],
+)
+def test_response_correction_retry_stays_on_primary_model(
+    monkeypatch,
+    error_type: type[gemini_client.GeminiCallError],
+) -> None:
+    reels = [
+        _reel("one", video_id="a", start=0, concept="one"),
+        _reel("two", video_id="b", start=0, concept="two"),
+    ]
+    models: list[str] = []
+    response_telemetry = replace(
+        _generation_result(["one", "two"]).telemetry,
+        retryable=True,
+    )
+
+    def fake_generate(*_args, **kwargs):
+        models.append(kwargs["model"])
+        kwargs["dispatch_state"].dispatched = True
+        if len(models) == 1:
+            raise error_type("response correction required", response_telemetry)
+        return _generation_result(["one", "two"])
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(reels, topic="topic")
+
+    assert models == [config.LESSON_ORDER_MODEL, config.LESSON_ORDER_MODEL]
+    assert result.ordered_reel_ids == ["one", "two"]
+    assert result.model_used == config.LESSON_ORDER_MODEL
+    assert result.degraded is False
 
 
 def test_transient_provider_failure_retries_then_orders(monkeypatch) -> None:
@@ -5464,6 +5514,7 @@ def test_transient_provider_failure_retries_then_orders(monkeypatch) -> None:
         _reel("two", video_id="b", start=0, concept="two"),
     ]
     models: list[str] = []
+    cache_writes: list[dict[str, Any]] = []
     transient_telemetry = replace(
         _generation_result(["one", "two"]).telemetry,
         provider_error_type="ServiceUnavailable",
@@ -5484,6 +5535,11 @@ def test_transient_provider_failure_retries_then_orders(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_write_cached_lesson_order",
+        lambda *_args, **kwargs: cache_writes.append(kwargs),
+    )
 
     result = lesson_ordering.order_lesson_batch(reels, topic="topic")
 
@@ -5492,7 +5548,10 @@ def test_transient_provider_failure_retries_then_orders(monkeypatch) -> None:
         config.LESSON_ORDER_FALLBACK_MODEL,
     ]
     assert result.ordered_reel_ids == ["one", "two"]
-    assert result.degraded is False
+    assert result.model_used == config.LESSON_ORDER_FALLBACK_MODEL
+    assert result.degraded is True
+    assert result.fallback_reason == "provider_call_failed"
+    assert cache_writes == []
 
 
 @pytest.mark.parametrize("status_code", [400, 409, 418])
@@ -5702,6 +5761,24 @@ def test_lesson_order_cache_round_trips_validated_restatements(
     response_payload = json.loads(stored["response_json"])
     assert response_payload["prompt_version"] == "lesson_order_v18"
     assert response_payload["cache_version"] == 15
+    for equivalent_model in (
+        f"models/{config.LESSON_ORDER_MODEL}",
+        f"{config.LESSON_ORDER_MODEL}-001",
+    ):
+        equivalent_payload = {
+            **response_payload,
+            "model_used": equivalent_model,
+        }
+        stored["response_json"] = json.dumps(equivalent_payload)
+        assert _REAL_READ_CACHED_LESSON_ORDER(
+            "cache-key",
+            original=reels,
+            reel_ids=["selected", "repeat", "current-subset"],
+            generation_context=None,
+            has_prior_objective_evidence=True,
+            release_limit=2,
+        ) is not None
+    stored["response_json"] = json.dumps(response_payload)
     assert _REAL_READ_CACHED_LESSON_ORDER(
         "cache-key",
         original=reels,
@@ -5721,6 +5798,9 @@ def test_lesson_order_cache_round_trips_validated_restatements(
     missing_current = dict(response_payload)
     missing_current.pop("current_restatement_reel_ids")
     invalid_payloads.append(missing_current)
+    fallback_model = dict(response_payload)
+    fallback_model["model_used"] = config.LESSON_ORDER_FALLBACK_MODEL
+    invalid_payloads.append(fallback_model)
     for invalid_ids in (["unknown"], ["repeat", "repeat"], ["selected"]):
         invalid = dict(response_payload)
         invalid["prior_restatement_reel_ids"] = invalid_ids

@@ -14960,6 +14960,7 @@ def test_pro_boundary_audit_schema_recovery_cannot_compose_past_three_dispatches
         ),
     }]
     configured_retries: list[int] = []
+    transient_retry_models: list[str | None] = []
     provider_dispatches = 0
 
     def exhausted_transport_then_invalid_schema(
@@ -14967,6 +14968,7 @@ def test_pro_boundary_audit_schema_recovery_cannot_compose_past_three_dispatches
     ):
         nonlocal provider_dispatches
         configured_retries.append(kwargs["max_retries"])
+        transient_retry_models.append(kwargs["transient_retry_model"])
         dispatch_count = kwargs["max_retries"] + 1
         provider_dispatches += dispatch_count
         telemetry = _settle_mock_dispatches(kwargs, dispatch_count)
@@ -14988,6 +14990,9 @@ def test_pro_boundary_audit_schema_recovery_cannot_compose_past_three_dispatches
         )
     calls = exc_info.value.selection_attempt_calls
     assert configured_retries == [2]
+    assert transient_retry_models == [
+        gemini_segment.config.SEGMENT_PRO_FALLBACK_MODEL
+    ]
     assert provider_dispatches == 3
     assert [call["physical_dispatches"] for call in calls] == [3]
     assert calls[0]["structured_retry_exhausted"] is True
@@ -16854,6 +16859,11 @@ def test_boundary_selector_never_attaches_video_even_when_requested(
         if profile == gemini_segment.PRO_BOUNDARY_PROFILE
         else None
     )
+    assert call["transient_retry_model"] == (
+        gemini_segment.config.SEGMENT_PRO_FALLBACK_MODEL
+        if profile == gemini_segment.PRO_BOUNDARY_PROFILE
+        else None
+    )
     [reservation] = reservations
     prompt_text = f"{call['system']}\n\n{contents}"
     schema_bytes = len(json.dumps(
@@ -17904,6 +17914,192 @@ def test_exact_token_preflight_admits_affordable_long_unicode_text(
     assert token_counts[0]["model"] == "gemini-3.1-pro-preview"
     assert token_counts[0]["schema"] is gemini_segment._BoundaryPlan
     assert reservations[0]["estimated_input_tokens"] == 60_000
+
+
+@pytest.mark.parametrize("failure_kind", ["http_503", "malformed_response"])
+def test_transient_primary_token_preflight_dispatches_stable_pro(
+    monkeypatch,
+    failure_kind,
+) -> None:
+    class CountUnavailable(RuntimeError):
+        status_code = 503
+
+    context = GenerationContext("slow", generation_id="preflight-pro-failover")
+    token_count_models: list[str] = []
+    generation_calls: list[dict] = []
+
+    def count_tokens(*_args, **kwargs):
+        token_count_models.append(kwargs["model"])
+        if kwargs["model"] == "gemini-3.1-pro-preview":
+            if failure_kind == "http_503":
+                raise CountUnavailable("unavailable")
+            raise gemini_client._TokenCountResponseError("malformed")
+        return 60_000
+
+    def generate(_system, _user, _schema, **kwargs):
+        generation_calls.append(kwargs)
+        telemetry = {
+            "model": kwargs["model"],
+            "prompt_tokens": 60_000,
+            "candidate_tokens": 10,
+            "thought_tokens": 0,
+            "total_tokens": 60_010,
+        }
+        _settle_mock_dispatch(kwargs, telemetry)
+        return SimpleNamespace(
+            text='{"topics": []}',
+            telemetry=telemetry,
+        )
+
+    monkeypatch.setattr(gemini_client, "count_request_tokens", count_tokens)
+    monkeypatch.setattr(gemini_client, "generate_json_v3", generate)
+
+    parsed, telemetry = gemini_segment._call_model(
+        "system",
+        "統" * 67_000,
+        gemini_segment._BoundaryPlan,
+        model="gemini-3.1-pro-preview",
+        thinking_level="medium",
+        max_output_tokens=6_000,
+        timeout_s=30.0,
+        deadline_monotonic=time.monotonic() + 10.0,
+        operation="pro_authoritative",
+        prompt_version=gemini_segment.PRO_BOUNDARY_PROFILE,
+        cancelled=None,
+        budget_reserve=context.reserve_gemini_call,
+        budget_reconcile=context.reconcile_gemini_call,
+        max_retries=1,
+        transient_retry_model="gemini-2.5-pro",
+    )
+
+    assert parsed.topics == []
+    assert token_count_models == [
+        "gemini-3.1-pro-preview",
+        "gemini-2.5-pro",
+    ]
+    assert len(generation_calls) == 1
+    assert generation_calls[0]["model"] == "gemini-2.5-pro"
+    assert generation_calls[0]["transient_retry_model"] is None
+    assert telemetry["model"] == "gemini-2.5-pro"
+    assert telemetry["failover_from_model"] == "gemini-3.1-pro-preview"
+    assert telemetry["failover_model"] == "gemini-2.5-pro"
+    assert telemetry["failover_reason"] == (
+        "primary_transient_token_preflight_error"
+    )
+    assert telemetry["quality_degraded"] is True
+    assert telemetry["reserved_input_tokens"] == 60_000
+    assert telemetry["physical_dispatches"] == 1
+
+
+def test_transport_failover_counts_and_reserves_the_actual_stable_model(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("slow", generation_id="model-scoped-preflight")
+    token_count_models: list[str] = []
+    reservation_payloads: list[dict] = []
+    tickets: list[dict] = []
+
+    def count_tokens(*_args, **kwargs):
+        token_count_models.append(kwargs["model"])
+        return (
+            200_000
+            if kwargs["model"] == "gemini-3.1-pro-preview"
+            else 200_001
+        )
+
+    def reserve(**payload):
+        reservation_payloads.append(payload)
+        ticket = context.reserve_gemini_call(**payload)
+        tickets.append(ticket)
+        return ticket
+
+    def generate(_system, _user, _schema, **kwargs):
+        primary_model = kwargs["model"]
+        fallback_model = kwargs["transient_retry_model"]
+        primary_telemetry = {
+            "model": primary_model,
+            "provider_status_code": 503,
+            "retryable": True,
+        }
+        primary_ticket = kwargs["before_dispatch"](
+            model=primary_model,
+            attempt=1,
+        )
+        kwargs["after_dispatch"](
+            primary_ticket,
+            model=primary_model,
+            attempt=1,
+            telemetry=primary_telemetry,
+        )
+        fallback_telemetry = {
+            "model": fallback_model,
+            "prompt_tokens": 200_001,
+            "candidate_tokens": 10,
+            "thought_tokens": 0,
+            "total_tokens": 200_011,
+            "service_tier_used": "priority",
+            "failover_from_model": primary_model,
+            "failover_model": fallback_model,
+            "failover_reason": "primary_transient_transport_error",
+        }
+        fallback_ticket = kwargs["before_dispatch"](
+            model=fallback_model,
+            attempt=2,
+        )
+        kwargs["after_dispatch"](
+            fallback_ticket,
+            model=fallback_model,
+            attempt=2,
+            telemetry=fallback_telemetry,
+        )
+        return SimpleNamespace(
+            text='{"topics": []}',
+            telemetry=fallback_telemetry,
+        )
+
+    monkeypatch.setattr(gemini_client, "count_request_tokens", count_tokens)
+    monkeypatch.setattr(gemini_client, "generate_json_v3", generate)
+
+    parsed, telemetry = gemini_segment._call_model(
+        "system",
+        "x" * 200_000,
+        gemini_segment._BoundaryPlan,
+        model="gemini-3.1-pro-preview",
+        thinking_level="medium",
+        max_output_tokens=100,
+        timeout_s=30.0,
+        deadline_monotonic=time.monotonic() + 10.0,
+        operation="pro_authoritative",
+        prompt_version=gemini_segment.PRO_BOUNDARY_PROFILE,
+        cancelled=None,
+        budget_reserve=reserve,
+        budget_reconcile=context.reconcile_gemini_call,
+        max_retries=1,
+        retry_service_tier="priority",
+        transient_retry_model="gemini-2.5-pro",
+    )
+
+    assert parsed.topics == []
+    assert token_count_models == [
+        "gemini-3.1-pro-preview",
+        "gemini-2.5-pro",
+    ]
+    assert [row["estimated_input_tokens"] for row in reservation_payloads] == [
+        200_000,
+        200_001,
+    ]
+    assert reservation_payloads[1]["model"] == "gemini-2.5-pro"
+    assert reservation_payloads[1]["billing_cost_multiplier"] == pytest.approx(
+        gemini_segment._PRO_PRIORITY_BILLING_MULTIPLIER
+    )
+    expected_fallback_reservation = (
+        200_001 * 2.50 + 100 * 15.00
+    ) / 1_000_000.0 * gemini_segment._PRO_PRIORITY_BILLING_MULTIPLIER
+    assert tickets[1]["reserved_cost_usd"] == pytest.approx(
+        expected_fallback_reservation
+    )
+    assert telemetry["model"] == "gemini-2.5-pro"
+    assert telemetry["physical_dispatches"] == 2
 
 
 def test_priority_retry_downgraded_to_standard_uses_standard_unknown_ceiling(

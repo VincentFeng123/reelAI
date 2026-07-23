@@ -31,6 +31,7 @@ def test_segment_router_keeps_flash_only_as_the_evaluation_default():
     assert config.SEGMENT_FLASH_MODEL == "gemini-3-flash-preview"
     assert config.SEGMENT_FLASH_FALLBACK_MODEL == ""
     assert config.SEGMENT_PRO_MODEL == "gemini-3.1-pro-preview"
+    assert config.SEGMENT_PRO_FALLBACK_MODEL == "gemini-2.5-pro"
     assert config.SEGMENT_MODEL == config.SEGMENT_PRO_MODEL
     assert config.SEGMENT_HYBRID_PERCENT == 100.0
 
@@ -38,7 +39,8 @@ def test_segment_router_keeps_flash_only_as_the_evaluation_default():
 def _reload_segment_config(monkeypatch, **values):
     keys = {
         "SEGMENT_ROUTING_MODE", "SEGMENT_FLASH_MODEL",
-        "SEGMENT_FLASH_FALLBACK_MODEL", "SEGMENT_PRO_MODEL", "SEGMENT_MODEL",
+        "SEGMENT_FLASH_FALLBACK_MODEL", "SEGMENT_PRO_MODEL",
+        "SEGMENT_PRO_FALLBACK_MODEL", "SEGMENT_MODEL",
         "SEGMENT_HYBRID_PERCENT",
     }
     with monkeypatch.context() as patch:
@@ -53,6 +55,7 @@ def _reload_segment_config(monkeypatch, **values):
             "flash": loaded.SEGMENT_FLASH_MODEL,
             "flash_fallback": loaded.SEGMENT_FLASH_FALLBACK_MODEL,
             "pro": loaded.SEGMENT_PRO_MODEL,
+            "pro_fallback": loaded.SEGMENT_PRO_FALLBACK_MODEL,
             "legacy": loaded.SEGMENT_MODEL,
             "percent": loaded.SEGMENT_HYBRID_PERCENT,
         }
@@ -72,6 +75,7 @@ def test_segment_router_rejects_invalid_values_and_clamps_percent(monkeypatch):
         "flash": "gemini-3-flash-preview",
         "flash_fallback": "",
         "pro": "gemini-3.1-pro-preview",
+        "pro_fallback": "gemini-2.5-pro",
         "legacy": "gemini-3.1-pro-preview",
         "percent": 0.0,
     }
@@ -144,3 +148,28 @@ def test_segment_flash_failover_model_is_configurable_and_can_be_disabled(monkey
         monkeypatch,
         SEGMENT_FLASH_FALLBACK_MODEL="",
     )["flash_fallback"] == ""
+
+
+def test_segment_pro_failover_is_stable_pro_only_and_distinct(monkeypatch):
+    assert _reload_segment_config(
+        monkeypatch,
+        SEGMENT_PRO_FALLBACK_MODEL="gemini-2.5-pro",
+    )["pro_fallback"] == "gemini-2.5-pro"
+    assert _reload_segment_config(
+        monkeypatch,
+        SEGMENT_PRO_FALLBACK_MODEL="models/gemini-2.5-pro",
+    )["pro_fallback"] == "models/gemini-2.5-pro"
+    for invalid_model in (
+        "gemini-3-flash-preview",
+        "gemini-3-pro",
+        "gemini-3.0-pro-preview",
+    ):
+        assert _reload_segment_config(
+            monkeypatch,
+            SEGMENT_PRO_FALLBACK_MODEL=invalid_model,
+        )["pro_fallback"] == ""
+    assert _reload_segment_config(
+        monkeypatch,
+        SEGMENT_PRO_MODEL="gemini-2.5-pro",
+        SEGMENT_PRO_FALLBACK_MODEL="gemini-2.5-pro",
+    )["pro_fallback"] == ""
