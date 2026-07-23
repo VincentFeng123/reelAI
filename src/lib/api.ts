@@ -1464,12 +1464,22 @@ async function consumeGenerationJob(
   let finalResponse: ReelsGenerateResponse | null = null;
   let consecutiveIdleWindows = 0;
   const idleTimeoutMs = Math.max(10, options.idleTimeoutMs ?? 35_000);
-  // Backend permits an eight-minute queue window plus a one-hour quality-first
-  // execution window. Keep one minute of transport slack, but stay finite.
-  const deadline = Date.now() + 69 * 60_000;
+  const executionTimeoutMs = 61 * 60_000;
+  // A durable job may legitimately wait behind other work. Keep that wait
+  // abortable, but start the finite execution budget only once work begins.
+  let executionDeadline = job.status === "running"
+    ? Date.now() + executionTimeoutMs
+    : null;
+  const markExecutionStarted = () => {
+    if (executionDeadline === null) {
+      executionDeadline = Date.now() + executionTimeoutMs;
+    }
+  };
 
-  while (Date.now() < deadline) {
-    const remainingMs = Math.max(1_000, deadline - Date.now());
+  while (executionDeadline === null || Date.now() < executionDeadline) {
+    const remainingMs = executionDeadline === null
+      ? 540_000
+      : Math.max(1_000, executionDeadline - Date.now());
     let terminalStatus: string | null = null;
     let terminalError: TypedApiError | null | undefined;
     try {
@@ -1503,6 +1513,7 @@ async function consumeGenerationJob(
         if (event.job_id !== job.job_id || !Number.isInteger(event.seq) || event.seq <= afterSeq) {
           return;
         }
+        markExecutionStarted();
         consecutiveIdleWindows = 0;
         options.onActivity?.();
         afterSeq = event.seq;
@@ -1590,7 +1601,12 @@ async function consumeGenerationJob(
     try {
       status = await fetchGenerationStatus(job.job_id, {
         signal: options.signal,
-        timeoutMs: Math.min(30_000, Math.max(1_000, deadline - Date.now())),
+        timeoutMs: Math.min(
+          30_000,
+          executionDeadline === null
+            ? 30_000
+            : Math.max(1_000, executionDeadline - Date.now()),
+        ),
       });
     } catch (error) {
       if (isRequestInterruptedError(error) || options.signal?.aborted) {
@@ -1601,6 +1617,9 @@ async function consumeGenerationJob(
       }
       await waitForReconnect(options.signal);
       continue;
+    }
+    if (status.status === "running" || (status.attempt_count ?? 0) > 0) {
+      markExecutionStarted();
     }
     if (status.status === "failed" || status.status === "cancelled") {
       options.onTerminal?.(status.status);

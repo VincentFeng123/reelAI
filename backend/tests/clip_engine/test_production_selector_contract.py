@@ -12308,7 +12308,7 @@ def test_pro_audit_shrinks_an_umbrella_to_one_atomic_objective_in_one_call(
     assert rejections == []
     assert len(dispatches) == len(calls) == 1
     assert dispatches[0]["operation"] == "pro_boundary_audit"
-    assert dispatches[0]["prompt_version"] == "pro_candidate_audit_v12"
+    assert dispatches[0]["prompt_version"] == "pro_candidate_audit_v13"
     [topic] = audited.topics
     assert (topic.start_line, topic.end_line) == (0, 0)
     assert topic.end_quote == "and produces ATP"
@@ -12463,6 +12463,8 @@ def _pro_audit_semantic_defaults(
         "family": proposal.concept_family or f"{proposal.title} concept",
         "a": list(proposal.concept_aliases),
         "direct": proposal.directly_teaches_topic,
+        "self": proposal.self_contained,
+        "stand": proposal.is_standalone,
         "ie": intent_evidence,
         "oi": objective_constraint_ids,
         "rw": [
@@ -12480,6 +12482,8 @@ def _pro_audit_rejection_defaults(evidence_quote: str) -> dict:
         "family": "rejected candidate",
         "a": [],
         "direct": False,
+        "self": False,
+        "stand": False,
         "ie": [],
         "oi": [],
         "rw": [],
@@ -12507,6 +12511,8 @@ def _run_stubbed_pro_candidate_audit(
             "family": "concept_family",
             "a": "concept_aliases",
             "direct": "directly_teaches_topic",
+            "self": "self_contained",
+            "stand": "is_standalone",
             "ie": "intent_evidence",
             "oi": "objective_constraint_ids",
             "rw": "relationship_witnesses",
@@ -13626,14 +13632,23 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
     assert "current_boundary_reference" in normalized
     assert "<current_selected_cues_focus>" in user
     assert "</current_selected_cues_focus>" in user
+    assert "<adjacent_transcript_cues>" in user
+    assert "</adjacent_transcript_cues>" in user
     selected_focus = user.split(
         "<current_selected_cues_focus>\n", 1,
     )[1].split("\n</current_selected_cues_focus>", 1)[0]
+    adjacent_focus = user.split(
+        "<adjacent_transcript_cues>\n", 1,
+    )[1].split("\n</adjacent_transcript_cues>", 1)[0]
     assert "Both people experience the same force" in selected_focus
     assert "And the larger person" in selected_focus
     assert "he is not going to move back very much" not in selected_focus
+    assert "he is not going to move back very much" in adjacent_focus
     assert "mandatory word-edge checklist" in normalized
-    assert "read current_selected_cues_focus literally" in normalized
+    assert (
+        "read current_selected_cues_focus as the literal current sq-through-eq speech"
+        in normalized
+    )
     assert (
         "a bare number/result, sentence tail, recap of a completed earlier example"
         in normalized
@@ -13674,6 +13689,13 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
     assert "the newton is not the only unit for force" in normalized
     assert "never end on an unfulfilled 'not only" in normalized
     assert "selector's cq and ie are untrusted hypotheses" in normalized
+    assert "inventory every definite or deictic reference" in normalized
+    assert "an unexplained numeric result" in normalized
+    assert "missing visual context is not a rejection reason" in normalized
+    assert "find the earliest complete teaching stop" in normalized
+    assert "countdowns, applause, laughter, screams" in normalized
+    assert "recomputed from the final repaired sq-through-eq speech" in normalized
+    assert "these labels are never hard rejection gates" in normalized
     assert "boundary fields are non-semantic echo sentinels" in normalized
     assert "filler/navigation only" in normalized
     audit_schema = gemini_segment._ProCandidateAuditPlan.model_json_schema()
@@ -13692,6 +13714,8 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
         "family",
         "a",
         "direct",
+        "self",
+        "stand",
         "ie",
         "oi",
         "rw",
@@ -13706,7 +13730,13 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
         "eq",
     } <= audit_required
     assert gemini_segment._PRO_BOUNDARY_AUDIT_PROMPT_VERSION == (
-        "pro_candidate_audit_v12"
+        "pro_candidate_audit_v13"
+    )
+    assert (
+        gemini_segment._pro_boundary_audit_output_tokens(
+            gemini_segment._MAX_CLIPS
+        )
+        <= gemini_segment._PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS
     )
 
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
@@ -13764,6 +13794,63 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
             cancelled=None,
         )
     assert exc_info.value.telemetry["error_type"] == "GeminiAuditContractError"
+
+
+def test_pro_candidate_audit_focus_is_exact_word_span_with_neighbor_cues() -> None:
+    request = "acceleration"
+    claim = "Acceleration is the rate at which velocity changes"
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="Acceleration is the rate",
+        end_quote="at which velocity changes",
+        claim_quote=claim,
+    )
+    plan = plan.model_copy(update={
+        "topics": [
+            plan.topics[0].model_copy(update={"start_line": 1, "end_line": 1})
+        ],
+    })
+    segments = [
+        {
+            "cue_id": "cue-before",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "Velocity was defined in the previous lesson.",
+        },
+        {
+            "cue_id": "cue-selected",
+            "start": 4.0,
+            "end": 10.0,
+            "text": (
+                "The prior answer was forty two. Acceleration is the rate at "
+                "which velocity changes. Next, we discuss jerk."
+            ),
+        },
+        {
+            "cue_id": "cue-after",
+            "start": 10.0,
+            "end": 14.0,
+            "text": "Jerk is the rate at which acceleration changes.",
+        },
+    ]
+
+    _system, user, _allowed = gemini_segment._pro_boundary_audit_prompts(
+        plan,
+        segments,
+        request,
+    )
+    selected_focus = user.split(
+        "<current_selected_cues_focus>\n", 1,
+    )[1].split("\n</current_selected_cues_focus>", 1)[0]
+    adjacent_focus = user.split(
+        "<adjacent_transcript_cues>\n", 1,
+    )[1].split("\n</adjacent_transcript_cues>", 1)[0]
+
+    assert selected_focus == claim
+    assert "prior answer" not in selected_focus
+    assert "discuss jerk" not in selected_focus
+    assert "Velocity was defined" in adjacent_focus
+    assert "Jerk is the rate" in adjacent_focus
 
 
 def test_pro_candidate_audit_advances_past_completed_prior_lesson(
@@ -14608,7 +14695,7 @@ def test_pro_boundary_audit_retries_one_schema_failure(
         attempted_levels.append(kwargs["thinking_level"])
         attempted_users.append(user)
         assert kwargs["operation"] == "pro_boundary_audit"
-        assert kwargs["max_retries"] == (2 if attempted == 1 else 0)
+        assert kwargs["max_retries"] == (2 if attempted == 1 else 1)
         assert kwargs["use_full_transient_retry_budget"] is True
         assert kwargs.get("retry_status_codes") is None
         telemetry = {
@@ -14630,6 +14717,8 @@ def test_pro_boundary_audit_retries_one_schema_failure(
             "family": "Bayes' theorem",
             "a": ["Bayes' rule"],
             "direct": True,
+            "self": True,
+            "stand": True,
             "ie": [{
                 "id": "subject",
                 "q": "Bayes' theorem updates a prior probability using the likelihood",
@@ -15524,7 +15613,10 @@ def test_pro_candidate_audit_keeps_valid_item_despite_extra_unknown_id(
     assert calls[0]["audit_partial_contract_retained_count"] == 1
 
 
-def test_pro_audit_response_schema_salvages_valid_items_independently() -> None:
+@pytest.mark.parametrize("missing_truth_field", ["self", "stand"])
+def test_pro_audit_response_schema_salvages_valid_items_independently(
+    missing_truth_field: str,
+) -> None:
     request = "cellular respiration"
     claim = "Glycolysis splits glucose into pyruvate while producing ATP"
     plan = _compact_custom_plan(
@@ -15550,7 +15642,7 @@ def test_pro_audit_response_schema_salvages_valid_items_independently() -> None:
     malformed_sibling = {
         key: value
         for key, value in valid_item.items()
-        if key != "family"
+        if key != missing_truth_field
     }
     malformed_sibling["id"] = "candidate-2"
 
@@ -16214,6 +16306,8 @@ def test_pro_candidate_audit_may_drop_untrusted_selector_context_evidence(
         "candidate_id": "candidate-1",
         "decision": "keep",
         "actual_objective": "Explain how evidence updates a Bayesian posterior",
+        "self": True,
+        "stand": True,
         "evidence_quote": "Posterior probability combines prior evidence with likelihood",
         "direct_start_line": 0,
         "direct_start_quote": "Posterior probability combines",
@@ -16243,6 +16337,8 @@ def test_pro_candidate_audit_may_drop_untrusted_selector_context_evidence(
 
     assert retained.topics[0].start_quote == "Posterior probability combines"
     assert retained.topics[0].start_line == 0
+    assert retained.topics[0].self_contained is True
+    assert retained.topics[0].is_standalone is True
     assert rejections == []
     report = gemini_segment._plan_to_report(
         retained,
@@ -16258,6 +16354,219 @@ def test_pro_candidate_audit_may_drop_untrusted_selector_context_evidence(
     assert "Necessary setup" not in report.clips[0]["_clip_text"]
     assert report.clips[0]["topic_evidence_quote"] == (
         "Posterior probability combines prior evidence with likelihood"
+    )
+    assert report.clips[0]["self_contained"] is True
+    assert report.clips[0]["is_standalone"] is True
+
+
+def test_pro_candidate_audit_overwrites_stale_independence_for_dependent_biology_opening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain how DNA ligase joins Okazaki fragments"
+    evidence = "joins these fragments by sealing the sugar phosphate backbone"
+    segments = [
+        {
+            "cue_id": "cue-dna-setup",
+            "start": 0.0,
+            "end": 7.0,
+            "text": (
+                "On the lagging strand, polymerase produces short Okazaki "
+                "fragments."
+            ),
+        },
+        {
+            "cue_id": "cue-dna-dependent",
+            "start": 7.0,
+            "end": 13.0,
+            "text": (
+                "It then joins these fragments by sealing the sugar phosphate "
+                "backbone."
+            ),
+        },
+    ]
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": [{
+                "constraint_id": "ligase",
+                "kind": "subject",
+                "source_phrase": "DNA ligase",
+                "requirement": request,
+            }],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="ligase-dependent-opening",
+            start_line=1,
+            end_line=1,
+            start_quote="It then joins these fragments",
+            end_quote="the sugar phosphate backbone",
+            claim_quote=evidence,
+            title="DNA ligase joins Okazaki fragments",
+            learning_objective=request,
+            facet="Okazaki fragment joining",
+            concept_family="DNA ligase joining of Okazaki fragments",
+            concept_aliases=[],
+            informativeness=0.8,
+            topic_relevance=1.0,
+            educational_importance=0.9,
+            difficulty=0.4,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[{"id": "ligase", "q": evidence}],
+            objective_constraint_ids=["ligase"],
+            relationship_witnesses=[],
+        )],
+    )
+
+    audited, _calls, rejections = _run_stubbed_pro_candidate_audit(
+        monkeypatch,
+        plan=plan,
+        segments=segments,
+        item={
+            "candidate_id": "candidate-1",
+            "decision": "keep",
+            "actual_objective": request,
+            "self_contained": False,
+            # A schema-valid contradictory model pair must fail closed without
+            # rejecting or spending a corrective call.
+            "is_standalone": True,
+            "evidence_quote": evidence,
+            "direct_start_line": 1,
+            "direct_start_quote": "joins these fragments by sealing",
+            "direct_start_context_resolved": False,
+            "start_line": 1,
+            "end_line": 1,
+            "start_quote": "It then joins these fragments",
+            "end_quote": "the sugar phosphate backbone",
+        },
+    )
+
+    assert rejections == []
+    [proposal] = audited.topics
+    assert proposal.self_contained is False
+    assert proposal.is_standalone is False
+    report = gemini_segment._plan_to_report(
+        audited,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=request,
+    )
+    assert report.clips[0]["self_contained"] is False
+    assert report.clips[0]["is_standalone"] is False
+
+
+def test_pro_candidate_audit_trims_reaction_tail_and_keeps_clean_chemistry_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain the sodium bicarbonate and acetic acid reaction"
+    evidence = "reacts with acetic acid to produce carbon dioxide"
+    segments = [
+        {
+            "cue_id": "cue-chemistry-result",
+            "start": 0.0,
+            "end": 9.0,
+            "text": (
+                "Sodium bicarbonate reacts with acetic acid to produce carbon "
+                "dioxide gas. The bubbles are evidence of gas production."
+            ),
+        },
+        {
+            "cue_id": "cue-performance-tail",
+            "start": 9.0,
+            "end": 18.0,
+            "text": (
+                "Everybody get ready. Three, two, one. Screaming and laughter. "
+                "That was amazing."
+            ),
+        },
+    ]
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": [{
+                "constraint_id": "reaction",
+                "kind": "subject",
+                "source_phrase": "sodium bicarbonate and acetic acid reaction",
+                "requirement": request,
+            }],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="reaction-with-performance-tail",
+            start_line=0,
+            end_line=1,
+            start_quote="Sodium bicarbonate reacts with acetic acid",
+            end_quote="That was amazing",
+            claim_quote=evidence,
+            title="Carbon dioxide production",
+            learning_objective=request,
+            facet="acid-bicarbonate gas production",
+            concept_family="Acid-bicarbonate reaction",
+            concept_aliases=[],
+            informativeness=0.9,
+            topic_relevance=1.0,
+            educational_importance=0.9,
+            difficulty=0.2,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[{"id": "reaction", "q": evidence}],
+            objective_constraint_ids=["reaction"],
+            relationship_witnesses=[],
+        )],
+    )
+
+    audited, _calls, rejections = _run_stubbed_pro_candidate_audit(
+        monkeypatch,
+        plan=plan,
+        segments=segments,
+        item={
+            "candidate_id": "candidate-1",
+            "decision": "keep",
+            "actual_objective": request,
+            "self_contained": True,
+            "is_standalone": True,
+            "evidence_quote": evidence,
+            "direct_start_line": 0,
+            "direct_start_quote": (
+                "Sodium bicarbonate reacts with acetic acid"
+            ),
+            "direct_start_context_resolved": True,
+            "start_line": 0,
+            "end_line": 0,
+            "start_quote": "Sodium bicarbonate reacts with acetic acid",
+            "end_quote": "evidence of gas production",
+        },
+    )
+
+    assert rejections == []
+    [proposal] = audited.topics
+    assert proposal.end_line == 0
+    assert proposal.self_contained is True
+    assert proposal.is_standalone is True
+    report = gemini_segment._plan_to_report(
+        audited,
+        segments,
+        [],
+        {
+            "_segment_trust_gemini_semantics": True,
+            "_segment_universal_boundaries": True,
+        },
+        topic=request,
+    )
+    assert report.clips[0]["self_contained"] is True
+    assert report.clips[0]["is_standalone"] is True
+    assert "Screaming and laughter" not in report.clips[0]["_clip_text"]
+    assert report.clips[0]["_clip_text"].endswith(
+        "evidence of gas production"
     )
 
 
@@ -26705,6 +27014,8 @@ def test_healthy_relationship_selector_and_audit_use_exactly_two_calls_no_retry(
         "family": "Newton's third law of motion",
         "a": [],
         "direct": True,
+        "self": True,
+        "stand": True,
         "ie": [{"id": "third-law", "q": evidence}],
         "oi": ["third-law"],
         "rw": [witness],
@@ -26771,6 +27082,8 @@ def test_healthy_relationship_selector_and_audit_use_exactly_two_calls_no_retry(
     assert len(calls) == 2
     assert [call["physical_dispatches"] for call in calls] == [1, 1]
     assert [call["retries"] for call in calls] == [0, 0]
+    assert report.clips[0]["self_contained"] is True
+    assert report.clips[0]["is_standalone"] is True
     assert not any(
         value
         for call in calls

@@ -48,6 +48,7 @@ DEFAULT_LEASE_SECONDS = 90
 DEFAULT_DEADLINE_SECONDS = 60 * 60
 DEFAULT_QUEUE_TTL_SECONDS = 8 * 60
 MAX_DURABLE_RETRY_AFTER_SECONDS = 30.0
+DURABLE_QUEUE_WAIT_PARAM = "durable_queue_wait"
 # Request-key version doubles as a production inventory compatibility gate.
 REQUEST_SCHEMA_VERSION = "adaptive_clip_concepts_v7"
 EMPTY_ADAPTATION_FINGERPRINT = hashlib.sha256(b"{}").hexdigest()
@@ -86,6 +87,11 @@ def _iso(value: datetime | str | None = None) -> str:
 
 def _normalize_text(value: object) -> str:
     return " ".join(str(value or "").split())
+
+
+def _uses_durable_queue_wait(job_row: dict[str, Any]) -> bool:
+    params = loads_json(str(job_row.get("request_params_json") or "{}"), default={})
+    return isinstance(params, dict) and params.get(DURABLE_QUEUE_WAIT_PARAM) is True
 
 
 def _settle_search_quota(conn: Any, job_id: str) -> None:
@@ -577,6 +583,8 @@ def expire_stale_queued_job(
         return False
     if int(current.get("attempt_count") or 0) != 0:
         return False
+    if _uses_durable_queue_wait(current):
+        return False
     now_dt = _utc_now(now)
     ttl_seconds = max(1, int(queue_ttl_seconds))
     cutoff = now_dt - timedelta(seconds=ttl_seconds)
@@ -718,6 +726,7 @@ def lease_job(
     else:
         raw_deadline = current.get("deadline_at")
         deadline_at = _iso(raw_deadline) if raw_deadline else None
+    durable_queue_wait = first_attempt and _uses_durable_queue_wait(current)
     lease_duration = max(1, min(DEFAULT_LEASE_SECONDS, int(lease_seconds)))
     lease_expires_dt = now_dt + timedelta(seconds=lease_duration)
     if deadline_at:
@@ -753,7 +762,7 @@ def lease_job(
               (
                   status = 'queued'
                   AND attempt_count = 0
-                  AND created_at > ?
+                  AND (? = 1 OR created_at > ?)
               )
               OR (
                   (deadline_at IS NULL OR deadline_at > ?)
@@ -782,6 +791,7 @@ def lease_job(
             now_text,
             now_text,
             job_id,
+            1 if durable_queue_wait else 0,
             queue_cutoff,
             now_text,
             now_text,
@@ -1270,6 +1280,7 @@ __all__ = [
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_MAX_ATTEMPTS",
     "DEFAULT_QUEUE_TTL_SECONDS",
+    "DURABLE_QUEUE_WAIT_PARAM",
     "EVENT_TYPES",
     "GenerationQueueFullError",
     "JobLeaseLostError",

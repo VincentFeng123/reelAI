@@ -1464,7 +1464,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
     def test_cache_version_includes_recall_and_stored_details(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 49)
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 50)
         self.assertEqual(
             main_module.reel_service.RANKED_FEED_CACHE_CONTRACT_VERSION,
             "quality_silence_v41",

@@ -152,6 +152,7 @@ def test_practice_fast_healthy_expansion_has_one_call_and_no_retry_wait(
     assert calls == 1
     intent_contract = result.pop("intent_contract")
     acquisition_ids = result.pop("acquisition_obligation_constraint_ids")
+    query_metadata = result.pop("query_metadata")
     assert result == {
         "corrected": "Physics",
         "queries": ["physics explained"],
@@ -160,6 +161,15 @@ def test_practice_fast_healthy_expansion_has_one_call_and_no_retry_wait(
     assert intent_contract["version"] == "expansion_intent_v2"
     assert intent_contract["request_intent"]["exact_request"] == "physics"
     assert acquisition_ids == ["subject"]
+    assert query_metadata == [{
+        "text": "physics explained",
+        "preserved_constraint_ids": ["subject"],
+        "intent_obligation_keys": sorted(
+            expand.trusted_intent_obligation_keys(intent_contract)
+        ),
+        "focused_intent_obligation_keys": [],
+        "covers_all_intent_constraints": True,
+    }]
 
 
 @pytest.mark.parametrize(

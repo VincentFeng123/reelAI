@@ -213,9 +213,9 @@ from .ingestion.pipeline import IngestionPipeline
 from .services.generation_jobs import (
     DEFAULT_HEARTBEAT_SECONDS,
     DEFAULT_LEASE_SECONDS,
+    DURABLE_QUEUE_WAIT_PARAM as GENERATION_DURABLE_QUEUE_WAIT_PARAM,
     EMPTY_ADAPTATION_FINGERPRINT as GENERATION_EMPTY_ADAPTATION_FINGERPRINT,
     REQUEST_SCHEMA_VERSION as GENERATION_REQUEST_SCHEMA_VERSION,
-    GenerationQueueFullError,
     JobLeaseLostError,
     TERMINAL_STATUSES as GENERATION_TERMINAL_STATUSES,
     append_event as append_generation_event,
@@ -476,9 +476,6 @@ MATERIAL_RATE_LIMIT_PER_WINDOW = 8
 REELS_RATE_LIMIT_PER_WINDOW = 12
 REELS_GENERATE_RATE_LIMIT_PER_WINDOW = 6
 FEED_RATE_LIMIT_PER_WINDOW = 36
-GENERATION_GLOBAL_ACTIVE_LIMIT = 4
-GENERATION_LEARNER_ACTIVE_LIMIT = 1
-GENERATION_QUEUE_RETRY_AFTER_SEC = 30
 GENERATION_JOB_STATUS_RATE_LIMIT_PER_WINDOW = 120
 FEEDBACK_RATE_LIMIT_PER_WINDOW = 60
 ASSESSMENT_PROGRESS_RATE_LIMIT_PER_WINDOW = 240
@@ -3570,13 +3567,17 @@ def _same_adaptation_current_restatement_policy(
     generation_ids: Iterable[str],
     *,
     adaptation_fingerprint: object,
+    reacquisition_checkpoint_out: list[bool] | None = None,
 ) -> tuple[set[str], set[str]]:
     """Return exact organizer omissions and their selected availability guards."""
     fingerprint = str(adaptation_fingerprint or "").strip()
     if not fingerprint:
+        if reacquisition_checkpoint_out is not None:
+            reacquisition_checkpoint_out.append(False)
         return set(), set()
     restatement_ids: set[str] = set()
     guard_ids: set[str] = set()
+    reacquisition_checkpoint_seen = False
     for generation_id in generation_ids:
         row = generation_rows.get(str(generation_id or "").strip())
         if not isinstance(row, Mapping):
@@ -3618,6 +3619,12 @@ def _same_adaptation_current_restatement_policy(
             continue
         restatement_ids.update(normalized)
         guard_ids.update(normalized_guards)
+        reacquisition_checkpoint_seen = bool(
+            reacquisition_checkpoint_seen
+            or metadata.get("editorial_reacquisition_checkpoint") is True
+        )
+    if reacquisition_checkpoint_out is not None:
+        reacquisition_checkpoint_out.append(reacquisition_checkpoint_seen)
     if not restatement_ids or not guard_ids:
         return set(), set()
     return restatement_ids, guard_ids
@@ -6542,6 +6549,7 @@ def _run_leased_generation_job(
                 source_generation_id,
                 generation_rows_out=source_generation_rows,
             )
+            prior_reacquisition_checkpoints: list[bool] = []
             (
                 same_adaptation_restatement_ids,
                 same_adaptation_restatement_guard_ids,
@@ -6551,6 +6559,12 @@ def _run_leased_generation_job(
                 adaptation_fingerprint=params.get(
                     "adaptation_fingerprint"
                 ),
+                reacquisition_checkpoint_out=(
+                    prior_reacquisition_checkpoints
+                ),
+            )
+            prior_reacquisition_checkpoint_seen = any(
+                prior_reacquisition_checkpoints
             )
             prior_consumed_video_ids = _generation_chain_consumed_video_ids(
                 conn,
@@ -6618,6 +6632,7 @@ def _run_leased_generation_job(
 
             base_exclusions = list(params.get("exclude_video_ids") or [])
             base_exclusions.extend(sorted(retired_failed_video_ids))
+            prior_covered_intent_obligation_keys: set[str] | None = None
 
             def run_retrieval_stage(
                 *,
@@ -6631,6 +6646,32 @@ def _run_leased_generation_job(
                 capacity_deferred_video_ids: set[str],
                 retrieved_video_ids: set[str],
             ) -> None:
+                nonlocal prior_covered_intent_obligation_keys
+                if prior_covered_intent_obligation_keys is None:
+                    prior_release_ids = (
+                        _authoritative_release_reel_ids(
+                            conn,
+                            source_generation_id,
+                        )
+                        or []
+                    )
+                    prior_coverage, _recent_prior_coverage = (
+                        _lesson_prior_coverage(
+                            conn,
+                            material_id=material_id,
+                            reel_ids=prior_release_ids,
+                        )
+                    )
+                    prior_covered_intent_obligation_keys = set().union(*(
+                        {
+                            str(value).strip()
+                            for value in (
+                                item.get("intent_obligation_keys") or ()
+                            )
+                            if str(value or "").strip()
+                        }
+                        for item in prior_coverage
+                    )) if prior_coverage else set()
                 reel_service.generate_reels(
                     conn,
                     material_id=material_id,
@@ -6663,6 +6704,9 @@ def _run_leased_generation_job(
                     attempted_video_ids=attempted_video_ids,
                     capacity_deferred_video_ids=capacity_deferred_video_ids,
                     retrieved_video_ids=retrieved_video_ids,
+                    covered_intent_obligation_keys=(
+                        prior_covered_intent_obligation_keys
+                    ),
                 )
 
             current_count = source_reel_count + _count_generation_surfaceable_reels(
@@ -6759,6 +6803,7 @@ def _run_leased_generation_job(
             reconciliation_tail_reel_ids: list[str] | None = None
             candidate_final_reels: list[dict[str, Any]] = []
             authoritative_prior_reel_ids: list[str] = []
+            editorial_reacquisition_available = False
             if cumulative_count or has_verified_reservoir or rankable_fallback:
                 candidate_final_reels = rankable_fallback or _generation_job_reels(
                     conn,
@@ -6943,11 +6988,70 @@ def _run_leased_generation_job(
                     )
                     if not isinstance(organizer_current_restatement_ids, list):
                         organizer_current_restatement_ids = []
-                    ordering_degraded = ordering.degraded
+                    editorial_fallback_reason: str | None = None
+                    current_candidate_reels = [
+                        reel
+                        for reel in candidate_final_reels
+                        if str(
+                            reel.get("reel_id") or ""
+                        ).strip()
+                    ]
+                    current_candidate_ids = [
+                        str(reel.get("reel_id") or "").strip()
+                        for reel in current_candidate_reels
+                    ]
+                    current_restatement_id_set = set(
+                        organizer_current_restatement_ids
+                    )
+                    adaptation_fingerprint = str(
+                        params.get("adaptation_fingerprint") or ""
+                    ).strip()
+                    restatement_only_current_omission = bool(
+                        is_continuation
+                        and adaptation_fingerprint
+                        and organizer_ordered_ids
+                        and not released_ordered_ids
+                        and current_candidate_ids
+                        and set(current_candidate_ids).issubset(
+                            current_restatement_id_set
+                        )
+                        and current_restatement_id_set.isdisjoint(
+                            organizer_ordered_ids
+                        )
+                    )
+                    if (
+                        restatement_only_current_omission
+                        and prior_reacquisition_checkpoint_seen
+                    ):
+                        # One empty editorial checkpoint already bought a fresh
+                        # bounded search. If every new valid candidate is again
+                        # only a restatement, surface the strongest current row
+                        # instead of creating an unbounded chain of empty partials.
+                        fallback_reel_id = current_candidate_ids[0]
+                        final_reels = [current_candidate_reels[0]]
+                        released_ordered_ids = [fallback_reel_id]
+                        organizer_current_restatement_ids = [
+                            reel_id
+                            for reel_id in organizer_current_restatement_ids
+                            if reel_id != fallback_reel_id
+                        ]
+                        editorial_fallback_reason = (
+                            "restatement_reacquisition_limit"
+                        )
+                        if reconciliation_tail_reel_ids is not None:
+                            reconciliation_tail_reel_ids = list(
+                                dict.fromkeys([
+                                    *reconciliation_tail_reel_ids,
+                                    fallback_reel_id,
+                                ])
+                            )
+                    ordering_degraded = bool(
+                        ordering.degraded or editorial_fallback_reason
+                    )
                     checkpoint_ids = assessment_checkpoint_reel_ids(
                         released_ordered_ids,
                         released_checkpoint_ids,
-                        degraded=ordering.degraded,
+                        degraded=ordering_degraded,
                     )
                     lesson_order_metadata = {
                         "version": 2,
@@ -6968,6 +7072,7 @@ def _run_leased_generation_job(
                             if organizer_current_restatement_ids
                             else []
                         ),
+                        "editorial_reacquisition_checkpoint": False,
                         "adaptation_fingerprint": str(
                             params.get("adaptation_fingerprint") or ""
                         ).strip(),
@@ -6976,10 +7081,20 @@ def _run_leased_generation_job(
                         ),
                         "model_used": ordering.model_used,
                         "created_at": now_iso(),
-                        "degraded": ordering.degraded,
-                        "fallback_reason": ordering.fallback_reason,
+                        "degraded": ordering_degraded,
+                        "fallback_reason": (
+                            editorial_fallback_reason
+                            or ordering.fallback_reason
+                        ),
                         "provider_called": ordering.provider_called,
                     }
+                    editorial_reacquisition_available = bool(
+                        restatement_only_current_omission
+                        and not prior_reacquisition_checkpoint_seen
+                    )
+                    lesson_order_metadata[
+                        "editorial_reacquisition_checkpoint"
+                    ] = editorial_reacquisition_available
                     _run_generation_db_transaction(
                         "lesson_order_metadata",
                         lambda lesson_conn: _persist_generation_lesson_order(
@@ -7112,7 +7227,10 @@ def _run_leased_generation_job(
                 )
                 final_reels = []
             has_terminal_result = (
-                bool(final_reels) or has_verified_reservoir or provider_cursor_open
+                bool(final_reels)
+                or has_verified_reservoir
+                or provider_cursor_open
+                or editorial_reacquisition_available
             )
 
             usage_records = context.usage()
@@ -7354,24 +7472,17 @@ def _wake_generation_worker() -> None:
 
 
 def _submit_bounded_generation_job(conn, **kwargs: Any) -> tuple[dict[str, Any], bool]:
-    try:
-        return submit_generation_job(
-            conn,
-            **kwargs,
-            max_global_active_jobs=GENERATION_GLOBAL_ACTIVE_LIMIT,
-            max_active_jobs_per_learner=GENERATION_LEARNER_ACTIVE_LIMIT,
-        )
-    except GenerationQueueFullError as exc:
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "code": "generation_queue_full",
-                "message": "Generation is busy. Retry after an active request finishes.",
-                "scope": exc.scope,
-                "limit": exc.limit,
-            },
-            headers={"Retry-After": str(GENERATION_QUEUE_RETRY_AFTER_SEC)},
-        ) from exc
+    request_params = kwargs.get("request_params")
+    if not isinstance(request_params, dict):
+        raise ValueError("request_params must be a dictionary")
+    kwargs["request_params"] = {
+        **request_params,
+        GENERATION_DURABLE_QUEUE_WAIT_PARAM: True,
+    }
+    # Admission is still bounded by verified-account, rate, billing, and quota
+    # checks. The worker bounds provider concurrency; accepted work stays queued
+    # instead of being dropped merely because another topic is still running.
+    return submit_generation_job(conn, **kwargs)
 
 
 def _start_generation_worker() -> None:

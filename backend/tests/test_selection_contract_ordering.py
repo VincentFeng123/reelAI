@@ -18,6 +18,10 @@ from backend.app.clip_engine.provider_cache import (
     transcript_artifact_key,
 )
 from backend.app.services.reels import ReelService
+from backend.intent_obligations import (
+    INTENT_OBLIGATION_CONTRACT_VERSION,
+    intent_obligation,
+)
 
 
 class SelectionContractOrderingTests(unittest.TestCase):
@@ -1447,6 +1451,103 @@ class SelectionContractOrderingTests(unittest.TestCase):
             self.assertIs(result[0]["_selection_is_standalone"], True)
             self.assertAlmostEqual(result[0]["relevance_score"], 0.93)
             self.assertAlmostEqual(result[0]["topic_relevance"], 0.93)
+
+    def test_ranked_feed_preserves_trusted_lesson_metadata_across_cache(self) -> None:
+        self._insert_versioned_reel(
+            reel_id="trusted-lesson-metadata",
+            video_id="video-a",
+            start=10,
+            difficulty=0.15,
+            base_score=0.8,
+        )
+        foundation = intent_obligation(
+            kind="subject",
+            source_phrase="potential energy",
+            source_start=0,
+            requirement="Explain potential energy first.",
+            evidence_quote="Potential energy is stored energy.",
+        )
+        application = intent_obligation(
+            kind="task",
+            source_phrase="kinetic energy",
+            source_start=17,
+            requirement="Then apply kinetic energy.",
+            evidence_quote="Kinetic energy is energy of motion.",
+        )
+        relationship = intent_obligation(
+            kind="relationship",
+            source_phrase="potential to kinetic",
+            source_start=32,
+            requirement="Connect potential energy to kinetic energy.",
+            evidence_quote="Potential energy changes into kinetic energy.",
+        )
+        self.assertTrue(foundation and application and relationship)
+        row = self.conn.execute(
+            "SELECT search_context_json FROM reels "
+            "WHERE id = 'trusted-lesson-metadata'"
+        ).fetchone()
+        context = json.loads(row[0])
+        context.update({
+            "selection_contract_version": "quality_silence_v41",
+            "selection_authority": "gemini",
+            "intent_obligation_contract_version": (
+                INTENT_OBLIGATION_CONTRACT_VERSION
+            ),
+            "intent_obligations": [foundation, application, relationship],
+            "intent_connections": [relationship],
+            "intent_relationship_witnesses": [{
+                "obligation_key": relationship["key"],
+                "members": ["potential energy", "kinetic energy"],
+                "links": ["changes into"],
+            }],
+            "intent_curriculum_edges": [{
+                "before_key": foundation["key"],
+                "after_key": application["key"],
+                "relation_key": relationship["key"],
+            }],
+            "intent_role": "primary",
+            "intent_coverage": 0.9,
+            "directly_teaches_topic": True,
+            "self_contained": True,
+            "is_standalone": True,
+            "topic_evidence_quote": (
+                "Potential energy changes into kinetic energy."
+            ),
+        })
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? "
+            "WHERE id = 'trusted-lesson-metadata'",
+            (json.dumps(context),),
+        )
+
+        fresh = self._ranked()
+        cached = self._ranked()
+
+        expected = {
+            "_selection_intent_obligations": [
+                foundation,
+                application,
+                relationship,
+            ],
+            "_selection_intent_connections": [relationship],
+            "_selection_intent_relationship_witnesses": [{
+                "obligation_key": relationship["key"],
+                "members": ["potential energy", "kinetic energy"],
+                "links": ["changes into"],
+            }],
+            "_selection_intent_curriculum_edges": [{
+                "before_key": foundation["key"],
+                "after_key": application["key"],
+                "relation_key": relationship["key"],
+            }],
+            "_selection_intent_role": "primary",
+            "_selection_intent_coverage": 0.9,
+            "_selection_directly_teaches_topic": True,
+        }
+        for result in (fresh, cached):
+            self.assertEqual(len(result), 1)
+            for key, value in expected.items():
+                self.assertEqual(result[0][key], value)
 
     def test_ranked_feed_uses_selector_cue_snapshot_after_artifact_refresh(self) -> None:
         response_video_id = "yt:dQw4w9WgXcQ"

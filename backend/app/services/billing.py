@@ -566,11 +566,11 @@ def reconcile_stale_reservations(
     max_age_seconds: int = 2 * 60 * 60,
     account_id: str | None = None,
 ) -> int:
-    """Refund reservations whose UTC day or maximum job lifetime has elapsed."""
+    """Refund stale orphan reservations while preserving nonterminal job quota."""
     current = _utc_now(now)
     usage_day, _reset_at = _day_and_reset(current)
     cutoff = (current - timedelta(seconds=max(60, int(max_age_seconds)))).isoformat()
-    account_clause = " AND account_id = ?" if account_id else ""
+    account_clause = " AND r.account_id = ?" if account_id else ""
     params: tuple[Any, ...] = (
         (usage_day, cutoff, account_id)
         if account_id
@@ -579,10 +579,23 @@ def reconcile_stale_reservations(
     rows = fetch_all(
         conn,
         f"""
-        SELECT id FROM search_quota_reservations
-        WHERE status = 'reserved'
-          AND (usage_day < ? OR updated_at <= ?)
+        SELECT r.id FROM search_quota_reservations AS r
+        WHERE r.status = 'reserved'
+          AND (r.usage_day < ? OR r.updated_at <= ?)
           {account_clause}
+          AND NOT EXISTS (
+              SELECT 1
+              FROM search_quota_reservation_jobs AS j
+              JOIN reel_generation_jobs AS g ON g.id = j.generation_job_id
+              WHERE j.reservation_id = r.id
+                AND g.status IN ('queued', 'running')
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM reel_generation_jobs AS g
+              WHERE g.id = r.generation_job_id
+                AND g.status IN ('queued', 'running')
+          )
         """,
         params,
     )

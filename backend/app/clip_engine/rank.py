@@ -144,6 +144,23 @@ def merge_and_rank(per_query: list[dict], level: str | None = None) -> list[dict
 
             query_family = semantic_query_family(res.get("query") or "")
         query_trust = str(res.get("query_trust") or "trusted").strip().casefold()
+        query_constraint_ids = [
+            str(value).strip()
+            for value in (res.get("query_constraint_ids") or [])
+            if str(value or "").strip()
+        ]
+        query_intent_obligation_keys = [
+            str(value).strip()
+            for value in (res.get("query_intent_obligation_keys") or [])
+            if str(value or "").strip()
+        ]
+        query_focused_intent_obligation_keys = [
+            str(value).strip()
+            for value in (
+                res.get("query_focused_intent_obligation_keys") or []
+            )
+            if str(value or "").strip()
+        ]
         filters_applied = res.get("filters_applied") or {}
         hd_match = bool(
             res.get("hd_preferred")
@@ -194,7 +211,11 @@ def merge_and_rank(per_query: list[dict], level: str | None = None) -> list[dict
                     "best_rank": rank,
                     "matched_queries": [],
                     "matched_query_provenance": {},
+                    "matched_query_constraint_ids": {},
+                    "matched_query_intent_obligation_keys": {},
                     "matched_families": [],
+                    "matched_intent_obligation_keys": [],
+                    "matched_focused_intent_obligation_keys": [],
                     "_family_trust": {},
                     "literal_match": False,
                     "canonical_match": False,
@@ -247,6 +268,22 @@ def merge_and_rank(per_query: list[dict], level: str | None = None) -> list[dict
                 entry["matched_query_provenance"][str(q)] = str(
                     res.get("query_provenance") or query_trust
                 )
+                entry["matched_query_constraint_ids"][str(q)] = list(
+                    dict.fromkeys(query_constraint_ids)
+                )
+                entry["matched_query_intent_obligation_keys"][str(q)] = list(
+                    dict.fromkeys(query_intent_obligation_keys)
+                )
+            entry["matched_intent_obligation_keys"] = list(dict.fromkeys([
+                *entry["matched_intent_obligation_keys"],
+                *query_intent_obligation_keys,
+            ]))
+            entry["matched_focused_intent_obligation_keys"] = list(
+                dict.fromkeys([
+                    *entry["matched_focused_intent_obligation_keys"],
+                    *query_focused_intent_obligation_keys,
+                ])
+            )
 
     items = list(by_id.values())
     for v in items:

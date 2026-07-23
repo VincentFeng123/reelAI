@@ -29,6 +29,10 @@ def test_provider_schemas_avoid_unsupported_additional_properties():
         G._EnrichmentPlan,
     ):
         assert "additionalProperties" not in str(GC._gemini3_json_schema(schema))
+    audit_schema = GC._gemini3_json_schema(G._ProCandidateAuditPlan)
+    assert {"self", "stand"} <= set(
+        audit_schema["$defs"]["_ProCandidateAuditItem"]["required"]
+    )
 
 
 def _transcript(duration: float = 100.0) -> dict:

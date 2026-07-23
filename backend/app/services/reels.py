@@ -1246,9 +1246,19 @@ class ReelService:
     # v47: treat legacy level-mismatch inventory as a soft ordering candidate.
     # v48: retain organizer dependency metadata in cached rows.
     # v49: retain boundary evidence and rank coarse fallback cuts last.
+    # v50: retain trusted objective and curriculum metadata for the organizer.
     # The separate contract key below invalidates prior inventory under v41.
-    RANKED_FEED_CACHE_VERSION = 49
+    RANKED_FEED_CACHE_VERSION = 50
     RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v41"
+    RANKED_FEED_LESSON_METADATA_FIELDS = (
+        "_selection_intent_obligations",
+        "_selection_intent_connections",
+        "_selection_intent_relationship_witnesses",
+        "_selection_intent_curriculum_edges",
+        "_selection_intent_role",
+        "_selection_intent_coverage",
+        "_selection_directly_teaches_topic",
+    )
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
         "quality_silence_v4",
@@ -1688,6 +1698,7 @@ class ReelService:
         retrieved_video_ids: set[str] | None = None,
         attempted_video_ids: set[str] | None = None,
         capacity_deferred_video_ids: set[str] | None = None,
+        covered_intent_obligation_keys: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         def raise_if_cancelled() -> None:
             if should_cancel is None:
@@ -2042,6 +2053,9 @@ class ReelService:
                     retrieved_video_ids=retrieved_video_ids,
                     attempted_video_ids=attempted_video_ids,
                     capacity_deferred_video_ids=capacity_deferred_video_ids,
+                    prior_covered_intent_obligation_keys=(
+                        covered_intent_obligation_keys
+                    ),
                 )
             except _ClipEngineCancellationError as exc:
                 raise GenerationCancelledError("Generation cancelled.") from exc
@@ -8632,6 +8646,11 @@ class ReelService:
             selection_caption_cues = list(
                 clean_item.get("_selection_caption_cues") or []
             )
+            selection_lesson_metadata = {
+                key: clean_item[key]
+                for key in self.RANKED_FEED_LESSON_METADATA_FIELDS
+                if key in clean_item
+            }
             for internal_key in [
                 key for key in clean_item if key.startswith("_selection_")
             ]:
@@ -8689,6 +8708,7 @@ class ReelService:
                     )
                 if selection_concept:
                     clean_item["_selection_concept"] = selection_concept
+                clean_item.update(selection_lesson_metadata)
             # Keep video_id on the response row so downstream filters (notably
             # main._ranked_request_reels's exclude_video_ids filter) can match
             # on it. Stripping it here silently defeated client pagination.

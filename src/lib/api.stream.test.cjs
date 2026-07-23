@@ -793,6 +793,181 @@ test("generation timeout remains active after stream headers arrive", TEST_OPTIO
   assert.equal(streamBody.locked, false);
 });
 
+test("legitimate queued time does not consume the generation execution timeout", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  const originalWindow = global.window;
+  const originalDateNow = Date.now;
+  let fakeNow = 0;
+  let streamCalls = 0;
+  let statusCalls = 0;
+
+  Date.now = () => fakeNow;
+  global.window = {
+    setTimeout(callback, delay, ...args) {
+      return setTimeout(callback, delay === 400 || delay === 401 ? 1 : delay, ...args);
+    },
+    clearTimeout,
+  };
+  global.fetch = async (url) => {
+    if (String(url).includes("/reels/generate")) {
+      return queuedGenerationResponse();
+    }
+    if (String(url).includes("/reels/generation-status/")) {
+      statusCalls += 1;
+      if (statusCalls === 1) {
+        fakeNow = 70 * 60_000;
+        return new Response(JSON.stringify({
+          job_id: "job-stream-test",
+          status: "queued",
+          attempt_count: 0,
+          material_id: "material-stream-test",
+          request_key: "request-stream-test",
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({
+        job_id: "job-stream-test",
+        status: "running",
+        attempt_count: 0,
+        material_id: "material-stream-test",
+        request_key: "request-stream-test",
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (!String(url).includes("/reels/generation-stream/")) {
+      throw new Error(`Unexpected request: ${url}`);
+    }
+    streamCalls += 1;
+    if (streamCalls < 3) {
+      return new Response("", {
+        status: 200,
+        headers: { "Content-Type": "application/x-ndjson" },
+      });
+    }
+    const events = [
+      {
+        job_id: "job-stream-test",
+        seq: 1,
+        timestamp: "2026-07-23T00:00:00Z",
+        type: "final",
+        payload: { reels: [], authoritative: true },
+      },
+      {
+        job_id: "job-stream-test",
+        seq: 2,
+        timestamp: "2026-07-23T00:00:01Z",
+        type: "terminal",
+        payload: { status: "completed" },
+      },
+    ];
+    return new Response(`${events.map((event) => JSON.stringify(event)).join("\n")}\n`, {
+      status: 200,
+      headers: { "Content-Type": "application/x-ndjson" },
+    });
+  };
+
+  try {
+    const response = await generateReelsStream({ materialId: "material-stream-test" });
+    assert.equal(response.terminal_status, "completed");
+    assert.equal(streamCalls, 3);
+    assert.equal(statusCalls, 2);
+  } finally {
+    Date.now = originalDateNow;
+    global.fetch = originalFetch;
+    if (originalWindow === undefined) {
+      delete global.window;
+    } else {
+      global.window = originalWindow;
+    }
+  }
+});
+
+test("a queued job with an attempt keeps the execution timeout finite", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  const originalWindow = global.window;
+  const originalDateNow = Date.now;
+  let fakeNow = 0;
+  let streamCalls = 0;
+
+  Date.now = () => fakeNow;
+  global.window = {
+    setTimeout(callback, delay, ...args) {
+      return setTimeout(callback, delay === 400 || delay === 401 ? 1 : delay, ...args);
+    },
+    clearTimeout,
+  };
+  global.fetch = async (url) => {
+    if (String(url).includes("/reels/generate")) {
+      return queuedGenerationResponse();
+    }
+    if (String(url).includes("/reels/generation-status/")) {
+      return new Response(JSON.stringify({
+        job_id: "job-stream-test",
+        status: "queued",
+        attempt_count: 1,
+        material_id: "material-stream-test",
+        request_key: "request-stream-test",
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (!String(url).includes("/reels/generation-stream/")) {
+      throw new Error(`Unexpected request: ${url}`);
+    }
+    streamCalls += 1;
+    if (streamCalls === 2) {
+      fakeNow = 62 * 60_000;
+    }
+    if (streamCalls < 3) {
+      return new Response("", {
+        status: 200,
+        headers: { "Content-Type": "application/x-ndjson" },
+      });
+    }
+    const events = [
+      {
+        job_id: "job-stream-test",
+        seq: 1,
+        timestamp: "2026-07-23T00:00:00Z",
+        type: "final",
+        payload: { reels: [], authoritative: true },
+      },
+      {
+        job_id: "job-stream-test",
+        seq: 2,
+        timestamp: "2026-07-23T00:00:01Z",
+        type: "terminal",
+        payload: { status: "completed" },
+      },
+    ];
+    return new Response(`${events.map((event) => JSON.stringify(event)).join("\n")}\n`, {
+      status: 200,
+      headers: { "Content-Type": "application/x-ndjson" },
+    });
+  };
+
+  try {
+    await assert.rejects(
+      generateReelsStream({ materialId: "material-stream-test" }),
+      /Generation did not finish before the job deadline\./,
+    );
+    assert.equal(streamCalls, 2);
+  } finally {
+    Date.now = originalDateNow;
+    global.fetch = originalFetch;
+    if (originalWindow === undefined) {
+      delete global.window;
+    } else {
+      global.window = originalWindow;
+    }
+  }
+});
+
 test("transient stream and status failures reconnect to the durable job", TEST_OPTIONS, async () => {
   const originalFetch = global.fetch;
   const originalWindow = global.window;

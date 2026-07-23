@@ -173,15 +173,28 @@ def _planned_query_offset(context: GenerationContext | None) -> int:
     return 5 + max(0, pass_count - 2) * 2
 
 
+def _candidate_objective_keys(video: dict) -> set[str]:
+    return {
+        str(value).strip()
+        for value in (
+            video.get("matched_focused_intent_obligation_keys") or ()
+        )
+        if str(value or "").strip()
+    }
+
+
 def _select_ranked_candidates(
     ranked: list[dict],
     *,
     limit: int,
     excluded: set[str],
     analysis_prefix: int | None = None,
+    covered_intent_obligation_keys: Sequence[str] | None = None,
 ) -> list[dict]:
     """Keep literal priority while putting bounded AI diversity in analysis."""
     eligible = [video for video in ranked if video.get("id") not in excluded]
+    if analysis_prefix is not None and int(analysis_prefix) == 0:
+        return eligible[:max(0, int(limit))]
     prefix_limit = min(
         max(0, int(limit)),
         max(1, int(analysis_prefix if analysis_prefix is not None else limit)),
@@ -189,16 +202,108 @@ def _select_ranked_candidates(
     # Speed is a preference within a credible relevance band, not permission
     # to promote arbitrarily weak short results over the top-ranked sources.
     focus_window = eligible[:max(prefix_limit, prefix_limit * 2)]
-    focused = []
-    for video in focus_window:
+    covered_obligation_keys = {
+        str(value).strip()
+        for value in (covered_intent_obligation_keys or ())
+        if str(value or "").strip()
+    }
+    available_uncovered_keys = (
+        set().union(*(
+            _candidate_objective_keys(video) - covered_obligation_keys
+            for video in eligible
+        ))
+        if eligible
+        else set()
+    )
+    short_source_ids: set[str] = set()
+    for video in eligible:
         try:
             duration = float(video.get("duration") or 0.0)
         except (TypeError, ValueError, OverflowError):
             duration = 0.0
         if 0.0 < duration <= _FOCUSED_ANALYSIS_SOURCE_MAX_SEC:
+            short_source_ids.add(str(video.get("id") or ""))
+
+    objective_candidates: list[dict] = []
+    represented_keys: set[str] = set()
+    if available_uncovered_keys:
+        for video in eligible:
+            if str(video.get("id") or "") not in short_source_ids:
+                continue
+            video_keys = (
+                _candidate_objective_keys(video) - covered_obligation_keys
+            )
+            if not video_keys - represented_keys:
+                continue
+            objective_candidates.append(video)
+            represented_keys.update(video_keys)
+            if (
+                len(objective_candidates) >= prefix_limit
+                or available_uncovered_keys.issubset(represented_keys)
+            ):
+                break
+        focus_ids = {str(video.get("id") or "") for video in focus_window}
+        focus_window.extend(
+            video
+            for video in objective_candidates
+            if str(video.get("id") or "") not in focus_ids
+        )
+    focused = [
+        video
+        for video in focus_window
+        if str(video.get("id") or "") in short_source_ids
+    ]
+    if (
+        len(focused) < prefix_limit
+        and not any(video.get("literal_match") for video in focused)
+    ):
+        focused_ids = {str(video.get("id") or "") for video in focused}
+        literal_fallback = next(
+            (
+                video
+                for video in eligible
+                if video.get("literal_match")
+                and str(video.get("id") or "") not in short_source_ids
+                and str(video.get("id") or "") not in focused_ids
+            ),
+            None,
+        )
+        if literal_fallback is not None:
+            focused.append(literal_fallback)
+            represented_keys.update(
+                _candidate_objective_keys(literal_fallback)
+                - covered_obligation_keys
+            )
+    # A long or unknown-duration source may fill an otherwise-empty analysis
+    # slot for an objective that has no short source. It must never displace an
+    # available short source from the first-release prefix.
+    if (
+        len(focused) < prefix_limit
+        and not available_uncovered_keys.issubset(represented_keys)
+    ):
+        focused_ids = {str(video.get("id") or "") for video in focused}
+        for video in eligible:
+            video_id = str(video.get("id") or "")
+            if video_id in short_source_ids or video_id in focused_ids:
+                continue
+            video_keys = (
+                _candidate_objective_keys(video) - covered_obligation_keys
+            )
+            if not video_keys - represented_keys:
+                continue
             focused.append(video)
+            objective_candidates.append(video)
+            focused_ids.add(video_id)
+            represented_keys.update(video_keys)
+            if (
+                len(focused) >= prefix_limit
+                or available_uncovered_keys.issubset(represented_keys)
+            ):
+                break
     analysis_pool = focused if len(focused) >= prefix_limit else eligible
-    if limit <= 1:
+    if limit <= 0:
+        return []
+    if limit <= 1 and not objective_candidates:
         return analysis_pool[:limit]
     if len(eligible) <= limit and prefix_limit >= limit:
         return eligible[:limit]
@@ -208,16 +313,6 @@ def _select_ranked_candidates(
         for video in analysis_pool
         if not video.get("literal_match")
     ]
-    if not non_literal:
-        selected = list(analysis_pool[:prefix_limit])
-        selected_ids = {str(video.get("id") or "") for video in selected}
-        for video in eligible:
-            if len(selected) >= limit:
-                break
-            if str(video.get("id") or "") not in selected_ids:
-                selected.append(video)
-        return selected[:limit]
-
     reserve = min(2, max(1, prefix_limit // 3))
     has_literal_anchor = any(
         bool(video.get("literal_match")) for video in analysis_pool
@@ -226,11 +321,18 @@ def _select_ranked_candidates(
     # source, then spend the scarce analysis prefix on an uncovered branch
     # before repeating an already represented one. Literal-anchor flows retain
     # their established priority and bounded single AI-diversity slot.
-    selected = analysis_pool[: (
-        max(0, prefix_limit - reserve)
-        if has_literal_anchor
-        else min(1, prefix_limit)
-    )]
+    if objective_candidates and has_literal_anchor:
+        selected = [
+            next(video for video in analysis_pool if video.get("literal_match"))
+        ][:prefix_limit]
+    elif objective_candidates:
+        selected = analysis_pool[:min(1, max(0, prefix_limit - 1))]
+    else:
+        selected = analysis_pool[: (
+            max(0, prefix_limit - reserve)
+            if has_literal_anchor
+            else min(1, prefix_limit)
+        )]
     selected_ids = {str(video.get("id") or "") for video in selected}
     selected_families = {
         str(family)
@@ -244,6 +346,31 @@ def _select_ranked_candidates(
         for video in selected
         if str(video.get("channel") or "").strip()
     }
+    selected_objective_keys = (
+        set().union(*(_candidate_objective_keys(video) for video in selected))
+        if selected
+        else set()
+    )
+    for video in objective_candidates:
+        if len(selected) >= prefix_limit:
+            break
+        video_id = str(video.get("id") or "")
+        video_keys = (
+            _candidate_objective_keys(video) - covered_obligation_keys
+        )
+        if video_id in selected_ids or not video_keys - selected_objective_keys:
+            continue
+        selected.append(video)
+        selected_ids.add(video_id)
+        selected_objective_keys.update(video_keys)
+        selected_families.update(
+            str(family)
+            for family in (video.get("matched_families") or [])
+            if str(family or "").strip()
+        )
+        channel = str(video.get("channel") or "").strip().casefold()
+        if channel:
+            selected_channels.add(channel)
     # Do not spend a scarce 2/3-source analysis budget twice on the same
     # channel when a comparably ranked teaching source is available. Bounding
     # the pool prevents diversity from promoting an arbitrarily weak result.
@@ -371,6 +498,8 @@ def _continue_provider_pages(
     enough: Callable[[], bool],
     annotate: Callable[[list[dict]], None],
     recovery_queries: Sequence[str] = (),
+    recovery_query_factory: Callable[[], Sequence[str]] | None = None,
+    annotate_recovery: Callable[[list[dict]], None] | None = None,
     attempted_recovery_queries_out: list[str] | None = None,
     initially_enough: bool | None = None,
 ) -> tuple[int, str | None, bool]:
@@ -402,9 +531,23 @@ def _continue_provider_pages(
         recovery_keys.add(query_key)
         pending_recovery.append(query)
     recovery_enqueued = False
+    recovery_planned = False
     has_enough = enough() if initially_enough is None else bool(initially_enough)
     while not has_enough:
         if not frontier:
+            if recovery_query_factory is not None and not recovery_planned:
+                recovery_planned = True
+                for raw_query in recovery_query_factory():
+                    query = " ".join(str(raw_query or "").split())
+                    query_key = semantic_key(query)
+                    if (
+                        not query
+                        or not query_key
+                        or query_key in existing_queries | recovery_keys
+                    ):
+                        continue
+                    recovery_keys.add(query_key)
+                    pending_recovery.append(query)
             if recovery_enqueued or not pending_recovery:
                 break
             # A successful zero-result response normally has no provider
@@ -459,7 +602,12 @@ def _continue_provider_pages(
         warning = str(page_result.get("warning") or "").strip() or warning
         if not page_sets:
             continue
-        annotate(page_sets)
+        is_recovery_query = semantic_key(query) in recovery_keys
+        (
+            annotate_recovery
+            if is_recovery_query and annotate_recovery is not None
+            else annotate
+        )(page_sets)
         result_sets.extend(page_sets)
         frontier.extend(
             _provider_page_frontier(
@@ -516,7 +664,8 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
              recovery_tried_queries: Sequence[str] = (),
              recovery_reason: str | None = None,
              recovery_rejected_video_ids: Sequence[str] = (),
-             analysis_limit: int | None = None) -> dict:
+             analysis_limit: int | None = None,
+             covered_intent_obligation_keys: Sequence[str] = ()) -> dict:
     if practice_fast:
         return discover_practice_fast(
             topic,
@@ -540,6 +689,7 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
             recovery_reason=recovery_reason,
             recovery_rejected_video_ids=recovery_rejected_video_ids,
             analysis_limit=analysis_limit,
+            covered_intent_obligation_keys=covered_intent_obligation_keys,
         )
     topic = " ".join(str(topic or "").split())
     if not topic:
@@ -747,7 +897,7 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
                 ranked_now,
                 limit=max(0, int(limit)),
                 excluded=exclude,
-                analysis_prefix=analysis_target or None,
+                analysis_prefix=analysis_target,
             )[:analysis_target]
         ) >= analysis_target
 
@@ -769,7 +919,7 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
         ranked,
         limit=limit,
         excluded=exclude,
-        analysis_prefix=analysis_target or None,
+        analysis_prefix=analysis_target,
     )
     return {"corrected": topic, "videos": videos,
             "credits_used": int(res["credits_used"] or 0) + extra_credits,
@@ -801,6 +951,7 @@ def discover_practice_fast(
     recovery_reason: str | None = None,
     recovery_rejected_video_ids: Sequence[str] = (),
     analysis_limit: int | None = None,
+    covered_intent_obligation_keys: Sequence[str] = (),
 ) -> dict:
     """Difficulty-first bootstrap or AI-expanded production search.
 
@@ -920,6 +1071,19 @@ def discover_practice_fast(
     from ..services.search_query_plan import semantic_query_family
 
     root_family = semantic_query_family(retrieval_query)
+    query_metadata_by_key: dict[str, dict] = {}
+
+    def retain_query_metadata(expansion_payload: dict[str, object]) -> None:
+        """Accumulate trusted provenance without relabeling an earlier query."""
+
+        for item in expansion_payload.get("query_metadata") or []:
+            if not isinstance(item, dict):
+                continue
+            query_key = semantic_key(item.get("text") or "")
+            if query_key:
+                query_metadata_by_key.setdefault(query_key, dict(item))
+
+    retain_query_metadata(expansion)
 
     def annotate(
         result_sets: list[dict],
@@ -934,10 +1098,27 @@ def discover_practice_fast(
         for result_set in result_sets:
             query = " ".join(str(result_set.get("query") or "").split())
             is_literal = query.casefold() == retrieval_query.casefold()
+            query_metadata = query_metadata_by_key.get(
+                semantic_key(query),
+                {},
+            )
+            query_obligation_keys = list(
+                query_metadata.get("intent_obligation_keys") or []
+            )
             result_set.update(
                 query_family=(semantic_query_family(query) or root_family),
                 query_trust=("literal" if is_literal else "ai" if expanded else "trusted"),
                 query_provenance=("literal" if is_literal else "gemini" if expanded else "deterministic"),
+                query_constraint_ids=list(
+                    query_metadata.get("preserved_constraint_ids") or []
+                ),
+                query_intent_obligation_keys=query_obligation_keys,
+                query_focused_intent_obligation_keys=list(
+                    query_metadata.get(
+                        "focused_intent_obligation_keys"
+                    )
+                    or []
+                ),
                 hd_preferred=False,
             )
 
@@ -973,7 +1154,10 @@ def discover_practice_fast(
                 ranked_now,
                 limit=max(0, int(limit)),
                 excluded=excluded,
-                analysis_prefix=analysis_target or None,
+                analysis_prefix=analysis_target,
+                covered_intent_obligation_keys=(
+                    covered_intent_obligation_keys
+                ),
             )[:analysis_target]
         ) >= analysis_target
 
@@ -994,43 +1178,62 @@ def discover_practice_fast(
         if video.get("id") not in excluded
     ]
     initially_enough = enough_from_ranked(ranked_before_recovery)
-    recovery_queries: list[str] = []
-    if (
+    recovery_expansion: dict[str, object] | None = None
+    recovery_available = bool(
         not bootstrap
         and not recovery_mode
         and not eligible_before_recovery
         and context is not None
-    ):
+    )
+
+    def plan_recovery_queries() -> list[str]:
+        nonlocal recovery_expansion
+        if not recovery_available or context is None:
+            return []
         recovery_capacity = context.budget.remaining("search")
-        if recovery_capacity > 0:
-            recovery_expansion = expand.expand_query_practice_fast(
-                retrieval_query,
-                recovery_capacity,
-                level=None,
-                should_cancel=should_cancel,
-                context=context,
-                source_context=source_context,
-                tried_queries=initial_queries,
-                recovery_reason=expand.RECOVERY_REASON_ZERO_SEARCH_RESULTS,
-            )
-            tried_query_keys = {
-                semantic_key(query) for query in initial_queries
-            }
-            for raw_query in recovery_expansion.get("queries") or []:
-                query = " ".join(str(raw_query or "").split())
-                query_key = semantic_key(query)
-                if (
-                    not query
-                    or not query_key
-                    or query_key in tried_query_keys
-                ):
-                    continue
-                tried_query_keys.add(query_key)
-                recovery_queries.append(query)
-                if len(recovery_queries) >= recovery_capacity:
-                    break
-            if recovery_queries:
-                expansion = recovery_expansion
+        if recovery_capacity <= 0:
+            return []
+        recovery_expansion = expand.expand_query_practice_fast(
+            retrieval_query,
+            recovery_capacity,
+            level=None,
+            should_cancel=should_cancel,
+            context=context,
+            source_context=source_context,
+            tried_queries=initial_queries,
+            recovery_reason=expand.RECOVERY_REASON_ZERO_SEARCH_RESULTS,
+        )
+        recovery_queries: list[str] = []
+        tried_query_keys = {
+            semantic_key(query) for query in initial_queries
+        }
+        for raw_query in recovery_expansion.get("queries") or []:
+            query = " ".join(str(raw_query or "").split())
+            query_key = semantic_key(query)
+            if (
+                not query
+                or not query_key
+                or query_key in tried_query_keys
+            ):
+                continue
+            tried_query_keys.add(query_key)
+            recovery_queries.append(query)
+            if len(recovery_queries) >= recovery_capacity:
+                break
+        if recovery_queries:
+            retain_query_metadata(recovery_expansion)
+        return recovery_queries
+
+    def annotate_recovery(result_sets: list[dict]) -> None:
+        annotate(
+            result_sets,
+            expanded=bool(
+                recovery_expansion is not None
+                and str(
+                    recovery_expansion.get("provider_used") or ""
+                ) == "gemini"
+            ),
+        )
 
     attempted_recovery_queries: list[str] = []
     pagination_credits, pagination_warning, provider_exhausted = (
@@ -1040,7 +1243,10 @@ def discover_practice_fast(
             search_runtime=search_runtime,
             enough=enough_ranked_videos,
             annotate=annotate,
-            recovery_queries=recovery_queries,
+            recovery_query_factory=(
+                plan_recovery_queries if recovery_available else None
+            ),
+            annotate_recovery=annotate_recovery,
             attempted_recovery_queries_out=attempted_recovery_queries,
             initially_enough=initially_enough,
         )
@@ -1190,7 +1396,8 @@ def discover_practice_fast(
         ranked,
         limit=top_n,
         excluded=excluded,
-        analysis_prefix=analysis_target or None,
+        analysis_prefix=analysis_target,
+        covered_intent_obligation_keys=covered_intent_obligation_keys,
     )
     corrected = (
         " ".join(str(expansion.get("corrected") or retrieval_query).split())
@@ -1207,6 +1414,11 @@ def discover_practice_fast(
         "acquisition_obligation_constraint_ids": expansion.get(
             "acquisition_obligation_constraint_ids"
         ),
+        "query_metadata": [
+            dict(query_metadata_by_key[query_key])
+            for query in initial_queries
+            if (query_key := semantic_key(query)) in query_metadata_by_key
+        ],
         "videos": videos,
         "credits_used": (
             int(initial.get("credits_used") or 0)

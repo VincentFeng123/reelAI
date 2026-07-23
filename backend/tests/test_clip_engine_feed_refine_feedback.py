@@ -526,12 +526,12 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
         self.assertNotEqual(learner_a_revision_1, learner_b_revision_1)
         self.assertNotEqual(learner_a_revision_1, learner_a_revision_2)
 
-    def test_ranked_feed_cache_version_is_49(self) -> None:
-        """Cache rows must include organizer boundary evidence."""
+    def test_ranked_feed_cache_version_is_50(self) -> None:
+        """Cache rows must include organizer boundary and lesson metadata."""
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_VERSION,
-            49,
-            "Current feeds must not reuse rows missing boundary evidence.",
+            50,
+            "Current feeds must not reuse rows missing trusted lesson metadata.",
         )
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
