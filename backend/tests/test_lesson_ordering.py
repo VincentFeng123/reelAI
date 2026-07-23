@@ -1246,6 +1246,99 @@ def test_required_prior_unseen_anchor_survives_append_safe_fallback(
     assert result.fallback_reason == "invalid_model_order"
 
 
+def test_required_prior_unseen_prefix_keeps_constraint_safe_crispr_delta(
+    monkeypatch,
+) -> None:
+    prior_unseen = _trusted_independent_reel(
+        "prior-hdr",
+        video_id="prior-source",
+        start=81.360,
+        t_end=131.630,
+        concept="homology-directed repair application",
+    )
+    cleavage = _trusted_independent_reel(
+        "cleavage",
+        video_id="crispr-source",
+        start=63.783,
+        t_end=84.110,
+        concept="Cas9 cleavage",
+    )
+    pam = _trusted_independent_reel(
+        "pam",
+        video_id="crispr-source",
+        start=50.701,
+        t_end=63.933,
+        concept="PAM requirement",
+    )
+    components = _trusted_independent_reel(
+        "components",
+        video_id="crispr-source",
+        start=32.689,
+        t_end=50.851,
+        concept="Cas9 and guide RNA components",
+    )
+    application = _trusted_independent_reel(
+        "application",
+        video_id="crispr-source",
+        start=116.219,
+        t_end=140.212,
+        concept="base-editing mutation correction",
+    )
+    reels = [prior_unseen, cleavage, pam, components, application]
+    calls = 0
+    permanent_telemetry = replace(
+        _generation_result([reel["reel_id"] for reel in reels]).telemetry,
+        provider_error_type="BadRequest",
+        provider_status_code=400,
+        retryable=False,
+    )
+
+    def unavailable(*_args, **kwargs):
+        nonlocal calls
+        calls += 1
+        kwargs["dispatch_state"].dispatched = True
+        raise gemini_client.GeminiTransportError(
+            "organizer unavailable",
+            permanent_telemetry,
+        )
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", unavailable)
+    monkeypatch.setattr(
+        lesson_ordering.time,
+        "sleep",
+        lambda *_args, **_kwargs: pytest.fail(
+            "degraded cross-batch ordering must not sleep"
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic=(
+            "Teach beginner CRISPR-Cas9 from mechanism to application: "
+            "components, PAM, cleavage, then mutation correction."
+        ),
+        release_limit=len(reels),
+        required_reel_ids=["prior-hdr"],
+    )
+
+    assert calls == 1
+    assert result.provider_called is True
+    assert result.degraded is True
+    assert result.fallback_reason == "provider_call_failed"
+    assert result.ordered_reel_ids == [
+        "prior-hdr",
+        "components",
+        "pam",
+        "cleavage",
+        "application",
+    ]
+    assert [reel["reel_id"] for reel in result.reels] == result.ordered_reel_ids
+    assert len(result.ordered_reel_ids) == len(reels)
+    assert set(result.ordered_reel_ids) == {
+        reel["reel_id"] for reel in reels
+    }
+
+
 def test_overlapping_required_prior_unseen_anchors_both_survive_fallback(
     monkeypatch,
 ) -> None:

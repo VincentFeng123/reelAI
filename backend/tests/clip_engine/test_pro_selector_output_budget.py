@@ -108,6 +108,12 @@ def _newton_plan() -> gemini_segment._CompactBoundaryPlan:
     )
 
 
+def _request_mismatched_newton_plan() -> gemini_segment._CompactBoundaryPlan:
+    payload = _newton_plan().model_dump(mode="json", by_alias=True)
+    payload["request_intent"]["exact_request"] = "Newton's first law F=ma"
+    return gemini_segment._CompactBoundaryPlan.model_validate(payload)
+
+
 def _newton_audit_plan() -> gemini_segment._ProCandidateAuditPlan:
     return gemini_segment._ProCandidateAuditPlan(items=[{
         "candidate_id": "candidate-1",
@@ -263,6 +269,169 @@ def test_pro_selector_and_boundary_audit_recover_one_transient_failure(
     ] == [504, 429]
 
 
+def test_selector_contract_correction_retries_transient_within_five_source_dispatches(
+    monkeypatch,
+) -> None:
+    plan = _newton_plan()
+    invalid_plan = _request_mismatched_newton_plan()
+    audit = _newton_audit_plan()
+    fake = _RetryClient(
+        _RetryHTTPError(503),
+        _RetryResponse(invalid_plan.model_dump_json(by_alias=True)),
+        _RetryHTTPError(504),
+        _RetryResponse(plan.model_dump_json(by_alias=True)),
+        _RetryResponse(audit.model_dump_json(by_alias=True)),
+    )
+    monkeypatch.setattr(gemini_client, "get_client", lambda: fake)
+    monkeypatch.setattr(gemini_client.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        gemini_client.random,
+        "uniform",
+        lambda lower, _upper: lower,
+    )
+
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "supadata-cue-0",
+                "start": 0.0,
+                "end": 8.0,
+                "text": (
+                    "Newton's second law says that the net force on an object "
+                    "equals its mass times its acceleration."
+                ),
+            }],
+            "words": [],
+            "source": "supadata",
+        },
+        {"_segment_operation": "pro_authoritative"},
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic="Newton's second law F=ma",
+        deadline_monotonic=time.monotonic() + 180.0,
+    )
+
+    assert result.error is None
+    assert result.accepted_count == 1
+    assert len(fake.calls) == 5
+    assert len(fake.outcomes) == 0
+    assert gemini_segment._PRO_SOURCE_MAX_PHYSICAL_DISPATCHES == 5
+    assert [
+        int(call.get("physical_dispatches") or 0)
+        for call in result.calls
+    ] == [2, 2, 1]
+    assert result.calls[0]["selector_contract_retry_reason"] == (
+        "intent_contract_request_mismatch"
+    )
+    assert result.calls[1]["selector_contract_retry_recovered"] is True
+    assert result.calls[1]["error_history"][0]["provider_status_code"] == 504
+    assert result.calls[2]["operation"] == "pro_boundary_audit"
+
+
+def test_selector_contract_correction_does_not_retry_permanent_400(
+    monkeypatch,
+) -> None:
+    invalid_plan = _request_mismatched_newton_plan()
+    fake = _RetryClient(
+        _RetryResponse(invalid_plan.model_dump_json(by_alias=True)),
+        _RetryHTTPError(400),
+        _RetryResponse(_newton_plan().model_dump_json(by_alias=True)),
+    )
+    monkeypatch.setattr(gemini_client, "get_client", lambda: fake)
+
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "supadata-cue-0",
+                "start": 0.0,
+                "end": 8.0,
+                "text": (
+                    "Newton's second law says that the net force on an object "
+                    "equals its mass times its acceleration."
+                ),
+            }],
+            "words": [],
+            "source": "supadata",
+        },
+        {"_segment_operation": "pro_authoritative"},
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic="Newton's second law F=ma",
+        deadline_monotonic=time.monotonic() + 180.0,
+    )
+
+    assert result.error is not None
+    assert len(fake.calls) == 2
+    assert len(fake.outcomes) == 1
+    assert [
+        int(call.get("physical_dispatches") or 0)
+        for call in result.calls
+    ] == [1, 1]
+    assert result.calls[1]["provider_status_code"] == 400
+    assert result.calls[1]["retryable"] is False
+    assert result.calls[1]["selector_contract_retry_exhausted"] is True
+
+
+def test_selector_contract_correction_transient_exhaustion_stays_below_five(
+    monkeypatch,
+) -> None:
+    invalid_plan = _request_mismatched_newton_plan()
+    fake = _RetryClient(
+        _RetryHTTPError(503),
+        _RetryResponse(invalid_plan.model_dump_json(by_alias=True)),
+        _RetryHTTPError(504),
+        _RetryHTTPError(504),
+        _RetryResponse(_newton_audit_plan().model_dump_json(by_alias=True)),
+    )
+    monkeypatch.setattr(gemini_client, "get_client", lambda: fake)
+    monkeypatch.setattr(gemini_client.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        gemini_client.random,
+        "uniform",
+        lambda lower, _upper: lower,
+    )
+
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "supadata-cue-0",
+                "start": 0.0,
+                "end": 8.0,
+                "text": (
+                    "Newton's second law says that the net force on an object "
+                    "equals its mass times its acceleration."
+                ),
+            }],
+            "words": [],
+            "source": "supadata",
+        },
+        {"_segment_operation": "pro_authoritative"},
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic="Newton's second law F=ma",
+        deadline_monotonic=time.monotonic() + 180.0,
+    )
+
+    assert result.error is not None
+    assert len(fake.calls) == 4
+    assert len(fake.outcomes) == 1
+    physical_dispatches = sum(
+        int(call.get("physical_dispatches") or 0)
+        for call in result.calls
+    )
+    assert physical_dispatches == 4
+    assert (
+        physical_dispatches
+        < gemini_segment._PRO_SOURCE_MAX_PHYSICAL_DISPATCHES
+    )
+    assert result.calls[1]["retries"] == 1
+    assert [
+        item["provider_status_code"]
+        for item in result.calls[1]["error_history"]
+    ] == [504, 504]
+    assert not any(
+        call.get("operation") == "pro_boundary_audit"
+        for call in result.calls
+    )
+
+
 @pytest.mark.parametrize("retry_recovers", [True, False])
 def test_audit_schema_correction_uses_remaining_source_budget_without_exceeding_cap(
     monkeypatch,
@@ -319,12 +488,17 @@ def test_audit_schema_correction_uses_remaining_source_budget_without_exceeding_
 
     assert (result.error is None) is retry_recovers
     assert result.accepted_count == (1 if retry_recovers else 0)
-    assert len(fake.calls) == gemini_segment._PRO_SOURCE_MAX_PHYSICAL_DISPATCHES
+    assert len(fake.calls) == 4
     assert len(fake.outcomes) == (0 if retry_recovers else 1)
-    assert sum(
+    physical_dispatches = sum(
         int(call.get("physical_dispatches") or 0)
         for call in result.calls
-    ) == gemini_segment._PRO_SOURCE_MAX_PHYSICAL_DISPATCHES
+    )
+    assert physical_dispatches == 4
+    assert (
+        physical_dispatches
+        <= gemini_segment._PRO_SOURCE_MAX_PHYSICAL_DISPATCHES
+    )
     assert result.calls[1]["contract_retry_attempt"] == 1
     assert result.calls[2]["physical_dispatches"] == 2
     if retry_recovers:
@@ -831,7 +1005,8 @@ def test_text_only_pro_retries_one_malformed_structured_response(
     assert generated[0]["media_resolution"] is None
     assert generated[1]["media_resolution"] is None
     assert generated[0]["max_retries"] == 1
-    assert generated[1]["max_retries"] == 0
+    assert generated[1]["max_retries"] == 2
+    assert generated[1]["use_full_transient_retry_budget"] is True
     assert [call["thinking_level"] for call in generated] == [
         "medium",
         "high",

@@ -364,52 +364,271 @@ def test_expansion_joint_structure_drops_only_redundant_relation_member() -> Non
     ]["description"]
 
 
-def test_expansion_rejects_every_kind_topology_mismatch() -> None:
-    with pytest.raises(ValueError, match="relationship topology must match"):
-        expand._PracticeFastExpansion.model_validate({
-            "corrected": "Teach alpha, then beta",
-            "intent_constraints": [{
-                "constraint_id": "sequence",
-                "kind": "format",
-                "source_phrase": "then",
-                "source_occurrence": 0,
-                "requirement": "Teach alpha before beta",
-                "relationship_topology": "ordered",
-            }],
-            "joint_structures": [],
-            "summary_preserved_constraint_ids": ["sequence"],
-            "reverse_coverage_complete": True,
-            "reverse_coverage_constraint_ids": ["sequence"],
-            "acquisition_obligation_constraint_ids": ["sequence"],
-            "coordinated_groups": [],
-            "queries": [{
-                "text": "alpha then beta lesson",
-                "preserved_constraint_ids": ["sequence"],
-            }],
-        })
+@pytest.mark.parametrize(
+    "topology",
+    ["directed", "reciprocal", "symmetric", "ordered", "unspecified"],
+)
+def test_expansion_normalizes_valid_nonrelationship_topology_layout(
+    topology: str,
+) -> None:
+    parsed = expand._PracticeFastExpansion.model_validate({
+        "corrected": "Teach alpha, then beta",
+        "intent_constraints": [{
+            "constraint_id": "sequence",
+            "kind": "format",
+            "source_phrase": "then",
+            "source_occurrence": 0,
+            "requirement": "Teach alpha before beta",
+            "relationship_topology": topology,
+        }],
+        "joint_structures": [],
+        "summary_preserved_constraint_ids": ["sequence"],
+        "reverse_coverage_complete": True,
+        "reverse_coverage_constraint_ids": ["sequence"],
+        "acquisition_obligation_constraint_ids": ["sequence"],
+        "coordinated_groups": [],
+        "queries": [{
+            "text": "alpha then beta lesson",
+            "preserved_constraint_ids": ["sequence"],
+        }],
+    })
 
-    with pytest.raises(ValueError, match="relationship topology must match"):
-        expand._PracticeFastExpansion.model_validate({
-            "corrected": "Compare alpha and beta",
-            "intent_constraints": [{
-                "constraint_id": "relation",
-                "kind": "relationship",
-                "source_phrase": "Compare",
-                "source_occurrence": 0,
-                "requirement": "Compare alpha and beta",
-                "relationship_topology": "not_applicable",
-            }],
-            "joint_structures": [],
-            "summary_preserved_constraint_ids": ["relation"],
-            "reverse_coverage_complete": True,
-            "reverse_coverage_constraint_ids": ["relation"],
-            "acquisition_obligation_constraint_ids": ["relation"],
-            "coordinated_groups": [],
-            "queries": [{
-                "text": "alpha beta comparison",
-                "preserved_constraint_ids": ["relation"],
-            }],
-        })
+    assert (
+        parsed.intent_constraints[0].relationship_topology
+        == "not_applicable"
+    )
+
+
+def test_expansion_normalizes_relationship_sentinel_but_rejects_unknown_enum() -> None:
+    payload = {
+        "corrected": "Compare alpha and beta",
+        "intent_constraints": [{
+            "constraint_id": "relation",
+            "kind": "relationship",
+            "source_phrase": "Compare",
+            "source_occurrence": 0,
+            "requirement": "Compare alpha and beta",
+            "relationship_topology": "not_applicable",
+        }],
+        "joint_structures": [],
+        "summary_preserved_constraint_ids": ["relation"],
+        "reverse_coverage_complete": True,
+        "reverse_coverage_constraint_ids": ["relation"],
+        "acquisition_obligation_constraint_ids": ["relation"],
+        "coordinated_groups": [],
+        "queries": [{
+            "text": "alpha beta comparison",
+            "preserved_constraint_ids": ["relation"],
+        }],
+    }
+
+    parsed = expand._PracticeFastExpansion.model_validate(payload)
+    assert parsed.intent_constraints[0].relationship_topology == "unspecified"
+
+    payload["intent_constraints"][0]["relationship_topology"] = "diagonal"
+    with pytest.raises(ValueError, match="relationship_topology"):
+        expand._PracticeFastExpansion.model_validate(payload)
+
+
+def test_practice_fast_relationship_sentinel_keeps_strict_contract_in_one_call(
+    monkeypatch,
+) -> None:
+    exact_request = "Compare alpha with beta"
+    constraints = _comparison_constraints()
+    constraints[-1]["relationship_topology"] = "not_applicable"
+    payload = _selector_contract_payload(
+        exact_request,
+        constraints,
+        joint_structures=_comparison_joint_structure(),
+    )
+    calls = 0
+
+    def fake_raw(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return json.dumps(payload)
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
+
+    result = expand.expand_query_practice_fast(exact_request, 1)
+
+    assert calls == 1
+    assert result["provider_used"] == "gemini"
+    normalized = {
+        constraint["constraint_id"]: constraint["relationship_topology"]
+        for constraint in result["intent_contract"]["request_intent"][
+            "constraints"
+        ]
+    }
+    assert normalized == {
+        "alpha": "not_applicable",
+        "beta": "not_applicable",
+        "compare": "unspecified",
+    }
+    assert set(result["acquisition_obligation_constraint_ids"]) == {
+        "alpha",
+        "beta",
+        "compare",
+    }
+
+
+def test_practice_fast_redundant_projections_canonicalize_in_one_call(
+    monkeypatch,
+) -> None:
+    exact_request = "Compare alpha with beta"
+    constraints = _comparison_constraints()
+    payload = _selector_contract_payload(
+        exact_request,
+        constraints,
+        joint_structures=_comparison_joint_structure(),
+    )
+    payload["acquisition_obligation_constraint_ids"] = ["alpha"]
+    payload["coordinated_groups"] = []
+    calls = 0
+    canonical = expand._PracticeFastExpansion.model_validate(payload)
+    assert [
+        group.model_dump(mode="json")
+        for group in canonical.coordinated_groups
+    ] == [{
+        "member_constraint_ids": ["alpha", "beta"],
+    }]
+
+    def fake_raw(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return json.dumps(payload)
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
+
+    result = expand.expand_query_practice_fast(exact_request, 1)
+
+    assert calls == 1
+    assert result["provider_used"] == "gemini"
+    assert result["acquisition_obligation_constraint_ids"] == [
+        "alpha",
+        "beta",
+        "compare",
+    ]
+    assert result["intent_contract"]["request_intent"][
+        "joint_structures"
+    ] == _comparison_joint_structure()
+    keys_by_constraint = expand.trusted_intent_obligation_keys_by_constraint(
+        result["intent_contract"]
+    )
+    assert set(keys_by_constraint) == {"alpha", "beta", "compare"}
+    assert result["query_metadata"] == [{
+        "text": exact_request,
+        "preserved_constraint_ids": ["alpha", "beta", "compare"],
+        "intent_obligation_keys": sorted(keys_by_constraint.values()),
+        "focused_intent_obligation_keys": [],
+        "covers_all_intent_constraints": True,
+    }]
+
+
+def test_expansion_projection_normalization_preserves_complete_payload() -> None:
+    exact_request = "Compare alpha with beta"
+    payload = _selector_contract_payload(
+        exact_request,
+        _comparison_constraints(),
+        joint_structures=_comparison_joint_structure(),
+    )
+
+    parsed = expand._PracticeFastExpansion.model_validate(payload)
+
+    assert (
+        parsed.acquisition_obligation_constraint_ids
+        == payload["acquisition_obligation_constraint_ids"]
+    )
+    assert [
+        group.model_dump(mode="json")
+        for group in parsed.coordinated_groups
+    ] == payload["coordinated_groups"]
+
+
+def test_expansion_projection_normalization_keeps_malformed_inputs_fail_closed() -> None:
+    exact_request = "Compare alpha with beta"
+    payload = _selector_contract_payload(
+        exact_request,
+        _comparison_constraints(),
+        joint_structures=_comparison_joint_structure(),
+    )
+
+    duplicate_acquisition = json.loads(json.dumps(payload))
+    duplicate_acquisition["acquisition_obligation_constraint_ids"] = [
+        "alpha",
+        "alpha",
+    ]
+    with pytest.raises(
+        ValueError,
+        match="acquisition obligations must be unique declared",
+    ):
+        expand._PracticeFastExpansion.model_validate(duplicate_acquisition)
+
+    unknown_acquisition = json.loads(json.dumps(payload))
+    unknown_acquisition["acquisition_obligation_constraint_ids"] = [
+        "alpha",
+        "missing",
+    ]
+    with pytest.raises(
+        ValueError,
+        match="acquisition obligations must be unique declared",
+    ):
+        expand._PracticeFastExpansion.model_validate(unknown_acquisition)
+
+    unknown_joint_member = json.loads(json.dumps(payload))
+    unknown_joint_member["joint_structures"][0][
+        "member_constraint_ids"
+    ][1] = "missing"
+    with pytest.raises(
+        ValueError,
+        match="joint structures must reference declared",
+    ):
+        expand._PracticeFastExpansion.model_validate(unknown_joint_member)
+
+    relationship_member = json.loads(json.dumps(payload))
+    relationship_member["intent_constraints"].append({
+        "constraint_id": "dependency",
+        "kind": "relationship",
+        "source_phrase": "with",
+        "source_occurrence": 0,
+        "requirement": "Relate alpha to beta",
+        "relationship_topology": "directed",
+    })
+    relationship_member["summary_preserved_constraint_ids"].append(
+        "dependency"
+    )
+    relationship_member["reverse_coverage_constraint_ids"].insert(
+        0,
+        "dependency",
+    )
+    relationship_member["acquisition_obligation_constraint_ids"].append(
+        "dependency"
+    )
+    relationship_member["joint_structures"][0][
+        "member_constraint_ids"
+    ][1] = "dependency"
+    with pytest.raises(
+        ValueError,
+        match="non-relationship constraints",
+    ):
+        expand._PracticeFastExpansion.model_validate(relationship_member)
+
+    duplicate_joint = json.loads(json.dumps(payload))
+    duplicate_joint["joint_structures"].append(
+        json.loads(json.dumps(duplicate_joint["joint_structures"][0]))
+    )
+    with pytest.raises(ValueError, match="joint structures must be unique"):
+        expand._PracticeFastExpansion.model_validate(duplicate_joint)
+
+    underdetermined_joint = json.loads(json.dumps(payload))
+    underdetermined_joint["joint_structures"][0][
+        "member_constraint_ids"
+    ] = ["alpha", "compare"]
+    with pytest.raises(
+        ValueError,
+        match="at least two non-relation side or stage",
+    ):
+        expand._PracticeFastExpansion.model_validate(underdetermined_joint)
 
 
 @pytest.mark.parametrize(

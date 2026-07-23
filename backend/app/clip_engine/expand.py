@@ -152,6 +152,52 @@ class _PracticeFastIntentConstraint(BaseModel):
         "not_applicable",
     ] = "not_applicable"
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_relationship_topology_layout(cls, value):
+        """Canonicalize only valid redundant kind/topology enum layouts."""
+        if (
+            not isinstance(value, dict)
+            or "relationship_topology" not in value
+        ):
+            return value
+        raw_kind = value.get("kind")
+        kind = getattr(raw_kind, "value", raw_kind)
+        topology = value.get("relationship_topology")
+        valid_kinds = {
+            "subject",
+            "task",
+            "relationship",
+            "scope",
+            "format",
+            "outcome",
+        }
+        valid_topologies = {
+            "directed",
+            "reciprocal",
+            "symmetric",
+            "ordered",
+            "unspecified",
+            "not_applicable",
+        }
+        if kind not in valid_kinds or topology not in valid_topologies:
+            return value
+        normalized_topology = (
+            "unspecified"
+            if kind == "relationship" and topology == "not_applicable"
+            else (
+                "not_applicable"
+                if kind != "relationship"
+                else topology
+            )
+        )
+        if normalized_topology == topology:
+            return value
+        normalized = dict(value)
+        normalized["relationship_topology"] = normalized_topology
+        return normalized
+
+
 class _PracticeFastJointStructure(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -371,14 +417,33 @@ class _PracticeFastExpansion(BaseModel):
             coordinated_keys.append(member_ids)
         if len(coordinated_keys) != len(set(coordinated_keys)):
             raise ValueError("coordinated groups must be unique")
-        if any(
-            tuple(structure.member_constraint_ids) not in coordinated_keys
-            for structure in self.joint_structures
-        ):
-            raise ValueError(
-                "every joint structure must retain its atomic members in a "
-                "coordinated group"
-            )
+        constraints_by_id = {
+            constraint.constraint_id: constraint
+            for constraint in self.intent_constraints
+        }
+        normalized_groups = list(self.coordinated_groups)
+        for structure in self.joint_structures:
+            member_ids = tuple(structure.member_constraint_ids)
+            if any(
+                constraints_by_id[member_id].kind == "relationship"
+                for member_id in member_ids
+            ):
+                raise ValueError(
+                    "coordinated groups must reference declared atomic "
+                    "non-relationship constraints"
+                )
+            if member_ids in coordinated_keys:
+                continue
+            if len(normalized_groups) >= 8:
+                raise ValueError(
+                    "every joint structure must retain its atomic members in "
+                    "the bounded coordinated groups"
+                )
+            normalized_groups.append(_PracticeFastCoordinatedGroup(
+                member_constraint_ids=list(member_ids),
+            ))
+            coordinated_keys.append(member_ids)
+        self.coordinated_groups = normalized_groups
         required_acquisition_ids = {
             constraint.constraint_id
             for constraint in self.intent_constraints
@@ -398,11 +463,18 @@ class _PracticeFastExpansion(BaseModel):
             structure.relation_constraint_id
             for structure in self.joint_structures
         )
-        if not required_acquisition_ids.issubset(set(acquisition_ids)):
-            raise ValueError(
-                "acquisition obligations must retain every teachable task, "
-                "relationship, outcome, subject, and coordinated member"
-            )
+        acquisition_id_set = set(acquisition_ids)
+        self.acquisition_obligation_constraint_ids = [
+            *acquisition_ids,
+            *(
+                constraint_id
+                for constraint_id in ids
+                if (
+                    constraint_id in required_acquisition_ids
+                    and constraint_id not in acquisition_id_set
+                )
+            ),
+        ]
         return self
 
 

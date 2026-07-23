@@ -3442,10 +3442,37 @@ def _fallback(
 ) -> LessonOrderResult:
     if required_reel_ids:
         # A failed cross-batch organizer must degrade to the existing unseen
-        # tail followed by the new delta. Partial model preferences are not a
-        # valid authority for moving already-released anchors.
-        ordered_reels = list(reels)
-        ordered_reel_ids = list(reel_ids)
+        # tail followed by a constraint-safe new delta. Partial model
+        # preferences are not a valid authority for moving already-released
+        # anchors, but acquisition rank is not a lesson order for fresh clips.
+        if len(reels) != len(reel_ids):
+            ordered_reels = list(reels)
+            ordered_reel_ids = list(reel_ids)
+        else:
+            required_id_set = set(required_reel_ids)
+            pairs = list(zip(reels, reel_ids, strict=True))
+            required_pairs = [
+                (reel, reel_id)
+                for reel, reel_id in pairs
+                if reel_id in required_id_set
+            ]
+            delta_pairs = [
+                (reel, reel_id)
+                for reel, reel_id in pairs
+                if reel_id not in required_id_set
+            ]
+            delta_reels, delta_reel_ids = _constraint_safe_fallback_order(
+                [reel for reel, _reel_id in delta_pairs],
+                [reel_id for _reel, reel_id in delta_pairs],
+                topic=topic,
+                preferred_ids=preferred_ids,
+            )
+            ordered_reels = [
+                reel for reel, _reel_id in required_pairs
+            ] + delta_reels
+            ordered_reel_ids = [
+                reel_id for _reel, reel_id in required_pairs
+            ] + delta_reel_ids
     else:
         ordered_reels, ordered_reel_ids = _constraint_safe_fallback_order(
             reels,

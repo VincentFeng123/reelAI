@@ -246,7 +246,7 @@ def test_practice_fast_semantic_retry_receives_compact_validation_feedback(
     calls: list[dict] = []
     invalid = json.loads(_valid_expansion_json())
     invalid["intent_constraints"][0]["kind"] = "relationship"
-    invalid["intent_constraints"][0]["relationship_topology"] = "not_applicable"
+    invalid["intent_constraints"][0]["relationship_topology"] = "diagonal"
 
     def fail_then_recover(*_args, **kwargs):
         calls.append(kwargs)
@@ -259,7 +259,7 @@ def test_practice_fast_semantic_retry_receives_compact_validation_feedback(
     assert result["provider_used"] == "gemini"
     assert len(calls) == 2
     assert "validation_feedback" not in calls[0]
-    assert "relationship topology must match" in calls[1][
+    assert "relationship_topology" in calls[1][
         "validation_feedback"
     ]
     assert "input_value" not in calls[1]["validation_feedback"]
@@ -287,7 +287,7 @@ def test_practice_fast_incomplete_reverse_coverage_uses_existing_correction(
     assert "reverse_coverage_constraint_ids" in calls[1]["validation_feedback"]
 
 
-def test_practice_fast_coordinated_member_omission_uses_existing_correction(
+def test_practice_fast_missing_required_acquisition_id_is_appended_without_retry(
     monkeypatch,
 ) -> None:
     request = "Explain duty and breach in negligence."
@@ -329,28 +329,25 @@ def test_practice_fast_coordinated_member_omission_uses_existing_correction(
 
     calls: list[dict] = []
 
-    def fail_then_recover(*_args, **kwargs):
+    def return_redundant_projection(*_args, **kwargs):
         calls.append(kwargs)
-        return response(
-            ["task", "duty", "subject"]
-            if len(calls) == 1
-            else ["task", "duty", "breach", "subject"]
-        )
+        return response(["task", "duty", "subject"])
 
-    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fail_then_recover)
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        return_redundant_projection,
+    )
 
     result = expand.expand_query_practice_fast(request, 1)
 
     assert result["acquisition_obligation_constraint_ids"] == [
         "task",
         "duty",
-        "breach",
         "subject",
+        "breach",
     ]
-    assert len(calls) == 2
-    assert "acquisition obligations must retain" in calls[1][
-        "validation_feedback"
-    ]
+    assert len(calls) == 1
 
 
 def test_acquisition_obligations_exclude_gemini_marked_contextual_constraints(
@@ -404,27 +401,30 @@ def test_acquisition_obligations_exclude_gemini_marked_contextual_constraints(
     assert len(expand.trusted_intent_obligation_keys(contract)) == 4
 
 
-def test_practice_fast_order_mismatch_is_corrected_not_normalized(
+def test_practice_fast_nonrelationship_topology_is_normalized_without_retry(
     monkeypatch,
 ) -> None:
     calls: list[dict] = []
-    invalid = json.loads(_valid_expansion_json())
-    invalid["intent_constraints"][0]["kind"] = "format"
-    invalid["intent_constraints"][0]["relationship_topology"] = "ordered"
+    mismatched = json.loads(_valid_expansion_json())
+    mismatched["intent_constraints"][0]["relationship_topology"] = "ordered"
 
-    def fail_then_recover(*_args, **kwargs):
+    def return_mismatched(*_args, **kwargs):
         calls.append(kwargs)
-        return json.dumps(invalid) if len(calls) == 1 else _valid_expansion_json()
+        return json.dumps(mismatched)
 
-    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fail_then_recover)
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        return_mismatched,
+    )
 
     result = expand.expand_query_practice_fast("physics", 1)
 
     assert result["provider_used"] == "gemini"
-    assert len(calls) == 2
-    assert "relationship topology must match" in calls[1][
-        "validation_feedback"
-    ]
+    assert len(calls) == 1
+    [constraint] = result["intent_contract"]["request_intent"]["constraints"]
+    assert constraint["kind"] == "subject"
+    assert constraint["relationship_topology"] == "not_applicable"
 
 
 def test_practice_fast_warning_redacts_rejected_model_values(

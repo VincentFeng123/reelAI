@@ -1766,7 +1766,7 @@ _PRO_FINAL_AUDIT_RESERVED_S = 60.0
 # transient provider failure may use this bounded second-attempt window.
 _PRO_AUDIT_RETRY_GRACE_S = 60.0
 _PRO_AUDIT_MAX_PHYSICAL_DISPATCHES = 3
-_PRO_SOURCE_MAX_PHYSICAL_DISPATCHES = 4
+_PRO_SOURCE_MAX_PHYSICAL_DISPATCHES = 5
 _LOGICAL_CORRECTION_MAX_CODES = 8
 _LOGICAL_CORRECTION_MAX_CODE_CHARS = 64
 _LOGICAL_CORRECTION_MAX_SUFFIX_CHARS = 768
@@ -1909,6 +1909,52 @@ class _IntentConstraint(_StrictModel):
         "unspecified",
         "not_applicable",
     ] = "not_applicable"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_relationship_topology_layout(cls, value):
+        """Canonicalize only valid redundant kind/topology enum layouts."""
+        if (
+            not isinstance(value, dict)
+            or "relationship_topology" not in value
+        ):
+            return value
+        raw_kind = value.get("kind")
+        kind = getattr(raw_kind, "value", raw_kind)
+        topology = value.get("relationship_topology")
+        valid_kinds = {
+            "subject",
+            "task",
+            "relationship",
+            "scope",
+            "format",
+            "outcome",
+        }
+        valid_topologies = {
+            "directed",
+            "reciprocal",
+            "symmetric",
+            "ordered",
+            "unspecified",
+            "not_applicable",
+        }
+        if kind not in valid_kinds or topology not in valid_topologies:
+            return value
+        normalized_topology = (
+            "unspecified"
+            if kind == "relationship" and topology == "not_applicable"
+            else (
+                "not_applicable"
+                if kind != "relationship"
+                else topology
+            )
+        )
+        if normalized_topology == topology:
+            return value
+        normalized = dict(value)
+        normalized["relationship_topology"] = normalized_topology
+        return normalized
+
 
 class _IntentJointStructure(_StrictModel):
     model_config = ConfigDict(extra="forbid")
@@ -24250,6 +24296,7 @@ def _run_selection_profile(
         *,
         claim_logical_quota: bool = True,
         logical_correction_reasons: tuple[str, ...] = (),
+        max_transport_retries: int | None = None,
     ) -> tuple[BaseModel, dict]:
         call_user = _logical_correction_user_content(
             selector_user,
@@ -24273,13 +24320,18 @@ def _run_selection_profile(
             ),
             budget_reserve=settings.get("_segment_budget_reserve"),
             budget_reconcile=settings.get("_segment_budget_reconcile"),
-            # The live Pro selector uses the full transient policy. The dormant
-            # latency-sensitive Flash path retains its existing 503-only retry
-            # or one Lite failover rather than multiplying both mechanisms.
+            # A Pro logical correction receives only the source dispatches left
+            # by its caller after reserving one mandatory final-audit attempt.
+            # The dormant latency-sensitive Flash path retains its existing
+            # 503-only retry or one Lite failover.
             max_retries=(
-                0
-                if logical_correction_reasons
+                max(0, min(2, max_transport_retries))
+                if max_transport_retries is not None
                 else (1 if retry_capacity_once else 0)
+            ),
+            use_full_transient_retry_budget=bool(
+                profile == PRO_BOUNDARY_PROFILE
+                and logical_correction_reasons
             ),
             retry_status_codes=(
                 frozenset({503}) if retry_flash_capacity_once else None
@@ -24311,6 +24363,25 @@ def _run_selection_profile(
         return parsed_response, call
 
     calls: list[dict] = []
+
+    def selector_correction_transport_retries() -> int:
+        """Spend only correction retries that leave one final-audit dispatch."""
+        if profile != PRO_BOUNDARY_PROFILE:
+            return 0
+        selector_dispatches = sum(
+            _physical_dispatch_count(selector_call)
+            for selector_call in calls
+        )
+        return max(
+            0,
+            min(
+                2,
+                _PRO_SOURCE_MAX_PHYSICAL_DISPATCHES
+                - selector_dispatches
+                - 2,
+            ),
+        )
+
     try:
         parsed, call = invoke_selector()
     except _SchemaResponseError as first_exc:
@@ -24336,6 +24407,9 @@ def _run_selection_profile(
             parsed, call = invoke_selector(
                 claim_logical_quota=False,
                 logical_correction_reasons=("invalid_structured_response",),
+                max_transport_retries=(
+                    selector_correction_transport_retries()
+                ),
             )
         except Exception as retry_exc:
             retry_call = _exception_telemetry(retry_exc)
@@ -24405,6 +24479,9 @@ def _run_selection_profile(
                 claim_logical_quota=False,
                 logical_correction_reasons=tuple(
                     first_schema_rejections + first_contract_rejections
+                ),
+                max_transport_retries=(
+                    selector_correction_transport_retries()
                 ),
             )
         except Exception as retry_exc:

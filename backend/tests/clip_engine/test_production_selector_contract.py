@@ -17624,13 +17624,16 @@ def test_contract_retry_reuses_logical_selector_slot_at_three_source_cap(
         gemini_segment._ProCandidateAuditPlan,
         gemini_segment._ProCandidateAuditPlan,
     ]
-    assert len(dispatched_schemas) == (
-        gemini_segment._PRO_SOURCE_MAX_PHYSICAL_DISPATCHES
-    )
-    assert sum(
+    assert len(dispatched_schemas) == 4
+    physical_dispatches = sum(
         int(call.get("physical_dispatches") or 0)
         for call in result.calls
-    ) == gemini_segment._PRO_SOURCE_MAX_PHYSICAL_DISPATCHES
+    )
+    assert physical_dispatches == 4
+    assert (
+        physical_dispatches
+        <= gemini_segment._PRO_SOURCE_MAX_PHYSICAL_DISPATCHES
+    )
     budget = context.budget.snapshot()["gemini"]
     assert budget["selector_calls"] == 3
     assert budget["boundary_audit_calls"] == 1
@@ -27119,6 +27122,156 @@ def test_bound_selector_uses_upstream_intent_and_topics_only_response() -> None:
     )
     assert isinstance(parsed, gemini_segment._ContractBoundCompactBoundaryPlan)
     assert rejections == []
+
+
+def _topology_mismatched_comparison_contract() -> dict:
+    return {
+        "version": "expansion_intent_v2",
+        "request_intent": {
+            "exact_request": "Compare caching and batching",
+            "constraints": [
+                {
+                    "constraint_id": "caching",
+                    "kind": "subject",
+                    "source_phrase": "caching",
+                    "source_occurrence": 0,
+                    "requirement": "Explain caching",
+                    "relationship_topology": "directed",
+                },
+                {
+                    "constraint_id": "batching",
+                    "kind": "scope",
+                    "source_phrase": "batching",
+                    "source_occurrence": 0,
+                    "requirement": "Explain batching",
+                    "relationship_topology": "symmetric",
+                },
+                {
+                    "constraint_id": "comparison",
+                    "kind": "relationship",
+                    "source_phrase": "Compare",
+                    "source_occurrence": 0,
+                    "requirement": "Compare caching and batching",
+                    "relationship_topology": "not_applicable",
+                },
+            ],
+            "joint_structures": [{
+                "member_constraint_ids": ["caching", "batching"],
+                "relation_constraint_id": "comparison",
+            }],
+        },
+    }
+
+
+def test_upstream_contract_canonicalizes_only_valid_topology_layout() -> None:
+    contract = _topology_mismatched_comparison_contract()
+
+    request_intent = gemini_segment._trusted_request_intent_from_settings({
+        "_segment_intent_contract": contract,
+    })
+
+    assert request_intent is not None
+    assert [
+        str(constraint.constraint_id)
+        for constraint in request_intent.constraints
+    ] == ["caching", "batching", "comparison"]
+    assert [
+        constraint.relationship_topology
+        for constraint in request_intent.constraints
+    ] == ["not_applicable", "not_applicable", "unspecified"]
+    assert request_intent.joint_structures[0].member_constraint_ids == [
+        "caching",
+        "batching",
+    ]
+
+    malformed = json.loads(json.dumps(contract))
+    malformed["request_intent"]["joint_structures"][0][
+        "relation_constraint_id"
+    ] = "missing"
+    assert gemini_segment._trusted_request_intent_from_settings({
+        "_segment_intent_contract": malformed,
+    }) is None
+
+    unknown_topology = json.loads(json.dumps(contract))
+    unknown_topology["request_intent"]["constraints"][2][
+        "relationship_topology"
+    ] = "diagonal"
+    assert gemini_segment._trusted_request_intent_from_settings({
+        "_segment_intent_contract": unknown_topology,
+    }) is None
+
+
+def test_selector_signature_uses_canonical_topology_layout() -> None:
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": "physics",
+            "constraints": [{
+                "constraint_id": "subject",
+                "kind": "subject",
+                "source_phrase": "physics",
+                "source_occurrence": 0,
+                "requirement": "Teach physics",
+                "relationship_topology": "ordered",
+            }],
+            "joint_structures": [],
+        },
+        topics=[],
+    )
+
+    contract = gemini_segment._validate_live_pro_selector_contract(
+        plan,
+        "physics",
+    )
+
+    assert contract.intent_error is None
+    assert contract.intent_signature == (
+        ("subject", "physics", 0, "teach physics", "not_applicable"),
+    )
+
+
+def test_normalized_unspecified_relationship_still_requires_witness() -> None:
+    request_intent = gemini_segment._trusted_request_intent_from_settings({
+        "_segment_intent_contract": _topology_mismatched_comparison_contract(),
+    })
+    assert request_intent is not None
+    assert request_intent.constraints[-1].relationship_topology == "unspecified"
+    connection = (
+        "Caching reuses earlier results while batching combines operations"
+    )
+    proposal = gemini_segment._CompactBoundaryTopic(
+        candidate_id="caching-batching-comparison",
+        start_line=0,
+        end_line=0,
+        start_quote="Caching reuses earlier results",
+        end_quote="batching combines operations",
+        claim_quote=connection,
+        title="Caching and Batching",
+        learning_objective="Compare caching and batching",
+        facet="caching versus batching",
+        concept_family="caching and batching comparison",
+        concept_aliases=[],
+        informativeness=0.95,
+        topic_relevance=0.99,
+        educational_importance=0.95,
+        difficulty=0.3,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        self_contained=True,
+        is_standalone=True,
+        intent_evidence=[
+            {"id": "caching", "q": "Caching reuses earlier results"},
+            {"id": "batching", "q": "batching combines operations"},
+            {"id": "comparison", "q": connection},
+        ],
+        objective_constraint_ids=["caching", "batching", "comparison"],
+        relationship_witnesses=[],
+    )
+
+    assert gemini_segment._objective_fulfillment_contract_error(
+        request_intent,
+        proposal,
+    ) == "objective_relationship_witness_mismatch"
 
 
 @pytest.mark.parametrize(

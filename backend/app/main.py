@@ -5960,6 +5960,40 @@ def _current_level_reusable_generation_reel_count(
     )
 
 
+def _generation_usage_with_authoritative_release_count(
+    usage: object,
+    *,
+    released_reels: int,
+) -> dict[str, Any]:
+    """Attach final release accounting without changing acquisition counters."""
+    normalized_usage = dict(usage) if isinstance(usage, Mapping) else {}
+    raw_summary = normalized_usage.get("summary")
+    summary = dict(raw_summary) if isinstance(raw_summary, Mapping) else {}
+    try:
+        released_count = max(0, int(released_reels))
+    except (TypeError, ValueError, OverflowError):
+        released_count = 0
+    known_cost = max(
+        0.0,
+        float(summary.get("known_billed_cost_usd") or 0.0),
+        float(summary.get("estimated_cost_usd") or 0.0),
+        float(summary.get("telemetry_priced_cost_usd") or 0.0),
+    )
+    billing_unknown = bool(
+        int(summary.get("billing_unknown_calls") or 0)
+        or float(summary.get("billing_unknown_reserved_cost_usd") or 0.0)
+        > 1e-9
+    )
+    summary["released_reels"] = released_count
+    summary["cost_per_released_reel_usd"] = (
+        round(known_cost / released_count, 8)
+        if released_count and not billing_unknown
+        else None
+    )
+    normalized_usage["summary"] = summary
+    return normalized_usage
+
+
 def _generation_usage_with_authoritative_gemini_exposure(
     conn: Any,
     job_row: Mapping[str, Any],
@@ -6187,6 +6221,11 @@ def _generation_usage_with_authoritative_gemini_exposure(
                 continue
             by_stage[str(stage)] = dict(ledger_bucket)
         normalized_usage["by_stage"] = by_stage
+    if "released_reels" in summary:
+        normalized_usage = _generation_usage_with_authoritative_release_count(
+            normalized_usage,
+            released_reels=summary["released_reels"],
+        )
     return normalized_usage
 
 
@@ -8225,6 +8264,10 @@ def _run_leased_generation_job(
 
             usage_records = context.usage()
             usage_payload = generation_usage_payload(terminal=True)
+            usage_payload = _generation_usage_with_authoritative_release_count(
+                usage_payload,
+                released_reels=len(final_reels),
+            )
             terminal_counters = dict(
                 usage_payload.get("counters") or stage_counters
             )
