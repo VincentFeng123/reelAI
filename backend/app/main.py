@@ -5310,7 +5310,8 @@ def _generation_gemini_ledger_exposure(
     job_id: str,
     *,
     prior_records: Iterable[dict[str, Any]] = (),
-) -> dict[str, float]:
+) -> dict[str, Any]:
+    """Reconcile Gemini exposure and Groq usage from one durable ledger scan."""
     database_records: list[dict[str, Any]] = []
     durable_ticket_ids: set[str] = set()
     for row in fetch_all(
@@ -5319,7 +5320,7 @@ def _generation_gemini_ledger_exposure(
         SELECT id, provider, operation, model, billable_requests, input_tokens,
                output_tokens, total_tokens, metadata_json
         FROM generation_provider_usage
-        WHERE job_id = ? AND provider = 'gemini'
+        WHERE job_id = ? AND provider IN ('gemini', 'groq')
         ORDER BY created_at, id
         """,
         (job_id,),
@@ -5330,15 +5331,17 @@ def _generation_gemini_ledger_exposure(
             metadata = {}
         safe_metadata = metadata if isinstance(metadata, dict) else {}
         usage_id = str(row.get("id") or "")
+        provider = str(row.get("provider") or "").strip().casefold()
         if (
-            usage_id
+            provider == "gemini"
+            and usage_id
             and safe_metadata.get("ticket_schema_version")
             == "gemini_dispatch_ticket_v1"
         ):
             durable_ticket_ids.add(usage_id)
         database_records.append({
             "id": usage_id,
-            "provider": "gemini",
+            "provider": provider,
             "operation": str(row.get("operation") or ""),
             "model_used": str(row.get("model") or ""),
             "attempt": safe_metadata.get("attempt"),
@@ -5367,7 +5370,11 @@ def _generation_gemini_ledger_exposure(
             or prior_metadata.get("gemini_ticket_id")
             or ""
         )
-        if prior_ticket_id and prior_ticket_id in durable_ticket_ids:
+        if (
+            str(prior.get("provider") or "").casefold() == "gemini"
+            and prior_ticket_id
+            and prior_ticket_id in durable_ticket_ids
+        ):
             continue
         records.append(prior)
 
@@ -5375,13 +5382,56 @@ def _generation_gemini_ledger_exposure(
     for record in database_records:
         metadata = record.get("metadata")
         if (
-            isinstance(metadata, Mapping)
+            str(record.get("provider") or "").casefold() == "gemini"
+            and isinstance(metadata, Mapping)
             and metadata.get("ticket_schema_version")
             == "gemini_dispatch_ticket_v1"
         ):
             durable_records.append(record)
         else:
             records.append(record)
+
+    def provider_record_identity(
+        record: Mapping[str, Any],
+        provider: str,
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        raw_metadata = record.get("metadata")
+        metadata = (
+            dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+        )
+        envelope: dict[str, Any] = {}
+        for field_name in (
+            "attempt",
+            "timestamp",
+            "status_code",
+            "quality_degraded",
+            "error_code",
+        ):
+            envelope[field_name] = (
+                record.get(field_name)
+                if record.get(field_name) is not None
+                else metadata.get(field_name)
+            )
+            metadata.pop(field_name, None)
+        identity = json.dumps(
+            {
+                "provider": provider,
+                "operation": str(record.get("operation") or ""),
+                "model_used": str(record.get("model_used") or ""),
+                "billable_requests": int(
+                    record.get("billable_requests") or 0
+                ),
+                "input_tokens": int(record.get("input_tokens") or 0),
+                "output_tokens": int(record.get("output_tokens") or 0),
+                "total_tokens": int(record.get("total_tokens") or 0),
+                "envelope": envelope,
+                "metadata": metadata,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return identity, metadata, envelope
 
     exposure = gemini_usage_records_exposure(records)
     committed_cost = max(
@@ -5406,22 +5456,14 @@ def _generation_gemini_ledger_exposure(
     unknown_attempts = 0
     seen_non_ticket_records: set[str] = set()
     for record in records:
-        record_identity = {
-            key: value
-            for key, value in record.items()
-            if key != "id"
-        }
-        record_key = json.dumps(
-            record_identity,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
+        if str(record.get("provider") or "").casefold() != "gemini":
+            continue
+        record_key, safe_metadata, _envelope = (
+            provider_record_identity(record, "gemini")
         )
         if record_key in seen_non_ticket_records:
             continue
         seen_non_ticket_records.add(record_key)
-        metadata = record.get("metadata")
-        safe_metadata = metadata if isinstance(metadata, Mapping) else {}
         raw_unknown_attempts = safe_metadata.get("billing_unknown_attempts")
         try:
             record_unknown_attempts = max(
@@ -5473,9 +5515,82 @@ def _generation_gemini_ledger_exposure(
             unknown_calls += 1
             unknown_attempts += 1
 
+    groq_records: list[dict[str, Any]] = []
+    seen_groq_records: set[str] = set()
+    for record in sorted(
+        records,
+        key=lambda candidate: 0 if candidate.get("id") else 1,
+    ):
+        if str(record.get("provider") or "").casefold() != "groq":
+            continue
+        structural_key, metadata, envelope = provider_record_identity(
+            record,
+            "groq",
+        )
+        dispatch_id = str(
+            metadata.get("groq_dispatch_id") or ""
+        ).strip()
+        record_key = (
+            f"groq_dispatch:{dispatch_id}"
+            if dispatch_id
+            else structural_key
+        )
+        if record_key in seen_groq_records:
+            continue
+        seen_groq_records.add(record_key)
+        normalized_record = {
+            key: value
+            for key, value in record.items()
+            if key != "id"
+        }
+        normalized_record["metadata"] = {
+            **metadata,
+            **{
+                field_name: field_value
+                for field_name, field_value in envelope.items()
+                if (
+                    field_value is not None
+                    and normalized_record.get(field_name) is None
+                )
+            },
+        }
+        groq_records.append(normalized_record)
+
     if unknown_cost <= 1e-9:
         unknown_calls = 0
         unknown_attempts = 0
+
+    groq_context = GenerationContext("fast")
+    for record in groq_records:
+        groq_context.record(
+            ProviderUsageRecord(
+                provider="groq",
+                operation=str(
+                    record.get("operation") or "transcript"
+                ),
+                attempt=max(1, int(record.get("attempt") or 1)),
+                timestamp=str(record.get("timestamp") or ""),
+                status_code=record.get("status_code"),
+                billable_requests=max(
+                    0,
+                    int(record.get("billable_requests") or 0),
+                ),
+                input_tokens=max(0, int(record.get("input_tokens") or 0)),
+                output_tokens=max(
+                    0,
+                    int(record.get("output_tokens") or 0),
+                ),
+                total_tokens=max(0, int(record.get("total_tokens") or 0)),
+                model_used=str(record.get("model_used") or ""),
+                quality_degraded=bool(record.get("quality_degraded")),
+                error_code=str(record.get("error_code") or ""),
+                metadata=dict(record.get("metadata") or {}),
+            ),
+            persist=False,
+        )
+    groq_payload = groq_context.usage_payload()
+    groq_summary = dict(groq_payload.get("summary") or {})
+    groq_by_stage = dict(groq_payload.get("by_stage") or {})
 
     return {
         "committed_cost_usd": committed_cost,
@@ -5485,6 +5600,31 @@ def _generation_gemini_ledger_exposure(
         "durable_ticket_count": float(len(durable_records)),
         "billing_unknown_calls": float(unknown_calls),
         "billing_unknown_attempts": float(unknown_attempts),
+        "groq_calls": float(groq_summary.get("groq_calls") or 0),
+        "groq_attempts": float(groq_summary.get("groq_attempts") or 0),
+        "groq_audio_seconds": float(
+            groq_summary.get("groq_audio_seconds") or 0.0
+        ),
+        "groq_billed_audio_seconds": float(
+            groq_summary.get("groq_billed_audio_seconds") or 0.0
+        ),
+        "groq_known_billed_cost_usd": float(
+            groq_summary.get("groq_known_billed_cost_usd") or 0.0
+        ),
+        "groq_billing_unknown_calls": float(
+            groq_summary.get("groq_billing_unknown_calls") or 0
+        ),
+        "groq_billing_unknown_attempts": float(
+            groq_summary.get("groq_billing_unknown_attempts") or 0
+        ),
+        "groq_billing_unknown_reserved_cost_usd": float(
+            groq_summary.get(
+                "groq_billing_unknown_reserved_cost_usd"
+            )
+            or 0.0
+        ),
+        "groq_provider_records": groq_records,
+        "groq_by_stage": groq_by_stage,
     }
 
 
@@ -5825,7 +5965,7 @@ def _generation_usage_with_authoritative_gemini_exposure(
     job_row: Mapping[str, Any],
     usage: object,
 ) -> dict[str, Any]:
-    """Overlay late durable ticket settlements on a stored usage snapshot."""
+    """Overlay late Gemini settlements and crash-surviving Groq usage."""
     normalized_usage = dict(usage) if isinstance(usage, Mapping) else {}
     job_id = str(job_row.get("id") or "")
     if (
@@ -5851,7 +5991,30 @@ def _generation_usage_with_authoritative_gemini_exposure(
         job_id,
         prior_records=prior_records,
     )
-    if int(exposure.get("durable_ticket_count") or 0) <= 0:
+    ledger_groq_calls = max(
+        0,
+        int(exposure.get("groq_calls") or 0),
+    )
+    raw_summary = normalized_usage.get("summary")
+    summary = dict(raw_summary) if isinstance(raw_summary, Mapping) else {}
+    stored_groq_claim = any(
+        float(summary.get(field_name) or 0.0) > 0.0
+        for field_name in (
+            "groq_calls",
+            "groq_attempts",
+            "groq_audio_seconds",
+            "groq_billed_audio_seconds",
+            "groq_known_billed_cost_usd",
+            "groq_billing_unknown_calls",
+            "groq_billing_unknown_attempts",
+            "groq_billing_unknown_reserved_cost_usd",
+        )
+    )
+    if (
+        int(exposure.get("durable_ticket_count") or 0) <= 0
+        and ledger_groq_calls <= 0
+        and not stored_groq_claim
+    ):
         return normalized_usage
     committed_cost = max(
         0.0,
@@ -5905,28 +6068,125 @@ def _generation_usage_with_authoritative_gemini_exposure(
     budget["gemini"] = gemini_budget
     normalized_usage["budget"] = budget
 
-    raw_summary = normalized_usage.get("summary")
-    summary = dict(raw_summary) if isinstance(raw_summary, Mapping) else {}
+    groq_known_cost = max(
+        0.0,
+        float(exposure.get("groq_known_billed_cost_usd") or 0.0),
+    )
+    groq_unknown_cost = max(
+        0.0,
+        float(
+            exposure.get("groq_billing_unknown_reserved_cost_usd")
+            or 0.0
+        ),
+    )
+    groq_unknown_calls = max(
+        0,
+        int(exposure.get("groq_billing_unknown_calls") or 0),
+    )
+    groq_unknown_attempts = max(
+        0,
+        int(exposure.get("groq_billing_unknown_attempts") or 0),
+    )
+    total_known_cost = known_cost + groq_known_cost
+    total_unknown_cost = unknown_cost + groq_unknown_cost
     summary.update(
         {
-            "estimated_cost_usd": known_cost,
-            "known_billed_cost_usd": known_cost,
-            "telemetry_priced_cost_usd": known_cost,
-            "current_cost_exposure_usd": committed_cost,
-            "billing_unknown_reserved_cost_usd": unknown_cost,
-            "billing_unknown_calls": unknown_calls,
-            "billing_unknown_attempts": unknown_attempts,
+            "gemini_known_billed_cost_usd": known_cost,
+            "gemini_billing_unknown_calls": unknown_calls,
+            "gemini_billing_unknown_attempts": unknown_attempts,
+            "gemini_billing_unknown_reserved_cost_usd": unknown_cost,
+            "groq_calls": ledger_groq_calls,
+            "groq_attempts": max(
+                0,
+                int(exposure.get("groq_attempts") or 0),
+            ),
+            "groq_audio_seconds": max(
+                0.0,
+                float(exposure.get("groq_audio_seconds") or 0.0),
+            ),
+            "groq_billed_audio_seconds": max(
+                0.0,
+                float(
+                    exposure.get("groq_billed_audio_seconds")
+                    or 0.0
+                ),
+            ),
+            "groq_known_billed_cost_usd": groq_known_cost,
+            "groq_billing_unknown_calls": groq_unknown_calls,
+            "groq_billing_unknown_attempts": groq_unknown_attempts,
+            "groq_billing_unknown_reserved_cost_usd": (
+                groq_unknown_cost
+            ),
+            "estimated_cost_usd": total_known_cost,
+            "known_billed_cost_usd": total_known_cost,
+            "telemetry_priced_cost_usd": total_known_cost,
+            "current_cost_exposure_usd": (
+                committed_cost + groq_known_cost + groq_unknown_cost
+            ),
+            "billing_unknown_reserved_cost_usd": total_unknown_cost,
+            "billing_unknown_calls": unknown_calls + groq_unknown_calls,
+            "billing_unknown_attempts": (
+                unknown_attempts + groq_unknown_attempts
+            ),
             "reserved_worst_case_cost_usd": lifetime_reserved_cost,
             "lifetime_reserved_worst_case_cost_usd": lifetime_reserved_cost,
         }
     )
     accepted_clips = max(0, int(summary.get("accepted_clips") or 0))
     summary["cost_per_accepted_clip_usd"] = (
-        round(known_cost / accepted_clips, 8)
-        if accepted_clips and unknown_cost <= 1e-9
+        round(total_known_cost / accepted_clips, 8)
+        if accepted_clips and total_unknown_cost <= 1e-9
         else None
     )
     normalized_usage["summary"] = summary
+
+    ledger_groq_records = exposure.get("groq_provider_records")
+    if isinstance(ledger_groq_records, list):
+        normalized_usage["provider_calls"] = [
+            record
+            for record in prior_records
+            if str(record.get("provider") or "").casefold() != "groq"
+        ] + [
+            dict(record)
+            for record in ledger_groq_records
+            if isinstance(record, dict)
+        ]
+
+    ledger_groq_by_stage = exposure.get("groq_by_stage")
+    if isinstance(ledger_groq_by_stage, Mapping):
+        raw_by_stage = normalized_usage.get("by_stage")
+        by_stage = (
+            {
+                str(stage): dict(bucket)
+                for stage, bucket in raw_by_stage.items()
+                if isinstance(bucket, Mapping)
+            }
+            if isinstance(raw_by_stage, Mapping)
+            else {}
+        )
+        groq_stage_names = {"groq_boundary_asr"}
+        for record in prior_records:
+            if str(record.get("provider") or "").casefold() != "groq":
+                continue
+            metadata = record.get("metadata")
+            safe_metadata = (
+                metadata if isinstance(metadata, Mapping) else {}
+            )
+            groq_stage_names.add(str(
+                safe_metadata.get("stage")
+                or record.get("operation")
+                or "unknown"
+            ))
+        groq_stage_names.update(
+            str(stage) for stage in ledger_groq_by_stage
+        )
+        for stage in groq_stage_names:
+            by_stage.pop(stage, None)
+        for stage, ledger_bucket in ledger_groq_by_stage.items():
+            if not isinstance(ledger_bucket, Mapping):
+                continue
+            by_stage[str(stage)] = dict(ledger_bucket)
+        normalized_usage["by_stage"] = by_stage
     return normalized_usage
 
 
@@ -5999,19 +6259,107 @@ def _sanitize_generation_replay_events(
         and job_status in {"completed", "partial", "exhausted"}
     )
     suppress_inventory = job_status in {"failed", "cancelled"}
-    terminal_inventory = bool(
-        job_row
-        and surfaceable_terminal
-        and str(job_row.get("result_generation_id") or "").strip()
+    if job_row and job_status in GENERATION_TERMINAL_STATUSES:
+        authoritative_reels = (
+            _generation_job_reels(conn, job_row)
+            if (
+                conn is not None
+                and surfaceable_terminal
+                and not suppress_inventory
+            )
+            else []
+        )
+    params = _job_request_params(job_row or {})
+    mode = (
+        "fast"
+        if str(params.get("generation_mode") or "slow") == "fast"
+        else "slow"
     )
-    if terminal_inventory and job_row is not None:
-        authoritative_reels = _generation_job_reels(conn, job_row)
+    try:
+        candidate_limit = max(
+            1,
+            min(
+                GENERATION_OUTPUT_CEILINGS[mode],
+                int(
+                    params.get("num_reels")
+                    or GENERATION_OUTPUT_CEILINGS[mode]
+                ),
+            ),
+        )
+    except (TypeError, ValueError, OverflowError):
+        candidate_limit = GENERATION_OUTPUT_CEILINGS[mode]
+    candidate_reels = [
+        payload.get("reel")
+        for event in events
+        if str(event.get("type") or "") == "candidate"
+        and isinstance((payload := event.get("payload")), dict)
+        and payload.get("provisional") is True
+        and isinstance(payload.get("reel"), dict)
+    ]
+    usable_candidate_ids = (
+        _usable_boundary_reel_ids(
+            conn,
+            [
+                str(reel.get("reel_id") or "")
+                for reel in candidate_reels
+            ],
+        )
+        if conn is not None and candidate_reels
+        else set()
+    )
+    authoritative_reel_ids = {
+        str(reel.get("reel_id") or "").strip()
+        for reel in authoritative_reels or []
+        if str(reel.get("reel_id") or "").strip()
+    }
+    authoritative_clip_keys = {
+        clip_key
+        for reel in authoritative_reels or []
+        if _reel_source_video_id(reel)
+        for _reel_id, clip_key in [_reel_identity_key(reel)]
+    }
+    emitted_candidate_ids: set[str] = set()
+    emitted_candidate_clip_keys: set[str] = set()
     for raw_event in events:
         event = dict(raw_event)
         event_type = str(event.get("type") or "")
         payload = dict(event.get("payload") or {})
         if event_type == "candidate":
-            continue
+            reel = payload.get("reel")
+            if (
+                payload.get("provisional") is not True
+                or not isinstance(reel, dict)
+            ):
+                continue
+            reel_id, clip_key = _reel_identity_key(reel)
+            meaningful_clip_key = (
+                clip_key if _reel_source_video_id(reel) else ""
+            )
+            if (
+                not reel_id
+                or reel_id not in usable_candidate_ids
+                or reel_id in emitted_candidate_ids
+                or (
+                    meaningful_clip_key
+                    and meaningful_clip_key in emitted_candidate_clip_keys
+                )
+                or len(emitted_candidate_ids) >= candidate_limit
+            ):
+                continue
+            if authoritative_reels is not None and (
+                reel_id not in authoritative_reel_ids
+                and (
+                    not meaningful_clip_key
+                    or meaningful_clip_key not in authoritative_clip_keys
+                )
+            ):
+                continue
+            emitted_candidate_ids.add(reel_id)
+            if meaningful_clip_key:
+                emitted_candidate_clip_keys.add(meaningful_clip_key)
+            payload["reel"] = _public_generation_reel(reel)
+            payload["provisional"] = True
+            event["payload"] = payload
         if event_type == "final" and job_row is not None:
             if suppress_inventory:
                 authoritative_reels = []
@@ -6592,6 +6940,19 @@ def _run_leased_generation_job(
             "mode": mode,
             "gemini": ledger_exposure,
         })
+        recovered_groq_records = ledger_exposure.get(
+            "groq_provider_records"
+        )
+        if isinstance(recovered_groq_records, list):
+            previous_provider_calls = [
+                record
+                for record in previous_provider_calls
+                if str(record.get("provider") or "").casefold() != "groq"
+            ] + [
+                dict(record)
+                for record in recovered_groq_records
+                if isinstance(record, dict)
+            ]
     previous_consumed_source_ids = {
         video_id
         for raw_id in previous_usage.get("consumed_video_ids", [])
@@ -6639,40 +7000,19 @@ def _run_leased_generation_job(
     ) -> dict[str, Any]:
         if terminal:
             context.budget.finalize_gemini_exposure()
-        payload = context.usage_payload()
-        if previous_provider_calls:
-            payload["provider_calls"] = [
-                dict(record)
-                for record in previous_provider_calls
-            ] + list(payload.get("provider_calls") or [])
-
-        previous_by_stage = previous_usage.get("by_stage")
-        if isinstance(previous_by_stage, dict):
-            by_stage = {
-                str(stage): dict(bucket)
-                for stage, bucket in (payload.get("by_stage") or {}).items()
-                if isinstance(bucket, dict)
-            }
-            for stage, previous_bucket in previous_by_stage.items():
-                if not isinstance(previous_bucket, dict):
-                    continue
-                bucket = by_stage.setdefault(str(stage), {})
-                for field, previous_value in previous_bucket.items():
-                    current_value = bucket.get(field)
-                    if (
-                        isinstance(previous_value, (int, float))
-                        and not isinstance(previous_value, bool)
-                        and isinstance(current_value, (int, float))
-                        and not isinstance(current_value, bool)
-                    ):
-                        bucket[field] = previous_value + current_value
-                    elif field not in bucket:
-                        bucket[field] = previous_value
-            payload["by_stage"] = by_stage
+        payload = context.usage_payload(
+            prior_records=previous_provider_calls,
+        )
 
         previous_summary = previous_usage.get("summary")
         if isinstance(previous_summary, dict):
             summary = dict(payload.get("summary") or {})
+            provider_summary_fields = set(summary) - {
+                "accepted_clips",
+                "fallback_reasons",
+                "rejection_reason_counts",
+                "rejected_boundaries",
+            }
             non_additive_summary_fields = {
                 "completion_cost_limit_usd",
                 "cost_limit_usd",
@@ -6680,7 +7020,7 @@ def _run_leased_generation_job(
                 "current_cost_exposure_usd",
                 "lifetime_reserved_worst_case_cost_usd",
                 "reserved_worst_case_cost_usd",
-            }
+            } | provider_summary_fields
             for field, previous_value in previous_summary.items():
                 current_value = summary.get(field)
                 if field == "fallback_reasons":
@@ -6839,6 +7179,27 @@ def _run_leased_generation_job(
                     or 0.0
                 ),
             )
+            groq_known_cost = max(
+                0.0,
+                float(summary.get("groq_known_billed_cost_usd") or 0.0),
+            )
+            groq_unknown_cost = max(
+                0.0,
+                float(
+                    summary.get(
+                        "groq_billing_unknown_reserved_cost_usd"
+                    )
+                    or 0.0
+                ),
+            )
+            record_gemini_known_cost = max(
+                0.0,
+                record_known_cost - groq_known_cost,
+            )
+            record_gemini_unknown_cost = max(
+                0.0,
+                record_unknown_cost - groq_unknown_cost,
+            )
             current_exposure = max(
                 0.0,
                 float(gemini_budget.get("cost_exposure_usd") or 0.0),
@@ -6863,15 +7224,23 @@ def _run_leased_generation_job(
                 0.0,
                 budget_committed_cost - budget_unknown_cost,
             )
-            known_cost = max(record_known_cost, budget_known_cost)
+            known_cost = (
+                max(record_gemini_known_cost, budget_known_cost)
+                + groq_known_cost
+            )
             missing_known_cost = max(
                 0.0,
-                budget_known_cost - record_known_cost,
+                budget_known_cost - record_gemini_known_cost,
             )
-            unknown_cost = max(record_unknown_cost, budget_unknown_cost)
+            unknown_cost = (
+                max(record_gemini_unknown_cost, budget_unknown_cost)
+                + groq_unknown_cost
+            )
             residual_unknown_cost = max(
                 0.0,
-                current_exposure - known_cost - unknown_cost,
+                current_exposure
+                - (known_cost - groq_known_cost)
+                - (unknown_cost - groq_unknown_cost),
             )
             unknown_cost += residual_unknown_cost
             for field in (
@@ -6885,32 +7254,30 @@ def _run_leased_generation_job(
                 )
             if missing_known_cost > 1e-9:
                 summary["unattributed_known_billed_cost_usd"] = round(
-                    float(
-                        summary.get("unattributed_known_billed_cost_usd")
-                        or 0.0
-                    )
-                    + missing_known_cost,
+                    missing_known_cost,
                     8,
                 )
+            else:
+                summary.pop("unattributed_known_billed_cost_usd", None)
             missing_unknown_cost = max(
                 0.0,
-                budget_unknown_cost - record_unknown_cost,
+                budget_unknown_cost - record_gemini_unknown_cost,
             ) + residual_unknown_cost
             summary["billing_unknown_reserved_cost_usd"] = round(
                 unknown_cost,
                 8,
             )
+            summary["current_cost_exposure_usd"] = round(
+                known_cost + unknown_cost,
+                8,
+            )
             if missing_unknown_cost > 1e-9:
                 summary["unattributed_billing_unknown_cost_usd"] = round(
-                    float(
-                        summary.get(
-                            "unattributed_billing_unknown_cost_usd"
-                        )
-                        or 0.0
-                    )
-                    + missing_unknown_cost,
+                    missing_unknown_cost,
                     8,
                 )
+            else:
+                summary.pop("unattributed_billing_unknown_cost_usd", None)
             accepted_clips = max(
                 0,
                 int(summary.get("accepted_clips") or 0),
@@ -7139,13 +7506,119 @@ def _run_leased_generation_job(
                 # receives the fresh provider budget after cached inventory is
                 # drained, so playback never waits on Gemini after clip three.
                 remaining_source_budget = 0
-            # Candidates remain private until retrieval is complete. The final
-            # ranked batch is released below, so discovery timing cannot lock a
-            # weaker supporting clip ahead of a stronger primary clip.
+            emitted_reel_ids: set[str] = set()
+            emitted_clip_keys: set[str] = set()
+            emitted_count = 0
+            if durable_attempt_count > 1:
+                prior_candidate_reels = [
+                    payload.get("reel")
+                    for event in replay_generation_events(conn, job_id=job_id)
+                    if str(event.get("type") or "") == "candidate"
+                    and isinstance((payload := event.get("payload")), dict)
+                    and payload.get("provisional") is True
+                    and isinstance(payload.get("reel"), dict)
+                ]
+                usable_prior_ids = _usable_boundary_reel_ids(
+                    conn,
+                    [
+                        str(reel.get("reel_id") or "")
+                        for reel in prior_candidate_reels
+                    ],
+                )
+                for reel in prior_candidate_reels:
+                    reel_id, clip_key = _reel_identity_key(reel)
+                    if not reel_id or reel_id not in usable_prior_ids:
+                        continue
+                    meaningful_clip_key = (
+                        clip_key if _reel_source_video_id(reel) else ""
+                    )
+                    if (
+                        reel_id in emitted_reel_ids
+                        or (
+                            meaningful_clip_key
+                            and meaningful_clip_key in emitted_clip_keys
+                        )
+                    ):
+                        continue
+                    emitted_reel_ids.add(reel_id)
+                    if meaningful_clip_key:
+                        emitted_clip_keys.add(meaningful_clip_key)
+                    emitted_count += 1
 
-            def on_candidate(_reel: dict[str, Any]) -> None:
+            def on_candidate(reel: dict[str, Any]) -> None:
+                nonlocal emitted_count
                 if should_cancel():
                     raise GenerationCancelledError("Generation cancelled.")
+                reel_id, clip_key = _reel_identity_key(reel)
+                meaningful_clip_key = (
+                    clip_key if _reel_source_video_id(reel) else ""
+                )
+                if (
+                    not reel_id
+                    or reel_id in emitted_reel_ids
+                    or (
+                        meaningful_clip_key
+                        and meaningful_clip_key in emitted_clip_keys
+                    )
+                    or emitted_count >= requested_count
+                ):
+                    return
+                candidate_payload = {
+                    "reel": _public_generation_reel(reel),
+                    "provisional": True,
+                }
+                try:
+                    append_generation_event(
+                        conn,
+                        job_id=job_id,
+                        event_type="candidate",
+                        payload=candidate_payload,
+                        lease_owner=lease_owner,
+                    )
+                except Exception:
+                    def append_candidate_if_absent(event_conn: Any) -> Any:
+                        for existing_event in replay_generation_events(
+                            event_conn,
+                            job_id=job_id,
+                            limit=2000,
+                        ):
+                            if str(existing_event.get("type") or "") != "candidate":
+                                continue
+                            existing_payload = existing_event.get("payload")
+                            if (
+                                not isinstance(existing_payload, dict)
+                                or existing_payload.get("provisional") is not True
+                                or not isinstance(existing_payload.get("reel"), dict)
+                            ):
+                                continue
+                            existing_reel = existing_payload["reel"]
+                            existing_reel_id, existing_clip_key = (
+                                _reel_identity_key(existing_reel)
+                            )
+                            if existing_reel_id == reel_id or (
+                                meaningful_clip_key
+                                and _reel_source_video_id(existing_reel)
+                                and existing_clip_key == meaningful_clip_key
+                            ):
+                                return existing_event
+                        return append_generation_event(
+                            event_conn,
+                            job_id=job_id,
+                            event_type="candidate",
+                            payload=candidate_payload,
+                            lease_owner=lease_owner,
+                        )
+
+                    _run_generation_db_transaction(
+                        "candidate_event",
+                        append_candidate_if_absent,
+                        retry_should_stop=db_retry_should_stop,
+                        replay_after_unknown_commit=True,
+                    )
+                emitted_reel_ids.add(reel_id)
+                if meaningful_clip_key:
+                    emitted_clip_keys.add(meaningful_clip_key)
+                emitted_count += 1
 
             base_exclusions = list(params.get("exclude_video_ids") or [])
             base_exclusions.extend(sorted(retired_failed_video_ids))

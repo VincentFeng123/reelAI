@@ -47,10 +47,17 @@ def test_worker_releases_only_final_ranked_inventory(monkeypatch) -> None:
             )
             generated.append(reel)
             kwargs["on_reel_created"](reel)
-            assert not any(
-                event["type"] == "candidate"
-                for event in generation_jobs.replay_events(conn, job_id=job["id"])
-            )
+            assert [
+                event["payload"]["reel"]["reel_id"]
+                for event in generation_jobs.replay_events(
+                    conn,
+                    job_id=job["id"],
+                )
+                if event["type"] == "candidate"
+            ] == [
+                f"release-reel-{emitted_index}"
+                for emitted_index in range(index + 1)
+            ]
 
     monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
     monkeypatch.setattr(
@@ -63,7 +70,13 @@ def test_worker_releases_only_final_ranked_inventory(monkeypatch) -> None:
 
         expected_ids = ["release-reel-2", "release-reel-1", "release-reel-0"]
         events = generation_jobs.replay_events(conn, job_id=job["id"])
-        assert [event["type"] for event in events] == ["final", "terminal"]
+        assert [event["type"] for event in events] == [
+            "candidate",
+            "candidate",
+            "candidate",
+            "final",
+            "terminal",
+        ]
         final = next(event for event in events if event["type"] == "final")
         assert [reel["reel_id"] for reel in final["payload"]["reels"]] == expected_ids
     finally:

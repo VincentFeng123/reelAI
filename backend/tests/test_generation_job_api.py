@@ -736,12 +736,18 @@ def test_generation_provider_usage_retries_once_with_stable_identity(
         main._persist_generation_provider_usage(
             str(job["id"]),
             ProviderUsageRecord(
-                provider="gemini",
-                operation="segmentation",
+                provider="groq",
+                operation="transcript",
                 attempt=1,
                 timestamp="2026-07-20T00:00:00+00:00",
                 billable_requests=1,
-                model_used="gemini-test",
+                model_used="whisper-large-v3-turbo",
+                metadata={
+                    "provider_call": True,
+                    "stage": "groq_boundary_asr",
+                    "billing_usage_known": True,
+                    "actual_cost_usd": 0.00012,
+                },
             ),
         )
 
@@ -751,6 +757,22 @@ def test_generation_provider_usage_retries_once_with_stable_identity(
             "SELECT COUNT(*) FROM generation_provider_usage WHERE job_id = ?",
             (job["id"],),
         ).fetchone()[0] == 1
+        stored = conn.execute(
+            """
+            SELECT provider, operation, model, metadata_json
+            FROM generation_provider_usage
+            WHERE job_id = ?
+            """,
+            (job["id"],),
+        ).fetchone()
+        assert stored[0:3] == (
+            "groq",
+            "transcript",
+            "whisper-large-v3-turbo",
+        )
+        assert json.loads(stored[3])["actual_cost_usd"] == pytest.approx(
+            0.00012
+        )
     finally:
         conn.close()
 
@@ -793,6 +815,52 @@ def test_generation_gemini_ledger_exposure_unions_and_deduplicates_snapshots() -
         "timestamp": "2026-07-19T23:59:59+00:00",
         "metadata": dict(base_metadata),
     }
+    groq_known_cost = 0.00012
+    groq_unknown_cost = 0.00011
+    groq_metadata = {
+        "provider_call": True,
+        "stage": "groq_boundary_asr",
+        "physical_dispatches": 1,
+        "groq_dispatch_id": "groq-dispatch-known-1",
+        "billing_usage_known": True,
+        "billing_unknown_attempts": 0,
+        "billing_unknown_reserved_cost_usd": 0.0,
+        "actual_cost_usd": groq_known_cost,
+        "audio_seconds": 12.0,
+        "billed_audio_seconds": 12.0,
+    }
+    groq_prior_duplicate = {
+        "provider": "groq",
+        "operation": "transcript",
+        "attempt": 1,
+        "timestamp": "2026-07-20T00:00:02+00:00",
+        "status_code": 200,
+        "billable_requests": 1,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "model_used": "whisper-large-v3-turbo",
+        "quality_degraded": False,
+        "error_code": "",
+        "metadata": dict(groq_metadata),
+    }
+    groq_prior_only = {
+        **groq_prior_duplicate,
+        "timestamp": "2026-07-20T00:00:03+00:00",
+        "status_code": 503,
+        "billable_requests": 0,
+        "error_code": "provider_transient",
+        "metadata": {
+            **groq_metadata,
+            "groq_dispatch_id": "groq-dispatch-unknown-3",
+            "billing_usage_known": False,
+            "billing_unknown_attempts": 1,
+            "billing_unknown_reserved_cost_usd": groq_unknown_cost,
+            "actual_cost_usd": None,
+            "audio_seconds": 2.0,
+            "billed_audio_seconds": 10.0,
+        },
+    }
     for timestamp in (
         "2026-07-20T00:00:00+00:00",
         "2026-07-20T00:00:01+00:00",
@@ -817,11 +885,53 @@ def test_generation_gemini_ledger_exposure_unions_and_deduplicates_snapshots() -
             },
             now=timestamp,
         )
+    generation_jobs.record_provider_usage(
+        conn,
+        job_id=str(job["id"]),
+        provider="groq",
+        operation="transcript",
+        model="whisper-large-v3-turbo",
+        billable_requests=1,
+        metadata={
+            **groq_metadata,
+            "attempt": 1,
+            "status_code": 200,
+            "quality_degraded": False,
+            "error_code": "",
+            "timestamp": "2026-07-20T00:00:02+00:00",
+        },
+        now="2026-07-20T00:00:02+00:00",
+    )
+    generation_jobs.record_provider_usage(
+        conn,
+        job_id=str(job["id"]),
+        provider="groq",
+        operation="transcript",
+        model="whisper-large-v3-turbo",
+        billable_requests=1,
+        metadata={
+            **groq_metadata,
+            "groq_dispatch_id": "groq-dispatch-known-2",
+            "attempt": 1,
+            "status_code": 200,
+            "quality_degraded": False,
+            "error_code": "",
+            # Deliberately identical physical-call time and payload apart from
+            # the dispatch identity. Both real requests must survive dedupe.
+            "timestamp": "2026-07-20T00:00:02+00:00",
+        },
+        now="2026-07-20T00:00:02+00:00",
+    )
     try:
         exposure = main._generation_gemini_ledger_exposure(
             conn,
             str(job["id"]),
-            prior_records=[prior_only_record, prior_record],
+            prior_records=[
+                prior_only_record,
+                prior_record,
+                groq_prior_duplicate,
+                groq_prior_only,
+            ],
         )
 
         assert exposure["committed_cost_usd"] == pytest.approx(0.6)
@@ -829,6 +939,22 @@ def test_generation_gemini_ledger_exposure_unions_and_deduplicates_snapshots() -
         assert exposure["lifetime_reserved_worst_case_cost_usd"] == pytest.approx(
             0.75
         )
+        assert exposure["groq_calls"] == 3
+        assert exposure["groq_attempts"] == 3
+        assert exposure["groq_known_billed_cost_usd"] == pytest.approx(
+            groq_known_cost * 2
+        )
+        assert exposure[
+            "groq_billing_unknown_reserved_cost_usd"
+        ] == pytest.approx(groq_unknown_cost)
+        assert exposure["groq_billing_unknown_calls"] == 1
+        assert exposure["groq_billing_unknown_attempts"] == 1
+        assert exposure["groq_audio_seconds"] == 26.0
+        assert exposure["groq_billed_audio_seconds"] == 34.0
+        assert len(exposure["groq_provider_records"]) == 3
+        assert exposure["groq_by_stage"]["groq_boundary_asr"][
+            "calls"
+        ] == 3
     finally:
         conn.close()
 
@@ -1108,6 +1234,62 @@ def test_terminal_status_and_replay_overlay_late_gemini_ticket_settlement() -> N
         admitted_physical_attempts=1,
         now=now + timedelta(milliseconds=100),
     )
+    generation_jobs.record_provider_usage(
+        conn,
+        job_id=str(job["id"]),
+        provider="groq",
+        operation="transcript",
+        model="whisper-large-v3-turbo",
+        billable_requests=1,
+        metadata={
+            "provider_call": True,
+            "stage": "groq_boundary_asr",
+            "physical_dispatches": 1,
+            "groq_dispatch_id": "late-terminal-groq-dispatch",
+            "billing_usage_known": True,
+            "billing_unknown_attempts": 0,
+            "billing_unknown_reserved_cost_usd": 0.0,
+            "actual_cost_usd": 0.00012,
+            "audio_seconds": 12.0,
+            "billed_audio_seconds": 12.0,
+            "attempt": 1,
+            "status_code": 200,
+            "quality_degraded": False,
+            "error_code": "",
+            "timestamp": (
+                now + timedelta(milliseconds=150)
+            ).isoformat(),
+        },
+        now=now + timedelta(milliseconds=150),
+    )
+    stale_groq_call = {
+        "provider": "groq",
+        "operation": "transcript",
+        "attempt": 1,
+        "timestamp": (
+            now + timedelta(milliseconds=150)
+        ).isoformat(),
+        "status_code": 200,
+        "billable_requests": 1,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "model_used": "whisper-large-v3-turbo",
+        "quality_degraded": False,
+        "error_code": "",
+        "metadata": {
+            "provider_call": True,
+            "stage": "groq_boundary_asr",
+            "physical_dispatches": 1,
+            "groq_dispatch_id": "late-terminal-groq-dispatch",
+            "billing_usage_known": True,
+            "billing_unknown_attempts": 0,
+            "billing_unknown_reserved_cost_usd": 0.0,
+            "actual_cost_usd": 0.00012,
+            "audio_seconds": 12.0,
+            "billed_audio_seconds": 12.0,
+        },
+    }
     stale_usage = {
         "budget": {
             "gemini": {
@@ -1119,11 +1301,36 @@ def test_terminal_status_and_replay_overlay_late_gemini_ticket_settlement() -> N
         },
         "summary": {
             "accepted_clips": 1,
-            "known_billed_cost_usd": 0.0,
-            "billing_unknown_reserved_cost_usd": 0.08,
+            "known_billed_cost_usd": 9.0,
+            "estimated_cost_usd": 9.0,
+            "telemetry_priced_cost_usd": 9.0,
+            "billing_unknown_reserved_cost_usd": 8.0,
             "cost_per_accepted_clip_usd": None,
+            "groq_calls": 9,
+            "groq_attempts": 9,
+            "groq_audio_seconds": 999.0,
+            "groq_billed_audio_seconds": 999.0,
+            "groq_known_billed_cost_usd": 9.0,
+            "groq_billing_unknown_calls": 8,
+            "groq_billing_unknown_attempts": 8,
+            "groq_billing_unknown_reserved_cost_usd": 8.0,
         },
-        "provider_calls": [],
+        "by_stage": {
+            "groq_boundary_asr": {
+                "calls": 9,
+                "attempts": 9,
+                "known_billed_cost_usd": 9.0,
+                "billing_unknown_calls": 8,
+                "billing_unknown_attempts": 8,
+                "billing_unknown_reserved_cost_usd": 8.0,
+                "audio_seconds": 999.0,
+                "billed_audio_seconds": 999.0,
+            },
+        },
+        "provider_calls": [
+            dict(stale_groq_call),
+            dict(stale_groq_call),
+        ],
     }
     terminal = generation_jobs.transition_terminal(
         conn,
@@ -1172,17 +1379,38 @@ def test_terminal_status_and_replay_overlay_late_gemini_ticket_settlement() -> N
                 "lifetime_reserved_worst_case_cost_usd"
             ] == pytest.approx(0.08)
             assert summary["known_billed_cost_usd"] == pytest.approx(
+                0.00043
+            )
+            assert summary["gemini_known_billed_cost_usd"] == pytest.approx(
                 0.00031
             )
+            assert summary["groq_known_billed_cost_usd"] == pytest.approx(
+                0.00012
+            )
+            assert summary["groq_calls"] == 1
+            assert summary["groq_attempts"] == 1
+            assert summary["groq_audio_seconds"] == 12.0
+            assert summary["groq_billed_audio_seconds"] == 12.0
             assert summary["current_cost_exposure_usd"] == pytest.approx(
-                0.00031
+                0.00043
             )
             assert summary["billing_unknown_reserved_cost_usd"] == 0.0
             assert summary["billing_unknown_calls"] == 0
             assert summary["billing_unknown_attempts"] == 0
             assert summary["cost_per_accepted_clip_usd"] == pytest.approx(
-                0.00031
+                0.00043
             )
+            assert [
+                call["provider"]
+                for call in usage["provider_calls"]
+            ] == ["groq"]
+            assert usage["by_stage"]["groq_boundary_asr"][
+                "known_billed_cost_usd"
+            ] == pytest.approx(0.00012)
+            assert usage["by_stage"]["groq_boundary_asr"]["calls"] == 1
+            assert usage["by_stage"]["groq_boundary_asr"][
+                "audio_seconds"
+            ] == 12.0
     finally:
         conn.close()
 
@@ -4397,6 +4625,208 @@ def test_generation_retry_terminalizes_and_reports_unemitted_gemini_exposure(
         assert budget["inflight_reserved_cost_usd"] == 0.0
         assert budget["admission_closed"] is True
         assert retrieval_calls == 2
+    finally:
+        conn.close()
+
+
+def test_generation_retry_recovers_uncheckpointed_groq_cost_in_terminal_usage(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_transactional_worker_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="terminal-groq-hard-crash-recovery",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    generated: list[dict] = []
+    attempts = 0
+    groq_cost = 0.00012
+    groq_unknown_cost = 0.00011
+
+    def generate_stage(worker_conn, **kwargs) -> None:
+        nonlocal attempts
+        attempts += 1
+        context = kwargs["generation_context"]
+        first_attempt = attempts == 1
+        context.record(ProviderUsageRecord(
+            provider="groq",
+            operation="transcript",
+            attempt=1,
+            timestamp=(
+                now + timedelta(seconds=attempts)
+            ).isoformat(),
+            status_code=503 if first_attempt else 200,
+            billable_requests=0 if first_attempt else 1,
+            model_used="whisper-large-v3-turbo",
+            error_code=(
+                "provider_transient" if first_attempt else ""
+            ),
+            metadata={
+                "provider_call": True,
+                "stage": "groq_boundary_asr",
+                "physical_dispatches": 1,
+                "groq_dispatch_id": f"groq-recovery-dispatch-{attempts}",
+                "billing_usage_known": not first_attempt,
+                "billing_unknown_attempts": 1 if first_attempt else 0,
+                "billing_unknown_reserved_cost_usd": (
+                    groq_unknown_cost if first_attempt else 0.0
+                ),
+                "actual_cost_usd": (
+                    None if first_attempt else groq_cost
+                ),
+                "audio_seconds": 2.0 if first_attempt else 12.0,
+                "billed_audio_seconds": (
+                    10.0 if first_attempt else 12.0
+                ),
+            },
+        ))
+        if first_attempt:
+            raise ProviderTransientError(
+                "Source analysis failed after Groq returned.",
+                provider="gemini",
+                operation="segmentation",
+                status_code=503,
+            )
+        generated.append(
+            _insert_generation_reel(
+                worker_conn,
+                generation_id=str(kwargs["generation_id"]),
+                reel_id="terminal-groq-recovery-reel",
+                video_id="GROQRECOV01",
+                created_at=(now + timedelta(seconds=2)).isoformat(),
+            )
+        )
+        context.increment_counter("persisted_clips")
+
+    def order_batch(reels, **_kwargs):
+        return mock.Mock(
+            reels=list(reels),
+            ordered_reel_ids=[reel["reel_id"] for reel in reels],
+            assessment_checkpoint_reel_ids=[],
+            model_used=None,
+            degraded=False,
+            fallback_reason=None,
+            provider_called=False,
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: list(generated),
+    )
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
+    try:
+        first_lease = generation_jobs.lease_job(
+            conn,
+            job_id=str(job["id"]),
+            lease_owner="groq-recovery-worker-1",
+            now=now,
+        )
+        assert first_lease
+        main._run_leased_generation_job(first_lease, threading.Event())
+
+        requeued = generation_jobs.get_job(conn, str(job["id"]))
+        assert requeued and requeued["status"] == "queued"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM generation_provider_usage "
+            "WHERE job_id = ? AND provider = 'groq'",
+            (str(job["id"]),),
+        ).fetchone()[0] == 1
+
+        # Simulate a hard loss after the provider row committed but before the
+        # attempt usage checkpoint became durable.
+        conn.execute(
+            "UPDATE reel_generation_jobs SET usage_json = '{}' WHERE id = ?",
+            (str(job["id"]),),
+        )
+        conn.commit()
+
+        second_lease = generation_jobs.lease_job(
+            conn,
+            job_id=str(job["id"]),
+            lease_owner="groq-recovery-worker-2",
+            now=now + timedelta(seconds=3),
+        )
+        assert second_lease and second_lease["attempt_count"] == 2
+        main._run_leased_generation_job(second_lease, threading.Event())
+
+        completed = generation_jobs.get_job(conn, str(job["id"]))
+        assert completed and completed["status"] == "completed"
+        usage = json.loads(str(completed["usage_json"] or "{}"))
+        summary = usage["summary"]
+        assert summary["groq_calls"] == 2
+        assert summary["groq_attempts"] == 2
+        assert summary["groq_known_billed_cost_usd"] == pytest.approx(
+            groq_cost
+        )
+        assert summary["known_billed_cost_usd"] == pytest.approx(
+            groq_cost
+        )
+        assert summary[
+            "groq_billing_unknown_reserved_cost_usd"
+        ] == pytest.approx(groq_unknown_cost)
+        assert summary["groq_billing_unknown_calls"] == 1
+        assert summary["groq_billing_unknown_attempts"] == 1
+        assert summary["billing_unknown_reserved_cost_usd"] == pytest.approx(
+            groq_unknown_cost
+        )
+        assert summary["current_cost_exposure_usd"] == pytest.approx(
+            groq_cost + groq_unknown_cost
+        )
+        assert summary["cost_per_accepted_clip_usd"] is None
+        assert summary["groq_audio_seconds"] == 14.0
+        assert summary["groq_billed_audio_seconds"] == 22.0
+        assert usage["by_stage"]["groq_boundary_asr"]["calls"] == 2
+        assert len([
+            call
+            for call in usage["provider_calls"]
+            if call["provider"] == "groq"
+        ]) == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM generation_provider_usage "
+            "WHERE job_id = ? AND provider = 'groq'",
+            (str(job["id"]),),
+        ).fetchone()[0] == 2
+        status = main._generation_job_status_payload(conn, completed)
+        events = main._sanitize_generation_replay_events(
+            conn,
+            completed,
+            generation_jobs.replay_events(
+                conn,
+                job_id=str(job["id"]),
+            ),
+        )
+        terminal_event = next(
+            event for event in events if event["type"] == "terminal"
+        )
+        for overlaid_usage in (
+            status["usage"],
+            terminal_event["payload"]["usage"],
+        ):
+            overlaid_summary = overlaid_usage["summary"]
+            assert overlaid_summary["groq_calls"] == 2
+            assert overlaid_summary[
+                "groq_known_billed_cost_usd"
+            ] == pytest.approx(groq_cost)
+            assert overlaid_summary[
+                "groq_billing_unknown_reserved_cost_usd"
+            ] == pytest.approx(groq_unknown_cost)
+            assert overlaid_summary[
+                "current_cost_exposure_usd"
+            ] == pytest.approx(groq_cost + groq_unknown_cost)
+            assert len([
+                call
+                for call in overlaid_usage["provider_calls"]
+                if call["provider"] == "groq"
+            ]) == 2
     finally:
         conn.close()
 
@@ -9395,6 +9825,9 @@ def test_slow_generation_uses_one_deep_retrieval_with_three_source_cap(monkeypat
         assert ("ranking", 0.85) in progress_updates
         events = generation_jobs.replay_events(conn, job_id=job["id"])
         assert [event["type"] for event in events] == [
+            "candidate",
+            "candidate",
+            "candidate",
             "final",
             "terminal",
         ]
@@ -9402,7 +9835,7 @@ def test_slow_generation_uses_one_deep_retrieval_with_three_source_cap(monkeypat
             event["payload"]["reel"]["reel_id"]
             for event in events
             if event["type"] == "candidate"
-        ] == []
+        ] == ["deep-reel-1", "deep-reel-2", "deep-reel-3"]
         final_reel_ids = [
             reel["reel_id"]
             for event in events
@@ -9515,7 +9948,10 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
         assert gemini_budget["pro_calls"] == 0
         assert gemini_budget["pro_call_limit"] == 0
         events = generation_jobs.replay_events(conn, job_id=job["id"])
-        assert [event["type"] for event in events].count("candidate") == 0
+        assert (
+            [event["type"] for event in events].count("candidate")
+            == expected_reel_cap
+        )
         assert [event["type"] for event in events][-2:] == ["final", "terminal"]
         final_event = next(event for event in events if event["type"] == "final")
         terminal_event = next(event for event in events if event["type"] == "terminal")
@@ -9582,7 +10018,9 @@ def test_generation_worker_caps_stream_but_keeps_every_persisted_candidate(
             for event in events
             if event["type"] == "candidate"
         ]
-        assert candidates == []
+        assert candidates == [
+            f"streamed-reel-{index}" for index in range(8)
+        ]
         completed_job = generation_jobs.get_job(conn, job["id"])
         assert completed_job is not None
         assert conn.execute(
@@ -9590,6 +10028,215 @@ def test_generation_worker_caps_stream_but_keeps_every_persisted_candidate(
             (str(completed_job["result_generation_id"] or ""),),
         ).fetchone()[0] == 18
         assert completed_job["status"] == "completed"
+    finally:
+        conn.close()
+
+
+def test_generation_worker_retries_candidate_event_after_lost_commit_ack(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="candidate-event-lost-commit-ack",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="candidate-event-retry-worker",
+        now=now,
+    )
+    assert leased
+    generated: list[dict] = []
+    generation_stage_calls = 0
+    candidate_append_attempts = 0
+    original_append_generation_event = main.append_generation_event
+
+    def generate_stage(worker_conn, **kwargs) -> None:
+        nonlocal generation_stage_calls
+        generation_stage_calls += 1
+        reel = _insert_generation_reel(
+            worker_conn,
+            generation_id=str(kwargs["generation_id"]),
+            reel_id="candidate-after-lost-commit-ack",
+            video_id="candidate-retry-video",
+            created_at=now.isoformat(),
+        )
+        generated.append(reel)
+        kwargs["on_reel_created"](reel)
+
+    def append_then_lose_first_ack(event_conn, **kwargs):
+        nonlocal candidate_append_attempts
+        result = original_append_generation_event(event_conn, **kwargs)
+        if kwargs["event_type"] == "candidate":
+            candidate_append_attempts += 1
+            if candidate_append_attempts == 1:
+                raise _PostgresTransactionFailure("08006")
+        return result
+
+    def fail_on_sleep(*_args, **_kwargs) -> None:
+        pytest.fail("candidate-event retry must not add a sleep")
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_generation_job_reels",
+        lambda *_args, **_kwargs: list(generated),
+    )
+    monkeypatch.setattr(
+        main,
+        "append_generation_event",
+        append_then_lose_first_ack,
+    )
+    monkeypatch.setattr(main.time, "sleep", fail_on_sleep)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        raw_events = generation_jobs.replay_events(conn, job_id=job["id"])
+        assert generation_stage_calls == 1
+        assert candidate_append_attempts == 1
+        assert [
+            event["type"] for event in raw_events
+        ] == ["candidate", "final", "terminal"]
+        completed_job = generation_jobs.get_job(conn, job["id"])
+        assert completed_job and completed_job["status"] == "completed"
+        first_raw_page = generation_jobs.replay_events(
+            conn,
+            job_id=job["id"],
+            limit=1,
+        )
+        second_raw_page = generation_jobs.replay_events(
+            conn,
+            job_id=job["id"],
+            after_seq=int(first_raw_page[-1]["seq"]),
+            limit=1,
+        )
+        first_page = main._sanitize_generation_replay_events(
+            conn,
+            completed_job,
+            first_raw_page,
+        )
+        second_page = main._sanitize_generation_replay_events(
+            conn,
+            completed_job,
+            second_raw_page,
+        )
+        assert [
+            event["payload"]["reel"]["reel_id"]
+            for event in [*first_page, *second_page]
+            if event["type"] == "candidate"
+        ] == ["candidate-after-lost-commit-ack"]
+    finally:
+        conn.close()
+
+
+def test_generation_worker_retry_deduplicates_prior_candidate_event(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="retry-candidate-dedupe",
+        generation_mode="fast",
+        retrieval_profile="unified",
+    )
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="retry-candidate-dedupe",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 2},
+        now=now,
+    )
+    first = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="candidate-worker-1",
+        now=now,
+    )
+    assert first
+    conn.execute(
+        "UPDATE reel_generation_jobs SET result_generation_id = ? WHERE id = ?",
+        (generation_id, job["id"]),
+    )
+    prior = _insert_generation_reel(
+        conn,
+        generation_id=generation_id,
+        reel_id="candidate-from-first-attempt",
+        video_id="candidate-video-first",
+        created_at=now.isoformat(),
+    )
+    generation_jobs.append_event(
+        conn,
+        job_id=job["id"],
+        event_type="candidate",
+        payload={"reel": prior, "provisional": True},
+        lease_owner="candidate-worker-1",
+        now=now,
+    )
+    requeued = generation_jobs.requeue_retryable_failure(
+        conn,
+        job_id=job["id"],
+        lease_owner="candidate-worker-1",
+        expected_attempt_count=1,
+        now=now + timedelta(milliseconds=100),
+    )
+    assert requeued and requeued["status"] == "queued"
+    second = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="candidate-worker-2",
+        now=now + timedelta(milliseconds=200),
+    )
+    assert second and second["attempt_count"] == 2
+    generated = [prior]
+
+    def generate_stage(worker_conn, **kwargs) -> None:
+        kwargs["on_reel_created"](prior)
+        fresh = _insert_generation_reel(
+            worker_conn,
+            generation_id=str(kwargs["generation_id"]),
+            reel_id="candidate-from-second-attempt",
+            video_id="candidate-video-second",
+            created_at=(now + timedelta(seconds=1)).isoformat(),
+        )
+        generated.append(fresh)
+        kwargs["on_reel_created"](fresh)
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_generation_job_reels",
+        lambda *_args, **_kwargs: list(generated),
+    )
+    try:
+        main._run_leased_generation_job(second, threading.Event())
+
+        assert [
+            event["payload"]["reel"]["reel_id"]
+            for event in generation_jobs.replay_events(
+                conn,
+                job_id=job["id"],
+            )
+            if event["type"] == "candidate"
+        ] == [
+            "candidate-from-first-attempt",
+            "candidate-from-second-attempt",
+        ]
     finally:
         conn.close()
 
@@ -12284,6 +12931,67 @@ def test_generation_stream_replays_monotonic_persisted_events(monkeypatch) -> No
         conn.close()
 
 
+def test_running_candidate_replay_filters_deduplicates_and_caps() -> None:
+    conn = _conn()
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="running-candidate-replay-contract",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 2},
+        now=now,
+    )
+    running = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="candidate-replay-worker",
+        now=now,
+    )
+    assert running
+    valid_reels = [
+        _insert_generation_reel(
+            conn,
+            generation_id="candidate-replay-generation",
+            reel_id=f"candidate-valid-{index}",
+            video_id=f"candidate-video-{index}",
+            created_at=(now + timedelta(seconds=index)).isoformat(),
+        )
+        for index in range(3)
+    ]
+    for reel in [
+        valid_reels[0],
+        valid_reels[0],
+        {"reel_id": "candidate-not-persisted"},
+        valid_reels[1],
+        valid_reels[2],
+    ]:
+        generation_jobs.append_event(
+            conn,
+            job_id=job["id"],
+            event_type="candidate",
+            payload={"reel": reel, "provisional": True},
+            lease_owner="candidate-replay-worker",
+            now=now,
+        )
+    try:
+        replay = main._sanitize_generation_replay_events(
+            conn,
+            running,
+            generation_jobs.replay_events(conn, job_id=job["id"]),
+        )
+
+        assert [
+            event["payload"]["reel"]["reel_id"]
+            for event in replay
+            if event["type"] == "candidate"
+        ] == ["candidate-valid-0", "candidate-valid-1"]
+    finally:
+        conn.close()
+
+
 def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(monkeypatch) -> None:
     conn = _conn()
     now = datetime.now(timezone.utc)
@@ -12502,7 +13210,7 @@ def test_completed_job_status_and_replay_drop_currently_invalid_candidate(monkey
         event["payload"]["reel"]["reel_id"]
         for event in replay
         if event["type"] == "candidate"
-    ] == []
+    ] == ["current-valid"]
     final = next(event for event in replay if event["type"] == "final")
     assert [reel["reel_id"] for reel in final["payload"]["reels"]] == [
         "current-valid"
@@ -12711,7 +13419,7 @@ def test_boundary_only_failure_surfaces_strict_transcript_fallback_in_feed_and_r
         event["payload"]["reel"]["reel_id"]
         for event in replay
         if event["type"] == "candidate"
-    ] == []
+    ] == [persisted.reel_id]
     final = next(event for event in replay if event["type"] == "final")
     assert final["payload"]["authoritative"] is True
     assert [item["reel_id"] for item in final["payload"]["reels"]] == [

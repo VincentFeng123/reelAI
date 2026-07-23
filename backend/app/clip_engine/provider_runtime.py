@@ -1731,9 +1731,17 @@ class GenerationContext:
             + int(record.get("output_tokens") or 0) * output_rate
         ) / 1_000_000.0 * billing_cost_multiplier
 
-    def usage_payload(self) -> dict[str, Any]:
+    def usage_payload(
+        self,
+        *,
+        prior_records: Iterable[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
         """Stable, aggregated job usage plus the existing raw provider ledger."""
-        records = self.usage()
+        records = [
+            dict(record)
+            for record in prior_records
+            if isinstance(record, Mapping)
+        ] + self.usage()
         counters = self.counters()
         gemini_calls = [
             row
@@ -1741,6 +1749,37 @@ class GenerationContext:
             if row.get("provider") == "gemini"
             and bool((row.get("metadata") or {}).get("provider_call"))
         ]
+        groq_calls = [
+            row
+            for row in records
+            if row.get("provider") == "groq"
+            and bool((row.get("metadata") or {}).get("provider_call"))
+        ]
+
+        def groq_metadata_number(
+            row: Mapping[str, Any],
+            field_name: str,
+        ) -> float:
+            try:
+                value = float((row.get("metadata") or {}).get(field_name) or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
+            return value if math.isfinite(value) and value >= 0.0 else 0.0
+
+        def groq_unknown_attempts(row: Mapping[str, Any]) -> int:
+            try:
+                return max(
+                    0,
+                    int(
+                        (row.get("metadata") or {}).get(
+                            "billing_unknown_attempts"
+                        )
+                        or 0
+                    ),
+                )
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
         by_stage: dict[str, dict[str, int | float]] = {}
         for row in gemini_calls:
             metadata = row.get("metadata") or {}
@@ -1798,6 +1837,61 @@ class GenerationContext:
                 bucket["billing_unknown_reserved_cost_usd"] = float(
                     bucket["billing_unknown_reserved_cost_usd"]
                 ) + _gemini_record_unknown_billing_cost(row)
+        for row in groq_calls:
+            metadata = row.get("metadata") or {}
+            stage = str(metadata.get("stage") or row.get("operation") or "unknown")
+            bucket = by_stage.setdefault(
+                stage,
+                {
+                    "calls": 0,
+                    "attempts": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "thought_tokens": 0,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": 0.0,
+                    "known_billed_cost_usd": 0.0,
+                    "telemetry_priced_cost_usd": 0.0,
+                    "reserved_cost_usd": 0.0,
+                    "billing_unknown_calls": 0,
+                    "billing_unknown_attempts": 0,
+                    "billing_unknown_reserved_cost_usd": 0.0,
+                    "audio_seconds": 0.0,
+                    "billed_audio_seconds": 0.0,
+                },
+            )
+            known_cost = (
+                groq_metadata_number(row, "actual_cost_usd")
+                if metadata.get("billing_usage_known") is True
+                else 0.0
+            )
+            unknown_attempts = groq_unknown_attempts(row)
+            bucket["calls"] = int(bucket["calls"]) + 1
+            bucket["attempts"] = int(bucket["attempts"]) + 1
+            bucket["estimated_cost_usd"] = (
+                float(bucket["estimated_cost_usd"]) + known_cost
+            )
+            bucket["known_billed_cost_usd"] = bucket["estimated_cost_usd"]
+            bucket["telemetry_priced_cost_usd"] = bucket["estimated_cost_usd"]
+            bucket["audio_seconds"] = float(
+                bucket.get("audio_seconds") or 0.0
+            ) + groq_metadata_number(row, "audio_seconds")
+            bucket["billed_audio_seconds"] = float(
+                bucket.get("billed_audio_seconds") or 0.0
+            ) + groq_metadata_number(row, "billed_audio_seconds")
+            if unknown_attempts:
+                bucket["billing_unknown_calls"] = int(
+                    bucket["billing_unknown_calls"]
+                ) + 1
+                bucket["billing_unknown_attempts"] = int(
+                    bucket["billing_unknown_attempts"]
+                ) + unknown_attempts
+                bucket["billing_unknown_reserved_cost_usd"] = float(
+                    bucket["billing_unknown_reserved_cost_usd"]
+                ) + groq_metadata_number(
+                    row,
+                    "billing_unknown_reserved_cost_usd",
+                )
         for bucket in by_stage.values():
             for cost_field in (
                 "estimated_cost_usd",
@@ -1805,21 +1899,52 @@ class GenerationContext:
                 "telemetry_priced_cost_usd",
                 "reserved_cost_usd",
                 "billing_unknown_reserved_cost_usd",
+                "audio_seconds",
+                "billed_audio_seconds",
             ):
-                bucket[cost_field] = round(float(bucket[cost_field]), 8)
+                if cost_field in bucket:
+                    bucket[cost_field] = round(float(bucket[cost_field]), 8)
 
-        estimated_cost = sum(self._gemini_cost(row) for row in gemini_calls)
+        gemini_known_cost = sum(self._gemini_cost(row) for row in gemini_calls)
+        groq_known_cost = sum(
+            groq_metadata_number(row, "actual_cost_usd")
+            for row in groq_calls
+            if (row.get("metadata") or {}).get("billing_usage_known") is True
+        )
+        estimated_cost = gemini_known_cost + groq_known_cost
         billing_unknown_rows = [
             row for row in gemini_calls if _gemini_record_billing_unknown(row)
         ]
-        billing_unknown_count = len(billing_unknown_rows)
-        billing_unknown_attempts = sum(
+        gemini_billing_unknown_count = len(billing_unknown_rows)
+        gemini_billing_unknown_attempts = sum(
             _gemini_record_unknown_billing_attempts(row)
             for row in billing_unknown_rows
         )
-        billing_unknown_reserved_cost = sum(
+        gemini_billing_unknown_reserved_cost = sum(
             _gemini_record_unknown_billing_cost(row)
             for row in billing_unknown_rows
+        )
+        groq_billing_unknown_rows = [
+            row for row in groq_calls if groq_unknown_attempts(row) > 0
+        ]
+        groq_billing_unknown_count = len(groq_billing_unknown_rows)
+        groq_billing_unknown_attempt_count = sum(
+            groq_unknown_attempts(row) for row in groq_billing_unknown_rows
+        )
+        groq_billing_unknown_reserved_cost = sum(
+            groq_metadata_number(row, "billing_unknown_reserved_cost_usd")
+            for row in groq_billing_unknown_rows
+        )
+        billing_unknown_count = (
+            gemini_billing_unknown_count + groq_billing_unknown_count
+        )
+        billing_unknown_attempts = (
+            gemini_billing_unknown_attempts
+            + groq_billing_unknown_attempt_count
+        )
+        billing_unknown_reserved_cost = (
+            gemini_billing_unknown_reserved_cost
+            + groq_billing_unknown_reserved_cost
         )
         accepted = int(counters.get("persisted_clips") or 0)
         with self._lock:
@@ -1830,10 +1955,41 @@ class GenerationContext:
         )
         budget = self.budget.snapshot()
         budget_snapshot = budget["gemini"]
+        groq_audio_seconds = sum(
+            groq_metadata_number(row, "audio_seconds")
+            for row in groq_calls
+        )
+        groq_billed_audio_seconds = sum(
+            groq_metadata_number(row, "billed_audio_seconds")
+            for row in groq_calls
+        )
         summary = {
             "gemini_calls": len(gemini_calls),
             "gemini_attempts": sum(
                 _gemini_physical_attempts(row) for row in gemini_calls
+            ),
+            "gemini_known_billed_cost_usd": round(gemini_known_cost, 8),
+            "gemini_billing_unknown_calls": gemini_billing_unknown_count,
+            "gemini_billing_unknown_attempts": gemini_billing_unknown_attempts,
+            "gemini_billing_unknown_reserved_cost_usd": round(
+                gemini_billing_unknown_reserved_cost,
+                8,
+            ),
+            "groq_calls": len(groq_calls),
+            "groq_attempts": len(groq_calls),
+            "groq_audio_seconds": round(groq_audio_seconds, 8),
+            "groq_billed_audio_seconds": round(
+                groq_billed_audio_seconds,
+                8,
+            ),
+            "groq_known_billed_cost_usd": round(groq_known_cost, 8),
+            "groq_billing_unknown_calls": groq_billing_unknown_count,
+            "groq_billing_unknown_attempts": (
+                groq_billing_unknown_attempt_count
+            ),
+            "groq_billing_unknown_reserved_cost_usd": round(
+                groq_billing_unknown_reserved_cost,
+                8,
             ),
             "flash_calls": sum(
                 1
@@ -1862,9 +2018,12 @@ class GenerationContext:
             "estimated_cost_usd": round(estimated_cost, 8),
             "known_billed_cost_usd": round(estimated_cost, 8),
             "telemetry_priced_cost_usd": round(estimated_cost, 8),
-            "current_cost_exposure_usd": budget_snapshot[
-                "cost_exposure_usd"
-            ],
+            "current_cost_exposure_usd": round(
+                float(budget_snapshot["cost_exposure_usd"])
+                + groq_known_cost
+                + groq_billing_unknown_reserved_cost,
+                8,
+            ),
             "cost_limit_usd": budget_snapshot["cost_limit_usd"],
             "completion_cost_limit_usd": budget_snapshot[
                 "completion_cost_limit_usd"

@@ -10,16 +10,22 @@ import math
 import os
 import re
 import time
+import uuid
 import wave
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from . import lexical_timing, silence
 from .lexical_timing import LexicalWord
+from .provider_runtime import GenerationContext, ProviderUsageRecord
 
 
 GROQ_BOUNDARY_MODEL = "whisper-large-v3-turbo"
+GROQ_BOUNDARY_PRICE_USD_PER_AUDIO_HOUR = 0.04
+GROQ_BOUNDARY_MIN_BILLED_AUDIO_SEC = 10.0
+GROQ_BOUNDARY_PRICING_VERSION = "groq-on-demand-2026-07-23"
 MAX_BOUNDARY_WINDOW_SEC = 20.0
 MAX_BOUNDARY_WAV_BYTES = 2 * 1024 * 1024
 EXPECTED_SAMPLE_RATE = 16_000
@@ -162,6 +168,101 @@ def _language(source: object) -> str:
     return primary if _LANGUAGE_RE.fullmatch(primary) else ""
 
 
+def _record_provider_usage(
+    generation_context: GenerationContext | None,
+    *,
+    decoded_duration_sec: float,
+    started_monotonic: float,
+    dispatch_id: str,
+    response: object | None = None,
+    error: BaseException | None = None,
+) -> None:
+    """Record one physical Groq dispatch without changing the fail-open result."""
+    if generation_context is None:
+        return
+    billed_audio_sec = max(
+        GROQ_BOUNDARY_MIN_BILLED_AUDIO_SEC,
+        decoded_duration_sec,
+    )
+    bounded_cost = (
+        billed_audio_sec
+        * GROQ_BOUNDARY_PRICE_USD_PER_AUDIO_HOUR
+        / 3600.0
+    )
+    status_code: int | None = 200 if error is None else None
+    if error is not None:
+        try:
+            raw_status = getattr(error, "status_code", None)
+            if raw_status is None:
+                raw_status = getattr(getattr(error, "response", None), "status_code", None)
+            status_code = int(raw_status) if raw_status is not None else None
+        except (TypeError, ValueError, OverflowError):
+            status_code = None
+    if error is None:
+        error_code = ""
+    elif status_code == 429:
+        error_code = "provider_rate_limited"
+    elif status_code == 408 or (status_code is not None and status_code >= 500):
+        error_code = "provider_transient"
+    elif status_code is not None and status_code >= 400:
+        error_code = "provider_request_rejected"
+    else:
+        error_code = "provider_transient"
+    request_id = str(
+        _field(_field(response, "x_groq"), "id") or ""
+    ).strip()
+    try:
+        generation_context.record(
+            ProviderUsageRecord(
+                provider="groq",
+                operation="transcript",
+                attempt=1,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                status_code=status_code,
+                billable_requests=1 if error is None else 0,
+                model_used=GROQ_BOUNDARY_MODEL,
+                error_code=error_code,
+                metadata={
+                    "provider_call": True,
+                    "stage": "groq_boundary_asr",
+                    "dispatched": True,
+                    "physical_dispatches": 1,
+                    "groq_dispatch_id": dispatch_id,
+                    "audio_seconds": round(decoded_duration_sec, 6),
+                    "billed_audio_seconds": round(billed_audio_sec, 6),
+                    "price_per_audio_hour_usd": (
+                        GROQ_BOUNDARY_PRICE_USD_PER_AUDIO_HOUR
+                    ),
+                    "minimum_billed_audio_seconds": (
+                        GROQ_BOUNDARY_MIN_BILLED_AUDIO_SEC
+                    ),
+                    "pricing_version": GROQ_BOUNDARY_PRICING_VERSION,
+                    "billing_usage_known": error is None,
+                    "billing_unknown_attempts": 0 if error is None else 1,
+                    "billing_unknown_reserved_cost_usd": (
+                        0.0 if error is None else round(bounded_cost, 8)
+                    ),
+                    "actual_cost_usd": (
+                        round(bounded_cost, 8) if error is None else None
+                    ),
+                    "latency_ms": max(
+                        0,
+                        round((time.monotonic() - started_monotonic) * 1000),
+                    ),
+                    **({"provider_request_id": request_id} if request_id else {}),
+                    **(
+                        {"provider_error_type": error.__class__.__name__}
+                        if error is not None
+                        else {}
+                    ),
+                },
+            )
+        )
+    except Exception:
+        # Accounting can never make a valid related clip disappear.
+        return
+
+
 def align_groq_edge_anchor(
     words: Sequence[LexicalWord],
     *,
@@ -259,6 +360,7 @@ def transcribe_boundary_words(
     window_end_sec: float,
     timeout_sec: float,
     cancel_check: Callable[[], bool] | None = None,
+    generation_context: GenerationContext | None = None,
 ) -> tuple[LexicalWord, ...]:
     """Return validated Groq word spans in absolute source time.
 
@@ -316,7 +418,26 @@ def transcribe_boundary_words(
                 language = _language(source)
                 if language:
                     request["language"] = language
-                response = client.audio.transcriptions.create(**request)
+                provider_started = time.monotonic()
+                dispatch_id = str(uuid.uuid4())
+                try:
+                    response = client.audio.transcriptions.create(**request)
+                except Exception as exc:
+                    _record_provider_usage(
+                        generation_context,
+                        decoded_duration_sec=decoded_duration,
+                        started_monotonic=provider_started,
+                        dispatch_id=dispatch_id,
+                        error=exc,
+                    )
+                    raise
+                _record_provider_usage(
+                    generation_context,
+                    decoded_duration_sec=decoded_duration,
+                    started_monotonic=provider_started,
+                    dispatch_id=dispatch_id,
+                    response=response,
+                )
             finally:
                 close = getattr(client, "close", None)
                 if callable(close):

@@ -12,6 +12,7 @@ import pytest
 from backend.app.clip_engine import groq_boundary_asr, silence
 from backend.app.clip_engine import lexical_timing
 from backend.app.clip_engine.lexical_timing import EdgeAnchor, LexicalWord
+from backend.app.clip_engine.provider_runtime import GenerationContext
 
 
 _POLYNOMIAL_CUE = (
@@ -152,6 +153,96 @@ def test_uploads_only_bounded_wav_and_returns_absolute_word_onsets(
     assert isinstance(payload, bytes)
     assert payload.startswith(b"RIFF")
     assert b"media.example" not in payload
+
+
+def test_successful_dispatch_records_one_priceable_groq_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    wav_path = tmp_path / "short.wav"
+    _write_wav(wav_path, duration_sec=2.0)
+    _install_decode(monkeypatch, wav_path)
+    client = _Client({
+        "x_groq": {"id": "groq-request-1"},
+        "words": [{"word": "cell", "start": 0.25, "end": 0.65}],
+    })
+    context = GenerationContext("slow")
+    monkeypatch.setenv("GROQ_API_KEY", "unit-test-key")
+    monkeypatch.setattr(
+        groq_boundary_asr,
+        "_create_client",
+        lambda **_kwargs: client,
+    )
+
+    words = groq_boundary_asr.transcribe_boundary_words(
+        _prepared(),
+        window_start_sec=10.0,
+        window_end_sec=12.0,
+        timeout_sec=5.0,
+        generation_context=context,
+    )
+
+    assert [word.text for word in words] == ["cell"]
+    assert client.audio.transcriptions.request is not None
+    [record] = context.usage()
+    assert record["provider"] == "groq"
+    assert record["operation"] == "transcript"
+    assert record["model_used"] == "whisper-large-v3-turbo"
+    assert record["status_code"] == 200
+    assert record["billable_requests"] == 1
+    assert record["metadata"]["provider_request_id"] == "groq-request-1"
+    assert record["metadata"]["groq_dispatch_id"]
+    assert record["metadata"]["audio_seconds"] == 2.0
+    assert record["metadata"]["billed_audio_seconds"] == 10.0
+    assert record["metadata"]["actual_cost_usd"] == pytest.approx(
+        10.0 * 0.04 / 3600.0,
+        abs=1e-8,
+    )
+    assert record["metadata"]["billing_unknown_attempts"] == 0
+    summary = context.usage_payload()["summary"]
+    assert summary["groq_calls"] == 1
+    assert summary["groq_known_billed_cost_usd"] == pytest.approx(
+        10.0 * 0.04 / 3600.0,
+        abs=1e-8,
+    )
+
+
+def test_failed_dispatch_records_one_unknown_groq_request_without_secret(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    wav_path = tmp_path / "short.wav"
+    _write_wav(wav_path, duration_sec=2.0)
+    _install_decode(monkeypatch, wav_path)
+    client = _Client(error=_ProviderFailure(503))
+    context = GenerationContext("slow")
+    monkeypatch.setenv("GROQ_API_KEY", "private-unit-test-key")
+    monkeypatch.setattr(
+        groq_boundary_asr,
+        "_create_client",
+        lambda **_kwargs: client,
+    )
+
+    assert groq_boundary_asr.transcribe_boundary_words(
+        _prepared(),
+        window_start_sec=10.0,
+        window_end_sec=12.0,
+        timeout_sec=5.0,
+        generation_context=context,
+    ) == ()
+
+    [record] = context.usage()
+    assert record["provider"] == "groq"
+    assert record["status_code"] == 503
+    assert record["billable_requests"] == 0
+    assert record["error_code"] == "provider_transient"
+    assert record["metadata"]["provider_error_type"] == "_ProviderFailure"
+    assert record["metadata"]["groq_dispatch_id"]
+    assert "private-unit-test-key" not in str(record)
+    assert record["metadata"]["billing_unknown_attempts"] == 1
+    assert record["metadata"][
+        "billing_unknown_reserved_cost_usd"
+    ] == pytest.approx(10.0 * 0.04 / 3600.0, abs=1e-8)
 
 
 def test_trailing_word_straddling_wav_endpoint_keeps_valid_prefix(
@@ -537,6 +628,7 @@ def test_no_key_or_empty_response_fails_open(
     tmp_path: Path,
 ) -> None:
     prepared = _prepared()
+    context = GenerationContext("slow")
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
 
     def unexpected_decode(*_args: object, **_kwargs: object):
@@ -548,7 +640,9 @@ def test_no_key_or_empty_response_fails_open(
         window_start_sec=10.0,
         window_end_sec=12.0,
         timeout_sec=5.0,
+        generation_context=context,
     ) == ()
+    assert context.usage() == []
 
     wav_path = tmp_path / "short.wav"
     _write_wav(wav_path)

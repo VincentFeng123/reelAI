@@ -29,6 +29,10 @@ from backend.app.ingestion.models import (
 )
 from backend.app.ingestion.pipeline import IngestionPipeline, _PlatformRateLimiter
 from backend.app.services.search_query_plan import SearchQueryPlan
+from backend.intent_obligations import (
+    INTENT_OBLIGATION_CONTRACT_VERSION,
+    intent_obligation,
+)
 
 
 def _pipeline() -> IngestionPipeline:
@@ -162,6 +166,66 @@ def _quality_clip(
     }
     clip.update(overrides)
     return clip
+
+
+def _foundation_application_intent_contract() -> tuple[
+    dict,
+    list[str],
+    dict[str, dict],
+]:
+    exact_request = "Teach core foundation before worked application."
+    constraints = [
+        {
+            "constraint_id": "foundation",
+            "kind": "subject",
+            "source_phrase": "core foundation",
+            "source_occurrence": 0,
+            "requirement": "Teach the core foundation",
+            "relationship_topology": "not_applicable",
+        },
+        {
+            "constraint_id": "application",
+            "kind": "outcome",
+            "source_phrase": "worked application",
+            "source_occurrence": 0,
+            "requirement": "Teach the worked application",
+            "relationship_topology": "not_applicable",
+        },
+    ]
+    contract = {
+        "version": "expansion_intent_v2",
+        "request_intent": {
+            "exact_request": exact_request,
+            "constraints": constraints,
+            "joint_structures": [],
+        },
+    }
+    obligations: dict[str, dict] = {}
+    for constraint in constraints:
+        obligation = intent_obligation(
+            kind=constraint["kind"],
+            source_phrase=constraint["source_phrase"],
+            source_start=exact_request.index(constraint["source_phrase"]),
+            requirement=constraint["requirement"],
+            evidence_quote="Python functions package reusable instructions.",
+        )
+        assert obligation is not None
+        obligations[constraint["constraint_id"]] = obligation
+    return contract, ["foundation", "application"], obligations
+
+
+def _audited_obligation_clip(
+    candidate_id: str,
+    obligation: dict,
+) -> dict:
+    return _quality_clip(
+        candidate_id=candidate_id,
+        directly_teaches_topic=False,
+        selection_authority="gemini",
+        intent_obligation_contract_version=INTENT_OBLIGATION_CONTRACT_VERSION,
+        intent_obligations=[obligation],
+        intent_connections=[obligation],
+    )
 
 
 def _shared_gemini_engine_out(*, reverse_clips: bool = False) -> dict:
@@ -2903,6 +2967,50 @@ def test_deep_boundary_deadline_reserves_silence_and_two_groq_edges() -> None:
     assert pipeline_module.clip_engine_silence.DEEP_PHASE_TIMEOUT_SEC >= (
         pipeline_module.clip_engine_silence.DEFAULT_TIMEOUT_SEC
         + 2 * pipeline_module.GROQ_BOUNDARY_TIMEOUT_SEC
+    )
+
+
+def test_groq_boundary_cache_forwards_context_once_per_physical_request(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("slow", require_acoustic_boundaries=True)
+    transcribe = mock.Mock(return_value=_groq_edge_words())
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_groq_boundary_asr,
+        "transcribe_boundary_words",
+        transcribe,
+    )
+    cache = pipeline_module._GroqBoundaryWordCache(
+        _ready_audio(),
+        source_end_sec=12.0,
+        generation_context=context,
+    )
+
+    first = cache.words_for_edge(
+        cue_id="cue-1",
+        target_sec=6.0,
+        timeout_sec=1.0,
+        cancel_check=None,
+    )
+    reused = cache.words_for_edge(
+        cue_id="cue-1",
+        target_sec=6.0,
+        timeout_sec=1.0,
+        cancel_check=None,
+    )
+    refreshed = cache.words_for_edge(
+        cue_id="cue-1",
+        target_sec=6.0,
+        timeout_sec=1.0,
+        cancel_check=None,
+        refresh=True,
+    )
+
+    assert first == reused == refreshed == _groq_edge_words()
+    assert transcribe.call_count == 2
+    assert all(
+        call.kwargs["generation_context"] is context
+        for call in transcribe.call_args_list
     )
 
 
@@ -8028,6 +8136,293 @@ def test_mode_source_budgets_are_analyzed_concurrently_without_backfill(
     assert discovery_calls == 1
     assert len(analyzed) == expected_sources
     assert max_active == expected_sources
+
+
+@pytest.mark.parametrize(
+    ("mode", "application_ids"),
+    [
+        ("fast", ["application-a"]),
+        ("slow", ["application-a", "application-b"]),
+    ],
+)
+def test_failed_source_slot_uses_existing_tail_for_missing_trusted_obligation(
+    monkeypatch,
+    mode: str,
+    application_ids: list[str],
+) -> None:
+    contract, acquisition_ids, obligations = (
+        _foundation_application_intent_contract()
+    )
+    videos = [
+        {
+            **_video(),
+            "id": video_id,
+            "url": f"https://youtu.be/{video_id}",
+        }
+        for video_id in [
+            *application_ids,
+            "selector-failed",
+            "foundation-tail",
+        ]
+    ]
+    discovery_calls = 0
+
+    def discover(*_args, **_kwargs):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        return {
+            **_discovery(),
+            "provider_used": "gemini",
+            "intent_contract": contract,
+            "acquisition_obligation_constraint_ids": acquisition_ids,
+            "videos": videos,
+        }
+
+    context = GenerationContext(mode)
+    attempted: set[str] = set()
+    completed: set[str] = set()
+    retrieved: set[str] = set()
+
+    def clip_and_filter(video, *_args, **_kwargs):
+        context.reserve("transcript")
+        context.reserve("segmentation")
+        video_id = video["id"]
+        if video_id == "selector-failed":
+            raise ProviderResponseValidationError(
+                "Gemini boundary audit rejected its response contract.",
+                provider="gemini",
+                operation="segmentation",
+            )
+        obligation = (
+            obligations["foundation"]
+            if video_id == "foundation-tail"
+            else obligations["application"]
+        )
+        return (
+            video,
+            [_audited_obligation_clip(f"clip-{video_id}", obligation)],
+            {"transcript": _transcript(), "clips": []},
+        )
+
+    pipeline = _pipeline()
+    monkeypatch.setattr(pipeline_module, "_discover", discover)
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        mock.Mock(side_effect=lambda **kwargs: (
+            f"reel-{kwargs['v']['id']}",
+            mock.sentinel.metadata,
+        )),
+    )
+
+    reels, resolved = pipeline.ingest_topic(
+        topic="Teach core foundation before worked application.",
+        material_id="material",
+        concept_id="concept",
+        max_videos=3,
+        max_reels=len(application_ids) + 1,
+        generation_context=context,
+        analyzed_video_ids=completed,
+        attempted_video_ids=attempted,
+        retrieved_video_ids=retrieved,
+    )
+
+    assert discovery_calls == 1
+    assert reels == [
+        *(f"reel-{video_id}" for video_id in application_ids),
+        "reel-foundation-tail",
+    ]
+    assert resolved == [
+        *application_ids,
+        "selector-failed",
+        "foundation-tail",
+    ]
+    assert attempted == set(resolved)
+    assert retrieved == set(resolved)
+    assert completed == {
+        *application_ids,
+        "foundation-tail",
+    }
+    assert context.counters()["provider_failures"] == 1
+    assert context.counters()["discovered_videos"] == len(resolved)
+
+
+def test_missing_trusted_coverage_does_not_widen_a_healthy_source_batch(
+    monkeypatch,
+) -> None:
+    contract, acquisition_ids, obligations = (
+        _foundation_application_intent_contract()
+    )
+    videos = [
+        {
+            **_video(),
+            "id": f"application-{index}",
+            "url": f"https://youtu.be/application-{index}",
+        }
+        for index in range(4)
+    ]
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: {
+            **_discovery(),
+            "provider_used": "gemini",
+            "intent_contract": contract,
+            "acquisition_obligation_constraint_ids": acquisition_ids,
+            "videos": videos,
+        },
+    )
+    context = GenerationContext("slow")
+    attempted: set[str] = set()
+    completed: set[str] = set()
+    retrieved: set[str] = set()
+
+    def clip_and_filter(video, *_args, **_kwargs):
+        context.reserve("transcript")
+        context.reserve("segmentation")
+        return (
+            video,
+            [
+                _audited_obligation_clip(
+                    f"clip-{video['id']}",
+                    obligations["application"],
+                )
+            ],
+            {"transcript": _transcript(), "clips": []},
+        )
+
+    pipeline = _pipeline()
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        mock.Mock(side_effect=lambda **kwargs: (
+            f"reel-{kwargs['v']['id']}",
+            mock.sentinel.metadata,
+        )),
+    )
+
+    reels, resolved = pipeline.ingest_topic(
+        topic="Teach core foundation before worked application.",
+        material_id="material",
+        concept_id="concept",
+        max_videos=3,
+        max_reels=3,
+        generation_context=context,
+        analyzed_video_ids=completed,
+        attempted_video_ids=attempted,
+        retrieved_video_ids=retrieved,
+    )
+
+    assert reels == [
+        "reel-application-0",
+        "reel-application-1",
+        "reel-application-2",
+    ]
+    assert resolved == ["application-0", "application-1", "application-2"]
+    assert attempted == set(resolved)
+    assert retrieved == set(resolved)
+    assert completed == set(resolved)
+    assert context.budget.remaining("transcript") == 2
+    assert context.budget.remaining("segmentation") == 2
+
+
+def test_failed_tail_backfill_keeps_valid_inventory_and_stops_at_budget(
+    monkeypatch,
+) -> None:
+    contract, acquisition_ids, obligations = (
+        _foundation_application_intent_contract()
+    )
+    video_ids = [
+        "application-a",
+        "application-b",
+        "selector-failed",
+        "tail-failed-a",
+        "tail-failed-b",
+        "tail-unattempted",
+    ]
+    videos = [
+        {
+            **_video(),
+            "id": video_id,
+            "url": f"https://youtu.be/{video_id}",
+        }
+        for video_id in video_ids
+    ]
+    discovery_calls = 0
+
+    def discover(*_args, **_kwargs):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        return {
+            **_discovery(),
+            "provider_used": "gemini",
+            "intent_contract": contract,
+            "acquisition_obligation_constraint_ids": acquisition_ids,
+            "videos": videos,
+        }
+
+    context = GenerationContext("slow")
+    attempted: set[str] = set()
+    completed: set[str] = set()
+    retrieved: set[str] = set()
+
+    def clip_and_filter(video, *_args, **_kwargs):
+        context.reserve("transcript")
+        context.reserve("segmentation")
+        video_id = video["id"]
+        if "failed" in video_id:
+            raise ProviderResponseValidationError(
+                "Gemini boundary audit rejected its response contract.",
+                provider="gemini",
+                operation="segmentation",
+            )
+        return (
+            video,
+            [
+                _audited_obligation_clip(
+                    f"clip-{video_id}",
+                    obligations["application"],
+                )
+            ],
+            {"transcript": _transcript(), "clips": []},
+        )
+
+    pipeline = _pipeline()
+    monkeypatch.setattr(pipeline_module, "_discover", discover)
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        mock.Mock(side_effect=lambda **kwargs: (
+            f"reel-{kwargs['v']['id']}",
+            mock.sentinel.metadata,
+        )),
+    )
+
+    reels, resolved = pipeline.ingest_topic(
+        topic="Teach core foundation before worked application.",
+        material_id="material",
+        concept_id="concept",
+        max_videos=3,
+        max_reels=2,
+        generation_context=context,
+        analyzed_video_ids=completed,
+        attempted_video_ids=attempted,
+        retrieved_video_ids=retrieved,
+    )
+
+    assert discovery_calls == 1
+    assert reels == ["reel-application-a", "reel-application-b"]
+    assert resolved == video_ids[:5]
+    assert attempted == set(video_ids[:5])
+    assert retrieved == set(video_ids[:5])
+    assert completed == {"application-a", "application-b"}
+    assert "tail-unattempted" not in attempted
+    assert context.counters()["provider_failures"] == 3
+    assert context.budget.remaining("transcript") == 0
+    assert context.budget.remaining("segmentation") == 0
 
 
 @pytest.mark.parametrize(

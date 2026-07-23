@@ -381,6 +381,93 @@ def test_flash_lite_expansion_uses_its_lower_reservation_and_usage_rates() -> No
     assert context.usage_payload()["by_stage"]["expansion"]["cached_tokens"] == 400
 
 
+def test_usage_payload_adds_groq_cost_without_changing_gemini_subtotal() -> None:
+    context = GenerationContext("slow", generation_id="job-mixed-provider-cost")
+    context.record_gemini(
+        attempt=1,
+        model_used="gemini-3.1-flash-lite",
+        quality_degraded=False,
+        stage="expansion",
+        usage={
+            "prompt_tokens": 1_000,
+            "candidate_tokens": 100,
+            "thought_tokens": 0,
+            "total_tokens": 1_100,
+        },
+    )
+    gemini_cost = (1_000 * 0.25 + 100 * 1.5) / 1_000_000.0
+    groq_known_cost = 12.0 * 0.04 / 3600.0
+    groq_unknown_cost = 10.0 * 0.04 / 3600.0
+    timestamp = datetime.now(timezone.utc).isoformat()
+    context.record(ProviderUsageRecord(
+        provider="groq",
+        operation="transcript",
+        attempt=1,
+        timestamp=timestamp,
+        status_code=200,
+        billable_requests=1,
+        model_used="whisper-large-v3-turbo",
+        metadata={
+            "provider_call": True,
+            "stage": "groq_boundary_asr",
+            "billing_usage_known": True,
+            "billing_unknown_attempts": 0,
+            "actual_cost_usd": groq_known_cost,
+            "audio_seconds": 12.0,
+            "billed_audio_seconds": 12.0,
+        },
+    ))
+    context.record(ProviderUsageRecord(
+        provider="groq",
+        operation="transcript",
+        attempt=1,
+        timestamp=timestamp,
+        status_code=None,
+        model_used="whisper-large-v3-turbo",
+        error_code="provider_transient",
+        metadata={
+            "provider_call": True,
+            "stage": "groq_boundary_asr",
+            "billing_usage_known": False,
+            "billing_unknown_attempts": 1,
+            "billing_unknown_reserved_cost_usd": groq_unknown_cost,
+            "audio_seconds": 2.0,
+            "billed_audio_seconds": 10.0,
+        },
+    ))
+    context.increment_counter("persisted_clips")
+
+    payload = context.usage_payload()
+    summary = payload["summary"]
+    assert summary["gemini_known_billed_cost_usd"] == pytest.approx(gemini_cost)
+    assert summary["groq_calls"] == 2
+    assert summary["groq_known_billed_cost_usd"] == pytest.approx(
+        groq_known_cost,
+        abs=1e-8,
+    )
+    assert summary["known_billed_cost_usd"] == pytest.approx(
+        gemini_cost + groq_known_cost,
+        abs=1e-8,
+    )
+    assert summary["groq_billing_unknown_calls"] == 1
+    assert summary["billing_unknown_calls"] == 1
+    assert summary["billing_unknown_reserved_cost_usd"] == pytest.approx(
+        groq_unknown_cost,
+        abs=1e-8,
+    )
+    assert summary["cost_per_accepted_clip_usd"] is None
+    stage = payload["by_stage"]["groq_boundary_asr"]
+    assert stage["calls"] == 2
+    assert stage["attempts"] == 2
+    assert stage["audio_seconds"] == 14.0
+    assert stage["billed_audio_seconds"] == 22.0
+    assert stage["known_billed_cost_usd"] == pytest.approx(
+        groq_known_cost,
+        abs=1e-8,
+    )
+    assert stage["billing_unknown_attempts"] == 1
+
+
 @pytest.mark.parametrize(
     ("input_tokens", "input_rate", "output_rate"),
     [(200_000, 2.0, 12.0), (200_001, 4.0, 18.0)],

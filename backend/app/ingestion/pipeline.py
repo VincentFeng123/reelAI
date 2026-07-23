@@ -1601,9 +1601,16 @@ def _projected_speech_bounds(
 class _GroqBoundaryWordCache:
     """Deduplicate short Groq ASR windows shared by concurrent clip edges."""
 
-    def __init__(self, prepared: object, *, source_end_sec: float) -> None:
+    def __init__(
+        self,
+        prepared: object,
+        *,
+        source_end_sec: float,
+        generation_context: GenerationContext | None = None,
+    ) -> None:
         self._prepared = prepared
         self._source_end_sec = max(0.0, float(source_end_sec))
+        self._generation_context = generation_context
         self._lock = threading.Lock()
         self._entries: dict[
             str,
@@ -1683,6 +1690,7 @@ class _GroqBoundaryWordCache:
                         window_end_sec=window_end,
                         timeout_sec=timeout_sec,
                         cancel_check=cancel_check,
+                        generation_context=self._generation_context,
                     )
                     or ()
                 )
@@ -3378,6 +3386,7 @@ def _verified_direct_adapter_clips(
     require_acoustic_boundaries: bool = False,
     exact_topic: str = "",
     embedding_service: Any = None,
+    generation_context: GenerationContext | None = None,
 ) -> list[dict[str, Any]]:
     """Return difficulty-ranked candidates with validated boundary evidence."""
     transcript = dict(engine_out.get("transcript") or {})
@@ -3492,6 +3501,7 @@ def _verified_direct_adapter_clips(
     groq_boundary_cache = _GroqBoundaryWordCache(
         prepared,
         source_end_sec=media_end,
+        generation_context=generation_context,
     )
     direct_verification_deadline = (
         time.monotonic() + clip_engine_silence.DEEP_PHASE_TIMEOUT_SEC
@@ -4057,6 +4067,7 @@ def _verified_direct_adapter_clip(
     should_cancel: Callable[[], bool] | None,
     prepared_audio: clip_engine_silence.AudioPreparationResult | None = None,
     require_acoustic_boundaries: bool = False,
+    generation_context: GenerationContext | None = None,
 ) -> dict[str, Any] | None:
     clips = _verified_direct_adapter_clips(
         source_url=source_url,
@@ -4065,6 +4076,7 @@ def _verified_direct_adapter_clip(
         limit=1,
         prepared_audio=prepared_audio,
         require_acoustic_boundaries=require_acoustic_boundaries,
+        generation_context=generation_context,
     )
     return clips[0] if clips else None
 
@@ -4365,6 +4377,7 @@ class IngestionPipeline:
             limit=None,
             prepared_audio=prepared_audio,
             require_acoustic_boundaries=True,
+            generation_context=generation_context,
         )
         if not verified:
             raise SegmentationError(
@@ -4528,6 +4541,7 @@ class IngestionPipeline:
             require_acoustic_boundaries=True,
             exact_topic=(query or ""),
             embedding_service=self._embedding_service,
+            generation_context=generation_context,
         )
 
         duration = _direct_adapter_duration_sec(
@@ -4657,6 +4671,7 @@ class IngestionPipeline:
                     should_cancel=should_cancel,
                     prepared_audio=prepared_audio,
                     require_acoustic_boundaries=True,
+                    generation_context=generation_context,
                 )
                 if best is None:
                     items.append(IngestFeedItem(source_url=url, status="skipped"))
@@ -4938,14 +4953,16 @@ class IngestionPipeline:
         engine the material→reels rewire calls.
 
         Returns `(reels, resolved_video_ids)`: `reels` in discover order then
-        clip order within a video; `resolved_video_ids` = the video ids
-        `discover` returned (a viability probe callers consume even under
-        `dry_run`).
+        clip order within a video; `resolved_video_ids` are the sources admitted
+        to analysis, including any failed-slot replacement. A `dry_run` returns
+        the initial viability-probe sources.
 
-        Cost/latency guardrail: `max_videos` bounds the paid `run.clip` calls.
-        All selected sources are analyzed concurrently. Completed valid clips
-        persist and stream immediately, and the returned list is restored to
-        discover order.
+        Cost/latency guardrail: `max_videos` bounds completed source analyses.
+        All initial sources are analyzed concurrently. A failed source may be
+        replaced from the already-discovered oversampled tail without another
+        search, but a healthy completed source never widens the source batch.
+        Completed valid clips persist and stream immediately, and the returned
+        list is restored to discover order.
         """
         topic = " ".join(str(topic or "").split())
         if not topic:
@@ -5113,6 +5130,11 @@ class IngestionPipeline:
             if query_plan is not None:
                 discovered_video["_query_plan"] = query_plan
         resolved_video_ids = [v["id"] for v in disc["videos"][:analysis_limit]]
+        resolved_video_id_set = {
+            str(video_id or "").strip()
+            for video_id in resolved_video_ids
+            if str(video_id or "").strip()
+        }
         if retrieved_video_ids is not None:
             retrieved_video_ids.update(
                 str(video_id or "").strip().split(":", 1)[-1]
@@ -5185,6 +5207,18 @@ class IngestionPipeline:
 
         def submit_video(index: int):
             analyzed_video_id = str(videos[index].get("id") or "").strip()
+            if (
+                analyzed_video_id
+                and analyzed_video_id not in resolved_video_id_set
+            ):
+                resolved_video_id_set.add(analyzed_video_id)
+                resolved_video_ids.append(analyzed_video_id)
+                if retrieved_video_ids is not None:
+                    retrieved_video_ids.add(
+                        analyzed_video_id.split(":", 1)[-1]
+                    )
+                if generation_context is not None:
+                    generation_context.increment_counter("discovered_videos")
             videos[index].pop("_segment_max_candidates", None)
             if (
                 audio_executor is not None
@@ -5575,6 +5609,7 @@ class IngestionPipeline:
             groq_boundary_cache = _GroqBoundaryWordCache(
                 prepared_audio,
                 source_end_sec=media_end,
+                generation_context=generation_context,
             )
 
             def verify_boundary(
@@ -6716,9 +6751,19 @@ class IngestionPipeline:
                 if retrieval_profile == "bootstrap":
                     persist_bootstrap_sources()
                 available_count = available_surface_inventory_count()
+                replacement_budget_available = bool(
+                    generation_context is None
+                    or (
+                        generation_context.budget.remaining("transcript") > 0
+                        and generation_context.budget.remaining("segmentation") > 0
+                    )
+                )
                 if (
                     not pending
-                    and next_index < min(len(videos), analysis_limit)
+                    and not batch_cancelled.is_set()
+                    and next_index < len(videos)
+                    and len(completed_results) < analysis_limit
+                    and replacement_budget_available
                     and (
                         (
                             available_count < minimum_valid
