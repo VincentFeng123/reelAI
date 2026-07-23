@@ -59,7 +59,7 @@ PRACTICE_FAST_EXPAND_TIMEOUT_MS = 10_000
 PRACTICE_FAST_EXPAND_OUTPUT_TOKENS = 2_048
 PRACTICE_FAST_EXPAND_FALLBACK_OUTPUT_TOKENS = 4_096
 PRACTICE_FAST_EXPAND_ATTEMPTS = 3
-PRACTICE_FAST_EXPAND_CACHE_VERSION = 14
+PRACTICE_FAST_EXPAND_CACHE_VERSION = 15
 PRACTICE_FAST_INTENT_CONTRACT_VERSION = "expansion_intent_v2"
 # An expansion can be nearly one segment-cache lifetime old when it discovers a
 # newly analyzed source. Keeping it for two lifetimes guarantees that source's
@@ -477,55 +477,70 @@ def trusted_intent_obligation_keys(
     constraint_ids: Sequence[str] | None = None,
 ) -> set[str]:
     """Derive durable obligation identities from a selector-trusted contract."""
-    if not isinstance(raw_contract, dict):
-        return set()
-    from ...pipeline.gemini_segment import (
-        _canonical_intent_constraint_sources,
-        _trusted_request_intent_from_settings,
+    keys_by_constraint = trusted_intent_obligation_keys_by_constraint(
+        raw_contract
     )
-
-    trusted = _trusted_request_intent_from_settings({
-        "_segment_intent_contract": raw_contract,
-    })
+    if not keys_by_constraint:
+        return set()
+    if constraint_ids is None:
+        return set(keys_by_constraint.values())
+    normalized_ids = [
+        " ".join(str(value or "").split())
+        for value in constraint_ids
+        if " ".join(str(value or "").split())
+    ]
+    if (
+        len(normalized_ids) != len(set(normalized_ids))
+        or not set(normalized_ids).issubset(keys_by_constraint)
+    ):
+        return set()
+    trusted = _trusted_request_intent(raw_contract)
     if trusted is None:
         return set()
-    known_ids = {
-        str(constraint.constraint_id) for constraint in trusted.constraints
-    }
-    if constraint_ids is None:
-        selected_ids = known_ids
-    else:
-        normalized_ids = [
-            " ".join(str(value or "").split())
-            for value in constraint_ids
-            if " ".join(str(value or "").split())
-        ]
-        if (
-            len(normalized_ids) != len(set(normalized_ids))
-            or not set(normalized_ids).issubset(known_ids)
-        ):
-            return set()
-        selected_ids = set(normalized_ids)
-        required_ids = {
-            str(constraint.constraint_id)
-            for constraint in trusted.constraints
-            if constraint.kind in {
-                "subject",
-                "task",
-                "relationship",
-                "outcome",
-            }
+    required_ids = {
+        str(constraint.constraint_id)
+        for constraint in trusted.constraints
+        if constraint.kind in {
+            "subject",
+            "task",
+            "relationship",
+            "outcome",
         }
-        if not required_ids.issubset(selected_ids):
-            return set()
+    }
+    if not required_ids.issubset(normalized_ids):
+        return set()
+    return {
+        keys_by_constraint[constraint_id]
+        for constraint_id in normalized_ids
+    }
+
+
+def _trusted_request_intent(raw_contract: object):
+    if not isinstance(raw_contract, dict):
+        return None
+    from ...pipeline.gemini_segment import _trusted_request_intent_from_settings
+
+    return _trusted_request_intent_from_settings({
+        "_segment_intent_contract": raw_contract,
+    })
+
+
+def trusted_intent_obligation_keys_by_constraint(
+    raw_contract: object,
+) -> dict[str, str]:
+    """Map each selector-trusted constraint ID to its durable obligation key."""
+    trusted = _trusted_request_intent(raw_contract)
+    if trusted is None:
+        return {}
+    from ...pipeline.gemini_segment import _canonical_intent_constraint_sources
+
     canonical_sources = _canonical_intent_constraint_sources(
         trusted.exact_request,
         trusted.constraints,
     )
     return {
-        key
+        str(constraint.constraint_id): key
         for constraint in trusted.constraints
-        if str(constraint.constraint_id) in selected_ids
         if (
             key := intent_obligation_key(
                 *canonical_sources[str(constraint.constraint_id)]
@@ -736,12 +751,21 @@ def _read_cached_expansion(cache_key: str, count: int) -> dict | None:
         )
     ):
         return None
+    query_metadata = _validated_query_metadata(
+        payload.get("query_metadata"),
+        queries=queries,
+        intent_contract=intent_contract,
+        acquisition_constraint_ids=acquisition_ids,
+    )
+    if query_metadata is None:
+        return None
     return {
         "corrected": corrected,
         "queries": queries,
         "provider_used": "gemini",
         "intent_contract": intent_contract,
         "acquisition_obligation_constraint_ids": acquisition_ids,
+        "query_metadata": query_metadata,
     }
 
 
@@ -762,6 +786,7 @@ def _write_cached_expansion(cache_key: str, result: dict) -> None:
                             "acquisition_obligation_constraint_ids": result[
                                 "acquisition_obligation_constraint_ids"
                             ],
+                            "query_metadata": result["query_metadata"],
                         }
                     ),
                     "created_at": now_iso(),
@@ -789,6 +814,140 @@ def _normalize(queries: list[str], n: int) -> list[str]:
         if len(result) >= max(0, int(n)):
             break
     return result
+
+
+def _validated_query_metadata(
+    raw_metadata: object,
+    *,
+    queries: Sequence[str],
+    intent_contract: object,
+    acquisition_constraint_ids: Sequence[str],
+) -> list[dict[str, object]] | None:
+    """Validate cached/live query provenance and derive trusted objective keys."""
+    if not isinstance(raw_metadata, list):
+        return None
+    keys_by_constraint = trusted_intent_obligation_keys_by_constraint(
+        intent_contract
+    )
+    if not keys_by_constraint:
+        return None
+    acquisition_ids = {
+        " ".join(str(value or "").split())
+        for value in acquisition_constraint_ids
+        if " ".join(str(value or "").split())
+    }
+    if not acquisition_ids or not acquisition_ids.issubset(keys_by_constraint):
+        return None
+    trusted = _trusted_request_intent(intent_contract)
+    if trusted is None:
+        return None
+    subject_ids = {
+        str(constraint.constraint_id)
+        for constraint in trusted.constraints
+        if constraint.kind == "subject"
+    }
+    by_query_key: dict[str, dict[str, object]] = {}
+    for raw_item in raw_metadata:
+        if not isinstance(raw_item, dict):
+            return None
+        text = " ".join(str(raw_item.get("text") or "").split())
+        query_key = _key(text)
+        raw_ids = raw_item.get("preserved_constraint_ids")
+        if not text or not query_key or not isinstance(raw_ids, list):
+            return None
+        constraint_ids = [
+            " ".join(str(value or "").split())
+            for value in raw_ids
+            if " ".join(str(value or "").split())
+        ]
+        if (
+            len(constraint_ids) != len(raw_ids)
+            or len(constraint_ids) != len(set(constraint_ids))
+            or not set(constraint_ids).issubset(keys_by_constraint)
+            or not subject_ids.issubset(constraint_ids)
+            or query_key in by_query_key
+        ):
+            return None
+        objective_keys = sorted({
+            keys_by_constraint[constraint_id]
+            for constraint_id in constraint_ids
+            if constraint_id in acquisition_ids
+        })
+        if not objective_keys:
+            return None
+        raw_objective_keys = raw_item.get("intent_obligation_keys")
+        if raw_objective_keys is not None and (
+            not isinstance(raw_objective_keys, list)
+            or [
+                " ".join(str(value or "").split())
+                for value in raw_objective_keys
+                if " ".join(str(value or "").split())
+            ] != objective_keys
+        ):
+            return None
+        covers_all_intent_constraints = set(
+            keys_by_constraint
+        ).issubset(constraint_ids)
+        focused_objective_keys = (
+            []
+            if covers_all_intent_constraints
+            else sorted({
+                keys_by_constraint[constraint_id]
+                for constraint_id in constraint_ids
+                if (
+                    constraint_id in acquisition_ids
+                    and constraint_id not in subject_ids
+                )
+            })
+        )
+        raw_focused_keys = raw_item.get(
+            "focused_intent_obligation_keys"
+        )
+        if raw_focused_keys is not None and (
+            not isinstance(raw_focused_keys, list)
+            or [
+                " ".join(str(value or "").split())
+                for value in raw_focused_keys
+                if " ".join(str(value or "").split())
+            ] != focused_objective_keys
+        ):
+            return None
+        by_query_key[query_key] = {
+            "text": text,
+            "preserved_constraint_ids": constraint_ids,
+            "intent_obligation_keys": objective_keys,
+            "focused_intent_obligation_keys": focused_objective_keys,
+            "covers_all_intent_constraints": covers_all_intent_constraints,
+        }
+    ordered: list[dict[str, object]] = []
+    for query in queries:
+        item = by_query_key.get(_key(query))
+        if item is None:
+            return None
+        ordered.append({**item, "text": " ".join(str(query).split())})
+    return ordered
+
+
+def _without_tried_expansion_queries(
+    expansion: dict,
+    tried_keys: set[str],
+) -> dict:
+    queries = [
+        query
+        for query in expansion.get("queries") or []
+        if _key(query) not in tried_keys
+    ]
+    allowed = {_key(query) for query in queries}
+    return {
+        **expansion,
+        "queries": queries,
+        "query_metadata": [
+            item
+            for item in expansion.get("query_metadata") or []
+            if isinstance(item, dict)
+            and _key(item.get("text")) in allowed
+        ],
+    }
 
 
 def _intent_tokens(value: object) -> list[str]:
@@ -861,6 +1020,8 @@ def _validated_ai_queries(
     topic: str,
     parsed: _PracticeFastExpansion,
     count: int,
+    *,
+    query_metadata_out: list[dict[str, object]] | None = None,
 ) -> list[str]:
     """Prefer broad-plus-focused subject-grounded retrieval branches."""
     constraints = list(parsed.intent_constraints)
@@ -888,22 +1049,27 @@ def _validated_ai_queries(
     broad: list[str] = []
     focused: list[tuple[str, frozenset[str]]] = []
     focused_signatures: set[frozenset[str]] = set()
+    constraint_ids_by_query_key: dict[str, list[str]] = {}
     non_subject_ids = constraint_ids - subject_ids
     for query in parsed.queries:
-        preserved = {
+        preserved_ids = [
             " ".join(str(value or "").split())
             for value in query.preserved_constraint_ids
             if " ".join(str(value or "").split())
-        }
+        ]
+        preserved = set(preserved_ids)
         if (
             not preserved
+            or len(preserved_ids) != len(preserved)
             or not preserved.issubset(constraint_ids)
             or not subject_ids.issubset(preserved)
         ):
             continue
         if preserved == constraint_ids:
+            constraint_ids_by_query_key[_key(query.text)] = preserved_ids
             broad.append(query.text)
             continue
+        constraint_ids_by_query_key.setdefault(_key(query.text), preserved_ids)
         signature = frozenset(preserved & non_subject_ids)
         if not signature or signature in focused_signatures:
             continue
@@ -924,19 +1090,33 @@ def _validated_ai_queries(
             continue
         focused_keys.add(key)
         normalized_focused.append((text, signature))
+
+    def finalize(candidates: list[str]) -> list[str]:
+        queries = _normalize(candidates, count)
+        if query_metadata_out is not None:
+            query_metadata_out.extend(
+                {
+                    "text": query,
+                    "preserved_constraint_ids": list(
+                        constraint_ids_by_query_key.get(_key(query), ())
+                    ),
+                }
+                for query in queries
+            )
+        return queries
+
     if not non_subject_ids:
-        return _normalize(normalized_model_broad, count)
+        return finalize(normalized_model_broad)
     if len(non_subject_ids) <= 2:
         normalized_focused.extend(
             (query, frozenset(non_subject_ids))
             for query in normalized_model_broad[1:]
         )
     if count <= 1:
-        return _normalize(
+        return finalize(
             [primary_broad or normalized_focused[0][0]]
             if primary_broad or normalized_focused
             else [],
-            count,
         )
     if not primary_broad and not normalized_focused:
         return []
@@ -956,13 +1136,12 @@ def _validated_ai_queries(
         normalized_focused[index]
         for index in sorted(selected_index_set)
     ]
-    return _normalize(
+    return finalize(
         [
             *([primary_broad] if primary_broad else []),
             *(query for query, _signature in selected_focused),
             *normalized_model_broad[1:],
         ],
-        count,
     )
 
 
@@ -1372,14 +1551,7 @@ def expand_query_practice_fast(
     cached = _read_cached_expansion(cache_key, count) if cache_key else None
     if cached is not None:
         if recovering_zero_results:
-            cached = {
-                **cached,
-                "queries": [
-                    query
-                    for query in cached["queries"]
-                    if _key(query) not in tried_keys
-                ],
-            }
+            cached = _without_tried_expansion_queries(cached, tried_keys)
             if not cached["queries"]:
                 cached = None
     if cached is not None:
@@ -1397,14 +1569,7 @@ def expand_query_practice_fast(
         cached = _read_cached_expansion(cache_key, count) if cache_key else None
         if cached is not None:
             if recovering_zero_results:
-                cached = {
-                    **cached,
-                    "queries": [
-                        query
-                        for query in cached["queries"]
-                        if _key(query) not in tried_keys
-                    ],
-                }
+                cached = _without_tried_expansion_queries(cached, tried_keys)
                 if not cached["queries"]:
                     cached = None
         if cached is not None:
@@ -1448,13 +1613,23 @@ def expand_query_practice_fast(
                 raw = _practice_fast_gemini_raw(topic, count, **kwargs)
                 parsed = _PracticeFastExpansion.model_validate_json(raw)
                 corrected = " ".join(str(parsed.corrected or topic).split()) or topic
-                queries = _validated_ai_queries(topic, parsed, count)
+                raw_query_metadata: list[dict[str, object]] = []
+                queries = _validated_ai_queries(
+                    topic,
+                    parsed,
+                    count,
+                    query_metadata_out=raw_query_metadata,
+                )
                 if recovering_zero_results:
-                    queries = [
-                        query
-                        for query in queries
-                        if _key(query) not in tried_keys
-                    ]
+                    filtered = _without_tried_expansion_queries(
+                        {
+                            "queries": queries,
+                            "query_metadata": raw_query_metadata,
+                        },
+                        tried_keys,
+                    )
+                    queries = filtered["queries"]
+                    raw_query_metadata = filtered["query_metadata"]
                 if not queries:
                     raise ValueError(
                         "Gemini returned no novel search query preserving the exact "
@@ -1483,14 +1658,26 @@ def expand_query_practice_fast(
                         "Gemini returned an intent contract rejected by the "
                         "clip selector"
                     )
+                acquisition_ids = list(
+                    parsed.acquisition_obligation_constraint_ids
+                )
+                query_metadata = _validated_query_metadata(
+                    raw_query_metadata,
+                    queries=queries,
+                    intent_contract=intent_contract,
+                    acquisition_constraint_ids=acquisition_ids,
+                )
+                if query_metadata is None:
+                    raise ValueError(
+                        "Gemini returned invalid query-to-intent metadata"
+                    )
                 result = {
                     "corrected": corrected,
                     "queries": queries,
                     "provider_used": "gemini",
                     "intent_contract": intent_contract,
-                    "acquisition_obligation_constraint_ids": list(
-                        parsed.acquisition_obligation_constraint_ids
-                    ),
+                    "acquisition_obligation_constraint_ids": acquisition_ids,
+                    "query_metadata": query_metadata,
                 }
                 if cache_key:
                     _write_cached_expansion(cache_key, result)

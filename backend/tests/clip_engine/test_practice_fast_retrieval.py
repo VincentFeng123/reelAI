@@ -125,13 +125,19 @@ def _without_intent_contract(result: dict) -> dict:
     acquisition_ids = public.pop(
         "acquisition_obligation_constraint_ids", None
     )
+    query_metadata = public.pop("query_metadata", None)
     if public.get("provider_used") == "gemini":
         assert intent_contract["version"] == "expansion_intent_v2"
         assert intent_contract["request_intent"]["constraints"]
         assert acquisition_ids
+        assert isinstance(query_metadata, list)
+        assert [item["text"] for item in query_metadata] == public["queries"]
+        assert all(item["preserved_constraint_ids"] for item in query_metadata)
+        assert all(item["intent_obligation_keys"] for item in query_metadata)
     else:
         assert intent_contract is None
         assert acquisition_ids is None
+        assert query_metadata is None
     return public
 
 
@@ -285,7 +291,7 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
 def test_practice_fast_expansion_requests_focused_sources() -> None:
     prompt = " ".join(expand._PRACTICE_FAST_SYSTEM.casefold().split())
 
-    assert expand.PRACTICE_FAST_EXPAND_CACHE_VERSION == 14
+    assert expand.PRACTICE_FAST_EXPAND_CACHE_VERSION == 15
     assert expand.PRACTICE_FAST_EXPAND_OUTPUT_TOKENS == 2_048
     assert "one concise, standalone, intent-preserving learning summary" in prompt
     assert "must make sense without the original request" in prompt
@@ -2049,14 +2055,120 @@ def test_practice_fast_expansion_stores_success_for_reuse(monkeypatch):
     assert context.counters()["expansion_cache_hits"] == 1
 
 
+def test_expansion_cache_round_trip_preserves_query_objective_metadata(
+    monkeypatch,
+) -> None:
+    exact_request = (
+        "Explain cellular respiration, ATP synthase, and proton gradient."
+    )
+    constraints = [
+        _selector_constraint(
+            "subject",
+            "subject",
+            "cellular respiration",
+        ),
+        _selector_constraint("atp", "scope", "ATP synthase"),
+        _selector_constraint("gradient", "scope", "proton gradient"),
+    ]
+    intent_contract = _selector_intent_contract(
+        exact_request,
+        constraints,
+    )
+    keys_by_constraint = (
+        expand.trusted_intent_obligation_keys_by_constraint(intent_contract)
+    )
+    queries = [
+        "cellular respiration ATP synthase proton gradient",
+        "cellular respiration ATP synthase mechanism",
+    ]
+    result = {
+        "corrected": exact_request,
+        "queries": queries,
+        "provider_used": "gemini",
+        "intent_contract": intent_contract,
+        "acquisition_obligation_constraint_ids": [
+            "subject",
+            "atp",
+            "gradient",
+        ],
+        "query_metadata": [
+            {
+                "text": queries[0],
+                "preserved_constraint_ids": [
+                    "subject",
+                    "atp",
+                    "gradient",
+                ],
+                "intent_obligation_keys": sorted(
+                    keys_by_constraint.values()
+                ),
+                "focused_intent_obligation_keys": [],
+                "covers_all_intent_constraints": True,
+            },
+            {
+                "text": queries[1],
+                "preserved_constraint_ids": ["subject", "atp"],
+                "intent_obligation_keys": sorted({
+                    keys_by_constraint["subject"],
+                    keys_by_constraint["atp"],
+                }),
+                "focused_intent_obligation_keys": [
+                    keys_by_constraint["atp"]
+                ],
+                "covers_all_intent_constraints": False,
+            },
+        ],
+    }
+    stored: dict = {}
+
+    monkeypatch.setattr(
+        expand,
+        "get_conn",
+        lambda *args, **kwargs: nullcontext(object()),
+    )
+    monkeypatch.setattr(
+        expand,
+        "upsert",
+        lambda _conn, _table, values, **_kwargs: stored.update(values),
+    )
+    monkeypatch.setattr(
+        expand,
+        "fetch_one",
+        lambda *_args, **_kwargs: {
+            "response_json": stored["response_json"],
+            "created_at": stored["created_at"],
+        },
+    )
+
+    expand._write_cached_expansion("cache-key", result)
+    cached = expand._read_cached_expansion("cache-key", 2)
+
+    assert cached == result
+
+
 def test_practice_fast_expansion_cache_outlives_segment_ttl_and_expires(monkeypatch):
+    intent_contract = _intent_contract()
+    subject_key = next(iter(
+        expand.trusted_intent_obligation_keys(intent_contract)
+    ))
+    cached_queries = ["physics lecture", "mechanics", "waves"]
     cached_row = {
         "response_json": json.dumps({
             "version": expand.PRACTICE_FAST_EXPAND_CACHE_VERSION,
             "corrected": "Physics",
-            "queries": ["physics lecture", "mechanics", "waves"],
-            "intent_contract": _intent_contract(),
+            "queries": cached_queries,
+            "intent_contract": intent_contract,
             "acquisition_obligation_constraint_ids": ["subject"],
+            "query_metadata": [
+                {
+                    "text": query,
+                    "preserved_constraint_ids": ["subject"],
+                    "intent_obligation_keys": [subject_key],
+                    "focused_intent_obligation_keys": [],
+                    "covers_all_intent_constraints": True,
+                }
+                for query in cached_queries
+            ],
         }),
         "created_at": (
             datetime.now(timezone.utc)
@@ -3354,7 +3466,7 @@ def test_literal_only_rejected_cursor_retries_with_fresh_grounded_branch(
     ]
     assert expansion_calls == [
         (topic, 3, []),
-        (topic, 4, [topic]),
+        (topic, 3, [topic]),
     ]
     assert [video["id"] for video in result["videos"]] == ["fresh-recovery"]
     assert "unusable cursor branch was skipped" in str(result["warning"])
@@ -3439,6 +3551,8 @@ def test_zero_result_without_cursor_uses_one_ai_recovery_until_inventory_exists(
         "Newton laws free body diagram problem progression",
     ]
     context = GenerationContext("slow")
+    initial_contract = {"phase": "initial"}
+    recovery_contract = {"phase": "recovery"}
     expansion_calls: list[tuple[str, int, list[str], str | None]] = []
     search_calls: list[str] = []
 
@@ -3449,16 +3563,18 @@ def test_zero_result_without_cursor_uses_one_ai_recovery_until_inventory_exists(
         )
         if not tried_queries:
             return {
-                "corrected": exact_request,
+                "corrected": f"{exact_request} initial",
                 "queries": [initial_query],
                 "provider_used": "gemini",
-                "intent_contract": _intent_contract(exact_request),
+                "intent_contract": initial_contract,
+                "acquisition_obligation_constraint_ids": ["initial"],
             }
         return {
-            "corrected": exact_request,
+            "corrected": f"{exact_request} recovery",
             "queries": [initial_query, *recovery_queries],
             "provider_used": "gemini",
-            "intent_contract": _intent_contract(exact_request),
+            "intent_contract": recovery_contract,
+            "acquisition_obligation_constraint_ids": ["recovery"],
         }
 
     def fake_search_all(queries, filters=None, **kwargs):
@@ -3500,9 +3616,225 @@ def test_zero_result_without_cursor_uses_one_ai_recovery_until_inventory_exists(
     ]
     assert search_calls == [initial_query, recovery_queries[0]]
     assert result["queries"] == [initial_query, recovery_queries[0]]
+    assert result["corrected"] == f"{exact_request} initial"
+    assert result["intent_contract"] == initial_contract
+    assert result["acquisition_obligation_constraint_ids"] == ["initial"]
     assert [video["id"] for video in result["videos"]] == ["recovered-video"]
     assert result["provider_exhausted"] is False
     assert context.budget.remaining("search") == 3
+
+
+def test_zero_result_recovery_keeps_original_cursor_objective_metadata(
+    monkeypatch,
+) -> None:
+    topic = "HTTP request lifecycle and status debugging"
+    initial_query = "HTTP request lifecycle explanation"
+    recovery_query = "HTTP status debugging examples"
+    initial_metadata = {
+        "text": initial_query,
+        "preserved_constraint_ids": ["subject", "lifecycle"],
+        "intent_obligation_keys": ["io:subject", "io:lifecycle"],
+        "focused_intent_obligation_keys": ["io:lifecycle"],
+        "covers_all_intent_constraints": False,
+    }
+    initial_contract = {"phase": "initial"}
+    expansion_calls: list[list[str]] = []
+    search_calls: list[tuple[list[str], list[str] | None]] = []
+
+    def fake_expand(_topic, _count, **kwargs):
+        tried_queries = list(kwargs.get("tried_queries") or [])
+        expansion_calls.append(tried_queries)
+        if tried_queries:
+            raise AssertionError(
+                "recovery planning must stay lazy when the original cursor "
+                "satisfies the fixed analysis target"
+            )
+        return {
+            "corrected": f"{topic} initial",
+            "queries": [initial_query],
+            "provider_used": "gemini",
+            "intent_contract": initial_contract,
+            "acquisition_obligation_constraint_ids": ["lifecycle"],
+            "query_metadata": [initial_metadata],
+        }
+
+    def fake_search_all(queries, _filters=None, **kwargs):
+        page_tokens = kwargs.get("page_tokens")
+        search_calls.append((list(queries), page_tokens))
+        if page_tokens is None:
+            return {
+                "per_query": [{
+                    "query": initial_query,
+                    "videos": [],
+                    "next_page_token": "initial-page-2",
+                }],
+                "credits_used": 1,
+                "warning": None,
+            }
+        assert page_tokens == ["initial-page-2"]
+        return {
+            "per_query": [{
+                "query": initial_query,
+                "videos": [{
+                    "id": "original-cursor-source",
+                    "duration": 300,
+                }],
+                "next_page_token": None,
+            }],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        topic,
+        limit=1,
+        breadth=1,
+        retrieval_profile="deep",
+        context=GenerationContext("slow"),
+        analysis_limit=1,
+    )
+
+    assert expansion_calls == [[]]
+    assert search_calls == [
+        ([initial_query], None),
+        ([initial_query], ["initial-page-2"]),
+    ]
+    assert all(recovery_query not in queries for queries, _token in search_calls)
+    assert result["corrected"] == f"{topic} initial"
+    assert result["intent_contract"] == initial_contract
+    assert result["acquisition_obligation_constraint_ids"] == ["lifecycle"]
+    assert result["query_metadata"] == [initial_metadata]
+    source = result["videos"][0]
+    assert source["matched_query_intent_obligation_keys"][initial_query] == [
+        "io:subject",
+        "io:lifecycle",
+    ]
+    assert source["matched_focused_intent_obligation_keys"] == [
+        "io:lifecycle"
+    ]
+
+
+def test_mixed_cursor_and_recovery_keep_initial_contract_and_query_metadata(
+    monkeypatch,
+) -> None:
+    topic = "HTTP request lifecycle and status debugging"
+    initial_query = "HTTP request lifecycle explanation"
+    recovery_query = "HTTP status debugging examples"
+    initial_metadata = {
+        "text": initial_query,
+        "preserved_constraint_ids": ["subject", "lifecycle"],
+        "intent_obligation_keys": ["io:subject", "io:lifecycle"],
+        "focused_intent_obligation_keys": ["io:lifecycle"],
+        "covers_all_intent_constraints": False,
+    }
+    recovery_metadata = {
+        "text": recovery_query,
+        "preserved_constraint_ids": ["subject", "status"],
+        "intent_obligation_keys": ["io:subject", "io:status"],
+        "focused_intent_obligation_keys": ["io:status"],
+        "covers_all_intent_constraints": False,
+    }
+    initial_contract = {"phase": "initial"}
+    recovery_contract = {"phase": "recovery"}
+    expansion_calls: list[list[str]] = []
+    search_calls: list[tuple[list[str], list[str] | None]] = []
+
+    def fake_expand(_topic, _count, **kwargs):
+        tried_queries = list(kwargs.get("tried_queries") or [])
+        expansion_calls.append(tried_queries)
+        if tried_queries:
+            return {
+                "corrected": f"{topic} recovery",
+                "queries": [recovery_query],
+                "provider_used": "gemini",
+                "intent_contract": recovery_contract,
+                "acquisition_obligation_constraint_ids": ["status"],
+                "query_metadata": [recovery_metadata],
+            }
+        return {
+            "corrected": f"{topic} initial",
+            "queries": [initial_query],
+            "provider_used": "gemini",
+            "intent_contract": initial_contract,
+            "acquisition_obligation_constraint_ids": ["lifecycle"],
+            "query_metadata": [initial_metadata],
+        }
+
+    def fake_search_all(queries, _filters=None, **kwargs):
+        page_tokens = kwargs.get("page_tokens")
+        search_calls.append((list(queries), page_tokens))
+        if page_tokens == ["initial-page-2"]:
+            return {
+                "per_query": [{
+                    "query": initial_query,
+                    "videos": [{
+                        "id": "original-cursor-source",
+                        "duration": 300,
+                    }],
+                    "next_page_token": None,
+                }],
+                "credits_used": 1,
+                "warning": None,
+            }
+        query = queries[0]
+        if query == recovery_query:
+            return {
+                "per_query": [{
+                    "query": recovery_query,
+                    "videos": [{
+                        "id": "recovery-source",
+                        "duration": 300,
+                    }],
+                    "next_page_token": None,
+                }],
+                "credits_used": 1,
+                "warning": None,
+            }
+        return {
+            "per_query": [{
+                "query": initial_query,
+                "videos": [],
+                "next_page_token": "initial-page-2",
+            }],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        topic,
+        limit=2,
+        breadth=2,
+        retrieval_profile="deep",
+        context=GenerationContext("slow"),
+        analysis_limit=2,
+    )
+
+    assert expansion_calls == [[], [initial_query]]
+    assert search_calls == [
+        ([initial_query], None),
+        ([initial_query], ["initial-page-2"]),
+        ([recovery_query], None),
+    ]
+    assert result["corrected"] == f"{topic} initial"
+    assert result["intent_contract"] == initial_contract
+    assert result["acquisition_obligation_constraint_ids"] == ["lifecycle"]
+    assert result["queries"] == [initial_query, recovery_query]
+    assert result["query_metadata"] == [initial_metadata, recovery_metadata]
+    by_id = {video["id"]: video for video in result["videos"]}
+    assert by_id["original-cursor-source"][
+        "matched_query_intent_obligation_keys"
+    ][initial_query] == ["io:subject", "io:lifecycle"]
+    assert by_id["recovery-source"]["matched_query_provenance"][
+        recovery_query
+    ] == "gemini"
+    assert by_id["recovery-source"]["ai_match_count"] == 1
+    assert by_id["recovery-source"]["trusted_match_count"] == 0
 
 
 def test_zero_result_recovery_uses_exact_five_search_budget(monkeypatch) -> None:
@@ -4261,6 +4593,471 @@ def test_ai_analysis_prefix_covers_an_unseen_query_family_before_repetition():
         "multi-facet-overview",
         "unseen-worked-examples",
         "repeated-overview",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("domain", "frequent_key", "distant_key"),
+    [
+        ("biology", "io:proofreading", "io:escaped-error"),
+        ("software", "io:http-status", "io:cache-debugging"),
+    ],
+)
+def test_trusted_objective_metadata_reaches_a_lower_ranked_focused_branch(
+    domain: str,
+    frequent_key: str,
+    distant_key: str,
+) -> None:
+    ranked = [
+        {
+            "id": f"{domain}-literal",
+            "duration": 300,
+            "literal_match": True,
+            "matched_families": [domain],
+            "matched_focused_intent_obligation_keys": [],
+        },
+        *[
+            {
+                "id": f"{domain}-frequent-{index}",
+                "duration": 300,
+                "literal_match": False,
+                "matched_families": [f"{domain}-frequent"],
+                "matched_focused_intent_obligation_keys": [
+                    frequent_key
+                ],
+            }
+            for index in range(6)
+        ],
+        {
+            "id": f"{domain}-distant-objective",
+            "duration": 300,
+            "literal_match": False,
+            "matched_families": [f"{domain}-distant"],
+            "matched_focused_intent_obligation_keys": [distant_key],
+        },
+    ]
+
+    fresh = search._select_ranked_candidates(
+        ranked,
+        limit=len(ranked),
+        excluded=set(),
+        analysis_prefix=3,
+    )
+    after_frequent_coverage = search._select_ranked_candidates(
+        ranked,
+        limit=len(ranked),
+        excluded=set(),
+        analysis_prefix=2,
+        covered_intent_obligation_keys=[frequent_key],
+    )
+
+    assert [video["id"] for video in fresh[:3]] == [
+        f"{domain}-literal",
+        f"{domain}-frequent-0",
+        f"{domain}-distant-objective",
+    ]
+    assert [video["id"] for video in after_frequent_coverage[:2]] == [
+        f"{domain}-literal",
+        f"{domain}-distant-objective",
+    ]
+
+
+def test_all_literal_pool_still_reserves_a_unique_focused_objective() -> None:
+    ranked = [
+        {
+            "id": f"literal-common-{index}",
+            "duration": 300,
+            "literal_match": True,
+            "matched_families": ["literal"],
+            "matched_focused_intent_obligation_keys": ["io:common"],
+        }
+        for index in range(3)
+    ]
+    ranked.append({
+        "id": "literal-unique-objective",
+        "duration": 300,
+        "literal_match": True,
+        "matched_families": ["literal", "unique"],
+        "matched_focused_intent_obligation_keys": ["io:unique"],
+    })
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=len(ranked),
+        excluded=set(),
+        analysis_prefix=2,
+    )
+
+    assert [video["id"] for video in selected[:2]] == [
+        "literal-common-0",
+        "literal-unique-objective",
+    ]
+
+
+def test_explicit_zero_analysis_prefix_preserves_ranked_order() -> None:
+    ranked = [
+        {
+            "id": "long-literal",
+            "duration": 4 * 60 * 60,
+            "literal_match": True,
+            "matched_focused_intent_obligation_keys": ["io:common"],
+        },
+        {
+            "id": "short-expanded",
+            "duration": 5 * 60,
+            "literal_match": False,
+            "matched_focused_intent_obligation_keys": ["io:unique"],
+        },
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=2,
+        excluded=set(),
+        analysis_prefix=0,
+    )
+
+    assert [video["id"] for video in selected] == [
+        "long-literal",
+        "short-expanded",
+    ]
+
+
+def test_zero_analysis_limit_preserves_order_without_extra_provider_calls(
+    monkeypatch,
+) -> None:
+    topic = "database transactions"
+    expanded_query = "database isolation anomalies"
+    expansion_calls = 0
+    search_calls: list[list[str]] = []
+    ranked = [
+        {
+            "id": "long-literal",
+            "duration": 4 * 60 * 60,
+            "literal_match": True,
+            "matched_focused_intent_obligation_keys": ["io:common"],
+        },
+        {
+            "id": "short-expanded",
+            "duration": 5 * 60,
+            "literal_match": False,
+            "matched_focused_intent_obligation_keys": ["io:unique"],
+        },
+    ]
+
+    def fake_expand(*_args, **_kwargs):
+        nonlocal expansion_calls
+        expansion_calls += 1
+        return {
+            "corrected": topic,
+            "queries": [topic, expanded_query],
+            "provider_used": "gemini",
+        }
+
+    def fake_search_all(queries, _filters=None, **_kwargs):
+        search_calls.append(list(queries))
+        return {
+            "per_query": [
+                {"query": query, "videos": []}
+                for query in queries
+            ],
+            "credits_used": len(queries),
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+    monkeypatch.setattr(
+        search.rank,
+        "merge_and_rank",
+        lambda *_args, **_kwargs: ranked,
+    )
+
+    result = search.discover_practice_fast(
+        topic,
+        limit=2,
+        breadth=2,
+        context=GenerationContext("slow"),
+        analysis_limit=0,
+    )
+
+    assert expansion_calls == 1
+    assert search_calls == [[topic, expanded_query]]
+    assert [video["id"] for video in result["videos"]] == [
+        "long-literal",
+        "short-expanded",
+    ]
+
+
+def test_one_source_prefix_keeps_its_literal_anchor() -> None:
+    ranked = [
+        {
+            "id": "literal-anchor",
+            "duration": 300,
+            "literal_match": True,
+            "matched_focused_intent_obligation_keys": ["io:common"],
+        },
+        {
+            "id": "focused-objective",
+            "duration": 300,
+            "literal_match": False,
+            "matched_focused_intent_obligation_keys": ["io:unique"],
+        },
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=1,
+        excluded=set(),
+        analysis_prefix=1,
+    )
+
+    assert [video["id"] for video in selected] == ["literal-anchor"]
+
+
+@pytest.mark.parametrize(
+    "duration",
+    [None, search._FOCUSED_ANALYSIS_SOURCE_MAX_SEC + 1],
+    ids=["unknown", "over-thirty-minutes"],
+)
+@pytest.mark.parametrize(
+    ("analysis_prefix", "expected_prefix"),
+    [
+        (1, ["literal-anchor"]),
+        (2, ["literal-anchor", "objective-a"]),
+    ],
+)
+def test_long_fallback_prefix_keeps_highest_ranked_literal_anchor(
+    duration: float | None,
+    analysis_prefix: int,
+    expected_prefix: list[str],
+) -> None:
+    ranked = [
+        {
+            "id": "literal-anchor",
+            "duration": duration,
+            "literal_match": True,
+            "matched_focused_intent_obligation_keys": [],
+        },
+        {
+            "id": "objective-a",
+            "duration": duration,
+            "literal_match": False,
+            "matched_focused_intent_obligation_keys": ["io:a"],
+        },
+        {
+            "id": "objective-b",
+            "duration": duration,
+            "literal_match": False,
+            "matched_focused_intent_obligation_keys": ["io:b"],
+        },
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=3,
+        excluded=set(),
+        analysis_prefix=analysis_prefix,
+    )
+
+    assert [video["id"] for video in selected[:analysis_prefix]] == (
+        expected_prefix
+    )
+
+
+def test_one_source_ai_prefix_prefers_an_uncovered_objective() -> None:
+    ranked = [
+        {
+            "id": "covered-top",
+            "duration": 300,
+            "literal_match": False,
+            "matched_focused_intent_obligation_keys": ["io:covered"],
+        },
+        {
+            "id": "covered-repeat",
+            "duration": 300,
+            "literal_match": False,
+            "matched_focused_intent_obligation_keys": ["io:covered"],
+        },
+        {
+            "id": "uncovered-objective",
+            "duration": 300,
+            "literal_match": False,
+            "matched_focused_intent_obligation_keys": ["io:uncovered"],
+        },
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=1,
+        excluded=set(),
+        analysis_prefix=1,
+        covered_intent_obligation_keys=["io:covered"],
+    )
+
+    assert [video["id"] for video in selected] == ["uncovered-objective"]
+
+
+def test_three_source_literal_prefix_reserves_distinct_objectives() -> None:
+    ranked = [
+        *[
+            {
+                "id": f"literal-common-{index}",
+                "duration": 300,
+                "literal_match": True,
+                "matched_focused_intent_obligation_keys": ["io:common"],
+            }
+            for index in range(3)
+        ],
+        {
+            "id": "literal-objective-b",
+            "duration": 300,
+            "literal_match": True,
+            "matched_focused_intent_obligation_keys": ["io:b"],
+        },
+        {
+            "id": "literal-objective-c",
+            "duration": 300,
+            "literal_match": True,
+            "matched_focused_intent_obligation_keys": ["io:c"],
+        },
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=5,
+        excluded=set(),
+        analysis_prefix=3,
+    )
+
+    assert [video["id"] for video in selected[:3]] == [
+        "literal-common-0",
+        "literal-objective-b",
+        "literal-objective-c",
+    ]
+
+
+def test_long_objective_source_fills_only_an_unoccupied_short_prefix_slot() -> None:
+    short_sources = [
+        {
+            "id": f"short-{index}",
+            "duration": 300,
+            "literal_match": index == 0,
+            "matched_families": [f"short-{index}"],
+            "matched_focused_intent_obligation_keys": ["io:common"],
+        }
+        for index in range(3)
+    ]
+    long_unique = {
+        "id": "long-unique-objective",
+        "duration": search._FOCUSED_ANALYSIS_SOURCE_MAX_SEC + 1,
+        "literal_match": False,
+        "matched_families": ["long-unique"],
+        "matched_focused_intent_obligation_keys": ["io:unique"],
+    }
+
+    full_short_prefix = search._select_ranked_candidates(
+        [*short_sources, long_unique],
+        limit=4,
+        excluded=set(),
+        analysis_prefix=3,
+    )
+    short_gap_fallback = search._select_ranked_candidates(
+        [*short_sources[:2], long_unique],
+        limit=3,
+        excluded=set(),
+        analysis_prefix=3,
+    )
+
+    assert "long-unique-objective" not in [
+        video["id"] for video in full_short_prefix[:3]
+    ]
+    assert [video["id"] for video in short_gap_fallback[:3]] == [
+        "short-0",
+        "short-1",
+        "long-unique-objective",
+    ]
+
+
+def test_deep_discovery_preserves_query_constraint_metadata_through_ranking(
+    monkeypatch,
+) -> None:
+    topic = "HTTP request lifecycle and status debugging"
+    broad_query = "HTTP request lifecycle status debugging"
+    focused_query = "HTTP 404 versus 500 debugging"
+    query_metadata = [
+        {
+            "text": broad_query,
+            "preserved_constraint_ids": [
+                "subject",
+                "lifecycle",
+                "status",
+            ],
+            "intent_obligation_keys": [
+                "io:subject",
+                "io:lifecycle",
+                "io:status",
+            ],
+            "focused_intent_obligation_keys": [],
+            "covers_all_intent_constraints": True,
+        },
+        {
+            "text": focused_query,
+            "preserved_constraint_ids": ["subject", "status"],
+            "intent_obligation_keys": ["io:subject", "io:status"],
+            "focused_intent_obligation_keys": ["io:status"],
+            "covers_all_intent_constraints": False,
+        },
+    ]
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda *_args, **_kwargs: {
+            "corrected": topic,
+            "queries": [broad_query, focused_query],
+            "provider_used": "gemini",
+            "query_metadata": query_metadata,
+        },
+    )
+    monkeypatch.setattr(
+        search.supadata_search,
+        "search_all",
+        lambda queries, _filters=None, **_kwargs: {
+            "per_query": [
+                {
+                    "query": query,
+                    "videos": [{
+                        "id": f"source-{index}",
+                        "title": "HTTP debugging lesson",
+                        "duration": 300,
+                    }],
+                }
+                for index, query in enumerate(queries)
+            ],
+            "credits_used": len(queries),
+            "warning": None,
+        },
+    )
+
+    result = search.discover_practice_fast(
+        topic,
+        limit=2,
+        breadth=3,
+        context=GenerationContext("slow"),
+        analysis_limit=2,
+    )
+
+    by_id = {video["id"]: video for video in result["videos"]}
+    focused = by_id["source-1"]
+    assert focused["matched_query_constraint_ids"][focused_query] == [
+        "subject",
+        "status",
+    ]
+    assert focused["matched_query_intent_obligation_keys"][
+        focused_query
+    ] == ["io:subject", "io:status"]
+    assert focused["matched_focused_intent_obligation_keys"] == [
+        "io:status"
     ]
 
 

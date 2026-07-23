@@ -750,6 +750,14 @@ def test_mixed_provider_failures_do_not_block_a_valid_completed_source(
 def test_ingest_topic_uses_ai_intent_summary_for_segmentation(monkeypatch) -> None:
     captured_topics: list[str] = []
     captured_contracts: list[dict | None] = []
+    videos = [
+        _video(),
+        {
+            **_video(),
+            "id": "abc123DEF45",
+            "url": "https://www.youtube.com/watch?v=abc123DEF45",
+        },
+    ]
     intent_contract = {
         "version": "expansion_intent_v1",
         "request_intent": {
@@ -769,7 +777,7 @@ def test_ingest_topic_uses_ai_intent_summary_for_segmentation(monkeypatch) -> No
         "provider_used": "gemini",
         "intent_contract": intent_contract,
         "topic_terms": ["calclus", "Calculus"],
-        "videos": [_video()],
+        "videos": videos,
         "credits_used": 0,
         "warning": None,
     }
@@ -787,12 +795,12 @@ def test_ingest_topic_uses_ai_intent_summary_for_segmentation(monkeypatch) -> No
         literal_topic="calclus",
         material_id="material",
         concept_id="concept",
-        max_videos=1,
+        max_videos=2,
     )
 
-    assert captured_topics == ["Calculus"]
-    assert captured_contracts == [intent_contract]
-    assert discovery["videos"][0]["_literal_topic"] == "calclus"
+    assert captured_topics == ["Calculus", "Calculus"]
+    assert captured_contracts == [intent_contract, intent_contract]
+    assert all(video["_literal_topic"] == "calclus" for video in videos)
 
 
 def test_ingest_topic_does_not_treat_non_gemini_correction_as_intent_summary(

@@ -1082,6 +1082,46 @@ def test_queued_first_attempt_gets_fresh_execution_deadline_when_leased() -> Non
         conn.close()
 
 
+def test_durable_queued_first_attempt_survives_queue_ttl_and_gets_fresh_deadline() -> None:
+    conn = _memory_conn()
+    try:
+        job, _ = jobs.submit_or_get_active(
+            conn,
+            material_id="material-1",
+            concept_id="concept-1",
+            request_key="durable-queue-request",
+            content_fingerprint="fingerprint-1",
+            learner_id="learner-1",
+            request_params={jobs.DURABLE_QUEUE_WAIT_PARAM: True},
+            now=BASE_TIME,
+            deadline_seconds=10,
+        )
+        claimed_at = BASE_TIME + timedelta(
+            seconds=jobs.DEFAULT_QUEUE_TTL_SECONDS + 60
+        )
+
+        assert jobs.expire_stale_queued_job(
+            conn,
+            job_id=job["id"],
+            now=claimed_at,
+        ) is False
+        leased = jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="durable-queue-worker",
+            now=claimed_at,
+        )
+
+        assert leased and leased["status"] == "running"
+        assert leased["attempt_count"] == 1
+        assert datetime.fromisoformat(leased["started_at"]) == claimed_at
+        assert datetime.fromisoformat(leased["deadline_at"]) == (
+            claimed_at + timedelta(seconds=10)
+        )
+    finally:
+        conn.close()
+
+
 def test_stale_queued_first_attempt_times_out_once_and_cannot_be_leased() -> None:
     conn = _memory_conn()
     try:

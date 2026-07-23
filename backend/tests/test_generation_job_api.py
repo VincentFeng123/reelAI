@@ -3229,6 +3229,7 @@ def test_current_restatement_inventory_suppression_is_adaptation_scoped(
             "ordered_reel_ids": ["rich", "application"],
             "current_restatement_reel_ids": ["strict-subset"],
             "current_restatement_guard_reel_ids": ["rich", "application"],
+            "editorial_reacquisition_checkpoint": True,
             "adaptation_fingerprint": "same-adaptation",
         },
     )
@@ -3239,18 +3240,22 @@ def test_current_restatement_inventory_suppression_is_adaptation_scoped(
         generation_id,
         generation_rows_out=generation_rows,
     )
+    same_adaptation_checkpoints: list[bool] = []
     same_adaptation_ids, same_adaptation_guards = (
         main._same_adaptation_current_restatement_policy(
             generation_rows,
             generation_ids,
             adaptation_fingerprint="same-adaptation",
+            reacquisition_checkpoint_out=same_adaptation_checkpoints,
         )
     )
+    changed_adaptation_checkpoints: list[bool] = []
     changed_adaptation_ids, changed_adaptation_guards = (
         main._same_adaptation_current_restatement_policy(
             generation_rows,
             generation_ids,
             adaptation_fingerprint="changed-adaptation",
+            reacquisition_checkpoint_out=changed_adaptation_checkpoints,
         )
     )
     job_row = {
@@ -3267,8 +3272,10 @@ def test_current_restatement_inventory_suppression_is_adaptation_scoped(
     try:
         assert same_adaptation_ids == {"strict-subset"}
         assert same_adaptation_guards == {"rich", "application"}
+        assert same_adaptation_checkpoints == [True]
         assert changed_adaptation_ids == set()
         assert changed_adaptation_guards == set()
+        assert changed_adaptation_checkpoints == [False]
         assert {
             reel["reel_id"]
             for reel in main._generation_job_reels(
@@ -7760,6 +7767,368 @@ def test_continuation_returns_any_unseen_cache_before_a_fresh_source_budget(
         conn.close()
 
 
+def test_restatement_only_continuation_reacquires_once_then_surfaces_valid_fallback(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="restatement-source",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    prior_job = _terminal_job_for_generation(
+        conn,
+        request_key="restatement-source",
+        generation_id=source_generation_id,
+        completed_at=now.isoformat(),
+        content_fingerprint="fingerprint",
+        request_params={
+            "generation_mode": "slow",
+            "num_reels": 1,
+            "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
+        },
+    )
+    first_job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="restatement-first-continuation",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={
+            "generation_mode": "slow",
+            "num_reels": 1,
+            "continuation_token": prior_job["id"],
+            "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
+        },
+        source_generation_id=source_generation_id,
+        now=now,
+    )
+    first_lease = generation_jobs.lease_job(
+        conn,
+        job_id=first_job["id"],
+        lease_owner="worker-restatement-first",
+        now=now,
+    )
+    assert first_lease
+
+    generated_generation_ids: set[str] = set()
+    retrieval_calls: list[dict] = []
+    reusable_calls: list[dict] = []
+    ordering_calls = 0
+    job_candidates = {
+        first_job["id"]: ["cached-restatement"],
+    }
+
+    def reusable_count(*_args, **kwargs):
+        reusable_calls.append(kwargs)
+        if kwargs.get("editorial_excluded_reel_ids"):
+            assert kwargs["editorial_excluded_reel_ids"] in (
+                {"cached-restatement"},
+                {"cached-restatement", "weaker-restatement"},
+            )
+            assert kwargs["editorial_guard_reel_ids"] == {"prior-guard"}
+            return 0
+        return 1
+
+    def generate_stage(_worker_conn, **kwargs) -> None:
+        retrieval_calls.append(kwargs)
+        generated_generation_ids.add(str(kwargs["generation_id"]))
+
+    def generation_reels(_worker_conn, job_row, **kwargs):
+        prior_unseen = kwargs.get("prior_unseen_reels_out")
+        if isinstance(prior_unseen, list):
+            prior_unseen.append({"reel_id": "prior-guard"})
+        candidate_ids = job_candidates[str(job_row.get("id") or "")]
+        return [{"reel_id": candidate_id} for candidate_id in candidate_ids]
+
+    def filter_overlaps(
+        _worker_conn,
+        *,
+        reels,
+        prior_reel_ids_out=None,
+        **_kwargs,
+    ):
+        if isinstance(prior_reel_ids_out, list):
+            prior_reel_ids_out.append("prior-guard")
+        return reels
+
+    def order_batch(reels, **_kwargs):
+        nonlocal ordering_calls
+        ordering_calls += 1
+        if ordering_calls == 1:
+            assert [reel["reel_id"] for reel in reels] == [
+                "prior-guard",
+                "cached-restatement",
+            ]
+            return mock.Mock(
+                reels=[{"reel_id": "prior-guard"}],
+                ordered_reel_ids=["prior-guard"],
+                assessment_checkpoint_reel_ids=[],
+                prior_restatement_reel_ids=[],
+                current_restatement_reel_ids=["cached-restatement"],
+                terminal_summary_start_reel_id=None,
+                model_used="gemini-test",
+                degraded=False,
+                fallback_reason=None,
+                provider_called=True,
+            )
+        if ordering_calls == 2:
+            assert [reel["reel_id"] for reel in reels] == [
+                "prior-guard",
+                "strongest-restatement",
+                "weaker-restatement",
+            ]
+            return mock.Mock(
+                reels=[{"reel_id": "prior-guard"}],
+                ordered_reel_ids=["prior-guard"],
+                assessment_checkpoint_reel_ids=[],
+                prior_restatement_reel_ids=[],
+                current_restatement_reel_ids=[
+                    "strongest-restatement",
+                    "weaker-restatement",
+                ],
+                terminal_summary_start_reel_id=None,
+                model_used="gemini-test",
+                degraded=False,
+                fallback_reason=None,
+                provider_called=True,
+            )
+        assert ordering_calls == 3
+        assert [reel["reel_id"] for reel in reels] == [
+            "prior-guard",
+            "fresh-objective",
+        ]
+        return mock.Mock(
+            reels=list(reels),
+            ordered_reel_ids=["prior-guard", "fresh-objective"],
+            assessment_checkpoint_reel_ids=[],
+            prior_restatement_reel_ids=[],
+            current_restatement_reel_ids=[],
+            terminal_summary_start_reel_id=None,
+            model_used="gemini-test",
+            degraded=False,
+            fallback_reason=None,
+            provider_called=True,
+        )
+
+    monkeypatch.setattr(
+        main,
+        "_current_level_reusable_generation_reel_count",
+        reusable_count,
+    )
+    monkeypatch.setattr(
+        main,
+        "_count_generation_surfaceable_reels",
+        lambda _conn, generation_id: (
+            1 if generation_id in generated_generation_ids else 0
+        ),
+    )
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(main, "_generation_job_reels", generation_reels)
+    monkeypatch.setattr(
+        main,
+        "_filter_continuation_release_temporal_overlaps",
+        filter_overlaps,
+    )
+    monkeypatch.setattr(
+        main,
+        "_continuation_delivered_reel_ids",
+        lambda *_args, **_kwargs: ["prior-guard"],
+    )
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
+    monkeypatch.setattr(
+        main,
+        "_authoritative_release_reel_ids",
+        lambda *_args, **_kwargs: ["released-objective"],
+    )
+    monkeypatch.setattr(
+        main,
+        "_lesson_prior_coverage",
+        lambda *_args, **_kwargs: (
+            [{"intent_obligation_keys": ["io:already-covered"]}],
+            [],
+        ),
+    )
+    try:
+        main._run_leased_generation_job(first_lease, threading.Event())
+
+        first_completed = generation_jobs.get_job(conn, first_job["id"])
+        assert first_completed and first_completed["status"] == "partial"
+        first_generation_id = str(
+            first_completed["result_generation_id"] or ""
+        )
+        assert first_generation_id
+        first_events = generation_jobs.replay_events(
+            conn,
+            job_id=first_job["id"],
+        )
+        first_final = next(
+            event for event in first_events if event["type"] == "final"
+        )
+        assert first_final["payload"]["reels"] == []
+        assert first_final["payload"]["generation_id"] == first_generation_id
+        first_generation = main._fetch_generation_row(
+            conn,
+            first_generation_id,
+        )
+        first_metadata = json.loads(
+            str(first_generation["lesson_order_json"])
+        )
+        assert first_metadata["current_restatement_reel_ids"] == [
+            "cached-restatement"
+        ]
+        assert first_metadata["current_restatement_guard_reel_ids"] == [
+            "prior-guard"
+        ]
+        assert first_metadata["editorial_reacquisition_checkpoint"] is True
+        assert retrieval_calls == []
+
+        second_job, _ = generation_jobs.submit_or_get_active(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key="restatement-second-continuation",
+            content_fingerprint="fingerprint",
+            learner_id="learner-1",
+            request_params={
+                "generation_mode": "slow",
+                "num_reels": 1,
+                "continuation_token": first_job["id"],
+                "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
+            },
+            source_generation_id=first_generation_id,
+            now=now + timedelta(seconds=1),
+        )
+        second_lease = generation_jobs.lease_job(
+            conn,
+            job_id=second_job["id"],
+            lease_owner="worker-restatement-second",
+            now=now + timedelta(seconds=1),
+        )
+        assert second_lease
+        job_candidates[second_job["id"]] = [
+            "strongest-restatement",
+            "weaker-restatement",
+        ]
+        main._run_leased_generation_job(second_lease, threading.Event())
+
+        assert len(retrieval_calls) == 1
+        assert retrieval_calls[0]["max_generation_videos"] == (
+            main.GENERATION_SOURCE_BUDGETS["slow"]
+        )
+        assert retrieval_calls[0]["covered_intent_obligation_keys"] == {
+            "io:already-covered"
+        }
+        second_completed = generation_jobs.get_job(conn, second_job["id"])
+        assert second_completed and second_completed["status"] == "completed"
+        assert reusable_calls[-1]["editorial_excluded_reel_ids"] == {
+            "cached-restatement"
+        }
+        second_events = generation_jobs.replay_events(
+            conn,
+            job_id=second_job["id"],
+        )
+        second_final = next(
+            event for event in second_events if event["type"] == "final"
+        )
+        assert [
+            reel["reel_id"] for reel in second_final["payload"]["reels"]
+        ] == ["strongest-restatement"]
+        second_generation_id = str(
+            second_completed["result_generation_id"] or ""
+        )
+        second_generation = main._fetch_generation_row(
+            conn,
+            second_generation_id,
+        )
+        second_metadata = json.loads(
+            str(second_generation["lesson_order_json"])
+        )
+        assert second_metadata["ordered_reel_ids"] == ["strongest-restatement"]
+        assert second_metadata["reconciliation_tail_reel_ids"] == [
+            "prior-guard",
+            "strongest-restatement",
+        ]
+        assert second_metadata["current_restatement_reel_ids"] == [
+            "weaker-restatement"
+        ]
+        assert second_metadata["current_restatement_guard_reel_ids"] == [
+            "prior-guard"
+        ]
+        assert second_metadata["editorial_reacquisition_checkpoint"] is False
+        assert second_metadata["degraded"] is True
+        assert second_metadata["fallback_reason"] == (
+            "restatement_reacquisition_limit"
+        )
+
+        third_job, _ = generation_jobs.submit_or_get_active(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key="restatement-third-continuation",
+            content_fingerprint="fingerprint",
+            learner_id="learner-1",
+            request_params={
+                "generation_mode": "slow",
+                "num_reels": 1,
+                "continuation_token": second_job["id"],
+                "adaptation_fingerprint": EMPTY_ADAPTATION_FINGERPRINT,
+            },
+            source_generation_id=second_generation_id,
+            now=now + timedelta(seconds=2),
+        )
+        third_lease = generation_jobs.lease_job(
+            conn,
+            job_id=third_job["id"],
+            lease_owner="worker-restatement-third",
+            now=now + timedelta(seconds=2),
+        )
+        assert third_lease
+        job_candidates[third_job["id"]] = ["fresh-objective"]
+        main._run_leased_generation_job(third_lease, threading.Event())
+
+        assert len(retrieval_calls) == 2
+        third_completed = generation_jobs.get_job(conn, third_job["id"])
+        assert third_completed and third_completed["status"] == "completed"
+        third_events = generation_jobs.replay_events(
+            conn,
+            job_id=third_job["id"],
+        )
+        third_final = next(
+            event for event in third_events if event["type"] == "final"
+        )
+        assert [
+            reel["reel_id"] for reel in third_final["payload"]["reels"]
+        ] == ["fresh-objective"]
+        third_generation_id = str(
+            third_completed["result_generation_id"] or ""
+        )
+        third_generation = main._fetch_generation_row(
+            conn,
+            third_generation_id,
+        )
+        third_metadata = json.loads(
+            str(third_generation["lesson_order_json"])
+        )
+        assert third_metadata["editorial_reacquisition_checkpoint"] is False
+        assert sum(
+            metadata["editorial_reacquisition_checkpoint"] is True
+            for metadata in (
+                first_metadata,
+                second_metadata,
+                third_metadata,
+            )
+        ) == 1
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize(
     ("provider_cursor_open", "expected_status"),
     [(False, "exhausted"), (True, "partial")],
@@ -10886,14 +11255,14 @@ def test_level_change_cancels_an_active_job_from_the_previous_difficulty(
         conn.close()
 
 
-def test_generate_cost_guard_preserves_active_and_completed_reuse(monkeypatch) -> None:
+def test_generate_durably_queues_distinct_work_and_preserves_reuse(monkeypatch) -> None:
     assert main.REELS_GENERATE_RATE_LIMIT_PER_WINDOW == 6
-    assert main.GENERATION_GLOBAL_ACTIVE_LIMIT == 4
-    assert main.GENERATION_LEARNER_ACTIVE_LIMIT == 1
 
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
     monkeypatch.setattr(main, "_wake_generation_worker", mock.Mock())
+    attach_reservation = mock.Mock()
+    monkeypatch.setattr(main, "attach_reservation_to_job", attach_reservation)
     rate_calls: list[tuple[str, int]] = []
     monkeypatch.setattr(
         main,
@@ -10941,25 +11310,32 @@ def test_generate_cost_guard_preserves_active_and_completed_reuse(monkeypatch) -
         cached = asyncio.run(main.generate_reels(object(), payload))
         assert cached["reels"] == [{"reel_id": "cached-reel"}]
 
-        with pytest.raises(main.HTTPException) as captured:
-            asyncio.run(main.generate_reels(
-                object(),
-                ReelsGenerateRequest(
-                    material_id="m1",
-                    concept_id="c1",
-                    num_reels=3,
-                    exclude_video_ids=["new-source"],
-                ),
-            ))
-        assert captured.value.status_code == 429
-        assert captured.value.detail == {
-            "code": "generation_queue_full",
-            "message": "Generation is busy. Retry after an active request finishes.",
-            "scope": "learner",
-            "limit": 1,
-        }
-        assert captured.value.headers == {"Retry-After": "30"}
-        assert rate_calls == [("generation-submit", 6)]
+        distinct_payload = ReelsGenerateRequest(
+            material_id="m1",
+            concept_id="c1",
+            num_reels=3,
+            exclude_video_ids=["new-source"],
+        )
+        distinct = asyncio.run(main.generate_reels(object(), distinct_payload))
+        assert distinct.status_code == 202
+        distinct_job_id = json.loads(distinct.body)["job_id"]
+        repeated = asyncio.run(main.generate_reels(object(), distinct_payload))
+        assert json.loads(repeated.body)["job_id"] == distinct_job_id
+
+        first_params = json.loads(
+            generation_jobs.get_job(conn, first_job_id)["request_params_json"]
+        )
+        distinct_params = json.loads(
+            generation_jobs.get_job(conn, distinct_job_id)["request_params_json"]
+        )
+        assert first_params[generation_jobs.DURABLE_QUEUE_WAIT_PARAM] is True
+        assert distinct_params[generation_jobs.DURABLE_QUEUE_WAIT_PARAM] is True
+        assert generation_jobs.get_job(conn, distinct_job_id)["status"] == "queued"
+        assert rate_calls == [
+            ("generation-submit", 6),
+            ("generation-submit", 6),
+        ]
+        assert attach_reservation.call_count == 2
     finally:
         conn.close()
 
@@ -12190,10 +12566,8 @@ def test_feed_paginates_five_clip_organizer_release_from_three_clip_request(
         conn.close()
 
 
-@pytest.mark.parametrize("throttle", ["capacity", "rate"])
-def test_feed_returns_ranked_reels_when_autofill_is_throttled(
+def test_feed_returns_ranked_reels_when_autofill_is_rate_limited(
     monkeypatch,
-    throttle: str,
 ) -> None:
     assert main.FEED_RATE_LIMIT_PER_WINDOW == 36
     conn = _conn()
@@ -12217,27 +12591,15 @@ def test_feed_returns_ranked_reels_when_autofill_is_throttled(
     wake = mock.Mock()
     monkeypatch.setattr(main, "_wake_generation_worker", wake)
     try:
-        if throttle == "capacity":
-            for index in range(main.GENERATION_LEARNER_ACTIVE_LIMIT):
-                generation_jobs.submit_or_get_active(
-                    conn,
-                    material_id="m1",
-                    concept_id=None,
-                    request_key=f"other-feed-request-{index}",
-                    content_fingerprint=f"other-fingerprint-{index}",
-                    learner_id="learner-1",
-                    request_params={},
-                )
-        else:
-            def reject_generation_submit(_request, scope, **_kwargs):
-                if scope == "generation-submit":
-                    raise main.HTTPException(status_code=429, detail="Too many requests.")
+        def reject_generation_submit(_request, scope, **_kwargs):
+            if scope == "generation-submit":
+                raise main.HTTPException(status_code=429, detail="Too many requests.")
 
-            monkeypatch.setattr(
-                main,
-                "_enforce_rate_limit",
-                reject_generation_submit,
-            )
+        monkeypatch.setattr(
+            main,
+            "_enforce_rate_limit",
+            reject_generation_submit,
+        )
 
         response = main.feed(object(), material_id="m1", autofill=True)
 
@@ -12247,6 +12609,62 @@ def test_feed_returns_ranked_reels_when_autofill_is_throttled(
         assert response["generation_job_id"] is None
         assert response["generation_job_status"] is None
         wake.assert_not_called()
+    finally:
+        conn.close()
+
+
+def test_feed_autofill_durably_queues_behind_existing_learner_job(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id=None,
+        request_key="existing-learner-request",
+        content_fingerprint="existing-fingerprint",
+        learner_id="learner-1",
+        request_params={},
+    )
+    monkeypatch.setattr(
+        main,
+        "_fetch_active_generation_row",
+        lambda *_args, **_kwargs: {"id": "existing-generation"},
+    )
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: [
+            {
+                "reel_id": f"ranked-{index}",
+                "selection_contract_version": main.SELECTION_CONTRACT_VERSION,
+            }
+            for index in range(5)
+        ],
+    )
+    wake = mock.Mock()
+    attach_reservation = mock.Mock()
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    monkeypatch.setattr(main, "attach_reservation_to_job", attach_reservation)
+    try:
+        response = main.feed(object(), material_id="m1", autofill=True)
+
+        assert [reel["reel_id"] for reel in response["reels"]] == [
+            f"ranked-{index}" for index in range(5)
+        ]
+        queued_id = response["generation_job_id"]
+        queued = generation_jobs.get_job(conn, queued_id)
+        assert queued and queued["status"] == "queued"
+        queued_params = json.loads(queued["request_params_json"])
+        assert queued_params[generation_jobs.DURABLE_QUEUE_WAIT_PARAM] is True
+        assert response["generation_job_status"] == "queued"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs "
+            "WHERE learner_id = 'learner-1' AND status IN ('queued', 'running')"
+        ).fetchone()[0] == 2
+        wake.assert_called_once_with()
+        attach_reservation.assert_called_once()
     finally:
         conn.close()
 

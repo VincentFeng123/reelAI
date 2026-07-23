@@ -328,6 +328,7 @@ def _discover(
     recovery_reason: str | None = None,
     recovery_rejected_video_ids: list[str] | None = None,
     analysis_limit: int | None = None,
+    covered_intent_obligation_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "limit": limit,
@@ -348,6 +349,10 @@ def _discover(
         kwargs["source_context"] = source_context
     if analysis_limit is not None:
         kwargs["analysis_limit"] = max(0, int(analysis_limit))
+    if covered_intent_obligation_keys:
+        kwargs["covered_intent_obligation_keys"] = sorted(
+            covered_intent_obligation_keys
+        )
     if recovery_tried_queries:
         kwargs["recovery_tried_queries"] = list(recovery_tried_queries)
         kwargs["recovery_reason"] = recovery_reason
@@ -4186,6 +4191,18 @@ def _retrieval_search_context(
         "matched_queries": list(video.get("matched_queries") or [])[:12],
         "matched_query_families": list(video.get("matched_families") or [])[:12],
         "matched_query_provenance": dict(video.get("matched_query_provenance") or {}),
+        "matched_query_constraint_ids": dict(
+            video.get("matched_query_constraint_ids") or {}
+        ),
+        "matched_query_intent_obligation_keys": dict(
+            video.get("matched_query_intent_obligation_keys") or {}
+        ),
+        "matched_intent_obligation_keys": list(
+            video.get("matched_intent_obligation_keys") or []
+        )[:16],
+        "matched_focused_intent_obligation_keys": list(
+            video.get("matched_focused_intent_obligation_keys") or []
+        )[:16],
     }
     if query_plan is not None:
         context.update(
@@ -4908,6 +4925,7 @@ class IngestionPipeline:
         recovery_tried_queries: list[str] | None = None,
         recovery_reason: str | None = None,
         recovery_rejected_video_ids: list[str] | None = None,
+        prior_covered_intent_obligation_keys: set[str] | None = None,
         _recovery_attempted: bool = False,
     ) -> tuple[list[ReelOutWithAttribution], list[str]]:
         """
@@ -5002,6 +5020,9 @@ class IngestionPipeline:
                 recovery_reason=recovery_reason,
                 recovery_rejected_video_ids=recovery_rejected_video_ids,
                 analysis_limit=analysis_limit,
+                covered_intent_obligation_keys=(
+                    prior_covered_intent_obligation_keys
+                ),
             )
         except _ClipProviderError:
             if generation_context is not None:
@@ -6843,6 +6864,9 @@ class IngestionPipeline:
                         clip_engine_expand.RECOVERY_REASON_ZERO_VALID_CLIPS
                     ),
                     recovery_rejected_video_ids=resolved_video_ids,
+                    prior_covered_intent_obligation_keys=(
+                        prior_covered_intent_obligation_keys
+                    ),
                     _recovery_attempted=True,
                 )
                 combined_resolved_video_ids = list(dict.fromkeys([

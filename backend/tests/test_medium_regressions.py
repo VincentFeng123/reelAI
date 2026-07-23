@@ -3592,7 +3592,7 @@ class MediumRegressionTests(unittest.TestCase):
         conn = self._build_ranked_feed_test_conn()
         service = ReelService(embedding_service=None, youtube_service=None)
         current_version = service.RANKED_FEED_CACHE_VERSION
-        self.assertEqual(current_version, 49)
+        self.assertEqual(current_version, 50)
 
         stale_relevance = {
             "score": 0.9,

@@ -1803,7 +1803,7 @@ _SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
 _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
-_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v12"
+_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v13"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
 _UPSTREAM_INTENT_CONTRACT_VERSION = "expansion_intent_v2"
 
@@ -2494,6 +2494,8 @@ def _require_pro_audit_semantic_schema(schema: dict[str, object]) -> None:
             "family",
             "a",
             "direct",
+            "self",
+            "stand",
             "ie",
             "oi",
             "rw",
@@ -2509,6 +2511,8 @@ def _require_pro_audit_semantic_schema(schema: dict[str, object]) -> None:
             "family",
             "a",
             "direct",
+            "self",
+            "stand",
             "ie",
             "oi",
             "rw",
@@ -2546,6 +2550,26 @@ class _ProCandidateAuditItem(_StrictModel):
         max_length=4,
     )
     directly_teaches_topic: bool = Field(default=False, strict=True, alias="direct")
+    self_contained: bool = Field(
+        default=False,
+        strict=True,
+        alias="self",
+        description=(
+            "True only when the final repaired sq-through-eq spoken span contains "
+            "its own necessary setup, referents, givens, quantities, reasoning, and "
+            "conclusion."
+        ),
+    )
+    is_standalone: bool = Field(
+        default=False,
+        strict=True,
+        alias="stand",
+        description=(
+            "True only when a cold viewer can understand and use the final repaired "
+            "sq-through-eq span without another clip, the request/title, or an "
+            "indispensable unspoken visual."
+        ),
+    )
     intent_evidence: list[_CompactIntentEvidence] = Field(
         default_factory=list,
         alias="ie",
@@ -3721,14 +3745,71 @@ def _pro_boundary_audit_prompts(
             f"intent {item.constraint_id}: {item.evidence_quote!r}"
             for item in candidate.intent_evidence
         )
-        current_cues = (
+        current_range_valid = (
+            0 <= candidate.start_line <= candidate.end_line < cue_count
+        )
+        current_start_anchor = (
+            _unique_boundary_anchor(
+                segments,
+                candidate.start_quote,
+                candidate.start_line,
+                candidate.end_line,
+                allow_timing_gaps=True,
+            )
+            if current_range_valid
+            else None
+        )
+        current_end_anchor = (
+            _unique_boundary_anchor(
+                segments,
+                candidate.end_quote,
+                candidate.start_line,
+                candidate.end_line,
+                allow_timing_gaps=True,
+            )
+            if current_range_valid
+            else None
+        )
+        current_selected_text = (
+            _semantic_clip_slice(
+                segments,
+                current_start_anchor.first_line,
+                current_end_anchor.last_line,
+                start_span=current_start_anchor.first_span,
+                end_span=current_end_anchor.last_span,
+            )[0]
+            if (
+                current_start_anchor is not None
+                and current_end_anchor is not None
+                and current_start_anchor.first_word_position
+                <= current_end_anchor.last_word_position
+            )
+            else "(current exact sq-through-eq span is invalid; recover from the full transcript)"
+        )
+        adjacent_indices = (
+            [
+                *range(
+                    max(0, candidate.start_line - _REPAIR_NEIGHBOR_CUES),
+                    candidate.start_line,
+                ),
+                *range(
+                    candidate.end_line + 1,
+                    min(
+                        cue_count,
+                        candidate.end_line + _REPAIR_NEIGHBOR_CUES + 1,
+                    ),
+                ),
+            ]
+            if current_range_valid
+            else []
+        )
+        adjacent_cues = (
             "\n".join(
                 f"[{line}] {_mmss(segments[line].get('start', 0.0))} "
                 f"{str(segments[line].get('text') or '').strip()}"
-                for line in range(candidate.start_line, candidate.end_line + 1)
+                for line in adjacent_indices
             )
-            if 0 <= candidate.start_line <= candidate.end_line < cue_count
-            else "(current cue range is invalid; recover from the full transcript)"
+            or "(no adjacent cues)"
         )
         blocks.append(
             f"<candidate audit_id={audit_id!r}>\n"
@@ -3753,8 +3834,11 @@ def _pro_boundary_audit_prompts(
             + "\n"
             "</untrusted_selector_hypotheses>\n"
             "<current_selected_cues_focus>\n"
-            f"{current_cues}\n"
+            f"{current_selected_text}\n"
             "</current_selected_cues_focus>\n"
+            "<adjacent_transcript_cues>\n"
+            f"{adjacent_cues}\n"
+            "</adjacent_transcript_cues>\n"
             "</candidate>"
         )
 
@@ -3887,8 +3971,8 @@ def _pro_boundary_audit_prompts(
           "reference. If it is generic, requires outside inference to establish the "
           "rejection, or supports both related and unrelated readings, decision MUST be keep.\n\n"
           "SEMANTIC METADATA — derive it afresh from literal speech, not selector labels or "
-          "outside knowledge. title, obj, facet, family, aliases, direct, ie, oi, rw, ow, "
-          "and ev must all "
+          "outside knowledge. title, obj, facet, family, aliases, direct, self, stand, ie, "
+          "oi, rw, ow, and ev must all "
           "describe the same atomic relationship actually established by the returned span. "
           "A defining relationship cannot be inferred merely because familiar adjectives, "
           "symbols, quantities, or neighboring concepts appear. If a concept requires "
@@ -3945,7 +4029,23 @@ def _pro_boundary_audit_prompts(
           "example.' Any repaired span must still contain the audit evidence_quote. The "
           "selector's cq and ie are untrusted hypotheses: exclude them when they belong to an "
           "agenda, completed prerequisite, prior example, or neighboring objective rather than "
-          "the audited unit.\n\n"
+          "the audited unit.\n"
+          "For the FINAL repaired sq-through-eq speech, inventory every definite or deictic "
+          "reference, pronoun, ordinal, comparison, scenario object, formula, number, unit, "
+          "measurement, result, and stated visual dependency. Phrases such as 'the curve,' "
+          "'that table,' 'this height,' or an unexplained numeric result are unresolved unless "
+          "the final spoken span itself supplies the required antecedent or givens. The title, "
+          "request, metadata, a previous clip, or an unseen graph/table/demonstration cannot "
+          "supply them. First shrink forward to a clean complete same-objective teaching unit "
+          "when one exists; otherwise expand only to the nearest contiguous same-objective "
+          "spoken setup. Missing visual context is not a rejection reason, but it must make "
+          "stand false when the speech cannot be independently understood without it.\n"
+          "Find the earliest complete teaching stop for obj. Once its necessary explanation, "
+          "answer, qualification, or observed result is complete, trim audience directions, "
+          "performance setup, suspense, jokes, countdowns, applause, laughter, screams, "
+          "reaction chatter, navigation, and the next topic. Retain a demonstration outcome "
+          "only when the observed result adds indispensable educational evidence not already "
+          "completed in the explanation, and then stop at that educational observation.\n\n"
           "REQUIRED COMMITMENT — the response schema uses compact keys; apply these exact "
           "definitions to every candidate:\n"
           "1. id=candidate_id and must equal audit_id. d=decision.\n"
@@ -4006,28 +4106,36 @@ def _pro_boundary_audit_prompts(
           "witness a two-body third-law pair, though they may witness balanced forces; a skater "
           "and wall with both push directions can witness action-reaction. A rejection returns "
           "direct=false, ie=[], oi=[], and rw=[].\n"
-          "5. ev=evidence_quote: copy 5-10 exact consecutive words proving the admission or "
+          "5. self=self_contained and stand=is_standalone must be recomputed from the FINAL "
+          "repaired sq-through-eq speech, never copied from selector hypotheses. self=true "
+          "only when that spoken span contains its own necessary setup, every referent, "
+          "inherited given, formula, quantity, reasoning step, and conclusion. stand=true "
+          "only when self=true and a cold viewer can independently understand and use the "
+          "unit without another clip, the request/title, or an indispensable unspoken visual. "
+          "If either test fails, return false truthfully but keep a valid related candidate; "
+          "these labels are never hard rejection gates. For a rejection return both false.\n"
+          "6. ev=evidence_quote: copy 5-10 exact consecutive words proving the admission or "
           "rejection decision. For KEEP it "
           "must be inside the returned repaired span and may come from its immediately nearby "
           "contiguous continuation. For any rejection it must be inside the ORIGINAL "
           "current sq-through-eq speech and ground that rejection.\n"
-          "6. ow=objective_witness_quote: for KEEP copy 5-10 exact consecutive words inside "
+          "7. ow=objective_witness_quote: for KEEP copy 5-10 exact consecutive words inside "
           "the FINAL repaired s:e corridor that directly prove the complete scalar t/obj/f/"
           "family claim. Setup or a weaker neighboring property is invalid. If a named payoff, "
           "application, mechanism, or defining claim occurs immediately after current e, "
           "extend e/eq through it; otherwise relabel every scalar field to the narrower claim "
           "ow actually proves. For a rejection, repeat ev in ow.\n"
-          "7. ds=direct_start_line and dq=direct_start_quote: independently locate the "
+          "8. ds=direct_start_line and dq=direct_start_quote: independently locate the "
           "earliest complete sentence or independent clause that DIRECTLY begins teaching obj. "
           "dq is a shortest unique 1-10-word exact quote beginning at that word. An agenda, "
           "preview, greeting, navigation, recap, completed prerequisite, or broad introduction "
           "that only mentions the target can never be dq. Do not reuse the supplied sq by "
           "default.\n"
-          "8. dc=direct_start_context_resolved: true only when a cold listener can begin at dq "
+          "9. dc=direct_start_context_resolved: true only when a cold listener can begin at dq "
           "and understand every referent, enumerated item, scenario object, given, comparison "
           "baseline, formula reference, and required prior result. A technical term explicitly "
           "named or defined at dq does not require an earlier standalone prerequisite.\n"
-          "9. s/e=start_line/end_line and sq/eq=start_quote/end_quote are the repaired final "
+          "10. s/e=start_line/end_line and sq/eq=start_quote/end_quote are the repaired final "
           "edges. If dc=true, sq MUST begin exactly at dq. If dc=false, sq MUST begin before dq "
           "at only the nearest indispensable spoken setup. Repair eq independently through the "
           "complete same-objective conclusion.\n"
@@ -4038,7 +4146,8 @@ def _pro_boundary_audit_prompts(
           "auditor ignores rejected boundary fields.\n\n"
           "MANDATORY WORD-EDGE CHECKLIST — apply every item to every KEEP candidate before "
           "returning it:\n"
-          "1. Read current_selected_cues_focus literally from current sq through current eq. "
+          "1. Read current_selected_cues_focus as the literal current sq-through-eq speech, "
+          "then use adjacent_transcript_cues and full_transcript_cues only to repair its edges. "
           "Treat its labels, title, objective, and scores as untrusted.\n"
           "2. Test the first spoken words. A bare number/result, sentence tail, recap of a "
           "completed earlier example, or mid-sentence fragment is never a valid cold start. "
@@ -22154,6 +22263,8 @@ def _validate_model_response(
                     "family",
                     "a",
                     "direct",
+                    "self",
+                    "stand",
                     "ie",
                     "oi",
                     "rw",
@@ -23105,10 +23216,9 @@ def _audit_pro_boundaries(
                     ),
                     budget_reserve=settings.get("_segment_budget_reserve"),
                     budget_reconcile=settings.get("_segment_budget_reconcile"),
-                    max_retries=(
-                        0
-                        if logical_correction
-                        else min(2, remaining_physical_dispatches - 1)
+                    max_retries=max(
+                        0,
+                        min(2, remaining_physical_dispatches - 1),
                     ),
                     use_full_transient_retry_budget=True,
                     claim_logical_quota=(
@@ -23671,6 +23781,10 @@ def _audit_pro_boundaries(
                     "facet": str(item.facet),
                     **family_payload,
                     "directly_teaches_topic": bool(item.directly_teaches_topic),
+                    "self_contained": bool(item.self_contained),
+                    "is_standalone": bool(
+                        item.self_contained and item.is_standalone
+                    ),
                     "intent_evidence": grounded_audit_intent,
                     **(
                         {

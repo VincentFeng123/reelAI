@@ -118,6 +118,8 @@ def _newton_audit_plan() -> gemini_segment._ProCandidateAuditPlan:
         "concept_family": "Newton's second law",
         "concept_aliases": ["F=ma"],
         "directly_teaches_topic": True,
+        "self_contained": True,
+        "is_standalone": True,
         "intent_evidence": [{
             "id": "law",
             "q": "net force on an object equals its mass times its acceleration",
@@ -140,7 +142,7 @@ def _newton_audit_plan() -> gemini_segment._ProCandidateAuditPlan:
     }])
 
 
-def test_v12_audit_budget_fits_forty_items_plus_observed_high_thinking() -> None:
+def test_v13_audit_budget_fits_forty_items_plus_observed_high_thinking() -> None:
     audit = gemini_segment._ProCandidateAuditPlan(items=[{
         "id": f"candidate-{index}",
         "d": "reject_filler_dominated",
@@ -150,6 +152,8 @@ def test_v12_audit_budget_fits_forty_items_plus_observed_high_thinking() -> None
         "family": "x",
         "a": [],
         "direct": False,
+        "self": False,
+        "stand": False,
         "ie": [],
         "oi": [],
         "rw": [],
@@ -186,6 +190,8 @@ def test_typical_nine_candidate_audit_uses_smaller_admissible_output_reservation
         "family": "x",
         "a": [],
         "direct": False,
+        "self": False,
+        "stand": False,
         "ie": [],
         "oi": [],
         "rw": [],
@@ -255,6 +261,79 @@ def test_pro_selector_and_boundary_audit_recover_one_transient_failure(
         call["error_history"][0]["provider_status_code"]
         for call in result.calls
     ] == [504, 429]
+
+
+@pytest.mark.parametrize("retry_recovers", [True, False])
+def test_audit_schema_correction_uses_remaining_source_budget_without_exceeding_cap(
+    monkeypatch,
+    retry_recovers: bool,
+) -> None:
+    plan = _newton_plan()
+    valid_audit = _newton_audit_plan()
+    invalid_audit = valid_audit.model_dump(mode="json", by_alias=True)
+    invalid_audit["items"][0]["t"] = "x" * 97
+    correction_outcomes = (
+        [
+            _RetryHTTPError(504),
+            _RetryResponse(valid_audit.model_dump_json(by_alias=True)),
+        ]
+        if retry_recovers
+        else [
+            _RetryHTTPError(504),
+            _RetryHTTPError(504),
+            _RetryResponse(valid_audit.model_dump_json(by_alias=True)),
+        ]
+    )
+    fake = _RetryClient(
+        _RetryResponse(plan.model_dump_json(by_alias=True)),
+        _RetryResponse(json.dumps(invalid_audit)),
+        *correction_outcomes,
+    )
+    monkeypatch.setattr(gemini_client, "get_client", lambda: fake)
+    monkeypatch.setattr(gemini_client.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        gemini_client.random,
+        "uniform",
+        lambda lower, _upper: lower,
+    )
+
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "supadata-cue-0",
+                "start": 0.0,
+                "end": 8.0,
+                "text": (
+                    "Newton's second law says that the net force on an object "
+                    "equals its mass times its acceleration."
+                ),
+            }],
+            "words": [],
+            "source": "supadata",
+        },
+        {"_segment_operation": "pro_authoritative"},
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic="Newton's second law F=ma",
+        deadline_monotonic=time.monotonic() + 180.0,
+    )
+
+    assert (result.error is None) is retry_recovers
+    assert result.accepted_count == (1 if retry_recovers else 0)
+    assert len(fake.calls) == gemini_segment._PRO_SOURCE_MAX_PHYSICAL_DISPATCHES
+    assert len(fake.outcomes) == (0 if retry_recovers else 1)
+    assert sum(
+        int(call.get("physical_dispatches") or 0)
+        for call in result.calls
+    ) == gemini_segment._PRO_SOURCE_MAX_PHYSICAL_DISPATCHES
+    assert result.calls[1]["contract_retry_attempt"] == 1
+    assert result.calls[2]["physical_dispatches"] == 2
+    if retry_recovers:
+        assert result.calls[2]["contract_retry_attempt"] == 2
+        assert result.calls[2]["contract_retry_recovered"] is True
+        assert (
+            result.calls[2]["error_history"][0]["provider_status_code"]
+            == 504
+        )
 
 
 def test_boundary_audit_late_transients_get_three_physical_attempts(
@@ -625,7 +704,7 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     assert result.calls[0]["reserved_output_tokens"] == call["max_output_tokens"]
     assert audit_call["schema"] is gemini_segment._ProCandidateAuditPlan
     assert audit_call["operation"] == "pro_boundary_audit"
-    assert audit_call["prompt_version"] == "pro_candidate_audit_v12"
+    assert audit_call["prompt_version"] == "pro_candidate_audit_v13"
     assert audit_call["thinking_level"] == "medium"
     assert audit_call["media_resolution"] is None
     assert gemini_segment._PRO_FINAL_AUDIT_RESERVED_S >= 60.0

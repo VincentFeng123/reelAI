@@ -238,6 +238,164 @@ def test_operation_replay_is_free_and_refunded_or_stale_work_can_reopen() -> Non
     assert billing.billing_status(conn, account_id, now=stale_now)["used_searches"] == 1
 
 
+@pytest.mark.parametrize("link_mode", ["reservation_jobs", "legacy"])
+@pytest.mark.parametrize("job_status", ["queued", "running"])
+@pytest.mark.parametrize("stale_reason", ["age", "utc_day"])
+def test_stale_reconciliation_keeps_quota_for_nonterminal_generation_jobs(
+    link_mode: str,
+    job_status: str,
+    stale_reason: str,
+) -> None:
+    conn = _conn()
+    account_id = _account(conn)
+    material_id = f"material-{link_mode}-{job_status}-{stale_reason}"
+    conn.execute(
+        "INSERT INTO materials (id, raw_text, source_type, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (material_id, "Biology", "topic", BASE_TIME.isoformat()),
+    )
+
+    def submit_job(suffix: str) -> dict:
+        job, created = generation_jobs.submit_or_get_active(
+            conn,
+            material_id=material_id,
+            concept_id=None,
+            request_key=f"{material_id}-{suffix}",
+            content_fingerprint=f"{material_id}-{suffix}-fingerprint",
+            learner_id=account_id,
+            request_params={generation_jobs.DURABLE_QUEUE_WAIT_PARAM: True},
+            now=BASE_TIME,
+        )
+        assert created
+        return job
+
+    active_job = submit_job("active")
+    if link_mode == "reservation_jobs":
+        terminal_anchor = submit_job("terminal-anchor")
+        reservation = billing.reserve_search(
+            conn,
+            account_id=account_id,
+            operation_key=f"material:{material_id}",
+            surface="generation",
+            generation_job_id=terminal_anchor["id"],
+            now=BASE_TIME,
+            enforce=True,
+        )
+        conn.execute(
+            """
+            INSERT INTO search_quota_reservation_jobs (
+                reservation_id, generation_job_id, attached_at
+            ) VALUES (?, ?, ?)
+            """,
+            (reservation["id"], active_job["id"], BASE_TIME.isoformat()),
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=terminal_anchor["id"],
+            status="failed",
+            error_code="provider_failed",
+            now=BASE_TIME + timedelta(minutes=2),
+        )
+    else:
+        reservation = billing.reserve_search(
+            conn,
+            account_id=account_id,
+            operation_key=f"material:{material_id}",
+            surface="generation",
+            generation_job_id=active_job["id"],
+            now=BASE_TIME,
+            enforce=True,
+        )
+        conn.execute(
+            "DELETE FROM search_quota_reservation_jobs WHERE reservation_id = ?",
+            (reservation["id"],),
+        )
+
+    if job_status == "running":
+        leased = generation_jobs.lease_job(
+            conn,
+            job_id=active_job["id"],
+            lease_owner="billing-test-worker",
+            now=BASE_TIME + timedelta(minutes=1),
+        )
+        assert leased and leased["status"] == "running"
+
+    if stale_reason == "age":
+        reconcile_at = BASE_TIME + timedelta(hours=3)
+        max_age_seconds = 2 * 60 * 60
+    else:
+        reconcile_at = BASE_TIME + timedelta(hours=13)
+        max_age_seconds = 3 * 24 * 60 * 60
+
+    assert billing.reconcile_stale_reservations(
+        conn,
+        now=reconcile_at,
+        max_age_seconds=max_age_seconds,
+        account_id=account_id,
+    ) == 0
+    assert conn.execute(
+        "SELECT status FROM search_quota_reservations WHERE id = ?",
+        (reservation["id"],),
+    ).fetchone()[0] == "reserved"
+
+    if link_mode == "reservation_jobs":
+        generation_jobs.append_event(
+            conn,
+            job_id=active_job["id"],
+            event_type="final",
+            payload={"reels": [{"reel_id": "usable-result"}], "batch_size": 1},
+            now=reconcile_at,
+        )
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=active_job["id"],
+            status="completed",
+            now=reconcile_at,
+        )
+        expected_status = "consumed"
+    else:
+        generation_jobs.transition_terminal(
+            conn,
+            job_id=active_job["id"],
+            status="failed",
+            error_code="provider_failed",
+            now=reconcile_at,
+        )
+        expected_status = "refunded"
+    assert conn.execute(
+        "SELECT status FROM search_quota_reservations WHERE id = ?",
+        (reservation["id"],),
+    ).fetchone()[0] == expected_status
+
+
+def test_stale_reconciliation_still_refunds_an_orphan_reservation() -> None:
+    conn = _conn()
+    account_id = _account(conn)
+    reservation = billing.reserve_search(
+        conn,
+        account_id=account_id,
+        operation_key="material:orphan",
+        surface="generation",
+        now=BASE_TIME,
+        enforce=True,
+    )
+
+    assert billing.reconcile_stale_reservations(
+        conn,
+        now=BASE_TIME + timedelta(hours=3),
+        account_id=account_id,
+    ) == 1
+    assert conn.execute(
+        "SELECT status FROM search_quota_reservations WHERE id = ?",
+        (reservation["id"],),
+    ).fetchone()[0] == "refunded"
+    assert conn.execute(
+        "SELECT used_count FROM daily_search_usage "
+        "WHERE account_id = ? AND usage_day = ?",
+        (account_id, BASE_TIME.date().isoformat()),
+    ).fetchone()[0] == 0
+
+
 def test_concurrent_sqlite_reservations_never_exceed_free_limit(tmp_path) -> None:
     path = str(tmp_path / "quota.sqlite3")
     setup = _conn(path)
