@@ -4780,7 +4780,10 @@ class IngestionPipeline:
         )
         selection_topic = (
             str(disc.get("corrected") or query)
-            if str(disc.get("provider_used") or "").casefold() == "gemini"
+            if (
+                str(disc.get("provider_used") or "").casefold() == "gemini"
+                and intent_contract is not None
+            )
             else query
         )
 
@@ -5081,12 +5084,18 @@ class IngestionPipeline:
             discovered_video["_knowledge_level"] = knowledge_level
             discovered_video["_topic_terms"] = topic_terms
             discovered_video["_literal_topic"] = authoritative_topic
-            # The expansion model's concise, intent-preserving summary is the
-            # shared retrieval/selection contract. Keep the literal request on
-            # the source for traceability, but do not make Gemini Pro re-parse
-            # conversational search text after expansion already normalized it.
+            # A strictly validated expansion contract may safely provide the
+            # concise selection summary. A retrieval-only Gemini fallback has
+            # no trusted intent contract, so Gemini Pro must remain anchored to
+            # the learner's exact request even though its AI queries found the
+            # candidate source.
             discovered_video["_selection_topic"] = (
                 corrected_topic
+                if (
+                    str(disc.get("provider_used") or "").casefold() == "gemini"
+                    and intent_contract is not None
+                )
+                else authoritative_topic
                 if str(disc.get("provider_used") or "").casefold() == "gemini"
                 else topic
             )
@@ -6812,9 +6821,21 @@ class IngestionPipeline:
             ),
             None,
         )
+        cohort_wide_selector_transient = bool(
+            not completed_results
+            and len(provider_errors) == len(all_futures) > 0
+            and all(
+                error.retryable
+                and error.code == "provider_transient"
+                and str(error.provider or "").casefold() == "gemini"
+                and str(error.operation or "").casefold() == "segmentation"
+                for error in provider_errors
+            )
+        )
         if (
             not reels
             and blocking_provider_error is None
+            and not cohort_wide_selector_transient
             and not _recovery_attempted
             and generation_context is not None
             and resolved_video_ids

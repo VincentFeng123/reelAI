@@ -833,6 +833,396 @@ def test_generation_gemini_ledger_exposure_unions_and_deduplicates_snapshots() -
         conn.close()
 
 
+def test_generation_worker_gemini_ticket_settles_after_lease_reclaim(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_transactional_worker_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="main-gemini-ticket-lease-race",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast"},
+        now=now,
+    )
+    first = generation_jobs.lease_job(
+        conn,
+        job_id=str(job["id"]),
+        lease_owner="worker-a",
+        now=now,
+    )
+    assert first and first["attempt_count"] == 1
+
+    captured: dict[str, object] = {}
+
+    class ContextCaptured(RuntimeError):
+        pass
+
+    def capture_context(*_args, **kwargs):
+        captured.update(kwargs)
+        raise ContextCaptured
+
+    monkeypatch.setattr(main, "GenerationContext", capture_context)
+    try:
+        with pytest.raises(ContextCaptured):
+            main._run_leased_generation_job(first, threading.Event())
+
+        reserve_ticket = captured["gemini_ticket_reserve_sink"]
+        settle_ticket = captured["gemini_ticket_settle_sink"]
+        assert callable(reserve_ticket)
+        assert callable(settle_ticket)
+        admitted = reserve_ticket(
+            ticket_id="main-race-ticket",
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            reservation={
+                "gemini_reservation_id": 1,
+                "reserved_input_tokens": 100,
+                "reserved_output_tokens": 10,
+                "reserved_cost_usd": 0.08,
+                "admitted_cost_usd": 0.08,
+                "billing_cost_multiplier": 1.0,
+                "admitted_physical_attempts": 1,
+            },
+        )
+        assert admitted and admitted["state"] == "admitted"
+
+        requeued = generation_jobs.requeue_retryable_failure(
+            conn,
+            job_id=str(job["id"]),
+            lease_owner="worker-a",
+            expected_attempt_count=1,
+            now=now + timedelta(seconds=1),
+        )
+        assert requeued and requeued["status"] == "queued"
+        successor = generation_jobs.lease_job(
+            conn,
+            job_id=str(job["id"]),
+            lease_owner="worker-b",
+            now=now + timedelta(seconds=2),
+        )
+        assert successor and successor["attempt_count"] == 2
+
+        assert reserve_ticket(
+            ticket_id="stale-worker-ticket",
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            reservation={
+                "gemini_reservation_id": 2,
+                "reserved_input_tokens": 100,
+                "reserved_output_tokens": 10,
+                "reserved_cost_usd": 0.08,
+                "admitted_cost_usd": 0.08,
+                "billing_cost_multiplier": 1.0,
+                "admitted_physical_attempts": 1,
+            },
+        ) is None
+        settled = settle_ticket(
+            ticket_id="main-race-ticket",
+            state="settled_known",
+            model="gemini-3.1-pro-preview",
+            input_tokens=100,
+            output_tokens=10,
+            total_tokens=110,
+            actual_cost_usd=0.00032,
+            metadata={"cached_tokens": 0},
+        )
+        assert settled and settled["state"] == "settled_known"
+        current = generation_jobs.get_job(conn, str(job["id"]))
+        assert current
+        assert current["status"] == "running"
+        assert current["lease_owner"] == "worker-b"
+        assert current["attempt_count"] == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM generation_provider_usage WHERE job_id = ?",
+            (str(job["id"]),),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_generation_gemini_ticket_exposure_uses_terminal_state_once() -> None:
+    conn = _conn()
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="gemini-ticket-state-exposure",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast"},
+    )
+    ticket_rows = (
+        (
+            "ticket-known",
+            1,
+            100,
+            10,
+            110,
+            {
+                "ticket_schema_version": "gemini_dispatch_ticket_v1",
+                "ticket_state": "settled_known",
+                "admitted_cost_usd": 0.08,
+                "actual_cost_usd": 0.00031,
+                "billing_usage_known": True,
+                "billing_unknown_reserved_cost_usd": 0.0,
+            },
+        ),
+        (
+            "ticket-unknown",
+            1,
+            0,
+            0,
+            0,
+            {
+                "ticket_schema_version": "gemini_dispatch_ticket_v1",
+                "ticket_state": "settled_unknown",
+                "admitted_cost_usd": 0.05,
+                "billing_usage_known": False,
+                "billing_unknown_reserved_cost_usd": 0.03,
+            },
+        ),
+        (
+            "ticket-admitted",
+            0,
+            0,
+            0,
+            0,
+            {
+                "ticket_schema_version": "gemini_dispatch_ticket_v1",
+                "ticket_state": "admitted",
+                "admitted_cost_usd": 0.04,
+                "billing_usage_known": False,
+                "billing_unknown_reserved_cost_usd": 0.0,
+            },
+        ),
+        (
+            "ticket-released",
+            0,
+            0,
+            0,
+            0,
+            {
+                "ticket_schema_version": "gemini_dispatch_ticket_v1",
+                "ticket_state": "released",
+                "admitted_cost_usd": 0.02,
+                "billing_usage_known": False,
+                "billing_unknown_reserved_cost_usd": 0.0,
+            },
+        ),
+    )
+    for (
+        usage_id,
+        billable_requests,
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        metadata,
+    ) in ticket_rows:
+        generation_jobs.record_provider_usage(
+            conn,
+            job_id=str(job["id"]),
+            provider="gemini",
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            billable_requests=billable_requests,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            metadata=metadata,
+            usage_id=usage_id,
+        )
+    duplicate_checkpoint_record = {
+        "provider": "gemini",
+        "operation": "pro_authoritative",
+        "model_used": "gemini-3.1-pro-preview",
+        "billable_requests": 1,
+        "input_tokens": 100,
+        "output_tokens": 10,
+        "total_tokens": 110,
+        "metadata": {
+            "gemini_ticket_id": "ticket-known",
+            "gemini_durable_ticket": True,
+            "billing_usage_known": True,
+            "provider_call": True,
+        },
+    }
+    try:
+        exposure = main._generation_gemini_ledger_exposure(
+            conn,
+            str(job["id"]),
+            prior_records=[duplicate_checkpoint_record],
+        )
+
+        assert exposure["committed_cost_usd"] == pytest.approx(0.07031)
+        assert exposure["cost_exposure_usd"] == pytest.approx(0.07031)
+        assert exposure["billing_unknown_cost_exposure_usd"] == pytest.approx(
+            0.07
+        )
+        assert exposure["lifetime_reserved_worst_case_cost_usd"] == pytest.approx(
+            0.19
+        )
+    finally:
+        conn.close()
+
+
+def test_terminal_status_and_replay_overlay_late_gemini_ticket_settlement() -> None:
+    conn = _conn()
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="late-ticket-terminal-overlay",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast"},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=str(job["id"]),
+        lease_owner="worker-a",
+        now=now,
+    )
+    assert leased
+    assert generation_jobs.admit_gemini_dispatch_ticket(
+        conn,
+        ticket_id="late-terminal-ticket",
+        job_id=str(job["id"]),
+        lease_owner="worker-a",
+        expected_attempt_count=1,
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        admitted_cost_usd=0.08,
+        provider_attempt=1,
+        reservation_id=1,
+        reserved_input_tokens=100,
+        reserved_output_tokens=10,
+        reserved_cost_usd=0.08,
+        billing_cost_multiplier=1.0,
+        admitted_physical_attempts=1,
+        now=now + timedelta(milliseconds=100),
+    )
+    stale_usage = {
+        "budget": {
+            "gemini": {
+                "committed_cost_usd": 0.08,
+                "cost_exposure_usd": 0.08,
+                "billing_unknown_cost_exposure_usd": 0.08,
+                "lifetime_reserved_worst_case_cost_usd": 0.08,
+            },
+        },
+        "summary": {
+            "accepted_clips": 1,
+            "known_billed_cost_usd": 0.0,
+            "billing_unknown_reserved_cost_usd": 0.08,
+            "cost_per_accepted_clip_usd": None,
+        },
+        "provider_calls": [],
+    }
+    terminal = generation_jobs.transition_terminal(
+        conn,
+        job_id=str(job["id"]),
+        status="failed",
+        lease_owner="worker-a",
+        usage=stale_usage,
+        now=now + timedelta(milliseconds=200),
+    )
+    assert terminal and terminal["status"] == "failed"
+    assert generation_jobs.settle_gemini_dispatch_ticket(
+        conn,
+        ticket_id="late-terminal-ticket",
+        job_id=str(job["id"]),
+        state="settled_known",
+        input_tokens=100,
+        output_tokens=10,
+        total_tokens=110,
+        actual_cost_usd=0.00031,
+        now=now + timedelta(milliseconds=300),
+    )
+    try:
+        status = main._generation_job_status_payload(conn, terminal)
+        events = main._sanitize_generation_replay_events(
+            conn,
+            terminal,
+            generation_jobs.replay_events(conn, job_id=str(job["id"])),
+        )
+        terminal_event = next(
+            event for event in events if event["type"] == "terminal"
+        )
+
+        for usage in (status["usage"], terminal_event["payload"]["usage"]):
+            gemini_budget = usage["budget"]["gemini"]
+            summary = usage["summary"]
+            assert gemini_budget["committed_cost_usd"] == pytest.approx(
+                0.00031
+            )
+            assert gemini_budget["cost_exposure_usd"] == pytest.approx(
+                0.00031
+            )
+            assert gemini_budget[
+                "billing_unknown_cost_exposure_usd"
+            ] == 0.0
+            assert gemini_budget[
+                "lifetime_reserved_worst_case_cost_usd"
+            ] == pytest.approx(0.08)
+            assert summary["known_billed_cost_usd"] == pytest.approx(
+                0.00031
+            )
+            assert summary["current_cost_exposure_usd"] == pytest.approx(
+                0.00031
+            )
+            assert summary["billing_unknown_reserved_cost_usd"] == 0.0
+            assert summary["billing_unknown_calls"] == 0
+            assert summary["billing_unknown_attempts"] == 0
+            assert summary["cost_per_accepted_clip_usd"] == pytest.approx(
+                0.00031
+            )
+    finally:
+        conn.close()
+
+
+def test_running_generation_status_does_not_scan_gemini_ticket_ledger(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="running-status-no-ticket-scan",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast"},
+    )
+    running = generation_jobs.lease_job(
+        conn,
+        job_id=str(job["id"]),
+        lease_owner="worker-a",
+    )
+    assert running
+    ledger_exposure = mock.Mock(
+        side_effect=AssertionError("running status scanned provider ledger")
+    )
+    monkeypatch.setattr(
+        main,
+        "_generation_gemini_ledger_exposure",
+        ledger_exposure,
+    )
+    try:
+        status = main._generation_job_status_payload(conn, running)
+
+        assert status["status"] == "running"
+        ledger_exposure.assert_not_called()
+    finally:
+        conn.close()
+
+
 def test_ambiguous_final_release_commit_is_not_replayed_or_duplicated(
     monkeypatch,
 ) -> None:
@@ -3807,6 +4197,305 @@ def test_generation_worker_retries_failure_terminalization_once(
             event["type"]
             for event in generation_jobs.replay_events(conn, job_id=str(job["id"]))
         ] == ["terminal"]
+    finally:
+        conn.close()
+
+
+def test_generation_retry_terminalizes_and_reports_unemitted_gemini_exposure(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_transactional_worker_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="terminal-gemini-exposure-retry",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    generated: list[dict] = []
+    retrieval_calls = 0
+    outstanding_admitted_cost = 0.0
+    final_outstanding_admitted_cost = 0.0
+    settled_unemitted_cost = (10 * 2.0 + 2 * 12.0) / 1_000_000.0
+
+    def record_known_call(context) -> None:
+        reservation = context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=100,
+            max_output_tokens=100,
+        )
+        context.record_gemini(
+            operation="segmentation",
+            attempt=1,
+            model_used="gemini-3.1-pro-preview",
+            quality_degraded=False,
+            usage={
+                **reservation,
+                "prompt_tokens": 10,
+                "candidate_tokens": 2,
+                "thought_tokens": 0,
+                "total_tokens": 12,
+                "dispatched": True,
+            },
+            stage="segmentation",
+        )
+
+    def generate_stage(worker_conn, **kwargs) -> None:
+        nonlocal retrieval_calls, outstanding_admitted_cost
+        nonlocal final_outstanding_admitted_cost
+        retrieval_calls += 1
+        context = kwargs["generation_context"]
+        record_known_call(context)
+        if retrieval_calls == 1:
+            settled = context.reserve_gemini_call(
+                operation="pro_authoritative",
+                model="gemini-3.1-pro-preview",
+                estimated_input_tokens=100,
+                max_output_tokens=100,
+            )
+            assert context.reconcile_gemini_call(
+                model_used="gemini-3.1-pro-preview",
+                usage={
+                    **settled,
+                    "prompt_tokens": 10,
+                    "candidate_tokens": 2,
+                    "thought_tokens": 0,
+                    "total_tokens": 12,
+                    "dispatched": True,
+                },
+            )
+            outstanding = context.reserve_gemini_call(
+                operation="pro_authoritative",
+                model="gemini-3.1-pro-preview",
+                estimated_input_tokens=100,
+                max_output_tokens=100,
+            )
+            outstanding_admitted_cost = float(
+                outstanding["admitted_cost_usd"]
+            )
+            raise ProviderTransientError(
+                "Gemini is temporarily unavailable.",
+                provider="gemini",
+                operation="segmentation",
+                status_code=503,
+            )
+        final_outstanding = context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=100,
+            max_output_tokens=100,
+        )
+        final_outstanding_admitted_cost = float(
+            final_outstanding["admitted_cost_usd"]
+        )
+        generated.append(
+            _insert_generation_reel(
+                worker_conn,
+                generation_id=str(kwargs["generation_id"]),
+                reel_id="terminal-exposure-reel",
+                video_id="TERMINAL001",
+                created_at=now.isoformat(),
+            )
+        )
+        context.increment_counter("persisted_clips")
+
+    def order_batch(reels, **_kwargs):
+        return mock.Mock(
+            reels=list(reels),
+            ordered_reel_ids=[reel["reel_id"] for reel in reels],
+            assessment_checkpoint_reel_ids=[],
+            model_used=None,
+            degraded=False,
+            fallback_reason=None,
+            provider_called=False,
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: list(generated),
+    )
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
+    try:
+        first_lease = generation_jobs.lease_job(
+            conn,
+            job_id=str(job["id"]),
+            lease_owner="terminal-exposure-worker-1",
+            now=now,
+        )
+        assert first_lease
+        main._run_leased_generation_job(first_lease, threading.Event())
+
+        requeued = generation_jobs.get_job(conn, str(job["id"]))
+        assert requeued and requeued["status"] == "queued"
+        first_usage = json.loads(str(requeued["usage_json"] or "{}"))
+        first_budget = first_usage["budget"]["gemini"]
+        first_summary = first_usage["summary"]
+        first_unknown = outstanding_admitted_cost
+        first_known = settled_unemitted_cost * 2
+        assert first_budget["admission_closed"] is True
+        assert first_budget["terminalized_reservation_count"] == 1
+        assert first_budget["inflight_reserved_cost_usd"] == 0.0
+        assert first_summary["gemini_calls"] == 1
+        assert first_summary["billing_unknown_calls"] == 0
+        assert first_summary[
+            "unattributed_known_billed_cost_usd"
+        ] == pytest.approx(settled_unemitted_cost)
+        assert first_summary[
+            "unattributed_billing_unknown_cost_usd"
+        ] == pytest.approx(first_unknown)
+        assert first_summary[
+            "billing_unknown_reserved_cost_usd"
+        ] == pytest.approx(first_unknown)
+        assert (
+            first_summary["known_billed_cost_usd"]
+            + first_summary["billing_unknown_reserved_cost_usd"]
+        ) == pytest.approx(first_budget["cost_exposure_usd"])
+        assert first_summary["known_billed_cost_usd"] == pytest.approx(
+            first_known
+        )
+
+        second_lease = generation_jobs.lease_job(
+            conn,
+            job_id=str(job["id"]),
+            lease_owner="terminal-exposure-worker-2",
+            now=now + timedelta(seconds=1),
+        )
+        assert second_lease
+        main._run_leased_generation_job(second_lease, threading.Event())
+
+        completed = generation_jobs.get_job(conn, str(job["id"]))
+        assert completed and completed["status"] == "completed"
+        usage = json.loads(str(completed["usage_json"] or "{}"))
+        budget = usage["budget"]["gemini"]
+        summary = usage["summary"]
+        final_unknown = first_unknown + final_outstanding_admitted_cost
+        assert summary["gemini_calls"] == 2
+        assert summary["billing_unknown_calls"] == 0
+        assert summary["billing_unknown_reserved_cost_usd"] == pytest.approx(
+            final_unknown
+        )
+        assert summary["known_billed_cost_usd"] == pytest.approx(
+            settled_unemitted_cost * 3
+        )
+        assert summary[
+            "unattributed_billing_unknown_cost_usd"
+        ] == pytest.approx(final_unknown)
+        assert (
+            summary["known_billed_cost_usd"]
+            + summary["billing_unknown_reserved_cost_usd"]
+        ) == pytest.approx(budget["cost_exposure_usd"])
+        assert summary["accepted_clips"] == 1
+        assert summary["cost_per_accepted_clip_usd"] is None
+        assert budget["inflight_reserved_cost_usd"] == 0.0
+        assert budget["admission_closed"] is True
+        assert retrieval_calls == 2
+    finally:
+        conn.close()
+
+
+def test_generation_terminal_cost_per_clip_includes_settled_unemitted_cost(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_transactional_worker_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="terminal-known-cost-per-clip",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    generated: list[dict] = []
+    known_cost = (10 * 2.0 + 2 * 12.0) / 1_000_000.0
+
+    def generate_stage(worker_conn, **kwargs) -> None:
+        context = kwargs["generation_context"]
+        settled = context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=100,
+            max_output_tokens=100,
+        )
+        assert context.reconcile_gemini_call(
+            model_used="gemini-3.1-pro-preview",
+            usage={
+                **settled,
+                "prompt_tokens": 10,
+                "candidate_tokens": 2,
+                "thought_tokens": 0,
+                "total_tokens": 12,
+                "dispatched": True,
+            },
+        )
+        generated.append(
+            _insert_generation_reel(
+                worker_conn,
+                generation_id=str(kwargs["generation_id"]),
+                reel_id="terminal-known-cost-reel",
+                video_id="KNOWNCOST01",
+                created_at=now.isoformat(),
+            )
+        )
+        context.increment_counter("persisted_clips")
+
+    def order_batch(reels, **_kwargs):
+        return mock.Mock(
+            reels=list(reels),
+            ordered_reel_ids=[reel["reel_id"] for reel in reels],
+            assessment_checkpoint_reel_ids=[],
+            model_used=None,
+            degraded=False,
+            fallback_reason=None,
+            provider_called=False,
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: list(generated),
+    )
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
+    try:
+        leased = generation_jobs.lease_job(
+            conn,
+            job_id=str(job["id"]),
+            lease_owner="terminal-known-cost-worker",
+            now=now,
+        )
+        assert leased
+        main._run_leased_generation_job(leased, threading.Event())
+
+        completed = generation_jobs.get_job(conn, str(job["id"]))
+        assert completed and completed["status"] == "completed"
+        usage = json.loads(str(completed["usage_json"] or "{}"))
+        budget = usage["budget"]["gemini"]
+        summary = usage["summary"]
+        assert summary["gemini_calls"] == 0
+        assert summary["known_billed_cost_usd"] == pytest.approx(known_cost)
+        assert summary["billing_unknown_reserved_cost_usd"] == 0.0
+        assert summary["unattributed_known_billed_cost_usd"] == pytest.approx(
+            known_cost
+        )
+        assert summary["accepted_clips"] == 1
+        assert summary["cost_per_accepted_clip_usd"] == pytest.approx(
+            known_cost
+        )
+        assert budget["cost_exposure_usd"] == pytest.approx(known_cost)
+        assert budget["billing_unknown_cost_exposure_usd"] == 0.0
+        assert budget["inflight_reserved_cost_usd"] == 0.0
     finally:
         conn.close()
 
@@ -6991,6 +7680,110 @@ def test_generation_worker_reuses_attached_generation_after_lease_reclaim(
             "SELECT generation_id FROM reels WHERE id = 'lease-reel'"
         ).fetchone()
         assert persisted[0] == generation_ids[0]
+    finally:
+        conn.close()
+
+
+def test_generation_worker_restores_yielded_attempt_cost_exposure(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="yielded-cost-exposure",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "slow", "num_reels": 2},
+        now=now,
+    )
+    first_lease = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="worker-a",
+        now=now,
+    )
+    assert first_lease
+    restored_snapshots: list[dict] = []
+    expected_exposure = 0.0
+    expected_unknown = 0.0
+
+    def yield_with_provider_exposure(_worker_conn, **kwargs) -> None:
+        nonlocal expected_exposure, expected_unknown
+        context = kwargs["generation_context"]
+        if not restored_snapshots:
+            settled = context.reserve_gemini_call(
+                operation="expansion",
+                model="gemini-3.1-flash-lite",
+                estimated_input_tokens=1_000,
+                max_output_tokens=100,
+            )
+            assert context.reconcile_gemini_call(
+                model_used="gemini-3.1-flash-lite",
+                usage={
+                    **settled,
+                    "prompt_tokens": 400,
+                    "candidate_tokens": 0,
+                    "thought_tokens": 0,
+                    "total_tokens": 400,
+                    "dispatched": True,
+                },
+            ) is True
+            inflight = context.reserve_gemini_call(
+                operation="expansion",
+                model="gemini-3.1-flash-lite",
+                estimated_input_tokens=2_000,
+                max_output_tokens=100,
+            )
+            expected_unknown = float(inflight["admitted_cost_usd"])
+            expected_exposure = 0.0001 + expected_unknown
+        restored_snapshots.append(context.budget.snapshot()["gemini"])
+        raise main.GenerationCancelledError("worker yielded")
+
+    monkeypatch.setattr(
+        main.reel_service,
+        "generate_reels",
+        yield_with_provider_exposure,
+    )
+    try:
+        main._run_leased_generation_job(first_lease, threading.Event())
+        checkpointed = generation_jobs.get_job(conn, job["id"])
+        assert checkpointed and checkpointed["status"] == "running"
+        first_usage = json.loads(checkpointed["usage_json"])
+        assert first_usage["budget"]["gemini"]["cost_exposure_usd"] == pytest.approx(
+            expected_exposure
+        )
+        assert first_usage["budget"]["gemini"][
+            "billing_unknown_cost_exposure_usd"
+        ] == pytest.approx(expected_unknown)
+        assert first_usage["summary"]["known_billed_cost_usd"] == pytest.approx(
+            0.0001
+        )
+
+        reclaim_at = now + timedelta(seconds=1)
+        conn.execute(
+            "UPDATE reel_generation_jobs SET lease_expires_at = ? WHERE id = ?",
+            ((reclaim_at - timedelta(seconds=1)).isoformat(), job["id"]),
+        )
+        second_lease = generation_jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-b",
+            now=reclaim_at,
+        )
+        assert second_lease and second_lease["attempt_count"] == 2
+        main._run_leased_generation_job(second_lease, threading.Event())
+
+        assert len(restored_snapshots) == 2
+        assert restored_snapshots[1]["cost_exposure_usd"] == pytest.approx(
+            expected_exposure
+        )
+        assert restored_snapshots[1][
+            "billing_unknown_cost_exposure_usd"
+        ] == pytest.approx(expected_unknown)
     finally:
         conn.close()
 

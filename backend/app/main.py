@@ -218,9 +218,11 @@ from .services.generation_jobs import (
     REQUEST_SCHEMA_VERSION as GENERATION_REQUEST_SCHEMA_VERSION,
     JobLeaseLostError,
     TERMINAL_STATUSES as GENERATION_TERMINAL_STATUSES,
+    admit_gemini_dispatch_ticket,
     append_event as append_generation_event,
     build_request_key as build_durable_request_key,
     cancellation_requested as generation_cancellation_requested,
+    checkpoint_yielded_attempt_usage as checkpoint_generation_yielded_usage,
     expire_stale_queued_job as expire_stale_generation_job,
     find_active_job as find_active_generation_job,
     find_completed_job as find_completed_generation_job,
@@ -233,6 +235,7 @@ from .services.generation_jobs import (
     requeue_retryable_failure as requeue_generation_retryable_failure,
     replay_events as replay_generation_events,
     request_cancellation as request_generation_cancellation,
+    settle_gemini_dispatch_ticket,
     submit_or_get_active as submit_generation_job,
     transition_terminal as transition_generation_terminal,
     update_progress as update_generation_progress,
@@ -5308,11 +5311,12 @@ def _generation_gemini_ledger_exposure(
     *,
     prior_records: Iterable[dict[str, Any]] = (),
 ) -> dict[str, float]:
-    records = [dict(record) for record in prior_records if isinstance(record, dict)]
+    database_records: list[dict[str, Any]] = []
+    durable_ticket_ids: set[str] = set()
     for row in fetch_all(
         conn,
         """
-        SELECT provider, operation, model, billable_requests, input_tokens,
+        SELECT id, provider, operation, model, billable_requests, input_tokens,
                output_tokens, total_tokens, metadata_json
         FROM generation_provider_usage
         WHERE job_id = ? AND provider = 'gemini'
@@ -5325,7 +5329,15 @@ def _generation_gemini_ledger_exposure(
         except (TypeError, json.JSONDecodeError):
             metadata = {}
         safe_metadata = metadata if isinstance(metadata, dict) else {}
-        records.append({
+        usage_id = str(row.get("id") or "")
+        if (
+            usage_id
+            and safe_metadata.get("ticket_schema_version")
+            == "gemini_dispatch_ticket_v1"
+        ):
+            durable_ticket_ids.add(usage_id)
+        database_records.append({
+            "id": usage_id,
             "provider": "gemini",
             "operation": str(row.get("operation") or ""),
             "model_used": str(row.get("model") or ""),
@@ -5340,7 +5352,140 @@ def _generation_gemini_ledger_exposure(
             "error_code": str(safe_metadata.get("error_code") or ""),
             "metadata": safe_metadata,
         })
-    return gemini_usage_records_exposure(records)
+
+    records: list[dict[str, Any]] = []
+    for prior_record in prior_records:
+        if not isinstance(prior_record, dict):
+            continue
+        prior = dict(prior_record)
+        raw_metadata = prior.get("metadata")
+        prior_metadata = (
+            raw_metadata if isinstance(raw_metadata, Mapping) else {}
+        )
+        prior_ticket_id = str(
+            prior.get("id")
+            or prior_metadata.get("gemini_ticket_id")
+            or ""
+        )
+        if prior_ticket_id and prior_ticket_id in durable_ticket_ids:
+            continue
+        records.append(prior)
+
+    durable_records: list[dict[str, Any]] = []
+    for record in database_records:
+        metadata = record.get("metadata")
+        if (
+            isinstance(metadata, Mapping)
+            and metadata.get("ticket_schema_version")
+            == "gemini_dispatch_ticket_v1"
+        ):
+            durable_records.append(record)
+        else:
+            records.append(record)
+
+    exposure = gemini_usage_records_exposure(records)
+    committed_cost = max(
+        0.0,
+        float(exposure.get("committed_cost_usd") or 0.0),
+    )
+    unknown_cost = max(
+        0.0,
+        float(
+            exposure.get("billing_unknown_cost_exposure_usd")
+            or 0.0
+        ),
+    )
+    lifetime_reserved_cost = max(
+        0.0,
+        float(
+            exposure.get("lifetime_reserved_worst_case_cost_usd")
+            or 0.0
+        ),
+    )
+    unknown_calls = 0
+    unknown_attempts = 0
+    seen_non_ticket_records: set[str] = set()
+    for record in records:
+        record_identity = {
+            key: value
+            for key, value in record.items()
+            if key != "id"
+        }
+        record_key = json.dumps(
+            record_identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        if record_key in seen_non_ticket_records:
+            continue
+        seen_non_ticket_records.add(record_key)
+        metadata = record.get("metadata")
+        safe_metadata = metadata if isinstance(metadata, Mapping) else {}
+        raw_unknown_attempts = safe_metadata.get("billing_unknown_attempts")
+        try:
+            record_unknown_attempts = max(
+                0,
+                int(raw_unknown_attempts or 0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            record_unknown_attempts = 0
+        if record_unknown_attempts:
+            unknown_calls += 1
+            unknown_attempts += record_unknown_attempts
+
+    def nonnegative_cost(value: object, *, fallback: float = 0.0) -> float:
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return fallback
+        return (
+            normalized
+            if math.isfinite(normalized) and normalized >= 0.0
+            else fallback
+        )
+
+    for record in durable_records:
+        metadata = dict(record.get("metadata") or {})
+        admitted_cost = nonnegative_cost(
+            metadata.get("admitted_cost_usd"),
+        )
+        lifetime_reserved_cost += admitted_cost
+        state = str(metadata.get("ticket_state") or "admitted")
+        if state == "released":
+            continue
+        if state == "settled_known":
+            committed_cost += nonnegative_cost(
+                metadata.get("actual_cost_usd"),
+            )
+            continue
+        ticket_unknown_cost = (
+            nonnegative_cost(
+                metadata.get("billing_unknown_reserved_cost_usd"),
+                fallback=admitted_cost,
+            )
+            if state == "settled_unknown"
+            else admitted_cost
+        )
+        committed_cost += ticket_unknown_cost
+        unknown_cost += ticket_unknown_cost
+        if ticket_unknown_cost > 1e-9:
+            unknown_calls += 1
+            unknown_attempts += 1
+
+    if unknown_cost <= 1e-9:
+        unknown_calls = 0
+        unknown_attempts = 0
+
+    return {
+        "committed_cost_usd": committed_cost,
+        "cost_exposure_usd": committed_cost,
+        "billing_unknown_cost_exposure_usd": unknown_cost,
+        "lifetime_reserved_worst_case_cost_usd": lifetime_reserved_cost,
+        "durable_ticket_count": float(len(durable_records)),
+        "billing_unknown_calls": float(unknown_calls),
+        "billing_unknown_attempts": float(unknown_attempts),
+    }
 
 
 def _job_request_params(job_row: dict[str, Any]) -> dict[str, Any]:
@@ -5675,11 +5820,126 @@ def _current_level_reusable_generation_reel_count(
     )
 
 
+def _generation_usage_with_authoritative_gemini_exposure(
+    conn: Any,
+    job_row: Mapping[str, Any],
+    usage: object,
+) -> dict[str, Any]:
+    """Overlay late durable ticket settlements on a stored usage snapshot."""
+    normalized_usage = dict(usage) if isinstance(usage, Mapping) else {}
+    job_id = str(job_row.get("id") or "")
+    if (
+        conn is None
+        or not job_id
+        or str(job_row.get("status") or "")
+        not in GENERATION_TERMINAL_STATUSES
+    ):
+        return normalized_usage
+
+    raw_provider_calls = normalized_usage.get("provider_calls")
+    prior_records = (
+        [
+            dict(record)
+            for record in raw_provider_calls
+            if isinstance(record, dict)
+        ]
+        if isinstance(raw_provider_calls, list)
+        else []
+    )
+    exposure = _generation_gemini_ledger_exposure(
+        conn,
+        job_id,
+        prior_records=prior_records,
+    )
+    if int(exposure.get("durable_ticket_count") or 0) <= 0:
+        return normalized_usage
+    committed_cost = max(
+        0.0,
+        float(exposure.get("committed_cost_usd") or 0.0),
+    )
+    unknown_cost = min(
+        committed_cost,
+        max(
+            0.0,
+            float(
+                exposure.get("billing_unknown_cost_exposure_usd")
+                or 0.0
+            ),
+        ),
+    )
+    known_cost = max(0.0, committed_cost - unknown_cost)
+    unknown_calls = max(
+        0,
+        int(exposure.get("billing_unknown_calls") or 0),
+    )
+    unknown_attempts = max(
+        0,
+        int(exposure.get("billing_unknown_attempts") or 0),
+    )
+    lifetime_reserved_cost = max(
+        0.0,
+        float(
+            exposure.get("lifetime_reserved_worst_case_cost_usd")
+            or 0.0
+        ),
+    )
+
+    raw_budget = normalized_usage.get("budget")
+    budget = dict(raw_budget) if isinstance(raw_budget, Mapping) else {}
+    raw_gemini_budget = budget.get("gemini")
+    gemini_budget = (
+        dict(raw_gemini_budget)
+        if isinstance(raw_gemini_budget, Mapping)
+        else {}
+    )
+    gemini_budget.update(
+        {
+            "reserved_cost_usd": lifetime_reserved_cost,
+            "lifetime_reserved_worst_case_cost_usd": lifetime_reserved_cost,
+            "settled_cost_exposure_usd": committed_cost,
+            "committed_cost_usd": committed_cost,
+            "billing_unknown_cost_exposure_usd": unknown_cost,
+            "cost_exposure_usd": committed_cost,
+        }
+    )
+    budget["gemini"] = gemini_budget
+    normalized_usage["budget"] = budget
+
+    raw_summary = normalized_usage.get("summary")
+    summary = dict(raw_summary) if isinstance(raw_summary, Mapping) else {}
+    summary.update(
+        {
+            "estimated_cost_usd": known_cost,
+            "known_billed_cost_usd": known_cost,
+            "telemetry_priced_cost_usd": known_cost,
+            "current_cost_exposure_usd": committed_cost,
+            "billing_unknown_reserved_cost_usd": unknown_cost,
+            "billing_unknown_calls": unknown_calls,
+            "billing_unknown_attempts": unknown_attempts,
+            "reserved_worst_case_cost_usd": lifetime_reserved_cost,
+            "lifetime_reserved_worst_case_cost_usd": lifetime_reserved_cost,
+        }
+    )
+    accepted_clips = max(0, int(summary.get("accepted_clips") or 0))
+    summary["cost_per_accepted_clip_usd"] = (
+        round(known_cost / accepted_clips, 8)
+        if accepted_clips and unknown_cost <= 1e-9
+        else None
+    )
+    normalized_usage["summary"] = summary
+    return normalized_usage
+
+
 def _generation_job_status_payload(conn, job_row: dict[str, Any]) -> dict[str, Any]:
     try:
         usage = json.loads(str(job_row.get("usage_json") or "{}"))
     except (TypeError, json.JSONDecodeError):
         usage = {}
+    usage = _generation_usage_with_authoritative_gemini_exposure(
+        conn,
+        job_row,
+        usage,
+    )
     error_code = str(job_row.get("terminal_error_code") or "").strip()
     error_message = str(job_row.get("terminal_error_message") or "").strip()
     error: dict[str, Any] | None = None
@@ -5772,6 +6032,13 @@ def _sanitize_generation_replay_events(
                     )
                 )
             payload["authoritative"] = True
+            event["payload"] = payload
+        elif event_type == "terminal" and job_row is not None:
+            payload["usage"] = _generation_usage_with_authoritative_gemini_exposure(
+                conn,
+                job_row,
+                payload.get("usage"),
+            )
             event["payload"] = payload
         sanitized.append(event)
     return sanitized
@@ -6171,6 +6438,116 @@ def _run_leased_generation_job(
             or _generation_job_db_should_stop(job_id, lease_owner)
         )
 
+    def reserve_gemini_ticket(
+        *,
+        ticket_id: str,
+        operation: str,
+        model: str,
+        reservation: Mapping[str, Any],
+    ) -> object:
+        reservation_metadata = dict(reservation)
+        reservation_id = max(
+            1,
+            int(
+                reservation_metadata.get("gemini_reservation_id")
+                or 1
+            ),
+        )
+        return _run_generation_db_transaction(
+            "gemini_ticket_admission",
+            lambda ticket_conn: admit_gemini_dispatch_ticket(
+                ticket_conn,
+                ticket_id=ticket_id,
+                job_id=job_id,
+                lease_owner=lease_owner,
+                expected_attempt_count=durable_attempt_count,
+                operation=operation,
+                model=model,
+                admitted_cost_usd=float(
+                    reservation_metadata.get("admitted_cost_usd")
+                    or 0.0
+                ),
+                provider_attempt=reservation_id,
+                reservation_id=reservation_id,
+                reserved_input_tokens=max(
+                    0,
+                    int(
+                        reservation_metadata.get("reserved_input_tokens")
+                        or 0
+                    ),
+                ),
+                reserved_output_tokens=max(
+                    1,
+                    int(
+                        reservation_metadata.get("reserved_output_tokens")
+                        or 1
+                    ),
+                ),
+                reserved_cost_usd=float(
+                    reservation_metadata.get("reserved_cost_usd")
+                    or 0.0
+                ),
+                billing_cost_multiplier=float(
+                    reservation_metadata.get("billing_cost_multiplier")
+                    or 1.0
+                ),
+                admitted_physical_attempts=max(
+                    1,
+                    int(
+                        reservation_metadata.get(
+                            "admitted_physical_attempts"
+                        )
+                        or 1
+                    ),
+                ),
+                metadata={
+                    **reservation_metadata,
+                    "gemini_ticket_id": ticket_id,
+                    "gemini_durable_ticket": True,
+                },
+            ),
+            retry_should_stop=db_retry_should_stop,
+            replay_after_unknown_commit=True,
+        )
+
+    def settle_gemini_ticket(
+        *,
+        ticket_id: str,
+        state: str,
+        model: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        total_tokens: int | None = None,
+        actual_cost_usd: float | None = None,
+        unknown_cost_usd: float | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> object:
+        settlement_metadata = dict(metadata or {})
+        if model:
+            settlement_metadata["model_used"] = model
+        return _run_generation_db_transaction(
+            "gemini_ticket_settlement",
+            lambda ticket_conn: settle_gemini_dispatch_ticket(
+                ticket_conn,
+                ticket_id=ticket_id,
+                job_id=job_id,
+                state=state,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                actual_cost_usd=(
+                    actual_cost_usd if state == "settled_known" else None
+                ),
+                unknown_cost_usd=(
+                    unknown_cost_usd if state == "settled_unknown" else None
+                ),
+                metadata=settlement_metadata,
+            ),
+            # Settlement is keyed only by ticket and job. It must converge
+            # after the admitting worker loses its lease to a successor.
+            replay_after_unknown_commit=True,
+        )
+
     context = GenerationContext(
         mode,
         generation_id=job_id,
@@ -6179,6 +6556,8 @@ def _run_leased_generation_job(
             record,
             retry_should_stop=db_retry_should_stop,
         ),
+        gemini_ticket_reserve_sink=reserve_gemini_ticket,
+        gemini_ticket_settle_sink=settle_gemini_ticket,
         cache_store=DatabaseProviderCache(),
         require_acoustic_boundaries=True,
     )
@@ -6256,7 +6635,10 @@ def _run_leased_generation_job(
     def generation_usage_payload(
         *,
         retry_error: dict[str, Any] | None = None,
+        terminal: bool = False,
     ) -> dict[str, Any]:
+        if terminal:
+            context.budget.finalize_gemini_exposure()
         payload = context.usage_payload()
         if previous_provider_calls:
             payload["provider_calls"] = [
@@ -6435,6 +6817,112 @@ def _run_leased_generation_job(
             retry_errors.append(dict(retry_error))
         if retry_errors:
             payload["retry_errors"] = retry_errors
+        if terminal:
+            summary = dict(payload.get("summary") or {})
+            budget = payload.get("budget")
+            gemini_budget = (
+                budget.get("gemini")
+                if isinstance(budget, dict)
+                and isinstance(budget.get("gemini"), dict)
+                else {}
+            )
+            record_known_cost = max(
+                0.0,
+                float(summary.get("known_billed_cost_usd") or 0.0),
+                float(summary.get("estimated_cost_usd") or 0.0),
+                float(summary.get("telemetry_priced_cost_usd") or 0.0),
+            )
+            record_unknown_cost = max(
+                0.0,
+                float(
+                    summary.get("billing_unknown_reserved_cost_usd")
+                    or 0.0
+                ),
+            )
+            current_exposure = max(
+                0.0,
+                float(gemini_budget.get("cost_exposure_usd") or 0.0),
+            )
+            budget_committed_cost = max(
+                0.0,
+                float(gemini_budget.get("committed_cost_usd") or 0.0),
+            )
+            budget_unknown_cost = min(
+                budget_committed_cost,
+                max(
+                    0.0,
+                    float(
+                        gemini_budget.get(
+                            "billing_unknown_cost_exposure_usd"
+                        )
+                        or 0.0
+                    ),
+                ),
+            )
+            budget_known_cost = max(
+                0.0,
+                budget_committed_cost - budget_unknown_cost,
+            )
+            known_cost = max(record_known_cost, budget_known_cost)
+            missing_known_cost = max(
+                0.0,
+                budget_known_cost - record_known_cost,
+            )
+            unknown_cost = max(record_unknown_cost, budget_unknown_cost)
+            residual_unknown_cost = max(
+                0.0,
+                current_exposure - known_cost - unknown_cost,
+            )
+            unknown_cost += residual_unknown_cost
+            for field in (
+                "estimated_cost_usd",
+                "known_billed_cost_usd",
+                "telemetry_priced_cost_usd",
+            ):
+                summary[field] = round(
+                    max(float(summary.get(field) or 0.0), known_cost),
+                    8,
+                )
+            if missing_known_cost > 1e-9:
+                summary["unattributed_known_billed_cost_usd"] = round(
+                    float(
+                        summary.get("unattributed_known_billed_cost_usd")
+                        or 0.0
+                    )
+                    + missing_known_cost,
+                    8,
+                )
+            missing_unknown_cost = max(
+                0.0,
+                budget_unknown_cost - record_unknown_cost,
+            ) + residual_unknown_cost
+            summary["billing_unknown_reserved_cost_usd"] = round(
+                unknown_cost,
+                8,
+            )
+            if missing_unknown_cost > 1e-9:
+                summary["unattributed_billing_unknown_cost_usd"] = round(
+                    float(
+                        summary.get(
+                            "unattributed_billing_unknown_cost_usd"
+                        )
+                        or 0.0
+                    )
+                    + missing_unknown_cost,
+                    8,
+                )
+            accepted_clips = max(
+                0,
+                int(summary.get("accepted_clips") or 0),
+            )
+            if unknown_cost > 1e-9 or not accepted_clips:
+                summary["cost_per_accepted_clip_usd"] = None
+            else:
+                summary["cost_per_accepted_clip_usd"] = round(
+                    known_cost / accepted_clips,
+                    8,
+                )
+            payload["summary"] = summary
         return payload
 
     def cancel_if_adaptation_stale(conn) -> bool:
@@ -6466,10 +6954,39 @@ def _run_leased_generation_job(
             status="cancelled",
             result_generation_id=generation_id or None,
             lease_owner=lease_owner,
-            usage=generation_usage_payload(),
+            usage=generation_usage_payload(terminal=True),
         )
         logger.info("cancelled stale adaptive generation job_id=%s", job_id)
         return True
+
+    def checkpoint_yielded_usage() -> bool:
+        usage = generation_usage_payload(terminal=True)
+        try:
+            checkpointed = bool(
+                _run_generation_db_transaction(
+                    "yielded_attempt_usage_checkpoint",
+                    lambda checkpoint_conn: checkpoint_generation_yielded_usage(
+                        checkpoint_conn,
+                        job_id=job_id,
+                        lease_owner=lease_owner,
+                        expected_attempt_count=durable_attempt_count,
+                        usage=usage,
+                    ),
+                    replay_after_unknown_commit=True,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "generation yielded-usage checkpoint failed job_id=%s",
+                job_id,
+            )
+            return False
+        logger.info(
+            "generation worker yielded lease job_id=%s usage_checkpointed=%s",
+            job_id,
+            checkpointed,
+        )
+        return checkpointed
 
     heartbeat_thread.start()
     try:
@@ -7234,7 +7751,7 @@ def _run_leased_generation_job(
             )
 
             usage_records = context.usage()
-            usage_payload = generation_usage_payload()
+            usage_payload = generation_usage_payload(terminal=True)
             terminal_counters = dict(
                 usage_payload.get("counters") or stage_counters
             )
@@ -7330,13 +7847,20 @@ def _run_leased_generation_job(
                     recall_preparation["fallback"],
                 )
     except GenerationCancelledError:
+        user_cancelled = False
         with get_conn(transactional=True) as conn:
-            if generation_cancellation_requested(conn, job_id):
-                request_generation_cancellation(conn, job_id=job_id)
-            else:
-                # Shutdown, deadline, or a lost lease is not a user
-                # cancellation. Leave the durable row for expiry/recovery.
-                logger.info("generation worker yielded lease job_id=%s", job_id)
+            user_cancelled = generation_cancellation_requested(conn, job_id)
+            if user_cancelled:
+                request_generation_cancellation(
+                    conn,
+                    job_id=job_id,
+                    usage=generation_usage_payload(terminal=True),
+                )
+        if not user_cancelled:
+            # Shutdown, deadline, or a lost lease is not a user cancellation.
+            # Leave the durable row for expiry/recovery after preserving this
+            # attempt's provider exposure.
+            checkpoint_yielded_usage()
     except (ClipEngineProviderError, IngestRateLimitedError) as exc:
         provider_exc = (
             ProviderRateLimitError(
@@ -7355,7 +7879,10 @@ def _run_leased_generation_job(
             job_id,
             provider_exc.as_dict(),
         )
-        provider_usage = generation_usage_payload(retry_error=provider_exc.as_dict())
+        provider_usage = generation_usage_payload(
+            retry_error=provider_exc.as_dict(),
+            terminal=True,
+        )
         provider_counters = dict(
             provider_usage.get("counters") or context.counters()
         )
@@ -7405,26 +7932,31 @@ def _run_leased_generation_job(
             )
         except JobLeaseLostError:
             logger.info("generation worker lost lease during provider failure job_id=%s", job_id)
+            checkpoint_yielded_usage()
             _wake_generation_worker()
     except JobLeaseLostError:
-        logger.info("generation worker lost lease job_id=%s", job_id)
+        checkpoint_yielded_usage()
     except Exception as exc:
         logger.exception("generation job failed job_id=%s", job_id)
-        _run_generation_db_transaction(
-            "failure_terminalization",
-            lambda terminal_conn: transition_generation_terminal(
-                terminal_conn,
-                job_id=job_id,
-                status="failed",
-                result_generation_id=generation_id or None,
-                lease_owner=lease_owner,
-                usage=generation_usage_payload(),
-                error_code="generation_failed",
-                error_message=str(exc),
-                error_detail={"counters": context.counters()},
-            ),
-            retry_should_stop=db_retry_should_stop,
-        )
+        failure_usage = generation_usage_payload(terminal=True)
+        try:
+            _run_generation_db_transaction(
+                "failure_terminalization",
+                lambda terminal_conn: transition_generation_terminal(
+                    terminal_conn,
+                    job_id=job_id,
+                    status="failed",
+                    result_generation_id=generation_id or None,
+                    lease_owner=lease_owner,
+                    usage=failure_usage,
+                    error_code="generation_failed",
+                    error_message=str(exc),
+                    error_detail={"counters": context.counters()},
+                ),
+                retry_should_stop=db_retry_should_stop,
+            )
+        except JobLeaseLostError:
+            checkpoint_yielded_usage()
     finally:
         local_stop.set()
         heartbeat_thread.join(timeout=1.0)

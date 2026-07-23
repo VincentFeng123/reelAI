@@ -1058,12 +1058,24 @@ def discover_practice_fast(
             source_context=source_context,
         )
         planned_queries = list(expansion.get("queries") or []) or [retrieval_query]
+    literal_recovery_key = (
+        semantic_key(retrieval_query)
+        if (
+            recovery_mode
+            and str(expansion.get("provider_used") or "") == "literal_fallback"
+        )
+        else ""
+    )
     for candidate in planned_queries:
         query = " ".join(str(candidate or "").split())
         key = semantic_key(query) if recovery_mode else " ".join(query.casefold().split())
         if not key or key in seen_query_keys:
             continue
-        if recovery_mode and key in recovery_tried_query_keys:
+        if (
+            recovery_mode
+            and key in recovery_tried_query_keys
+            and key != literal_recovery_key
+        ):
             continue
         seen_query_keys.add(key)
         initial_queries.append(query)

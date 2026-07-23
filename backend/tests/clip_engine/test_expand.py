@@ -441,9 +441,13 @@ def test_practice_fast_warning_redacts_rejected_model_values(
     )
     caplog.set_level("WARNING", logger=expand.__name__)
 
-    with pytest.raises(ProviderResponseValidationError):
-        expand.expand_query_practice_fast("physics", 1)
+    result = expand.expand_query_practice_fast("physics", 1)
 
+    assert result == {
+        "corrected": "physics",
+        "queries": ["physics"],
+        "provider_used": "literal_fallback",
+    }
     assert secret not in caplog.text
     assert "input_value" not in caplog.text
     assert "type=ValidationError" in caplog.text
@@ -626,7 +630,7 @@ def test_practice_fast_model_404_uses_flash_fallback(monkeypatch) -> None:
     assert result["provider_used"] == "gemini"
 
 
-def test_practice_fast_recovery_exhaustion_is_typed_not_empty(
+def test_practice_fast_recovery_exhaustion_uses_exact_request(
     monkeypatch,
 ) -> None:
     calls: list[str] = []
@@ -637,19 +641,23 @@ def test_practice_fast_recovery_exhaustion_is_typed_not_empty(
 
     monkeypatch.setattr(expand, "_practice_fast_gemini_raw", repeated_query)
 
-    with pytest.raises(ProviderResponseValidationError):
-        expand.expand_query_practice_fast(
-            "physics",
-            1,
-            tried_queries=["physics explained"],
-            recovery_reason=expand.RECOVERY_REASON_ZERO_SEARCH_RESULTS,
-        )
+    result = expand.expand_query_practice_fast(
+        "physics",
+        1,
+        tried_queries=["physics", "physics explained"],
+        recovery_reason=expand.RECOVERY_REASON_ZERO_SEARCH_RESULTS,
+    )
 
     assert calls == [
         expand.PRACTICE_FAST_EXPAND_MODEL,
         expand.PRACTICE_FAST_EXPAND_MODEL,
         expand.PRACTICE_FAST_EXPAND_FALLBACK_MODEL,
     ]
+    assert result == {
+        "corrected": "physics",
+        "queries": ["physics"],
+        "provider_used": "literal_fallback",
+    }
 
 
 @pytest.mark.parametrize(

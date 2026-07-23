@@ -406,6 +406,59 @@ class _PracticeFastExpansion(BaseModel):
         return self
 
 
+class _PracticeFastRetrievalQuery(BaseModel):
+    """Failure-only view of a subject-grounded Gemini retrieval query."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    text: str = Field(min_length=1, max_length=240)
+    preserved_constraint_ids: list[str] = Field(
+        min_length=1,
+        max_length=16,
+    )
+
+
+class _PracticeFastRetrievalConstraint(BaseModel):
+    """Only the fields required to anchor a failure-only search branch."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    constraint_id: str = Field(min_length=1, max_length=32)
+    kind: Literal[
+        "subject",
+        "task",
+        "relationship",
+        "scope",
+        "format",
+        "outcome",
+    ]
+    source_phrase: str = Field(min_length=1, max_length=160)
+
+
+class _PracticeFastRetrievalEnvelope(BaseModel):
+    """Typed search fields retained when auxiliary intent metadata is invalid."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    corrected: str = Field(min_length=1, max_length=4_096)
+    intent_constraints: list[_PracticeFastRetrievalConstraint] = Field(
+        min_length=1,
+        max_length=16,
+    )
+    summary_preserved_constraint_ids: list[str] = Field(
+        min_length=1,
+        max_length=16,
+    )
+    queries: list[_PracticeFastRetrievalQuery] = Field(
+        min_length=1,
+        max_length=16,
+    )
+
+
+class _PracticeFastEmptyResponseError(ValueError):
+    """Gemini completed the request but returned no expansion text."""
+
+
 class _PracticeFastRequestIntent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -814,6 +867,101 @@ def _normalize(queries: list[str], n: int) -> list[str]:
         if len(result) >= max(0, int(n)):
             break
     return result
+
+
+def _typed_retrieval_fallback(
+    raw: str,
+    topic: str,
+    count: int,
+    *,
+    tried_keys: set[str],
+) -> dict | None:
+    """Keep only Gemini retrieval fields mechanically grounded in the request."""
+
+    try:
+        parsed = _PracticeFastRetrievalEnvelope.model_validate_json(raw)
+    except (TypeError, ValueError):
+        return None
+    constraint_ids = [
+        " ".join(str(constraint.constraint_id or "").split())
+        for constraint in parsed.intent_constraints
+    ]
+    if (
+        any(not constraint_id for constraint_id in constraint_ids)
+        or len(constraint_ids) != len(set(constraint_ids))
+    ):
+        return None
+    summary_ids = [
+        " ".join(str(constraint_id or "").split())
+        for constraint_id in parsed.summary_preserved_constraint_ids
+    ]
+    if (
+        len(summary_ids) != len(set(summary_ids))
+        or set(summary_ids) != set(constraint_ids)
+    ):
+        return None
+    subject_ids = {
+        constraint_id
+        for constraint_id, constraint in zip(
+            constraint_ids,
+            parsed.intent_constraints,
+        )
+        if constraint.kind == "subject"
+    }
+    if not subject_ids:
+        return None
+    from ...pipeline.gemini_segment import _intent_constraint_source_spans
+
+    # This is a retrieval-only last resort. Require every declared subject to
+    # be copied from the request, but do not discard usable search queries just
+    # because auxiliary occurrence or relationship metadata failed the strict
+    # downstream intent contract. Gemini Pro still validates clips against the
+    # exact request before anything can be released.
+    if any(
+        not _intent_constraint_source_spans(
+            topic,
+            str(constraint.source_phrase or "").strip(),
+        )
+        for constraint in parsed.intent_constraints
+        if constraint.kind == "subject"
+    ):
+        return None
+    corrected = " ".join(parsed.corrected.split())
+    grounded_query_texts: list[str] = []
+    declared_ids = set(constraint_ids)
+    for query in parsed.queries:
+        preserved_ids = [
+            " ".join(str(constraint_id or "").split())
+            for constraint_id in query.preserved_constraint_ids
+        ]
+        if (
+            any(not constraint_id for constraint_id in preserved_ids)
+            or len(preserved_ids) != len(set(preserved_ids))
+            or not set(preserved_ids).issubset(declared_ids)
+            or not subject_ids.issubset(preserved_ids)
+        ):
+            continue
+        grounded_query_texts.append(query.text)
+    # Keep one exact-request branch beside Gemini's expansions. The fallback
+    # intentionally does not make a local semantic judgment about AI query
+    # wording, so this branch guarantees retrieval remains anchored even when
+    # auxiliary metadata failed and an AI query drifted.
+    normalized = _normalize(
+        [topic, *grounded_query_texts],
+        len(grounded_query_texts) + 1,
+    )
+    queries = [
+        query
+        for query in normalized
+        if _key(query) not in tried_keys
+    ][:max(0, int(count))]
+    if not corrected or not queries:
+        return None
+    return {
+        "corrected": corrected,
+        "queries": queries,
+        "provider_used": "gemini",
+    }
 
 
 def _validated_query_metadata(
@@ -1347,7 +1495,9 @@ async def _practice_fast_gemini_raw_async(
             )
         text = str(getattr(response, "text", "") or "").strip()
         if not text:
-            raise ValueError("Gemini returned an empty query expansion")
+            raise _PracticeFastEmptyResponseError(
+                "Gemini returned an empty query expansion"
+            )
         return text
     finally:
         aio_client = getattr(client, "aio", None)
@@ -1565,6 +1715,8 @@ def expand_query_practice_fast(
 
     errors: list[str] = []
     last_failure: Exception | None = None
+    retrieval_fallback: dict | None = None
+    provider_response_received = False
     with singleflight(cache_key, should_cancel) if cache_key else nullcontext():
         cached = _read_cached_expansion(cache_key, count) if cache_key else None
         if cached is not None:
@@ -1584,6 +1736,7 @@ def expand_query_practice_fast(
         use_fallback_model = False
         for attempt in range(PRACTICE_FAST_EXPAND_ATTEMPTS):
             raise_if_cancelled(should_cancel)
+            raw: str | None = None
             model = (
                 PRACTICE_FAST_EXPAND_FALLBACK_MODEL
                 if use_fallback_model
@@ -1611,6 +1764,7 @@ def expand_query_practice_fast(
                 if validation_feedback:
                     kwargs["validation_feedback"] = validation_feedback
                 raw = _practice_fast_gemini_raw(topic, count, **kwargs)
+                provider_response_received = True
                 parsed = _PracticeFastExpansion.model_validate_json(raw)
                 corrected = " ".join(str(parsed.corrected or topic).split()) or topic
                 raw_query_metadata: list[dict[str, object]] = []
@@ -1688,6 +1842,23 @@ def expand_query_practice_fast(
                 raise CancellationError("Generation cancelled.") from exc
             except Exception as exc:
                 raise_if_cancelled(should_cancel)
+                if isinstance(
+                    exc,
+                    (
+                        _PracticeFastEmptyResponseError,
+                        ProviderResponseValidationError,
+                    ),
+                ):
+                    provider_response_received = True
+                if raw is not None:
+                    candidate = _typed_retrieval_fallback(
+                        raw,
+                        topic,
+                        count,
+                        tried_keys=tried_keys,
+                    )
+                    if candidate is not None:
+                        retrieval_fallback = candidate
                 last_failure = exc
                 validation_feedback = _practice_fast_validation_feedback(exc)
                 provider_status = gemini_client._gemini_status_code(exc)
@@ -1720,6 +1891,20 @@ def expand_query_practice_fast(
     )
     if last_failure is None:
         last_failure = RuntimeError("Gemini expansion ended without a response")
+    if retrieval_fallback is not None:
+        logger.warning(
+            "practice-fast Gemini %s is using typed AI retrieval fields after "
+            "strict intent metadata exhaustion",
+            "zero-result recovery" if recovering_zero_results else "expansion",
+        )
+        return retrieval_fallback
+    if provider_response_received:
+        logger.warning(
+            "practice-fast Gemini %s is using the exact learner request after "
+            "structured response exhaustion",
+            "zero-result recovery" if recovering_zero_results else "expansion",
+        )
+        return literal_fallback(topic, count)
     raise _practice_fast_provider_error(last_failure) from last_failure
 
 

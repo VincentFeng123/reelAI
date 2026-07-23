@@ -9,6 +9,7 @@ from google.genai import errors as genai_errors
 from pydantic import BaseModel, Field
 
 from backend import gemini_client as gc
+from backend.app.clip_engine.provider_runtime import GenerationContext
 
 
 class _Schema(BaseModel):
@@ -23,7 +24,8 @@ class _ConstrainedSchema(BaseModel):
 class _FakeResponse:
     def __init__(self, text: str = '{"ok": true}', *, finish_reason="STOP",
                  prompt_tokens=11, candidate_tokens=7, thought_tokens=5,
-                 total_tokens=23, cached_tokens=3):
+                 total_tokens=23, cached_tokens=3,
+                 service_tier: str | None = None):
         self.text = text
         self.candidates = [SimpleNamespace(
             finish_reason=SimpleNamespace(value=finish_reason),
@@ -34,6 +36,13 @@ class _FakeResponse:
             thoughts_token_count=thought_tokens,
             total_token_count=total_tokens,
             cached_content_token_count=cached_tokens,
+        )
+        self.sdk_http_response = SimpleNamespace(
+            headers=(
+                {}
+                if service_tier is None
+                else {"x-gemini-service-tier": service_tier}
+            ),
         )
 
 
@@ -446,6 +455,64 @@ def test_gemini3_retries_one_transient_error_with_short_jitter(
     },)
     assert all(call["config"].http_options.retry_options.attempts == 1
                for call in fake.models.calls)
+
+
+def test_gemini3_uses_priority_only_for_a_transient_retry(monkeypatch):
+    fake = _FakeClient(
+        _HTTPError(504),
+        _FakeResponse(service_tier="priority"),
+    )
+    monkeypatch.setattr(gc, "_sleep_before_retry", lambda *_args: True)
+
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        max_retries=1,
+        retry_service_tier="priority",
+    )
+
+    first, retry = [call["config"] for call in fake.models.calls]
+    assert first.service_tier is None
+    assert _enum_value(retry.service_tier) == "priority"
+    assert result.telemetry.service_tier_requested == "priority"
+    assert result.telemetry.service_tier_used == "priority"
+
+
+def test_gemini3_reports_provider_downgrade_of_priority_retry(monkeypatch):
+    fake = _FakeClient(
+        _HTTPError(504),
+        _FakeResponse(service_tier="standard"),
+    )
+    monkeypatch.setattr(gc, "_sleep_before_retry", lambda *_args: True)
+
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        max_retries=1,
+        retry_service_tier="priority",
+    )
+
+    first, retry = [call["config"] for call in fake.models.calls]
+    assert first.service_tier is None
+    assert _enum_value(retry.service_tier) == "priority"
+    assert result.telemetry.service_tier_requested == "priority"
+    assert result.telemetry.service_tier_used == "standard"
+
+
+def test_gemini3_healthy_call_never_requests_retry_priority(monkeypatch):
+    fake = _FakeClient(_FakeResponse(service_tier="standard"))
+
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        max_retries=1,
+        retry_service_tier="priority",
+    )
+
+    assert len(fake.models.calls) == 1
+    assert fake.models.calls[0]["config"].service_tier is None
+    assert result.telemetry.service_tier_requested is None
+    assert result.telemetry.service_tier_used == "standard"
 
 
 @pytest.mark.parametrize("status_code", [499, 504])
@@ -1208,6 +1275,77 @@ def test_gemini3_healthy_dispatch_hooks_do_not_sleep_or_retry(monkeypatch):
         ("after", 7, 1),
     ]
     assert sleeps == []
+
+
+def test_durable_context_healthy_dispatch_has_one_call_and_no_legacy_write(
+    monkeypatch,
+):
+    fake = _FakeClient(_FakeResponse())
+    durable_events = []
+    legacy_records = []
+    physical_usage = {}
+    sleeps = []
+    context = GenerationContext(
+        "fast",
+        generation_id="durable-healthy-dispatch",
+        usage_sink=legacy_records.append,
+        gemini_ticket_reserve_sink=lambda **payload: (
+            durable_events.append(("admit", payload["ticket_id"]))
+            or {"id": payload["ticket_id"]}
+        ),
+        gemini_ticket_settle_sink=lambda **payload: durable_events.append(
+            ("settle", payload["ticket_id"])
+        ),
+    )
+
+    def before_dispatch(*, model, attempt):
+        assert attempt == 1
+        return context.reserve_gemini_call(
+            operation="flash_boundary_selector",
+            model=model,
+            prompt_text="system\nuser",
+            max_output_tokens=24_576,
+        )
+
+    def after_dispatch(ticket, *, model, attempt, telemetry):
+        assert attempt == 1
+        physical_usage.update({
+            **ticket,
+            **telemetry.as_dict(),
+            "dispatched": True,
+        })
+        assert context.reconcile_gemini_call(
+            model_used=model,
+            usage=physical_usage,
+            dispatched=True,
+        )
+
+    monkeypatch.setattr(
+        gc,
+        "_sleep_before_retry",
+        lambda *args: sleeps.append(args) or True,
+    )
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        before_dispatch=before_dispatch,
+        after_dispatch=after_dispatch,
+    )
+    context.record_gemini(
+        operation="segmentation",
+        attempt=1,
+        model_used=result.telemetry.model,
+        quality_degraded=False,
+        usage=physical_usage,
+        stage="segmentation",
+    )
+
+    assert len(fake.models.calls) == 1
+    assert [event[0] for event in durable_events] == ["admit", "settle"]
+    assert durable_events[0][1] == durable_events[1][1]
+    assert sleeps == []
+    assert legacy_records == []
+    assert len(context.usage()) == 1
 
 
 def test_gemini3_cancellation_or_client_failure_before_dispatch_has_no_ticket(

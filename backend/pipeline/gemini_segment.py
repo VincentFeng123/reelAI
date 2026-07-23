@@ -1807,13 +1807,14 @@ _PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v14"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
 _UPSTREAM_INTENT_CONTRACT_VERSION = "expansion_intent_v2"
 
-_PRICING_VERSION = "gemini-standard-2026-07-11"
+_PRICING_VERSION = "gemini-tier-aware-2026-07-23"
 _PRICING_PER_MILLION = {
     "flash": {"input": 1.50, "output": 9.00},
     "flash_lite": {"input": 0.25, "output": 1.50},
     "flash_preview": {"input": 0.50, "output": 3.00},
     "pro": {"input": 2.00, "output": 12.00},
 }
+_PRO_PRIORITY_BILLING_MULTIPLIER = 1.8
 
 _flash_disable_lock = Lock()
 _flash_disabled_reason: str | None = None
@@ -22496,6 +22497,7 @@ def _call_model(
     max_retries: int = 1,
     use_full_transient_retry_budget: bool = False,
     retry_status_codes: frozenset[int] | set[int] | None = None,
+    retry_service_tier: str | None = None,
     failover_model: str | None = None,
     media_resolution=None,
     estimated_media_tokens: int = 0,
@@ -22623,6 +22625,11 @@ def _call_model(
                 estimated_input_tokens=estimated_input_tokens,
                 max_physical_attempts=1,
                 count_logical_call=not logical_quota_reserved,
+                billing_cost_multiplier=(
+                    _PRO_PRIORITY_BILLING_MULTIPLIER
+                    if attempt > 1 and retry_service_tier == "priority"
+                    else 1.0
+                ),
                 deadline_monotonic=(
                     admission_deadline if attempt == 1 else deadline_monotonic
                 ),
@@ -22645,6 +22652,7 @@ def _call_model(
             dispatched: bool = True,
         ) -> None:
             del attempt
+            nonlocal reservation
             nonlocal physical_dispatches
             nonlocal billing_unknown_attempts
             nonlocal billing_unknown_reserved_cost_usd
@@ -22661,6 +22669,50 @@ def _call_model(
             physical_dispatches += 1
             physical_usage = _telemetry_dict(telemetry)
             last_physical_telemetry = dict(physical_usage)
+            if physical_usage.get("service_tier_used") == "standard":
+                try:
+                    reserved_multiplier = float(
+                        ticket_fields.get("billing_cost_multiplier") or 1.0
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    reserved_multiplier = 1.0
+                if (
+                    math.isfinite(reserved_multiplier)
+                    and reserved_multiplier > 1.0
+                ):
+                    priority_reserved_cost = max(
+                        0.0,
+                        float(
+                            ticket_fields.get("reserved_cost_usd")
+                            or 0.0
+                        ),
+                    )
+                    standard_reserved_cost = max(
+                        0.0,
+                        priority_reserved_cost / reserved_multiplier,
+                    )
+                    ticket_fields[
+                        "priority_reserved_cost_usd"
+                    ] = priority_reserved_cost
+                    ticket_fields[
+                        "reserved_billing_cost_multiplier"
+                    ] = reserved_multiplier
+                    ticket_fields["reserved_cost_usd"] = standard_reserved_cost
+                    ticket_fields["admitted_cost_usd"] = (
+                        standard_reserved_cost
+                        * max(
+                            1,
+                            int(
+                                ticket_fields.get(
+                                    "admitted_physical_attempts",
+                                    1,
+                                )
+                                or 1
+                            ),
+                        )
+                    )
+                    ticket_fields["billing_cost_multiplier"] = 1.0
+                    reservation = dict(ticket_fields)
             physical_usage.update(ticket_fields)
             physical_usage.update({
                 "model": model,
@@ -22669,6 +22721,8 @@ def _call_model(
                 "retries": 0,
                 "dispatched": True,
             })
+            if physical_usage.get("service_tier_used") == "standard":
+                physical_usage["billing_cost_multiplier"] = 1.0
             billing_known = bool(
                 (physical_usage.get("prompt_tokens") or 0) > 0
                 and physical_usage.get("candidate_tokens") is not None
@@ -22714,6 +22768,7 @@ def _call_model(
                         use_full_transient_retry_budget
                     ),
                     retry_status_codes=retry_status_codes,
+                    retry_service_tier=retry_service_tier,
                     cancelled=cancelled,
                     media_resolution=media_resolution,
                     before_dispatch=before_provider_dispatch,
@@ -22827,6 +22882,8 @@ def _call_model(
         telemetry = successful_telemetry or _telemetry_dict(result.telemetry)
         for key, value in reservation.items():
             telemetry.setdefault(key, value)
+        if telemetry.get("service_tier_used") == "standard":
+            telemetry["billing_cost_multiplier"] = 1.0
         telemetry.setdefault("dispatched", True)
         telemetry["physical_dispatches"] = physical_dispatches
         telemetry["billing_unknown_attempts"] = billing_unknown_attempts
@@ -22870,7 +22927,20 @@ def _model_cost(call: dict) -> float:
         call.get("candidate_tokens") or call.get("candidates_token_count") or 0
     )
     thought = int(call.get("thought_tokens") or call.get("thoughts_token_count") or 0)
-    return (prompt * rates["input"] + (candidate + thought) * rates["output"]) / 1_000_000.0
+    try:
+        billing_cost_multiplier = float(
+            call.get("billing_cost_multiplier") or 1.0
+        )
+    except (TypeError, ValueError, OverflowError):
+        billing_cost_multiplier = 1.0
+    if (
+        not math.isfinite(billing_cost_multiplier)
+        or not 1.0 <= billing_cost_multiplier <= 2.0
+    ):
+        billing_cost_multiplier = 1.0
+    return (
+        prompt * rates["input"] + (candidate + thought) * rates["output"]
+    ) / 1_000_000.0 * billing_cost_multiplier
 
 
 def _emit(sink: Optional[Callable[[dict], None]], event: str, **fields) -> None:
@@ -23240,6 +23310,7 @@ def _audit_pro_boundaries(
                         min(2, remaining_physical_dispatches - 1),
                     ),
                     use_full_transient_retry_budget=True,
+                    retry_service_tier="priority",
                     claim_logical_quota=(
                         _claim_logical_quota and structured_attempt == 1
                     ),
@@ -24212,6 +24283,9 @@ def _run_selection_profile(
             ),
             retry_status_codes=(
                 frozenset({503}) if retry_flash_capacity_once else None
+            ),
+            retry_service_tier=(
+                "priority" if profile == PRO_BOUNDARY_PROFILE else None
             ),
             failover_model=(
                 config.SEGMENT_FLASH_FALLBACK_MODEL

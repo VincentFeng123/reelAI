@@ -803,6 +803,47 @@ def test_ingest_topic_uses_ai_intent_summary_for_segmentation(monkeypatch) -> No
     assert all(video["_literal_topic"] == "calclus" for video in videos)
 
 
+def test_ingest_topic_keeps_contractless_ai_retrieval_anchored_to_exact_request(
+    monkeypatch,
+) -> None:
+    exact_request = "Derive the chain rule with a worked example"
+    captured_topics: list[str] = []
+    captured_contracts: list[dict | None] = []
+    videos = [_video()]
+    discovery = {
+        "corrected": "Italian cooking techniques for fresh pasta",
+        "provider_used": "gemini",
+        "topic_terms": ["chain rule"],
+        "videos": videos,
+        "credits_used": 0,
+        "warning": None,
+    }
+
+    def fake_clip(_url, *, topic, **kwargs):
+        captured_topics.append(topic)
+        captured_contracts.append(kwargs.get("intent_contract"))
+        return {"clips": [], "transcript": _transcript(), "notes": ""}
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: discovery,
+    )
+    monkeypatch.setattr(pipeline_module, "_run_clip", fake_clip)
+
+    _pipeline().ingest_topic(
+        topic="chain rule",
+        literal_topic=exact_request,
+        material_id="material",
+        concept_id="concept",
+        max_videos=1,
+    )
+
+    assert captured_topics == [exact_request]
+    assert captured_contracts == [None]
+    assert videos[0]["_selection_topic"] == exact_request
+
+
 def test_ingest_topic_does_not_treat_non_gemini_correction_as_intent_summary(
     monkeypatch,
 ) -> None:
@@ -8102,6 +8143,118 @@ def test_zero_clip_batch_uses_bounded_novel_source_recovery(
     ]
     assert context.budget.remaining("transcript") == 0
     assert context.budget.remaining("segmentation") == 0
+
+
+def test_all_source_gemini_selector_transients_skip_semantic_recovery(
+    monkeypatch,
+) -> None:
+    videos = [
+        {
+            **_video(),
+            "id": f"selector-transient-{index}",
+            "url": f"https://youtu.be/selector-transient-{index}",
+        }
+        for index in range(3)
+    ]
+    discovery = mock.Mock(return_value={
+        **_discovery(),
+        "queries": ["Python recursion explained"],
+        "videos": videos,
+    })
+    pipeline = _pipeline()
+    analyzed: list[str] = []
+
+    def fail_selector(video, *_args, **_kwargs):
+        analyzed.append(video["id"])
+        raise ProviderTransientError(
+            "Gemini selector is temporarily unavailable.",
+            provider="gemini",
+            operation="segmentation",
+            status_code=503,
+        )
+
+    monkeypatch.setattr(pipeline_module, "_discover", discovery)
+    monkeypatch.setattr(pipeline, "_clip_and_filter", fail_selector)
+    context = GenerationContext("slow")
+
+    with pytest.raises(ProviderTransientError):
+        pipeline.ingest_topic(
+            topic="Python recursion",
+            material_id="material",
+            concept_id="concept",
+            max_videos=3,
+            generation_context=context,
+        )
+
+    assert discovery.call_count == 1
+    assert set(analyzed) == {video["id"] for video in videos}
+    assert context.counters()["provider_failures"] == 3
+
+
+def test_mixed_selector_transient_and_clean_empty_keeps_novel_recovery(
+    monkeypatch,
+) -> None:
+    initial_videos = [
+        {**_video(), "id": "selector-transient"},
+        {**_video(), "id": "clean-empty"},
+    ]
+    recovery_video = {**_video(), "id": "novel-recovery"}
+    discovery_calls = 0
+
+    def discover(_topic, **_kwargs):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        return {
+            **_discovery(),
+            "queries": ["Python recursion explained"],
+            "videos": (
+                initial_videos
+                if discovery_calls == 1
+                else [recovery_video]
+            ),
+        }
+
+    def clip_and_filter(video, *_args, **_kwargs):
+        if video["id"] == "selector-transient":
+            raise ProviderTransientError(
+                "Gemini selector is temporarily unavailable.",
+                provider="gemini",
+                operation="segmentation",
+                status_code=503,
+            )
+        if video["id"] == "clean-empty":
+            return video, [], {"transcript": _transcript(), "clips": []}
+        return (
+            video,
+            [_quality_clip(candidate_id="novel-recovery-clip")],
+            {"transcript": _transcript(), "clips": []},
+        )
+
+    pipeline = _pipeline()
+    monkeypatch.setattr(pipeline_module, "_discover", discover)
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        mock.Mock(return_value=("recovered-reel", mock.sentinel.metadata)),
+    )
+
+    reels, resolved = pipeline.ingest_topic(
+        topic="Python recursion",
+        material_id="material",
+        concept_id="concept",
+        max_videos=2,
+        max_reels=1,
+        generation_context=GenerationContext("fast"),
+    )
+
+    assert reels == ["recovered-reel"]
+    assert resolved == [
+        "selector-transient",
+        "clean-empty",
+        "novel-recovery",
+    ]
+    assert discovery_calls == 2
 
 
 def test_zero_clip_recovery_is_attempted_only_once_when_recovery_also_rejects(

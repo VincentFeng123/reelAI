@@ -6,6 +6,7 @@ import logging
 import math
 import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -195,7 +196,11 @@ class GenerationBudget:
         self._gemini_committed_cost_usd = 0.0
         self._gemini_billing_unknown_cost_usd = 0.0
         self._gemini_inflight: dict[int, _GeminiCostReservation] = {}
+        self._gemini_terminalized: dict[int, _GeminiCostReservation] = {}
         self._next_gemini_reservation_id = 1
+        self._gemini_admission_closed = False
+        self._gemini_terminalized_reservation_count = 0
+        self._gemini_terminalized_inflight_cost_usd = 0.0
         self._selector_calls = 0
         self._flash_selector_calls = 0
         self._pro_selector_calls = 0
@@ -379,6 +384,12 @@ class GenerationBudget:
                 )
 
             with self._gemini_condition:
+                if self._gemini_admission_closed:
+                    raise ProviderBudgetExceededError(
+                        "Gemini cost admission is closed for this generation attempt.",
+                        provider="gemini",
+                        operation=operation,
+                    )
                 if is_pro and not is_allowed_pro_operation:
                     raise ProviderBudgetExceededError(
                         "This Gemini Pro operation is disabled for generation.",
@@ -497,12 +508,42 @@ class GenerationBudget:
                     continue
                 self._gemini_condition.wait(timeout=min(0.05, remaining))
 
+    def finalize_gemini_exposure(self) -> dict[str, int | float | bool]:
+        """Close this attempt and retain every outstanding call fail-closed."""
+        with self._gemini_condition:
+            if not self._gemini_admission_closed:
+                terminalized_cost = sum(
+                    reservation.admitted_cost_usd
+                    for reservation in self._gemini_inflight.values()
+                )
+                self._gemini_admission_closed = True
+                self._gemini_terminalized_reservation_count = len(
+                    self._gemini_inflight
+                )
+                self._gemini_terminalized_inflight_cost_usd = terminalized_cost
+                self._gemini_committed_cost_usd += terminalized_cost
+                self._gemini_billing_unknown_cost_usd += terminalized_cost
+                self._gemini_terminalized.update(self._gemini_inflight)
+                self._gemini_inflight.clear()
+                self._gemini_condition.notify_all()
+            return {
+                "admission_closed": self._gemini_admission_closed,
+                "terminalized_reservation_count": (
+                    self._gemini_terminalized_reservation_count
+                ),
+                "terminalized_inflight_cost_usd": round(
+                    self._gemini_terminalized_inflight_cost_usd,
+                    8,
+                ),
+            }
+
     def reconcile_gemini(
         self,
         reservation_id: int | None,
         *,
         actual_cost_usd: float | None,
         unknown_prior_attempts: int = 0,
+        unknown_final_attempt_cost_usd: float | None = None,
     ) -> bool:
         """Settle one logical call without dropping unknown retry exposure."""
         with self._gemini_condition:
@@ -514,10 +555,39 @@ class GenerationBudget:
                 return False
             reservation = self._gemini_inflight.pop(int(reservation_id), None)
             if reservation is None:
-                return False
+                reservation = self._gemini_terminalized.pop(
+                    int(reservation_id),
+                    None,
+                )
+                if reservation is None:
+                    return False
+                # Terminalization already retained the whole admitted ticket as
+                # unknown. Replace that conservative placeholder with the late
+                # provider evidence instead of counting the same call twice.
+                self._gemini_committed_cost_usd = max(
+                    0.0,
+                    self._gemini_committed_cost_usd
+                    - reservation.admitted_cost_usd,
+                )
+                self._gemini_billing_unknown_cost_usd = max(
+                    0.0,
+                    self._gemini_billing_unknown_cost_usd
+                    - reservation.admitted_cost_usd,
+                )
             reserved = reservation.attempt_cost_usd
+            unknown_final_cost = reserved
+            if unknown_final_attempt_cost_usd is not None:
+                try:
+                    candidate_unknown_cost = max(
+                        0.0,
+                        float(unknown_final_attempt_cost_usd),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    candidate_unknown_cost = reserved
+                if math.isfinite(candidate_unknown_cost):
+                    unknown_final_cost = min(reserved, candidate_unknown_cost)
             final_attempt_cost = (
-                reserved
+                unknown_final_cost
                 if actual_cost_usd is None
                 else max(0.0, float(actual_cost_usd))
             )
@@ -526,7 +596,7 @@ class GenerationBudget:
             self._gemini_committed_cost_usd += committed
             self._gemini_billing_unknown_cost_usd += unknown_retry_cost
             if actual_cost_usd is None:
-                self._gemini_billing_unknown_cost_usd += reserved
+                self._gemini_billing_unknown_cost_usd += unknown_final_cost
             if final_attempt_cost > reserved + 1e-9:
                 logger.warning(
                     "Gemini actual cost exceeded reservation: actual=$%.6f reserved=$%.6f",
@@ -540,6 +610,100 @@ class GenerationBudget:
                     max(1, int(unknown_prior_attempts) + 1),
                     reservation.max_physical_attempts,
                 )
+            self._gemini_condition.notify_all()
+            return True
+
+    def abandon_gemini_admission(
+        self,
+        reservation_id: int,
+        *,
+        model: str,
+        operation: str,
+        count_logical_call: bool,
+    ) -> bool:
+        """Roll back a call that cannot persist its pre-dispatch ticket."""
+        normalized_model = str(model or "").casefold()
+        normalized_operation = str(operation or "").casefold()
+        is_pro = (
+            "pro" in normalized_model
+            or normalized_operation.startswith("pro_")
+        )
+        is_pro_fallback = normalized_operation == "pro_fallback"
+        is_pro_boundary_audit = (
+            is_pro and normalized_operation == "pro_boundary_audit"
+        )
+        is_pro_selector = (
+            is_pro and normalized_operation == "pro_authoritative"
+        )
+        is_flash_selector = (
+            not is_pro
+            and normalized_operation
+            in {
+                "flash_single_candidate",
+                "flash_boundary_selector",
+                "boundary_selection",
+            }
+        )
+        with self._gemini_condition:
+            reservation = self._gemini_inflight.pop(
+                int(reservation_id),
+                None,
+            )
+            was_terminalized = False
+            if reservation is None:
+                reservation = self._gemini_terminalized.pop(
+                    int(reservation_id),
+                    None,
+                )
+                was_terminalized = reservation is not None
+            if reservation is None:
+                return False
+            admitted_cost = reservation.admitted_cost_usd
+            self._gemini_reserved_cost_usd = max(
+                0.0,
+                self._gemini_reserved_cost_usd - admitted_cost,
+            )
+            if was_terminalized:
+                self._gemini_committed_cost_usd = max(
+                    0.0,
+                    self._gemini_committed_cost_usd - admitted_cost,
+                )
+                self._gemini_billing_unknown_cost_usd = max(
+                    0.0,
+                    self._gemini_billing_unknown_cost_usd - admitted_cost,
+                )
+                self._gemini_terminalized_reservation_count = max(
+                    0,
+                    self._gemini_terminalized_reservation_count - 1,
+                )
+                self._gemini_terminalized_inflight_cost_usd = max(
+                    0.0,
+                    self._gemini_terminalized_inflight_cost_usd
+                    - admitted_cost,
+                )
+            if count_logical_call:
+                if is_pro_fallback:
+                    self._pro_fallback_calls = max(
+                        0,
+                        self._pro_fallback_calls - 1,
+                    )
+                if is_flash_selector or is_pro_selector:
+                    self._selector_calls = max(0, self._selector_calls - 1)
+                if is_flash_selector:
+                    self._flash_selector_calls = max(
+                        0,
+                        self._flash_selector_calls - 1,
+                    )
+                if is_pro_selector:
+                    self._pro_selector_calls = max(
+                        0,
+                        self._pro_selector_calls - 1,
+                    )
+                if is_pro_boundary_audit:
+                    self._boundary_audit_calls = max(
+                        0,
+                        self._boundary_audit_calls - 1,
+                    )
             self._gemini_condition.notify_all()
             return True
 
@@ -588,6 +752,24 @@ class GenerationBudget:
                         + sum(
                             item.admitted_cost_usd
                             for item in self._gemini_inflight.values()
+                        ),
+                        8,
+                    ),
+                    "admission_closed": self._gemini_admission_closed,
+                    "terminalized_reservation_count": (
+                        self._gemini_terminalized_reservation_count
+                    ),
+                    "terminalized_inflight_cost_usd": round(
+                        self._gemini_terminalized_inflight_cost_usd,
+                        8,
+                    ),
+                    "terminalized_unreconciled_reservation_count": len(
+                        self._gemini_terminalized
+                    ),
+                    "terminalized_unreconciled_cost_usd": round(
+                        sum(
+                            item.admitted_cost_usd
+                            for item in self._gemini_terminalized.values()
                         ),
                         8,
                     ),
@@ -778,12 +960,16 @@ class GenerationContext:
         *,
         generation_id: str = "",
         usage_sink: Callable[[ProviderUsageRecord], None] | None = None,
+        gemini_ticket_reserve_sink: Callable[..., object] | None = None,
+        gemini_ticket_settle_sink: Callable[..., object] | None = None,
         cache_store: Any = None,
         require_acoustic_boundaries: bool = False,
     ) -> None:
         self.generation_id = generation_id
         self.budget = GenerationBudget.for_mode(mode)
         self.usage_sink = usage_sink
+        self.gemini_ticket_reserve_sink = gemini_ticket_reserve_sink
+        self.gemini_ticket_settle_sink = gemini_ticket_settle_sink
         self.cache_store = cache_store
         self.require_acoustic_boundaries = bool(require_acoustic_boundaries)
         self._usage: list[ProviderUsageRecord] = []
@@ -813,10 +999,14 @@ class GenerationContext:
         estimated_input_tokens: int | None = None,
         max_physical_attempts: int | None = None,
         count_logical_call: bool = True,
+        billing_cost_multiplier: float = 1.0,
         deadline_monotonic: float | None = None,
         cancelled: Callable[[], bool] | object | None = None,
-    ) -> dict[str, int | float]:
+    ) -> dict[str, int | float | str | bool]:
         """Reserve worst-case billed tokens before a Gemini request is dispatched."""
+        multiplier = float(billing_cost_multiplier)
+        if not math.isfinite(multiplier) or not 1.0 <= multiplier <= 2.0:
+            raise ValueError("billing_cost_multiplier must be between 1 and 2")
         prompt_tokens = (
             max(0, int(estimated_input_tokens))
             if estimated_input_tokens is not None
@@ -829,7 +1019,7 @@ class GenerationContext:
         )
         estimated_cost = (
             prompt_tokens * input_rate + output_tokens * output_rate
-        ) / 1_000_000.0
+        ) / 1_000_000.0 * multiplier
         admitted_attempts = (
             1
             if max_physical_attempts is None
@@ -844,14 +1034,45 @@ class GenerationContext:
             deadline_monotonic=deadline_monotonic,
             cancelled=cancelled,
         )
-        return {
+        ticket: dict[str, int | float | str | bool] = {
             "gemini_reservation_id": reservation_id,
             "reserved_input_tokens": prompt_tokens,
             "reserved_output_tokens": output_tokens,
             "reserved_cost_usd": estimated_cost,
+            "billing_cost_multiplier": multiplier,
             "admitted_physical_attempts": admitted_attempts,
             "admitted_cost_usd": estimated_cost * admitted_attempts,
         }
+        if self.gemini_ticket_reserve_sink is not None:
+            durable_ticket_id = str(uuid.uuid4())
+            try:
+                persisted = self.gemini_ticket_reserve_sink(
+                    ticket_id=durable_ticket_id,
+                    operation=operation,
+                    model=model,
+                    reservation=dict(ticket),
+                )
+            except Exception:
+                self.budget.abandon_gemini_admission(
+                    reservation_id,
+                    model=model,
+                    operation=operation,
+                    count_logical_call=count_logical_call,
+                )
+                raise
+            if not persisted:
+                self.budget.abandon_gemini_admission(
+                    reservation_id,
+                    model=model,
+                    operation=operation,
+                    count_logical_call=count_logical_call,
+                )
+                raise RuntimeError(
+                    "Gemini dispatch ticket could not be persisted"
+                )
+            ticket["gemini_ticket_id"] = durable_ticket_id
+            ticket["gemini_durable_ticket"] = True
+        return ticket
 
     def reconcile_gemini_call(
         self,
@@ -913,6 +1134,16 @@ class GenerationContext:
         )
         actual_cost: float | None
         if usage_known:
+            raw_multiplier = _usage_field(usage, "billing_cost_multiplier")
+            try:
+                billing_cost_multiplier = float(raw_multiplier or 1.0)
+            except (TypeError, ValueError, OverflowError):
+                billing_cost_multiplier = 1.0
+            if (
+                not math.isfinite(billing_cost_multiplier)
+                or not 1.0 <= billing_cost_multiplier <= 2.0
+            ):
+                billing_cost_multiplier = 1.0
             input_rate, cached_input_rate, output_rate = _gemini_token_rates(
                 model_used,
                 input_tokens=input_tokens,
@@ -921,13 +1152,47 @@ class GenerationContext:
                 (input_tokens - cached_tokens) * input_rate
                 + cached_tokens * cached_input_rate
                 + output_tokens * output_rate
-            ) / 1_000_000.0
+            ) / 1_000_000.0 * billing_cost_multiplier
         elif dispatched_value:
             # A dispatched call with missing token telemetry may still be billed.
             actual_cost = None
         else:
             actual_cost = 0.0
-        return self.budget.reconcile_gemini(
+        trusted_unknown_cost: float | None = None
+        if (
+            actual_cost is None
+            and str(
+                _usage_field(usage, "service_tier_requested") or ""
+            ).casefold()
+            == "priority"
+            and str(
+                _usage_field(usage, "service_tier_used") or ""
+            ).casefold()
+            == "standard"
+        ):
+            try:
+                priority_reserved_cost = float(
+                    _usage_field(usage, "priority_reserved_cost_usd")
+                )
+                reserved_multiplier = float(
+                    _usage_field(
+                        usage,
+                        "reserved_billing_cost_multiplier",
+                    )
+                )
+            except (TypeError, ValueError, OverflowError):
+                priority_reserved_cost = 0.0
+                reserved_multiplier = 0.0
+            if (
+                math.isfinite(priority_reserved_cost)
+                and priority_reserved_cost > 0.0
+                and math.isfinite(reserved_multiplier)
+                and 1.0 < reserved_multiplier <= 2.0
+            ):
+                trusted_unknown_cost = (
+                    priority_reserved_cost / reserved_multiplier
+                )
+        reconciled = self.budget.reconcile_gemini(
             reservation_id,
             actual_cost_usd=actual_cost,
             # Successful final-attempt usage cannot price an earlier transport
@@ -937,7 +1202,66 @@ class GenerationContext:
             unknown_prior_attempts=(
                 _gemini_retry_attempts(usage) if dispatched_value else 0
             ),
+            unknown_final_attempt_cost_usd=(
+                trusted_unknown_cost
+            ),
         )
+        durable_ticket_id = str(
+            _usage_field(usage, "gemini_ticket_id") or ""
+        ).strip()
+        if (
+            reconciled
+            and durable_ticket_id
+            and bool(_usage_field(usage, "gemini_durable_ticket"))
+            and self.gemini_ticket_settle_sink is not None
+        ):
+            self.gemini_ticket_settle_sink(
+                ticket_id=durable_ticket_id,
+                state=(
+                    "released"
+                    if not dispatched_value
+                    else "settled_known"
+                    if actual_cost is not None
+                    else "settled_unknown"
+                ),
+                model=model_used,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=_usage_value(
+                    usage,
+                    "total_token_count",
+                    "totalTokenCount",
+                    "total_tokens",
+                )
+                or input_tokens + output_tokens,
+                actual_cost_usd=(
+                    actual_cost
+                    if dispatched_value and actual_cost is not None
+                    else None
+                ),
+                unknown_cost_usd=(
+                    trusted_unknown_cost
+                    or _usage_field(usage, "reserved_cost_usd")
+                    if actual_cost is None and dispatched_value
+                    else None
+                ),
+                metadata={
+                    "dispatched": dispatched_value,
+                    "billing_cost_multiplier": _usage_field(
+                        usage,
+                        "billing_cost_multiplier",
+                    ),
+                    "service_tier_requested": _usage_field(
+                        usage,
+                        "service_tier_requested",
+                    ),
+                    "service_tier_used": _usage_field(
+                        usage,
+                        "service_tier_used",
+                    ),
+                },
+            )
+        return reconciled
 
     def configure_pro_fallback_gate(self, expected_initial_results: int) -> None:
         """Set the first-wave size before its concurrent selectors are started."""
@@ -1040,10 +1364,15 @@ class GenerationContext:
             self._pro_fallback_claimed = True
             return True
 
-    def record(self, record: ProviderUsageRecord) -> None:
+    def record(
+        self,
+        record: ProviderUsageRecord,
+        *,
+        persist: bool = True,
+    ) -> None:
         with self._lock:
             self._usage.append(record)
-        if self.usage_sink is not None:
+        if persist and self.usage_sink is not None:
             try:
                 self.usage_sink(record)
             except Exception as exc:
@@ -1268,9 +1597,16 @@ class GenerationContext:
             "prompt_version",
             "thinking_level",
             "gemini_reservation_id",
+            "gemini_ticket_id",
+            "gemini_durable_ticket",
             "reserved_input_tokens",
             "reserved_output_tokens",
             "reserved_cost_usd",
+            "billing_cost_multiplier",
+            "priority_reserved_cost_usd",
+            "reserved_billing_cost_multiplier",
+            "service_tier_requested",
+            "service_tier_used",
             "admitted_physical_attempts",
             "admitted_cost_usd",
             "physical_dispatches",
@@ -1349,7 +1685,13 @@ class GenerationContext:
             usage=usage,
             dispatched=dispatched_value,
         )
-        self.record(record)
+        self.record(
+            record,
+            persist=not bool(
+                _usage_field(usage, "gemini_durable_ticket")
+                and _usage_field(usage, "gemini_ticket_id")
+            ),
+        )
 
     def usage(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -1369,11 +1711,25 @@ class GenerationContext:
             max(0, int((record.get("metadata") or {}).get("cached_tokens") or 0)),
         )
         uncached_tokens = input_tokens - cached_tokens
+        try:
+            billing_cost_multiplier = float(
+                (record.get("metadata") or {}).get(
+                    "billing_cost_multiplier",
+                    1.0,
+                )
+            )
+        except (TypeError, ValueError, OverflowError):
+            billing_cost_multiplier = 1.0
+        if (
+            not math.isfinite(billing_cost_multiplier)
+            or not 1.0 <= billing_cost_multiplier <= 2.0
+        ):
+            billing_cost_multiplier = 1.0
         return (
             uncached_tokens * input_rate
             + cached_tokens * cached_input_rate
             + int(record.get("output_tokens") or 0) * output_rate
-        ) / 1_000_000.0
+        ) / 1_000_000.0 * billing_cost_multiplier
 
     def usage_payload(self) -> dict[str, Any]:
         """Stable, aggregated job usage plus the existing raw provider ledger."""
@@ -1472,7 +1828,8 @@ class GenerationContext:
         cache_hits = sum(
             1 for row in records if bool((row.get("metadata") or {}).get("cache_hit"))
         )
-        budget_snapshot = self.budget.snapshot()["gemini"]
+        budget = self.budget.snapshot()
+        budget_snapshot = budget["gemini"]
         summary = {
             "gemini_calls": len(gemini_calls),
             "gemini_attempts": sum(
@@ -1538,7 +1895,7 @@ class GenerationContext:
             "rejected_boundaries": int(counters.get("boundary_rejections") or 0),
         }
         return {
-            "budget": self.budget.snapshot(),
+            "budget": budget,
             "summary": summary,
             "by_stage": by_stage,
             "provider_calls": records,

@@ -859,11 +859,12 @@ def test_budget_is_reserved_once_and_default_call_allows_one_transient_retry(mon
                 ).encode("utf-8"))
             ) / 3)
             + 1_000
-        ),
-        "max_physical_attempts": 1,
-        "count_logical_call": True,
-        "cancelled": None,
-    }
+            ),
+            "max_physical_attempts": 1,
+            "count_logical_call": True,
+            "billing_cost_multiplier": 1.0,
+            "cancelled": None,
+        }
 
 
 def test_selector_dispatches_are_capped_process_wide_at_three(monkeypatch):

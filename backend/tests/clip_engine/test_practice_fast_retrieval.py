@@ -413,32 +413,37 @@ def test_expansion_rejects_every_kind_topology_mismatch() -> None:
 
 
 @pytest.mark.parametrize(
-    ("topic", "constraints", "joint_structures"),
+    ("topic", "constraints", "joint_structures", "fallback_expected"),
     [
         (
             "Teach C, then test C.",
             _repeated_c_constraints(0, 2),
             [],
+            True,
         ),
         (
             "Teach C, then test C.",
             _repeated_c_constraints(None, 1),
             [],
+            True,
         ),
         (
             "Teach C, then test C.",
             _repeated_c_constraints(0, 0),
             [],
+            True,
         ),
         (
             "Compare alpha with beta.",
             _comparison_constraints(relation_kind="scope"),
             _comparison_joint_structure(),
+            True,
         ),
         (
             "Compare alpha with beta.",
             _comparison_constraints(relation_phrase="Compare alpha"),
             _comparison_joint_structure(),
+            True,
         ),
     ],
     ids=[
@@ -449,11 +454,12 @@ def test_expansion_rejects_every_kind_topology_mismatch() -> None:
         "invalid-relation-topology",
     ],
 )
-def test_expansion_retries_selector_rejected_contract_before_cache_or_return(
+def test_expansion_uses_typed_ai_queries_after_strict_contract_exhaustion(
     monkeypatch,
     topic,
     constraints,
     joint_structures,
+    fallback_expected,
 ) -> None:
     raw = json.dumps(_selector_contract_payload(
         topic,
@@ -476,15 +482,391 @@ def test_expansion_retries_selector_rejected_contract_before_cache_or_return(
         lambda *args: cache_writes.append(args),
     )
 
-    with pytest.raises(ProviderResponseValidationError):
-        expand.expand_query_practice_fast(
+    if fallback_expected:
+        result = expand.expand_query_practice_fast(
             topic,
             1,
             context=GenerationContext("fast"),
         )
+    else:
+        with pytest.raises(ProviderResponseValidationError):
+            expand.expand_query_practice_fast(
+                topic,
+                1,
+                context=GenerationContext("fast"),
+            )
+        result = None
 
     assert provider_calls == expand.PRACTICE_FAST_EXPAND_ATTEMPTS
     assert cache_writes == []
+    if fallback_expected:
+        assert result == {
+            "corrected": topic,
+            "queries": [topic],
+            "provider_used": "gemini",
+        }
+
+
+def test_typed_retrieval_fallback_ignores_invalid_auxiliary_constraint_fields(
+    monkeypatch,
+) -> None:
+    topic = "Explain the chain rule with a worked example"
+    payload = json.loads(_intent_expansion_json(
+        corrected=topic,
+        source_phrase="chain rule",
+        queries=["chain rule worked example lesson"],
+    ))
+    [subject] = payload["intent_constraints"]
+    subject.pop("requirement")
+    subject["source_occurrence"] = "first"
+    subject["relationship_topology"] = "diagonal"
+    subject["future_auxiliary_field"] = {"freeform": True}
+    provider_calls = 0
+
+    def fake_raw(*_args, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        return json.dumps(payload)
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
+
+    result = expand.expand_query_practice_fast(topic, 2)
+
+    assert provider_calls == expand.PRACTICE_FAST_EXPAND_ATTEMPTS
+    assert result == {
+        "corrected": topic,
+        "queries": [topic, "chain rule worked example lesson"],
+        "provider_used": "gemini",
+    }
+
+
+def test_expansion_typed_ai_fallback_keeps_newest_usable_response(
+    monkeypatch,
+) -> None:
+    first = json.loads(_intent_expansion_json(
+        corrected="First AI summary",
+        source_phrase="calculus",
+        queries=["first calculus query"],
+    ))
+    first["corrected"] = "First AI summary " + ("x" * 221)
+    second = json.loads(_intent_expansion_json(
+        corrected="Second AI summary",
+        source_phrase="calculus",
+        queries=["second calculus query"],
+    ))
+    second["corrected"] = "Second AI summary " + ("y" * 221)
+    responses: list[object] = [
+        json.dumps(first),
+        json.dumps(second),
+        RuntimeError("temporary final-attempt outage"),
+    ]
+    calls = 0
+
+    def fake_raw(*_args, **_kwargs):
+        nonlocal calls
+        response = responses[calls]
+        calls += 1
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
+
+    result = expand.expand_query_practice_fast("calculus", 3)
+
+    assert calls == expand.PRACTICE_FAST_EXPAND_ATTEMPTS
+    assert result == {
+        "corrected": second["corrected"],
+        "queries": ["calculus", "second calculus query"],
+        "provider_used": "gemini",
+    }
+
+
+@pytest.mark.parametrize(
+    ("topic", "subject", "query"),
+    [
+        (
+            "Explain conservation of momentum in collisions.",
+            "conservation of momentum",
+            "conservation of momentum collision explanation",
+        ),
+        (
+            "Teach meiosis and genetic variation.",
+            "meiosis",
+            "meiosis genetic variation lesson",
+        ),
+        (
+            "Derive the quotient rule with a worked example.",
+            "quotient rule",
+            "quotient rule derivation worked example",
+        ),
+        (
+            "Explain database transaction isolation levels.",
+            "transaction isolation",
+            "database transaction isolation levels explained",
+        ),
+        (
+            "Compare negligence duty and breach.",
+            "negligence",
+            "negligence duty breach comparison",
+        ),
+    ],
+    ids=["physics", "biology", "math", "software", "law"],
+)
+def test_typed_ai_retrieval_fallback_is_domain_agnostic(
+    monkeypatch,
+    topic,
+    subject,
+    query,
+) -> None:
+    payload = json.loads(_intent_expansion_json(
+        corrected=topic,
+        source_phrase=subject,
+        queries=[query],
+    ))
+    payload["corrected"] += " " + ("x" * 221)
+    provider_calls = 0
+    cache_writes = []
+
+    def fake_raw(*_args, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        return json.dumps(payload)
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
+    monkeypatch.setattr(expand, "_read_cached_expansion", lambda *_args: None)
+    monkeypatch.setattr(
+        expand,
+        "_write_cached_expansion",
+        lambda *args: cache_writes.append(args),
+    )
+
+    result = expand.expand_query_practice_fast(
+        topic,
+        2,
+        context=GenerationContext("fast"),
+    )
+
+    assert provider_calls == expand.PRACTICE_FAST_EXPAND_ATTEMPTS
+    assert result == {
+        "corrected": payload["corrected"],
+        "queries": [topic, query],
+        "provider_used": "gemini",
+    }
+    assert cache_writes == []
+
+
+@pytest.mark.parametrize(
+    ("topic", "raw_response"),
+    [
+        (
+            "Explain angular momentum conservation.",
+            "{malformed",
+        ),
+        (
+            "Teach cell signaling pathways.",
+            "",
+        ),
+        (
+            "Derive integration by parts with an example.",
+            json.dumps({
+                "corrected": "Integration by parts",
+                "queries": [],
+            }),
+        ),
+        (
+            "Explain distributed consensus algorithms.",
+            "[not-an-expansion-object]",
+        ),
+        (
+            "Compare strict liability and negligence.",
+            json.dumps({
+                "corrected": "Strict liability and negligence",
+                "intent_constraints": [],
+                "queries": [],
+            }),
+        ),
+    ],
+    ids=["physics-malformed", "biology-empty", "math-schema", "software-malformed", "law-schema"],
+)
+def test_exact_request_fallback_is_domain_agnostic_after_provider_responses(
+    monkeypatch,
+    topic,
+    raw_response,
+) -> None:
+    provider_calls = 0
+    cache_writes = []
+
+    def fake_raw(*_args, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        return raw_response
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
+    monkeypatch.setattr(expand, "_read_cached_expansion", lambda *_args: None)
+    monkeypatch.setattr(
+        expand,
+        "_write_cached_expansion",
+        lambda *args: cache_writes.append(args),
+    )
+
+    result = expand.expand_query_practice_fast(
+        topic,
+        3,
+        context=GenerationContext("fast"),
+    )
+
+    assert provider_calls == expand.PRACTICE_FAST_EXPAND_ATTEMPTS
+    assert result == {
+        "corrected": topic,
+        "queries": [topic],
+        "provider_used": "literal_fallback",
+    }
+    assert cache_writes == []
+
+
+def test_exact_request_fallback_remains_available_during_recovery(
+    monkeypatch,
+) -> None:
+    topic = "Explain Fourier transforms"
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: "{malformed",
+    )
+
+    result = expand.expand_query_practice_fast(
+        topic,
+        2,
+        tried_queries=[topic, "Fourier transform tutorial"],
+        recovery_reason=expand.RECOVERY_REASON_ZERO_VALID_CLIPS,
+    )
+
+    assert result == {
+        "corrected": topic,
+        "queries": [topic],
+        "provider_used": "literal_fallback",
+    }
+
+
+@pytest.mark.parametrize("status_code", [429, 403])
+def test_typed_ai_fallback_survives_a_later_provider_failure(
+    monkeypatch,
+    status_code,
+) -> None:
+    payload = json.loads(_intent_expansion_json(
+        corrected="Calculus",
+        source_phrase="calculus",
+        queries=["calculus derivative lesson"],
+    ))
+    payload["corrected"] += " " + ("x" * 221)
+
+    class LaterProviderFailure(RuntimeError):
+        retryable = False
+
+        def __init__(self):
+            super().__init__("later provider failure")
+            self.status_code = status_code
+
+    responses: list[object] = [
+        json.dumps(payload),
+        LaterProviderFailure(),
+    ]
+    calls = 0
+
+    def fake_raw(*_args, **_kwargs):
+        nonlocal calls
+        response = responses[calls]
+        calls += 1
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
+
+    result = expand.expand_query_practice_fast("calculus", 2)
+
+    assert calls == 2
+    assert result == {
+        "corrected": payload["corrected"],
+        "queries": ["calculus", "calculus derivative lesson"],
+        "provider_used": "gemini",
+    }
+
+
+def test_expansion_strict_retry_wins_over_earlier_typed_ai_fallback(
+    monkeypatch,
+) -> None:
+    fallback_payload = json.loads(_intent_expansion_json(
+        corrected="Calculus fallback",
+        source_phrase="calculus",
+        queries=["calculus fallback query"],
+    ))
+    fallback_payload["corrected"] += " " + ("x" * 221)
+    strict_payload = _intent_expansion_json(
+        corrected="Calculus",
+        source_phrase="calculus",
+        queries=["calculus strict query"],
+    )
+    responses = iter([json.dumps(fallback_payload), strict_payload])
+    cache_writes = []
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: next(responses),
+    )
+    monkeypatch.setattr(expand, "_read_cached_expansion", lambda *_args: None)
+    monkeypatch.setattr(
+        expand,
+        "_write_cached_expansion",
+        lambda *args: cache_writes.append(args),
+    )
+
+    result = expand.expand_query_practice_fast(
+        "calculus",
+        3,
+        context=GenerationContext("fast"),
+    )
+
+    assert result["corrected"] == "Calculus"
+    assert result["queries"] == ["calculus strict query"]
+    assert result["intent_contract"]["request_intent"]["exact_request"] == "calculus"
+    assert len(cache_writes) == 1
+
+
+def test_expansion_typed_ai_recovery_filters_tried_queries_before_count(
+    monkeypatch,
+) -> None:
+    payload = json.loads(_intent_expansion_json(
+        corrected="Series circuits",
+        source_phrase="series circuits",
+        queries=[
+            "series circuit current tutorial",
+            "series circuit voltage worked example",
+        ],
+    ))
+    payload["corrected"] += " " + ("x" * 221)
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: json.dumps(payload),
+    )
+
+    result = expand.expand_query_practice_fast(
+        "series circuits",
+        1,
+        tried_queries=[
+            "series circuits",
+            "series circuit current tutorial",
+        ],
+        recovery_reason=expand.RECOVERY_REASON_ZERO_VALID_CLIPS,
+    )
+
+    assert result == {
+        "corrected": payload["corrected"],
+        "queries": ["series circuit voltage worked example"],
+        "provider_used": "gemini",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1400,7 +1782,11 @@ def test_practice_fast_expansion_keeps_partial_focus_beside_complete_broad_query
                 "text": "chain rule worked example",
                 "preserved_constraint_ids": ["request"],
             }],
-            None,
+            {
+                "corrected": "chain rule worked example",
+                "queries": ["chain rule worked example"],
+                "provider_used": "literal_fallback",
+            },
         ),
         (
             [
@@ -1444,7 +1830,7 @@ def test_practice_fast_expansion_keeps_partial_focus_beside_complete_broad_query
         ),
     ],
 )
-def test_practice_fast_expansion_requires_subject_and_accepts_focused_queries(
+def test_practice_fast_expansion_falls_back_without_subject_and_accepts_focused_queries(
     monkeypatch,
     intent_constraints,
     queries,
@@ -1461,12 +1847,9 @@ def test_practice_fast_expansion_requires_subject_and_accepts_focused_queries(
         lambda *_args, **_kwargs: _expansion_payload_json(payload),
     )
 
-    if expected is None:
-        with pytest.raises(ProviderResponseValidationError):
-            expand.expand_query_practice_fast("chain rule worked example", 3)
-    else:
-        result = expand.expand_query_practice_fast("chain rule worked example", 3)
-        assert _without_intent_contract(result) == expected
+    result = expand.expand_query_practice_fast("chain rule worked example", 3)
+
+    assert _without_intent_contract(result) == expected
 
 
 def test_practice_fast_expansion_trusts_grounded_ai_retrieval_branch_when_plan_is_sparse(
@@ -1504,7 +1887,9 @@ def test_practice_fast_expansion_trusts_grounded_ai_retrieval_branch_when_plan_i
     }
 
 
-def test_practice_fast_expansion_rejects_ungrounded_ai_subject(monkeypatch):
+def test_practice_fast_expansion_uses_exact_request_for_ungrounded_ai_subject(
+    monkeypatch,
+):
     payload = {
         "corrected": "quotient rule",
         "intent_constraints": [
@@ -1528,8 +1913,13 @@ def test_practice_fast_expansion_rejects_ungrounded_ai_subject(monkeypatch):
         lambda *_args, **_kwargs: _expansion_payload_json(payload),
     )
 
-    with pytest.raises(ProviderResponseValidationError):
-        expand.expand_query_practice_fast("chain rule worked example", 3)
+    result = expand.expand_query_practice_fast("chain rule worked example", 3)
+
+    assert result == {
+        "corrected": "chain rule worked example",
+        "queries": ["chain rule worked example"],
+        "provider_used": "literal_fallback",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1541,7 +1931,7 @@ def test_practice_fast_expansion_rejects_ungrounded_ai_subject(monkeypatch):
     ],
     ids=["incomplete", "unknown", "duplicate"],
 )
-def test_practice_fast_expansion_rejects_unbound_corrected_summary(
+def test_practice_fast_expansion_uses_exact_request_for_unbound_corrected_summary(
     monkeypatch,
     summary_ids,
 ):
@@ -1581,8 +1971,52 @@ def test_practice_fast_expansion_rejects_unbound_corrected_summary(
         lambda *_args, **_kwargs: json.dumps(payload),
     )
 
-    with pytest.raises(ProviderResponseValidationError):
-        expand.expand_query_practice_fast("chain rule worked example", 3)
+    result = expand.expand_query_practice_fast("chain rule worked example", 3)
+
+    assert result == {
+        "corrected": "chain rule worked example",
+        "queries": ["chain rule worked example"],
+        "provider_used": "literal_fallback",
+    }
+
+
+def test_empty_provider_response_uses_exact_request_and_disables_sdk_retries(
+    monkeypatch,
+):
+    from google import genai
+    from google.genai import types
+
+    retry_attempts = []
+    original_retry_options = types.HttpRetryOptions
+
+    def capture_retry_options(**kwargs):
+        retry_attempts.append(kwargs["attempts"])
+        return original_retry_options(**kwargs)
+
+    async def empty_response(**_kwargs):
+        class Response:
+            text = ""
+            model_version = expand.PRACTICE_FAST_EXPAND_MODEL
+            usage_metadata = {}
+
+        return Response()
+
+    monkeypatch.setattr(expand.config, "require_gemini_key", lambda: "gemini-test")
+    monkeypatch.setattr(types, "HttpRetryOptions", capture_retry_options)
+    monkeypatch.setattr(
+        genai,
+        "Client",
+        lambda **_kwargs: _FakeGeminiClient(empty_response),
+    )
+
+    result = expand.expand_query_practice_fast("Explain plate tectonics", 3)
+
+    assert retry_attempts == [1] * expand.PRACTICE_FAST_EXPAND_ATTEMPTS
+    assert result == {
+        "corrected": "Explain plate tectonics",
+        "queries": ["Explain plate tectonics"],
+        "provider_used": "literal_fallback",
+    }
 
 
 def test_failed_expansion_dispatch_is_recorded_once(monkeypatch):
@@ -3480,6 +3914,68 @@ def test_literal_only_rejected_cursor_retries_with_fresh_grounded_branch(
     assert [video["id"] for video in result["videos"]] == ["fresh-recovery"]
     assert "unusable cursor branch was skipped" in str(result["warning"])
     assert context.budget.remaining("search") == 2
+
+
+def test_recovery_search_preserves_deliberate_exact_request_fallback(
+    monkeypatch,
+) -> None:
+    topic = "Explain angular momentum conservation"
+    expansion_calls = []
+    search_calls = []
+
+    def fake_expand(request, count, **kwargs):
+        expansion_calls.append(
+            (
+                request,
+                count,
+                list(kwargs.get("tried_queries") or []),
+            )
+        )
+        return {
+            "corrected": request,
+            "queries": [request],
+            "provider_used": "literal_fallback",
+        }
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        del filters, kwargs
+        search_calls.append(list(queries))
+        return {
+            "per_query": [{
+                "query": queries[0],
+                "videos": [{"id": "literal-recovery-video"}],
+                "next_page_token": None,
+            }],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+    monkeypatch.setattr(
+        search.rank,
+        "merge_and_rank",
+        lambda result_sets, **_kwargs: [
+            video
+            for result_set in result_sets
+            for video in result_set.get("videos") or []
+        ],
+    )
+
+    result = search.discover_practice_fast(
+        topic,
+        limit=1,
+        breadth=1,
+        retrieval_profile="deep",
+        recovery_tried_queries=[topic],
+        recovery_reason=expand.RECOVERY_REASON_ZERO_VALID_CLIPS,
+    )
+
+    assert expansion_calls == [(topic, 1, [topic])]
+    assert search_calls == [[topic]]
+    assert [video["id"] for video in result["videos"]] == [
+        "literal-recovery-video"
+    ]
 
 
 @pytest.mark.parametrize(

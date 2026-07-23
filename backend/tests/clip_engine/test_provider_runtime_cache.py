@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
+import threading
 import time
 
 import pytest
@@ -21,6 +22,7 @@ from backend.app.clip_engine.provider_cache import (
 from backend.app.clip_engine.provider_runtime import (
     GenerationBudget,
     GenerationContext,
+    ProviderUsageRecord,
     bounded_retry_after,
 )
 from backend.pipeline import gemini_segment
@@ -428,6 +430,47 @@ def test_pro_reservation_applies_long_context_tier_before_dispatch() -> None:
             max_output_tokens=100,
         )
     assert context.budget.snapshot()["gemini"]["pro_selector_calls"] == 1
+
+
+def test_priority_retry_reserves_and_prices_documented_pro_premium() -> None:
+    context = GenerationContext("slow", generation_id="job-pro-priority-retry")
+    reservation = context.reserve_gemini_call(
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=10_000,
+        max_output_tokens=1_000,
+        billing_cost_multiplier=1.8,
+    )
+    standard_reserved = (10_000 * 2.0 + 1_000 * 12.0) / 1_000_000.0
+
+    assert reservation["billing_cost_multiplier"] == 1.8
+    assert reservation["reserved_cost_usd"] == pytest.approx(
+        standard_reserved * 1.8
+    )
+
+    context.record_gemini(
+        attempt=1,
+        model_used="gemini-3.1-pro-preview",
+        quality_degraded=False,
+        stage="selection",
+        usage={
+            **reservation,
+            "prompt_tokens": 2_000,
+            "candidate_tokens": 100,
+            "thought_tokens": 50,
+            "total_tokens": 2_150,
+            "service_tier_requested": "priority",
+            "service_tier_used": "priority",
+            "dispatched": True,
+        },
+    )
+
+    expected = (2_000 * 2.0 + 150 * 12.0) / 1_000_000.0 * 1.8
+    payload = context.usage_payload()
+    assert payload["summary"]["estimated_cost_usd"] == pytest.approx(expected)
+    assert payload["provider_calls"][0]["metadata"][
+        "service_tier_used"
+    ] == "priority"
 
 
 def test_current_cost_diagnostics_do_not_report_lifetime_reservations_as_spend() -> None:
@@ -1036,6 +1079,38 @@ def test_unknown_dispatched_usage_keeps_full_reservation_fail_closed() -> None:
         )
 
 
+def test_untrusted_unknown_usage_cannot_reduce_its_reserved_ceiling() -> None:
+    context = GenerationContext("fast", generation_id="job-unknown-override")
+    reservation = context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=200_000,
+        max_output_tokens=8_192,
+    )
+
+    context.record_gemini(
+        attempt=1,
+        model_used="gemini-3.5-flash",
+        quality_degraded=False,
+        usage={
+            **reservation,
+            "reserved_cost_usd": 0.0,
+            "unknown_final_attempt_cost_usd": 0.0,
+            "dispatched": True,
+        },
+        status_code=None,
+        error_code="provider_usage_missing",
+    )
+
+    gemini = context.budget.snapshot()["gemini"]
+    assert gemini["committed_cost_usd"] == pytest.approx(
+        reservation["admitted_cost_usd"]
+    )
+    assert gemini["billing_unknown_cost_exposure_usd"] == pytest.approx(
+        reservation["admitted_cost_usd"]
+    )
+
+
 def test_total_only_dispatched_usage_keeps_full_reservation_fail_closed() -> None:
     context = GenerationContext("fast", generation_id="job-total-only-billing")
     reservation = context.reserve_gemini_call(
@@ -1187,6 +1262,301 @@ def test_non_dispatched_reservation_releases_capacity_idempotently() -> None:
     assert budget["inflight_reserved_cost_usd"] == pytest.approx(
         replacement["admitted_cost_usd"]
     )
+
+
+def test_durable_gemini_ticket_is_persisted_before_reservation_returns() -> None:
+    persisted: list[dict] = []
+    context = GenerationContext(
+        "fast",
+        generation_id="job-durable-ticket",
+        gemini_ticket_reserve_sink=lambda **payload: (
+            persisted.append(payload) or {"id": payload["ticket_id"]}
+        ),
+    )
+
+    ticket = context.reserve_gemini_call(
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=1_000,
+        max_output_tokens=100,
+    )
+
+    assert len(persisted) == 1
+    assert persisted[0]["ticket_id"] == ticket["gemini_ticket_id"]
+    assert persisted[0]["reservation"]["gemini_reservation_id"] == (
+        ticket["gemini_reservation_id"]
+    )
+    assert ticket["gemini_durable_ticket"] is True
+
+
+def test_failed_durable_ticket_persistence_releases_local_cost_exposure() -> None:
+    context = GenerationContext(
+        "fast",
+        generation_id="job-durable-ticket-failure",
+        gemini_ticket_reserve_sink=lambda **_payload: None,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="dispatch ticket could not be persisted",
+    ):
+        context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
+        )
+
+    gemini = context.budget.snapshot()["gemini"]
+    assert gemini["committed_cost_usd"] == 0.0
+    assert gemini["inflight_reserved_cost_usd"] == 0.0
+    assert gemini["lifetime_reserved_worst_case_cost_usd"] == 0.0
+    assert gemini["selector_calls"] == 0
+    assert gemini["pro_selector_calls"] == 0
+
+
+def test_durable_ticket_settles_once_and_replaces_append_only_usage_sink() -> None:
+    persisted: list[dict] = []
+    settled: list[dict] = []
+    appended: list[ProviderUsageRecord] = []
+    context = GenerationContext(
+        "fast",
+        generation_id="job-durable-ticket-settlement",
+        usage_sink=appended.append,
+        gemini_ticket_reserve_sink=lambda **payload: (
+            persisted.append(payload) or {"id": payload["ticket_id"]}
+        ),
+        gemini_ticket_settle_sink=lambda **payload: settled.append(payload),
+    )
+    ticket = context.reserve_gemini_call(
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=1_000,
+        max_output_tokens=100,
+    )
+    usage = {
+        **ticket,
+        "prompt_tokens": 1_000,
+        "candidate_tokens": 10,
+        "thought_tokens": 0,
+        "total_tokens": 1_010,
+        "dispatched": True,
+    }
+
+    assert context.reconcile_gemini_call(
+        model_used="gemini-3.1-pro-preview",
+        usage=usage,
+        dispatched=True,
+    ) is True
+    context.record_gemini(
+        attempt=1,
+        model_used="gemini-3.1-pro-preview",
+        quality_degraded=False,
+        stage="selection",
+        usage=usage,
+    )
+
+    assert len(persisted) == 1
+    assert len(settled) == 1
+    assert settled[0]["ticket_id"] == ticket["gemini_ticket_id"]
+    assert settled[0]["state"] == "settled_known"
+    assert settled[0]["actual_cost_usd"] == pytest.approx(
+        (1_000 * 2.0 + 10 * 12.0) / 1_000_000.0
+    )
+    assert appended == []
+    assert len(context.usage()) == 1
+
+
+def test_durable_ticket_release_does_not_claim_actual_provider_cost() -> None:
+    settled: list[dict] = []
+    context = GenerationContext(
+        "fast",
+        generation_id="job-durable-ticket-release",
+        gemini_ticket_reserve_sink=lambda **payload: {
+            "id": payload["ticket_id"],
+        },
+        gemini_ticket_settle_sink=lambda **payload: settled.append(payload),
+    )
+    ticket = context.reserve_gemini_call(
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=1_000,
+        max_output_tokens=100,
+    )
+
+    assert context.reconcile_gemini_call(
+        model_used="gemini-3.1-pro-preview",
+        usage={**ticket, "dispatched": False},
+        dispatched=False,
+    ) is True
+
+    assert len(settled) == 1
+    assert settled[0]["state"] == "released"
+    assert settled[0]["actual_cost_usd"] is None
+    assert settled[0]["unknown_cost_usd"] is None
+
+
+def test_terminal_gemini_exposure_is_fail_closed_idempotent_and_retryable() -> None:
+    context = GenerationContext("fast", generation_id="job-terminal-exposure")
+    reservation = context.reserve_gemini_call(
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=100,
+        max_output_tokens=100,
+    )
+    admitted_cost = float(reservation["admitted_cost_usd"])
+
+    first = context.budget.finalize_gemini_exposure()
+    second = context.budget.finalize_gemini_exposure()
+    assert first == second == {
+        "admission_closed": True,
+        "terminalized_reservation_count": 1,
+        "terminalized_inflight_cost_usd": pytest.approx(admitted_cost),
+    }
+
+    terminal = context.budget.snapshot()["gemini"]
+    assert terminal["inflight_reserved_cost_usd"] == 0.0
+    assert terminal["committed_cost_usd"] == pytest.approx(admitted_cost)
+    assert terminal["billing_unknown_cost_exposure_usd"] == pytest.approx(
+        admitted_cost
+    )
+    assert terminal["terminalized_unreconciled_reservation_count"] == 1
+    assert context.budget.reconcile_gemini(
+        int(reservation["gemini_reservation_id"]),
+        actual_cost_usd=0.00001,
+    ) is True
+    assert context.budget.snapshot()["gemini"]["cost_exposure_usd"] == pytest.approx(
+        0.00001
+    )
+    assert context.budget.snapshot()["gemini"][
+        "billing_unknown_cost_exposure_usd"
+    ] == 0.0
+    assert context.budget.snapshot()["gemini"][
+        "terminalized_unreconciled_reservation_count"
+    ] == 0
+    assert context.budget.reconcile_gemini(
+        int(reservation["gemini_reservation_id"]),
+        actual_cost_usd=0.5,
+    ) is False
+    assert context.budget.snapshot()["gemini"]["cost_exposure_usd"] == pytest.approx(
+        0.00001
+    )
+    with pytest.raises(ProviderBudgetExceededError, match="admission is closed"):
+        context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=100,
+            max_output_tokens=100,
+        )
+
+    retry = GenerationContext("fast", generation_id="job-terminal-exposure-retry")
+    retry.budget.restore_gemini_retry_exposure(context.budget.snapshot())
+    retry.budget.restore_gemini_retry_exposure(context.budget.snapshot())
+    restored = retry.budget.snapshot()["gemini"]
+    assert restored["cost_exposure_usd"] == pytest.approx(0.00001)
+    assert restored["billing_unknown_cost_exposure_usd"] == 0.0
+    assert restored["admission_closed"] is False
+    retry.reserve_gemini_call(
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=100,
+        max_output_tokens=100,
+    )
+
+
+def test_late_non_dispatched_ticket_removes_terminal_placeholder() -> None:
+    context = GenerationContext("fast", generation_id="job-late-not-dispatched")
+    reservation = context.reserve_gemini_call(
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=100,
+        max_output_tokens=100,
+    )
+    context.budget.finalize_gemini_exposure()
+
+    assert context.reconcile_gemini_call(
+        model_used="gemini-3.1-pro-preview",
+        usage={**reservation, "dispatched": False},
+        dispatched=False,
+    ) is True
+    gemini = context.budget.snapshot()["gemini"]
+    assert gemini["committed_cost_usd"] == 0.0
+    assert gemini["billing_unknown_cost_exposure_usd"] == 0.0
+    assert gemini["terminalized_unreconciled_reservation_count"] == 0
+
+
+def test_concurrent_terminalization_and_reconciliation_count_ticket_once() -> None:
+    for iteration in range(20):
+        budget = GenerationBudget.for_mode("fast")
+        reservation_id = budget.reserve_gemini(
+            model="gemini-3.1-pro-preview",
+            operation="pro_authoritative",
+            estimated_cost_usd=0.05,
+        )
+        barrier = threading.Barrier(2)
+
+        def reconcile() -> bool:
+            barrier.wait()
+            return budget.reconcile_gemini(
+                reservation_id,
+                actual_cost_usd=0.01,
+            )
+
+        def finalize() -> dict[str, int | float | bool]:
+            barrier.wait()
+            return budget.finalize_gemini_exposure()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            reconciled = executor.submit(reconcile)
+            finalized = executor.submit(finalize)
+        assert reconciled.result(timeout=1) is True
+        finalized.result(timeout=1)
+
+        gemini = budget.snapshot()["gemini"]
+        assert gemini["inflight_reserved_cost_usd"] == 0.0
+        assert gemini["admission_closed"] is True
+        assert gemini["committed_cost_usd"] == pytest.approx(0.01)
+        assert gemini["billing_unknown_cost_exposure_usd"] == 0.0
+        assert gemini["terminalized_unreconciled_reservation_count"] == 0
+
+
+def test_late_known_usage_reclassifies_terminal_placeholder_without_double_count(
+) -> None:
+    context = GenerationContext("fast", generation_id="job-late-known-usage")
+    reservation = context.reserve_gemini_call(
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=1_000,
+        max_output_tokens=100,
+    )
+    context.budget.finalize_gemini_exposure()
+
+    context.record_gemini(
+        attempt=1,
+        model_used="gemini-3.1-pro-preview",
+        quality_degraded=False,
+        stage="selection",
+        usage={
+            **reservation,
+            "prompt_tokens": 1_000,
+            "candidate_tokens": 10,
+            "thought_tokens": 0,
+            "total_tokens": 1_010,
+            "dispatched": True,
+        },
+    )
+
+    actual_cost = (1_000 * 2.0 + 10 * 12.0) / 1_000_000.0
+    gemini = context.budget.snapshot()["gemini"]
+    assert gemini["committed_cost_usd"] == pytest.approx(actual_cost)
+    assert gemini["billing_unknown_cost_exposure_usd"] == 0.0
+    assert gemini["terminalized_unreconciled_reservation_count"] == 0
+    payload = context.usage_payload()
+    assert payload["summary"]["gemini_calls"] == 1
+    assert payload["summary"]["known_billed_cost_usd"] == pytest.approx(
+        actual_cost
+    )
+    assert payload["summary"]["billing_unknown_reserved_cost_usd"] == 0.0
 
 
 def test_blocked_cost_reservation_is_bounded_by_deadline_and_cancellation() -> None:

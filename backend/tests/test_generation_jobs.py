@@ -922,6 +922,77 @@ def test_retryable_failure_requeue_respects_deadline_and_cancellation(
         conn.close()
 
 
+def test_yielded_usage_checkpoint_cannot_overwrite_a_newer_attempt() -> None:
+    conn = _memory_conn()
+    try:
+        job, _ = _submit(conn, request_key="yielded-usage-checkpoint")
+        first = jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-a",
+            now=BASE_TIME,
+        )
+        assert first and first["attempt_count"] == 1
+        conn.execute(
+            """
+            UPDATE reel_generation_jobs
+            SET lease_owner = ?, lease_expires_at = ?
+            WHERE id = ?
+            """,
+            (
+                "worker-stolen",
+                (BASE_TIME + timedelta(seconds=1)).isoformat(),
+                job["id"],
+            ),
+        )
+        first_usage = {"budget": {"gemini": {"cost_exposure_usd": 0.25}}}
+        assert jobs.checkpoint_yielded_attempt_usage(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-a",
+            expected_attempt_count=1,
+            usage=first_usage,
+            now=BASE_TIME + timedelta(seconds=2),
+        ) is True
+        assert json.loads(
+            jobs.get_job(conn, job["id"])["usage_json"]
+        ) == first_usage
+
+        second = jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-b",
+            now=BASE_TIME + timedelta(seconds=2),
+        )
+        assert second and second["attempt_count"] == 2
+        successor_usage = {
+            "budget": {"gemini": {"cost_exposure_usd": 0.5}}
+        }
+        assert jobs.update_progress(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-b",
+            phase="selection",
+            progress=0.5,
+            usage=successor_usage,
+            now=BASE_TIME + timedelta(seconds=3),
+        ) is True
+
+        assert jobs.checkpoint_yielded_attempt_usage(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-a",
+            expected_attempt_count=1,
+            usage={"stale": True},
+            now=BASE_TIME + timedelta(seconds=3),
+        ) is False
+        assert json.loads(
+            jobs.get_job(conn, job["id"])["usage_json"]
+        ) == successor_usage
+    finally:
+        conn.close()
+
+
 def test_rate_limit_requeue_waits_until_retry_not_before() -> None:
     conn = _memory_conn()
     try:
@@ -1400,6 +1471,514 @@ def test_cancellation_is_idempotent_and_revokes_running_lease() -> None:
         assert [event["type"] for event in jobs.replay_events(conn, job_id=job["id"])] == [
             "terminal"
         ]
+    finally:
+        conn.close()
+
+
+def test_cancelled_worker_can_persist_final_usage_without_duplicate_event() -> None:
+    conn = _memory_conn()
+    try:
+        job, _ = _submit(conn)
+        assert jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-a",
+            now=BASE_TIME,
+        )
+        jobs.request_cancellation(
+            conn,
+            job_id=job["id"],
+            now=BASE_TIME + timedelta(seconds=5),
+        )
+        finalized_usage = {
+            "summary": {
+                "known_billed_cost_usd": 0.01,
+                "billing_unknown_reserved_cost_usd": 0.02,
+            }
+        }
+
+        cancelled = jobs.request_cancellation(
+            conn,
+            job_id=job["id"],
+            usage=finalized_usage,
+            now=BASE_TIME + timedelta(seconds=6),
+        )
+
+        assert cancelled and cancelled["status"] == "cancelled"
+        assert json.loads(cancelled["usage_json"]) == finalized_usage
+        events = jobs.replay_events(conn, job_id=job["id"])
+        assert [event["type"] for event in events] == ["terminal"]
+        assert events[0]["payload"]["usage"] == finalized_usage
+    finally:
+        conn.close()
+
+
+def test_gemini_dispatch_ticket_admission_is_lease_guarded_and_replay_safe() -> None:
+    conn = _memory_conn()
+    try:
+        job, _ = _submit(conn, request_key="gemini-ticket-admission")
+        leased = jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-a",
+            now=BASE_TIME,
+        )
+        assert leased and leased["attempt_count"] == 1
+
+        ticket = jobs.admit_gemini_dispatch_ticket(
+            conn,
+            ticket_id="gemini-ticket-1",
+            job_id=job["id"],
+            lease_owner="worker-a",
+            expected_attempt_count=1,
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            admitted_cost_usd=0.125,
+            provider_attempt=1,
+            reservation_id=1,
+            reserved_input_tokens=1000,
+            reserved_output_tokens=500,
+            reserved_cost_usd=0.125,
+            billing_cost_multiplier=1.0,
+            admitted_physical_attempts=1,
+            metadata={"stage": "segmentation"},
+            now=BASE_TIME + timedelta(seconds=1),
+        )
+        replay = jobs.admit_gemini_dispatch_ticket(
+            conn,
+            ticket_id="gemini-ticket-1",
+            job_id=job["id"],
+            lease_owner="worker-a",
+            expected_attempt_count=1,
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            admitted_cost_usd=0.125,
+            provider_attempt=1,
+            reservation_id=1,
+            reserved_input_tokens=1000,
+            reserved_output_tokens=500,
+            reserved_cost_usd=0.125,
+            billing_cost_multiplier=1.0,
+            admitted_physical_attempts=1,
+            metadata={"stage": "segmentation"},
+            now=BASE_TIME + timedelta(seconds=2),
+        )
+
+        assert ticket and replay
+        assert replay["id"] == ticket["id"] == "gemini-ticket-1"
+        assert ticket["state"] == "admitted"
+        assert ticket["generation_attempt"] == 1
+        assert ticket["provider_attempt"] == 1
+        assert ticket["admitted_cost_usd"] == pytest.approx(0.125)
+        assert ticket["metadata"]["provider_call"] is False
+        assert ticket["metadata"]["dispatched"] is False
+        assert ticket["metadata"]["billing_unknown_attempts"] == 1
+        assert ticket["metadata"]["billing_unknown_reserved_cost_usd"] == pytest.approx(
+            0.125
+        )
+        assert conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM generation_provider_usage
+            WHERE id = 'gemini-ticket-1'
+            """
+        ).fetchone()[0] == 1
+
+        assert jobs.admit_gemini_dispatch_ticket(
+            conn,
+            ticket_id="wrong-owner",
+            job_id=job["id"],
+            lease_owner="worker-b",
+            expected_attempt_count=1,
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            admitted_cost_usd=0.125,
+            provider_attempt=1,
+            reservation_id=2,
+            reserved_input_tokens=1000,
+            reserved_output_tokens=500,
+            reserved_cost_usd=0.125,
+            billing_cost_multiplier=1.0,
+            admitted_physical_attempts=1,
+            now=BASE_TIME + timedelta(seconds=2),
+        ) is None
+        assert jobs.admit_gemini_dispatch_ticket(
+            conn,
+            ticket_id="wrong-attempt",
+            job_id=job["id"],
+            lease_owner="worker-a",
+            expected_attempt_count=2,
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            admitted_cost_usd=0.125,
+            provider_attempt=1,
+            reservation_id=3,
+            reserved_input_tokens=1000,
+            reserved_output_tokens=500,
+            reserved_cost_usd=0.125,
+            billing_cost_multiplier=1.0,
+            admitted_physical_attempts=1,
+            now=BASE_TIME + timedelta(seconds=2),
+        ) is None
+        assert jobs.admit_gemini_dispatch_ticket(
+            conn,
+            ticket_id="expired-lease",
+            job_id=job["id"],
+            lease_owner="worker-a",
+            expected_attempt_count=1,
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            admitted_cost_usd=0.125,
+            provider_attempt=1,
+            reservation_id=4,
+            reserved_input_tokens=1000,
+            reserved_output_tokens=500,
+            reserved_cost_usd=0.125,
+            billing_cost_multiplier=1.0,
+            admitted_physical_attempts=1,
+            now=BASE_TIME + timedelta(seconds=91),
+        ) is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM generation_provider_usage"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_gemini_dispatch_ticket_identity_conflict_fails_closed() -> None:
+    conn = _memory_conn()
+    try:
+        job, _ = _submit(conn, request_key="gemini-ticket-conflict")
+        assert jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-a",
+            now=BASE_TIME,
+        )
+        assert jobs.admit_gemini_dispatch_ticket(
+            conn,
+            ticket_id="gemini-conflict",
+            job_id=job["id"],
+            lease_owner="worker-a",
+            expected_attempt_count=1,
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            admitted_cost_usd=0.1,
+            provider_attempt=1,
+            reservation_id=1,
+            reserved_input_tokens=800,
+            reserved_output_tokens=400,
+            reserved_cost_usd=0.1,
+            billing_cost_multiplier=1.0,
+            admitted_physical_attempts=1,
+            now=BASE_TIME + timedelta(seconds=1),
+        )
+
+        with pytest.raises(
+            db.DatabaseIntegrityError,
+            match="Gemini dispatch ticket identity conflict",
+        ):
+            jobs.admit_gemini_dispatch_ticket(
+                conn,
+                ticket_id="gemini-conflict",
+                job_id=job["id"],
+                lease_owner="worker-a",
+                expected_attempt_count=1,
+                operation="pro_authoritative",
+                model="gemini-3.1-pro-preview",
+                admitted_cost_usd=0.1,
+                provider_attempt=1,
+                reservation_id=1,
+                reserved_input_tokens=800,
+                reserved_output_tokens=401,
+                reserved_cost_usd=0.1,
+                billing_cost_multiplier=1.0,
+                admitted_physical_attempts=1,
+                now=BASE_TIME + timedelta(seconds=2),
+            )
+    finally:
+        conn.close()
+
+
+def test_gemini_dispatch_ticket_settles_after_lease_reclaim_without_touching_job() -> None:
+    conn = _memory_conn()
+    try:
+        job, _ = _submit(conn, request_key="gemini-ticket-late-settlement")
+        first = jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-a",
+            now=BASE_TIME,
+        )
+        assert first and first["attempt_count"] == 1
+        assert jobs.admit_gemini_dispatch_ticket(
+            conn,
+            ticket_id="late-ticket",
+            job_id=job["id"],
+            lease_owner="worker-a",
+            expected_attempt_count=1,
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            admitted_cost_usd=0.2,
+            provider_attempt=1,
+            reservation_id=1,
+            reserved_input_tokens=1200,
+            reserved_output_tokens=500,
+            reserved_cost_usd=0.2,
+            billing_cost_multiplier=1.8,
+            admitted_physical_attempts=1,
+            metadata={"stage": "segmentation"},
+            now=BASE_TIME + timedelta(seconds=1),
+        )
+        second = jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-b",
+            now=BASE_TIME + timedelta(seconds=91),
+        )
+        assert second and second["attempt_count"] == 2
+        assert second["lease_owner"] == "worker-b"
+
+        settled = jobs.settle_gemini_dispatch_ticket(
+            conn,
+            ticket_id="late-ticket",
+            job_id=job["id"],
+            state="settled_known",
+            input_tokens=1200,
+            output_tokens=300,
+            total_tokens=1600,
+            actual_cost_usd=0.25,
+            metadata={
+                "cached_tokens": 100,
+                "billing_cost_multiplier": 1.0,
+            },
+            now=BASE_TIME + timedelta(seconds=92),
+        )
+        replay = jobs.settle_gemini_dispatch_ticket(
+            conn,
+            ticket_id="late-ticket",
+            job_id=job["id"],
+            state="settled_known",
+            input_tokens=1200,
+            output_tokens=300,
+            total_tokens=1600,
+            actual_cost_usd=0.25,
+            metadata={
+                "cached_tokens": 100,
+                "billing_cost_multiplier": 1.0,
+            },
+            now=BASE_TIME + timedelta(seconds=93),
+        )
+
+        assert settled and replay
+        assert settled["state"] == replay["state"] == "settled_known"
+        assert settled["billable_requests"] == 1
+        assert settled["input_tokens"] == 1200
+        assert settled["output_tokens"] == 300
+        assert settled["total_tokens"] == 1600
+        assert settled["actual_cost_usd"] == pytest.approx(0.25)
+        assert settled["metadata"]["billing_usage_known"] is True
+        assert settled["metadata"]["billing_unknown_attempts"] == 0
+        assert settled["metadata"]["cached_tokens"] == 100
+        assert settled["reserved_billing_cost_multiplier"] == pytest.approx(1.8)
+        assert settled["billing_cost_multiplier"] == pytest.approx(1.0)
+        current = jobs.get_job(conn, job["id"])
+        assert current
+        assert current["status"] == "running"
+        assert current["attempt_count"] == 2
+        assert current["lease_owner"] == "worker-b"
+        with pytest.raises(
+            db.DatabaseIntegrityError,
+            match="Gemini dispatch ticket settlement conflict",
+        ):
+            jobs.settle_gemini_dispatch_ticket(
+                conn,
+                ticket_id="late-ticket",
+                job_id=job["id"],
+                state="settled_unknown",
+                now=BASE_TIME + timedelta(seconds=93),
+            )
+        assert jobs.admit_gemini_dispatch_ticket(
+            conn,
+            ticket_id="late-ticket",
+            job_id=job["id"],
+            lease_owner="worker-a",
+            expected_attempt_count=1,
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            admitted_cost_usd=0.2,
+            provider_attempt=1,
+            reservation_id=1,
+            reserved_input_tokens=1200,
+            reserved_output_tokens=500,
+            reserved_cost_usd=0.2,
+            billing_cost_multiplier=1.8,
+            admitted_physical_attempts=1,
+            now=BASE_TIME + timedelta(seconds=93),
+        ) is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_requests", "expected_unknown_attempts"),
+    [
+        ("released", 0, 0),
+        ("settled_unknown", 0, 1),
+    ],
+)
+def test_gemini_dispatch_ticket_terminal_unknown_and_release_states(
+    state: str,
+    expected_requests: int,
+    expected_unknown_attempts: int,
+) -> None:
+    conn = _memory_conn()
+    try:
+        job, _ = _submit(conn, request_key=f"gemini-ticket-{state}")
+        assert jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-a",
+            now=BASE_TIME,
+        )
+        assert jobs.admit_gemini_dispatch_ticket(
+            conn,
+            ticket_id=f"ticket-{state}",
+            job_id=job["id"],
+            lease_owner="worker-a",
+            expected_attempt_count=1,
+            operation="pro_boundary_audit",
+            model="gemini-3.1-pro-preview",
+            admitted_cost_usd=0.08,
+            provider_attempt=1,
+            reservation_id=1,
+            reserved_input_tokens=500,
+            reserved_output_tokens=200,
+            reserved_cost_usd=0.08,
+            billing_cost_multiplier=1.0,
+            admitted_physical_attempts=1,
+            now=BASE_TIME + timedelta(seconds=1),
+        )
+
+        settled = jobs.settle_gemini_dispatch_ticket(
+            conn,
+            ticket_id=f"ticket-{state}",
+            job_id=job["id"],
+            state=state,
+            input_tokens=0 if state == "released" else 50,
+            output_tokens=0 if state == "released" else 10,
+            unknown_cost_usd=0.05 if state == "settled_unknown" else None,
+            now=BASE_TIME + timedelta(seconds=2),
+        )
+
+        assert settled
+        assert settled["state"] == state
+        assert settled["billable_requests"] == expected_requests
+        assert settled["metadata"]["billing_unknown_attempts"] == (
+            expected_unknown_attempts
+        )
+        assert settled["metadata"]["billing_unknown_reserved_cost_usd"] == (
+            pytest.approx(0.05 if state == "settled_unknown" else 0.0)
+        )
+        if state == "released":
+            assert settled["input_tokens"] == 0
+            assert settled["output_tokens"] == 0
+            assert settled["metadata"]["provider_call"] is False
+        else:
+            assert settled["input_tokens"] == 50
+            assert settled["output_tokens"] == 10
+            assert settled["metadata"]["provider_call"] is True
+        replay = jobs.settle_gemini_dispatch_ticket(
+            conn,
+            ticket_id=f"ticket-{state}",
+            job_id=job["id"],
+            state=state,
+            input_tokens=0 if state == "released" else 50,
+            output_tokens=0 if state == "released" else 10,
+            unknown_cost_usd=0.05 if state == "settled_unknown" else None,
+            now=BASE_TIME + timedelta(seconds=3),
+        )
+        assert replay and replay["state"] == state
+        if state == "settled_unknown":
+            with pytest.raises(
+                db.DatabaseIntegrityError,
+                match="Gemini dispatch ticket settlement conflict",
+            ):
+                jobs.settle_gemini_dispatch_ticket(
+                    conn,
+                    ticket_id=f"ticket-{state}",
+                    job_id=job["id"],
+                    state=state,
+                    input_tokens=50,
+                    output_tokens=10,
+                    unknown_cost_usd=0.04,
+                    now=BASE_TIME + timedelta(seconds=4),
+                )
+    finally:
+        conn.close()
+
+
+def test_gemini_dispatch_ticket_cas_exhaustion_does_not_return_admitted_row(
+    monkeypatch,
+) -> None:
+    conn = _memory_conn()
+    try:
+        job, _ = _submit(conn, request_key="gemini-ticket-cas")
+        assert jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-a",
+            now=BASE_TIME,
+        )
+        assert jobs.admit_gemini_dispatch_ticket(
+            conn,
+            ticket_id="ticket-cas",
+            job_id=job["id"],
+            lease_owner="worker-a",
+            expected_attempt_count=1,
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            admitted_cost_usd=0.08,
+            provider_attempt=1,
+            reservation_id=1,
+            reserved_input_tokens=500,
+            reserved_output_tokens=200,
+            reserved_cost_usd=0.08,
+            billing_cost_multiplier=1.0,
+            admitted_physical_attempts=1,
+            now=BASE_TIME + timedelta(seconds=1),
+        )
+        original_execute_modify = jobs.execute_modify
+
+        def lose_settlement_cas(connection, query, params=()):
+            if (
+                "UPDATE generation_provider_usage" in query
+                and "SET billable_requests" in query
+            ):
+                return 0
+            return original_execute_modify(connection, query, params)
+
+        monkeypatch.setattr(jobs, "execute_modify", lose_settlement_cas)
+        with pytest.raises(
+            db.DatabaseIntegrityError,
+            match="Gemini dispatch ticket settlement conflict",
+        ):
+            jobs.settle_gemini_dispatch_ticket(
+                conn,
+                ticket_id="ticket-cas",
+                job_id=job["id"],
+                state="settled_unknown",
+                unknown_cost_usd=0.05,
+                now=BASE_TIME + timedelta(seconds=2),
+            )
+        stored = conn.execute(
+            """
+            SELECT metadata_json
+            FROM generation_provider_usage
+            WHERE id = 'ticket-cas'
+            """
+        ).fetchone()
+        assert json.loads(stored["metadata_json"])["ticket_state"] == "admitted"
     finally:
         conn.close()
 

@@ -48,6 +48,8 @@ class GeminiCallTelemetry:
     retryable: Optional[bool] = None
     retry_after_sec: Optional[float] = None
     error_history: tuple[dict[str, object], ...] = ()
+    service_tier_requested: Optional[str] = None
+    service_tier_used: Optional[str] = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -347,11 +349,25 @@ def _finish_reason(response) -> Optional[str]:
     return str(getattr(reason, "value", reason))
 
 
+def _response_service_tier(response) -> Optional[str]:
+    """Read Gemini's billed serving tier without retaining other headers."""
+
+    sdk_response = _field(response, "sdk_http_response")
+    headers = _field(sdk_response, "headers")
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    value = str(getter("x-gemini-service-tier") or "").strip().casefold()
+    return value if value in {"standard", "priority", "flex"} else None
+
+
 def _call_telemetry(*, model: str, operation: str, prompt_version: str,
                     thinking_level: str, started: float, retries: int,
                     response=None, error: Exception | None = None,
                     retryable: bool | None = None,
-                    error_history=()) -> GeminiCallTelemetry:
+                    error_history=(),
+                    service_tier_requested: str | None = None,
+                    ) -> GeminiCallTelemetry:
     usage = _field(response, "usage_metadata") if response is not None else None
     return GeminiCallTelemetry(
         model=model,
@@ -375,6 +391,12 @@ def _call_telemetry(*, model: str, operation: str, prompt_version: str,
             _gemini_retry_after(error) if error is not None else None
         ),
         error_history=tuple(dict(item) for item in error_history),
+        service_tier_requested=service_tier_requested,
+        service_tier_used=(
+            _response_service_tier(response)
+            if response is not None
+            else None
+        ),
     )
 
 
@@ -557,6 +579,7 @@ def generate_json_v3(
     max_retries: int = 1,
     use_full_transient_retry_budget: bool = False,
     retry_status_codes: frozenset[int] | set[int] | None = None,
+    retry_service_tier: str | None = None,
     cancelled=None,
     media_resolution=None,
     before_dispatch: Callable[..., object] | None = None,
@@ -572,6 +595,8 @@ def generate_json_v3(
     ``time.monotonic()`` deadline shared by the caller's complete workflow.
     ``initial_attempt_deadline_monotonic`` may reserve the workflow tail while
     still allowing a transient retry to use the full operation deadline.
+    ``retry_service_tier="priority"`` upgrades only physical retries after a
+    transient failure; the healthy first attempt remains Standard.
     Cancellation is cooperative between in-flight HTTP requests. Optional
     dispatch hooks run once around every physical provider attempt, including
     retries, so callers can admit and settle attempt-scoped resources.
@@ -612,6 +637,11 @@ def generate_json_v3(
         raise ValueError("retry_status_codes must contain transient HTTP statuses")
     else:
         allowed_retry_statuses = frozenset(retry_status_codes)
+    normalized_retry_service_tier = str(
+        retry_service_tier or ""
+    ).strip().casefold()
+    if normalized_retry_service_tier not in {"", "priority"}:
+        raise ValueError("retry_service_tier must be None or 'priority'")
 
     started = time.perf_counter()
     operation_deadline = (
@@ -631,12 +661,18 @@ def generate_json_v3(
     last_failure_telemetry: GeminiCallTelemetry | None = None
 
     for attempt in range(max_attempts):
+        attempt_service_tier = (
+            normalized_retry_service_tier
+            if attempt > 0 and normalized_retry_service_tier
+            else None
+        )
         if _cancel_requested(cancelled):
             telemetry = _call_telemetry(
                 model=mdl, operation=operation, prompt_version=prompt_version,
                 thinking_level=level, started=started,
                 retries=max(0, requests_started - 1),
                 error_history=error_history,
+                service_tier_requested=attempt_service_tier,
             )
             raise GeminiCancelledError("Gemini call cancelled", telemetry)
 
@@ -650,6 +686,7 @@ def generate_json_v3(
                 thinking_level=level, started=started,
                 retries=max(0, requests_started - 1),
                 error_history=error_history,
+                service_tier_requested=attempt_service_tier,
             )
             raise GeminiDeadlineExceededError("Gemini call deadline exceeded", telemetry)
         if client is None:
@@ -663,6 +700,7 @@ def generate_json_v3(
                 thinking_level=level, started=started,
                 retries=max(0, requests_started - 1),
                 error_history=error_history,
+                service_tier_requested=attempt_service_tier,
             )
             raise GeminiCancelledError("Gemini call cancelled", telemetry)
         if time.monotonic() >= attempt_deadline:
@@ -671,6 +709,7 @@ def generate_json_v3(
                 thinking_level=level, started=started,
                 retries=max(0, requests_started - 1),
                 error_history=error_history,
+                service_tier_requested=attempt_service_tier,
             )
             raise GeminiDeadlineExceededError(
                 "Gemini call deadline exceeded", telemetry,
@@ -689,6 +728,7 @@ def generate_json_v3(
                 started=started,
                 retries=max(0, requests_started - 1),
                 error_history=error_history,
+                service_tier_requested=attempt_service_tier,
             )
             if after_dispatch is not None:
                 after_dispatch(
@@ -722,6 +762,8 @@ def generate_json_v3(
             )
             if media_resolution is not None:
                 config_kwargs["media_resolution"] = media_resolution
+            if attempt_service_tier == "priority":
+                config_kwargs["service_tier"] = types.ServiceTier.PRIORITY
             request_config = types.GenerateContentConfig(**config_kwargs)
         except Exception as error:  # noqa: BLE001
             telemetry = _call_telemetry(
@@ -733,6 +775,7 @@ def generate_json_v3(
                 retries=max(0, requests_started - 1),
                 error=error,
                 error_history=error_history,
+                service_tier_requested=attempt_service_tier,
             )
             if after_dispatch is not None:
                 after_dispatch(
@@ -766,6 +809,7 @@ def generate_json_v3(
                 error=error,
                 retryable=retryable,
                 error_history=error_history,
+                service_tier_requested=attempt_service_tier,
             )
             last_failure_telemetry = telemetry
             if after_dispatch is not None:
@@ -822,6 +866,7 @@ def generate_json_v3(
             thinking_level=level, started=started,
             retries=max(0, requests_started - 1), response=response,
             error_history=error_history,
+            service_tier_requested=attempt_service_tier,
         )
         if after_dispatch is not None:
             after_dispatch(
@@ -870,6 +915,7 @@ def generate_json_v3(
                 response=response,
                 retryable=True,
                 error_history=error_history,
+                service_tier_requested=attempt_service_tier,
             )
             last_failure_telemetry = telemetry
             if _cancel_requested(cancelled):

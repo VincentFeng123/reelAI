@@ -41,6 +41,13 @@ ACTIVE_STATUSES = frozenset({"queued", "running"})
 TERMINAL_STATUSES = frozenset({"completed", "partial", "exhausted", "failed", "cancelled"})
 ALL_STATUSES = ACTIVE_STATUSES | TERMINAL_STATUSES
 EVENT_TYPES = frozenset({"candidate", "final", "terminal"})
+GEMINI_DISPATCH_TICKET_SCHEMA_VERSION = "gemini_dispatch_ticket_v1"
+GEMINI_DISPATCH_TICKET_STATES = frozenset(
+    {"admitted", "released", "settled_known", "settled_unknown"}
+)
+GEMINI_DISPATCH_TICKET_TERMINAL_STATES = frozenset(
+    {"released", "settled_known", "settled_unknown"}
+)
 
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_HEARTBEAT_SECONDS = 15
@@ -905,6 +912,7 @@ def request_cancellation(
     conn: Any,
     *,
     job_id: str,
+    usage: dict[str, Any] | None = None,
     now: datetime | str | None = None,
 ) -> dict[str, Any] | None:
     """Persist cancellation, revoke any lease, and emit the terminal event once."""
@@ -926,12 +934,46 @@ def request_cancellation(
             updated_at = ?,
             terminal_error_code = COALESCE(terminal_error_code, 'cancelled'),
             terminal_error_message = COALESCE(terminal_error_message, 'Generation cancelled.'),
+            usage_json = COALESCE(?, usage_json),
             error_text = 'cancelled'
         WHERE id = ? AND status IN ('queued', 'running')
             """,
-            (timestamp, timestamp, timestamp, job_id),
+            (
+                timestamp,
+                timestamp,
+                timestamp,
+                dumps_json(usage) if usage is not None else None,
+                job_id,
+            ),
         )
         row = get_job(conn, job_id)
+        if (
+            not updated
+            and row
+            and usage is not None
+            and str(row.get("status") or "") == "cancelled"
+            and int(row.get("cancel_requested") or 0)
+        ):
+            execute_modify(
+                conn,
+                """
+                UPDATE reel_generation_jobs
+                SET usage_json = ?, updated_at = ?
+                WHERE id = ? AND status = 'cancelled' AND cancel_requested = 1
+                """,
+                (dumps_json(usage), timestamp, job_id),
+            )
+            row = get_job(conn, job_id)
+            if row:
+                execute_modify(
+                    conn,
+                    """
+                    UPDATE generation_job_events
+                    SET payload_json = ?
+                    WHERE job_id = ? AND event_type = 'terminal'
+                    """,
+                    (dumps_json(_terminal_payload(row)), job_id),
+                )
         if updated and row:
             append_event(
                 conn,
@@ -991,6 +1033,49 @@ def update_progress(
             "AND cancel_requested = 0 AND lease_expires_at > ? "
             "AND (deadline_at IS NULL OR deadline_at > ?)",
             values,
+        )
+    )
+
+
+def checkpoint_yielded_attempt_usage(
+    conn: Any,
+    *,
+    job_id: str,
+    lease_owner: str,
+    expected_attempt_count: int,
+    usage: dict[str, Any],
+    now: datetime | str | None = None,
+) -> bool:
+    """Persist a yielded attempt without overwriting a newer lease attempt."""
+    if not str(lease_owner or "").strip():
+        raise ValueError("lease_owner is required")
+    attempt_count = int(expected_attempt_count)
+    if attempt_count < 1:
+        raise ValueError("expected_attempt_count must be positive")
+    timestamp = _iso(now)
+    return bool(
+        execute_modify(
+            conn,
+            """
+            UPDATE reel_generation_jobs
+            SET usage_json = ?, updated_at = ?
+            WHERE id = ?
+              AND status = 'running'
+              AND attempt_count = ?
+              AND cancel_requested = 0
+              AND (
+                    lease_owner = ?
+                    OR lease_expires_at <= ?
+              )
+            """,
+            (
+                dumps_json(usage),
+                timestamp,
+                job_id,
+                attempt_count,
+                lease_owner,
+                timestamp,
+            ),
         )
     )
 
@@ -1272,6 +1357,562 @@ def record_provider_usage(
     return record_id
 
 
+def _gemini_ticket_cost(value: object, *, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a nonnegative finite number")
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be a nonnegative finite number") from exc
+    if not math.isfinite(normalized) or normalized < 0.0:
+        raise ValueError(f"{field} must be a nonnegative finite number")
+    return round(normalized, 8)
+
+
+def _gemini_ticket_metadata_json(metadata: dict[str, Any]) -> str:
+    return json.dumps(
+        metadata,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _gemini_ticket_identity_sha256(identity: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        identity,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _gemini_ticket_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    metadata = loads_json(str(row.get("metadata_json") or "{}"), default={})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    actual_cost = metadata.get("actual_cost_usd")
+    try:
+        normalized_actual_cost = (
+            None if actual_cost is None else max(0.0, float(actual_cost))
+        )
+    except (TypeError, ValueError, OverflowError):
+        normalized_actual_cost = None
+    try:
+        admitted_cost = max(0.0, float(metadata.get("admitted_cost_usd") or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        admitted_cost = 0.0
+    try:
+        reserved_billing_multiplier = max(
+            0.0,
+            float(
+                metadata.get("reserved_billing_cost_multiplier")
+                or metadata.get("billing_cost_multiplier")
+                or 0.0
+            ),
+        )
+    except (TypeError, ValueError, OverflowError):
+        reserved_billing_multiplier = 0.0
+    try:
+        effective_billing_multiplier = max(
+            0.0,
+            float(metadata.get("billing_cost_multiplier") or 0.0),
+        )
+    except (TypeError, ValueError, OverflowError):
+        effective_billing_multiplier = 0.0
+    return {
+        "id": str(row.get("id") or ""),
+        "job_id": str(row.get("job_id") or ""),
+        "state": str(metadata.get("ticket_state") or ""),
+        "operation": str(row.get("operation") or ""),
+        "model": str(row.get("model") or ""),
+        "generation_attempt": int(metadata.get("generation_attempt") or 0),
+        "provider_attempt": int(metadata.get("attempt") or 0),
+        "reservation_id": int(metadata.get("gemini_reservation_id") or 0),
+        "reserved_input_tokens": max(
+            0,
+            int(metadata.get("reserved_input_tokens") or 0),
+        ),
+        "reserved_output_tokens": max(
+            0,
+            int(metadata.get("reserved_output_tokens") or 0),
+        ),
+        "reserved_cost_usd": max(
+            0.0,
+            float(metadata.get("reserved_cost_usd") or 0.0),
+        ),
+        "reserved_billing_cost_multiplier": reserved_billing_multiplier,
+        "billing_cost_multiplier": effective_billing_multiplier,
+        "admitted_physical_attempts": max(
+            0,
+            int(metadata.get("admitted_physical_attempts") or 0),
+        ),
+        "admitted_cost_usd": admitted_cost,
+        "actual_cost_usd": normalized_actual_cost,
+        "billable_requests": max(0, int(row.get("billable_requests") or 0)),
+        "input_tokens": max(0, int(row.get("input_tokens") or 0)),
+        "output_tokens": max(0, int(row.get("output_tokens") or 0)),
+        "total_tokens": max(0, int(row.get("total_tokens") or 0)),
+        "metadata": metadata,
+        "created_at": str(row.get("created_at") or ""),
+        "settled_at": str(metadata.get("settled_at") or ""),
+    }
+
+
+def _get_gemini_dispatch_ticket(
+    conn: Any,
+    *,
+    ticket_id: str,
+) -> dict[str, Any] | None:
+    row = fetch_one(
+        conn,
+        """
+        SELECT id, job_id, provider, operation, model, billable_requests,
+               input_tokens, output_tokens, total_tokens, metadata_json, created_at
+        FROM generation_provider_usage
+        WHERE id = ?
+        """,
+        (ticket_id,),
+    )
+    if not row:
+        return None
+    metadata = loads_json(str(row.get("metadata_json") or "{}"), default={})
+    if (
+        str(row.get("provider") or "") != "gemini"
+        or not isinstance(metadata, dict)
+        or metadata.get("ticket_schema_version")
+        != GEMINI_DISPATCH_TICKET_SCHEMA_VERSION
+    ):
+        raise DatabaseIntegrityError(
+            f"provider usage identity is not a Gemini dispatch ticket: {ticket_id}"
+        )
+    return row
+
+
+def admit_gemini_dispatch_ticket(
+    conn: Any,
+    *,
+    ticket_id: str,
+    job_id: str,
+    lease_owner: str,
+    expected_attempt_count: int,
+    operation: str,
+    model: str,
+    admitted_cost_usd: float,
+    provider_attempt: int,
+    reservation_id: int,
+    reserved_input_tokens: int,
+    reserved_output_tokens: int,
+    reserved_cost_usd: float,
+    billing_cost_multiplier: float,
+    admitted_physical_attempts: int,
+    metadata: dict[str, Any] | None = None,
+    now: datetime | str | None = None,
+) -> dict[str, Any] | None:
+    """Durably admit one physical Gemini attempt under the current job lease."""
+    normalized_ticket_id = str(ticket_id or "").strip()
+    normalized_job_id = str(job_id or "").strip()
+    normalized_lease_owner = str(lease_owner or "").strip()
+    normalized_operation = str(operation or "").strip()
+    normalized_model = str(model or "").strip()
+    if not normalized_ticket_id:
+        raise ValueError("ticket_id is required")
+    if not normalized_job_id:
+        raise ValueError("job_id is required")
+    if not normalized_lease_owner:
+        raise ValueError("lease_owner is required")
+    if not normalized_operation:
+        raise ValueError("operation is required")
+    if not normalized_model:
+        raise ValueError("model is required")
+    generation_attempt = int(expected_attempt_count)
+    if generation_attempt < 1:
+        raise ValueError("expected_attempt_count must be positive")
+    physical_attempt = int(provider_attempt)
+    if physical_attempt < 1:
+        raise ValueError("provider_attempt must be positive")
+    normalized_reservation_id = int(reservation_id)
+    if normalized_reservation_id < 1:
+        raise ValueError("reservation_id must be positive")
+    normalized_reserved_input = int(reserved_input_tokens)
+    normalized_reserved_output = int(reserved_output_tokens)
+    if normalized_reserved_input < 0:
+        raise ValueError("reserved_input_tokens must be nonnegative")
+    if normalized_reserved_output < 1:
+        raise ValueError("reserved_output_tokens must be positive")
+    normalized_reserved_cost = _gemini_ticket_cost(
+        reserved_cost_usd,
+        field="reserved_cost_usd",
+    )
+    normalized_multiplier = _gemini_ticket_cost(
+        billing_cost_multiplier,
+        field="billing_cost_multiplier",
+    )
+    if not 1.0 <= normalized_multiplier <= 2.0:
+        raise ValueError("billing_cost_multiplier must be between 1 and 2")
+    normalized_admitted_attempts = int(admitted_physical_attempts)
+    if normalized_admitted_attempts != 1:
+        raise ValueError("admitted_physical_attempts must be 1")
+    admitted_cost = _gemini_ticket_cost(
+        admitted_cost_usd,
+        field="admitted_cost_usd",
+    )
+    if not math.isclose(
+        admitted_cost,
+        normalized_reserved_cost,
+        rel_tol=0.0,
+        abs_tol=1e-8,
+    ):
+        raise ValueError(
+            "admitted_cost_usd must equal reserved_cost_usd for one physical attempt"
+        )
+    timestamp = _iso(now)
+    ticket_identity = {
+        "job_id": normalized_job_id,
+        "operation": normalized_operation,
+        "model": normalized_model,
+        "generation_attempt": generation_attempt,
+        "provider_attempt": physical_attempt,
+        "gemini_reservation_id": normalized_reservation_id,
+        "reserved_input_tokens": normalized_reserved_input,
+        "reserved_output_tokens": normalized_reserved_output,
+        "reserved_cost_usd": normalized_reserved_cost,
+        "reserved_billing_cost_multiplier": normalized_multiplier,
+        "billing_cost_multiplier": normalized_multiplier,
+        "admitted_physical_attempts": normalized_admitted_attempts,
+        "admitted_cost_usd": admitted_cost,
+    }
+    ticket_identity_sha256 = _gemini_ticket_identity_sha256(ticket_identity)
+    ticket_metadata = {
+        **(metadata or {}),
+        "ticket_schema_version": GEMINI_DISPATCH_TICKET_SCHEMA_VERSION,
+        "ticket_state": "admitted",
+        "ticket_identity_sha256": ticket_identity_sha256,
+        "generation_attempt": generation_attempt,
+        "attempt": physical_attempt,
+        "gemini_reservation_id": normalized_reservation_id,
+        "reserved_input_tokens": normalized_reserved_input,
+        "reserved_output_tokens": normalized_reserved_output,
+        "reserved_cost_usd": normalized_reserved_cost,
+        "reserved_billing_cost_multiplier": normalized_multiplier,
+        "billing_cost_multiplier": normalized_multiplier,
+        "admitted_physical_attempts": normalized_admitted_attempts,
+        "provider_call": False,
+        "dispatched": False,
+        "billing_usage_known": False,
+        "billing_unknown_attempts": 1,
+        "billing_unknown_reserved_cost_usd": admitted_cost,
+        "admitted_cost_usd": admitted_cost,
+        "timestamp": timestamp,
+    }
+    encoded_metadata = _gemini_ticket_metadata_json(ticket_metadata)
+    with _atomic_write(conn):
+        inserted = execute_modify(
+            conn,
+            """
+            INSERT INTO generation_provider_usage (
+                id, job_id, provider, operation, model, billable_requests,
+                input_tokens, output_tokens, total_tokens, metadata_json, created_at
+            )
+            SELECT ?, id, 'gemini', ?, ?, 0, 0, 0, 0, ?, ?
+            FROM reel_generation_jobs
+            WHERE id = ?
+              AND status = 'running'
+              AND lease_owner = ?
+              AND attempt_count = ?
+              AND cancel_requested = 0
+              AND lease_expires_at > ?
+              AND (deadline_at IS NULL OR deadline_at > ?)
+            ON CONFLICT(id) DO NOTHING
+            """,
+            (
+                normalized_ticket_id,
+                normalized_operation,
+                normalized_model,
+                encoded_metadata,
+                timestamp,
+                normalized_job_id,
+                normalized_lease_owner,
+                generation_attempt,
+                timestamp,
+                timestamp,
+            ),
+        )
+        replayed = inserted
+        if not inserted:
+            replayed = execute_modify(
+                conn,
+                """
+                UPDATE generation_provider_usage
+                SET id = id
+                WHERE id = ?
+                  AND job_id = ?
+                  AND provider = 'gemini'
+                  AND operation = ?
+                  AND model = ?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM reel_generation_jobs
+                      WHERE reel_generation_jobs.id = ?
+                        AND status = 'running'
+                        AND lease_owner = ?
+                        AND attempt_count = ?
+                        AND cancel_requested = 0
+                        AND lease_expires_at > ?
+                        AND (deadline_at IS NULL OR deadline_at > ?)
+                  )
+                """,
+                (
+                    normalized_ticket_id,
+                    normalized_job_id,
+                    normalized_operation,
+                    normalized_model,
+                    normalized_job_id,
+                    normalized_lease_owner,
+                    generation_attempt,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        row = _get_gemini_dispatch_ticket(conn, ticket_id=normalized_ticket_id)
+        if not row:
+            return None
+        snapshot = _gemini_ticket_snapshot(row)
+        identity_matches = (
+            snapshot["job_id"] == normalized_job_id
+            and snapshot["operation"] == normalized_operation
+            and snapshot["model"] == normalized_model
+            and snapshot["metadata"].get("ticket_identity_sha256")
+            == ticket_identity_sha256
+        )
+        if not identity_matches:
+            raise DatabaseIntegrityError(
+                f"Gemini dispatch ticket identity conflict: {normalized_ticket_id}"
+            )
+        if not replayed or snapshot["state"] != "admitted":
+            return None
+        return snapshot
+
+
+def settle_gemini_dispatch_ticket(
+    conn: Any,
+    *,
+    ticket_id: str,
+    job_id: str,
+    state: Literal["released", "settled_known", "settled_unknown"],
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    total_tokens: int | None = None,
+    actual_cost_usd: float | None = None,
+    unknown_cost_usd: float | None = None,
+    metadata: dict[str, Any] | None = None,
+    now: datetime | str | None = None,
+) -> dict[str, Any] | None:
+    """Settle an admitted ticket without depending on the worker's old lease."""
+    normalized_ticket_id = str(ticket_id or "").strip()
+    normalized_job_id = str(job_id or "").strip()
+    normalized_state = str(state or "").strip()
+    if not normalized_ticket_id:
+        raise ValueError("ticket_id is required")
+    if not normalized_job_id:
+        raise ValueError("job_id is required")
+    if normalized_state not in GEMINI_DISPATCH_TICKET_TERMINAL_STATES:
+        raise ValueError("state must be released, settled_known, or settled_unknown")
+    if normalized_state == "settled_known":
+        if actual_cost_usd is None:
+            raise ValueError("actual_cost_usd is required for settled_known")
+        normalized_actual_cost = _gemini_ticket_cost(
+            actual_cost_usd,
+            field="actual_cost_usd",
+        )
+    else:
+        if actual_cost_usd is not None:
+            raise ValueError("actual_cost_usd is only valid for settled_known")
+        normalized_actual_cost = None
+    if normalized_state == "settled_unknown":
+        normalized_unknown_cost = (
+            None
+            if unknown_cost_usd is None
+            else _gemini_ticket_cost(
+                unknown_cost_usd,
+                field="unknown_cost_usd",
+            )
+        )
+    else:
+        if unknown_cost_usd is not None:
+            raise ValueError("unknown_cost_usd is only valid for settled_unknown")
+        normalized_unknown_cost = None
+    settlement_metadata = dict(metadata or {})
+    if "billing_cost_multiplier" in settlement_metadata:
+        effective_billing_multiplier = _gemini_ticket_cost(
+            settlement_metadata["billing_cost_multiplier"],
+            field="metadata.billing_cost_multiplier",
+        )
+        if not 1.0 <= effective_billing_multiplier <= 2.0:
+            raise ValueError(
+                "metadata.billing_cost_multiplier must be between 1 and 2"
+            )
+        settlement_metadata["billing_cost_multiplier"] = (
+            effective_billing_multiplier
+        )
+    safe_input = max(0, int(input_tokens or 0))
+    safe_output = max(0, int(output_tokens or 0))
+    safe_total = max(
+        0,
+        int(
+            total_tokens
+            if total_tokens is not None
+            else safe_input + safe_output
+        ),
+    )
+    if normalized_state == "released" and (safe_input or safe_output or safe_total):
+        raise ValueError("released tickets cannot include provider token usage")
+    timestamp = _iso(now)
+
+    with _atomic_write(conn):
+        for _attempt in range(3):
+            row = _get_gemini_dispatch_ticket(
+                conn,
+                ticket_id=normalized_ticket_id,
+            )
+            if not row or str(row.get("job_id") or "") != normalized_job_id:
+                return None
+            snapshot = _gemini_ticket_snapshot(row)
+            current_state = str(snapshot.get("state") or "")
+            admitted_cost = float(snapshot["admitted_cost_usd"])
+            if (
+                normalized_unknown_cost is not None
+                and normalized_unknown_cost > admitted_cost + 1e-9
+            ):
+                raise ValueError(
+                    "unknown_cost_usd cannot exceed admitted_cost_usd"
+                )
+            effective_unknown_cost = (
+                (
+                    admitted_cost
+                    if normalized_unknown_cost is None
+                    else normalized_unknown_cost
+                )
+                if normalized_state == "settled_unknown"
+                else 0.0
+            )
+            settlement_identity_sha256 = _gemini_ticket_identity_sha256({
+                "ticket_id": normalized_ticket_id,
+                "job_id": normalized_job_id,
+                "state": normalized_state,
+                "input_tokens": (
+                    0 if normalized_state == "released" else safe_input
+                ),
+                "output_tokens": (
+                    0 if normalized_state == "released" else safe_output
+                ),
+                "total_tokens": (
+                    0 if normalized_state == "released" else safe_total
+                ),
+                "actual_cost_usd": normalized_actual_cost,
+                "unknown_cost_usd": effective_unknown_cost,
+                "metadata": settlement_metadata,
+            })
+            if current_state in GEMINI_DISPATCH_TICKET_TERMINAL_STATES:
+                if (
+                    snapshot["metadata"].get("settlement_identity_sha256")
+                    == settlement_identity_sha256
+                ):
+                    return snapshot
+                raise DatabaseIntegrityError(
+                    f"Gemini dispatch ticket settlement conflict: "
+                    f"{normalized_ticket_id}"
+                )
+            if current_state != "admitted":
+                raise DatabaseIntegrityError(
+                    f"invalid Gemini dispatch ticket state: {current_state!r}"
+                )
+            settled_metadata = {
+                **snapshot["metadata"],
+                **settlement_metadata,
+                "ticket_schema_version": GEMINI_DISPATCH_TICKET_SCHEMA_VERSION,
+                "ticket_state": normalized_state,
+                "ticket_identity_sha256": snapshot["metadata"][
+                    "ticket_identity_sha256"
+                ],
+                "settlement_identity_sha256": settlement_identity_sha256,
+                "generation_attempt": snapshot["generation_attempt"],
+                "attempt": snapshot["provider_attempt"],
+                "gemini_reservation_id": snapshot["reservation_id"],
+                "reserved_input_tokens": snapshot["reserved_input_tokens"],
+                "reserved_output_tokens": snapshot["reserved_output_tokens"],
+                "reserved_cost_usd": snapshot["reserved_cost_usd"],
+                "reserved_billing_cost_multiplier": snapshot[
+                    "reserved_billing_cost_multiplier"
+                ],
+                "billing_cost_multiplier": settlement_metadata.get(
+                    "billing_cost_multiplier",
+                    snapshot["reserved_billing_cost_multiplier"],
+                ),
+                "admitted_physical_attempts": snapshot[
+                    "admitted_physical_attempts"
+                ],
+                "provider_call": normalized_state != "released",
+                "dispatched": normalized_state != "released",
+                "billing_usage_known": normalized_state == "settled_known",
+                "billing_unknown_attempts": (
+                    1 if normalized_state == "settled_unknown" else 0
+                ),
+                "billing_unknown_reserved_cost_usd": (
+                    effective_unknown_cost
+                ),
+                "admitted_cost_usd": admitted_cost,
+                "actual_cost_usd": normalized_actual_cost,
+                "timestamp": timestamp,
+                "settled_at": timestamp,
+            }
+            encoded_metadata = _gemini_ticket_metadata_json(settled_metadata)
+            updated = execute_modify(
+                conn,
+                """
+                UPDATE generation_provider_usage
+                SET billable_requests = ?,
+                    input_tokens = ?,
+                    output_tokens = ?,
+                    total_tokens = ?,
+                    metadata_json = ?
+                WHERE id = ?
+                  AND job_id = ?
+                  AND provider = 'gemini'
+                  AND metadata_json = ?
+                """,
+                (
+                    1 if normalized_state == "settled_known" else 0,
+                    0 if normalized_state == "released" else safe_input,
+                    0 if normalized_state == "released" else safe_output,
+                    0 if normalized_state == "released" else safe_total,
+                    encoded_metadata,
+                    normalized_ticket_id,
+                    normalized_job_id,
+                    str(row.get("metadata_json") or "{}"),
+                ),
+            )
+            if updated:
+                settled = _get_gemini_dispatch_ticket(
+                    conn,
+                    ticket_id=normalized_ticket_id,
+                )
+                return _gemini_ticket_snapshot(settled) if settled else None
+        row = _get_gemini_dispatch_ticket(conn, ticket_id=normalized_ticket_id)
+        if not row or str(row.get("job_id") or "") != normalized_job_id:
+            return None
+        snapshot = _gemini_ticket_snapshot(row)
+        if (
+            snapshot["metadata"].get("settlement_identity_sha256")
+            == settlement_identity_sha256
+        ):
+            return snapshot
+        raise DatabaseIntegrityError(
+            f"Gemini dispatch ticket settlement conflict: {normalized_ticket_id}"
+        )
+
+
 __all__ = [
     "ACTIVE_STATUSES",
     "ALL_STATUSES",
@@ -1282,12 +1923,16 @@ __all__ = [
     "DEFAULT_QUEUE_TTL_SECONDS",
     "DURABLE_QUEUE_WAIT_PARAM",
     "EVENT_TYPES",
+    "GEMINI_DISPATCH_TICKET_SCHEMA_VERSION",
+    "GEMINI_DISPATCH_TICKET_STATES",
     "GenerationQueueFullError",
     "JobLeaseLostError",
     "TERMINAL_STATUSES",
     "append_event",
+    "admit_gemini_dispatch_ticket",
     "build_request_key",
     "cancellation_requested",
+    "checkpoint_yielded_attempt_usage",
     "expire_stale_queued_job",
     "find_active_job",
     "find_completed_job",
@@ -1301,6 +1946,7 @@ __all__ = [
     "requeue_retryable_failure",
     "replay_events",
     "request_cancellation",
+    "settle_gemini_dispatch_ticket",
     "submit_or_get_active",
     "transition_terminal",
     "update_progress",

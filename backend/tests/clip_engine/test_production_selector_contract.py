@@ -16849,6 +16849,11 @@ def test_boundary_selector_never_attaches_video_even_when_requested(
         if profile == gemini_segment.FLASH_SPLIT_PROFILE
         else None
     )
+    assert call["retry_service_tier"] == (
+        "priority"
+        if profile == gemini_segment.PRO_BOUNDARY_PROFILE
+        else None
+    )
     [reservation] = reservations
     prompt_text = f"{call['system']}\n\n{contents}"
     schema_bytes = len(json.dumps(
@@ -17896,6 +17901,82 @@ def test_exact_token_preflight_admits_affordable_long_unicode_text(
     assert token_counts[0]["model"] == "gemini-3.1-pro-preview"
     assert token_counts[0]["schema"] is gemini_segment._BoundaryPlan
     assert reservations[0]["estimated_input_tokens"] == 60_000
+
+
+def test_priority_retry_downgraded_to_standard_uses_standard_unknown_ceiling(
+    monkeypatch,
+) -> None:
+    context = GenerationContext("fast", generation_id="priority-downgrade")
+    tickets: list[dict] = []
+
+    def generate(_system, _user, _schema, **kwargs):
+        for attempt in (1, 2):
+            ticket = kwargs["before_dispatch"](
+                model=kwargs["model"],
+                attempt=attempt,
+            )
+            tickets.append(dict(ticket))
+            kwargs["after_dispatch"](
+                ticket,
+                model=kwargs["model"],
+                attempt=attempt,
+                telemetry={
+                    "model": kwargs["model"],
+                    "service_tier_requested": (
+                        "priority" if attempt == 2 else None
+                    ),
+                    "service_tier_used": "standard",
+                },
+            )
+        return SimpleNamespace(
+            text='{"topics": []}',
+            telemetry={
+                "model": kwargs["model"],
+                "service_tier_requested": "priority",
+                "service_tier_used": "standard",
+            },
+        )
+
+    monkeypatch.setattr(gemini_client, "generate_json_v3", generate)
+
+    parsed, telemetry = gemini_segment._call_model(
+        "system",
+        "user",
+        gemini_segment._BoundaryPlan,
+        model="gemini-3.1-pro-preview",
+        thinking_level="medium",
+        max_output_tokens=100,
+        timeout_s=30.0,
+        deadline_monotonic=time.monotonic() + 10.0,
+        operation="pro_authoritative",
+        prompt_version=gemini_segment.PRO_BOUNDARY_PROFILE,
+        cancelled=None,
+        budget_reserve=context.reserve_gemini_call,
+        budget_reconcile=context.reconcile_gemini_call,
+        max_retries=1,
+        retry_service_tier="priority",
+    )
+
+    assert parsed.topics == []
+    assert len(tickets) == 2
+    standard_reservation = tickets[0]["reserved_cost_usd"]
+    assert tickets[1]["reserved_cost_usd"] == pytest.approx(
+        standard_reservation * gemini_segment._PRO_PRIORITY_BILLING_MULTIPLIER
+    )
+    gemini = context.budget.snapshot()["gemini"]
+    assert gemini["committed_cost_usd"] == pytest.approx(
+        standard_reservation * 2
+    )
+    assert gemini["billing_unknown_cost_exposure_usd"] == pytest.approx(
+        standard_reservation * 2
+    )
+    assert telemetry["reserved_cost_usd"] == pytest.approx(
+        standard_reservation
+    )
+    assert telemetry["billing_unknown_reserved_cost_usd"] == pytest.approx(
+        standard_reservation * 2
+    )
+    assert telemetry["billing_cost_multiplier"] == 1.0
 
 
 @pytest.mark.parametrize("exact_tokens", [199_500, 200_000])

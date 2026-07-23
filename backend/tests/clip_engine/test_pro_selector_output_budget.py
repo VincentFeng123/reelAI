@@ -695,6 +695,7 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     assert call["thinking_level"] == "medium"
     assert call["max_retries"] == 1
     assert call["retry_status_codes"] is None
+    assert call["retry_service_tier"] == "priority"
     assert call["max_output_tokens"] == gemini_segment._PRO_BOUNDARY_OUTPUT_TOKENS
     assert (
         call["max_output_tokens"] - _OBSERVED_PRO_THOUGHT_TOKENS
@@ -707,6 +708,7 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     assert audit_call["prompt_version"] == "pro_candidate_audit_v14"
     assert audit_call["thinking_level"] == "medium"
     assert audit_call["media_resolution"] is None
+    assert audit_call["retry_service_tier"] == "priority"
     assert gemini_segment._PRO_FINAL_AUDIT_RESERVED_S >= 60.0
     assert (
         gemini_segment._TOTAL_DEADLINE_S

@@ -279,6 +279,39 @@ class ClipEngineSearchTests(unittest.TestCase):
             breadth=3,
         )
 
+    def test_contractless_ai_retrieval_keeps_exact_search_query_for_selection(
+        self,
+    ) -> None:
+        discovery = {
+            **_FAKE_DISCOVER,
+            "corrected": "Italian cooking techniques for fresh pasta",
+            "provider_used": "gemini",
+        }
+        with (
+            mock.patch.object(pipeline_module, "clip_engine_search") as mock_search,
+            mock.patch.object(pipeline_module, "clip_engine_run") as mock_run,
+        ):
+            mock_search.discover.return_value = discovery
+            mock_run.clip.return_value = _FAKE_ENGINE_OUT
+
+            result = main_module.ingestion_pipeline.ingest_search(
+                query="derive the chain rule with a worked example",
+                platforms=["yt"],
+                max_per_platform=5,
+                material_id="m1",
+                language="en",
+                exclude_video_ids=[],
+            )
+
+        self.assertEqual(result.succeeded, 1)
+        self.assertEqual(
+            mock_run.clip.call_args.kwargs["topic"],
+            "derive the chain rule with a worked example",
+        )
+        self.assertIsNone(
+            mock_run.clip.call_args.kwargs.get("intent_contract"),
+        )
+
     def test_ingest_search_surfaces_safe_transcript_fallback_without_silence(self) -> None:
         unavailable = pipeline_module.clip_engine_silence.SilenceVerificationResult(
             "unavailable",
