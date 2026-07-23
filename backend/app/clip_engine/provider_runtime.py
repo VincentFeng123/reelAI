@@ -939,6 +939,8 @@ def _gemini_token_rates(
         )
     ):
         return 0.30, 0.03, 2.50
+    if model_name == "gemini-3.6-flash":
+        return 1.50, 0.15, 7.50
     if "flash-lite" in normalized:
         return 0.25, 0.025, 1.50
     if "gemini-3-flash" in normalized and "gemini-3.5-flash" not in normalized:

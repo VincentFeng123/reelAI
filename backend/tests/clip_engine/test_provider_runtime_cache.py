@@ -473,6 +473,40 @@ def test_flash_lite_expansion_uses_its_lower_reservation_and_usage_rates() -> No
     assert context.usage_payload()["by_stage"]["expansion"]["cached_tokens"] == 400
 
 
+def test_gemini_3_6_flash_uses_exact_standard_reservation_and_usage_rates() -> None:
+    model = "gemini-3.6-flash"
+    assert provider_runtime._gemini_token_rates(model) == (1.50, 0.15, 7.50)
+    context = GenerationContext("fast", generation_id="job-36-flash-pricing")
+    reservation = context.reserve_gemini_call(
+        operation="expansion",
+        model=model,
+        estimated_input_tokens=1_000,
+        max_output_tokens=100,
+    )
+    context.record_gemini(
+        operation="expansion",
+        attempt=1,
+        model_used=model,
+        quality_degraded=True,
+        stage="expansion",
+        usage={
+            **reservation,
+            "prompt_tokens": 1_000,
+            "candidate_tokens": 100,
+            "thought_tokens": 0,
+            "cached_content_token_count": 400,
+            "total_tokens": 1_100,
+        },
+    )
+
+    reserved = (1_000 * 1.50 + 100 * 7.50) / 1_000_000.0
+    actual = (600 * 1.50 + 400 * 0.15 + 100 * 7.50) / 1_000_000.0
+    assert reservation["reserved_cost_usd"] == pytest.approx(reserved)
+    assert context.usage_payload()["summary"]["estimated_cost_usd"] == pytest.approx(
+        actual
+    )
+
+
 def test_usage_payload_adds_groq_cost_without_changing_gemini_subtotal() -> None:
     context = GenerationContext("slow", generation_id="job-mixed-provider-cost")
     context.record_gemini(

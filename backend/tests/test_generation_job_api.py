@@ -16,6 +16,7 @@ import pytest
 from backend import gemini_client
 from backend.app import db
 from backend.app import main
+from backend.app.clip_engine import expand
 from backend.app.clip_engine import segment_cache
 from backend.app.clip_engine import silence as clip_engine_silence
 from backend.app.clip_engine.errors import (
@@ -5654,6 +5655,115 @@ def test_generation_worker_retries_transient_provider_twice_then_succeeds_same_j
         assert wake.call_count == 2
         assert len(retrieval_calls) == 3
         assert ledger_recovery.call_count == 2
+    finally:
+        conn.close()
+
+
+def test_generation_worker_keeps_durable_retries_after_grounded_expansion_fallback(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_transactional_worker_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    topic = (
+        "Ohm's law, Kirchhoff junction and loop rules, series and parallel "
+        "resistance, and progressively harder circuit problems"
+    )
+    job, _created = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="expansion-rate-limit-final-fallback",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 1},
+        now=now,
+    )
+    generated: list[dict] = []
+    expansion_models: list[str] = []
+    final_plans: list[dict] = []
+
+    def rate_limited_expansion(*_args, model, **_kwargs):
+        expansion_models.append(model)
+        raise ProviderRateLimitError(
+            "Gemini expansion is rate limited.",
+            provider="gemini",
+            operation="expansion",
+            status_code=429,
+        )
+
+    def generate_stage(worker_conn, **kwargs) -> None:
+        context = kwargs["generation_context"]
+        plan = expand.expand_query_practice_fast(
+            topic,
+            3,
+            context=context,
+        )
+        final_plans.append(plan)
+        generated.append(
+            _insert_generation_reel(
+                worker_conn,
+                generation_id=str(kwargs["generation_id"]),
+                reel_id="expansion-fallback-reel",
+                video_id="CIRCUIT0001",
+                created_at=now.isoformat(),
+            )
+        )
+
+    def order_batch(reels, **_kwargs):
+        return mock.Mock(
+            reels=list(reels),
+            ordered_reel_ids=[reel["reel_id"] for reel in reels],
+            assessment_checkpoint_reel_ids=[],
+            model_used=None,
+            degraded=False,
+            fallback_reason=None,
+            provider_called=False,
+        )
+
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        rate_limited_expansion,
+    )
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: list(generated),
+    )
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
+    try:
+        leased = generation_jobs.lease_job(
+            conn,
+            job_id=str(job["id"]),
+            lease_owner="expansion-fallback-worker",
+            now=now,
+        )
+        assert leased and leased["attempt_count"] == 1
+        assert leased["max_attempts"] == 3
+        main._run_leased_generation_job(leased, threading.Event())
+
+        assert expansion_models == [
+            expand.PRACTICE_FAST_EXPAND_MODEL,
+            expand.PRACTICE_FAST_EXPAND_FALLBACK_MODEL,
+        ]
+        assert final_plans == [{
+            "corrected": topic,
+            "queries": [topic],
+            "provider_used": "literal_fallback",
+        }]
+        completed = generation_jobs.get_job(conn, str(job["id"]))
+        assert completed and completed["status"] == "completed"
+        assert completed["attempt_count"] == 1
+        assert completed["max_attempts"] == 3
+        assert [
+            event["type"]
+            for event in generation_jobs.replay_events(
+                conn,
+                job_id=str(job["id"]),
+            )
+        ] == ["final", "terminal"]
     finally:
         conn.close()
 

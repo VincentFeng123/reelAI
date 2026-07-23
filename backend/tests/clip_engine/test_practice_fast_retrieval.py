@@ -5,13 +5,16 @@ import json
 import threading
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from backend.app.clip_engine import expand, rank, search, segment_cache
 from backend.app.clip_engine.errors import (
     CancellationError,
+    ProviderAuthenticationError,
     ProviderConfigurationError,
+    ProviderRateLimitError,
     ProviderRequestError,
     ProviderResponseValidationError,
     ProviderTransientError,
@@ -759,7 +762,7 @@ def test_typed_retrieval_fallback_ignores_invalid_auxiliary_constraint_fields(
     }
 
 
-def test_expansion_typed_ai_fallback_keeps_newest_usable_response(
+def test_expansion_transient_latest_failure_uses_exact_request_not_stale_ai(
     monkeypatch,
 ) -> None:
     first = json.loads(_intent_expansion_json(
@@ -795,9 +798,9 @@ def test_expansion_typed_ai_fallback_keeps_newest_usable_response(
 
     assert calls == expand.PRACTICE_FAST_EXPAND_ATTEMPTS
     assert result == {
-        "corrected": second["corrected"],
-        "queries": ["calculus", "second calculus query"],
-        "provider_used": "gemini",
+        "corrected": "calculus",
+        "queries": ["calculus"],
+        "provider_used": "literal_fallback",
     }
 
 
@@ -969,7 +972,7 @@ def test_exact_request_fallback_remains_available_during_recovery(
 
 
 @pytest.mark.parametrize("status_code", [429, 403])
-def test_typed_ai_fallback_survives_a_later_provider_failure(
+def test_latest_provider_failure_controls_stale_typed_ai_fallback(
     monkeypatch,
     status_code,
 ) -> None:
@@ -987,30 +990,30 @@ def test_typed_ai_fallback_survives_a_later_provider_failure(
             super().__init__("later provider failure")
             self.status_code = status_code
 
-    responses: list[object] = [
-        json.dumps(payload),
-        LaterProviderFailure(),
-    ]
     calls = 0
 
     def fake_raw(*_args, **_kwargs):
         nonlocal calls
-        response = responses[calls]
         calls += 1
-        if isinstance(response, Exception):
-            raise response
-        return response
+        if calls == 1:
+            return json.dumps(payload)
+        raise LaterProviderFailure()
 
     monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
 
-    result = expand.expand_query_practice_fast("calculus", 2)
-
-    assert calls == 2
-    assert result == {
-        "corrected": payload["corrected"],
-        "queries": ["calculus", "calculus derivative lesson"],
-        "provider_used": "gemini",
-    }
+    if status_code == 403:
+        with pytest.raises(ProviderAuthenticationError) as exc_info:
+            expand.expand_query_practice_fast("calculus", 2)
+        assert exc_info.value.status_code == 403
+        assert calls == 2
+    else:
+        result = expand.expand_query_practice_fast("calculus", 2)
+        assert calls == 3
+        assert result == {
+            "corrected": "calculus",
+            "queries": ["calculus"],
+            "provider_used": "literal_fallback",
+        }
 
 
 def test_expansion_strict_retry_wins_over_earlier_typed_ai_fallback(
@@ -2238,6 +2241,54 @@ def test_empty_provider_response_uses_exact_request_and_disables_sdk_retries(
     }
 
 
+@pytest.mark.parametrize(
+    ("finish_reason", "block_reason"),
+    [
+        ("SAFETY", None),
+        (None, "SAFETY"),
+    ],
+    ids=["candidate-finish-reason", "prompt-feedback"],
+)
+def test_real_blocked_provider_response_never_uses_literal_search(
+    monkeypatch,
+    finish_reason,
+    block_reason,
+) -> None:
+    from google import genai
+
+    calls = 0
+
+    async def blocked_response(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(
+            text="",
+            model_version=expand.PRACTICE_FAST_EXPAND_MODEL,
+            usage_metadata={},
+            candidates=(
+                [SimpleNamespace(finish_reason=finish_reason)]
+                if finish_reason
+                else []
+            ),
+            prompt_feedback=SimpleNamespace(block_reason=block_reason),
+        )
+
+    monkeypatch.setattr(expand.config, "require_gemini_key", lambda: "gemini-test")
+    monkeypatch.setattr(
+        genai,
+        "Client",
+        lambda **_kwargs: _FakeGeminiClient(blocked_response),
+    )
+
+    with pytest.raises(ProviderRequestError, match="rejected"):
+        expand.expand_query_practice_fast(
+            "Explain a sensitive but valid learning request",
+            3,
+        )
+
+    assert calls == 1
+
+
 def test_failed_expansion_dispatch_is_recorded_once(monkeypatch):
     from google import genai
 
@@ -2587,7 +2638,7 @@ def test_practice_fast_expansion_uses_configured_flash_on_final_attempt(
     }
 
 
-def test_practice_fast_expansion_raises_typed_failure_after_all_models(
+def test_practice_fast_expansion_uses_literal_after_all_models_unavailable(
     monkeypatch,
 ):
     calls = []
@@ -2599,14 +2650,18 @@ def test_practice_fast_expansion_raises_typed_failure_after_all_models(
     monkeypatch.setattr(expand, "_practice_fast_gemini_raw", failed_models)
     monkeypatch.setattr(expand.config, "GEMINI_MODEL", "gemini-3.1-pro-preview")
 
-    with pytest.raises(ProviderTransientError):
-        expand.expand_query_practice_fast("physics", 3)
+    result = expand.expand_query_practice_fast("physics", 3)
 
     assert calls == [
         "gemini-3.1-flash-lite",
         "gemini-3.1-flash-lite",
         expand.PRACTICE_FAST_EXPAND_FALLBACK_MODEL,
     ]
+    assert result == {
+        "corrected": "physics",
+        "queries": ["physics"],
+        "provider_used": "literal_fallback",
+    }
 
 
 def test_practice_fast_expansion_retries_failed_flash_step_once(monkeypatch):
@@ -3115,6 +3170,59 @@ def test_long_topic_deep_searches_only_bounded_ai_queries(monkeypatch):
     assert result["queries"] == expected
     assert result["topic_terms"] == [topic]
     assert result["credits_used"] == 3
+
+
+def test_deep_search_uses_exact_request_when_expansion_models_are_rate_limited(
+    monkeypatch,
+) -> None:
+    topic = (
+        "Ohm's law, Kirchhoff junction and loop rules, series and parallel "
+        "resistance, and progressively harder circuit problems"
+    )
+    expansion_models: list[str] = []
+    search_calls: list[list[str]] = []
+
+    def rate_limited(*_args, model, **_kwargs):
+        expansion_models.append(model)
+        raise ProviderRateLimitError(
+            "Gemini expansion is rate limited.",
+            provider="gemini",
+            operation="expansion",
+            status_code=429,
+        )
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        search_calls.append(list(queries))
+        return {
+            "per_query": [{
+                "query": queries[0],
+                "videos": [{
+                    "id": "CIRCUIT0001",
+                    "title": "Ohm's law and Kirchhoff circuit problems",
+                    "viewCount": 1_000,
+                }],
+                "next_page_token": None,
+            }],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", rate_limited)
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        topic,
+        limit=1,
+        breadth=3,
+        retrieval_profile="deep",
+    )
+
+    assert expansion_models == [
+        expand.PRACTICE_FAST_EXPAND_MODEL,
+        expand.PRACTICE_FAST_EXPAND_FALLBACK_MODEL,
+    ]
+    assert search_calls == [[topic]]
+    assert [video["id"] for video in result["videos"]] == ["CIRCUIT0001"]
 
 
 @pytest.mark.parametrize(

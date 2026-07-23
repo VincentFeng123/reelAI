@@ -8,6 +8,7 @@ from backend.app.clip_engine.errors import (
     CancellationError,
     ModelUnavailableError,
     ProviderAuthenticationError,
+    ProviderBudgetExceededError,
     ProviderConfigurationError,
     ProviderError,
     ProviderQuotaError,
@@ -221,7 +222,32 @@ def test_practice_fast_retryable_failure_recovers_on_second_call(
     assert result["queries"] == ["physics explained"]
 
 
-def test_practice_fast_rate_limit_defers_to_durable_retry(
+@pytest.mark.parametrize("status_code", [429, 503])
+def test_practice_fast_availability_failure_tries_alternate_model(
+    monkeypatch,
+    status_code,
+) -> None:
+    calls: list[str] = []
+
+    def rate_limited(*_args, model, **_kwargs):
+        calls.append(model)
+        if model == expand.PRACTICE_FAST_EXPAND_MODEL:
+            raise _StatusFailure(status_code, retryable=False)
+        return _valid_expansion_json()
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", rate_limited)
+
+    result = expand.expand_query_practice_fast("physics", 1)
+
+    assert calls == [
+        expand.PRACTICE_FAST_EXPAND_MODEL,
+        expand.PRACTICE_FAST_EXPAND_FALLBACK_MODEL,
+    ]
+    assert result["provider_used"] == "gemini"
+    assert result["queries"] == ["physics explained"]
+
+
+def test_practice_fast_rate_limit_exhaustion_uses_literal_immediately(
     monkeypatch,
 ) -> None:
     calls: list[str] = []
@@ -232,12 +258,96 @@ def test_practice_fast_rate_limit_defers_to_durable_retry(
 
     monkeypatch.setattr(expand, "_practice_fast_gemini_raw", rate_limited)
 
-    with pytest.raises(ProviderRateLimitError) as exc_info:
-        expand.expand_query_practice_fast("physics", 1)
+    result = expand.expand_query_practice_fast(
+        "Ohm's law with Kirchhoff junction and loop rules",
+        3,
+    )
 
-    assert calls == [expand.PRACTICE_FAST_EXPAND_MODEL]
-    assert exc_info.value.status_code == 429
-    assert exc_info.value.retryable is True
+    assert calls == [
+        expand.PRACTICE_FAST_EXPAND_MODEL,
+        expand.PRACTICE_FAST_EXPAND_FALLBACK_MODEL,
+    ]
+    assert result == {
+        "corrected": "Ohm's law with Kirchhoff junction and loop rules",
+        "queries": ["Ohm's law with Kirchhoff junction and loop rules"],
+        "provider_used": "literal_fallback",
+    }
+
+
+def test_practice_fast_does_not_fallback_on_permanent_failure(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    def fail_configuration(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise ProviderConfigurationError(
+            "GEMINI_API_KEY is not set.",
+            provider="gemini",
+            operation="expansion",
+        )
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fail_configuration)
+
+    with pytest.raises(ProviderConfigurationError):
+        expand.expand_query_practice_fast(
+            "physics",
+            3,
+        )
+
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("first_response", "later_failure"),
+    [
+        (
+            "{not valid json",
+            ProviderConfigurationError(
+                "GEMINI_API_KEY is not set.",
+                provider="gemini",
+                operation="expansion",
+            ),
+        ),
+        (
+            json.dumps({
+                **json.loads(_valid_expansion_json()),
+                "reverse_coverage_complete": False,
+            }),
+            ProviderAuthenticationError(
+                "Gemini authentication failed.",
+                provider="gemini",
+                operation="expansion",
+                status_code=401,
+            ),
+        ),
+    ],
+    ids=["invalid-raw-then-config", "retrieval-envelope-then-auth"],
+)
+def test_practice_fast_later_permanent_failure_overrides_prior_response(
+    monkeypatch,
+    first_response,
+    later_failure,
+) -> None:
+    calls = 0
+
+    def mixed_sequence(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return first_response
+        raise later_failure
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", mixed_sequence)
+
+    with pytest.raises(type(later_failure)):
+        expand.expand_query_practice_fast(
+            "physics",
+            3,
+        )
+
+    assert calls == 2
 
 
 def test_practice_fast_semantic_retry_receives_compact_validation_feedback(
@@ -465,6 +575,8 @@ def test_practice_fast_warning_redacts_rejected_model_values(
         _StatusFailure(422, retryable=True),
         _provider_failure(ProviderTransientError, status_code=422),
         _provider_failure(ProviderConfigurationError),
+        _provider_failure(ProviderQuotaError, status_code=429),
+        _provider_failure(ProviderBudgetExceededError, status_code=429),
         _provider_failure(ProviderRequestError),
         GeminiBlockedResponseError("blocked response"),
         _StatuslessPermanentFailure("permanent failure"),
@@ -477,6 +589,8 @@ def test_practice_fast_warning_redacts_rejected_model_values(
         "422",
         "status-overrides-stale-true",
         "configuration",
+        "typed-quota-429",
+        "typed-budget-429",
         "statusless-provider-request",
         "blocked",
         "statusless-explicit-permanent",
@@ -526,7 +640,7 @@ def test_practice_fast_exhausted_contract_is_typed_and_never_literal(
     assert exc_info.value.operation == "expansion"
 
 
-def test_practice_fast_exhausted_provider_499_is_typed_transient(
+def test_practice_fast_exhausted_provider_499_uses_literal_fallback(
     monkeypatch,
 ) -> None:
     calls = 0
@@ -538,12 +652,14 @@ def test_practice_fast_exhausted_provider_499_is_typed_transient(
 
     monkeypatch.setattr(expand, "_practice_fast_gemini_raw", provider_cancelled)
 
-    with pytest.raises(ProviderTransientError) as exc_info:
-        expand.expand_query_practice_fast("physics", 1)
+    result = expand.expand_query_practice_fast("physics", 1)
 
     assert calls == expand.PRACTICE_FAST_EXPAND_ATTEMPTS
-    assert exc_info.value.status_code == 499
-    assert exc_info.value.retryable is True
+    assert result == {
+        "corrected": "physics",
+        "queries": ["physics"],
+        "provider_used": "literal_fallback",
+    }
 
 
 def test_practice_fast_application_cancellation_after_provider_499_does_not_retry(
@@ -696,3 +812,25 @@ def test_practice_fast_rate_limit_preserves_provider_retry_after() -> None:
 
     assert isinstance(failure, ProviderRateLimitError)
     assert failure.retry_after_sec == pytest.approx(12.0)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ProviderQuotaError(
+            "Gemini quota is exhausted.",
+            provider="gemini",
+            operation="expansion",
+            status_code=429,
+        ),
+        ProviderBudgetExceededError(
+            "Generation budget is exhausted.",
+            provider="gemini",
+            operation="expansion",
+            status_code=429,
+        ),
+    ],
+    ids=["quota", "budget"],
+)
+def test_practice_fast_preserves_typed_permanent_429(failure) -> None:
+    assert expand._practice_fast_provider_error(failure) is failure

@@ -3,8 +3,9 @@
 Topic correction, aliases, and semantic expansion are owned by the persisted
 TopicExpansionService. The existing ``expand_query`` API retains its stable templates.
 Production retrieval uses ``expand_query_practice_fast`` for a cached Gemini plan.
-Recoverable failures receive bounded corrective Gemini retries; exhausted failures
-remain typed so the durable generation controller can retry them.
+Recoverable failures receive bounded corrective or alternate-model retries. If
+both expansion models are unavailable, the exact learner request remains a
+grounded search query; permanent provider and safety failures stay typed.
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ from .errors import (
     CancellationError,
     ModelUnavailableError,
     ProviderAuthenticationError,
+    ProviderBudgetExceededError,
     ProviderConfigurationError,
     ProviderError,
     ProviderQuotaError,
@@ -1565,6 +1567,31 @@ async def _practice_fast_gemini_raw_async(
                     "dispatched": True,
                 },
             )
+        finish_reason = (
+            str(gemini_client._finish_reason(response) or "").strip().upper()
+        )
+        prompt_feedback = gemini_client._field(response, "prompt_feedback")
+        raw_block_reason = gemini_client._field(prompt_feedback, "block_reason")
+        block_reason = str(
+            getattr(raw_block_reason, "value", raw_block_reason) or ""
+        ).strip().upper()
+        if (
+            finish_reason
+            and not finish_reason.endswith(("STOP", "MAX_TOKENS"))
+        ) or block_reason not in {
+            "",
+            "0",
+            "NONE",
+            "UNSPECIFIED",
+            "BLOCK_REASON_UNSPECIFIED",
+        }:
+            raise ProviderRequestError(
+                "Gemini blocked the expansion response.",
+                provider="gemini",
+                operation="expansion",
+                status_code=200,
+                detail="blocked_response",
+            )
         text = str(getattr(response, "text", "") or "").strip()
         if not text:
             raise _PracticeFastEmptyResponseError(
@@ -1689,9 +1716,19 @@ def _practice_fast_provider_error(exc: Exception) -> ProviderError:
     """Preserve typed failures and classify raw Gemini expansion failures."""
     status = gemini_client._gemini_status_code(exc)
     retry_after_sec = gemini_client._gemini_retry_after(exc)
-    if isinstance(exc, ProviderError) and (
-        status is None or isinstance(exc, ProviderResponseValidationError)
+    if isinstance(
+        exc,
+        (
+            ModelUnavailableError,
+            ProviderAuthenticationError,
+            ProviderBudgetExceededError,
+            ProviderConfigurationError,
+            ProviderQuotaError,
+            ProviderResponseValidationError,
+        ),
     ):
+        return exc
+    if isinstance(exc, ProviderError) and status is None:
         return exc
     detail = type(exc).__name__
     kwargs = {
@@ -1743,10 +1780,11 @@ def expand_query_practice_fast(
     recovery_reason: str | None = None,
     rejected_video_ids: Sequence[str] = (),
 ) -> dict:
-    """Return cached Gemini search terms or raise a typed provider failure.
+    """Return cached Gemini terms or an exact-request availability fallback.
 
     Expansion deliberately does not reserve the Supadata search budget tracked by
     ``context``. The context enables durable cache reuse and usage accounting.
+    Permanent provider, configuration, and safety failures remain typed.
     """
     topic = " ".join(str(topic or "").split())
     count = max(0, int(n))
@@ -1788,7 +1826,7 @@ def expand_query_practice_fast(
     errors: list[str] = []
     last_failure: Exception | None = None
     retrieval_fallback: dict | None = None
-    provider_response_received = False
+    last_failure_had_provider_response = False
     with singleflight(cache_key, should_cancel) if cache_key else nullcontext():
         cached = _read_cached_expansion(cache_key, count) if cache_key else None
         if cached is not None:
@@ -1806,6 +1844,7 @@ def expand_query_practice_fast(
             return cached
         validation_feedback = ""
         use_fallback_model = False
+        attempted_models: set[str] = set()
         for attempt in range(PRACTICE_FAST_EXPAND_ATTEMPTS):
             raise_if_cancelled(should_cancel)
             raw: str | None = None
@@ -1835,8 +1874,8 @@ def expand_query_practice_fast(
                     )
                 if validation_feedback:
                     kwargs["validation_feedback"] = validation_feedback
+                attempted_models.add(model)
                 raw = _practice_fast_gemini_raw(topic, count, **kwargs)
-                provider_response_received = True
                 parsed = _PracticeFastExpansion.model_validate_json(raw)
                 corrected = " ".join(str(parsed.corrected or topic).split()) or topic
                 raw_query_metadata: list[dict[str, object]] = []
@@ -1914,46 +1953,59 @@ def expand_query_practice_fast(
                 raise CancellationError("Generation cancelled.") from exc
             except Exception as exc:
                 raise_if_cancelled(should_cancel)
-                if isinstance(
-                    exc,
-                    (
-                        _PracticeFastEmptyResponseError,
-                        ProviderResponseValidationError,
-                    ),
-                ):
-                    provider_response_received = True
-                if raw is not None:
-                    candidate = _typed_retrieval_fallback(
+                last_failure_had_provider_response = bool(
+                    raw is not None
+                    or isinstance(
+                        exc,
+                        (
+                            _PracticeFastEmptyResponseError,
+                            ProviderResponseValidationError,
+                        ),
+                    )
+                )
+                retrieval_fallback = (
+                    _typed_retrieval_fallback(
                         raw,
                         topic,
                         count,
                         tried_keys=tried_keys,
                     )
-                    if candidate is not None:
-                        retrieval_fallback = candidate
+                    if raw is not None
+                    else None
+                )
                 last_failure = exc
                 validation_feedback = _practice_fast_validation_feedback(exc)
                 provider_status = gemini_client._gemini_status_code(exc)
+                classified_failure = _practice_fast_provider_error(exc)
                 errors.append(
                     f"{model} attempt {attempt + 1}: "
                     f"{_practice_fast_failure_log_summary(exc)}"
                 )
-                # A provider-wide quota window applies to every Gemini model.
-                # Model fallback inside the same durable attempt only multiplies
-                # identical 429s and consumes the bounded job-attempt ceiling
-                # before delayed recovery can run.
-                if provider_status == 429:
-                    break
+                model_availability_failure = bool(
+                    isinstance(
+                        classified_failure,
+                        (ModelUnavailableError, ProviderRateLimitError),
+                    )
+                    or (
+                        isinstance(classified_failure, ProviderTransientError)
+                        and provider_status is not None
+                        and 500 <= provider_status <= 599
+                    )
+                )
                 if (
-                    provider_status == 404
+                    model_availability_failure
                     and model == PRACTICE_FAST_EXPAND_MODEL
                     and PRACTICE_FAST_EXPAND_FALLBACK_MODEL != model
+                    and PRACTICE_FAST_EXPAND_FALLBACK_MODEL
+                    not in attempted_models
                 ):
                     use_fallback_model = True
                     continue
+                if model_availability_failure:
+                    break
                 if (
                     attempt + 1 >= PRACTICE_FAST_EXPAND_ATTEMPTS
-                    or not _practice_fast_failure_is_retryable(exc)
+                    or not classified_failure.retryable
                 ):
                     break
     logger.warning(
@@ -1963,21 +2015,36 @@ def expand_query_practice_fast(
     )
     if last_failure is None:
         last_failure = RuntimeError("Gemini expansion ended without a response")
-    if retrieval_fallback is not None:
+    typed_failure = _practice_fast_provider_error(last_failure)
+    response_validation_fallback = bool(
+        isinstance(typed_failure, ProviderResponseValidationError)
+        and last_failure_had_provider_response
+    )
+    if response_validation_fallback and retrieval_fallback is not None:
         logger.warning(
             "practice-fast Gemini %s is using typed AI retrieval fields after "
             "strict intent metadata exhaustion",
             "zero-result recovery" if recovering_zero_results else "expansion",
         )
         return retrieval_fallback
-    if provider_response_received:
+    if (
+        response_validation_fallback
+        or isinstance(
+            typed_failure,
+            (
+                ModelUnavailableError,
+                ProviderRateLimitError,
+                ProviderTransientError,
+            ),
+        )
+    ):
         logger.warning(
             "practice-fast Gemini %s is using the exact learner request after "
-            "structured response exhaustion",
+            "bounded expansion availability/validation exhaustion",
             "zero-result recovery" if recovering_zero_results else "expansion",
         )
         return literal_fallback(topic, count)
-    raise _practice_fast_provider_error(last_failure) from last_failure
+    raise typed_failure from last_failure
 
 
 def expand_query(
