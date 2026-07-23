@@ -532,7 +532,7 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
             }
             _settle_mock_dispatch(kwargs, telemetry)
             return SimpleNamespace(
-                text=_newton_audit_plan().model_dump_json(),
+                text=_newton_audit_plan().model_dump_json(by_alias=True),
                 telemetry=telemetry,
             )
         if (
@@ -705,7 +705,7 @@ def test_text_only_pro_retries_one_malformed_structured_response(
         ) == 1:
             return SimpleNamespace(text="{malformed", telemetry=telemetry)
         if schema is gemini_segment._ProCandidateAuditPlan:
-            text = _newton_audit_plan().model_dump_json()
+            text = _newton_audit_plan().model_dump_json(by_alias=True)
         else:
             text = plan.model_dump_json(by_alias=True)
         return SimpleNamespace(text=text, telemetry=telemetry)
@@ -750,7 +750,7 @@ def test_text_only_pro_retries_one_malformed_structured_response(
     assert generated[0]["media_resolution"] is None
     assert generated[1]["media_resolution"] is None
     assert generated[0]["max_retries"] == 1
-    assert generated[1]["max_retries"] == 1
+    assert generated[1]["max_retries"] == 0
     assert [call["thinking_level"] for call in generated] == [
         "medium",
         "high",

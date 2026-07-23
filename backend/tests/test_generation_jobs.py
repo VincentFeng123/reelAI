@@ -969,6 +969,81 @@ def test_rate_limit_requeue_waits_until_retry_not_before() -> None:
         conn.close()
 
 
+def test_rate_limit_without_provider_hint_uses_bounded_attempt_backoff() -> None:
+    conn = _memory_conn()
+    try:
+        job, _ = _submit(conn, request_key="retry-rate-limit-default")
+        first = jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="rate-limit-default-worker-1",
+            now=BASE_TIME,
+        )
+        assert first
+        usage = {
+            "retry_errors": [
+                {"code": "provider_rate_limited", "retry_after_sec": None}
+            ]
+        }
+        requeued = jobs.requeue_retryable_failure(
+            conn,
+            job_id=job["id"],
+            lease_owner="rate-limit-default-worker-1",
+            expected_attempt_count=1,
+            usage=usage,
+            now=BASE_TIME + timedelta(seconds=1),
+        )
+        assert requeued
+        assert datetime.fromisoformat(requeued["retry_not_before_at"]) == (
+            BASE_TIME + timedelta(seconds=6)
+        )
+        second = jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="rate-limit-default-worker-2",
+            now=BASE_TIME + timedelta(seconds=6),
+        )
+        assert second and second["attempt_count"] == 2
+        second_requeue = jobs.requeue_retryable_failure(
+            conn,
+            job_id=job["id"],
+            lease_owner="rate-limit-default-worker-2",
+            expected_attempt_count=2,
+            usage=usage,
+            now=BASE_TIME + timedelta(seconds=7),
+        )
+        assert second_requeue
+        assert datetime.fromisoformat(
+            second_requeue["retry_not_before_at"]
+        ) == BASE_TIME + timedelta(seconds=22)
+    finally:
+        conn.close()
+
+
+def test_non_rate_limit_without_provider_hint_requeues_immediately() -> None:
+    conn = _memory_conn()
+    try:
+        job, _ = _submit(conn, request_key="retry-transient-no-delay")
+        first = jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="transient-default-worker",
+            now=BASE_TIME,
+        )
+        assert first
+        requeued = jobs.requeue_retryable_failure(
+            conn,
+            job_id=job["id"],
+            lease_owner="transient-default-worker",
+            expected_attempt_count=1,
+            usage={"retry_errors": [{"code": "provider_transient"}]},
+            now=BASE_TIME + timedelta(seconds=1),
+        )
+        assert requeued and requeued["retry_not_before_at"] is None
+    finally:
+        conn.close()
+
+
 def test_queued_first_attempt_gets_fresh_execution_deadline_when_leased() -> None:
     conn = _memory_conn()
     try:

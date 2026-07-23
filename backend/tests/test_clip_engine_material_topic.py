@@ -32,6 +32,10 @@ from backend.app.clip_engine.provider_runtime import GenerationContext  # noqa: 
 import backend.app.main as main_module  # noqa: E402
 from backend.app.ingestion import pipeline as pipeline_module  # noqa: E402
 from backend.app.ingestion.models import ReelOutWithAttribution  # noqa: E402
+from backend.intent_obligations import (  # noqa: E402
+    INTENT_OBLIGATION_CONTRACT_VERSION,
+    intent_obligation,
+)
 from backend.pipeline import gemini_segment as segment_module  # noqa: E402
 
 
@@ -892,7 +896,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
             )
 
         self.assertEqual(len(reels), 1)
-        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v40")
+        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v41")
         self.assertEqual(reels[0].t_start, 12.001)
         self.assertEqual(reels[0].t_end, 433.012)
         self.assertGreater(reels[0].t_end - reels[0].t_start, 180.0)
@@ -955,7 +959,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
 
         self.assertEqual(len(beginner_feed), 1)
         self.assertEqual(
-            beginner_feed[0]["selection_contract_version"], "quality_silence_v40"
+            beginner_feed[0]["selection_contract_version"], "quality_silence_v41"
         )
         self.assertIsInstance(beginner_feed[0]["t_start"], float)
         self.assertIsInstance(beginner_feed[0]["t_end"], float)
@@ -1078,6 +1082,50 @@ class IngestTopicProgressTests(unittest.TestCase):
                 overrides={"yt": (1000, 60.0)}
             ),
         )
+
+    @staticmethod
+    def _trusted_intent_fixture() -> tuple[str, dict, dict[str, dict]]:
+        request = "Teach photosynthesis."
+        constraints = [
+            {
+                "constraint_id": constraint_id,
+                "kind": kind,
+                "source_phrase": phrase,
+                "source_occurrence": 0,
+                "requirement": requirement,
+                "relationship_topology": "not_applicable",
+            }
+            for constraint_id, kind, phrase, requirement in (
+                ("task", "task", "Teach", "Teach the requested lesson"),
+                (
+                    "subject",
+                    "subject",
+                    "photosynthesis",
+                    "Teach photosynthesis",
+                ),
+            )
+        ]
+        contract = {
+            "version": "expansion_intent_v2",
+            "request_intent": {
+                "exact_request": request,
+                "constraints": constraints,
+                "joint_structures": [],
+            },
+        }
+        obligations = {
+            constraint["constraint_id"]: intent_obligation(
+                kind=constraint["kind"],
+                source_phrase=constraint["source_phrase"],
+                source_start=request.index(constraint["source_phrase"]),
+                requirement=constraint["requirement"],
+                evidence_quote=(
+                    f"Grounded evidence for {constraint['constraint_id']}"
+                ),
+            )
+            for constraint in constraints
+        }
+        return request, contract, obligations
 
     def test_fast_video_is_persisted_and_emitted_while_earlier_video_is_still_running(self) -> None:
         pipeline = self._pipeline()
@@ -1451,6 +1499,7 @@ class IngestTopicProgressTests(unittest.TestCase):
         stalled_cancelled = threading.Event()
         analyzed: set[str] = set()
         streamed: list[str] = []
+        context = GenerationContext("slow")
 
         def clip_and_filter(video, _topic, _language, should_cancel, _context):
             if video["id"] == "stalled-video":
@@ -1460,10 +1509,8 @@ class IngestTopicProgressTests(unittest.TestCase):
                 stalled_cancelled.set()
                 return video, [], {"transcript": {}}
             self.assertTrue(stalled_started.wait(1.0))
-            return video, [
-                {"title": f"fast-{index}", "score": 1.0}
-                for index in range(3)
-            ], {"transcript": {}}
+            engine_out = _build_engine_out("vidAAAAAAAA")
+            return video, engine_out["clips"], engine_out
 
         with (
             mock.patch.object(
@@ -1498,17 +1545,194 @@ class IngestTopicProgressTests(unittest.TestCase):
                 material_id="material",
                 concept_id="concept",
                 max_videos=2,
-                max_reels=8,
+                max_reels=2,
                 on_reel_created=streamed.append,
                 analyzed_video_ids=analyzed,
+                generation_context=context,
             )
             elapsed = time.monotonic() - started
 
-        self.assertEqual(reels, ["fast-video"] * 3)
-        self.assertEqual(streamed, ["fast-video"] * 3)
+        self.assertEqual(reels, ["fast-video"] * 2)
+        self.assertEqual(streamed, ["fast-video"] * 2)
         self.assertEqual(analyzed, {"fast-video"})
+        self.assertEqual(context.counters()["clip_fetch_timeouts"], 1)
+        self.assertEqual(context.counters()["post_progress_timeouts"], 1)
         self.assertLess(elapsed, 0.2)
         self.assertTrue(stalled_cancelled.wait(0.1))
+
+    def test_incomplete_trusted_coverage_keeps_existing_idle_latency_guard(
+        self,
+    ) -> None:
+        pipeline = self._pipeline()
+        request, intent_contract, obligations = self._trusted_intent_fixture()
+        stalled_video = self._video("stalled-after-complete")
+        fast_video = self._video("incomplete-fast")
+        stalled_cancelled = threading.Event()
+        analyzed: set[str] = set()
+
+        def clip_and_filter(
+            video, _topic, _language, should_cancel, _context
+        ):
+            if video["id"] == stalled_video["id"]:
+                while not should_cancel():
+                    time.sleep(0.002)
+                stalled_cancelled.set()
+                return video, [], {"transcript": {}}
+            engine_out = _build_engine_out("vidAAAAAAAA")
+            for clip in engine_out["clips"]:
+                clip.update(
+                    selection_authority="gemini",
+                    intent_obligation_contract_version=(
+                        INTENT_OBLIGATION_CONTRACT_VERSION
+                    ),
+                    intent_obligations=[obligations["subject"]],
+                )
+            return video, engine_out["clips"], engine_out
+
+        context = GenerationContext("slow")
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": request,
+                    "provider_used": "gemini",
+                    "intent_contract": intent_contract,
+                    "acquisition_obligation_constraint_ids": [
+                        "task",
+                        "subject",
+                    ],
+                    "videos": [stalled_video, fast_video],
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(
+                pipeline_module, "INGEST_TOPIC_VIDEO_TIMEOUT_SEC", 0.4
+            ),
+            mock.patch.object(
+                pipeline_module,
+                "INGEST_TOPIC_USEFUL_INVENTORY_IDLE_TIMEOUT_SEC",
+                0.03,
+            ),
+            mock.patch.object(
+                pipeline, "_clip_and_filter", side_effect=clip_and_filter
+            ),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (
+                    kwargs["v"]["id"],
+                    mock.sentinel.metadata,
+                ),
+            ),
+        ):
+            started = time.monotonic()
+            reels, _ = pipeline.ingest_topic(
+                topic=request,
+                material_id="material",
+                concept_id="concept",
+                max_videos=2,
+                max_reels=2,
+                analyzed_video_ids=analyzed,
+                generation_context=context,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(reels, [fast_video["id"], fast_video["id"]])
+        self.assertEqual(analyzed, {fast_video["id"]})
+        self.assertEqual(context.counters()["post_progress_timeouts"], 1)
+        self.assertGreaterEqual(elapsed, 0.02)
+        self.assertLess(elapsed, 0.2)
+        self.assertTrue(stalled_cancelled.wait(0.1))
+
+    def test_source_start_uses_retained_obligations_and_preserves_fallback(
+        self,
+    ) -> None:
+        request, intent_contract, obligations = self._trusted_intent_fixture()
+        videos = [self._video(f"coverage-source-{index}") for index in range(4)]
+
+        for mode in ("complete", "incomplete", "contractless"):
+            with self.subTest(mode=mode):
+                pipeline = self._pipeline()
+                attempted: set[str] = set()
+
+                def clip_and_filter(video, *_args):
+                    engine_out = _build_engine_out("vidAAAAAAAA")
+                    for clip in engine_out["clips"]:
+                        clip.update(
+                            selection_authority="gemini",
+                            intent_obligation_contract_version=(
+                                INTENT_OBLIGATION_CONTRACT_VERSION
+                            ),
+                            intent_obligations=list(obligations.values()),
+                        )
+                    return video, engine_out["clips"], engine_out
+
+                retained_obligations = (
+                    list(obligations.values())
+                    if mode == "complete"
+                    else [obligations["subject"]]
+                )
+                retained_context = {
+                    "selection_authority": "gemini",
+                    "intent_obligation_contract_version": (
+                        INTENT_OBLIGATION_CONTRACT_VERSION
+                    ),
+                    "intent_obligations": retained_obligations,
+                }
+
+                def persist_engine_clip(**kwargs):
+                    kwargs["on_persistence_result"](False)
+                    kwargs["on_persisted_selection_context"](
+                        retained_context
+                    )
+                    return kwargs["v"]["id"], mock.sentinel.metadata
+
+                discovery = {
+                    "corrected": request,
+                    "provider_used": "gemini",
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                }
+                if mode != "contractless":
+                    discovery.update(
+                        intent_contract=intent_contract,
+                        acquisition_obligation_constraint_ids=[
+                            "task",
+                            "subject",
+                        ],
+                    )
+
+                with (
+                    mock.patch.object(
+                        pipeline_module, "_discover", return_value=discovery
+                    ),
+                    mock.patch.object(
+                        pipeline,
+                        "_clip_and_filter",
+                        side_effect=clip_and_filter,
+                    ),
+                    mock.patch.object(
+                        pipeline,
+                        "_persist_engine_clip",
+                        side_effect=persist_engine_clip,
+                    ),
+                ):
+                    pipeline.ingest_topic(
+                        topic=request,
+                        material_id="material",
+                        concept_id="concept",
+                        max_videos=4,
+                        max_reels=2,
+                        attempted_video_ids=attempted,
+                    )
+
+                expected = {video["id"] for video in videos[:3]}
+                if mode == "incomplete":
+                    expected.add(videos[3]["id"])
+                self.assertEqual(attempted, expected)
 
     def test_off_level_valid_clip_streams_without_delaying_nearer_clip_order(self) -> None:
         pipeline = self._pipeline()

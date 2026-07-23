@@ -94,6 +94,10 @@ def test_context_aligned_boundary_is_usable_but_not_acoustically_verified() -> N
 
 def test_previous_context_aligned_contract_remains_viewable() -> None:
     context = _context_aligned_search_context()
+    context["selection_contract_version"] = "quality_silence_v40"
+    assert silence.persisted_boundary_is_usable(
+        context, t_start=2.0, t_end=9.0
+    ) is True
     context["selection_contract_version"] = "quality_silence_v37"
     assert silence.persisted_boundary_is_usable(
         context, t_start=2.0, t_end=9.0
@@ -147,7 +151,7 @@ def test_previous_context_aligned_contract_remains_viewable() -> None:
 
 def test_current_strict_boundary_is_bound_to_persisted_range() -> None:
     context = {
-        "selection_contract_version": "quality_silence_v40",
+        "selection_contract_version": "quality_silence_v41",
         "boundary_status": "verified",
         "boundary_diagnostics": {
             "acoustic_verified": True,

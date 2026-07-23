@@ -29,6 +29,12 @@ class _StatuslessPermanentFailure(RuntimeError):
     retryable = False
 
 
+class _RateLimitWithHeaders(_StatusFailure):
+    def __init__(self, retry_after: str):
+        super().__init__(429, retryable=False)
+        self.headers = {"Retry-After": retry_after}
+
+
 class GeminiBlockedResponseError(RuntimeError):
     retryable = True
 
@@ -43,6 +49,10 @@ def _valid_expansion_json() -> str:
             "source_phrase": "physics",
             "requirement": "Teach physics",
         }],
+        "reverse_coverage_complete": True,
+        "reverse_coverage_constraint_ids": ["subject"],
+        "acquisition_obligation_constraint_ids": ["subject"],
+        "coordinated_groups": [],
         "queries": [{
             "text": "physics explained",
             "preserved_constraint_ids": ["subject"],
@@ -141,6 +151,7 @@ def test_practice_fast_healthy_expansion_has_one_call_and_no_retry_wait(
 
     assert calls == 1
     intent_contract = result.pop("intent_contract")
+    acquisition_ids = result.pop("acquisition_obligation_constraint_ids")
     assert result == {
         "corrected": "Physics",
         "queries": ["physics explained"],
@@ -148,6 +159,7 @@ def test_practice_fast_healthy_expansion_has_one_call_and_no_retry_wait(
     }
     assert intent_contract["version"] == "expansion_intent_v2"
     assert intent_contract["request_intent"]["exact_request"] == "physics"
+    assert acquisition_ids == ["subject"]
 
 
 @pytest.mark.parametrize(
@@ -156,7 +168,6 @@ def test_practice_fast_healthy_expansion_has_one_call_and_no_retry_wait(
         ConnectionError("connection reset"),
         ValueError("invalid local response contract"),
         _StatusFailure(408, retryable=False),
-        _StatusFailure(429, retryable=False),
         _StatusFailure(499, retryable=False),
         _StatusFailure(500, retryable=False),
         _StatusFailure(503, retryable=False),
@@ -167,7 +178,6 @@ def test_practice_fast_healthy_expansion_has_one_call_and_no_retry_wait(
         "statusless-transport",
         "local-contract",
         "408",
-        "429",
         "499",
         "500",
         "503",
@@ -201,6 +211,25 @@ def test_practice_fast_retryable_failure_recovers_on_second_call(
     assert result["queries"] == ["physics explained"]
 
 
+def test_practice_fast_rate_limit_defers_to_durable_retry(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    def rate_limited(*_args, model, **_kwargs):
+        calls.append(model)
+        raise _StatusFailure(429, retryable=False)
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", rate_limited)
+
+    with pytest.raises(ProviderRateLimitError) as exc_info:
+        expand.expand_query_practice_fast("physics", 1)
+
+    assert calls == [expand.PRACTICE_FAST_EXPAND_MODEL]
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.retryable is True
+
+
 def test_practice_fast_semantic_retry_receives_compact_validation_feedback(
     monkeypatch,
 ) -> None:
@@ -225,6 +254,144 @@ def test_practice_fast_semantic_retry_receives_compact_validation_feedback(
     ]
     assert "input_value" not in calls[1]["validation_feedback"]
     assert expand.PRACTICE_FAST_EXPAND_ATTEMPTS == 3
+
+
+def test_practice_fast_incomplete_reverse_coverage_uses_existing_correction(
+    monkeypatch,
+) -> None:
+    calls: list[dict] = []
+    invalid = json.loads(_valid_expansion_json())
+    invalid["reverse_coverage_constraint_ids"] = []
+
+    def fail_then_recover(*_args, **kwargs):
+        calls.append(kwargs)
+        return json.dumps(invalid) if len(calls) == 1 else _valid_expansion_json()
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fail_then_recover)
+
+    result = expand.expand_query_practice_fast("physics", 1)
+
+    assert result["provider_used"] == "gemini"
+    assert len(calls) == 2
+    assert "validation_feedback" not in calls[0]
+    assert "reverse_coverage_constraint_ids" in calls[1]["validation_feedback"]
+
+
+def test_practice_fast_coordinated_member_omission_uses_existing_correction(
+    monkeypatch,
+) -> None:
+    request = "Explain duty and breach in negligence."
+    constraints = [
+        {
+            "constraint_id": constraint_id,
+            "kind": kind,
+            "source_phrase": phrase,
+            "requirement": requirement,
+        }
+        for constraint_id, kind, phrase, requirement in (
+            ("task", "task", "Explain", "Explain the requested concepts"),
+            ("duty", "scope", "duty", "Explain duty"),
+            ("breach", "scope", "breach", "Explain breach"),
+            ("subject", "subject", "negligence", "Teach negligence"),
+        )
+    ]
+
+    def response(acquisition_ids: list[str]) -> str:
+        constraint_ids = [
+            constraint["constraint_id"] for constraint in constraints
+        ]
+        return json.dumps({
+            "corrected": request,
+            "intent_constraints": constraints,
+            "joint_structures": [],
+            "summary_preserved_constraint_ids": constraint_ids,
+            "reverse_coverage_complete": True,
+            "reverse_coverage_constraint_ids": list(reversed(constraint_ids)),
+            "acquisition_obligation_constraint_ids": acquisition_ids,
+            "coordinated_groups": [{
+                "member_constraint_ids": ["duty", "breach"],
+            }],
+            "queries": [{
+                "text": request,
+                "preserved_constraint_ids": constraint_ids,
+            }],
+        })
+
+    calls: list[dict] = []
+
+    def fail_then_recover(*_args, **kwargs):
+        calls.append(kwargs)
+        return response(
+            ["task", "duty", "subject"]
+            if len(calls) == 1
+            else ["task", "duty", "breach", "subject"]
+        )
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fail_then_recover)
+
+    result = expand.expand_query_practice_fast(request, 1)
+
+    assert result["acquisition_obligation_constraint_ids"] == [
+        "task",
+        "duty",
+        "breach",
+        "subject",
+    ]
+    assert len(calls) == 2
+    assert "acquisition obligations must retain" in calls[1][
+        "validation_feedback"
+    ]
+
+
+def test_acquisition_obligations_exclude_gemini_marked_contextual_constraints(
+    monkeypatch,
+) -> None:
+    request = "Teach calculus to a beginner in a concise video."
+    constraints = [
+        {
+            "constraint_id": constraint_id,
+            "kind": kind,
+            "source_phrase": phrase,
+            "requirement": requirement,
+        }
+        for constraint_id, kind, phrase, requirement in (
+            ("task", "task", "Teach", "Teach calculus"),
+            ("subject", "subject", "calculus", "Teach calculus"),
+            ("level", "scope", "beginner", "Target a beginner"),
+            ("format", "format", "concise video", "Use a concise video"),
+        )
+    ]
+    constraint_ids = [
+        constraint["constraint_id"] for constraint in constraints
+    ]
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: json.dumps({
+            "corrected": request,
+            "intent_constraints": constraints,
+            "joint_structures": [],
+            "summary_preserved_constraint_ids": constraint_ids,
+            "reverse_coverage_complete": True,
+            "reverse_coverage_constraint_ids": list(reversed(constraint_ids)),
+            "acquisition_obligation_constraint_ids": ["task", "subject"],
+            "coordinated_groups": [],
+            "queries": [{
+                "text": request,
+                "preserved_constraint_ids": constraint_ids,
+            }],
+        }),
+    )
+
+    result = expand.expand_query_practice_fast(request, 1)
+
+    contract = result["intent_contract"]
+    selected_keys = expand.trusted_intent_obligation_keys(
+        contract,
+        result["acquisition_obligation_constraint_ids"],
+    )
+    assert len(selected_keys) == 2
+    assert len(expand.trusted_intent_obligation_keys(contract)) == 4
 
 
 def test_practice_fast_order_mismatch_is_corrected_not_normalized(
@@ -502,3 +669,12 @@ def test_practice_fast_provider_status_mapping(
     assert failure.status_code == status
     assert failure.retryable is retryable
     assert failure.detail == "_StatusFailure"
+
+
+def test_practice_fast_rate_limit_preserves_provider_retry_after() -> None:
+    failure = expand._practice_fast_provider_error(
+        _RateLimitWithHeaders("12")
+    )
+
+    assert isinstance(failure, ProviderRateLimitError)
+    assert failure.retry_after_sec == pytest.approx(12.0)

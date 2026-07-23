@@ -436,7 +436,7 @@ LESSON_ORDER_CANDIDATE_LIMITS = {
     for mode, source_budget in GENERATION_SOURCE_BUDGETS.items()
 }
 SOURCE_ANALYSIS_MAX_ATTEMPTS = 2
-SELECTION_CONTRACT_VERSION = "quality_silence_v40"
+SELECTION_CONTRACT_VERSION = "quality_silence_v41"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -3355,6 +3355,8 @@ _LESSON_ORDER_SELECTION_FIELDS = frozenset({
     "_selection_intent_coverage",
     "_selection_directly_teaches_topic",
     "_selection_boundary_status",
+    "_selection_self_contained",
+    "_selection_is_standalone",
 })
 
 
@@ -8489,6 +8491,7 @@ async def create_material(
         )
 
     source_parts: list[str] = []
+    analysis_source_parts: list[str] = []
     source_type = "mixed"
     source_path = None
     file_content: bytes | None = None
@@ -8505,10 +8508,12 @@ async def create_material(
             raise HTTPException(status_code=400, detail=str(e)) from e
         if file_text.strip():
             source_parts.append(file_text)
+            analysis_source_parts.append(file_text)
         source_type = "file"
 
     if text and text.strip():
         source_parts.append(text)
+        analysis_source_parts.append(text)
         if source_type != "file":
             source_type = "text"
 
@@ -8517,8 +8522,11 @@ async def create_material(
         if source_type not in {"file", "text"}:
             source_type = "topic"
 
-    raw_text = "\n\n".join(source_parts)
-    raw_text = normalize_whitespace(raw_text)
+    structured_source_text = "\n\n".join(source_parts)
+    structured_analysis_text = (
+        "\n\n".join(analysis_source_parts) or structured_source_text
+    )
+    raw_text = normalize_whitespace(structured_source_text)
     if len(raw_text) < 3:
         raise HTTPException(status_code=400, detail="Input is too short")
 
@@ -8639,23 +8647,12 @@ async def create_material(
     try:
         with get_conn() as provider_conn:
             concept_limit = 6 if SERVERLESS_MODE else 12
-            concepts, objectives = material_intelligence_service.extract_concepts_and_objectives(
+            concepts, _objectives = material_intelligence_service.extract_concepts_and_objectives(
                 provider_conn,
-                raw_text,
+                structured_analysis_text,
                 subject_tag=subject_tag,
                 max_concepts=concept_limit,
             )
-            if objectives and len(concepts) < concept_limit and not any(
-                c["title"].lower() == "learning objectives" for c in concepts
-            ):
-                concepts.append(
-                    {
-                        "id": str(uuid.uuid4()),
-                        "title": "Learning Objectives",
-                        "keywords": [o[:40] for o in objectives][:5],
-                        "summary": objectives[0][:240],
-                    }
-                )
 
             concept_embeddings = []
             for concept in concepts:
@@ -9215,6 +9212,14 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                     ).strip() or None
                     fresh_retry_source_budget = source_generation_id is not None
                 else:
+                    if (
+                        str(terminal_retry_job.get("terminal_error_code") or "")
+                        in JOB_GLOBAL_PROVIDER_ERROR_CODES
+                    ):
+                        source_generation_id = str(
+                            terminal_retry_job.get("source_generation_id") or ""
+                        ).strip() or None
+                        fresh_retry_source_budget = source_generation_id is not None
                     fresh_root_recovery = True
         elif continuation_job is None:
             latest_compatible_job = _latest_compatible_generation_job(

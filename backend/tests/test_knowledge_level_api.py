@@ -102,6 +102,99 @@ class KnowledgeLevelApiTests(unittest.TestCase):
                 conn, "SELECT knowledge_level FROM materials WHERE id = ?", (material_id,))
         self.assertEqual(row["knowledge_level"], "advanced")
 
+    def test_create_text_material_preserves_structure_only_for_analysis(self) -> None:
+        source = (
+            "Cellular Respiration:\n"
+            "Glycolysis begins glucose breakdown.\n\n"
+            "ATP Yield:\n"
+            "Oxidative phosphorylation produces most ATP."
+        )
+        captured: list[str] = []
+
+        def capture_concepts(
+            conn,
+            text: str,
+            subject_tag=None,
+            max_concepts: int = 12,
+        ):
+            del conn, max_concepts
+            captured.append(text)
+            self.assertEqual(subject_tag, "Biology")
+            return _fake_concepts(None, text, subject_tag)
+
+        with (
+            mock.patch.object(
+                main_module.material_intelligence_service,
+                "extract_concepts_and_objectives",
+                side_effect=capture_concepts,
+            ),
+            mock.patch.object(main_module, "_enforce_rate_limit"),
+        ):
+            response = self.client.post(
+                "/api/material",
+                data={"text": source, "subject_tag": "Biology"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(captured, [source])
+        material_id = response.json()["material_id"]
+        with db_module.get_conn() as conn:
+            material = db_module.fetch_one(
+                conn,
+                "SELECT raw_text, source_type FROM materials WHERE id = ?",
+                (material_id,),
+            )
+            chunks = db_module.fetch_all(
+                conn,
+                "SELECT text FROM material_chunks WHERE material_id = ? "
+                "ORDER BY chunk_index",
+                (material_id,),
+            )
+        normalized = (
+            "Cellular Respiration: Glycolysis begins glucose breakdown. "
+            "ATP Yield: Oxidative phosphorylation produces most ATP. "
+            "Topic: Biology"
+        )
+        self.assertEqual(material["raw_text"], normalized)
+        self.assertEqual(material["source_type"], "text")
+        self.assertEqual([row["text"] for row in chunks], [normalized])
+
+    def test_material_objectives_do_not_create_a_generic_search_concept(self) -> None:
+        concept = {
+            "id": str(uuid.uuid4()),
+            "title": "Quicksort Partitioning",
+            "keywords": ["pivot", "partition"],
+            "summary": "Trace pivot partitioning before recursive calls.",
+        }
+        with (
+            mock.patch.object(
+                main_module.material_intelligence_service,
+                "extract_concepts_and_objectives",
+                return_value=(
+                    [concept],
+                    ["Trace one recursive quicksort example."],
+                ),
+            ),
+            mock.patch.object(main_module, "_enforce_rate_limit"),
+        ):
+            response = self.client.post(
+                "/api/material",
+                data={"text": "Quicksort partitions around a pivot before recursion."},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            [item["title"] for item in response.json()["extracted_concepts"]],
+            ["Quicksort Partitioning"],
+        )
+        with db_module.get_conn() as conn:
+            rows = db_module.fetch_all(
+                conn,
+                "SELECT title FROM concepts WHERE material_id = ?",
+                (response.json()["material_id"],),
+            )
+        self.assertEqual([row["title"] for row in rows], ["Quicksort Partitioning"])
+
     def test_create_material_default_beginner_and_invalid_422(self) -> None:
         ok = self.client.post("/api/material", data={"subject_tag": "physics"})
         self.assertEqual(ok.status_code, 200)

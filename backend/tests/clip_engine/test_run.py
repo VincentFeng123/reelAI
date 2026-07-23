@@ -10,6 +10,7 @@ from backend.app.clip_engine.errors import (
     ProviderAuthenticationError,
     ProviderBudgetExceededError,
     ProviderQuotaError,
+    ProviderRateLimitError,
     ProviderRequestError,
     ProviderResponseValidationError,
     ProviderTransientError,
@@ -353,7 +354,7 @@ def test_pro_boundary_fallback_preserves_canonical_video_cache_identity(monkeypa
 
 
 def test_direct_url_segment_cache_hit_skips_all_gemini_and_budget(monkeypatch):
-    assert run.segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v40"
+    assert run.segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v41"
     transcript = {
         "segments": [{
             "cue_id": "cached-cue",
@@ -543,10 +544,18 @@ def test_failed_selector_result_is_not_cached(monkeypatch):
     assert stored == []
 
 
-@pytest.mark.parametrize("provider_status", [429, 503])
+@pytest.mark.parametrize(
+    ("provider_status", "expected_error", "expected_message"),
+    [
+        (429, ProviderRateLimitError, "Gemini clip selection is rate limited."),
+        (503, ProviderTransientError, "Gemini is temporarily unavailable."),
+    ],
+)
 def test_selector_outage_preserves_transcript_success_and_typed_failure(
     monkeypatch,
     provider_status,
+    expected_error,
+    expected_message,
 ):
     transcript = {
         "segments": [{
@@ -576,7 +585,7 @@ def test_selector_outage_preserves_transcript_success_and_typed_failure(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
     )
 
-    with pytest.raises(ProviderTransientError) as exc_info:
+    with pytest.raises(expected_error) as exc_info:
         run.clip(
             "https://youtu.be/dQw4w9WgXcQ",
             "topic",
@@ -585,7 +594,7 @@ def test_selector_outage_preserves_transcript_success_and_typed_failure(
 
     assert exc_info.value.status_code == provider_status
     assert exc_info.value.operation == "segmentation"
-    assert str(exc_info.value) == "Gemini is temporarily unavailable."
+    assert str(exc_info.value) == expected_message
     assert context.counters()["usable_transcripts"] == 1
 
 

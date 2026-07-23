@@ -94,6 +94,51 @@ def test_gemini_structured_output_uses_pydantic_json_schema(monkeypatch) -> None
     assert configs[0].response_json_schema == StructuredPayload.model_json_schema()
 
 
+def test_gemini_key_attempt_limit_caps_physical_dispatch_and_rotates(
+    monkeypatch,
+) -> None:
+    _clear_text_provider_env(monkeypatch)
+    monkeypatch.setenv("GEMINI_API_KEY", "rate-limited-key")
+    monkeypatch.setenv("GEMINI_API_KEY_2", "healthy-key")
+    monkeypatch.setattr(llm_router, "_gemini_key_offset", 0)
+    dispatched_keys: list[str] = []
+    retry_attempts: list[int | None] = []
+
+    class Models:
+        def __init__(self, key: str):
+            self.key = key
+
+        async def generate_content(self, *args, **kwargs):
+            dispatched_keys.append(self.key)
+            if self.key == "rate-limited-key":
+                raise RuntimeError("429 rate limit")
+            return SimpleNamespace(text='{"ok":true}')
+
+    class Client:
+        def __init__(self, *, api_key, http_options):
+            retry_attempts.append(http_options.retry_options.attempts)
+            self.aio = SimpleNamespace(models=Models(api_key))
+
+    kwargs = {
+        "genai_module": SimpleNamespace(Client=Client),
+        "model": "gemini-test",
+        "system": "system",
+        "user": "user",
+        "temperature": 0.1,
+        "json_mode": True,
+        "max_output_tokens": 100,
+        "key_attempt_limit": 1,
+    }
+    with pytest.raises(RuntimeError, match="429"):
+        llm_router._gemini_chat(**kwargs)
+
+    assert dispatched_keys == ["rate-limited-key"]
+    assert llm_router._gemini_key_offset == 1
+    assert llm_router._gemini_chat(**kwargs) == '{"ok":true}'
+    assert dispatched_keys == ["rate-limited-key", "healthy-key"]
+    assert retry_attempts == [1, 1]
+
+
 def test_invalid_structured_cache_falls_back_to_valid_provider(monkeypatch) -> None:
     monkeypatch.setattr(llm_router, "_read_cache", lambda conn, key: '{"wrong":true}')
     writes = []

@@ -506,6 +506,7 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
              context: GenerationContext | None = None,
              cache_store: ProviderCacheStore | None = None,
              literal_topic: str | None = None,
+             source_context: str | None = None,
              use_query_planner: bool = True,
              query_plan: "SearchQueryPlan | None" = None,
              consumed_video_ids: list[str] | None = None,
@@ -529,6 +530,7 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
             context=context,
             cache_store=cache_store,
             literal_topic=literal_topic,
+            source_context=source_context,
             use_query_planner=use_query_planner,
             query_plan=query_plan,
             consumed_video_ids=consumed_video_ids,
@@ -789,6 +791,7 @@ def discover_practice_fast(
     context: GenerationContext | None = None,
     cache_store: ProviderCacheStore | None = None,
     literal_topic: str | None = None,
+    source_context: str | None = None,
     use_query_planner: bool = True,
     query_plan: "SearchQueryPlan | None" = None,
     consumed_video_ids: list[str] | None = None,
@@ -855,16 +858,13 @@ def discover_practice_fast(
         "provider_used": "literal_fallback",
     }
     if recovery_mode:
-        exact_request = (
-            " ".join(str(literal_topic or retrieval_query).split())
-            or retrieval_query
-        )
         expansion = expand.expand_query_practice_fast(
-            exact_request,
+            retrieval_query,
             query_count,
             level=None,
             should_cancel=should_cancel,
             context=context,
+            source_context=source_context,
             tried_queries=normalized_recovery_tried,
             recovery_reason=recovery_reason,
             rejected_video_ids=recovery_rejected_video_ids,
@@ -881,6 +881,7 @@ def discover_practice_fast(
             level=None,
             should_cancel=should_cancel,
             context=context,
+            source_context=source_context,
         )
         planned_queries = list(expansion.get("queries") or []) or [retrieval_query]
     for candidate in planned_queries:
@@ -1002,16 +1003,13 @@ def discover_practice_fast(
     ):
         recovery_capacity = context.budget.remaining("search")
         if recovery_capacity > 0:
-            exact_request = (
-                " ".join(str(literal_topic or retrieval_query).split())
-                or retrieval_query
-            )
             recovery_expansion = expand.expand_query_practice_fast(
-                exact_request,
+                retrieval_query,
                 recovery_capacity,
                 level=None,
                 should_cancel=should_cancel,
                 context=context,
+                source_context=source_context,
                 tried_queries=initial_queries,
                 recovery_reason=expand.RECOVERY_REASON_ZERO_SEARCH_RESULTS,
             )
@@ -1206,6 +1204,9 @@ def discover_practice_fast(
         "topic_terms": [retrieval_query],
         "provider_used": expansion.get("provider_used") or "literal_fallback",
         "intent_contract": expansion.get("intent_contract"),
+        "acquisition_obligation_constraint_ids": expansion.get(
+            "acquisition_obligation_constraint_ids"
+        ),
         "videos": videos,
         "credits_used": (
             int(initial.get("credits_used") or 0)

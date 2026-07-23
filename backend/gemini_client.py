@@ -46,6 +46,7 @@ class GeminiCallTelemetry:
     provider_error_type: Optional[str] = None
     provider_status_code: Optional[int] = None
     retryable: Optional[bool] = None
+    retry_after_sec: Optional[float] = None
     error_history: tuple[dict[str, object], ...] = ()
 
     def as_dict(self) -> dict:
@@ -370,6 +371,9 @@ def _call_telemetry(*, model: str, operation: str, prompt_version: str,
             _gemini_status_code(error) if error is not None else None
         ),
         retryable=retryable if error is not None else None,
+        retry_after_sec=(
+            _gemini_retry_after(error) if error is not None else None
+        ),
         error_history=tuple(dict(item) for item in error_history),
     )
 

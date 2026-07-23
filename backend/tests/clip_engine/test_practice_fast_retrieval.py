@@ -56,6 +56,10 @@ def _intent_expansion_json(
             "requirement": f"Teach {corrected}",
             "relationship_topology": "not_applicable",
         }],
+        "reverse_coverage_complete": True,
+        "reverse_coverage_constraint_ids": ["subject"],
+        "acquisition_obligation_constraint_ids": ["subject"],
+        "coordinated_groups": [],
         "queries": [
             {
                 "text": query,
@@ -88,17 +92,46 @@ def _expansion_payload_json(payload: dict) -> str:
             for constraint in completed.get("intent_constraints", [])
         ],
     )
+    constraint_ids = [
+        constraint["constraint_id"]
+        for constraint in completed.get("intent_constraints", [])
+    ]
+    completed.setdefault("reverse_coverage_complete", True)
+    completed.setdefault(
+        "reverse_coverage_constraint_ids",
+        list(reversed(constraint_ids)),
+    )
+    completed.setdefault(
+        "acquisition_obligation_constraint_ids",
+        constraint_ids,
+    )
+    completed.setdefault(
+        "coordinated_groups",
+        [
+            {
+                "member_constraint_ids": list(
+                    structure.get("member_constraint_ids") or []
+                )
+            }
+            for structure in completed.get("joint_structures", [])
+        ],
+    )
     return json.dumps(completed)
 
 
 def _without_intent_contract(result: dict) -> dict:
     public = dict(result)
     intent_contract = public.pop("intent_contract", None)
+    acquisition_ids = public.pop(
+        "acquisition_obligation_constraint_ids", None
+    )
     if public.get("provider_used") == "gemini":
         assert intent_contract["version"] == "expansion_intent_v2"
         assert intent_contract["request_intent"]["constraints"]
+        assert acquisition_ids
     else:
         assert intent_contract is None
+        assert acquisition_ids is None
     return public
 
 
@@ -132,6 +165,17 @@ def _selector_contract_payload(
         "intent_constraints": constraints,
         "joint_structures": list(joint_structures or []),
         "summary_preserved_constraint_ids": constraint_ids,
+        "reverse_coverage_complete": True,
+        "reverse_coverage_constraint_ids": list(reversed(constraint_ids)),
+        "acquisition_obligation_constraint_ids": constraint_ids,
+        "coordinated_groups": [
+            {
+                "member_constraint_ids": list(
+                    structure.get("member_constraint_ids") or []
+                )
+            }
+            for structure in (joint_structures or [])
+        ],
         "queries": [{
             "text": exact_request,
             "preserved_constraint_ids": constraint_ids,
@@ -241,7 +285,7 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
 def test_practice_fast_expansion_requests_focused_sources() -> None:
     prompt = " ".join(expand._PRACTICE_FAST_SYSTEM.casefold().split())
 
-    assert expand.PRACTICE_FAST_EXPAND_CACHE_VERSION == 13
+    assert expand.PRACTICE_FAST_EXPAND_CACHE_VERSION == 14
     assert expand.PRACTICE_FAST_EXPAND_OUTPUT_TOKENS == 2_048
     assert "one concise, standalone, intent-preserving learning summary" in prompt
     assert "must make sense without the original request" in prompt
@@ -259,6 +303,10 @@ def test_practice_fast_expansion_requests_focused_sources() -> None:
     ]
     assert "summary_preserved_constraint_ids" in expansion_schema["required"]
     assert "joint_structures" in expansion_schema["required"]
+    assert "reverse_coverage_complete" in expansion_schema["required"]
+    assert "reverse_coverage_constraint_ids" in expansion_schema["required"]
+    assert "acquisition_obligation_constraint_ids" in expansion_schema["required"]
+    assert "coordinated_groups" in expansion_schema["required"]
     assert "default" not in expansion_schema["properties"]["joint_structures"]
     constraint_schema = expansion_schema["$defs"][
         "_PracticeFastIntentConstraint"
@@ -276,6 +324,10 @@ def test_practice_fast_expansion_requests_focused_sources() -> None:
     assert "the first broad query must preserve every constraint" in prompt
     assert "every subject constraint plus one or more distinct" in prompt
     assert "collectively target every named facet or list member" in prompt
+    assert "from its final words back to its beginning" in prompt
+    assert "do not use the forward intent_constraints list" in prompt
+    assert "one coordinated_groups item" in prompt
+    assert "never use one umbrella member for a coordinated list" in prompt
     assert "subject means the governing named topic, law, concept, or object" in prompt
     assert "components and named list members under that governing topic are scope" in (
         prompt
@@ -320,6 +372,10 @@ def test_expansion_rejects_every_kind_topology_mismatch() -> None:
             }],
             "joint_structures": [],
             "summary_preserved_constraint_ids": ["sequence"],
+            "reverse_coverage_complete": True,
+            "reverse_coverage_constraint_ids": ["sequence"],
+            "acquisition_obligation_constraint_ids": ["sequence"],
+            "coordinated_groups": [],
             "queries": [{
                 "text": "alpha then beta lesson",
                 "preserved_constraint_ids": ["sequence"],
@@ -339,6 +395,10 @@ def test_expansion_rejects_every_kind_topology_mismatch() -> None:
             }],
             "joint_structures": [],
             "summary_preserved_constraint_ids": ["relation"],
+            "reverse_coverage_complete": True,
+            "reverse_coverage_constraint_ids": ["relation"],
+            "acquisition_obligation_constraint_ids": ["relation"],
+            "coordinated_groups": [],
             "queries": [{
                 "text": "alpha beta comparison",
                 "preserved_constraint_ids": ["relation"],
@@ -485,10 +545,11 @@ def test_expansion_accepts_selector_trusted_contract_in_one_call(
 
 
 @pytest.mark.parametrize(
-    ("topic", "constraints", "joint_structures"),
+    ("topic", "source_context", "constraints", "joint_structures"),
     [
         (
             "Explain Newton's second law F=ma with net force and acceleration.",
+            "Relate net force to acceleration and solve an incline problem.",
             [
                 ("subject", "subject", "Newton's second law F=ma"),
                 ("force", "scope", "net force"),
@@ -498,6 +559,7 @@ def test_expansion_accepts_selector_trusted_contract_in_one_call(
         ),
         (
             "Compare glycolysis with the Krebs cycle during cellular respiration.",
+            "Trace how carbon intermediates and ATP connect both stages.",
             [
                 ("subject", "subject", "cellular respiration"),
                 ("glycolysis", "scope", "glycolysis"),
@@ -515,6 +577,7 @@ def test_expansion_accepts_selector_trusted_contract_in_one_call(
         ),
         (
             "Derive the chain rule and solve one composite-function example.",
+            "Connect the derivative formula to one worked composite function.",
             [
                 ("subject", "subject", "chain rule"),
                 ("derive", "task", "Derive"),
@@ -524,6 +587,7 @@ def test_expansion_accepts_selector_trusted_contract_in_one_call(
         ),
         (
             "Explain quicksort partitioning and trace one recursive example.",
+            "Show the pivot invariant before tracing recursive subarrays.",
             [
                 ("subject", "subject", "quicksort"),
                 ("partition", "scope", "partitioning"),
@@ -533,6 +597,7 @@ def test_expansion_accepts_selector_trusted_contract_in_one_call(
         ),
         (
             "Apply negligence duty, breach, causation, and damages to one fact pattern.",
+            "Use one fact pattern to test every required negligence element.",
             [
                 ("subject", "subject", "negligence"),
                 ("duty", "scope", "duty"),
@@ -549,10 +614,16 @@ def test_expansion_accepts_selector_trusted_contract_in_one_call(
 def test_expansion_preserves_atomic_cross_domain_request_contracts(
     monkeypatch,
     topic,
+    source_context,
     constraints,
     joint_structures,
 ) -> None:
     constraint_ids = [constraint_id for constraint_id, _kind, _phrase in constraints]
+    coordinated_member_ids = [
+        constraint_id
+        for constraint_id, kind, _phrase in constraints
+        if kind not in {"subject", "relationship"}
+    ]
     payload = {
         "corrected": topic.rstrip("."),
         "intent_constraints": [
@@ -572,24 +643,39 @@ def test_expansion_preserves_atomic_cross_domain_request_contracts(
         ],
         "joint_structures": joint_structures,
         "summary_preserved_constraint_ids": constraint_ids,
+        "reverse_coverage_complete": True,
+        "reverse_coverage_constraint_ids": list(reversed(constraint_ids)),
+        "acquisition_obligation_constraint_ids": constraint_ids,
+        "coordinated_groups": (
+            [{"member_constraint_ids": coordinated_member_ids}]
+            if len(coordinated_member_ids) >= 2
+            else []
+        ),
         "queries": [{
             "text": topic.rstrip("."),
             "preserved_constraint_ids": constraint_ids,
         }],
     }
     calls = 0
+    captured_contexts: list[str | None] = []
 
-    def fake_raw(*_args, **_kwargs):
+    def fake_raw(*_args, **kwargs):
         nonlocal calls
         calls += 1
+        captured_contexts.append(kwargs.get("source_context"))
         return json.dumps(payload)
 
     monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
 
-    result = expand.expand_query_practice_fast(topic, 1)
+    result = expand.expand_query_practice_fast(
+        topic,
+        1,
+        source_context=source_context,
+    )
 
     contract = result["intent_contract"]
     assert calls == 1
+    assert captured_contexts == [source_context]
     assert contract["version"] == "expansion_intent_v2"
     assert contract["request_intent"]["exact_request"] == topic
     assert [
@@ -597,6 +683,12 @@ def test_expansion_preserves_atomic_cross_domain_request_contracts(
         for item in contract["request_intent"]["constraints"]
     ] == constraint_ids
     assert contract["request_intent"]["joint_structures"] == joint_structures
+    assert len(
+        expand.trusted_intent_obligation_keys(
+            contract,
+            result["acquisition_obligation_constraint_ids"],
+        )
+    ) == len(constraint_ids)
 
 
 @pytest.mark.parametrize(
@@ -1599,6 +1691,10 @@ def test_successful_expansion_dispatch_is_not_double_recorded(monkeypatch):
         "intent_constraints",
         "joint_structures",
         "summary_preserved_constraint_ids",
+        "reverse_coverage_complete",
+        "reverse_coverage_constraint_ids",
+        "acquisition_obligation_constraint_ids",
+        "coordinated_groups",
         "queries",
     }
     assert set(schema["required"]) == set(schema["properties"])
@@ -1655,6 +1751,9 @@ def test_zero_result_recovery_prompt_includes_exact_request_tried_queries_and_si
         return _Response()
 
     exact_request = "Newton's laws with free-body diagram problems"
+    source_context = (
+        "Relate net force to acceleration before solving an incline problem."
+    )
     tried_queries = ["Newton laws tutorial", "Newton laws explained"]
     monkeypatch.setattr(expand.config, "require_gemini_key", lambda: "gemini-test")
     monkeypatch.setattr(genai, "Client", lambda **_kwargs: _FakeGeminiClient(succeed))
@@ -1666,6 +1765,7 @@ def test_zero_result_recovery_prompt_includes_exact_request_tried_queries_and_si
             model=expand.PRACTICE_FAST_EXPAND_MODEL,
             level=None,
             should_cancel=None,
+            source_context=source_context,
             tried_queries=tried_queries,
             recovery_reason=expand.RECOVERY_REASON_ZERO_SEARCH_RESULTS,
         )
@@ -1673,9 +1773,47 @@ def test_zero_result_recovery_prompt_includes_exact_request_tried_queries_and_si
 
     prompt = str(seen["contents"])
     assert exact_request in prompt
+    assert source_context in prompt
+    assert prompt.count("SOURCE_GROUNDED_CONTEXT") == 1
+    assert "It is not a second user request" in prompt
+    assert "Every constraint and exact-request identity" in prompt
     assert "ZERO_SEARCH_RESULT_RECOVERY" in prompt
     assert "zero eligible YouTube videos" in prompt
     assert json.dumps(tried_queries, ensure_ascii=True) in prompt
+
+
+def test_source_context_cache_identity_is_normalized_and_isolated() -> None:
+    topic = "Cellular respiration"
+    no_context = expand._expansion_cache_key(topic, 3, None)
+    blank_context = expand._expansion_cache_key(
+        topic,
+        3,
+        None,
+        source_context=" \n ",
+    )
+    context_a = expand._expansion_cache_key(
+        topic,
+        3,
+        None,
+        source_context="Trace glycolysis into ATP production.",
+    )
+    normalized_context_a = expand._expansion_cache_key(
+        topic,
+        3,
+        None,
+        source_context="  Trace glycolysis\ninto ATP production.  ",
+    )
+    context_b = expand._expansion_cache_key(
+        topic,
+        3,
+        None,
+        source_context="Compare aerobic and anaerobic respiration.",
+    )
+
+    assert no_context == blank_context
+    assert context_a == normalized_context_a
+    assert context_a != no_context
+    assert context_a != context_b
 
 
 def test_zero_clip_recovery_has_distinct_signal_rejected_ids_and_cache_key(
@@ -1918,6 +2056,7 @@ def test_practice_fast_expansion_cache_outlives_segment_ttl_and_expires(monkeypa
             "corrected": "Physics",
             "queries": ["physics lecture", "mechanics", "waves"],
             "intent_contract": _intent_contract(),
+            "acquisition_obligation_constraint_ids": ["subject"],
         }),
         "created_at": (
             datetime.now(timezone.utc)
@@ -2010,6 +2149,7 @@ def test_current_expansion_cache_rejects_missing_or_malformed_intent_contract(
             "corrected": "Physics",
             "queries": ["physics lecture"],
             "intent_contract": intent_contract,
+            "acquisition_obligation_constraint_ids": ["subject"],
         }),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -3289,20 +3429,24 @@ def test_zero_result_without_cursor_uses_one_ai_recovery_until_inventory_exists(
     monkeypatch,
 ) -> None:
     exact_request = "Teach Newton's laws with progressively harder problems"
+    broad_literal = "Complete introductory mechanics course"
+    source_context = (
+        "Progress from balanced forces to free-body diagram calculations."
+    )
     initial_query = "Newton laws tutorial"
     recovery_queries = [
         "Newton laws balanced forces worked problems",
         "Newton laws free body diagram problem progression",
     ]
     context = GenerationContext("slow")
-    expansion_calls: list[
-        tuple[str, int, list[str], str | None, list[str]]
-    ] = []
+    expansion_calls: list[tuple[str, int, list[str], str | None]] = []
     search_calls: list[str] = []
 
     def fake_expand(request, count, **kwargs):
         tried_queries = list(kwargs.get("tried_queries") or [])
-        expansion_calls.append((request, count, tried_queries))
+        expansion_calls.append(
+            (request, count, tried_queries, kwargs.get("source_context"))
+        )
         if not tried_queries:
             return {
                 "corrected": exact_request,
@@ -3344,13 +3488,15 @@ def test_zero_result_without_cursor_uses_one_ai_recovery_until_inventory_exists(
         exact_request,
         limit=1,
         breadth=1,
+        literal_topic=broad_literal,
+        source_context=source_context,
         retrieval_profile="deep",
         context=context,
     )
 
     assert expansion_calls == [
-        (exact_request, 1, []),
-        (exact_request, 4, [initial_query]),
+        (exact_request, 1, [], source_context),
+        (exact_request, 4, [initial_query], source_context),
     ]
     assert search_calls == [initial_query, recovery_queries[0]]
     assert result["queries"] == [initial_query, recovery_queries[0]]
@@ -3526,6 +3672,10 @@ def test_explicit_clip_rejection_recovery_searches_only_novel_ai_queries(
     monkeypatch,
 ) -> None:
     exact_request = "Explain series circuit current and voltage"
+    broad_literal = "Complete introductory electricity and magnetism course"
+    source_context = (
+        "Use charge conservation to connect current and voltage drops."
+    )
     tried_queries = [
         "series circuit current explained",
         "series circuit voltage tutorial",
@@ -3538,7 +3688,7 @@ def test_explicit_clip_rejection_recovery_searches_only_novel_ai_queries(
     context = GenerationContext("slow")
     for _ in range(3):
         context.reserve("search")
-    expansion_calls: list[tuple[str, int, list[str]]] = []
+    expansion_calls: list[tuple[object, ...]] = []
     search_calls: list[list[str]] = []
 
     def fake_expand(topic, count, **kwargs):
@@ -3549,6 +3699,7 @@ def test_explicit_clip_rejection_recovery_searches_only_novel_ai_queries(
                 list(kwargs.get("tried_queries") or []),
                 kwargs.get("recovery_reason"),
                 list(kwargs.get("rejected_video_ids") or []),
+                kwargs.get("source_context"),
             )
         )
         return {
@@ -3591,7 +3742,8 @@ def test_explicit_clip_rejection_recovery_searches_only_novel_ai_queries(
         exact_request,
         limit=2,
         breadth=8,
-        literal_topic=exact_request,
+        literal_topic=broad_literal,
+        source_context=source_context,
         retrieval_profile="bootstrap",
         context=context,
         recovery_tried_queries=tried_queries,
@@ -3605,6 +3757,7 @@ def test_explicit_clip_rejection_recovery_searches_only_novel_ai_queries(
         tried_queries,
         expand.RECOVERY_REASON_ZERO_VALID_CLIPS,
         ["rejected-a", "rejected-b"],
+        source_context,
     )]
     assert search_calls == [novel_queries]
     assert result["queries"] == novel_queries

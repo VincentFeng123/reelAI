@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ... import gemini_client
 from ...concept_tokens import semantic_key, semantic_tokens
+from ...intent_obligations import intent_obligation_key
 from . import config
 from .cancellation import raise_if_cancelled, run_cancellable
 from .errors import (
@@ -58,7 +59,7 @@ PRACTICE_FAST_EXPAND_TIMEOUT_MS = 10_000
 PRACTICE_FAST_EXPAND_OUTPUT_TOKENS = 2_048
 PRACTICE_FAST_EXPAND_FALLBACK_OUTPUT_TOKENS = 4_096
 PRACTICE_FAST_EXPAND_ATTEMPTS = 3
-PRACTICE_FAST_EXPAND_CACHE_VERSION = 13
+PRACTICE_FAST_EXPAND_CACHE_VERSION = 14
 PRACTICE_FAST_INTENT_CONTRACT_VERSION = "expansion_intent_v2"
 # An expansion can be nearly one segment-cache lifetime old when it discovers a
 # newly analyzed source. Keeping it for two lifetimes guarantees that source's
@@ -66,6 +67,7 @@ PRACTICE_FAST_INTENT_CONTRACT_VERSION = "expansion_intent_v2"
 PRACTICE_FAST_EXPAND_CACHE_TTL_SEC = 2 * SEGMENT_CACHE_TTL_SEC
 RECOVERY_REASON_ZERO_SEARCH_RESULTS = "zero_search_results"
 RECOVERY_REASON_ZERO_VALID_CLIPS = "zero_valid_clips"
+PRACTICE_FAST_SOURCE_CONTEXT_MAX_CHARS = 600
 
 
 def _normalized_recovery_reason(value: object) -> str:
@@ -83,6 +85,17 @@ def _normalized_rejected_video_ids(values: Sequence[str]) -> list[str]:
         for raw_value in values
         if (video_id := " ".join(str(raw_value or "").split()))
     })
+
+
+def _normalized_source_context(value: object) -> str:
+    normalized = " ".join(str(value or "").split())
+    if len(normalized) <= PRACTICE_FAST_SOURCE_CONTEXT_MAX_CHARS:
+        return normalized
+    return (
+        normalized[:PRACTICE_FAST_SOURCE_CONTEXT_MAX_CHARS]
+        .rsplit(" ", 1)[0]
+        .strip()
+    )
 
 
 def _require_source_occurrence_schema(schema: dict[str, object]) -> None:
@@ -190,6 +203,27 @@ class _PracticeFastJointStructure(BaseModel):
         return self
 
 
+class _PracticeFastCoordinatedGroup(BaseModel):
+    """Gemini's explicit audit that coordinated members stayed atomic."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    member_constraint_ids: list[str] = Field(
+        min_length=2,
+        max_length=16,
+        description=(
+            "Distinct atomic constraint IDs for every explicitly coordinated "
+            "task, facet, list member, side, or stage."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _unique_members(self):
+        if len(self.member_constraint_ids) != len(set(self.member_constraint_ids)):
+            raise ValueError("coordinated group member ids must be unique")
+        return self
+
+
 class _PracticeFastQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -227,6 +261,36 @@ class _PracticeFastExpansion(BaseModel):
             "exactly once."
         ),
     )
+    reverse_coverage_complete: Literal[True] = Field(
+        description=(
+            "True only after independently scanning the exact request from end "
+            "to beginning and mapping every explicit requirement."
+        ),
+    )
+    reverse_coverage_constraint_ids: list[str] = Field(
+        min_length=1,
+        max_length=16,
+        description=(
+            "Every atomic constraint found by the reverse request audit, each "
+            "listed exactly once."
+        ),
+    )
+    acquisition_obligation_constraint_ids: list[str] = Field(
+        min_length=1,
+        max_length=16,
+        description=(
+            "Every independently teachable request obligation acquisition "
+            "should seek. Exclude contextual level or style constraints that a "
+            "clip objective cannot fulfill."
+        ),
+    )
+    coordinated_groups: list[_PracticeFastCoordinatedGroup] = Field(
+        max_length=8,
+        description=(
+            "One group for each explicitly coordinated set; empty only when the "
+            "request has no coordinated tasks, facets, list members, sides, or stages."
+        ),
+    )
     queries: list[_PracticeFastQuery]
 
     @model_validator(mode="after")
@@ -249,6 +313,24 @@ class _PracticeFastExpansion(BaseModel):
         if len(set(ids)) != len(ids):
             raise ValueError("intent constraint ids must be unique")
         id_set = set(ids)
+        reverse_ids = list(self.reverse_coverage_constraint_ids)
+        if (
+            len(reverse_ids) != len(set(reverse_ids))
+            or set(reverse_ids) != id_set
+        ):
+            raise ValueError(
+                "reverse coverage must reference every intent constraint "
+                "exactly once"
+            )
+        acquisition_ids = list(self.acquisition_obligation_constraint_ids)
+        if (
+            len(acquisition_ids) != len(set(acquisition_ids))
+            or not set(acquisition_ids).issubset(id_set)
+        ):
+            raise ValueError(
+                "acquisition obligations must be unique declared intent "
+                "constraint ids"
+            )
         if any(
             structure.relation_constraint_id not in id_set
             or any(
@@ -267,6 +349,60 @@ class _PracticeFastExpansion(BaseModel):
         ]
         if len(structure_keys) != len(set(structure_keys)):
             raise ValueError("joint structures must be unique")
+        coordinated_keys: list[tuple[str, ...]] = []
+        for group in self.coordinated_groups:
+            member_ids = tuple(group.member_constraint_ids)
+            if (
+                any(member_id not in id_set for member_id in member_ids)
+                or any(
+                    next(
+                        constraint
+                        for constraint in self.intent_constraints
+                        if constraint.constraint_id == member_id
+                    ).kind
+                    == "relationship"
+                    for member_id in member_ids
+                )
+            ):
+                raise ValueError(
+                    "coordinated groups must reference declared atomic "
+                    "non-relationship constraints"
+                )
+            coordinated_keys.append(member_ids)
+        if len(coordinated_keys) != len(set(coordinated_keys)):
+            raise ValueError("coordinated groups must be unique")
+        if any(
+            tuple(structure.member_constraint_ids) not in coordinated_keys
+            for structure in self.joint_structures
+        ):
+            raise ValueError(
+                "every joint structure must retain its atomic members in a "
+                "coordinated group"
+            )
+        required_acquisition_ids = {
+            constraint.constraint_id
+            for constraint in self.intent_constraints
+            if constraint.kind in {
+                "subject",
+                "task",
+                "relationship",
+                "outcome",
+            }
+        }
+        required_acquisition_ids.update(
+            member_id
+            for group in self.coordinated_groups
+            for member_id in group.member_constraint_ids
+        )
+        required_acquisition_ids.update(
+            structure.relation_constraint_id
+            for structure in self.joint_structures
+        )
+        if not required_acquisition_ids.issubset(set(acquisition_ids)):
+            raise ValueError(
+                "acquisition obligations must retain every teachable task, "
+                "relationship, outcome, subject, and coordinated member"
+            )
         return self
 
 
@@ -336,6 +472,68 @@ def _validated_selector_intent_contract(
     }
 
 
+def trusted_intent_obligation_keys(
+    raw_contract: object,
+    constraint_ids: Sequence[str] | None = None,
+) -> set[str]:
+    """Derive durable obligation identities from a selector-trusted contract."""
+    if not isinstance(raw_contract, dict):
+        return set()
+    from ...pipeline.gemini_segment import (
+        _canonical_intent_constraint_sources,
+        _trusted_request_intent_from_settings,
+    )
+
+    trusted = _trusted_request_intent_from_settings({
+        "_segment_intent_contract": raw_contract,
+    })
+    if trusted is None:
+        return set()
+    known_ids = {
+        str(constraint.constraint_id) for constraint in trusted.constraints
+    }
+    if constraint_ids is None:
+        selected_ids = known_ids
+    else:
+        normalized_ids = [
+            " ".join(str(value or "").split())
+            for value in constraint_ids
+            if " ".join(str(value or "").split())
+        ]
+        if (
+            len(normalized_ids) != len(set(normalized_ids))
+            or not set(normalized_ids).issubset(known_ids)
+        ):
+            return set()
+        selected_ids = set(normalized_ids)
+        required_ids = {
+            str(constraint.constraint_id)
+            for constraint in trusted.constraints
+            if constraint.kind in {
+                "subject",
+                "task",
+                "relationship",
+                "outcome",
+            }
+        }
+        if not required_ids.issubset(selected_ids):
+            return set()
+    canonical_sources = _canonical_intent_constraint_sources(
+        trusted.exact_request,
+        trusted.constraints,
+    )
+    return {
+        key
+        for constraint in trusted.constraints
+        if str(constraint.constraint_id) in selected_ids
+        if (
+            key := intent_obligation_key(
+                *canonical_sources[str(constraint.constraint_id)]
+            )
+        )
+    }
+
+
 _PRACTICE_FAST_SYSTEM = """You compress a user's learning request and expand it into a diverse set of
 YouTube search queries that maximize topical coverage.
 
@@ -382,18 +580,37 @@ Do this:
    constraint ID that corrected preserves. corrected must preserve all of them. List each ID
    exactly once, with no omissions, duplicates, or unknown IDs; if any requirement is absent,
    revise corrected before returning it.
-9. The first broad query must preserve every constraint. Every later focused query must preserve
+9. Independently re-read the exact request from its final words back to its beginning. Do not use
+   the forward intent_constraints list as the source of this audit. Find every explicit task,
+   facet, named list member, relationship, requested outcome, format, scope qualifier, and teaching
+   order. Put the corresponding atomic constraint IDs in reverse_coverage_constraint_ids exactly
+   once and set reverse_coverage_complete=true only after every discovered requirement maps to one.
+   If the reverse audit finds an omission or a combined constraint, repair intent_constraints first.
+10. For every explicit coordination of two or more tasks, facets, named list members, comparison
+   sides, or ordered stages, return one coordinated_groups item containing a distinct constraint ID
+   for every member. Never use one umbrella member for a coordinated list. Include the member group
+   used by every joint_structure; return coordinated_groups=[] only when there is no explicit
+   coordination.
+11. Return acquisition_obligation_constraint_ids for every independently teachable request
+   obligation that source acquisition should seek. It must include every subject, task,
+   relationship, outcome, and coordinated_groups member. Include a scope or format when a clip can
+   substantively fulfill it (for example a named facet, unit explanation, comparison side, worked
+   example, or requested problem type). Exclude purely contextual viewer level, pacing, tone, or
+   source-format preferences that no clip objective can fulfill.
+12. The first broad query must preserve every constraint. Every later focused query must preserve
    every subject constraint plus one or more distinct task, relationship, scope, format, or outcome
    constraints. Collectively target every named facet or list member; when the request says each,
    every, or all, give distinct members focused coverage where N permits.
-10. For every query, return exactly the IDs of the constraints it preserves. Synonyms and natural
+13. For every query, return exactly the IDs of the constraints it preserves. Synonyms and natural
    YouTube wording are welcome, but focused queries must not lose the governing subject or drift
    into an adjacent field.
 
 Return only the requested JSON object with corrected, intent_constraints, joint_structures,
-summary_preserved_constraint_ids, and queries. corrected is the downstream learning intent; keep
-it separate from the retrieval queries. Return N optimized search queries; do not automatically
-spend one query on the raw literal wording."""
+summary_preserved_constraint_ids, reverse_coverage_complete,
+reverse_coverage_constraint_ids, acquisition_obligation_constraint_ids,
+coordinated_groups, and queries. corrected is the downstream learning intent; keep it separate
+from the retrieval queries. Return N optimized search queries; do not automatically spend one
+query on the raw literal wording."""
 
 
 def literal_fallback(topic: str, n: int) -> dict:
@@ -410,6 +627,7 @@ def _expansion_cache_key(
     n: int,
     level: str | None,
     *,
+    source_context: str | None = None,
     tried_queries: Sequence[str] = (),
     recovery_reason: str | None = None,
     rejected_video_ids: Sequence[str] = (),
@@ -423,6 +641,9 @@ def _expansion_cache_key(
         "prompt_sha256": hashlib.sha256(_PRACTICE_FAST_SYSTEM.encode("utf-8")).hexdigest(),
         "schema": _PracticeFastExpansion.model_json_schema(),
     }
+    normalized_source_context = _normalized_source_context(source_context)
+    if normalized_source_context:
+        contract["source_context"] = normalized_source_context
     normalized_tried = _normalize(list(tried_queries), len(tried_queries))
     if normalized_tried:
         # A recovery must not reuse the healthy-path expansion or another
@@ -499,11 +720,28 @@ def _read_cached_expansion(cache_key: str, count: int) -> dict | None:
         ).model_dump(mode="json")
     except (TypeError, ValueError):
         return None
+    raw_acquisition_ids = payload.get("acquisition_obligation_constraint_ids")
+    if not isinstance(raw_acquisition_ids, list):
+        return None
+    acquisition_ids = [
+        " ".join(str(value or "").split())
+        for value in raw_acquisition_ids
+        if " ".join(str(value or "").split())
+    ]
+    if (
+        len(acquisition_ids) != len(raw_acquisition_ids)
+        or not trusted_intent_obligation_keys(
+            intent_contract,
+            acquisition_ids,
+        )
+    ):
+        return None
     return {
         "corrected": corrected,
         "queries": queries,
         "provider_used": "gemini",
         "intent_contract": intent_contract,
+        "acquisition_obligation_constraint_ids": acquisition_ids,
     }
 
 
@@ -521,6 +759,9 @@ def _write_cached_expansion(cache_key: str, result: dict) -> None:
                             "corrected": result["corrected"],
                             "queries": result["queries"],
                             "intent_contract": result["intent_contract"],
+                            "acquisition_obligation_constraint_ids": result[
+                                "acquisition_obligation_constraint_ids"
+                            ],
                         }
                     ),
                     "created_at": now_iso(),
@@ -778,6 +1019,7 @@ async def _practice_fast_gemini_raw_async(
     level: str | None,
     should_cancel: Callable[[], bool] | None,
     context: "GenerationContext | None" = None,
+    source_context: str | None = None,
     tried_queries: Sequence[str] = (),
     recovery_reason: str | None = None,
     rejected_video_ids: Sequence[str] = (),
@@ -801,8 +1043,25 @@ async def _practice_fast_gemini_raw_async(
     user = (
         f"User topic: {topic!r}\nN = {max(1, int(n))}{level_line}\n"
         "Return corrected, intent_constraints, joint_structures, "
-        "summary_preserved_constraint_ids, and queries as JSON."
+        "summary_preserved_constraint_ids, reverse_coverage_complete, "
+        "reverse_coverage_constraint_ids, "
+        "acquisition_obligation_constraint_ids, coordinated_groups, and "
+        "queries as JSON."
     )
+    normalized_source_context = _normalized_source_context(source_context)
+    if normalized_source_context:
+        user += (
+            "\nSOURCE_GROUNDED_CONTEXT (backend supplied): "
+            + json.dumps(normalized_source_context, ensure_ascii=True)
+            + "\nUse this context to disambiguate the User topic and make "
+            "corrected a concise, concrete learning intent that carries its "
+            "relevant process and learning outcome into downstream clip "
+            "selection. It is not a second user request: do not create intent "
+            "constraints, source_occurrence text, or mandatory scope from "
+            "context alone. Every constraint and exact-request identity must "
+            "still come from User topic. Queries may use context terminology "
+            "only when it remains consistent with User topic."
+        )
     normalized_tried = _normalize(list(tried_queries), len(tried_queries))
     if normalized_tried:
         normalized_reason = _normalized_recovery_reason(recovery_reason)
@@ -935,6 +1194,7 @@ def _practice_fast_gemini_raw(
     level: str | None = None,
     should_cancel: Callable[[], bool] | None = None,
     context: "GenerationContext | None" = None,
+    source_context: str | None = None,
     tried_queries: Sequence[str] = (),
     recovery_reason: str | None = None,
     rejected_video_ids: Sequence[str] = (),
@@ -948,6 +1208,7 @@ def _practice_fast_gemini_raw(
             level=level,
             should_cancel=should_cancel,
             context=context,
+            source_context=source_context,
             tried_queries=tried_queries,
             recovery_reason=recovery_reason,
             rejected_video_ids=rejected_video_ids,
@@ -1026,6 +1287,7 @@ def _practice_fast_failure_log_summary(exc: Exception) -> str:
 def _practice_fast_provider_error(exc: Exception) -> ProviderError:
     """Preserve typed failures and classify raw Gemini expansion failures."""
     status = gemini_client._gemini_status_code(exc)
+    retry_after_sec = gemini_client._gemini_retry_after(exc)
     if isinstance(exc, ProviderError) and (
         status is None or isinstance(exc, ProviderResponseValidationError)
     ):
@@ -1048,7 +1310,11 @@ def _practice_fast_provider_error(exc: Exception) -> ProviderError:
             "The configured Gemini expansion model is unavailable.", **kwargs
         )
     if status == 429:
-        return ProviderRateLimitError("Gemini expansion is rate limited.", **kwargs)
+        return ProviderRateLimitError(
+            "Gemini expansion is rate limited.",
+            retry_after_sec=retry_after_sec,
+            **kwargs,
+        )
     if status in {408, 499} or (status is not None and 500 <= status <= 599):
         return ProviderTransientError(
             "Gemini expansion is temporarily unavailable.", **kwargs
@@ -1071,6 +1337,7 @@ def expand_query_practice_fast(
     should_cancel: Callable[[], bool] | None = None,
     *,
     context: "GenerationContext | None" = None,
+    source_context: str | None = None,
     tried_queries: Sequence[str] = (),
     recovery_reason: str | None = None,
     rejected_video_ids: Sequence[str] = (),
@@ -1084,6 +1351,7 @@ def expand_query_practice_fast(
     count = max(0, int(n))
     if not topic or count == 0:
         return literal_fallback(topic, count)
+    normalized_source_context = _normalized_source_context(source_context)
     normalized_tried = _normalize(list(tried_queries), len(tried_queries))
     tried_keys = {_key(query) for query in normalized_tried}
     recovering_zero_results = bool(normalized_tried)
@@ -1093,6 +1361,7 @@ def expand_query_practice_fast(
             topic,
             count,
             level,
+            source_context=normalized_source_context,
             tried_queries=normalized_tried,
             recovery_reason=recovery_reason,
             rejected_video_ids=rejected_video_ids,
@@ -1164,6 +1433,8 @@ def expand_query_practice_fast(
                 }
                 if context is not None:
                     kwargs["context"] = context
+                if normalized_source_context:
+                    kwargs["source_context"] = normalized_source_context
                 if recovering_zero_results:
                     kwargs["tried_queries"] = normalized_tried
                     kwargs["recovery_reason"] = _normalized_recovery_reason(
@@ -1217,6 +1488,9 @@ def expand_query_practice_fast(
                     "queries": queries,
                     "provider_used": "gemini",
                     "intent_contract": intent_contract,
+                    "acquisition_obligation_constraint_ids": list(
+                        parsed.acquisition_obligation_constraint_ids
+                    ),
                 }
                 if cache_key:
                     _write_cached_expansion(cache_key, result)
@@ -1229,12 +1503,19 @@ def expand_query_practice_fast(
                 raise_if_cancelled(should_cancel)
                 last_failure = exc
                 validation_feedback = _practice_fast_validation_feedback(exc)
+                provider_status = gemini_client._gemini_status_code(exc)
                 errors.append(
                     f"{model} attempt {attempt + 1}: "
                     f"{_practice_fast_failure_log_summary(exc)}"
                 )
+                # A provider-wide quota window applies to every Gemini model.
+                # Model fallback inside the same durable attempt only multiplies
+                # identical 429s and consumes the bounded job-attempt ceiling
+                # before delayed recovery can run.
+                if provider_status == 429:
+                    break
                 if (
-                    gemini_client._gemini_status_code(exc) == 404
+                    provider_status == 404
                     and model == PRACTICE_FAST_EXPAND_MODEL
                     and PRACTICE_FAST_EXPAND_FALLBACK_MODEL != model
                 ):

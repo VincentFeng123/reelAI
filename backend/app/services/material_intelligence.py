@@ -14,7 +14,8 @@ from .text_utils import normalize_whitespace
 
 logger = logging.getLogger(__name__)
 
-MATERIAL_INTELLIGENCE_PROMPT_VERSION = "specific-processes-v2"
+MATERIAL_INTELLIGENCE_PROMPT_VERSION = "specific-processes-v3"
+MATERIAL_INTELLIGENCE_MAX_ATTEMPTS = 3
 _UMBRELLA_CONCEPT_TITLES = {
     "biology",
     "chemistry",
@@ -262,22 +263,40 @@ class MaterialIntelligenceService:
         cached = fetch_one(conn, "SELECT response_json FROM llm_cache WHERE cache_key = ?", (cache_key,))
         if cached:
             try:
-                return json.loads(cached["response_json"])
-            except json.JSONDecodeError:
+                cached_payload = json.loads(cached["response_json"])
+            except (TypeError, json.JSONDecodeError):
                 pass
+            else:
+                if self._payload_is_usable(cached_payload):
+                    return cached_payload
 
         payload = self._generate_payload(text=text, subject_tag=subject_tag, max_concepts=max_concepts)
-        upsert(
-            conn,
-            "llm_cache",
-            {
-                "cache_key": cache_key,
-                "response_json": dumps_json(payload),
-                "created_at": now_iso(),
-            },
-            pk="cache_key",
-        )
+        if self._payload_is_usable(payload):
+            upsert(
+                conn,
+                "llm_cache",
+                {
+                    "cache_key": cache_key,
+                    "response_json": dumps_json(payload),
+                    "created_at": now_iso(),
+                },
+                pk="cache_key",
+            )
         return payload
+
+    def _payload_is_usable(self, value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        concepts = value.get("concepts")
+        return bool(
+            isinstance(concepts, list)
+            and any(
+                isinstance(item, dict)
+                and str(item.get("title") or "").strip()
+                and str(item.get("summary") or "").strip()
+                for item in concepts
+            )
+        )
 
     def _generate_payload(self, text: str, subject_tag: str | None, max_concepts: int) -> dict[str, Any]:
         if not self.llm_available:
@@ -300,7 +319,8 @@ class MaterialIntelligenceService:
             "- Do not use broad umbrella titles such as Energy or Biology when the source names a more precise process such as Photosynthesis, Cellular Respiration, or DNA Replication.\n"
             "- Order concepts by direct support and importance in the supplied material.\n"
             "- keywords should be 3 to 8 specific terms/phrases.\n"
-            "- summary should be 1-2 sentences and <= 240 characters.\n"
+            "- summary should be a source-grounded retrieval brief of 1-2 sentences and <= 240 characters.\n"
+            "- Each concept summary must include the matching learning outcome for that concept.\n"
             "- objectives: array of concise learning outcomes.\n"
             "- priority_summary: 1 concise paragraph with the most important part to learn first.\n"
             "- priority_keywords: 4-8 terms useful for retrieving the most relevant explanations.\n"
@@ -308,18 +328,28 @@ class MaterialIntelligenceService:
             f"{excerpt}"
         )
 
-        try:
-            content = llm_router.chat_completion(
-                system=system_prompt,
-                user=user_prompt,
-                temperature=0.2,
-                json_mode=True,
-            )
-            if not content:
-                return {}
-            return json.loads(content)
-        except Exception:
-            return {}
+        for attempt in range(MATERIAL_INTELLIGENCE_MAX_ATTEMPTS):
+            try:
+                content = llm_router.chat_completion(
+                    system=system_prompt,
+                    user=user_prompt,
+                    temperature=0.2,
+                    json_mode=True,
+                    gemini_model=self.model,
+                    gemini_key_attempt_limit=1,
+                )
+                payload = json.loads(content) if content else {}
+            except Exception as exc:
+                logger.warning(
+                    "material intelligence attempt failed attempt=%d/%d error_type=%s",
+                    attempt + 1,
+                    MATERIAL_INTELLIGENCE_MAX_ATTEMPTS,
+                    type(exc).__name__,
+                )
+                continue
+            if self._payload_is_usable(payload):
+                return payload
+        return {}
 
     def _sanitize_concepts(self, value: Any, max_concepts: int) -> list[dict[str, Any]]:
         if not isinstance(value, list):
