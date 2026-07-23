@@ -1244,8 +1244,10 @@ class ReelService:
     # v45: retain candidate, chain, position, and prerequisite organizer metadata.
     # v46: retain the trusted narrow clip concept for organizer input.
     # v47: treat legacy level-mismatch inventory as a soft ordering candidate.
+    # v48: retain organizer dependency metadata in cached rows.
+    # v49: retain boundary evidence and rank coarse fallback cuts last.
     # The separate contract key below invalidates prior inventory under v40.
-    RANKED_FEED_CACHE_VERSION = 48
+    RANKED_FEED_CACHE_VERSION = 49
     RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v40"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
@@ -2430,6 +2432,9 @@ class ReelService:
         t_end = float(getattr(reel_obj, "t_end", 0.0) or 0.0)
         raw_informativeness = getattr(reel_obj, "informativeness", None)
         raw_difficulty = getattr(reel_obj, "difficulty", None)
+        boundary_status = str(
+            getattr(reel_obj, "boundary_status", "") or ""
+        ).strip().lower()
         persisted_concept_id = str(
             getattr(reel_obj, "concept_id", "") or concept["id"]
         )
@@ -2478,6 +2483,8 @@ class ReelService:
             "selection_contract_version": (
                 getattr(reel_obj, "selection_contract_version", None)
             ),
+            "boundary_status": boundary_status,
+            "_selection_boundary_status": boundary_status,
             "boundary_confidence": getattr(
                 reel_obj, "boundary_confidence", None
             ),
@@ -6092,13 +6099,20 @@ class ReelService:
         cls,
         items: list[dict[str, Any]],
         knowledge_level: str | None,
+        *,
+        difficulty_target: float | None = None,
     ) -> list[dict[str, Any]]:
         """Order every valid clip by proximity to the requested difficulty."""
-        target_stage = {
-            "beginner": 0,
-            "intermediate": 1,
-            "advanced": 2,
-        }.get(str(knowledge_level or "").strip().lower(), 0)
+        if difficulty_target is None:
+            target_stage = {
+                "beginner": 0,
+                "intermediate": 1,
+                "advanced": 2,
+            }.get(str(knowledge_level or "").strip().lower(), 0)
+        else:
+            target_stage = cls._selection_difficulty_stage(
+                {"difficulty": difficulty_target}
+            )
         return [
             item
             for _index, item in sorted(
@@ -6126,8 +6140,8 @@ class ReelService:
         *,
         input_order: int = 0,
         target_stage: int | None = None,
-    ) -> tuple[int, int, int, float, float, float, float, int, float, int]:
-        """Rank value within a difficulty stage, with deterministic fallbacks."""
+    ) -> tuple[int, int, int, int, float, float, float, float, int, float, int]:
+        """Rank proven cuts first, then value within the nearest difficulty stage."""
         compatibility_score = cls._selection_number(
             item.get("_selection_content_score"), 0.0
         )
@@ -6186,7 +6200,14 @@ class ReelService:
             1.0,
         )
         difficulty_stage = cls._selection_difficulty_stage(item)
+        boundary_fallback = int(
+            str(item.get("_selection_boundary_status") or "")
+            .strip()
+            .casefold()
+            == "best_effort"
+        )
         return (
+            boundary_fallback,
             (
                 difficulty_stage
                 if target_stage is None
@@ -8501,6 +8522,9 @@ class ReelService:
             selection_contract_version = str(
                 clean_item.get("_selection_contract_version") or ""
             ).strip()
+            selection_boundary_status = str(
+                clean_item.get("_selection_boundary_status") or ""
+            ).strip().casefold()
             selection_quality_floor = self._selection_number(
                 clean_item.get("_selection_quality_floor"), 0.0
             )
@@ -8598,6 +8622,9 @@ class ReelService:
                         selection_educational_importance
                     )
                 clean_item["_selection_source_rank"] = selection_source_rank
+                clean_item["_selection_boundary_status"] = (
+                    selection_boundary_status
+                )
                 if selection_candidate_id:
                     clean_item["_selection_candidate_id"] = selection_candidate_id
                 if selection_chain_id:

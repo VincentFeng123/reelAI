@@ -3354,6 +3354,7 @@ _LESSON_ORDER_SELECTION_FIELDS = frozenset({
     "_selection_intent_role",
     "_selection_intent_coverage",
     "_selection_directly_teaches_topic",
+    "_selection_boundary_status",
 })
 
 
@@ -3411,6 +3412,45 @@ def _current_selection_contract_reels(
             or ""
         ).strip()
         == SELECTION_CONTRACT_VERSION
+    ]
+
+
+def _prefer_proven_boundary_inventory(
+    reels: Iterable[dict[str, Any]],
+    *,
+    protected_reel_ids: Iterable[str] = (),
+) -> list[dict[str, Any]]:
+    """Use coarse Gemini cuts only when no stronger clip is available.
+
+    ``best_effort`` rows remain valid fallback inventory.  A previously
+    released row is immutable, but a fresh best-effort row must not displace a
+    verified or transcript-context-aligned candidate merely to fill a batch.
+    """
+
+    candidates = list(reels)
+    protected = {
+        reel_id
+        for value in protected_reel_ids
+        if (reel_id := str(value or "").strip())
+    }
+    stronger_boundary_statuses = {"verified", "context_aligned"}
+    has_stronger_candidate = any(
+        str(reel.get("_selection_boundary_status") or "")
+        .strip()
+        .casefold()
+        in stronger_boundary_statuses
+        for reel in candidates
+    )
+    if not has_stronger_candidate:
+        return candidates
+    return [
+        reel
+        for reel in candidates
+        if str(reel.get("reel_id") or "").strip() in protected
+        or str(reel.get("_selection_boundary_status") or "")
+        .strip()
+        .casefold()
+        != "best_effort"
     ]
 
 
@@ -4870,13 +4910,19 @@ def _ranked_request_reels(
             difficulty_progress = reel_service.learner_progress(
                 conn, material_id, learner_id
             )
-            target_stage = {
-                "beginner": 0,
-                "intermediate": 1,
-                "advanced": 2,
-            }.get(
-                str(difficulty_progress.get("selected_level") or "beginner"),
-                0,
+            target_stage = reel_service._selection_difficulty_stage(
+                {
+                    "difficulty": effective_level_target(
+                        str(
+                            difficulty_progress.get("selected_level")
+                            or "beginner"
+                        ),
+                        float(
+                            difficulty_progress.get("global_adjustment")
+                            or 0.0
+                        ),
+                    )
+                }
             )
             ranked = _merge_selection_ordered_reel_lists(
                 *ranked_batches,
@@ -4915,6 +4961,12 @@ def _ranked_request_reels(
         ranked = reel_service.select_difficulty_inventory(
             ranked,
             str(difficulty_progress.get("selected_level") or "beginner"),
+            difficulty_target=effective_level_target(
+                str(
+                    difficulty_progress.get("selected_level") or "beginner"
+                ),
+                float(difficulty_progress.get("global_adjustment") or 0.0),
+            ),
         )
     if authoritative_release_ids is not None:
         ranked = [
@@ -5373,22 +5425,6 @@ def _generation_job_reels(
         conn,
         continuation_token,
     )
-    source_release_reel_ids: list[str] = []
-    if prior_unseen_reels_out is not None:
-        generation_row = _fetch_generation_row(conn, generation_id) or {}
-        source_generation_id = str(
-            generation_row.get("source_generation_id") or ""
-        ).strip()
-        if source_generation_id:
-            # A release is not a view. Preserve its recursive editorial plan;
-            # ranked loading below removes only durable progress and exclusions.
-            source_release_reel_ids = list(
-                _authoritative_release_reel_ids(conn, source_generation_id) or ()
-            )
-    prior_release_reel_ids = list(dict.fromkeys([
-        *delivered_reel_ids,
-        *source_release_reel_ids,
-    ]))
     editorial_excluded_ids = list(dict.fromkeys(
         reel_id
         for value in editorial_excluded_reel_ids
@@ -5468,6 +5504,47 @@ def _generation_job_reels(
         for reel in ranked
     ]
     valid_reels = _current_selection_contract_reels(internal_reels)
+    boundary_statuses = {
+        str(reel.get("_selection_boundary_status") or "")
+        .strip()
+        .casefold()
+        for reel in valid_reels
+    }
+    valid_reel_ids = {
+        str(reel.get("reel_id") or "").strip()
+        for reel in valid_reels
+        if str(reel.get("reel_id") or "").strip()
+    }
+    needs_source_release_protection = bool(
+        prior_unseen_reels_out is not None
+        or set(editorial_excluded_ids).intersection(valid_reel_ids)
+        or (
+            "best_effort" in boundary_statuses
+            and bool(
+                boundary_statuses.intersection({"verified", "context_aligned"})
+            )
+        )
+    )
+    source_release_reel_ids: list[str] = []
+    if needs_source_release_protection:
+        source_generation_id = str(
+            job_row.get("source_generation_id") or ""
+        ).strip()
+        if not source_generation_id:
+            generation_row = _fetch_generation_row(conn, generation_id) or {}
+            source_generation_id = str(
+                generation_row.get("source_generation_id") or ""
+            ).strip()
+        if source_generation_id:
+            # A release is not a view. Preserve its recursive editorial plan;
+            # healthy single-lane batches avoid this parent-chain lookup.
+            source_release_reel_ids = list(
+                _authoritative_release_reel_ids(conn, source_generation_id) or ()
+            )
+    prior_release_reel_ids = list(dict.fromkeys([
+        *delivered_reel_ids,
+        *source_release_reel_ids,
+    ]))
     available_guard_ids = {
         str(reel.get("reel_id") or "").strip()
         for reel in valid_reels
@@ -5482,9 +5559,16 @@ def _generation_job_reels(
         valid_reels = [
             reel
             for reel in valid_reels
-            if str(reel.get("reel_id") or "").strip()
-            not in editorial_excluded_id_set
+            if (
+                (reel_id := str(reel.get("reel_id") or "").strip())
+                not in editorial_excluded_id_set
+                or reel_id in prior_release_reel_ids
+            )
         ]
+    valid_reels = _prefer_proven_boundary_inventory(
+        valid_reels,
+        protected_reel_ids=prior_release_reel_ids,
+    )
     if prior_unseen_reels_out is not None and prior_release_reel_ids:
         prior_release_reel_id_set = set(prior_release_reel_ids)
         valid_reels_by_id = {

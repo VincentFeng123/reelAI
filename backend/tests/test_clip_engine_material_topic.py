@@ -1579,6 +1579,592 @@ class IngestTopicProgressTests(unittest.TestCase):
         self.assertGreaterEqual(elapsed, 0.05)
         self.assertLess(elapsed, 0.3)
 
+    def test_best_effort_cannot_consume_cap_or_emit_before_pending_stronger_source(
+        self,
+    ) -> None:
+        pipeline = self._pipeline()
+        videos = [self._video("fallback-video"), self._video("stronger-video")]
+        stored: list[str] = []
+        streamed: list[str] = []
+        analyzed: set[str] = set()
+
+        def clip_and_filter(video, *_args):
+            if video["id"] == "stronger-video":
+                time.sleep(0.04)
+                boundary_status = "context_aligned"
+            else:
+                boundary_status = "best_effort"
+            return video, [{
+                "title": f"{video['id']} lesson",
+                "score": 1.0,
+                "difficulty": 0.2,
+                "selection_candidate_id": video["id"],
+                "search_context": {
+                    "surface_eligible": True,
+                    "boundary_status": boundary_status,
+                },
+            }], {"transcript": {}}
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(
+                pipeline_module,
+                "INGEST_TOPIC_VIDEO_TIMEOUT_SEC",
+                0.3,
+            ),
+            mock.patch.object(
+                pipeline_module,
+                "INGEST_TOPIC_USEFUL_INVENTORY_IDLE_TIMEOUT_SEC",
+                0.08,
+            ),
+            mock.patch.object(
+                pipeline,
+                "_clip_and_filter",
+                side_effect=clip_and_filter,
+            ),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (
+                    stored.append(kwargs["v"]["id"]) or kwargs["v"]["id"],
+                    mock.sentinel.metadata,
+                ),
+            ),
+        ):
+            started = time.monotonic()
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=2,
+                max_reels=1,
+                max_persisted_reels=1,
+                on_reel_created=streamed.append,
+                analyzed_video_ids=analyzed,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(reels, ["stronger-video"])
+        self.assertEqual(stored, ["stronger-video"])
+        self.assertEqual(streamed, ["stronger-video"])
+        self.assertEqual(analyzed, {"fallback-video", "stronger-video"})
+        self.assertGreaterEqual(elapsed, 0.03)
+        self.assertLess(elapsed, 0.2)
+
+    def test_non_surfaceable_row_cannot_consume_valid_fallback_persistence_cap(
+        self,
+    ) -> None:
+        pipeline = self._pipeline()
+        video = self._video("mixed-video")
+        stored: list[str] = []
+        streamed: list[str] = []
+        clips = [
+            {
+                "title": "deferred dependency",
+                "score": 1.0,
+                "difficulty": 0.2,
+                "selection_candidate_id": "deferred",
+                "search_context": {
+                    "surface_eligible": False,
+                    "boundary_status": "context_aligned",
+                },
+            },
+            {
+                "title": "valid coarse fallback",
+                "score": 1.0,
+                "difficulty": 0.2,
+                "selection_candidate_id": "fallback",
+                "search_context": {
+                    "surface_eligible": True,
+                    "boundary_status": "best_effort",
+                },
+            },
+        ]
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": [video],
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(
+                pipeline,
+                "_clip_and_filter",
+                return_value=(video, clips, {"transcript": {}}),
+            ),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (
+                    stored.append(kwargs["clip"]["selection_candidate_id"])
+                    or kwargs["clip"]["selection_candidate_id"],
+                    mock.sentinel.metadata,
+                ),
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=1,
+                max_reels=1,
+                max_persisted_reels=1,
+                on_reel_created=streamed.append,
+            )
+
+        self.assertEqual(reels, ["fallback"])
+        self.assertEqual(stored, ["fallback"])
+        self.assertEqual(streamed, ["fallback"])
+
+    def test_all_best_effort_batch_remains_nonempty_under_persistence_cap(
+        self,
+    ) -> None:
+        pipeline = self._pipeline()
+        videos = [
+            self._video("coarse-first"),
+            self._video("coarse-second"),
+            self._video("coarse-stalled"),
+        ]
+        stored: list[str] = []
+        streamed: list[str] = []
+        stream_times: list[float] = []
+        stalled_started = threading.Event()
+        stalled_cancelled = threading.Event()
+
+        def clip_and_filter(
+            video, _topic, _language, should_cancel, _context
+        ):
+            if video["id"] == "coarse-stalled":
+                stalled_started.set()
+                while not should_cancel():
+                    time.sleep(0.002)
+                stalled_cancelled.set()
+                return video, [], {"transcript": {}}
+            self.assertTrue(stalled_started.wait(1.0))
+            if video["id"] == "coarse-second":
+                time.sleep(0.15)
+            return video, [{
+                "title": video["id"],
+                "score": 1.0,
+                "difficulty": 0.2,
+                "selection_candidate_id": video["id"],
+                "search_context": {
+                    "surface_eligible": True,
+                    "boundary_status": "best_effort",
+                },
+            }], {"transcript": {}}
+
+        def stream(reel: str) -> None:
+            streamed.append(reel)
+            stream_times.append(time.monotonic())
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(
+                pipeline_module,
+                "INGEST_TOPIC_VIDEO_TIMEOUT_SEC",
+                0.8,
+            ),
+            mock.patch.object(
+                pipeline_module,
+                "INGEST_TOPIC_USEFUL_INVENTORY_IDLE_TIMEOUT_SEC",
+                0.2,
+            ),
+            mock.patch.object(
+                pipeline, "_clip_and_filter", side_effect=clip_and_filter
+            ),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (
+                    stored.append(kwargs["v"]["id"])
+                    or kwargs["v"]["id"],
+                    mock.sentinel.metadata,
+                ),
+            ),
+        ):
+            started = time.monotonic()
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=3,
+                max_reels=1,
+                max_persisted_reels=1,
+                on_reel_created=stream,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(reels, ["coarse-first"])
+        self.assertEqual(stored, ["coarse-first"])
+        self.assertEqual(streamed, ["coarse-first"])
+        self.assertEqual(len(stream_times), 1)
+        self.assertLess(stream_times[0] - started, 0.28)
+        self.assertLess(elapsed, 0.28)
+        self.assertTrue(stalled_cancelled.wait(0.1))
+
+    def test_complete_best_effort_inventory_does_not_start_an_extra_source(
+        self,
+    ) -> None:
+        pipeline = self._pipeline()
+        videos = [self._video(f"coarse-{index}") for index in range(4)]
+        analyzed: list[str] = []
+
+        def clip_and_filter(video, *_args):
+            analyzed.append(video["id"])
+            return video, [{
+                "title": video["id"],
+                "score": 1.0,
+                "difficulty": 0.2,
+                "selection_candidate_id": video["id"],
+                "search_context": {
+                    "surface_eligible": True,
+                    "boundary_status": "best_effort",
+                },
+            }], {"transcript": {}}
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(
+                pipeline, "_clip_and_filter", side_effect=clip_and_filter
+            ),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (
+                    kwargs["v"]["id"],
+                    mock.sentinel.metadata,
+                ),
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=4,
+                max_reels=3,
+                max_persisted_reels=3,
+            )
+
+        self.assertCountEqual(analyzed, ["coarse-0", "coarse-1", "coarse-2"])
+        self.assertEqual(reels, ["coarse-0", "coarse-1", "coarse-2"])
+
+    def test_deferred_fallback_bounds_a_newly_started_source_wait(self) -> None:
+        pipeline = self._pipeline()
+        videos = [self._video(f"source-{index}") for index in range(4)]
+        initial_empty = [threading.Event(), threading.Event()]
+        stalled_started = threading.Event()
+        stalled_cancelled = threading.Event()
+        streamed: list[str] = []
+        stream_times: list[float] = []
+
+        def clip_and_filter(
+            video, _topic, _language, should_cancel, _context
+        ):
+            source_index = int(video["id"].rsplit("-", 1)[-1])
+            if source_index < 2:
+                initial_empty[source_index].set()
+                return video, [], {"transcript": {}}
+            if source_index == 2:
+                self.assertTrue(initial_empty[0].wait(1.0))
+                self.assertTrue(initial_empty[1].wait(1.0))
+                return video, [{
+                    "title": video["id"],
+                    "score": 1.0,
+                    "difficulty": 0.2,
+                    "selection_candidate_id": video["id"],
+                    "search_context": {
+                        "surface_eligible": True,
+                        "boundary_status": "best_effort",
+                    },
+                }], {"transcript": {}}
+            stalled_started.set()
+            while not should_cancel():
+                time.sleep(0.002)
+            stalled_cancelled.set()
+            return video, [], {"transcript": {}}
+
+        def stream(reel: str) -> None:
+            streamed.append(reel)
+            stream_times.append(time.monotonic())
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(
+                pipeline_module,
+                "INGEST_TOPIC_VIDEO_TIMEOUT_SEC",
+                0.5,
+            ),
+            mock.patch.object(
+                pipeline_module,
+                "INGEST_TOPIC_USEFUL_INVENTORY_IDLE_TIMEOUT_SEC",
+                0.03,
+            ),
+            mock.patch.object(
+                pipeline, "_clip_and_filter", side_effect=clip_and_filter
+            ),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (
+                    kwargs["v"]["id"],
+                    mock.sentinel.metadata,
+                ),
+            ),
+        ):
+            started = time.monotonic()
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=4,
+                max_reels=2,
+                max_persisted_reels=2,
+                on_reel_created=stream,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertTrue(stalled_started.is_set())
+        self.assertEqual(reels, ["source-2"])
+        self.assertEqual(streamed, ["source-2"])
+        self.assertEqual(len(stream_times), 1)
+        self.assertLess(stream_times[0] - started, 0.2)
+        self.assertLess(elapsed, 0.2)
+        self.assertTrue(stalled_cancelled.wait(0.1))
+
+    def test_retained_boundary_status_controls_best_effort_classification(
+        self,
+    ) -> None:
+        def clip_and_filter(video, *_args):
+            return video, [{
+                "title": video["id"],
+                "score": 1.0,
+                "difficulty": 0.2,
+                "selection_candidate_id": video["id"],
+                "search_context": {
+                    "surface_eligible": True,
+                    "boundary_status": "best_effort",
+                },
+            }], {"transcript": {}}
+
+        cases = (
+            (
+                ("retained-verified", "coarse-only"),
+                {"retained-verified"},
+                ["retained-verified"],
+                1,
+                ["retained-verified"],
+            ),
+            (
+                ("coarse-only", "retained-verified"),
+                {"retained-verified"},
+                ["retained-verified"],
+                1,
+                ["retained-verified"],
+            ),
+            (
+                ("retained-coarse", "retained-verified"),
+                {"retained-coarse", "retained-verified"},
+                ["retained-coarse", "retained-verified"],
+                1,
+                ["retained-verified"],
+            ),
+            (
+                ("retained-verified", "retained-context"),
+                {"retained-verified", "retained-context"},
+                ["retained-verified", "retained-context"],
+                2,
+                ["retained-verified", "retained-context"],
+            ),
+        )
+        for max_persisted_reels in (1, None):
+            for (
+                video_ids,
+                retained_ids,
+                expected_persisted,
+                max_reels,
+                expected_reels,
+            ) in cases:
+                with self.subTest(
+                    video_ids=video_ids,
+                    max_persisted_reels=max_persisted_reels,
+                ):
+                    self._assert_retained_boundary_status_controls_fallback(
+                        video_ids=video_ids,
+                        retained_ids=retained_ids,
+                        expected_persisted=expected_persisted,
+                        max_persisted_reels=max_persisted_reels,
+                        max_reels=max_reels,
+                        expected_reels=expected_reels,
+                        clip_and_filter=clip_and_filter,
+                    )
+
+    def _assert_retained_boundary_status_controls_fallback(
+        self,
+        *,
+        video_ids: tuple[str, str],
+        retained_ids: set[str],
+        expected_persisted: list[str],
+        max_persisted_reels: int | None,
+        max_reels: int,
+        expected_reels: list[str],
+        clip_and_filter,
+    ) -> None:
+        pipeline = self._pipeline()
+        videos = [self._video(video_id) for video_id in video_ids]
+        persisted: list[str] = []
+        streamed: list[object] = []
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = mock.sentinel.connection
+        candidate_loader = mock.Mock(
+            side_effect=lambda _conn, **kwargs: (
+                {"id": kwargs["selection_candidate_id"]}
+                if kwargs["selection_candidate_id"] in retained_ids
+                else None
+            )
+        )
+
+        def persist(*, v, on_persistence_result, **_kwargs):
+            persisted.append(v["id"])
+            on_persistence_result(v["id"] not in retained_ids)
+            return (
+                mock.Mock(
+                    reel_id=v["id"],
+                    boundary_status=(
+                        "verified"
+                        if v["id"] == "retained-verified"
+                        else (
+                            "context_aligned"
+                            if v["id"] == "retained-context"
+                            else "best_effort"
+                        )
+                    ),
+                ),
+                mock.sentinel.metadata,
+            )
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(
+                pipeline,
+                "_clip_and_filter",
+                side_effect=clip_and_filter,
+            ),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=persist,
+            ),
+            mock.patch.object(
+                pipeline_module,
+                "get_conn",
+                return_value=connection,
+            ),
+            mock.patch.object(
+                pipeline_module,
+                "load_reel_by_selection_candidate",
+                candidate_loader,
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                generation_id="generation",
+                max_videos=2,
+                max_reels=max_reels,
+                max_persisted_reels=max_persisted_reels,
+                on_reel_created=streamed.append,
+            )
+
+        self.assertEqual(
+            {
+                (
+                    kwargs["material_id"],
+                    kwargs["concept_id"],
+                    kwargs["video_id"],
+                    kwargs["generation_id"],
+                    kwargs["selection_candidate_id"],
+                )
+                for _args, kwargs in candidate_loader.call_args_list
+            },
+            {
+                (
+                    "material",
+                    "concept",
+                    f"yt:{video_id}",
+                    "generation",
+                    video_id,
+                )
+                for video_id in video_ids
+            },
+        )
+        self.assertTrue(
+            all(
+                args == (mock.sentinel.connection,)
+                for args, _kwargs in candidate_loader.call_args_list
+            )
+        )
+        self.assertEqual(persisted, expected_persisted)
+        self.assertEqual(
+            [reel.reel_id for reel in reels],
+            expected_reels,
+        )
+        self.assertEqual(
+            [reel.reel_id for reel in streamed],
+            expected_reels,
+        )
+
     def test_empty_first_source_does_not_prevent_useful_source_completion(self) -> None:
         pipeline = self._pipeline()
         videos = [self._video("empty-video"), self._video("useful-video")]

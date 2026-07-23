@@ -13,6 +13,7 @@ from unittest import mock
 from fastapi.responses import JSONResponse
 import pytest
 
+from backend import gemini_client
 from backend.app import db
 from backend.app import main
 from backend.app.clip_engine import segment_cache
@@ -109,6 +110,212 @@ def test_current_request_filter_rejects_stale_or_unversioned_inventory() -> None
         current,
         internal_current,
     ]) == [current, internal_current]
+
+
+def test_af_220_best_effort_is_used_only_when_stronger_inventory_is_empty() -> None:
+    verified = {
+        "reel_id": "verified",
+        "_selection_boundary_status": "verified",
+    }
+    context_aligned = {
+        "reel_id": "context",
+        "_selection_boundary_status": "context_aligned",
+    }
+    best_effort = {
+        "reel_id": "fallback",
+        "_selection_boundary_status": "best_effort",
+    }
+    unknown = {
+        "reel_id": "unknown",
+        "_selection_boundary_status": "unknown",
+    }
+
+    assert main._prefer_proven_boundary_inventory([
+        best_effort,
+        context_aligned,
+        verified,
+    ]) == [context_aligned, verified]
+    assert main._prefer_proven_boundary_inventory([best_effort]) == [best_effort]
+    assert main._prefer_proven_boundary_inventory(
+        [best_effort, unknown]
+    ) == [best_effort, unknown]
+    assert main._prefer_proven_boundary_inventory(
+        [best_effort, verified],
+        protected_reel_ids=["fallback"],
+    ) == [best_effort, verified]
+    assert main._prefer_proven_boundary_inventory(
+        [context_aligned, best_effort],
+        protected_reel_ids=["context"],
+    ) == [context_aligned]
+
+
+def test_af_220_healthy_single_boundary_lane_skips_parent_release_lookup(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="boundary-healthy-single-lane",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: [{
+            "reel_id": "healthy-verified",
+            "video_id": "healthy-video",
+            "t_start": 0.0,
+            "t_end": 30.0,
+            "selection_contract_version": "quality_silence_v40",
+            "_selection_boundary_status": "verified",
+        }],
+    )
+    monkeypatch.setattr(
+        main,
+        "_authoritative_release_reel_ids",
+        mock.Mock(side_effect=AssertionError("healthy lane read parent releases")),
+    )
+    try:
+        reels = main._generation_job_reels(
+            conn,
+            {
+                "result_generation_id": generation_id,
+                "source_generation_id": "unused-parent",
+                "material_id": "m1",
+                "concept_id": "c1",
+                "learner_id": "learner-1",
+                "request_params_json": json.dumps({
+                    "generation_mode": "slow",
+                    "num_reels": 9,
+                }),
+            },
+            apply_release_order=False,
+            preserve_lesson_order_metadata=True,
+        )
+
+        assert [reel["reel_id"] for reel in reels] == ["healthy-verified"]
+    finally:
+        conn.close()
+
+
+def test_af_220_editorial_filter_runs_before_boundary_fallback_choice(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="boundary-after-editorial-filter",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    fallback = {
+        "reel_id": "valid-fallback",
+        "video_id": "fallback-video",
+        "t_start": 0.0,
+        "t_end": 30.0,
+        "selection_contract_version": "quality_silence_v40",
+        "_selection_boundary_status": "best_effort",
+    }
+    excluded_stronger = {
+        "reel_id": "excluded-restatement",
+        "video_id": "stronger-video",
+        "t_start": 0.0,
+        "t_end": 30.0,
+        "selection_contract_version": "quality_silence_v40",
+        "_selection_boundary_status": "verified",
+    }
+
+    def ranked(*_args, **kwargs):
+        kwargs["seen_reel_ids_out"].add("available-editorial-guard")
+        return [fallback, excluded_stronger]
+
+    monkeypatch.setattr(main, "_ranked_request_reels", ranked)
+    try:
+        reels = main._generation_job_reels(
+            conn,
+            {
+                "result_generation_id": generation_id,
+                "material_id": "m1",
+                "concept_id": "c1",
+                "learner_id": "learner-1",
+                "request_params_json": json.dumps({
+                    "generation_mode": "slow",
+                    "num_reels": 9,
+                }),
+            },
+            apply_release_order=False,
+            preserve_lesson_order_metadata=True,
+            editorial_excluded_reel_ids=["excluded-restatement"],
+            editorial_guard_reel_ids=["available-editorial-guard"],
+        )
+
+        assert [reel["reel_id"] for reel in reels] == ["valid-fallback"]
+    finally:
+        conn.close()
+
+
+def test_af_220_terminal_reconstruction_preserves_released_fallback_without_collector(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    root_generation_id, rows, _jobs = _released_generation_chain(
+        conn,
+        [(["released-fallback"], ["released-fallback"])],
+    )
+    child_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="boundary-released-child",
+        generation_mode="slow",
+        retrieval_profile="unified",
+        source_generation_id=root_generation_id,
+    )
+    released_fallback = {
+        **rows[root_generation_id][0],
+        "_selection_boundary_status": "best_effort",
+    }
+    fresh_stronger = {
+        "reel_id": "fresh-verified",
+        "video_id": "fresh-video",
+        "t_start": 0.0,
+        "t_end": 30.0,
+        "selection_contract_version": "quality_silence_v40",
+        "_selection_boundary_status": "verified",
+    }
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: [released_fallback, fresh_stronger],
+    )
+    try:
+        reels = main._generation_job_reels(
+            conn,
+            {
+                "result_generation_id": child_generation_id,
+                "material_id": "m1",
+                "concept_id": "c1",
+                "learner_id": "learner-1",
+                "request_params_json": json.dumps({
+                    "generation_mode": "slow",
+                    "num_reels": 9,
+                }),
+            },
+            apply_release_order=False,
+            preserve_lesson_order_metadata=True,
+        )
+
+        assert [reel["reel_id"] for reel in reels] == [
+            "released-fallback",
+            "fresh-verified",
+        ]
+    finally:
+        conn.close()
 
 
 def test_reel_response_schema_retains_v3_source_and_selector_metadata() -> None:
@@ -12689,10 +12896,25 @@ def test_v7_feed_merges_value_ranked_batches_without_breaking_batch_topology(
         conn.close()
 
 
-def test_generation_chain_uses_nearest_difficulty_across_all_batches(
+@pytest.mark.parametrize(
+    ("global_adjustment", "expected"),
+    [
+        (0.0, ["beginner-only", "intermediate-only"]),
+        (0.20, ["intermediate-only", "beginner-only"]),
+    ],
+)
+def test_generation_chain_uses_effective_difficulty_across_all_batches(
     monkeypatch,
+    global_adjustment: float,
+    expected: list[str],
 ) -> None:
     conn = _conn()
+    main.reel_service.learner_progress(conn, "m1", main.LEGACY_LEARNER_ID)
+    conn.execute(
+        "UPDATE learner_material_progress SET global_adjustment = ? "
+        "WHERE learner_id = ? AND material_id = 'm1'",
+        (global_adjustment, main.LEGACY_LEARNER_ID),
+    )
     root_generation_id = main._create_generation_row(
         conn,
         material_id="m1",
@@ -12721,16 +12943,16 @@ def test_generation_chain_uses_nearest_difficulty_across_all_batches(
             "_selection_quality_floor": 0.9,
             "_selection_quality_mean": 0.9,
             "_selection_topic_relevance": 0.9,
-                "_selection_source_rank": 0,
-                "_selection_ordered": True,
-                "selection_contract_version": "quality_silence_v40",
+            "_selection_source_rank": 0,
+            "_selection_ordered": True,
+            "selection_contract_version": "quality_silence_v40",
         }
 
     monkeypatch.setattr(
         main.reel_service,
         "ranked_feed",
         lambda *_args, **kwargs: (
-            [reel("advanced-only", 0.85)]
+            [reel("beginner-only", 0.15)]
             if kwargs.get("generation_id") == root_generation_id
             else [reel("intermediate-only", 0.50)]
         ),
@@ -12755,12 +12977,89 @@ def test_generation_chain_uses_nearest_difficulty_across_all_batches(
             limit=20,
         )
 
-        assert [item["reel_id"] for item in ranked] == [
-            "intermediate-only",
-            "advanced-only",
-        ]
+        assert [item["reel_id"] for item in ranked] == expected
     finally:
         conn.close()
+
+
+def test_successful_organizer_flow_survives_reversed_numeric_difficulty(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_read_cached_lesson_order",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_write_cached_lesson_order",
+        lambda *_args, **_kwargs: None,
+    )
+
+    reels = [
+        {
+            "reel_id": "concept-orientation",
+            "video_id": "orientation-source",
+            "t_start": 10.0,
+            "t_end": 30.0,
+            "concept_id": "shared-objective",
+            "concept_title": "Conceptual orientation",
+            "ai_summary": "Defines and explains the concept before calculation.",
+            "transcript_snippet": "First understand what the principle means.",
+            "difficulty": 0.85,
+            "_selection_intent_role": "primary",
+        },
+        {
+            "reel_id": "worked-example",
+            "video_id": "example-source",
+            "t_start": 10.0,
+            "t_end": 30.0,
+            "concept_id": "shared-objective",
+            "concept_title": "Worked application",
+            "ai_summary": "Applies the concept in a worked problem.",
+            "transcript_snippet": "Now substitute the values and solve.",
+            "difficulty": 0.15,
+            "_selection_intent_role": "supporting",
+        },
+    ]
+    response = gemini_client.GenerationResult(
+        text=json.dumps({
+            "ordered_reel_ids": ["concept-orientation", "worked-example"],
+            "assessment_checkpoint_reel_ids": [],
+            "prior_restatement_reel_ids": [],
+            "current_restatement_reel_ids": [],
+            "terminal_summary_start_reel_id": None,
+        }),
+        telemetry=gemini_client.GeminiCallTelemetry(
+            model="difficulty-organizer-test",
+            operation="ordering",
+            prompt_version=lesson_ordering.LESSON_ORDER_PROMPT_VERSION,
+            thinking_level="disabled",
+            latency_ms=1.0,
+            retries=0,
+            finish_reason="STOP",
+            prompt_tokens=10,
+            candidate_tokens=10,
+            thought_tokens=0,
+            total_tokens=20,
+        ),
+    )
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: response,
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="Teach the concept, then solve a worked example.",
+        learner_level="beginner",
+        learner_difficulty_target=0.15,
+        release_limit=len(reels),
+    )
+
+    assert result.degraded is False
+    assert result.ordered_reel_ids == ["concept-orientation", "worked-example"]
 
 
 def test_cross_level_reservoir_ignores_invalid_rows_when_valid_inventory_remains() -> None:

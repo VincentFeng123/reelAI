@@ -726,7 +726,7 @@ def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_
 
     assert payload["concept_title"] == "How force and mass change acceleration"
     assert payload["concept_family"] == "force-mass-acceleration proportionality"
-    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v15"
+    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v16"
     assert "semantic restatements" in lesson_ordering._SYSTEM_PROMPT
     assert "concept, then explanation, then application or worked example" in (
         lesson_ordering._SYSTEM_PROMPT
@@ -740,6 +740,92 @@ def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_
     )
     assert "learner_level" not in payload
     assert "difficulty" in payload
+
+
+@pytest.mark.parametrize(
+    "boundary_status",
+    ["verified", "context_aligned", "best_effort"],
+)
+def test_organizer_full_prompt_exposes_boundary_evidence(
+    boundary_status: str,
+) -> None:
+    reel = _reel(
+        f"candidate-{boundary_status}",
+        video_id=f"source-{boundary_status}",
+        start=0,
+        concept="supplied learning unit",
+        _selection_boundary_status=boundary_status,
+    )
+
+    prompt = lesson_ordering._user_prompt(
+        [reel],
+        topic="Teach the supplied learning unit.",
+        learner_level="beginner",
+        release_limit=1,
+    )
+    full_payload = json.loads(
+        prompt.split("CLIPS_JSON:\n", 1)[1].split("\n\nFinal request:", 1)[0]
+    )
+    [full_clip] = full_payload["clips"]
+    assert full_clip["boundary_evidence"] == boundary_status
+
+
+@pytest.mark.parametrize(
+    "boundary_status",
+    ["verified", "context_aligned", "best_effort"],
+)
+def test_organizer_compact_payload_exposes_boundary_evidence(
+    boundary_status: str,
+) -> None:
+    reel = _reel(
+        f"candidate-{boundary_status}",
+        video_id=f"source-{boundary_status}",
+        start=0,
+        concept="supplied learning unit",
+        _selection_boundary_status=boundary_status,
+    )
+    compact_payload = lesson_ordering._compact_clip_payload(
+        [lesson_ordering._clip_payload(reel)],
+        concept_text_limit=96,
+        semantic_text_limit=1_000,
+    )
+    [compact_row] = compact_payload["clips"]
+    decoded_compact = dict(
+        zip(compact_payload["columns"], compact_row, strict=True)
+    )
+    assert decoded_compact["boundary_evidence"] == boundary_status
+
+
+def test_organizer_policy_prefers_stronger_boundaries_and_keeps_best_effort_last_resort() -> None:
+    policy_sentences = [
+        sentence.strip().casefold()
+        for sentence in lesson_ordering._SYSTEM_PROMPT.split(".")
+        if sentence.strip()
+    ]
+
+    assert any(
+        "prefer" in sentence
+        and "verified" in sentence
+        and "context_aligned" in sentence
+        for sentence in policy_sentences
+    ), "the organizer must prefer verified/context-aligned cuts over best-effort cuts"
+    assert any(
+        "best_effort" in sentence
+        and "only" in sentence
+        and "stronger" in sentence
+        and "valid" in sentence
+        and ("candidate" in sentence or "clip" in sentence)
+        for sentence in policy_sentences
+    ), "best-effort selection must be limited to cases with no stronger valid candidate"
+    assert any(
+        "best_effort" in sentence
+        and (
+            "nonempty" in sentence
+            or "at least one" in sentence
+            or "empty lesson" in sentence
+        )
+        for sentence in policy_sentences
+    ), "the no-stronger-candidate path must still return a nonempty best-effort lesson"
 
 
 def test_required_prior_unseen_anchor_can_move_after_recovered_foundations(
@@ -1082,7 +1168,7 @@ def test_compact_clip_columns_reconstruct_every_organizer_value_without_shift() 
     columns = compact["columns"]
     [row] = compact["clips"]
 
-    assert len(columns) == len(set(columns)) == len(row) == 24
+    assert len(columns) == len(set(columns)) == len(row) == 25
     decoded = dict(zip(columns, row, strict=True))
     assert decoded["chain_position"] == 2
     assert decoded["prerequisite_candidate_refs"] == [1]
@@ -5027,7 +5113,7 @@ def test_lesson_order_cache_round_trips_validated_restatements(
     assert cached.prior_restatement_reel_ids == ["repeat"]
     assert cached.current_restatement_reel_ids == ["current-subset"]
     response_payload = json.loads(stored["response_json"])
-    assert response_payload["prompt_version"] == "lesson_order_v15"
+    assert response_payload["prompt_version"] == "lesson_order_v16"
     assert response_payload["cache_version"] == 13
     assert _REAL_READ_CACHED_LESSON_ORDER(
         "cache-key",

@@ -17,6 +17,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1000,6 +1001,61 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             for reel in result
         ))
 
+    def test_direct_generated_response_preserves_and_ranks_boundary_status(self) -> None:
+        concept = {"id": CONCEPT_ID, "title": "Cellular respiration"}
+
+        def generated_reel(
+            reel_id: str,
+            *,
+            boundary_status: str,
+            difficulty: float,
+        ) -> dict:
+            reel_obj = SimpleNamespace(
+                reel_id=reel_id,
+                material_id=MATERIAL_ID,
+                concept_id=CONCEPT_ID,
+                concept_title=concept["title"],
+                video_url=f"https://www.youtube.com/embed/{reel_id}",
+                difficulty=difficulty,
+                selection_contract_version="quality_silence_v40",
+                boundary_status=boundary_status,
+                selection_topic_relevance=0.9,
+                selection_quality_floor=0.9,
+                selection_quality_mean=0.9,
+            )
+            return main_module.reel_service._reel_attribution_to_dict(
+                reel_obj,
+                concept,
+                0,
+                1,
+            )
+
+        coarse = generated_reel(
+            "coarse-current",
+            boundary_status="best_effort",
+            difficulty=0.15,
+        )
+        grounded = generated_reel(
+            "grounded-adjacent",
+            boundary_status="context_aligned",
+            difficulty=0.5,
+        )
+
+        self.assertEqual(coarse["boundary_status"], "best_effort")
+        self.assertEqual(
+            coarse["_selection_boundary_status"], "best_effort"
+        )
+        result = main_module.reel_service._finalize_generated_reels(
+            generated=[coarse, grounded],
+            num_reels=1,
+            preferred_video_duration="any",
+        )
+        self.assertEqual([reel["reel_id"] for reel in result], ["grounded-adjacent"])
+        self.assertEqual(result[0]["boundary_status"], "context_aligned")
+        self.assertFalse(any(
+            key.startswith("_selection_") for key in result[0]
+        ))
+
     def test_quality_silence_v11_history_remains_compatible(self) -> None:
         legacy = {
             "reel_id": "legacy-v11",
@@ -1400,7 +1456,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
     def test_cache_version_includes_recall_and_stored_details(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 48)
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 49)
         self.assertEqual(
             main_module.reel_service.RANKED_FEED_CACHE_CONTRACT_VERSION,
             "quality_silence_v40",
