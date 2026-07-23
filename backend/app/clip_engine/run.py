@@ -16,6 +16,7 @@ from .errors import (
     ClipError,
     ProviderBudgetExceededError,
     ProviderError,
+    ProviderRateLimitError,
     ProviderRequestError,
     ProviderResponseValidationError,
     ProviderTransientError,
@@ -335,6 +336,15 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
                 telemetry.get("provider_error_type") or ""
             )
             raw_retryable = telemetry.get("retryable")
+            raw_retry_after = telemetry.get("retry_after_sec")
+            try:
+                retry_after_sec = (
+                    float(raw_retry_after)
+                    if raw_retry_after is not None
+                    else None
+                )
+            except (TypeError, ValueError, OverflowError):
+                retry_after_sec = None
             if error_type == "ProviderBudgetExceededError":
                 raise ProviderBudgetExceededError(
                     "Clip selection budget was exhausted before dispatch.",
@@ -361,6 +371,19 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
                     detail=_selector_response_validation_detail(
                         telemetry,
                         error_type,
+                    ),
+                ) from exc
+            if status_code == 429:
+                raise ProviderRateLimitError(
+                    "Gemini clip selection is rate limited.",
+                    provider="gemini",
+                    operation="segmentation",
+                    status_code=status_code,
+                    retry_after_sec=retry_after_sec,
+                    detail=(
+                        f"{error_type}:{provider_error_type}"
+                        if provider_error_type
+                        else error_type
                     ),
                 ) from exc
             if isinstance(raw_retryable, bool):

@@ -53,7 +53,7 @@ def _strict_boundary_context(
     return {
         "selection_candidate_id": candidate_id,
         "surface_eligible": surface,
-        "selection_contract_version": "quality_silence_v40",
+        "selection_contract_version": "quality_silence_v41",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -78,7 +78,7 @@ def _transcript_boundary_context(
     return {
         "selection_candidate_id": candidate_id,
         "surface_eligible": surface,
-        "selection_contract_version": "quality_silence_v40",
+        "selection_contract_version": "quality_silence_v41",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -107,7 +107,7 @@ def _family_profile_context(
     selection_authority: str = "gemini",
 ) -> dict:
     return {
-        "selection_contract_version": "quality_silence_v40",
+        "selection_contract_version": "quality_silence_v41",
         "selection_authority": selection_authority,
         "concept_family_contract_version": contract_version,
         "concept_family": family,
@@ -1327,7 +1327,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "search_context": {
                     "selection_candidate_id": candidate_id,
                     "surface_eligible": True,
-                    "selection_contract_version": "quality_silence_v40",
+                    "selection_contract_version": "quality_silence_v41",
                     "speech_corridor_verified": True,
                     "boundary_status": "verified",
                     "boundary_diagnostics": {
@@ -1369,7 +1369,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
             }
             if verified:
                 context.update({
-                    "selection_contract_version": "quality_silence_v40",
+                    "selection_contract_version": "quality_silence_v41",
                     "speech_corridor_verified": True,
                     "boundary_diagnostics": {
                         "acoustic_verified": True,
@@ -1600,7 +1600,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
             )
         context = json.loads(row["search_context_json"])
         self.assertEqual(
-            context["selection_contract_version"], "quality_silence_v40"
+            context["selection_contract_version"], "quality_silence_v41"
         )
         self.assertEqual(context["boundary_status"], "context_aligned")
 

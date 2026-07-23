@@ -679,6 +679,7 @@ def test_durable_topic_and_ingest_search_share_practice_fast_discovery(monkeypat
     pipeline.ingest_topic(
         topic="derivative intuition",
         literal_topic="Calculus Basics",
+        source_context="Build intuition from slope before applying derivative rules.",
         material_id="material",
         concept_id="concept",
         max_videos=1,
@@ -694,7 +695,11 @@ def test_durable_topic_and_ingest_search_share_practice_fast_discovery(monkeypat
     assert captured[0]["use_query_planner"] is False
     assert all(call["practice_fast"] is True for call in captured)
     assert captured[0]["literal_topic"] == "Calculus Basics"
+    assert captured[0]["source_context"] == (
+        "Build intuition from slope before applying derivative rules."
+    )
     assert captured[1]["literal_topic"] == "Calculus Basics"
+    assert "source_context" not in captured[1]
     assert captured[1]["breadth"] == 3
 
 

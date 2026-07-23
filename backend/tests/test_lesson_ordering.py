@@ -59,6 +59,28 @@ def _reel(
     }
 
 
+def _trusted_independent_reel(
+    reel_id: str,
+    *,
+    video_id: str,
+    start: float,
+    concept: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    return _reel(
+        reel_id,
+        video_id=video_id,
+        start=start,
+        concept=concept,
+        selection_contract_version=(
+            lesson_ordering.SELECTION_CONTRACT_VERSION
+        ),
+        _selection_self_contained=True,
+        _selection_is_standalone=True,
+        **extra,
+    )
+
+
 def _generation_result(
     ordered_ids: list[str],
     checkpoint_ids: list[str] | None = None,
@@ -726,18 +748,17 @@ def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_
 
     assert payload["concept_title"] == "How force and mass change acceleration"
     assert payload["concept_family"] == "force-mass-acceleration proportionality"
-    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v16"
-    assert "semantic restatements" in lesson_ordering._SYSTEM_PROMPT
-    assert "concept, then explanation, then application or worked example" in (
-        lesson_ordering._SYSTEM_PROMPT
-    )
-    assert "closest adjacent band" in lesson_ordering._SYSTEM_PROMPT
-    assert "Never return zero clips solely because of difficulty" in (
-        lesson_ordering._SYSTEM_PROMPT
-    )
-    assert "after learner feedback and quiz adjustment" in " ".join(
-        lesson_ordering._SYSTEM_PROMPT.split()
-    )
+    assert payload["clip_duration_seconds"] == 20.0
+    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v18"
+    policy = " ".join(lesson_ordering._SYSTEM_PROMPT.split())
+    assert "semantic restatements" in policy
+    assert "concept, then explanation, then application or worked example" in policy
+    assert "release_limit is a ceiling, not a target" in policy
+    assert "shortest context-complete clip" in policy
+    assert "only supplied way to keep the lesson nonempty" in policy
+    assert "closest adjacent band" in policy
+    assert "Never return zero clips solely because of difficulty" in policy
+    assert "after learner feedback and quiz adjustment" in policy
     assert "learner_level" not in payload
     assert "difficulty" in payload
 
@@ -794,6 +815,250 @@ def test_organizer_compact_payload_exposes_boundary_evidence(
         zip(compact_payload["columns"], compact_row, strict=True)
     )
     assert decoded_compact["boundary_evidence"] == boundary_status
+
+
+def test_organizer_full_and_compact_payload_expose_exact_clip_duration() -> None:
+    reel = _trusted_independent_reel(
+        "long-candidate",
+        video_id="long-source",
+        start=12.5,
+        concept="complete derivation",
+        t_end=196.37,
+        clip_duration_sec=999.0,
+    )
+
+    clip = lesson_ordering._clip_payload(reel)
+    compact_payload = lesson_ordering._compact_clip_payload(
+        [clip],
+        concept_text_limit=96,
+        semantic_text_limit=1_000,
+    )
+    [compact_row] = compact_payload["clips"]
+    decoded_compact = dict(
+        zip(compact_payload["columns"], compact_row, strict=True)
+    )
+
+    assert clip["clip_duration_seconds"] == 183.87
+    assert decoded_compact["clip_duration_seconds"] == 183.87
+    assert clip["selection_contract_current"] is True
+    assert clip["self_contained"] is True
+    assert clip["is_standalone"] is True
+    assert decoded_compact["selection_contract_current"] is True
+    assert decoded_compact["self_contained"] is True
+    assert decoded_compact["is_standalone"] is True
+
+
+def test_public_semantic_booleans_cannot_imply_trusted_independence() -> None:
+    payload = lesson_ordering._clip_payload(_reel(
+        "untrusted-public-flags",
+        video_id="same-source",
+        start=0,
+        concept="supplied unit",
+        selection_contract_version=(
+            lesson_ordering.SELECTION_CONTRACT_VERSION
+        ),
+        self_contained=True,
+        is_standalone=True,
+    ))
+
+    assert payload["selection_contract_current"] is True
+    assert payload["self_contained"] is None
+    assert payload["is_standalone"] is None
+
+
+@pytest.mark.parametrize(
+    (
+        "topic",
+        "family",
+        "long_summary",
+        "short_summary",
+        "distinct_summary",
+    ),
+    [
+        (
+            "derivatives",
+            "instantaneous change",
+            "Shrinking secant intervals approach the instantaneous rate.",
+            "The instantaneous rate is the limit of average rates as the interval shrinks.",
+            "Form and simplify the difference quotient before taking its limit.",
+        ),
+        (
+            "cellular respiration",
+            "oxidative phosphorylation",
+            "A proton gradient drives ATP synthase to make ATP.",
+            "ATP synthase uses the proton gradient as the energy source for ATP production.",
+            "Oxygen accepts the terminal electrons and combines with protons to form water.",
+        ),
+        (
+            "electric circuits",
+            "Ohm relationship",
+            "Voltage equals current times resistance and links the three circuit quantities.",
+            "Ohm's law relates potential difference, current, and resistance through V equals IR.",
+            "Use the relationship to solve a series-circuit resistance problem.",
+        ),
+        (
+            "Python exceptions",
+            "finally cleanup",
+            "The finally block runs after success or failure so cleanup still occurs.",
+            "Cleanup in finally executes whether or not the try block raises an exception.",
+            "Apply finally to close a file while preserving exception propagation.",
+        ),
+        (
+            "negligence",
+            "duty and breach",
+            "Negligence requires a duty whose unreasonable breach causes compensable harm.",
+            "A claimant proves duty, breach, causation, and damages for negligence.",
+            "Apply the reasonable-person standard to the facts to decide breach.",
+        ),
+    ],
+)
+def test_healthy_organizer_prefers_concise_nonredundant_subset_across_domains(
+    monkeypatch,
+    topic: str,
+    family: str,
+    long_summary: str,
+    short_summary: str,
+    distinct_summary: str,
+) -> None:
+    reels = [
+        _reel(
+            "long-repeat",
+            video_id=f"{topic}-long-source",
+            start=0,
+            concept=f"{family} extended explanation",
+            concept_id="long-concept-id",
+            _selection_concept_family=family,
+            ai_summary=long_summary,
+            transcript_snippet=long_summary,
+            t_end=183.87,
+        ),
+        _reel(
+            "short-complete",
+            video_id=f"{topic}-short-source",
+            start=0,
+            concept=f"{family} concise explanation",
+            concept_id="short-concept-id",
+            _selection_concept_family=family,
+            ai_summary=short_summary,
+            transcript_snippet=short_summary,
+            t_end=52.04,
+        ),
+        _reel(
+            "distinct-contribution",
+            video_id=f"{topic}-distinct-source",
+            start=0,
+            concept=f"{family} application",
+            concept_id="distinct-concept-id",
+            _selection_concept_family=family,
+            ai_summary=distinct_summary,
+            transcript_snippet=distinct_summary,
+            t_end=74.08,
+        ),
+    ]
+    calls = 0
+
+    def fake_generate(
+        system_prompt,
+        user_prompt,
+        *,
+        dispatch_state,
+        **_kwargs,
+    ):
+        nonlocal calls
+        calls += 1
+        dispatch_state.dispatched = True
+        clips = json.loads(
+            user_prompt.split("CLIPS_JSON:\n", 1)[1].split(
+                "\n\nFinal request:", 1
+            )[0]
+        )["clips"]
+        by_id = {clip["reel_id"]: clip for clip in clips}
+        assert by_id["long-repeat"]["clip_duration_seconds"] == 183.87
+        assert by_id["short-complete"]["clip_duration_seconds"] == 52.04
+        assert "shortest context-complete clip" in " ".join(
+            system_prompt.split()
+        )
+        return _generation_result(
+            ["short-complete", "distinct-contribution"],
+            current_restatement_reel_ids=["long-repeat"],
+        )
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        fake_generate,
+    )
+    monkeypatch.setattr(
+        lesson_ordering.time,
+        "sleep",
+        lambda *_args, **_kwargs: pytest.fail(
+            "healthy concise-selection path must not sleep"
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic=f"Teach {topic} from concept through application.",
+        release_limit=3,
+    )
+
+    assert calls == 1
+    assert result.provider_called is True
+    assert result.ordered_reel_ids == [
+        "short-complete",
+        "distinct-contribution",
+    ]
+    assert result.current_restatement_reel_ids == ["long-repeat"]
+    assert result.degraded is False
+
+
+def test_provider_failure_keeps_only_valid_long_related_clip_nonempty(
+    monkeypatch,
+) -> None:
+    long_only = _reel(
+        "long-only",
+        video_id="only-related-source",
+        start=0,
+        concept="complete indivisible proof",
+        ai_summary="Develops the only supplied proof through its conclusion.",
+        transcript_snippet="The proof begins, develops each implication, and reaches its conclusion.",
+        t_end=260.0,
+        _selection_boundary_status="best_effort",
+    )
+    telemetry = replace(
+        _generation_result(["long-only"]).telemetry,
+        provider_error_type="BadRequest",
+        provider_status_code=400,
+        retryable=False,
+    )
+    calls = 0
+
+    def fail_once(*_args, **kwargs):
+        nonlocal calls
+        calls += 1
+        kwargs["dispatch_state"].dispatched = True
+        raise gemini_client.GeminiTransportError(
+            "permanent organizer rejection",
+            telemetry,
+        )
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        fail_once,
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [long_only],
+        topic="Teach the complete proof.",
+        release_limit=1,
+    )
+
+    assert calls == 1
+    assert result.ordered_reel_ids == ["long-only"]
+    assert result.reels == [long_only]
+    assert result.degraded is True
+    assert result.fallback_reason == "provider_call_failed"
 
 
 def test_organizer_policy_prefers_stronger_boundaries_and_keeps_best_effort_last_resort() -> None:
@@ -1168,12 +1433,13 @@ def test_compact_clip_columns_reconstruct_every_organizer_value_without_shift() 
     columns = compact["columns"]
     [row] = compact["clips"]
 
-    assert len(columns) == len(set(columns)) == len(row) == 25
+    assert len(columns) == len(set(columns)) == len(row) == 29
     decoded = dict(zip(columns, row, strict=True))
     assert decoded["chain_position"] == 2
     assert decoded["prerequisite_candidate_refs"] == [1]
     assert decoded["concept_title"] == "net force vector sum"
     assert decoded["concept_family"] == "net force vector sum"
+    assert decoded["clip_duration_seconds"] == 20.0
     assert decoded["intent_obligation_refs"] == []
     assert decoded["intent_connection_refs"] == []
     assert decoded["relationship_witness_obligation_refs"] == []
@@ -1217,7 +1483,8 @@ def test_small_batch_keeps_the_full_object_prompt_byte_for_byte() -> None:
         + "\n\nCLIPS_JSON:\n"
         + json.dumps(clip_payload, ensure_ascii=False, separators=(",", ":"))
         + "\n\nFinal request: Return at most 2 clips as a coherent feedback-aware "
-        "subset, preserve prerequisites and same-source chronology, and return only "
+        "subset, preserve prerequisites and the conditional same-source chronology "
+        "rules, and return only "
         "{\"ordered_reel_ids\":[...],\"assessment_checkpoint_reel_ids\":[...],"
         "\"prior_restatement_reel_ids\":[...],"
         "\"current_restatement_reel_ids\":[...],"
@@ -4652,6 +4919,232 @@ def test_same_source_chronology_is_repaired_without_degrading(monkeypatch) -> No
     assert result.assessment_checkpoint_reel_ids == []
 
 
+def test_current_independent_physics_clips_keep_gemini_prerequisite_order(
+    monkeypatch,
+) -> None:
+    worked = _trusted_independent_reel(
+        "worked-current",
+        video_id="dc-circuits",
+        start=10,
+        concept="worked current calculation",
+    )
+    definition = _trusted_independent_reel(
+        "current-definition",
+        video_id="dc-circuits",
+        start=100,
+        concept="definition of electric current",
+    )
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result(["current-definition", "worked-current"])
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+    monkeypatch.setattr(
+        lesson_ordering.time,
+        "sleep",
+        lambda *_args, **_kwargs: pytest.fail("healthy ordering must not sleep"),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [worked, definition],
+        topic="Define electric current, then solve a current problem.",
+        required_reel_ids=["worked-current"],
+    )
+
+    assert calls == 1
+    assert result.ordered_reel_ids == [
+        "current-definition",
+        "worked-current",
+    ]
+    assert result.ordered_reel_ids.count("worked-current") == 1
+    assert result.degraded is False
+    assert lesson_ordering._preserves_source_chronology(
+        result.ordered_reel_ids,
+        {reel["reel_id"]: reel for reel in (worked, definition)},
+    )
+
+
+def test_current_independent_biology_clips_keep_coherent_source_order(
+    monkeypatch,
+) -> None:
+    purpose = _trusted_independent_reel(
+        "respiration-purpose",
+        video_id="cellular-respiration",
+        start=10,
+        concept="purpose of cellular respiration",
+    )
+    glycolysis = _trusted_independent_reel(
+        "glycolysis",
+        video_id="cellular-respiration",
+        start=40,
+        concept="glycolysis",
+    )
+    oxygen = _trusted_independent_reel(
+        "oxygen-role",
+        video_id="cellular-respiration",
+        start=80,
+        concept="oxygen as terminal electron acceptor",
+    )
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result([
+            "respiration-purpose",
+            "glycolysis",
+            "oxygen-role",
+        ])
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        [oxygen, purpose, glycolysis],
+        topic=(
+            "Explain the purpose of cellular respiration, glycolysis, and "
+            "oxygen's terminal role."
+        ),
+    )
+
+    assert calls == 1
+    assert result.ordered_reel_ids == [
+        "respiration-purpose",
+        "glycolysis",
+        "oxygen-role",
+    ]
+    assert result.degraded is False
+
+
+@pytest.mark.parametrize(
+    "hard_reason",
+    [
+        "legacy",
+        "missing_self_contained",
+        "non_standalone",
+        "overlap",
+        "chain",
+        "prerequisite",
+        "curriculum",
+    ],
+)
+def test_same_source_hard_chronology_controls_remain_conservative(
+    monkeypatch,
+    hard_reason: str,
+) -> None:
+    if hard_reason == "legacy":
+        earlier = _reel(
+            "earlier",
+            video_id="same-source",
+            start=10,
+            concept="foundation",
+        )
+        later = _reel(
+            "later",
+            video_id="same-source",
+            start=100,
+            concept="application",
+        )
+    else:
+        earlier = _trusted_independent_reel(
+            "earlier",
+            video_id="same-source",
+            start=10,
+            concept="foundation",
+        )
+        later = _trusted_independent_reel(
+            "later",
+            video_id="same-source",
+            start=100,
+            concept="application",
+        )
+    if hard_reason == "missing_self_contained":
+        earlier.pop("_selection_self_contained")
+    elif hard_reason == "non_standalone":
+        later["_selection_is_standalone"] = False
+    elif hard_reason == "overlap":
+        earlier["t_end"] = 105.0
+    elif hard_reason == "chain":
+        earlier.update(chain_id="derivation", chain_position=1)
+        later.update(chain_id="derivation", chain_position=2)
+    elif hard_reason == "prerequisite":
+        earlier["selection_candidate_id"] = "foundation-candidate"
+        later["prerequisite_ids"] = ["foundation-candidate"]
+    elif hard_reason == "curriculum":
+        foundation = _obligation("foundation", "Teach the foundation")
+        application = _obligation("application", "Teach the application")
+        edge = {
+            "before_key": foundation["key"],
+            "after_key": application["key"],
+        }
+        earlier["_selection_intent_obligations"] = [foundation]
+        later["_selection_intent_obligations"] = [application]
+        later["_selection_intent_curriculum_edges"] = [edge]
+
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result(["later", "earlier"])
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", fake_generate)
+
+    result = lesson_ordering.order_lesson_batch(
+        [later, earlier],
+        topic="Teach a foundation and its application.",
+    )
+
+    assert calls == 1
+    assert result.ordered_reel_ids == ["earlier", "later"]
+    assert result.degraded is False
+
+
+def test_degraded_independent_same_source_order_uses_timestamp_tie_break(
+    monkeypatch,
+) -> None:
+    later = _trusted_independent_reel(
+        "later",
+        video_id="same-source",
+        start=100,
+        concept="later independent unit",
+    )
+    earlier = _trusted_independent_reel(
+        "earlier",
+        video_id="same-source",
+        start=10,
+        concept="earlier independent unit",
+    )
+    calls = 0
+
+    def unavailable(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise lesson_ordering.ProviderConfigurationError(
+            "offline",
+            provider="gemini",
+            operation="ordering",
+        )
+
+    monkeypatch.setattr(lesson_ordering, "_generate_lesson_order", unavailable)
+    monkeypatch.setattr(
+        lesson_ordering.time,
+        "sleep",
+        lambda *_args, **_kwargs: pytest.fail("degraded ordering must not sleep"),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [later, earlier],
+        topic="Teach the supplied related units.",
+    )
+
+    assert calls == 1
+    assert result.ordered_reel_ids == ["earlier", "later"]
+    assert result.degraded is True
+
+
 def test_salvaged_mixed_source_plan_orders_and_dedupes_overlapping_clips(
     monkeypatch,
 ) -> None:
@@ -5113,8 +5606,8 @@ def test_lesson_order_cache_round_trips_validated_restatements(
     assert cached.prior_restatement_reel_ids == ["repeat"]
     assert cached.current_restatement_reel_ids == ["current-subset"]
     response_payload = json.loads(stored["response_json"])
-    assert response_payload["prompt_version"] == "lesson_order_v16"
-    assert response_payload["cache_version"] == 13
+    assert response_payload["prompt_version"] == "lesson_order_v18"
+    assert response_payload["cache_version"] == 15
     assert _REAL_READ_CACHED_LESSON_ORDER(
         "cache-key",
         original=reels,

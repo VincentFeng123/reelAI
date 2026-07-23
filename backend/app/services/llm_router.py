@@ -352,6 +352,7 @@ def _gemini_chat(
     max_output_tokens: int | None,
     response_schema: type[BaseModel] | None = None,
     api_key_override: str | None = None,
+    key_attempt_limit: int | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> str | None:
     global _gemini_key_offset
@@ -365,14 +366,24 @@ def _gemini_chat(
 
     from google.genai import types as genai_types
 
-    for attempt in range(len(all_keys)):
+    key_attempts = len(all_keys)
+    if key_attempt_limit is not None:
+        key_attempts = min(key_attempts, max(1, int(key_attempt_limit)))
+
+    for attempt in range(key_attempts):
         raise_if_cancelled(should_cancel)
         idx = (_gemini_key_offset + attempt) % len(all_keys) if not api_key_override else 0
         key = all_keys[idx]
         if not key:
             continue
         try:
-            client = genai_module.Client(api_key=key)
+            client_kwargs: dict[str, Any] = {"api_key": key}
+            if key_attempt_limit is not None:
+                client_kwargs["http_options"] = genai_types.HttpOptions(
+                    timeout=max(10_000, int(GEMINI_DEFAULT_TIMEOUT * 1_000)),
+                    retry_options=genai_types.HttpRetryOptions(attempts=1),
+                )
+            client = genai_module.Client(**client_kwargs)
         except Exception:
             continue
 
@@ -510,6 +521,7 @@ def chat_completion(
     groq_model: str = GROQ_DEFAULT_MODEL,
     cerebras_model: str = CEREBRAS_DEFAULT_MODEL,
     gemini_api_key_override: str | None = None,
+    gemini_key_attempt_limit: int | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> str | None:
     """Run a chat completion: Gemini first, Groq fallback.
@@ -569,6 +581,7 @@ def chat_completion(
                 response_schema=response_schema,
                 max_output_tokens=max_tokens,
                 api_key_override=gemini_api_key_override,
+                key_attempt_limit=gemini_key_attempt_limit,
                 should_cancel=should_cancel,
             )
             if out:

@@ -319,6 +319,7 @@ def _discover(
     language: str = "en",
     generation_context: GenerationContext | None = None,
     literal_topic: str | None = None,
+    source_context: str | None = None,
     use_query_planner: bool = True,
     breadth: int | None = None,
     retrieval_profile: str = "deep",
@@ -343,6 +344,8 @@ def _discover(
         "practice_fast": True,
         "retrieval_profile": retrieval_profile,
     }
+    if source_context:
+        kwargs["source_context"] = source_context
     if analysis_limit is not None:
         kwargs["analysis_limit"] = max(0, int(analysis_limit))
     if recovery_tried_queries:
@@ -924,7 +927,7 @@ def _boundary_evidence_grade(
     if (
         not isinstance(context, dict)
         or str(context.get("selection_contract_version") or "").strip()
-        != "quality_silence_v40"
+        != "quality_silence_v41"
     ):
         return 0
     if (
@@ -3939,7 +3942,7 @@ def _verified_direct_adapter_clips(
         search_context.update(
             **_concept_family_search_context(clip),
             **_intent_obligation_search_context(clip),
-            selection_contract_version="quality_silence_v40",
+            selection_contract_version="quality_silence_v41",
             **(
                 {"selection_authority": "gemini"}
                 if gemini_authoritative
@@ -4896,6 +4899,7 @@ class IngestionPipeline:
         preferred_video_duration: str = "any",
         generation_context: GenerationContext | None = None,
         literal_topic: str | None = None,
+        source_context: str | None = None,
         retrieval_profile: str = "deep",
         analyzed_video_ids: set[str] | None = None,
         retrieved_video_ids: set[str] | None = None,
@@ -4925,6 +4929,10 @@ class IngestionPipeline:
         topic = " ".join(str(topic or "").split())
         if not topic:
             raise UnsupportedSourceError("A non-blank YouTube search topic is required.")
+        source_context = " ".join(str(source_context or "").split()).strip()
+        if len(source_context) > 600:
+            source_context = source_context[:600].rsplit(" ", 1)[0].strip()
+        source_context = source_context or None
         retrieval_profile = (
             "bootstrap" if str(retrieval_profile).strip().lower() == "bootstrap" else "deep"
         )
@@ -4985,6 +4993,7 @@ class IngestionPipeline:
                 language=language,
                 generation_context=generation_context,
                 literal_topic=literal_topic or topic,
+                source_context=source_context,
                 use_query_planner=False,
                 breadth=clip_engine_config.SEARCH_BREADTH,
                 retrieval_profile=retrieval_profile,
@@ -5030,6 +5039,21 @@ class IngestionPipeline:
             dict(disc["intent_contract"])
             if isinstance(disc.get("intent_contract"), dict)
             else None
+        )
+        expected_intent_obligation_keys = (
+            clip_engine_expand.trusted_intent_obligation_keys(
+                intent_contract,
+                (
+                    disc.get("acquisition_obligation_constraint_ids")
+                    if isinstance(
+                        disc.get("acquisition_obligation_constraint_ids"),
+                        list,
+                    )
+                    else []
+                ),
+            )
+            if intent_contract is not None
+            else set()
         )
         for source_rank, discovered_video in enumerate(disc["videos"]):
             discovered_video["_retrieval_profile"] = retrieval_profile
@@ -5328,6 +5352,7 @@ class IngestionPipeline:
 
         surfaceable_candidate_ids_by_video: dict[str, set[str]] = {}
         stronger_surface_count = 0
+        covered_intent_obligation_keys: set[str] = set()
         deferred_best_effort_sequence = 0
         deferred_best_effort_candidates: list[
             tuple[
@@ -5341,6 +5366,20 @@ class IngestionPipeline:
                 ReelOutWithAttribution | None,
             ]
         ] = []
+
+        def record_accepted_intent_obligations(
+            clip: dict[str, Any],
+        ) -> None:
+            """Aggregate only versioned, Gemini-audited surfaceable objectives."""
+
+            obligation_context = _intent_obligation_search_context(clip)
+            covered_intent_obligation_keys.update(
+                str(obligation.get("key") or "").strip()
+                for obligation in obligation_context.get(
+                    "intent_obligations", []
+                )
+                if str(obligation.get("key") or "").strip()
+            )
 
         def persist_prepared_candidate(
             *,
@@ -5360,10 +5399,17 @@ class IngestionPipeline:
             if persistence_cap is not None and stored_count >= persistence_cap:
                 return None
             created_new_reel = True
+            retained_selection_context: dict[str, Any] | None = None
 
             def record_persistence_result(created: bool) -> None:
                 nonlocal created_new_reel
                 created_new_reel = created
+
+            def record_persisted_selection_context(
+                selection_context: dict[str, Any],
+            ) -> None:
+                nonlocal retained_selection_context
+                retained_selection_context = dict(selection_context)
 
             reel, _ = self._persist_engine_clip(
                 v=v,
@@ -5374,6 +5420,9 @@ class IngestionPipeline:
                 target_max=0,
                 generation_id=generation_id,
                 on_persistence_result=record_persistence_result,
+                on_persisted_selection_context=(
+                    record_persisted_selection_context
+                ),
                 should_cancel=should_cancel,
             )
             if created_new_reel:
@@ -5394,6 +5443,11 @@ class IngestionPipeline:
                 if generation_context is not None:
                     generation_context.increment_counter("deferred_clips")
                 return None
+            record_accepted_intent_obligations(
+                retained_selection_context
+                if retained_selection_context is not None
+                else clip
+            )
             retained_boundary_status = str(
                 getattr(reel, "boundary_status", "")
                 or (clip.get("search_context") or {}).get("boundary_status")
@@ -6303,6 +6357,16 @@ class IngestionPipeline:
                     candidate_deadline,
                 )
 
+        def trusted_coverage_remains_incomplete() -> bool:
+            """Keep started useful sources alive only under a trusted contract."""
+
+            return bool(
+                expected_intent_obligation_keys
+                and not expected_intent_obligation_keys.issubset(
+                    covered_intent_obligation_keys
+                )
+            )
+
         def persist_deferred_best_effort_if_needed() -> None:
             """Surface the coarse lane only after the normal source batch is empty."""
 
@@ -6624,9 +6688,14 @@ class IngestionPipeline:
                 available_count = available_surface_inventory_count()
                 if (
                     not pending
-                    and available_count < minimum_valid
-                    and available_count < inventory_cap
                     and next_index < min(len(videos), analysis_limit)
+                    and (
+                        (
+                            available_count < minimum_valid
+                            and available_count < inventory_cap
+                        )
+                        or trusted_coverage_remains_incomplete()
+                    )
                 ):
                     future = submit_video(next_index)
                     pending[future] = (next_index, videos[next_index])
@@ -6763,6 +6832,7 @@ class IngestionPipeline:
                     preferred_video_duration=preferred_video_duration,
                     generation_context=generation_context,
                     literal_topic=literal_topic,
+                    source_context=source_context,
                     retrieval_profile=retrieval_profile,
                     analyzed_video_ids=analyzed_video_ids,
                     retrieved_video_ids=retrieved_video_ids,
@@ -7094,7 +7164,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v40",
+                    selection_contract_version="quality_silence_v41",
                     **_intent_obligation_search_context(clip),
                     content_score=content_score,
                     quality_floor=quality_floor,
@@ -7300,6 +7370,9 @@ class IngestionPipeline:
         target_max: int,
         generation_id: str | None = None,
         on_persistence_result: Callable[[bool], None] | None = None,
+        on_persisted_selection_context: (
+            Callable[[dict[str, Any]], None] | None
+        ) = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> tuple[ReelOutWithAttribution, IngestMetadata]:
         """
@@ -7350,6 +7423,7 @@ class IngestionPipeline:
             ),
             clip_details=clip,
             on_persistence_result=on_persistence_result,
+            on_persisted_selection_context=on_persisted_selection_context,
             should_cancel=should_cancel,
         )
         return reel, metadata
@@ -7371,6 +7445,9 @@ class IngestionPipeline:
         clip_difficulty: float | None = None,
         clip_details: dict[str, Any] | None = None,
         on_persistence_result: Callable[[bool], None] | None = None,
+        on_persisted_selection_context: (
+            Callable[[dict[str, Any]], None] | None
+        ) = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> ReelOutWithAttribution:
         """Persist one clip, retrying only a failed PostgreSQL transaction once."""
@@ -7393,6 +7470,9 @@ class IngestionPipeline:
                     clip_difficulty=clip_difficulty,
                     clip_details=clip_details,
                     on_persistence_result=on_persistence_result,
+                    on_persisted_selection_context=(
+                        on_persisted_selection_context
+                    ),
                     should_cancel=should_cancel,
                     _transaction_state=transaction_state,
                 )
@@ -7431,6 +7511,9 @@ class IngestionPipeline:
         clip_difficulty: float | None = None,
         clip_details: dict[str, Any] | None = None,
         on_persistence_result: Callable[[bool], None] | None = None,
+        on_persisted_selection_context: (
+            Callable[[dict[str, Any]], None] | None
+        ) = None,
         should_cancel: Callable[[], bool] | None = None,
         _transaction_state: dict[str, bool] | None = None,
     ) -> ReelOutWithAttribution:
@@ -7773,6 +7856,14 @@ class IngestionPipeline:
                 )
                 if existing:
                     reel_id = existing["id"]
+                    try:
+                        retained_context = json.loads(
+                            str(existing.get("search_context_json") or "{}")
+                        )
+                    except (TypeError, json.JSONDecodeError):
+                        retained_context = {}
+                    if isinstance(retained_context, dict):
+                        selection_context = retained_context
                     # Still store metadata blob (may have changed since prior ingest).
                 else:
                     raise DatabaseIntegrityError(
@@ -7916,6 +8007,8 @@ class IngestionPipeline:
         )
         if on_persistence_result is not None:
             on_persistence_result(created_new_reel)
+        if on_persisted_selection_context is not None:
+            on_persisted_selection_context(dict(selection_context))
         return persisted_reel
 
 

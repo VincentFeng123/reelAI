@@ -1246,9 +1246,9 @@ class ReelService:
     # v47: treat legacy level-mismatch inventory as a soft ordering candidate.
     # v48: retain organizer dependency metadata in cached rows.
     # v49: retain boundary evidence and rank coarse fallback cuts last.
-    # The separate contract key below invalidates prior inventory under v40.
+    # The separate contract key below invalidates prior inventory under v41.
     RANKED_FEED_CACHE_VERSION = 49
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v40"
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v41"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
         "quality_silence_v4",
@@ -1287,6 +1287,7 @@ class ReelService:
         "quality_silence_v38",
         "quality_silence_v39",
         "quality_silence_v40",
+        "quality_silence_v41",
     })
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
@@ -1968,6 +1969,10 @@ class ReelService:
             )
             if not topic:
                 continue
+            source_context = self._concept_source_context(
+                concept,
+                strict_topic_only=strict_topic_only,
+            )
             video_budget = min(
                 MATERIAL_MAX_VIDEOS_PER_CONCEPT,
                 generation_video_limit - videos_processed,
@@ -2031,6 +2036,7 @@ class ReelService:
                         if literal_subject_tag and concept_id is None
                         else topic
                     ),
+                    source_context=source_context,
                     retrieval_profile=retrieval_profile,
                     analyzed_video_ids=analyzed_ids,
                     retrieved_video_ids=retrieved_video_ids,
@@ -2566,6 +2572,7 @@ class ReelService:
                 "quality_silence_v38",
                 "quality_silence_v39",
                 "quality_silence_v40",
+                "quality_silence_v41",
             }
             for reel in generated
         ):
@@ -2759,6 +2766,22 @@ class ReelService:
         if self._is_short_leaf_topic(topic):
             return f"{topic} in {parent}"
         return topic
+
+    def _concept_source_context(
+        self,
+        concept_row: dict,
+        *,
+        strict_topic_only: bool,
+    ) -> str | None:
+        """Return bounded source-grounded context for the existing AI expansion."""
+        if strict_topic_only:
+            return None
+        summary = self._clean_query_text(str(concept_row.get("summary") or ""))
+        if not summary:
+            return None
+        if len(summary) > 600:
+            summary = summary[:600].rsplit(" ", 1)[0].strip()
+        return summary or None
 
     @staticmethod
     def _is_short_leaf_topic(value: str) -> bool:
@@ -6460,6 +6483,7 @@ class ReelService:
                 "quality_silence_v38",
                 "quality_silence_v39",
                 "quality_silence_v40",
+                "quality_silence_v41",
             },
         )
         metadata["_selection_substantive"] = selection_bool(
@@ -6502,6 +6526,7 @@ class ReelService:
                 "quality_silence_v38",
                 "quality_silence_v39",
                 "quality_silence_v40",
+                "quality_silence_v41",
             },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
@@ -8152,6 +8177,7 @@ class ReelService:
                             "quality_silence_v38",
                             "quality_silence_v39",
                             "quality_silence_v40",
+                            "quality_silence_v41",
                         }
                         and selection_metadata.get(
                             "_selection_speech_corridor_verified"
@@ -8203,6 +8229,7 @@ class ReelService:
                     "quality_silence_v38",
                     "quality_silence_v39",
                     "quality_silence_v40",
+                    "quality_silence_v41",
                 } and (
                     (
                         min(
@@ -8252,6 +8279,7 @@ class ReelService:
                             "quality_silence_v38",
                             "quality_silence_v39",
                             "quality_silence_v40",
+                            "quality_silence_v41",
                         }
                         else self._selection_number(
                             selection_metadata.get("_selection_topic_relevance"), 0.0
@@ -8522,6 +8550,12 @@ class ReelService:
             selection_contract_version = str(
                 clean_item.get("_selection_contract_version") or ""
             ).strip()
+            selection_self_contained = clean_item.get(
+                "_selection_self_contained"
+            )
+            selection_is_standalone = clean_item.get(
+                "_selection_is_standalone"
+            )
             selection_boundary_status = str(
                 clean_item.get("_selection_boundary_status") or ""
             ).strip().casefold()
@@ -8625,6 +8659,16 @@ class ReelService:
                 clean_item["_selection_boundary_status"] = (
                     selection_boundary_status
                 )
+                if (
+                    selection_contract_version
+                    == self.RANKED_FEED_CACHE_CONTRACT_VERSION
+                ):
+                    clean_item["_selection_self_contained"] = (
+                        selection_self_contained is True
+                    )
+                    clean_item["_selection_is_standalone"] = (
+                        selection_is_standalone is True
+                    )
                 if selection_candidate_id:
                     clean_item["_selection_candidate_id"] = selection_candidate_id
                 if selection_chain_id:
@@ -8687,6 +8731,7 @@ class ReelService:
                 "quality_silence_v38",
                 "quality_silence_v39",
                 "quality_silence_v40",
+                "quality_silence_v41",
             }:
                 # V5+ captions must be immutable selection-time evidence. A
                 # provider artifact key identifies a retrieval profile and may
@@ -8740,6 +8785,7 @@ class ReelService:
                         "quality_silence_v38",
                         "quality_silence_v39",
                         "quality_silence_v40",
+                        "quality_silence_v41",
                     }
                     or transcript_artifact_key
                     else str(clean_item.get("transcript_snippet") or "")

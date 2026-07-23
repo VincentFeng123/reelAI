@@ -420,6 +420,167 @@ class MediumRegressionTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_material_intelligence_retries_until_complete_concept_summary(self) -> None:
+        service = MaterialIntelligenceService()
+        service.llm_available = True
+        service.model = "gemini-material-test"
+        complete = {
+            "concepts": [{
+                "title": "Cellular Respiration",
+                "summary": "Explain how respiration releases energy and produces ATP.",
+            }],
+            "objectives": ["Trace ATP production."],
+        }
+        with mock.patch(
+            "backend.app.services.llm_router.chat_completion",
+            side_effect=[
+                None,
+                '{"concepts":[{"title":"Cellular Respiration"}]}',
+                json.dumps(complete),
+            ],
+        ) as completion:
+            result = service._generate_payload(
+                "Cellular respiration releases energy through ATP production.",
+                "biology",
+                6,
+            )
+
+        self.assertEqual(result, complete)
+        self.assertEqual(completion.call_count, 3)
+        self.assertTrue(all(
+            call.kwargs["gemini_model"] == "gemini-material-test"
+            and call.kwargs["gemini_key_attempt_limit"] == 1
+            for call in completion.call_args_list
+        ))
+
+    def test_material_intelligence_never_dispatches_a_fourth_attempt(self) -> None:
+        service = MaterialIntelligenceService()
+        service.llm_available = True
+        with mock.patch(
+            "backend.app.services.llm_router.chat_completion",
+            side_effect=[
+                '{"concepts":[],"objectives":["Understand the topic."]}',
+                '{"concepts":[{"title":"Quicksort"}]}',
+                "{}",
+                '{"concepts":[{"title":"Must not run","summary":"Fourth call."}]}',
+            ],
+        ) as completion:
+            result = service._generate_payload(
+                "Quicksort partitions an array before recursive calls.",
+                "software",
+                6,
+            )
+
+        self.assertEqual(result, {})
+        self.assertEqual(completion.call_count, 3)
+
+    def test_material_intelligence_ignores_failed_cache_and_caches_only_success(
+        self,
+    ) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA)
+        service = MaterialIntelligenceService()
+        text = "Negligence requires duty, breach, causation, and damages."
+        cache_key = service._cache_key(text, "law", 6)
+        conn.execute(
+            "INSERT INTO llm_cache (cache_key, response_json, created_at) VALUES (?, ?, ?)",
+            (cache_key, "{}", "2026-07-12T00:00:00+00:00"),
+        )
+        complete = {
+            "concepts": [{
+                "title": "Negligence Elements",
+                "summary": "Apply duty, breach, causation, and damages to facts.",
+            }],
+            "objectives": [],
+        }
+        try:
+            with mock.patch.object(
+                service,
+                "_generate_payload",
+                side_effect=[{}, complete],
+            ) as generate:
+                self.assertEqual(
+                    service._cached_or_generate(conn, text, "law", 6),
+                    {},
+                )
+                self.assertEqual(
+                    service._cached_or_generate(conn, text, "law", 6),
+                    complete,
+                )
+                self.assertEqual(
+                    service._cached_or_generate(conn, text, "law", 6),
+                    complete,
+                )
+            self.assertEqual(generate.call_count, 2)
+            cached = conn.execute(
+                "SELECT response_json FROM llm_cache WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+            self.assertEqual(json.loads(cached["response_json"]), complete)
+        finally:
+            conn.close()
+
+    def test_material_intelligence_ignores_non_string_cached_payload(self) -> None:
+        service = MaterialIntelligenceService()
+        complete = {
+            "concepts": [{
+                "title": "Chain Rule",
+                "summary": "Derive and apply the chain rule to composite functions.",
+            }]
+        }
+        with (
+            mock.patch.object(
+                material_intelligence_module,
+                "fetch_one",
+                return_value={"response_json": None},
+            ),
+            mock.patch.object(
+                service,
+                "_generate_payload",
+                return_value=complete,
+            ),
+            mock.patch.object(material_intelligence_module, "upsert") as cache_write,
+        ):
+            result = service._cached_or_generate(
+                object(),
+                "The chain rule differentiates composite functions.",
+                "math",
+                6,
+            )
+
+        self.assertEqual(result, complete)
+        cache_write.assert_called_once()
+
+    def test_structured_headings_survive_deterministic_cross_domain_fallback(
+        self,
+    ) -> None:
+        fixtures = {
+            "physics": ("Free Body Diagrams:", "Free Body Diagrams"),
+            "biology": ("Cellular Respiration:", "Cellular Respiration"),
+            "math": ("Chain Rule:", "Chain Rule"),
+            "software": ("Quicksort Partitioning:", "Quicksort Partitioning"),
+            "law": ("Negligence Elements:", "Negligence Elements"),
+        }
+        service = MaterialIntelligenceService()
+        service.llm_available = False
+        with mock.patch(
+            "backend.app.services.concepts._extract_concepts_via_llm",
+            return_value=None,
+        ):
+            for domain, (heading, expected_title) in fixtures.items():
+                with self.subTest(domain=domain):
+                    concepts, _objectives = service.extract_concepts_and_objectives(
+                        None,
+                        f"{heading}\nA complete explanation follows in this section.",
+                        subject_tag=domain,
+                        max_concepts=6,
+                    )
+                    self.assertIn(
+                        expected_title,
+                        [concept["title"] for concept in concepts],
+                    )
+
     def test_material_intelligence_uses_only_one_concept_llm_call(self) -> None:
         service = MaterialIntelligenceService()
         service.llm_available = True

@@ -763,13 +763,8 @@ def test_schema_failure_preserves_successful_call_usage_telemetry(monkeypatch):
     assert G._exception_telemetry(exc_info.value)["dispatched"] is True
 
 
-@pytest.mark.parametrize(
-    "retry_outcome",
-    ["valid", "repeated_invalid", "empty", "complementary"],
-)
-def test_boundary_schema_retries_one_bad_topic_without_losing_valid_sibling(
+def test_boundary_schema_keeps_valid_sibling_without_retrying_bad_topic(
     monkeypatch,
-    retry_outcome,
 ):
     valid = G._CompactBoundaryTopic(
         candidate_id="candidate-alpha",
@@ -799,15 +794,6 @@ def test_boundary_schema_retries_one_bad_topic_without_losing_valid_sibling(
         objective_constraint_ids=["subject"],
         relationship_witnesses=[],
     ).model_dump(mode="json", by_alias=True)
-    complementary = {
-        **valid,
-        "id": "candidate-beta",
-        "title": "Beta lesson",
-        "obj": "Understand the complete beta lesson.",
-        "facet": "beta",
-        "family": "beta lesson concept",
-        "aliases": ["beta concept"],
-    }
     malformed = {**valid, "id": "candidate-bad", "rel": "high"}
     telemetry = GC.GeminiCallTelemetry(
         model=G.config.SEGMENT_PRO_MODEL,
@@ -827,13 +813,6 @@ def test_boundary_schema_retries_one_bad_topic_without_losing_valid_sibling(
     def repeated_partial(*_args, **_kwargs):
         nonlocal dispatches
         dispatches += 1
-        topics = [malformed, valid]
-        if dispatches == 2 and retry_outcome == "valid":
-            topics = [valid]
-        elif dispatches == 2 and retry_outcome == "empty":
-            topics = []
-        elif dispatches == 2 and retry_outcome == "complementary":
-            topics = [complementary]
         return GC.GenerationResult(
             json.dumps({
                 "request_intent": {
@@ -845,7 +824,7 @@ def test_boundary_schema_retries_one_bad_topic_without_losing_valid_sibling(
                         "requirement": "Teach the alpha lesson",
                     }],
                 },
-                "topics": topics,
+                "topics": [malformed, valid],
             }),
             telemetry,
         )
@@ -879,26 +858,15 @@ def test_boundary_schema_retries_one_bad_topic_without_losing_valid_sibling(
         topic="alpha lesson",
     )
 
-    expected_count = 2 if retry_outcome == "complementary" else 1
-    assert result.accepted_count == expected_count
-    retry_recovers = retry_outcome in {"valid", "complementary"}
-    assert result.proposed_count == (
-        expected_count if retry_recovers else 2
-    )
+    assert result.accepted_count == 1
+    assert result.proposed_count == 2
     assert result.classification == "green"
-    assert result.rejection_reasons == (
-        []
-        if retry_recovers
-        else ["proposal_0:schema_invalid:rel:float_type"]
-    )
-    assert dispatches == 2
+    assert result.rejection_reasons == [
+        "proposal_0:schema_invalid:rel:float_type",
+    ]
+    assert dispatches == 1
     assert result.calls[0]["schema_rejected_count"] == 1
-    assert result.calls[0]["partial_schema_retry_attempt"] == 1
-    assert result.calls[1]["partial_schema_retry_recovered"] is retry_recovers
-    assert result.calls[1]["partial_schema_retry_exhausted"] is (not retry_recovers)
-    assert result.calls[0].get("partial_schema_retry_retained") is (
-        None if retry_recovers else True
-    )
+    assert "partial_schema_retry_attempt" not in result.calls[0]
 
 
 def test_partial_retry_merge_is_stable_bounded_and_retry_wins_same_id():
@@ -960,7 +928,7 @@ def test_partial_retry_merge_is_stable_bounded_and_retry_wins_same_id():
     assert "candidate-40" not in {item.candidate_id for item in merged.topics}
 
 
-def test_partial_retry_merges_equivalent_intent_after_constraint_id_rename(
+def test_safe_partial_selector_skips_equivalent_intent_retry(
     monkeypatch,
 ):
     def topic(
@@ -1010,23 +978,20 @@ def test_partial_retry_merges_equivalent_intent_after_constraint_id_rename(
             }],
         }
 
-    responses = iter([
-        (
+    selector_calls = 0
+
+    def return_safe_partial(*_args, **_kwargs):
+        nonlocal selector_calls
+        selector_calls += 1
+        return (
             G._CompactBoundaryPlan(
                 request_intent=intent("subject"),
                 topics=[topic("alpha-first", 0, "first", "subject")],
             ),
             {"schema_rejection_reasons": ["proposal_1:schema_invalid"]},
-        ),
-        (
-            G._CompactBoundaryPlan(
-                request_intent=intent("topic"),
-                topics=[topic("alpha-second", 1, "second", "topic")],
-            ),
-            {},
-        ),
-    ])
-    monkeypatch.setattr(G, "_call_model", lambda *_args, **_kwargs: next(responses))
+        )
+
+    monkeypatch.setattr(G, "_call_model", return_safe_partial)
     monkeypatch.setattr(
         G,
         "_audit_pro_boundaries",
@@ -1061,12 +1026,12 @@ def test_partial_retry_merges_equivalent_intent_after_constraint_id_rename(
         topic="alpha lesson",
     )
 
-    assert result.accepted_count == 2
-    assert {clip["selection_candidate_id"] for clip in result.clips} == {
+    assert selector_calls == 1
+    assert result.accepted_count == 1
+    assert [clip["selection_candidate_id"] for clip in result.clips] == [
         "alpha-first",
-        "alpha-second",
-    }
-    assert result.calls[1]["partial_schema_retry_recovered"] is True
+    ]
+    assert "partial_schema_retry_attempt" not in result.calls[0]
 
 
 @pytest.mark.parametrize("failure", ["request_mismatch", "lexical_token_union_gap"])

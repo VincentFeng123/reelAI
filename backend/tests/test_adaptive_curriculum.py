@@ -91,7 +91,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         selection_authority: str = "gemini",
     ) -> dict:
         context = {
-            "selection_contract_version": "quality_silence_v40",
+            "selection_contract_version": "quality_silence_v41",
             "selection_authority": selection_authority,
             "concept_family_contract_version": contract_version,
             "concept_family": family,
@@ -200,7 +200,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
                     (concept_id, self.MATERIAL, title),
                 )
         family_context = {
-            "selection_contract_version": "quality_silence_v40",
+            "selection_contract_version": "quality_silence_v41",
             "selection_authority": "gemini",
             "concept_family_contract_version": "concept_family_v3",
             "concept_family": "Newton's second law of motion",

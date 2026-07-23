@@ -1766,6 +1766,7 @@ _PRO_FINAL_AUDIT_RESERVED_S = 60.0
 # transient provider failure may use this bounded second-attempt window.
 _PRO_AUDIT_RETRY_GRACE_S = 60.0
 _PRO_AUDIT_MAX_PHYSICAL_DISPATCHES = 3
+_PRO_SOURCE_MAX_PHYSICAL_DISPATCHES = 4
 _LOGICAL_CORRECTION_MAX_CODES = 8
 _LOGICAL_CORRECTION_MAX_CODE_CHARS = 64
 _LOGICAL_CORRECTION_MAX_SUFFIX_CHARS = 768
@@ -22098,36 +22099,46 @@ def _validate_model_response(
         _CompactBoundaryPlan,
         _ContractBoundCompactBoundaryPlan,
         _IntentBoundaryPlan,
+        _ProCandidateAuditPlan,
     }:
         return schema.model_validate_json(text), []
 
     payload = json.loads(text)
+    collection_key = "items" if schema is _ProCandidateAuditPlan else "topics"
     expected_keys = (
-        {"request_intent", "topics"}
-        if schema in {_CompactBoundaryPlan, _IntentBoundaryPlan}
-        else {"topics"}
+        {"items"}
+        if schema is _ProCandidateAuditPlan
+        else (
+            {"request_intent", "topics"}
+            if schema in {_CompactBoundaryPlan, _IntentBoundaryPlan}
+            else {"topics"}
+        )
     )
     if (
         not isinstance(payload, dict)
         or set(payload) != expected_keys
-        or not isinstance(payload.get("topics"), list)
+        or not isinstance(payload.get(collection_key), list)
     ):
         return schema.model_validate(payload), []
 
     request_intent: _RequestIntent | None = None
     topic_schema: type[BaseModel] = (
-        _CompactBoundaryTopic
-        if schema in {_CompactBoundaryPlan, _ContractBoundCompactBoundaryPlan}
-        else _BoundaryTopic
+        _ProCandidateAuditItem
+        if schema is _ProCandidateAuditPlan
+        else (
+            _CompactBoundaryTopic
+            if schema in {_CompactBoundaryPlan, _ContractBoundCompactBoundaryPlan}
+            else _BoundaryTopic
+        )
     )
     if schema in {_CompactBoundaryPlan, _IntentBoundaryPlan}:
         request_intent = _RequestIntent.model_validate(payload["request_intent"])
     if schema is _IntentBoundaryPlan:
         topic_schema = _IntentBoundaryTopic
 
-    topics: list[_BoundaryTopic] = []
+    topics: list[BaseModel] = []
     rejection_reasons: list[str] = []
-    for index, raw_topic in enumerate(payload["topics"]):
+    for index, raw_topic in enumerate(payload[collection_key]):
         try:
             if topic_schema is _CompactBoundaryTopic and (
                 not isinstance(raw_topic, dict)
@@ -22135,19 +22146,45 @@ def _validate_model_response(
                 or "aliases" not in raw_topic
             ):
                 raise ValueError("compact topic requires family and aliases")
+            if topic_schema is _ProCandidateAuditItem and (
+                not isinstance(raw_topic, dict)
+                or not {
+                    "t",
+                    "f",
+                    "family",
+                    "a",
+                    "direct",
+                    "ie",
+                    "oi",
+                    "rw",
+                    "ow",
+                }.issubset(raw_topic)
+            ):
+                raise ValueError("audit item requires semantic fields")
             topics.append(topic_schema.model_validate(raw_topic))
         except (ValidationError, ValueError) as exc:
             if not isinstance(exc, ValidationError):
                 rejection_reasons.append(
-                    f"proposal_{index}:schema_invalid:family:missing"
+                    (
+                        f"audit_item_{index}:schema_invalid:semantic_fields:missing"
+                        if topic_schema is _ProCandidateAuditItem
+                        else f"proposal_{index}:schema_invalid:family:missing"
+                    )
                 )
                 continue
             first_error = exc.errors(include_url=False)[0]
             location = ".".join(str(part) for part in first_error.get("loc", ()))
             rejection_reasons.append(
-                f"proposal_{index}:schema_invalid:{location or 'item'}:"
+                (
+                    f"audit_item_{index}:schema_invalid:"
+                    if topic_schema is _ProCandidateAuditItem
+                    else f"proposal_{index}:schema_invalid:"
+                )
+                + f"{location or 'item'}:"
                 f"{first_error.get('type') or 'validation_error'}"
             )
+    if schema is _ProCandidateAuditPlan:
+        return _ProCandidateAuditPlan(items=topics), rejection_reasons
     if schema is _IntentBoundaryPlan:
         assert request_intent is not None
         return _IntentBoundaryPlan(
@@ -22948,6 +22985,14 @@ def _pro_boundary_audit_output_tokens(candidate_count: int) -> int:
     )
 
 
+def _physical_dispatch_count(call: dict) -> int:
+    """Read one bounded call's real provider dispatch count."""
+    raw_count = call.get("physical_dispatches")
+    if isinstance(raw_count, int) and not isinstance(raw_count, bool):
+        return max(0, raw_count)
+    return 0 if call.get("dispatched") is False else 1
+
+
 def _audit_pro_boundaries(
     plan: _CompactBoundaryPlan,
     segments: list[dict],
@@ -22957,6 +23002,7 @@ def _audit_pro_boundaries(
     deadline: float,
     cancelled: CancelledCb,
     _retry_contract_once: bool = True,
+    _allow_contract_correction: bool = True,
     _claim_logical_quota: bool = True,
     _remaining_physical_dispatches: int = _PRO_AUDIT_MAX_PHYSICAL_DISPATCHES,
     _selector_rejection_reasons: tuple[str, ...] = (),
@@ -22987,14 +23033,9 @@ def _audit_pro_boundaries(
 
     def consume_physical_dispatches(call: dict) -> None:
         nonlocal remaining_physical_dispatches
-        raw_count = call.get("physical_dispatches")
-        if isinstance(raw_count, bool) or not isinstance(raw_count, int):
-            dispatch_count = 0 if call.get("dispatched") is False else 1
-        else:
-            dispatch_count = max(0, raw_count)
         remaining_physical_dispatches = max(
             0,
-            remaining_physical_dispatches - dispatch_count,
+            remaining_physical_dispatches - _physical_dispatch_count(call),
         )
 
     system, user, allowed = _pro_boundary_audit_prompts(
@@ -23014,10 +23055,16 @@ def _audit_pro_boundaries(
                 audit_retry_deadline = (
                     deadline + _PRO_AUDIT_RETRY_GRACE_S
                 )
+                logical_correction = (
+                    structured_attempt == 2 or not _retry_contract_once
+                )
+                call_deadline = (
+                    deadline if logical_correction else audit_retry_deadline
+                )
                 audit_initial_attempt_deadline = (
                     deadline
                     if _retry_contract_once and structured_attempt == 1
-                    else audit_retry_deadline
+                    else call_deadline
                 )
                 attempt_rejection_reasons = [
                     *_selector_rejection_reasons,
@@ -23049,7 +23096,7 @@ def _audit_pro_boundaries(
                     ),
                     max_output_tokens=audit_output_tokens,
                     timeout_s=_PRO_TIMEOUT_S,
-                    deadline_monotonic=audit_retry_deadline,
+                    deadline_monotonic=call_deadline,
                     operation="pro_boundary_audit",
                     prompt_version=_PRO_BOUNDARY_AUDIT_PROMPT_VERSION,
                     cancelled=cancelled,
@@ -23058,9 +23105,10 @@ def _audit_pro_boundaries(
                     ),
                     budget_reserve=settings.get("_segment_budget_reserve"),
                     budget_reconcile=settings.get("_segment_budget_reconcile"),
-                    max_retries=min(
-                        2,
-                        remaining_physical_dispatches - 1,
+                    max_retries=(
+                        0
+                        if logical_correction
+                        else min(2, remaining_physical_dispatches - 1)
                     ),
                     use_full_transient_retry_budget=True,
                     claim_logical_quota=(
@@ -23085,14 +23133,11 @@ def _audit_pro_boundaries(
                 calls.append(call)
                 if (
                     structured_attempt == 1
+                    and _allow_contract_correction
+                    and _retry_contract_once
                     and remaining_physical_dispatches > 0
                     and not _cancel_requested(cancelled)
-                    and (
-                        deadline
-                        + _PRO_AUDIT_RETRY_GRACE_S
-                        - time.monotonic()
-                        >= 5.0
-                    )
+                    and deadline - time.monotonic() >= 5.0
                 ):
                     continue
                 raise
@@ -23268,8 +23313,9 @@ def _audit_pro_boundaries(
             else:
                 reject_contract("audit_rejection_evidence_invalid")
             # A rejection item is not boundary authority. Invalid rejection
-            # evidence fails open to the untouched original candidate; valid
-            # rejection is applied independently of the repeated edge fields.
+            # evidence leaves the item unresolved so it is dropped or enters
+            # bounded correction; valid rejection is applied independently of
+            # the repeated edge fields.
             continue
 
         if (
@@ -23647,9 +23693,15 @@ def _audit_pro_boundaries(
                     if semantic_evidence_valid
                     else "audit_semantic_contract_invalid"
                 )
+                # A valid Pro boundary is not enough to authorize selector
+                # semantics that the independent Pro audit failed to prove.
+                # Drop only this item so a malformed sibling cannot poison
+                # independently complete audited candidates.
+                continue
         else:
             semantic_repair_retained += 1
             reject_contract("audit_semantic_fields_missing")
+            continue
         replacement = proposal.model_copy(update={
             "start_line": item.start_line,
             "end_line": item.end_line,
@@ -23665,6 +23717,7 @@ def _audit_pro_boundaries(
 
     expected_ids = set(allowed)
     resolved_indices = set(replacements) | set(rejected)
+    unresolved_indices = set(range(len(plan.topics))) - resolved_indices
     id_contract_invalid = bool(
         len(audit.items) != len(expected_ids)
         or set(id_counts) != expected_ids
@@ -23679,10 +23732,10 @@ def _audit_pro_boundaries(
     contract_invalid = bool(
         id_contract_invalid
         or returned_ids != expected_ids
-        or len(resolved_indices) != len(plan.topics)
-        or semantic_repair_retained
+        or unresolved_indices
     )
     if contract_invalid:
+        must_recover = bool(unresolved_indices and not replacements)
         if calls:
             calls[-1].update({
                 "contract_retry_reason": "invalid_audit_contract",
@@ -23690,20 +23743,26 @@ def _audit_pro_boundaries(
                     audit_contract_rejection_reasons
                 ),
                 "contract_retry_exhausted": (
-                    not _retry_contract_once
-                    or remaining_physical_dispatches == 0
+                    must_recover
+                    and (
+                        not _retry_contract_once
+                        or not _allow_contract_correction
+                        or remaining_physical_dispatches == 0
+                    )
+                ),
+                "audit_partial_contract_retained": bool(replacements),
+                "audit_partial_contract_retained_count": len(replacements),
+                "audit_partial_contract_discarded_count": len(
+                    unresolved_indices
                 ),
             })
         if (
-            _retry_contract_once
+            must_recover
+            and _retry_contract_once
+            and _allow_contract_correction
             and remaining_physical_dispatches > 0
             and not _cancel_requested(cancelled)
-            and (
-                deadline
-                + _PRO_AUDIT_RETRY_GRACE_S
-                - time.monotonic()
-                >= 5.0
-            )
+            and deadline - time.monotonic() >= 5.0
         ):
             if calls:
                 calls[-1]["contract_retry_attempt"] = 1
@@ -23717,6 +23776,7 @@ def _audit_pro_boundaries(
                         deadline=deadline,
                         cancelled=cancelled,
                         _retry_contract_once=False,
+                        _allow_contract_correction=False,
                         _claim_logical_quota=False,
                         _remaining_physical_dispatches=(
                             remaining_physical_dispatches
@@ -23747,48 +23807,50 @@ def _audit_pro_boundaries(
             if retry_calls:
                 retry_calls[0].setdefault("contract_retry_attempt", 2)
             return retried_plan, [*calls, *retry_calls], retry_rejections
-        _emit(
-            sink,
-            "candidate_audit",
-            attempted_count=len(plan.topics),
-            returned_count=len(returned_ids),
-            unexpected_id_count=len(set(id_counts) - expected_ids),
-            boundary_applied_count=0,
-            boundary_retained_count=len(plan.topics),
-            semantic_repair_applied_count=0,
-            semantic_repair_retained_count=max(
-                semantic_repair_retained,
-                len(plan.topics) - len(resolved_indices),
-            ),
-            rejected_count=0,
-            reason="invalid_audit_contract",
-        )
-        terminal = dict(calls[-1] if calls else {})
-        terminal.update({
-            "error_type": "GeminiAuditContractError",
-            "retryable": True,
-            "contract_retry_exhausted": True,
-            "audit_contract_rejection_reasons": list(
-                audit_contract_rejection_reasons
-            ),
-        })
-        audit_exc = _ModelCallError(
-            "Gemini candidate audit contract retry exhausted",
-            terminal,
-        )
-        audit_exc.selection_attempt_calls = [*calls[:-1], terminal]
-        raise audit_exc
+        if must_recover:
+            _emit(
+                sink,
+                "candidate_audit",
+                attempted_count=len(plan.topics),
+                returned_count=len(returned_ids),
+                unexpected_id_count=len(set(id_counts) - expected_ids),
+                boundary_applied_count=0,
+                boundary_retained_count=len(plan.topics),
+                semantic_repair_applied_count=0,
+                semantic_repair_retained_count=max(
+                    semantic_repair_retained,
+                    len(unresolved_indices),
+                ),
+                rejected_count=0,
+                reason="invalid_audit_contract",
+            )
+            terminal = dict(calls[-1] if calls else {})
+            terminal.update({
+                "error_type": "GeminiAuditContractError",
+                "retryable": True,
+                "contract_retry_exhausted": True,
+                "audit_contract_rejection_reasons": list(
+                    audit_contract_rejection_reasons
+                ),
+            })
+            audit_exc = _ModelCallError(
+                "Gemini candidate audit contract retry exhausted",
+                terminal,
+            )
+            audit_exc.selection_attempt_calls = [*calls[:-1], terminal]
+            raise audit_exc
     if not _retry_contract_once and calls:
         calls[-1]["contract_retry_recovered"] = True
 
     audited_topics = [
-        replacements.get(index, topic_item)
-        for index, topic_item in enumerate(plan.topics)
-        if index not in rejected
+        replacements[index] for index in sorted(replacements)
     ]
     rejection_reasons = [
         f"gemini_audit:candidate-{index + 1}:{decision.value}"
         for index, decision in sorted(rejected.items())
+    ] + [
+        f"gemini_audit:candidate-{index + 1}:invalid_contract"
+        for index in sorted(unresolved_indices)
     ]
     decision_counts = {
         decision.value: sum(value is decision for value in rejected.values())
@@ -23807,11 +23869,8 @@ def _audit_pro_boundaries(
         boundary_applied_count=sum(
             index not in rejected for index in replacements
         ),
-        boundary_retained_count=(
-            len(plan.topics) - len(rejected) - sum(
-                index not in rejected for index in replacements
-            )
-        ),
+        boundary_retained_count=0,
+        contract_discarded_count=len(unresolved_indices),
         protected_boundary_retained_count=protected_boundary_failures,
         start_diagnostic_retained_count=start_diagnostic_failures,
         audit_evidence_retained_count=audit_evidence_failures,
@@ -24002,7 +24061,11 @@ def _run_selection_profile(
             # The live Pro selector uses the full transient policy. The dormant
             # latency-sensitive Flash path retains its existing 503-only retry
             # or one Lite failover rather than multiplying both mechanisms.
-            max_retries=1 if retry_capacity_once else 0,
+            max_retries=(
+                0
+                if logical_correction_reasons
+                else (1 if retry_capacity_once else 0)
+            ),
             retry_status_codes=(
                 frozenset({503}) if retry_flash_capacity_once else None
             ),
@@ -24089,9 +24152,12 @@ def _run_selection_profile(
     first_contract_rejections = list(
         call.get("selector_contract_rejection_reasons") or []
     )
+    selector_correction_already_used = bool(calls)
     if (
         profile == PRO_BOUNDARY_PROFILE
         and (first_schema_rejections or first_contract_rejections)
+        and not parsed.topics
+        and not selector_correction_already_used
         and not _cancel_requested(cancelled)
         and selector_deadline - time.monotonic() >= 5.0
     ):
@@ -24272,6 +24338,11 @@ def _run_selection_profile(
                 if first_contract_rejections
                 else "GeminiSelectorSchemaError"
             )
+            correction_skip_reason = (
+                "correction_already_used"
+                if selector_correction_already_used
+                else "insufficient_deadline"
+            )
             call.update({
                 "partial_schema_retry_attempt": 1,
                 "partial_schema_retry_reason": (
@@ -24280,7 +24351,7 @@ def _run_selection_profile(
                     else "candidate_schema_rejection"
                 ),
                 "partial_schema_retry_exhausted": True,
-                "partial_schema_retry_skipped": "insufficient_deadline",
+                "partial_schema_retry_skipped": correction_skip_reason,
                 "error_type": selector_error_type,
                 "retryable": True,
             })
@@ -24293,17 +24364,32 @@ def _run_selection_profile(
                         and first_selector_contract.intent_error is not None
                         else "candidate_concept_family_contract"
                     ),
-                    "selector_contract_retry_skipped": "insufficient_deadline",
+                    "selector_contract_retry_skipped": correction_skip_reason,
                     "selector_contract_retry_exhausted": True,
                 })
             contract_exc = _ModelCallError(
-                "Gemini selector repair retry unavailable before deadline",
+                (
+                    "Gemini selector repair retry already consumed"
+                    if selector_correction_already_used
+                    else "Gemini selector repair retry unavailable before deadline"
+                ),
                 call,
             )
-            contract_exc.selection_attempt_calls = [call]
+            contract_exc.selection_attempt_calls = list(calls)
             raise contract_exc
     pro_audit_rejections: list[str] = []
     if profile == PRO_BOUNDARY_PROFILE and isinstance(parsed, _CompactBoundaryPlan):
+        selector_dispatches = sum(
+            _physical_dispatch_count(selector_call)
+            for selector_call in calls
+        )
+        remaining_pro_dispatches = max(
+            0,
+            min(
+                _PRO_AUDIT_MAX_PHYSICAL_DISPATCHES,
+                _PRO_SOURCE_MAX_PHYSICAL_DISPATCHES - selector_dispatches,
+            ),
+        )
         selector_audit_repair_reasons = tuple(
             str(reason)
             for selector_call in calls
@@ -24320,6 +24406,10 @@ def _run_selection_profile(
                     settings,
                     deadline=deadline,
                     cancelled=cancelled,
+                    _allow_contract_correction=(
+                        remaining_pro_dispatches > 1
+                    ),
+                    _remaining_physical_dispatches=remaining_pro_dispatches,
                     _selector_rejection_reasons=(
                         selector_audit_repair_reasons
                     ),

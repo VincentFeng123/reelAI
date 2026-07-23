@@ -104,6 +104,45 @@ class ConceptTopicQueryTests(unittest.TestCase):
         self.assertEqual(svc._concept_topic_query(_row("", ["diffusion"])), "")
         self.assertEqual(svc._concept_topic_query(_row("   ", ["diffusion"])), "")
 
+    def test_source_context_is_bounded_and_domain_agnostic(self) -> None:
+        svc = _svc()
+        summaries = {
+            "physics": "Relate net force to acceleration and solve incline problems.",
+            "biology": "Trace glycolysis through ATP production in respiration.",
+            "math": "Derive the chain rule and apply it to composite functions.",
+            "software": "Explain quicksort partitioning and trace recursive calls.",
+            "law": "Apply duty, breach, causation, and damages to a fact pattern.",
+        }
+        for domain, summary in summaries.items():
+            with self.subTest(domain=domain):
+                self.assertEqual(
+                    svc._concept_source_context(
+                        {"summary": f"  {summary}\n"},
+                        strict_topic_only=False,
+                    ),
+                    summary,
+                )
+
+        self.assertIsNone(
+            svc._concept_source_context(
+                {"summary": summaries["physics"]},
+                strict_topic_only=True,
+            )
+        )
+        self.assertIsNone(
+            svc._concept_source_context(
+                {"summary": " \n "},
+                strict_topic_only=False,
+            )
+        )
+        bounded = svc._concept_source_context(
+            {"summary": "context " * 120},
+            strict_topic_only=False,
+        )
+        self.assertIsNotNone(bounded)
+        self.assertLessEqual(len(bounded), 600)
+        self.assertFalse(bounded.endswith("contex"))
+
     # ------------------------------------------------------------------
     # Bonus: ingestion_pipeline param is stored
     # ------------------------------------------------------------------

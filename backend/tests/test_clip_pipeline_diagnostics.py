@@ -6465,7 +6465,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
 ) -> None:
     strict_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v40",
+        "selection_contract_version": "quality_silence_v41",
         "speech_corridor_verified": True,
         "boundary_status": "verified",
         "boundary_diagnostics": {
@@ -6475,7 +6475,7 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
     }
     transcript_current = {
         "surface_eligible": True,
-        "selection_contract_version": "quality_silence_v40",
+        "selection_contract_version": "quality_silence_v41",
         "speech_corridor_verified": True,
         "boundary_status": "context_aligned",
         "selection_caption_cues": [
@@ -6538,7 +6538,7 @@ def test_failed_boundary_storage_does_not_consume_ready_material_cap(
     deferred.append({
         "search_context_json": json.dumps({
             "surface_eligible": True,
-            "selection_contract_version": "quality_silence_v40",
+            "selection_contract_version": "quality_silence_v41",
             "speech_corridor_verified": True,
             "boundary_status": "verified",
             "boundary_diagnostics": {
@@ -7405,7 +7405,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v40"
+        assert context["selection_contract_version"] == "quality_silence_v41"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"
@@ -7992,6 +7992,9 @@ def test_zero_clip_batch_uses_bounded_novel_source_recovery(
     recovery_count: int,
 ) -> None:
     topic = "Intro to Python"
+    source_context = (
+        "Explain function calls before tracing a recursive Python example."
+    )
     tried_queries = [topic, "Python functions tutorial"]
     initial_videos = [
         {
@@ -8068,10 +8071,15 @@ def test_zero_clip_batch_uses_bounded_novel_source_recovery(
         max_videos=10,
         max_reels=1,
         generation_context=context,
+        source_context=source_context,
         retrieval_profile="deep",
     )
 
     assert len(discovery_calls) == 2
+    assert [call["source_context"] for call in discovery_calls] == [
+        source_context,
+        source_context,
+    ]
     assert discovery_calls[0]["analysis_limit"] == initial_count
     assert discovery_calls[1]["analysis_limit"] == recovery_count
     assert len(analyzed) == initial_count + recovery_count

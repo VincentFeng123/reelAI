@@ -1003,8 +1003,28 @@ def requeue_retryable_failure(
         raise ValueError("expected_attempt_count must be positive")
     now_dt = _utc_now(now)
     timestamp = now_dt.isoformat()
+    retry_error_code = ""
+    if isinstance(usage, dict):
+        retry_errors = usage.get("retry_errors")
+        if isinstance(retry_errors, list) and retry_errors:
+            latest_error = retry_errors[-1]
+            if isinstance(latest_error, dict):
+                retry_error_code = str(latest_error.get("code") or "").strip()
+    default_rate_limit_delay = (
+        min(
+            MAX_DURABLE_RETRY_AFTER_SECONDS,
+            5.0 * (3.0 ** max(0, attempt_count - 1)),
+        )
+        if retry_after_sec is None
+        and retry_error_code == "provider_rate_limited"
+        else 0.0
+    )
     try:
-        retry_delay = float(retry_after_sec or 0.0)
+        retry_delay = float(
+            default_rate_limit_delay
+            if retry_after_sec is None
+            else retry_after_sec
+        )
     except (TypeError, ValueError, OverflowError):
         retry_delay = 0.0
     if not math.isfinite(retry_delay):

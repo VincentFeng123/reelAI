@@ -554,6 +554,10 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             ingest_topic.call_args.kwargs["topic"],
             "Cellular respiration",
         )
+        self.assertEqual(
+            ingest_topic.call_args.kwargs["source_context"],
+            "How cells release energy.",
+        )
 
     def test_explicit_concept_generation_keeps_concept_as_literal_topic(self) -> None:
         with db_module.get_conn(transactional=True) as conn:
@@ -580,6 +584,10 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertEqual(
             ingest_topic.call_args.kwargs["literal_topic"],
             "Cellular respiration",
+        )
+        self.assertEqual(
+            ingest_topic.call_args.kwargs["source_context"],
+            "How cells release energy.",
         )
 
     def test_acronym_leaf_search_keeps_parent_topic_and_avoids_sap_atp(self) -> None:
@@ -914,7 +922,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertEqual(len(feed), 2)
         self.assertTrue(all(
-            reel.get("selection_contract_version") == "quality_silence_v40"
+            reel.get("selection_contract_version") == "quality_silence_v41"
             for reel in feed
         ))
 
@@ -1017,7 +1025,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 concept_title=concept["title"],
                 video_url=f"https://www.youtube.com/embed/{reel_id}",
                 difficulty=difficulty,
-                selection_contract_version="quality_silence_v40",
+                selection_contract_version="quality_silence_v41",
                 boundary_status=boundary_status,
                 selection_topic_relevance=0.9,
                 selection_quality_floor=0.9,
@@ -1459,7 +1467,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 49)
         self.assertEqual(
             main_module.reel_service.RANKED_FEED_CACHE_CONTRACT_VERSION,
-            "quality_silence_v40",
+            "quality_silence_v41",
         )
         self.assertIn(
             "quality_silence_v27",

@@ -14608,7 +14608,7 @@ def test_pro_boundary_audit_retries_one_schema_failure(
         attempted_levels.append(kwargs["thinking_level"])
         attempted_users.append(user)
         assert kwargs["operation"] == "pro_boundary_audit"
-        assert kwargs["max_retries"] == (2 if attempted == 1 else 1)
+        assert kwargs["max_retries"] == (2 if attempted == 1 else 0)
         assert kwargs["use_full_transient_retry_budget"] is True
         assert kwargs.get("retry_status_codes") is None
         telemetry = {
@@ -14816,7 +14816,7 @@ def test_pro_boundary_audit_recursive_contract_recovery_shares_dispatch_budget(
     assert calls[1]["structured_retry_exhausted"] is True
 
 
-def test_pro_boundary_audit_contract_retry_uses_grace_after_original_deadline(
+def test_pro_boundary_audit_contract_retry_does_not_start_after_original_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = "Bayes' theorem"
@@ -14878,29 +14878,23 @@ def test_pro_boundary_audit_contract_retry_uses_grace_after_original_deadline(
 
     monkeypatch.setattr(gemini_segment.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(gemini_segment, "_call_model", invalid_then_valid)
-    audited, calls, rejections = gemini_segment._audit_pro_boundaries(
-        plan,
-        segments,
-        request,
-        {},
-        deadline=101.0,
-        cancelled=None,
-    )
+    with pytest.raises(gemini_segment._ModelCallError) as exc_info:
+        gemini_segment._audit_pro_boundaries(
+            plan,
+            segments,
+            request,
+            {},
+            deadline=101.0,
+            cancelled=None,
+        )
 
-    assert attempts == 2
+    assert attempts == 1
     assert deadlines == [
         (101.0 + gemini_segment._PRO_AUDIT_RETRY_GRACE_S, 101.0),
-        (
-            101.0 + gemini_segment._PRO_AUDIT_RETRY_GRACE_S,
-            101.0 + gemini_segment._PRO_AUDIT_RETRY_GRACE_S,
-        ),
     ]
-    assert len(calls) == 2
-    assert calls[0]["contract_retry_attempt"] == 1
-    assert calls[1]["contract_retry_attempt"] == 2
-    assert calls[1]["contract_retry_recovered"] is True
-    assert len(audited.topics) == 1
-    assert rejections == []
+    [call] = exc_info.value.selection_attempt_calls
+    assert call["contract_retry_exhausted"] is True
+    assert "contract_retry_attempt" not in call
 
 
 def test_pro_boundary_audit_can_repair_beyond_two_coarse_cues(
@@ -15469,7 +15463,7 @@ def test_pro_candidate_audit_contract_retry_recovers_valid_second_response(
     assert calls[1]["contract_retry_recovered"] is True
 
 
-def test_pro_candidate_audit_retries_extra_unknown_id_then_exhausts(
+def test_pro_candidate_audit_keeps_valid_item_despite_extra_unknown_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = "Explain Newton's second law F=ma"
@@ -15511,21 +15505,205 @@ def test_pro_candidate_audit_retries_extra_unknown_id_then_exhausts(
         }
 
     monkeypatch.setattr(gemini_segment, "_call_model", extra_id_audit)
-    with pytest.raises(gemini_segment._ModelCallError) as exc_info:
-        gemini_segment._audit_pro_boundaries(
-            plan,
-            segments,
-            request,
-            {},
-            deadline=time.monotonic() + 10.0,
-            cancelled=None,
-        )
-    calls = exc_info.value.selection_attempt_calls
+    audited, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
 
-    assert attempts == 2
-    assert calls[0]["contract_retry_attempt"] == 1
-    assert calls[1]["contract_retry_attempt"] == 2
-    assert calls[1]["contract_retry_exhausted"] is True
+    assert attempts == 1
+    assert len(audited.topics) == 1
+    assert audited.topics[0].learning_objective == (
+        "Explain Newton's second law as F=ma"
+    )
+    assert rejections == []
+    assert calls[0]["audit_partial_contract_retained"] is True
+    assert calls[0]["audit_partial_contract_retained_count"] == 1
+
+
+def test_pro_audit_response_schema_salvages_valid_items_independently() -> None:
+    request = "cellular respiration"
+    claim = "Glycolysis splits glucose into pyruvate while producing ATP"
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="Glycolysis splits glucose",
+        end_quote="pyruvate while producing ATP",
+        claim_quote=claim,
+    )
+    valid_item = {
+        **_pro_audit_semantic_defaults(plan, evidence_quote=claim),
+        "id": "candidate-1",
+        "d": "keep",
+        "obj": "Explain the products of glycolysis",
+        "ev": claim,
+        "ds": 0,
+        "dq": "Glycolysis splits glucose",
+        "dc": True,
+        "s": 0,
+        "e": 0,
+        "sq": "Glycolysis splits glucose",
+        "eq": "pyruvate while producing ATP",
+    }
+    malformed_sibling = {
+        key: value
+        for key, value in valid_item.items()
+        if key != "family"
+    }
+    malformed_sibling["id"] = "candidate-2"
+
+    parsed, rejections = gemini_segment._validate_model_response(
+        gemini_segment._ProCandidateAuditPlan,
+        json.dumps({"items": [valid_item, malformed_sibling]}),
+    )
+
+    assert isinstance(parsed, gemini_segment._ProCandidateAuditPlan)
+    assert [item.candidate_id for item in parsed.items] == ["candidate-1"]
+    assert rejections == [
+        "audit_item_1:schema_invalid:semantic_fields:missing",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("learning_request", "claim"),
+    [
+        (
+            "Newton's second law",
+            "Net force equals mass times acceleration for this object",
+        ),
+        (
+            "cellular respiration",
+            "Glycolysis splits glucose into pyruvate while producing ATP",
+        ),
+        (
+            "derivatives",
+            "The derivative gives the instantaneous rate of change",
+        ),
+        (
+            "Python exception handling",
+            "A Python try block catches exceptions with except",
+        ),
+        (
+            "negligence law",
+            "Negligence requires duty breach causation and resulting damages",
+        ),
+    ],
+)
+def test_pro_audit_keeps_complete_candidate_when_sibling_semantics_are_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+    learning_request: str,
+    claim: str,
+) -> None:
+    claim_words = claim.split()
+    sibling_claim = (
+        "A related worked example applies the same concept correctly"
+    )
+    sibling_words = sibling_claim.split()
+    base_plan = _compact_custom_plan(
+        request=learning_request,
+        start_quote=" ".join(claim_words[:4]),
+        end_quote=" ".join(claim_words[-4:]),
+        claim_quote=claim,
+    )
+    first = base_plan.topics[0].model_copy(
+        update={"candidate_id": "safe-candidate"},
+    )
+    sibling = base_plan.topics[0].model_copy(update={
+        "candidate_id": "invalid-sibling",
+        "start_line": 1,
+        "end_line": 1,
+        "start_quote": " ".join(sibling_words[:4]),
+        "end_quote": " ".join(sibling_words[-4:]),
+        "claim_quote": sibling_claim,
+    })
+    plan = base_plan.model_copy(update={"topics": [first, sibling]})
+    segments = [
+        {"cue_id": "cue-0", "start": 0.0, "end": 8.0, "text": f"{claim}."},
+        {
+            "cue_id": "cue-1",
+            "start": 8.0,
+            "end": 16.0,
+            "text": f"{sibling_claim}.",
+        },
+    ]
+    valid_item = {
+        **_pro_audit_semantic_defaults(plan, evidence_quote=claim),
+        "id": "candidate-1",
+        "d": "keep",
+        "obj": f"Explain {learning_request}",
+        "ev": claim,
+        "ds": 0,
+        "dq": " ".join(claim_words[:4]),
+        "dc": True,
+        "s": 0,
+        "e": 0,
+        "sq": " ".join(claim_words[:4]),
+        "eq": " ".join(claim_words[-4:]),
+    }
+    invalid_sibling = {
+        "id": "candidate-2",
+        "d": "keep",
+        "obj": f"Apply {learning_request}",
+        "ev": sibling_claim,
+        "ds": 1,
+        "dq": " ".join(sibling_words[:4]),
+        "dc": True,
+        "s": 1,
+        "e": 1,
+        "sq": " ".join(sibling_words[:4]),
+        "eq": " ".join(sibling_words[-4:]),
+    }
+    audit = gemini_segment._ProCandidateAuditPlan(
+        items=[valid_item, invalid_sibling],
+    )
+    audit_attempts = 0
+
+    def selector_then_audit(_system, _user, schema, **_kwargs):
+        nonlocal audit_attempts
+        if schema is gemini_segment._CompactBoundaryPlan:
+            return plan, {
+                "model": "gemini-3.1-pro-preview",
+                "operation": "pro_authoritative",
+                "physical_dispatches": 1,
+            }
+        audit_attempts += 1
+        return audit, {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_boundary_audit",
+            "physical_dispatches": 1,
+        }
+
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        selector_then_audit,
+    )
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": segments,
+            "words": [],
+            "source": "supadata",
+        },
+        {},
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic=learning_request,
+    )
+
+    assert result.error is None
+    assert audit_attempts == 1
+    assert len(result.calls) == 2
+    assert result.accepted_count == 1
+    assert [clip["selection_candidate_id"] for clip in result.clips] == [
+        "safe-candidate",
+    ]
+    assert result.rejection_reasons == [
+        "gemini_audit:candidate-2:invalid_contract",
+    ]
+    assert result.calls[1]["audit_partial_contract_retained"] is True
+    assert result.calls[1]["audit_partial_contract_retained_count"] == 1
+    assert result.calls[1]["audit_partial_contract_discarded_count"] == 1
 
 
 def test_pro_candidate_audit_uses_ai_family_without_semantic_retry(
@@ -16670,6 +16848,80 @@ def test_valid_semantic_empty_without_retry_time_remains_successful(
     assert "selector_contract_retry_attempt" not in result.calls[0]
 
 
+def test_valid_selector_candidate_skips_malformed_sibling_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "photosynthesis"
+    claim = "Plants convert light into stored chemical energy through photosynthesis"
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="Plants convert light",
+        end_quote="energy through photosynthesis",
+        claim_quote=claim,
+    )
+    audit = gemini_segment._ProCandidateAuditPlan(items=[{
+        **_pro_audit_semantic_defaults(plan, evidence_quote=claim),
+        "id": "candidate-1",
+        "d": "keep",
+        "obj": "Explain how photosynthesis stores captured light energy",
+        "ev": claim,
+        "ds": 0,
+        "dq": "Plants convert light",
+        "dc": True,
+        "s": 0,
+        "e": 0,
+        "sq": "Plants convert light",
+        "eq": "energy through photosynthesis",
+    }])
+    dispatched_schemas: list[type[object]] = []
+
+    def return_selector_then_audit(_system, _user, schema, **_kwargs):
+        dispatched_schemas.append(schema)
+        if schema is gemini_segment._CompactBoundaryPlan:
+            return plan, {
+                "model": "gemini-3.1-pro-preview",
+                "operation": "pro_authoritative",
+                "physical_dispatches": 1,
+                "schema_rejection_reasons": [
+                    "proposal_1:schema_invalid:family:missing",
+                ],
+            }
+        return audit, {
+            "model": "gemini-3.1-pro-preview",
+            "operation": "pro_boundary_audit",
+            "physical_dispatches": 1,
+        }
+
+    monkeypatch.setattr(
+        gemini_segment,
+        "_call_model",
+        return_selector_then_audit,
+    )
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "cue-0",
+                "start": 0.0,
+                "end": 8.0,
+                "text": f"{claim}.",
+            }],
+            "words": [],
+            "source": "supadata",
+        },
+        {},
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic=request,
+    )
+
+    assert result.error is None
+    assert result.accepted_count == 1
+    assert dispatched_schemas == [
+        gemini_segment._CompactBoundaryPlan,
+        gemini_segment._ProCandidateAuditPlan,
+    ]
+    assert "partial_schema_retry_attempt" not in result.calls[0]
+
+
 def test_repeated_invalid_selector_contract_is_operational_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -16902,9 +17154,86 @@ def test_contract_retry_reuses_logical_selector_slot_at_three_source_cap(
         gemini_segment._ProCandidateAuditPlan,
         gemini_segment._ProCandidateAuditPlan,
     ]
+    assert len(dispatched_schemas) == (
+        gemini_segment._PRO_SOURCE_MAX_PHYSICAL_DISPATCHES
+    )
+    assert sum(
+        int(call.get("physical_dispatches") or 0)
+        for call in result.calls
+    ) == gemini_segment._PRO_SOURCE_MAX_PHYSICAL_DISPATCHES
     budget = context.budget.snapshot()["gemini"]
     assert budget["selector_calls"] == 3
     assert budget["boundary_audit_calls"] == 1
+
+
+def test_source_dispatch_cap_blocks_second_selector_correction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "photosynthesis"
+    claim = "Plants convert light into stored chemical energy through photosynthesis"
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="Plants convert light",
+        end_quote="energy through photosynthesis",
+        claim_quote=claim,
+    )
+    empty = plan.model_copy(update={"topics": []})
+    dispatched_schemas: list[type[object]] = []
+
+    def staged_selector(_system, _user, schema, **_kwargs):
+        dispatched_schemas.append(schema)
+        if len(dispatched_schemas) == 1:
+            raise gemini_segment._SchemaResponseError(
+                "invalid selector response",
+                {
+                    "model": "gemini-3.1-pro-preview",
+                    "operation": "pro_authoritative",
+                    "physical_dispatches": 2,
+                },
+            )
+        if len(dispatched_schemas) == 2:
+            return empty, {
+                "model": "gemini-3.1-pro-preview",
+                "operation": "pro_authoritative",
+                "physical_dispatches": 1,
+                "schema_rejection_reasons": [
+                    "proposal_0:schema_invalid:family:missing",
+                ],
+            }
+        pytest.fail("a second selector correction bypassed the source cap")
+
+    monkeypatch.setattr(gemini_segment, "_call_model", staged_selector)
+    result = gemini_segment.run_segment_profile(
+        {
+            "segments": [{
+                "cue_id": "cue-0",
+                "start": 0.0,
+                "end": 8.0,
+                "text": f"{claim}.",
+            }],
+            "words": [],
+            "source": "supadata",
+        },
+        {},
+        gemini_segment.PRO_BOUNDARY_PROFILE,
+        topic=request,
+    )
+
+    assert result.accepted_count == 0
+    assert result.error == (
+        "GeminiSelectorSchemaError: Gemini model call failed"
+    )
+    assert dispatched_schemas == [
+        gemini_segment._CompactBoundaryPlan,
+        gemini_segment._CompactBoundaryPlan,
+    ]
+    assert sum(
+        int(call.get("physical_dispatches") or 0)
+        for call in result.calls
+    ) == 3
+    assert result.calls[-1]["partial_schema_retry_skipped"] == (
+        "correction_already_used"
+    )
 
 
 def test_long_preferred_video_url_dispatches_one_pro_transcript_only_call(
