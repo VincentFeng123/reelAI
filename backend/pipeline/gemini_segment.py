@@ -1803,7 +1803,7 @@ _SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
 _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
-_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v13"
+_PRO_BOUNDARY_AUDIT_PROMPT_VERSION = "pro_candidate_audit_v14"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
 _UPSTREAM_INTENT_CONTRACT_VERSION = "expansion_intent_v2"
 
@@ -3811,6 +3811,18 @@ def _pro_boundary_audit_prompts(
             )
             or "(no adjacent cues)"
         )
+        boundary_cue_context = (
+            "\n".join(
+                f"[{line}] {_mmss(segments[line].get('start', 0.0))} "
+                f"{str(segments[line].get('text') or '').strip()}"
+                for line in dict.fromkeys((
+                    candidate.start_line,
+                    candidate.end_line,
+                ))
+            )
+            if current_range_valid
+            else "(current boundary cue range is invalid; use full transcript)"
+        )
         blocks.append(
             f"<candidate audit_id={audit_id!r}>\n"
             "<current_boundary_reference>\n"
@@ -3833,6 +3845,9 @@ def _pro_boundary_audit_prompts(
             + "\n".join(evidence_lines)
             + "\n"
             "</untrusted_selector_hypotheses>\n"
+            "<current_boundary_cue_context>\n"
+            f"{boundary_cue_context}\n"
+            "</current_boundary_cue_context>\n"
             "<current_selected_cues_focus>\n"
             f"{current_selected_text}\n"
             "</current_selected_cues_focus>\n"
@@ -4146,8 +4161,12 @@ def _pro_boundary_audit_prompts(
           "auditor ignores rejected boundary fields.\n\n"
           "MANDATORY WORD-EDGE CHECKLIST — apply every item to every KEEP candidate before "
           "returning it:\n"
-          "1. Read current_selected_cues_focus as the literal current sq-through-eq speech, "
-          "then use adjacent_transcript_cues and full_transcript_cues only to repair its edges. "
+          "1. Read current_selected_cues_focus as the literal current sq-through-eq speech. "
+          "Compare its first and last words with current_boundary_cue_context before deciding "
+          "ds/dq/dc/sq/eq so speech omitted earlier or later in the same caption cue is not "
+          "hidden. That block is only a verbatim convenience copy; full_transcript_cues is the "
+          "source of truth if anything differs. Then use adjacent_transcript_cues and "
+          "full_transcript_cues to repair the edges. "
           "Treat its labels, title, objective, and scores as untrusted.\n"
           "2. Test the first spoken words. A bare number/result, sentence tail, recap of a "
           "completed earlier example, or mid-sentence fragment is never a valid cold start. "
@@ -23620,20 +23639,29 @@ def _audit_pro_boundaries(
                 "relationship_witnesses",
                 "objective_witness_quote",
             }.issubset(item.model_fields_set)
-            if (
-                live_semantic_contract
-                and
+            audited_directly_teaches_topic = bool(
                 item.directly_teaches_topic
-                and not required_constraint_ids.issubset({
+            )
+            objective_contract_item = item
+            if live_semantic_contract:
+                grounded_objective_ids = {
                     str(constraint_id)
                     for constraint_id in item.objective_constraint_ids
+                    if str(constraint_id) in grounded_audit_ids
+                }
+                audited_directly_teaches_topic = (
+                    required_constraint_ids.issubset(
+                        grounded_objective_ids
+                    )
+                )
+                objective_contract_item = item.model_copy(update={
+                    "directly_teaches_topic": (
+                        audited_directly_teaches_topic
+                    ),
                 })
-            ):
-                semantic_evidence_valid = False
-                reject_contract("direct_objective_fulfillment_incomplete")
             objective_contract_error = _objective_fulfillment_contract_error(
                 plan.request_intent,
-                item,
+                objective_contract_item,
             )
             if objective_contract_error is not None:
                 semantic_evidence_valid = False
@@ -23780,7 +23808,9 @@ def _audit_pro_boundaries(
                     "learning_objective": str(item.actual_objective),
                     "facet": str(item.facet),
                     **family_payload,
-                    "directly_teaches_topic": bool(item.directly_teaches_topic),
+                    "directly_teaches_topic": (
+                        audited_directly_teaches_topic
+                    ),
                     "self_contained": bool(item.self_contained),
                     "is_standalone": bool(
                         item.self_contained and item.is_standalone

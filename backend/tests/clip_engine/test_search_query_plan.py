@@ -845,6 +845,70 @@ def test_candidate_cap_reserves_canonical_correction_before_ai_subtopics() -> No
     ]
 
 
+@pytest.mark.parametrize("domain", ["calculus", "biology", "software", "law"])
+def test_objective_analysis_prefix_prefers_provider_retrieval_evidence_without_reordering_tail(
+    domain: str,
+) -> None:
+    objective_keys = [f"io:{domain}:{index}" for index in range(3)]
+    popular_drift = [
+        {
+            "id": f"{domain}-popular-drift-{index}",
+            "duration": 600,
+            "literal_match": False,
+            "retrieval_score": 0.35 + index * 0.01,
+            "matched_focused_intent_obligation_keys": [objective_key],
+        }
+        for index, objective_key in enumerate(objective_keys)
+    ]
+    direct_provider_results = [
+        {
+            "id": f"{domain}-direct-provider-{index}",
+            "duration": 600,
+            "literal_match": False,
+            "retrieval_score": 0.75 - index * 0.01,
+            "matched_focused_intent_obligation_keys": [objective_key],
+        }
+        for index, objective_key in enumerate(objective_keys)
+    ]
+
+    selected = search._select_ranked_candidates(
+        [*popular_drift, *direct_provider_results],
+        limit=6,
+        excluded=set(),
+        analysis_prefix=3,
+    )
+
+    assert [video["id"] for video in selected[:3]] == [
+        f"{domain}-direct-provider-{index}" for index in range(3)
+    ]
+    assert [video["id"] for video in selected[3:]] == [
+        f"{domain}-popular-drift-{index}" for index in range(3)
+    ]
+
+
+def test_objective_analysis_prefix_preserves_legacy_order_without_retrieval_scores() -> None:
+    ranked = [
+        {
+            "id": f"legacy-{index}",
+            "duration": 600,
+            "literal_match": False,
+            "matched_focused_intent_obligation_keys": [f"io:{index}"],
+        }
+        for index in range(4)
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=4,
+        excluded=set(),
+        analysis_prefix=3,
+    )
+
+    assert [video["id"] for video in selected] == [
+        f"legacy-{index}" for index in range(4)
+    ]
+
+
 def test_hash_embedding_never_supplies_semantic_relevance_proof() -> None:
     class HashOnlyEmbedding:
         dim = 256

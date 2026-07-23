@@ -215,6 +215,25 @@ def _select_ranked_candidates(
         if eligible
         else set()
     )
+    objective_order = eligible
+    if available_uncovered_keys:
+        def retrieval_priority(video: dict) -> tuple[bool, float]:
+            try:
+                score = float(video["retrieval_score"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return False, 0.0
+            if not 0.0 <= score <= 1.0:
+                return False, 0.0
+            return True, score
+
+        # Supadata provider rank is already represented in retrieval_score.
+        # Use it only for the scarce objective-analysis prefix; the final tail
+        # is still appended from ``eligible`` in its original stable order.
+        objective_order = sorted(
+            eligible,
+            key=retrieval_priority,
+            reverse=True,
+        )
     short_source_ids: set[str] = set()
     for video in eligible:
         try:
@@ -227,7 +246,7 @@ def _select_ranked_candidates(
     objective_candidates: list[dict] = []
     represented_keys: set[str] = set()
     if available_uncovered_keys:
-        for video in eligible:
+        for video in objective_order:
             if str(video.get("id") or "") not in short_source_ids:
                 continue
             video_keys = (
@@ -248,10 +267,14 @@ def _select_ranked_candidates(
             for video in objective_candidates
             if str(video.get("id") or "") not in focus_ids
         )
+    focus_ids = {str(video.get("id") or "") for video in focus_window}
     focused = [
         video
-        for video in focus_window
-        if str(video.get("id") or "") in short_source_ids
+        for video in objective_order
+        if (
+            str(video.get("id") or "") in focus_ids
+            and str(video.get("id") or "") in short_source_ids
+        )
     ]
     if (
         len(focused) < prefix_limit
@@ -282,7 +305,7 @@ def _select_ranked_candidates(
         and not available_uncovered_keys.issubset(represented_keys)
     ):
         focused_ids = {str(video.get("id") or "") for video in focused}
-        for video in eligible:
+        for video in objective_order:
             video_id = str(video.get("id") or "")
             if video_id in short_source_ids or video_id in focused_ids:
                 continue

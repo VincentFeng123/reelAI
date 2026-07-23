@@ -292,7 +292,7 @@ def test_practice_fast_expansion_requests_focused_sources() -> None:
     prompt = " ".join(expand._PRACTICE_FAST_SYSTEM.casefold().split())
 
     assert expand.PRACTICE_FAST_EXPAND_CACHE_VERSION == 15
-    assert expand.PRACTICE_FAST_EXPAND_OUTPUT_TOKENS == 2_048
+    assert expand.PRACTICE_FAST_EXPAND_OUTPUT_TOKENS == 4_096
     assert "one concise, standalone, intent-preserving learning summary" in prompt
     assert "must make sense without the original request" in prompt
     assert "must be at most 200 characters" in prompt
@@ -1686,7 +1686,7 @@ def test_successful_expansion_dispatch_is_not_double_recorded(monkeypatch):
     config = seen["config"]
     assert str(config.thinking_config.thinking_level).casefold().endswith("low")
     assert config.temperature is None
-    assert config.max_output_tokens == 2_048
+    assert config.max_output_tokens == 4_096
     schema = config.response_json_schema
     serialized_schema = json.dumps(schema)
     assert "additionalProperties" not in serialized_schema
@@ -1734,6 +1734,15 @@ def test_fallback_expansion_gets_failure_only_output_headroom(monkeypatch):
     )
 
     assert seen["config"].max_output_tokens == 4_096
+
+
+def test_primary_expansion_keeps_three_attempts_with_full_contract_headroom() -> None:
+    assert expand.PRACTICE_FAST_EXPAND_OUTPUT_TOKENS == 4_096
+    assert (
+        expand.PRACTICE_FAST_EXPAND_OUTPUT_TOKENS
+        == expand.PRACTICE_FAST_EXPAND_FALLBACK_OUTPUT_TOKENS
+    )
+    assert expand.PRACTICE_FAST_EXPAND_ATTEMPTS == 3
 
 
 def test_zero_result_recovery_prompt_includes_exact_request_tried_queries_and_signal(

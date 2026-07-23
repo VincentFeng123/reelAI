@@ -206,6 +206,46 @@ def test_generation_context_preserves_selector_retry_diagnostics() -> None:
     assert {name: metadata[name] for name in diagnostics} == diagnostics
 
 
+def test_generation_context_preserves_audit_retry_diagnostics() -> None:
+    context = GenerationContext("slow", generation_id="job-audit-diagnostics")
+    diagnostics = {
+        "selector_audit_repair_count": 1,
+        "selector_audit_repair_reasons": [
+            "direct_objective_fulfillment_incomplete",
+        ],
+        "structured_retry_attempt": 2,
+        "structured_retry_reason": "invalid_structured_response",
+        "structured_retry_recovered": False,
+        "structured_retry_exhausted": True,
+        "contract_retry_attempt": 2,
+        "contract_retry_reason": "invalid_audit_contract",
+        "contract_retry_recovered": False,
+        "contract_retry_exhausted": True,
+        "audit_error_type": "ValidationError",
+        "audit_contract_rejection_reasons": [
+            "audit_semantic_contract_invalid",
+        ],
+        "audit_partial_contract_retained": True,
+        "audit_partial_contract_retained_count": 1,
+        "audit_partial_contract_discarded_count": 2,
+    }
+    context.record_gemini(
+        attempt=2,
+        model_used="gemini-3.1-pro-preview",
+        quality_degraded=False,
+        usage={
+            "prompt_tokens": 100,
+            "candidate_tokens": 20,
+            "thought_tokens": 0,
+            "total_tokens": 120,
+            **diagnostics,
+        },
+    )
+
+    metadata = context.usage_payload()["provider_calls"][0]["metadata"]
+    assert {name: metadata[name] for name in diagnostics} == diagnostics
+
+
 def test_generation_context_enforces_actual_gemini_call_and_cost_budgets() -> None:
     context = GenerationContext("fast", generation_id="job-budget")
     for _ in range(3):

@@ -4741,6 +4741,7 @@ function FeedPageInner() {
       }
       return;
     }
+    setVisibleFeedError(null);
     const successful = responses as Array<Array<Awaited<ReturnType<typeof fetchFeed>>>>;
     const nextLevelsByMaterial = new Map<string, string>();
     for (let index = 0; index < successful.length; index += 1) {
@@ -4858,6 +4859,7 @@ function FeedPageInner() {
     rememberFeedContinuationToken,
     rememberFeedGenerationJob,
     reelClipKey,
+    setVisibleFeedError,
     settingsScopeReady,
     updateSessionReels,
   ]);

@@ -1606,6 +1606,7 @@ async def _generate_lesson_order_async(
 
         raise_if_cancelled(should_cancel)
         usage = getattr(response, "usage_metadata", None)
+        thought_tokens = _usage_field(usage, "thoughts_token_count")
         telemetry = gemini_client.GeminiCallTelemetry(
             model=str(
                 getattr(response, "model_version", "")
@@ -1619,7 +1620,9 @@ async def _generate_lesson_order_async(
             finish_reason=_finish_reason(response),
             prompt_tokens=_usage_field(usage, "prompt_token_count"),
             candidate_tokens=_usage_field(usage, "candidates_token_count"),
-            thought_tokens=_usage_field(usage, "thoughts_token_count"),
+            thought_tokens=(
+                0 if thought_tokens is None else thought_tokens
+            ),
             total_tokens=_usage_field(usage, "total_token_count"),
             cached_tokens=_usage_field(usage, "cached_content_token_count"),
         )

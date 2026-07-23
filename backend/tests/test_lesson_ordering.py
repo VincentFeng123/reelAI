@@ -13,6 +13,7 @@ import pytest
 from backend import gemini_client
 from backend.app.clip_engine import config
 from backend.app.clip_engine.errors import CancellationError
+from backend.app.clip_engine.provider_runtime import GenerationContext
 from backend.app.services import lesson_ordering
 from backend.intent_obligations import intent_obligation
 
@@ -5960,7 +5961,11 @@ def test_generate_content_receives_text_only_and_no_media_configuration(
                     }
                 ),
                 model_version=config.LESSON_ORDER_MODEL,
-                usage_metadata=None,
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=120,
+                    candidates_token_count=20,
+                    total_token_count=140,
+                ),
                 candidates=[SimpleNamespace(finish_reason="STOP")],
             )
 
@@ -6001,6 +6006,18 @@ def test_generate_content_receives_text_only_and_no_media_configuration(
     )
 
     assert result.text
+    assert result.telemetry.thought_tokens == 0
+    context = GenerationContext("slow")
+    context.record_gemini(
+        operation="ordering",
+        attempt=1,
+        model_used=result.telemetry.model,
+        quality_degraded=False,
+        usage=result.telemetry.as_dict(),
+    )
+    usage_metadata = context.usage_payload()["provider_calls"][0]["metadata"]
+    assert usage_metadata["billing_usage_known"] is True
+    assert usage_metadata["thought_tokens"] == 0
     assert set(captured) == {"client_kwargs", "model", "contents", "config"}
     assert captured["contents"] == user_prompt
     assert isinstance(captured["contents"], str)

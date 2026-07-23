@@ -704,7 +704,7 @@ def test_text_only_pro_keeps_candidate_budget_after_observed_thought_usage(
     assert result.calls[0]["reserved_output_tokens"] == call["max_output_tokens"]
     assert audit_call["schema"] is gemini_segment._ProCandidateAuditPlan
     assert audit_call["operation"] == "pro_boundary_audit"
-    assert audit_call["prompt_version"] == "pro_candidate_audit_v13"
+    assert audit_call["prompt_version"] == "pro_candidate_audit_v14"
     assert audit_call["thinking_level"] == "medium"
     assert audit_call["media_resolution"] is None
     assert gemini_segment._PRO_FINAL_AUDIT_RESERVED_S >= 60.0

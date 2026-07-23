@@ -12308,12 +12308,126 @@ def test_pro_audit_shrinks_an_umbrella_to_one_atomic_objective_in_one_call(
     assert rejections == []
     assert len(dispatches) == len(calls) == 1
     assert dispatches[0]["operation"] == "pro_boundary_audit"
-    assert dispatches[0]["prompt_version"] == "pro_candidate_audit_v13"
+    assert dispatches[0]["prompt_version"] == "pro_candidate_audit_v14"
     [topic] = audited.topics
     assert (topic.start_line, topic.end_line) == (0, 0)
     assert topic.end_quote == "and produces ATP"
     assert topic.learning_objective == "Explain glycolysis's role in cellular respiration"
     assert topic.directly_teaches_topic is False
+
+
+def test_pro_audit_derives_direct_from_grounded_objectives_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = "Explain duty and breach in negligence"
+    evidence = "defendant to owe the plaintiff a legal obligation"
+    segments = [{
+        "cue_id": "duty-only",
+        "start": 0.0,
+        "end": 8.0,
+        "text": (
+            "Duty requires a defendant to owe the plaintiff a legal obligation."
+        ),
+    }]
+    plan = gemini_segment._CompactBoundaryPlan(
+        request_intent={
+            "exact_request": request,
+            "constraints": [
+                {
+                    "constraint_id": "duty",
+                    "kind": "subject",
+                    "source_phrase": "duty",
+                    "source_occurrence": 0,
+                    "requirement": "Explain duty in negligence",
+                },
+                {
+                    "constraint_id": "breach",
+                    "kind": "subject",
+                    "source_phrase": "breach",
+                    "source_occurrence": 0,
+                    "requirement": "Explain breach in negligence",
+                },
+            ],
+        },
+        topics=[gemini_segment._CompactBoundaryTopic(
+            candidate_id="duty-unit",
+            start_line=0,
+            end_line=0,
+            start_quote="Duty requires a defendant",
+            end_quote="a legal obligation",
+            claim_quote=evidence,
+            title="Duty in Negligence",
+            learning_objective="Explain the duty element of negligence",
+            facet="duty",
+            concept_family="Negligence duty element",
+            concept_aliases=[],
+            informativeness=0.9,
+            topic_relevance=1.0,
+            educational_importance=0.9,
+            difficulty=0.2,
+            directly_teaches_topic=False,
+            substantive=True,
+            factually_grounded=True,
+            self_contained=True,
+            is_standalone=True,
+            intent_evidence=[{"id": "duty", "q": evidence}],
+            objective_constraint_ids=["duty"],
+            relationship_witnesses=[],
+        )],
+    )
+    audit = gemini_segment._ProCandidateAuditPlan(items=[{
+        "id": "candidate-1",
+        "d": "keep",
+        "obj": "Explain the duty element of negligence",
+        "t": "Duty in Negligence",
+        "f": "duty",
+        "family": "Negligence duty element",
+        "a": [],
+        # The model flag contradicts its grounded objective inventory. The
+        # inventory is authoritative, so this remains a supporting unit.
+        "direct": True,
+        "self": True,
+        "stand": True,
+        "ie": [{"id": "duty", "q": evidence}],
+        "oi": ["duty"],
+        "rw": [],
+        "ow": evidence,
+        "ev": evidence,
+        "ds": 0,
+        "dq": "Duty requires a defendant",
+        "dc": True,
+        "s": 0,
+        "e": 0,
+        "sq": "Duty requires a defendant",
+        "eq": "a legal obligation",
+    }])
+    thinking_levels: list[str] = []
+
+    def call_model(*_args, **kwargs):
+        thinking_levels.append(kwargs["thinking_level"])
+        return audit, {
+            "model": gemini_segment.config.SEGMENT_PRO_MODEL,
+            "operation": kwargs["operation"],
+            "physical_dispatches": 1,
+        }
+
+    monkeypatch.setattr(gemini_segment, "_call_model", call_model)
+
+    audited, calls, rejections = gemini_segment._audit_pro_boundaries(
+        plan,
+        segments,
+        request,
+        {},
+        deadline=time.monotonic() + 10.0,
+        cancelled=None,
+    )
+
+    assert thinking_levels == ["medium"]
+    assert len(calls) == 1
+    assert calls[0].get("contract_retry_attempt") is None
+    assert rejections == []
+    assert len(audited.topics) == 1
+    assert audited.topics[0].directly_teaches_topic is False
 
 
 def test_compact_schema_and_final_audit_require_context_complete_evidence_and_edges() -> None:
@@ -13730,7 +13844,7 @@ def test_pro_candidate_audit_keeps_related_bad_cut_and_repairs_words(
         "eq",
     } <= audit_required
     assert gemini_segment._PRO_BOUNDARY_AUDIT_PROMPT_VERSION == (
-        "pro_candidate_audit_v13"
+        "pro_candidate_audit_v14"
     )
     assert (
         gemini_segment._pro_boundary_audit_output_tokens(
@@ -13845,12 +13959,54 @@ def test_pro_candidate_audit_focus_is_exact_word_span_with_neighbor_cues() -> No
     adjacent_focus = user.split(
         "<adjacent_transcript_cues>\n", 1,
     )[1].split("\n</adjacent_transcript_cues>", 1)[0]
+    boundary_cue_context = user.split(
+        "<current_boundary_cue_context>\n", 1,
+    )[1].split("\n</current_boundary_cue_context>", 1)[0]
 
     assert selected_focus == claim
     assert "prior answer" not in selected_focus
     assert "discuss jerk" not in selected_focus
+    assert "[1] 00:04" in boundary_cue_context
+    assert "The prior answer was forty two." in boundary_cue_context
+    assert "Next, we discuss jerk." in boundary_cue_context
     assert "Velocity was defined" in adjacent_focus
     assert "Jerk is the rate" in adjacent_focus
+
+
+def test_pro_candidate_audit_locally_exposes_omitted_same_cue_law_prefix() -> None:
+    request = "elements of negligence"
+    plan = _compact_custom_plan(
+        request=request,
+        start_quote="to hold the",
+        end_quote="duty breach causation and damages",
+        claim_quote="duty breach causation and damages",
+    )
+    segments = [{
+        "cue_id": "law-boundary",
+        "start": 6.0,
+        "end": 12.0,
+        "text": (
+            "the following four elements to hold the defendant liable for "
+            "negligence the plaintiff must establish duty breach causation and damages"
+        ),
+    }]
+
+    _system, user, _allowed = gemini_segment._pro_boundary_audit_prompts(
+        plan,
+        segments,
+        request,
+    )
+    selected_focus = user.split(
+        "<current_selected_cues_focus>\n", 1,
+    )[1].split("\n</current_selected_cues_focus>", 1)[0]
+    boundary_cue_context = user.split(
+        "<current_boundary_cue_context>\n", 1,
+    )[1].split("\n</current_boundary_cue_context>", 1)[0]
+
+    assert selected_focus.startswith("to hold the defendant")
+    assert "the following four elements" not in selected_focus
+    assert "[0] 00:06" in boundary_cue_context
+    assert "the following four elements to hold the" in boundary_cue_context
 
 
 def test_pro_candidate_audit_advances_past_completed_prior_lesson(

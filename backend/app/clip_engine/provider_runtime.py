@@ -1304,6 +1304,21 @@ class GenerationContext:
             "selector_contract_retry_recovered",
             "selector_contract_retry_exhausted",
             "selector_contract_retry_skipped",
+            "selector_audit_repair_count",
+            "selector_audit_repair_reasons",
+            "structured_retry_attempt",
+            "structured_retry_reason",
+            "structured_retry_recovered",
+            "structured_retry_exhausted",
+            "contract_retry_attempt",
+            "contract_retry_reason",
+            "contract_retry_recovered",
+            "contract_retry_exhausted",
+            "audit_error_type",
+            "audit_contract_rejection_reasons",
+            "audit_partial_contract_retained",
+            "audit_partial_contract_retained_count",
+            "audit_partial_contract_discarded_count",
         ):
             value = _usage_field(usage, field_name)
             if value is not None:

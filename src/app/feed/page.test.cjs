@@ -4071,6 +4071,7 @@ test("every adaptive rerank invalidates old generation before changing inventory
     isSearchScopeActive: (scope) => scope === activeSearchScopeRef.current && !scope.controller.signal.aborted,
     knowledgeLevelByMaterialRef: { current: new Map([["material-a", "beginner"]]) },
     clearGenerationTracking: () => events.push("clear"),
+    setVisibleFeedError: (value) => events.push(value === null ? "clear-error" : `error:${value}`),
     setAssessmentPreparingFeed: () => {},
     renewActiveSearchScope: () => {
       activeSearchScopeRef.current.controller.abort();
@@ -4109,6 +4110,7 @@ test("every adaptive rerank invalidates old generation before changing inventory
     "renew",
     "can-request:true",
     "fetch:2",
+    "clear-error",
     "inventory:watched,old-unseen",
     "remember:adaptive-job",
     "consume:adaptive-job:2",
@@ -4182,6 +4184,7 @@ test("an adaptive rerank response cannot cross the live watched frontier", async
     isSearchScopeActive: (scope) => scope === activeSearchScopeRef.current && !scope.controller.signal.aborted,
     knowledgeLevelByMaterialRef: { current: new Map() },
     clearGenerationTracking: () => {},
+    setVisibleFeedError: () => {},
     setAssessmentPreparingFeed: () => {},
     renewActiveSearchScope: () => {
       activeSearchScopeRef.current.controller.abort();
@@ -4303,6 +4306,7 @@ test("adaptive rerank preserves every released identity at full and near-full ca
       isSearchScopeActive: (scope) => scope === activeSearchScopeRef.current && !scope.controller.signal.aborted,
       knowledgeLevelByMaterialRef: { current: new Map() },
       clearGenerationTracking: () => {},
+      setVisibleFeedError: () => {},
       setAssessmentPreparingFeed: () => {},
       renewActiveSearchScope: () => {
         activeSearchScopeRef.current.controller.abort();
