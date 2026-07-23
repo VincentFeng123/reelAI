@@ -939,11 +939,10 @@ def test_exact_request_fallback_is_domain_agnostic_after_provider_responses(
     )
 
     assert provider_calls == expand.PRACTICE_FAST_EXPAND_ATTEMPTS
-    assert result == {
-        "corrected": topic,
-        "queries": [topic],
-        "provider_used": "literal_fallback",
-    }
+    assert result["corrected"] == topic
+    assert result["provider_used"] == "literal_fallback"
+    assert result["queries"][0] == topic
+    assert len(result["queries"]) >= 1
     assert cache_writes == []
 
 
@@ -964,11 +963,9 @@ def test_exact_request_fallback_remains_available_during_recovery(
         recovery_reason=expand.RECOVERY_REASON_ZERO_VALID_CLIPS,
     )
 
-    assert result == {
-        "corrected": topic,
-        "queries": [topic],
-        "provider_used": "literal_fallback",
-    }
+    assert result["corrected"] == topic
+    assert result["queries"][0] == topic
+    assert result["provider_used"] == "literal_fallback"
 
 
 @pytest.mark.parametrize("status_code", [429, 403])
@@ -3221,7 +3218,9 @@ def test_deep_search_uses_exact_request_when_expansion_models_are_rate_limited(
         expand.PRACTICE_FAST_EXPAND_MODEL,
         expand.PRACTICE_FAST_EXPAND_FALLBACK_MODEL,
     ]
-    assert search_calls == [[topic]]
+    assert search_calls
+    assert search_calls[0][0] == topic
+    assert len(search_calls[0]) == 3
     assert [video["id"] for video in result["videos"]] == ["CIRCUIT0001"]
 
 
@@ -5131,6 +5130,62 @@ def test_discover_practice_fast_limits_ai_queries_to_remaining_search_budget(mon
 
     assert seen["n"] == 3
     assert seen["queries"] == [["physics", "physics explained"]]
+
+
+def test_literal_availability_fallback_uses_remaining_grounded_queries(monkeypatch):
+    topic = (
+        "Teach electric circuits from Ohm's law and Kirchhoff's junction "
+        "and loop rules through series and parallel resistance, then solve "
+        "progressively harder circuit problems with clear reasoning."
+    )
+    search_calls: list[list[str]] = []
+
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda expansion_topic, n, **_kwargs: expand.literal_fallback(
+            expansion_topic,
+            n,
+        ),
+    )
+
+    def fake_search_all(queries, filters=None, **_kwargs):
+        search_calls.append(list(queries))
+        return {
+            "per_query": [
+                {
+                    "query": query,
+                    "videos": (
+                        []
+                        if query == topic
+                        else [{
+                            "id": "circuits-grounded-subquery",
+                            "title": "Ohm's law and Kirchhoff's laws worked examples",
+                        }]
+                    ),
+                    "next_page_token": None,
+                }
+                for query in queries
+            ],
+            "credits_used": len(queries),
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        topic,
+        limit=1,
+        breadth=8,
+        context=GenerationContext("slow"),
+        retrieval_profile="deep",
+    )
+
+    assert search_calls
+    assert search_calls[0][0] == topic
+    assert len(search_calls[0]) == 3
+    assert result["videos"][0]["id"] == "circuits-grounded-subquery"
+    assert result["queries"] == search_calls[0]
 
 
 def test_discover_practice_fast_caps_ai_search_to_three_queries(monkeypatch):

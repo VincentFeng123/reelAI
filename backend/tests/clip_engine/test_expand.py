@@ -109,6 +109,22 @@ def test_unicode_normalization_prevents_duplicate_queries() -> None:
     assert expand._normalize(["CAFÉ", "cafe\u0301", "  café  "], 5) == ["CAFÉ"]
 
 
+def test_literal_fallback_uses_grounded_subqueries_for_long_requests() -> None:
+    topic = (
+        "Teach electric circuits from Ohm's law and Kirchhoff's junction "
+        "and loop rules through series and parallel resistance, then solve "
+        "progressively harder circuit problems with clear reasoning."
+    )
+
+    result = expand.literal_fallback(topic, 3)
+
+    assert result["provider_used"] == "literal_fallback"
+    assert result["queries"][0] == topic
+    assert len(result["queries"]) == 3
+    assert all(query for query in result["queries"])
+    assert any("Kirchhoff" in query or "series" in query for query in result["queries"][1:])
+
+
 def test_intent_tokens_preserve_attached_language_punctuation_only() -> None:
     assert expand._intent_tokens("C C++ C#") == ["C", "c++", "c#"]
     assert expand._intent_tokens("C + + memory # topic") == [
@@ -267,11 +283,10 @@ def test_practice_fast_rate_limit_exhaustion_uses_literal_immediately(
         expand.PRACTICE_FAST_EXPAND_MODEL,
         expand.PRACTICE_FAST_EXPAND_FALLBACK_MODEL,
     ]
-    assert result == {
-        "corrected": "Ohm's law with Kirchhoff junction and loop rules",
-        "queries": ["Ohm's law with Kirchhoff junction and loop rules"],
-        "provider_used": "literal_fallback",
-    }
+    assert result["corrected"] == "Ohm's law with Kirchhoff junction and loop rules"
+    assert result["provider_used"] == "literal_fallback"
+    assert result["queries"][0] == "Ohm's law with Kirchhoff junction and loop rules"
+    assert len(result["queries"]) == 3
 
 
 def test_practice_fast_does_not_fallback_on_permanent_failure(

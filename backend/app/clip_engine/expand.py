@@ -755,11 +755,50 @@ from the retrieval queries. Return N optimized search queries; do not automatica
 query on the raw literal wording."""
 
 
+def _literal_fallback_queries(topic: str, n: int) -> list[str]:
+    literal = " ".join(str(topic or "").split())
+    count = max(0, int(n))
+    if not literal or count <= 0:
+        return []
+    if count == 1:
+        return [literal]
+    clauses = [
+        " ".join(part.split())
+        for part in re.split(
+            r"(?:[,;:()]|\bthen\b|\bthrough\b|\bfrom\b|\bwith\b|\band\b)",
+            literal,
+            flags=re.IGNORECASE,
+        )
+        if " ".join(part.split())
+    ]
+    content_tokens = [
+        token
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9'+/-]*", literal)
+        if token.casefold() not in _INTENT_STOPWORDS and len(token) > 1
+    ]
+    compact = " ".join(content_tokens)
+    variants = [literal]
+    if len(compact.split()) >= 3:
+        variants.append(compact)
+    if clauses:
+        longest = sorted(
+            clauses,
+            key=lambda value: (len(value.split()), len(value)),
+            reverse=True,
+        )
+        variants.extend(longest[: max(1, count)])
+    if len(content_tokens) >= 5:
+        midpoint = max(3, min(len(content_tokens) - 2, len(content_tokens) // 2))
+        variants.append(" ".join(content_tokens[:midpoint]))
+        variants.append(" ".join(content_tokens[midpoint:]))
+    return _normalize(variants, count)
+
+
 def literal_fallback(topic: str, n: int) -> dict:
     literal = " ".join(str(topic or "").split())
     return {
         "corrected": literal,
-        "queries": [literal] if literal and int(n) > 0 else [],
+        "queries": _literal_fallback_queries(topic, n),
         "provider_used": "literal_fallback",
     }
 

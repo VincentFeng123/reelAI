@@ -5748,11 +5748,11 @@ def test_generation_worker_keeps_durable_retries_after_grounded_expansion_fallba
             expand.PRACTICE_FAST_EXPAND_MODEL,
             expand.PRACTICE_FAST_EXPAND_FALLBACK_MODEL,
         ]
-        assert final_plans == [{
-            "corrected": topic,
-            "queries": [topic],
-            "provider_used": "literal_fallback",
-        }]
+        assert len(final_plans) == 1
+        assert final_plans[0]["corrected"] == topic
+        assert final_plans[0]["provider_used"] == "literal_fallback"
+        assert final_plans[0]["queries"][0] == topic
+        assert len(final_plans[0]["queries"]) == 3
         completed = generation_jobs.get_job(conn, str(job["id"]))
         assert completed and completed["status"] == "completed"
         assert completed["attempt_count"] == 1
