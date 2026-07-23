@@ -1,9 +1,10 @@
 """Guarded Gemini educational clip segmentation.
 
 Production uses one medium-thinking Pro selection call followed by one
-high-thinking Pro candidate-and-boundary audit over timestamped transcript
-text. Deterministic code validates exact quotes and structure but makes no
-semantic admission decision. Video media is never attached.
+medium-thinking Pro candidate-and-boundary audit over timestamped transcript
+text. Logical schema or semantic correction escalates to high thinking.
+Deterministic code validates exact quotes and structure but makes no semantic
+admission decision. Video media is never attached.
 Legacy routing and enrichment helpers remain available only for isolated
 evaluation compatibility; the public production adapter never dispatches them.
 
@@ -1765,6 +1766,9 @@ _PRO_FINAL_AUDIT_RESERVED_S = 60.0
 # transient provider failure may use this bounded second-attempt window.
 _PRO_AUDIT_RETRY_GRACE_S = 60.0
 _PRO_AUDIT_MAX_PHYSICAL_DISPATCHES = 3
+_LOGICAL_CORRECTION_MAX_CODES = 8
+_LOGICAL_CORRECTION_MAX_CODE_CHARS = 64
+_LOGICAL_CORRECTION_MAX_SUFFIX_CHARS = 768
 _PRO_SELECTOR_ATTEMPT_TIMEOUT_S = (
     _TOTAL_DEADLINE_S - _PRO_FINAL_AUDIT_RESERVED_S
 )
@@ -1776,7 +1780,7 @@ _BOUNDARY_OUTPUT_TOKENS = 6_400
 # separate allowance so medium reasoning cannot consume the structured payload;
 # provider runtime independently bounds the call count and total job exposure.
 _PRO_BOUNDARY_OUTPUT_TOKENS = 12_288
-# The final audit may return 40 decisions plus repaired edges, and high
+# The final audit may return 40 decisions plus repaired edges, and correction
 # thinking tokens count against the same provider output ceiling.
 _PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS = 22_528
 _PRO_BOUNDARY_AUDIT_MIN_OUTPUT_TOKENS = 8_192
@@ -12664,6 +12668,7 @@ class _LiveSelectorContract:
     intent_ids_by_semantics: dict[tuple[str, str, int, str, str], str]
     intent_error: str | None
     candidate_rejections: tuple[str, ...]
+    audit_repair_reasons: tuple[str, ...]
 
     @property
     def rejection_reasons(self) -> tuple[str, ...]:
@@ -12793,6 +12798,14 @@ def _objective_fulfillment_contract_error(
     return None
 
 
+_AUDIT_REPAIRABLE_SELECTOR_OBJECTIVE_ERRORS = frozenset({
+    "direct_objective_fulfillment_incomplete",
+    "objective_fulfillment_untrusted_sibling_umbrella",
+    "objective_relationship_topology_mismatch",
+    "objective_relationship_member_mismatch",
+})
+
+
 def _validate_live_pro_selector_contract(
     plan: _CompactBoundaryPlan,
     topic: str,
@@ -12819,6 +12832,7 @@ def _validate_live_pro_selector_contract(
             intent_ids_by_semantics={},
             intent_error=intent_error,
             candidate_rejections=(),
+            audit_repair_reasons=(),
         )
 
     signature_constraints = (
@@ -12875,6 +12889,7 @@ def _validate_live_pro_selector_contract(
     }
     valid_topics: list[_CompactBoundaryTopic] = []
     candidate_rejections: list[str] = []
+    audit_repair_reasons: list[str] = []
     for proposal in plan.topics:
         evidence_ids = [
             str(item.constraint_id)
@@ -12898,18 +12913,21 @@ def _validate_live_pro_selector_contract(
             proposal,
         )
         if objective_error is not None:
-            candidate_rejections.append(
-                f"candidate_{proposal.candidate_id}:{objective_error}"
-            )
-            continue
+            reason = f"candidate_{proposal.candidate_id}:{objective_error}"
+            if objective_error in _AUDIT_REPAIRABLE_SELECTOR_OBJECTIVE_ERRORS:
+                audit_repair_reasons.append(reason)
+            else:
+                candidate_rejections.append(reason)
+                continue
         family_payload, family_error = _validated_proposal_concept_family_payload(
             proposal
         )
         if family_error is not None:
-            candidate_rejections.append(
+            audit_repair_reasons.append(
                 f"candidate_{proposal.candidate_id}:concept_family_contract:"
                 f"{family_error}"
             )
+            valid_topics.append(proposal)
             continue
         valid_topics.append(proposal.model_copy(update=family_payload))
     return _LiveSelectorContract(
@@ -12918,6 +12936,7 @@ def _validate_live_pro_selector_contract(
         intent_ids_by_semantics=ids_by_semantics,
         intent_error=None,
         candidate_rejections=tuple(candidate_rejections),
+        audit_repair_reasons=tuple(audit_repair_reasons),
     )
 
 
@@ -12925,6 +12944,10 @@ def _annotate_live_selector_contract(
     call: dict,
     contract: _LiveSelectorContract,
 ) -> None:
+    audit_repair_reasons = list(contract.audit_repair_reasons)
+    if audit_repair_reasons:
+        call["selector_audit_repair_reasons"] = audit_repair_reasons
+        call["selector_audit_repair_count"] = len(audit_repair_reasons)
     reasons = list(contract.rejection_reasons)
     if not reasons:
         return
@@ -22846,6 +22869,73 @@ def _boundary_selector_content(
     return transcript_prompt, None, False
 
 
+_LOGICAL_CORRECTION_CODE_PREFIXES = (
+    "audit_",
+    "concept_family_",
+    "direct_objective_",
+    "family_",
+    "intent_contract_",
+    "intent_evidence_",
+    "invalid_",
+    "objective_",
+    "schema_",
+)
+
+
+def _bounded_logical_correction_codes(
+    rejection_reasons: list[str] | tuple[str, ...],
+) -> tuple[str, ...]:
+    """Extract only bounded internal codes, never response payload or IDs."""
+    codes: list[str] = []
+    for raw_reason in rejection_reasons:
+        reason_codes = [
+            token[:_LOGICAL_CORRECTION_MAX_CODE_CHARS]
+            for token in re.findall(r"[a-z][a-z0-9_]*", str(raw_reason).casefold())
+            if token == "invalid_structured_response"
+            or token.startswith(_LOGICAL_CORRECTION_CODE_PREFIXES)
+        ]
+        if not reason_codes:
+            reason_codes = ["contract_validation_failure"]
+        for code in reason_codes:
+            if code not in codes:
+                codes.append(code)
+            if len(codes) >= _LOGICAL_CORRECTION_MAX_CODES:
+                return tuple(codes)
+    return tuple(codes)
+
+
+def _logical_correction_user_content(
+    user_content: str | list,
+    *,
+    stage: str,
+    rejection_reasons: list[str] | tuple[str, ...],
+) -> str | list:
+    """Append payload-free validation codes to a fresh logical model call."""
+    codes = list(_bounded_logical_correction_codes(rejection_reasons))
+    if not codes:
+        return user_content
+    stage_name = "audit" if stage == "audit" else "selector"
+
+    def render(current_codes: list[str]) -> str:
+        return (
+            f"\n\n<logical_correction stage={stage_name!r}>\n"
+            "The preceding logical response failed these validator codes:\n"
+            + "".join(f"- {code}\n" for code in current_codes)
+            + "Do not quote, copy, or reconstruct any prior response payload. "
+              "Return one fresh, complete schema response that corrects these "
+              "codes while preserving every otherwise valid candidate.\n"
+              "</logical_correction>"
+        )
+
+    suffix = render(codes)
+    while len(suffix) > _LOGICAL_CORRECTION_MAX_SUFFIX_CHARS and len(codes) > 1:
+        codes.pop()
+        suffix = render(codes)
+    if isinstance(user_content, list):
+        return [*user_content, suffix.lstrip()]
+    return f"{user_content}{suffix}"
+
+
 def _pro_boundary_audit_output_tokens(candidate_count: int) -> int:
     """Reserve audit output in proportion to the bounded decision inventory."""
     bounded_count = max(1, min(_MAX_CLIPS, int(candidate_count)))
@@ -22869,6 +22959,8 @@ def _audit_pro_boundaries(
     _retry_contract_once: bool = True,
     _claim_logical_quota: bool = True,
     _remaining_physical_dispatches: int = _PRO_AUDIT_MAX_PHYSICAL_DISPATCHES,
+    _selector_rejection_reasons: tuple[str, ...] = (),
+    _logical_correction_reasons: tuple[str, ...] = (),
 ) -> tuple[_CompactBoundaryPlan, list[dict], list[str]]:
     """Let Pro independently audit admission, fulfillment, and word edges."""
     if not plan.topics or not segments:
@@ -22927,12 +23019,34 @@ def _audit_pro_boundaries(
                     if _retry_contract_once and structured_attempt == 1
                     else audit_retry_deadline
                 )
+                attempt_rejection_reasons = [
+                    *_selector_rejection_reasons,
+                    *_logical_correction_reasons,
+                    *(
+                        ["invalid_structured_response"]
+                        if structured_attempt == 2
+                        else []
+                    ),
+                ]
+                audit_user = _logical_correction_user_content(
+                    user,
+                    stage="audit",
+                    rejection_reasons=attempt_rejection_reasons,
+                )
                 audit, call = _call_model(
                     system,
-                    user,
+                    audit_user,
                     _ProCandidateAuditPlan,
                     model=config.SEGMENT_PRO_MODEL,
-                    thinking_level="high",
+                    thinking_level=(
+                        "high"
+                        if (
+                            structured_attempt == 2
+                            or not _retry_contract_once
+                            or bool(_logical_correction_reasons)
+                        )
+                        else "medium"
+                    ),
                     max_output_tokens=audit_output_tokens,
                     timeout_s=_PRO_TIMEOUT_S,
                     deadline_monotonic=audit_retry_deadline,
@@ -23607,6 +23721,12 @@ def _audit_pro_boundaries(
                         _remaining_physical_dispatches=(
                             remaining_physical_dispatches
                         ),
+                        _selector_rejection_reasons=(
+                            _selector_rejection_reasons
+                        ),
+                        _logical_correction_reasons=tuple(
+                            audit_contract_rejection_reasons
+                        ),
                     )
                 )
             except Exception as exc:
@@ -23855,13 +23975,19 @@ def _run_selection_profile(
     def invoke_selector(
         *,
         claim_logical_quota: bool = True,
+        logical_correction_reasons: tuple[str, ...] = (),
     ) -> tuple[BaseModel, dict]:
+        call_user = _logical_correction_user_content(
+            selector_user,
+            stage="selector",
+            rejection_reasons=logical_correction_reasons,
+        )
         parsed_response, call = _call_model(
             system,
-            selector_user,
+            call_user,
             schema,
             model=model,
-            thinking_level=level,
+            thinking_level=("high" if logical_correction_reasons else level),
             max_output_tokens=cap,
             timeout_s=timeout,
             deadline_monotonic=selector_deadline,
@@ -23908,8 +24034,8 @@ def _run_selection_profile(
         parsed, call = invoke_selector()
     except _SchemaResponseError as first_exc:
         # A provider-successful response can occasionally be malformed JSON.
-        # Retry the same selector step once with a separate reservation and the
-        # identical transcript prompt; semantic no-result outcomes are not errors.
+        # Retry the same selector step once with a separate reservation and
+        # bounded validator codes; semantic no-result outcomes are not errors.
         first_call = _exception_telemetry(first_exc)
         first_call.update({
             "error_type": type(first_exc).__name__,
@@ -23926,7 +24052,10 @@ def _run_selection_profile(
             raise
         calls.append(first_call)
         try:
-            parsed, call = invoke_selector(claim_logical_quota=False)
+            parsed, call = invoke_selector(
+                claim_logical_quota=False,
+                logical_correction_reasons=("invalid_structured_response",),
+            )
         except Exception as retry_exc:
             retry_call = _exception_telemetry(retry_exc)
             retry_call.setdefault("error_type", type(retry_exc).__name__)
@@ -23990,6 +24119,9 @@ def _run_selection_profile(
         try:
             retry_parsed, retry_call = invoke_selector(
                 claim_logical_quota=False,
+                logical_correction_reasons=tuple(
+                    first_schema_rejections + first_contract_rejections
+                ),
             )
         except Exception as retry_exc:
             if _cancel_requested(cancelled):
@@ -24172,14 +24304,38 @@ def _run_selection_profile(
             raise contract_exc
     pro_audit_rejections: list[str] = []
     if profile == PRO_BOUNDARY_PROFILE and isinstance(parsed, _CompactBoundaryPlan):
-        parsed, boundary_audit_calls, pro_audit_rejections = _audit_pro_boundaries(
-            parsed,
-            segments,
-            topic,
-            settings,
-            deadline=deadline,
-            cancelled=cancelled,
+        selector_audit_repair_reasons = tuple(
+            str(reason)
+            for selector_call in calls
+            for reason in (
+                selector_call.get("selector_audit_repair_reasons") or []
+            )
         )
+        try:
+            parsed, boundary_audit_calls, pro_audit_rejections = (
+                _audit_pro_boundaries(
+                    parsed,
+                    segments,
+                    topic,
+                    settings,
+                    deadline=deadline,
+                    cancelled=cancelled,
+                    _selector_rejection_reasons=(
+                        selector_audit_repair_reasons
+                    ),
+                )
+            )
+        except Exception as exc:
+            audit_calls = getattr(exc, "selection_attempt_calls", [])
+            exc.selection_attempt_calls = [
+                *calls,
+                *(
+                    audit_calls
+                    if isinstance(audit_calls, list)
+                    else []
+                ),
+            ]
+            raise
         calls.extend(boundary_audit_calls)
     require_enrichment = profile in {CORRECTED_PRO_PROFILE, FLASH_SINGLE_PROFILE}
     conversion_settings = dict(settings)
