@@ -292,6 +292,8 @@ def test_generation_context_preserves_selector_retry_diagnostics() -> None:
         "selector_contract_retry_recovered": False,
         "selector_contract_retry_exhausted": True,
         "selector_contract_retry_skipped": "insufficient_deadline",
+        "validation_failures": ["required_ids_missing"],
+        "validation_repairs": ["source_chronology_invalid"],
     }
     context.record_gemini(
         attempt=2,

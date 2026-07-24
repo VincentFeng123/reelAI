@@ -1624,6 +1624,8 @@ class GenerationContext:
             "contract_retry_reason",
             "contract_retry_recovered",
             "contract_retry_exhausted",
+            "validation_failures",
+            "validation_repairs",
             "audit_error_type",
             "audit_contract_rejection_reasons",
             "audit_partial_contract_retained",

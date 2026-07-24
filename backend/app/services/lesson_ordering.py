@@ -1761,6 +1761,7 @@ _EXPLICIT_CONCEPT_SEQUENCE = re.compile(
 _SEQUENCE_GENERIC_TOKENS = frozenset({
     "a", "an", "concept", "law", "of", "principle", "s", "the",
 })
+_COORDINATED_SEQUENCE_MARKERS = frozenset({"and", "or"})
 
 
 def _sequence_tokens(value: object) -> list[str]:
@@ -1826,6 +1827,154 @@ def _requested_concept_position(
     return min(positions) if positions else None
 
 
+def _coordinated_concept_positions(
+    reels_by_id: Mapping[str, Mapping[str, Any]],
+    *,
+    topic_tokens: Sequence[str],
+) -> dict[str, int]:
+    """Resolve explicit lists that state a shared label head or tail once."""
+    endpoint_tokens: dict[
+        tuple[int, int, str],
+        dict[str, set[str]],
+    ] = {}
+    for reel_id, reel in reels_by_id.items():
+        for variant, name in enumerate((
+            reel.get("concept_title"),
+            reel.get("concept_family")
+            or reel.get("_selection_concept_family"),
+        )):
+            if not name:
+                continue
+            option = tuple(
+                token
+                for token in _sequence_tokens(name)
+                if token not in _SEQUENCE_GENERIC_TOKENS
+            )
+            if len(option) < 2:
+                continue
+            for endpoint in (0, -1):
+                scope = option[endpoint]
+                if (
+                    scope not in _SEQUENCE_GENERIC_TOKENS
+                    and len(scope) >= 4
+                ):
+                    endpoint_tokens.setdefault(
+                        (variant, endpoint, scope),
+                        {},
+                    )[reel_id] = set(option)
+
+    accepted_clusters: list[dict[str, int]] = []
+    for (
+        _variant,
+        endpoint,
+        scope,
+    ), member_tokens in endpoint_tokens.items():
+        if len(member_tokens) < 2 or topic_tokens.count(scope) != 1:
+            continue
+        token_frequency: dict[str, int] = {}
+        for tokens in member_tokens.values():
+            for token in tokens:
+                token_frequency[token] = token_frequency.get(token, 0) + 1
+        unique_tokens = {
+            reel_id: [
+                token
+                for token in tokens
+                if token_frequency[token] == 1
+            ]
+            for reel_id, tokens in member_tokens.items()
+        }
+        if any(len(tokens) != 1 for tokens in unique_tokens.values()):
+            continue
+        if any(
+            not (
+                is_canonical_ordinal_token(tokens[0])
+                or len(tokens[0]) >= 4
+            )
+            for tokens in unique_tokens.values()
+        ):
+            continue
+        if any(
+            topic_tokens.count(tokens[0]) != 1
+            for tokens in unique_tokens.values()
+        ):
+            continue
+
+        positions = {
+            reel_id: topic_tokens.index(tokens[0])
+            for reel_id, tokens in unique_tokens.items()
+        }
+        if len(set(positions.values())) < 2:
+            continue
+        scope_position = topic_tokens.index(scope)
+        ordered_positions = list(positions.values())
+        if endpoint == -1:
+            structurally_aligned = (
+                all(position < scope_position for position in ordered_positions)
+                and scope_position - max(ordered_positions) <= 2
+            )
+        else:
+            structurally_aligned = (
+                all(position > scope_position for position in ordered_positions)
+                and min(ordered_positions) - scope_position <= 2
+            )
+        span_start = min([scope_position, *ordered_positions])
+        span_end = max([scope_position, *ordered_positions])
+        if (
+            not structurally_aligned
+            or span_end - span_start > max(8, len(member_tokens) * 3)
+            or not any(
+                token in _COORDINATED_SEQUENCE_MARKERS
+                for token in topic_tokens[span_start : span_end + 1]
+            )
+        ):
+            continue
+        accepted_clusters.append(positions)
+
+    proposals: dict[str, set[int]] = {}
+    for positions in accepted_clusters:
+        for reel_id, position in positions.items():
+            proposals.setdefault(reel_id, set()).add(position)
+    conflicted_ids = {
+        reel_id
+        for reel_id, positions in proposals.items()
+        if len(positions) > 1
+    }
+    if conflicted_ids:
+        proposals = {}
+        for positions in accepted_clusters:
+            if conflicted_ids.isdisjoint(positions):
+                for reel_id, position in positions.items():
+                    proposals.setdefault(reel_id, set()).add(position)
+    return {
+        reel_id: next(iter(positions))
+        for reel_id, positions in proposals.items()
+        if len(positions) == 1
+    }
+
+
+def _requested_concept_positions(
+    reels_by_id: Mapping[str, Mapping[str, Any]],
+    *,
+    topic_tokens: Sequence[str],
+) -> dict[str, int]:
+    positions = {
+        reel_id: position
+        for reel_id, reel in reels_by_id.items()
+        if (
+            position := _requested_concept_position(
+                reel,
+                topic_tokens=topic_tokens,
+            )
+        ) is not None
+    }
+    for reel_id, position in _coordinated_concept_positions(
+        reels_by_id,
+        topic_tokens=topic_tokens,
+    ).items():
+        positions.setdefault(reel_id, position)
+    return positions
+
+
 def _constraint_safe_fallback_order(
     reels: list[dict[str, Any]],
     reel_ids: list[str],
@@ -1857,16 +2006,10 @@ def _constraint_safe_fallback_order(
     reels_by_id = dict(zip(reel_ids, reels, strict=True))
     topic_tokens = _sequence_tokens(topic)
     requested_position = (
-        {
-            reel_id: position
-            for reel_id, reel in reels_by_id.items()
-            if (
-                position := _requested_concept_position(
-                    reel,
-                    topic_tokens=topic_tokens,
-                )
-            ) is not None
-        }
+        _requested_concept_positions(
+            reels_by_id,
+            topic_tokens=topic_tokens,
+        )
         if _EXPLICIT_CONCEPT_SEQUENCE.search(str(topic or ""))
         else {}
     )
@@ -3633,21 +3776,20 @@ def _enforce_mandatory_selection(
     reconciliation_topic = ""
     if added_ids and _EXPLICIT_CONCEPT_SEQUENCE.search(str(topic or "")):
         topic_tokens = _sequence_tokens(topic)
+        topic_positions = _requested_concept_positions(
+            {
+                reel_id: reels_by_id[reel_id]
+                for reel_id in retained_input_ids
+            },
+            topic_tokens=topic_tokens,
+        )
         added_has_position = any(
-            _requested_concept_position(
-                reels_by_id[reel_id],
-                topic_tokens=topic_tokens,
-            )
-            is not None
+            reel_id in topic_positions
             for reel_id in added_ids
             if reel_id in retained
         )
         selected_has_position = any(
-            _requested_concept_position(
-                reels_by_id[reel_id],
-                topic_tokens=topic_tokens,
-            )
-            is not None
+            reel_id in topic_positions
             for reel_id in selected_ids
             if reel_id in retained
         )

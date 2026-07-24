@@ -2028,6 +2028,68 @@ def test_required_prior_unseen_anchor_survives_append_safe_fallback(
     assert result.fallback_reason == "invalid_model_order"
 
 
+def test_required_prior_fallback_preserves_coordinated_topic_order(
+    monkeypatch,
+) -> None:
+    mantle = _reel(
+        "mantle",
+        video_id="mantle-video",
+        start=0,
+        concept="Mantle Convection",
+    )
+    convergent = _reel(
+        "convergent",
+        video_id="convergent-video",
+        start=0,
+        concept="Convergent Plate Boundaries",
+    )
+    divergent = _reel(
+        "divergent",
+        video_id="divergent-video",
+        start=0,
+        concept="Divergent Plate Boundaries",
+    )
+    transform = _reel(
+        "transform",
+        video_id="transform-video",
+        start=0,
+        concept="Transform Plate Boundaries",
+    )
+    calls = 0
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result(["convergent", "divergent", "transform"])
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        fake_generate,
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        [mantle, convergent, divergent, transform],
+        topic=(
+            "Teach plate tectonics from mantle convection through divergent, "
+            "convergent, and transform boundaries, then connect each boundary "
+            "to earthquakes and volcanoes."
+        ),
+        release_limit=4,
+        required_reel_ids=["mantle"],
+    )
+
+    assert calls == lesson_ordering.LESSON_ORDER_ATTEMPTS
+    assert result.ordered_reel_ids == [
+        "mantle",
+        "divergent",
+        "convergent",
+        "transform",
+    ]
+    assert result.degraded is True
+    assert result.fallback_reason == "invalid_model_order"
+
+
 def test_required_prior_unseen_prefix_keeps_constraint_safe_crispr_delta(
     monkeypatch,
 ) -> None:
@@ -5455,6 +5517,246 @@ def test_explicit_sequence_preserves_operator_concepts_in_fallback_order() -> No
     assert lesson_ordering._sequence_tokens("Swift String?") != (
         lesson_ordering._sequence_tokens("Swift String")
     )
+
+
+def test_explicit_sequence_resolves_coordinated_shared_tail() -> None:
+    convergent = _reel(
+        "convergent",
+        video_id="convergent-video",
+        start=0,
+        concept="Convergent Plate Boundaries",
+        concept_family="Collision Boundaries",
+    )
+    divergent = _reel(
+        "divergent",
+        video_id="divergent-video",
+        start=0,
+        concept="Divergent Plate Boundaries",
+        concept_family="Spreading Boundaries",
+    )
+    transform = _reel(
+        "transform",
+        video_id="transform-video",
+        start=0,
+        concept="Transform Plate Boundaries",
+        concept_family="Sliding Boundaries",
+    )
+
+    ordered, ordered_ids = lesson_ordering._constraint_safe_fallback_order(
+        [convergent, divergent, transform],
+        ["convergent", "divergent", "transform"],
+        topic=(
+            "Teach plate tectonics through divergent, convergent, and "
+            "transform boundaries, then connect each boundary to earthquakes."
+        ),
+    )
+
+    assert ordered_ids == ["divergent", "convergent", "transform"]
+    assert ordered == [divergent, convergent, transform]
+
+
+@pytest.mark.parametrize(
+    ("topic", "expected_ids"),
+    [
+        (
+            "Explain beta after alpha overview.",
+            ["alpha", "beta"],
+        ),
+        (
+            "Before alpha, explain beta overview.",
+            ["beta", "alpha"],
+        ),
+    ],
+)
+def test_coordinated_sequence_does_not_reverse_relational_language(
+    topic: str,
+    expected_ids: list[str],
+) -> None:
+    beta = _reel(
+        "beta",
+        video_id="beta-video",
+        start=0,
+        concept="Beta Overview",
+    )
+    alpha = _reel(
+        "alpha",
+        video_id="alpha-video",
+        start=0,
+        concept="Alpha Overview",
+    )
+
+    _ordered, ordered_ids = lesson_ordering._constraint_safe_fallback_order(
+        [beta, alpha],
+        ["beta", "alpha"],
+        topic=topic,
+    )
+
+    assert ordered_ids == expected_ids
+
+
+def test_coordinated_shared_tail_is_domain_independent() -> None:
+    quick = _reel(
+        "quick",
+        video_id="quick-video",
+        start=0,
+        concept="Quick Sort",
+    )
+    insertion = _reel(
+        "insertion",
+        video_id="insertion-video",
+        start=0,
+        concept="Insertion Sort",
+    )
+    merge = _reel(
+        "merge",
+        video_id="merge-video",
+        start=0,
+        concept="Merge Sort",
+    )
+
+    _ordered, ordered_ids = lesson_ordering._constraint_safe_fallback_order(
+        [quick, insertion, merge],
+        ["quick", "insertion", "merge"],
+        topic=(
+            "Teach insertion, merge, and quick sort, then compare their "
+            "runtime tradeoffs."
+        ),
+    )
+
+    assert ordered_ids == ["insertion", "merge", "quick"]
+
+
+def test_coordinated_sequence_does_not_infer_from_scattered_terms() -> None:
+    beta = _reel(
+        "beta",
+        video_id="beta-video",
+        start=0,
+        concept="Beta Overview",
+    )
+    alpha = _reel(
+        "alpha",
+        video_id="alpha-video",
+        start=0,
+        concept="Alpha Overview",
+    )
+
+    _ordered, ordered_ids = lesson_ordering._constraint_safe_fallback_order(
+        [beta, alpha],
+        ["beta", "alpha"],
+        topic=(
+            "Begin with an overview, then discuss alpha details before "
+            "returning much later to beta examples."
+        ),
+    )
+
+    assert ordered_ids == ["beta", "alpha"]
+
+
+def test_coordinated_sequence_rejects_conflicting_label_variants() -> None:
+    alpha = _reel(
+        "alpha",
+        video_id="alpha-video",
+        start=0,
+        concept="Alpha Topic Overview",
+        concept_family="Xray Subject Summary",
+    )
+    beta = _reel(
+        "beta",
+        video_id="beta-video",
+        start=0,
+        concept="Beta Topic Overview",
+        concept_family="Beta Subject Summary",
+    )
+    gamma = _reel(
+        "gamma",
+        video_id="gamma-video",
+        start=0,
+        concept="Gamma Topic Overview",
+    )
+
+    _ordered, ordered_ids = lesson_ordering._constraint_safe_fallback_order(
+        [alpha, beta, gamma],
+        ["alpha", "beta", "gamma"],
+        topic=(
+            "Teach alpha, beta, and gamma overview, then compare xray and "
+            "summary."
+        ),
+    )
+
+    assert ordered_ids == ["alpha", "beta", "gamma"]
+
+
+@pytest.mark.parametrize(
+    "topic",
+    [
+        (
+            "Teach divergent convergent transform boundaries, then compare "
+            "their effects."
+        ),
+        (
+            "Teach divergent and convergent boundaries, then revisit "
+            "divergent before transform boundaries."
+        ),
+    ],
+)
+def test_coordinated_sequence_rejects_ambiguous_topic_evidence(
+    topic: str,
+) -> None:
+    reels = [
+        _reel(
+            "convergent",
+            video_id="convergent-video",
+            start=0,
+            concept="Convergent Plate Boundaries",
+        ),
+        _reel(
+            "divergent",
+            video_id="divergent-video",
+            start=0,
+            concept="Divergent Plate Boundaries",
+        ),
+        _reel(
+            "transform",
+            video_id="transform-video",
+            start=0,
+            concept="Transform Plate Boundaries",
+        ),
+    ]
+
+    _ordered, ordered_ids = lesson_ordering._constraint_safe_fallback_order(
+        reels,
+        ["convergent", "divergent", "transform"],
+        topic=topic,
+    )
+
+    assert ordered_ids == ["convergent", "divergent", "transform"]
+
+
+def test_coordinated_sequence_cannot_override_prerequisites() -> None:
+    convergent = _reel(
+        "convergent",
+        video_id="convergent-video",
+        start=0,
+        concept="Convergent Plate Boundaries",
+    )
+    divergent = _reel(
+        "divergent",
+        video_id="divergent-video",
+        start=0,
+        concept="Divergent Plate Boundaries",
+        prerequisite_ids=["convergent"],
+    )
+
+    _ordered, ordered_ids = lesson_ordering._constraint_safe_fallback_order(
+        [divergent, convergent],
+        ["divergent", "convergent"],
+        topic=(
+            "Teach divergent and convergent plate boundaries, then compare "
+            "them."
+        ),
+    )
+
+    assert ordered_ids == ["convergent", "divergent"]
 
 
 def test_invalid_order_is_repaired_without_retry(monkeypatch) -> None:
