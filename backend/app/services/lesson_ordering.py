@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from backend import gemini_client
+from backend.concept_families import concept_family_identity_key
 from backend.concept_ordinals import (
     NUMBERED_CONCEPT_KIND_TOKENS,
     canonicalize_concept_identifier_tokens,
@@ -46,14 +47,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-LESSON_ORDER_PROMPT_VERSION = "lesson_order_v20"
+LESSON_ORDER_PROMPT_VERSION = "lesson_order_v21"
 LESSON_ORDER_TIMEOUT_S = 10.0
 # Even an invalid worst-case schema payload with four bounded UUID lists and a
 # terminal marker fits this ceiling. Actual
 # generated length, not this ceiling, drives latency.
 LESSON_ORDER_MAX_OUTPUT_TOKENS = 10_240
 LESSON_ORDER_ATTEMPTS = 2
-LESSON_ORDER_CACHE_VERSION = 17
+LESSON_ORDER_CACHE_VERSION = 18
 LESSON_ORDER_CACHE_TTL_SEC = 30 * 24 * 60 * 60
 LESSON_ORDER_MAX_CLIPS = 200
 LESSON_ORDER_MAX_USER_PROMPT_CHARS = 64_000
@@ -323,6 +324,10 @@ request facets then count as covered by the richer selected clip. Keep this list
 quality, level mismatch, release-limit pressure, missing context, or any candidate that adds a
 genuinely new explanation, reasoning step, application, misconception, remediation, worked
 step, or request facet. Never put a required ID here.
+A shared subject-only obligation reference identifies request scope, not semantic containment.
+Do not call clips from distinct nonempty concept families current restatements merely because
+they share that coarse subject reference. Keep both unless the selected clip's actual semantic
+evidence contains the omitted clip's specific educational contribution.
 
 Hard output rules:
 - Return one or more supplied reel_ids in ordered_reel_ids. You may omit a supplied ID.
@@ -2317,6 +2322,89 @@ def _enforce_mandatory_selection(
         reels_by_id,
         prior_concept_coverage,
     )
+    current_restatement_ids = set(result.current_restatement_reel_ids or ())
+    subject_only_keys_by_reel: dict[str, frozenset[str]] = {}
+    trusted_family_by_reel: dict[str, str] = {}
+    for reel_id, reel in reels_by_id.items():
+        obligations = _trusted_intent_obligations(reel)
+        if obligations and all(
+            obligation.get("kind") == "subject"
+            for obligation in obligations
+        ):
+            subject_only_keys_by_reel[reel_id] = frozenset(
+                intent_obligation_keys(obligations)
+            )
+        trusted_family_by_reel[reel_id] = concept_family_identity_key(
+            _clean_text(
+                reel.get("_selection_concept_family"),
+                96,
+            )
+        )
+
+    # A coarse subject facet cannot prove that two distinct audited concept
+    # families are semantic restatements. Protect one missing-family witness
+    # only when it fits beside Gemini's existing bounded selection; otherwise
+    # preserve the model's release-limit choice unchanged.
+    selected_release_closure = set().union(*(
+        _selection_dependency_closure(
+            reel_id,
+            reels_by_id,
+            satisfied_reel_ids=satisfied_context_ids,
+        )
+        for reel_id in selected_ids
+    )) if selected_ids else set()
+    protected_current_restatement_ids: set[str] = set()
+    protected_family_coverage = {
+        (
+            subject_only_keys_by_reel[reel_id],
+            trusted_family_by_reel[reel_id],
+        )
+        for reel_id in selected_ids
+        if _selection_inventory_tier(reels_by_id[reel_id]) <= 2
+        and subject_only_keys_by_reel.get(reel_id)
+        and trusted_family_by_reel.get(reel_id)
+    }
+    for reel_id in result.current_restatement_reel_ids or ():
+        subject_keys = subject_only_keys_by_reel.get(reel_id)
+        family = trusted_family_by_reel.get(reel_id)
+        if (
+            reel_id not in current_restatement_ids
+            or reel_id in forbidden_prelocked_ids
+            or _selection_inventory_tier(reels_by_id[reel_id]) > 2
+            or not subject_keys
+            or not family
+            or (subject_keys, family) in protected_family_coverage
+            or not any(
+                subject_only_keys_by_reel.get(selected_id) == subject_keys
+                and _selection_inventory_tier(reels_by_id[selected_id]) <= 2
+                and trusted_family_by_reel.get(selected_id)
+                and trusted_family_by_reel[selected_id] != family
+                for selected_id in selected_ids
+            )
+        ):
+            continue
+        candidate_closure = _selection_dependency_closure(
+            reel_id,
+            reels_by_id,
+            satisfied_reel_ids=satisfied_context_ids,
+        )
+        if len(selected_release_closure | candidate_closure) > effective_release_limit:
+            continue
+        protected_current_restatement_ids.add(reel_id)
+        protected_family_coverage.add((subject_keys, family))
+        selected_release_closure.update(candidate_closure)
+
+    if protected_current_restatement_ids:
+        current_restatement_ids -= protected_current_restatement_ids
+        required_identity_ids.update(protected_current_restatement_ids)
+        result = replace(
+            result,
+            current_restatement_reel_ids=[
+                reel_id
+                for reel_id in result.current_restatement_reel_ids or ()
+                if reel_id not in protected_current_restatement_ids
+            ],
+        )
     prior_restatement_ids = set(result.prior_restatement_reel_ids or ())
     prior_restatement_obligation_keys = (
         set().union(*(
@@ -2330,7 +2418,6 @@ def _enforce_mandatory_selection(
         )
         else set()
     )
-    current_restatement_ids = set(result.current_restatement_reel_ids or ())
     current_restatement_obligation_keys = (
         set().union(*(
             obligations_by_reel.get(reel_id, set())

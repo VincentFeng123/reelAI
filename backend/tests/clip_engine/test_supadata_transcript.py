@@ -234,6 +234,50 @@ def test_unavailable_timestamped_transcript_is_typed_per_video(monkeypatch) -> N
     assert calls == 1
 
 
+def test_documented_206_transcript_unavailable_is_not_retried(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    def unavailable(*_args):
+        nonlocal calls
+        calls += 1
+        return _Response(
+            206,
+            {
+                "error": "transcript-unavailable",
+                "message": "Transcript Unavailable",
+                "details": "No transcript is available for this video",
+            },
+            {"x-billable-requests": "1"},
+        )
+
+    _install_client(monkeypatch, unavailable)
+    cache = MemoryProviderCache()
+    context = GenerationContext("fast", cache_store=cache)
+
+    with pytest.raises(TranscriptUnavailableError) as exc_info:
+        supadata_client.fetch_transcript_artifact(
+            VIDEO_URL,
+            context=context,
+        )
+
+    assert calls == 1
+    assert exc_info.value.status_code == 206
+    assert exc_info.value.detail == "No transcript is available for this video"
+    assert len(context.usage()) == 1
+    assert context.usage()[0]["status_code"] == 206
+    assert context.usage()[0]["billable_requests"] == 1
+    assert context.usage()[0]["error_code"] == "transcript_unavailable"
+    assert cache.get_transcript(
+        video_id=VIDEO_ID,
+        provider="supadata",
+        requested_language="en",
+        native_mode=False,
+        schema_version=TRANSCRIPT_SCHEMA_VERSION,
+    ) is None
+
+
 @pytest.mark.parametrize(
     "first_response",
     [

@@ -182,6 +182,245 @@ def test_required_unseen_clip_dominates_optional_cross_source_strict_restatement
     assert result.current_restatement_reel_ids == ["strict-subset"]
 
 
+def test_subject_only_collision_cannot_hide_a_distinct_trusted_family(
+    monkeypatch,
+) -> None:
+    broad_subject = _obligation(
+        "AP Statistics",
+        "Teach AP Statistics",
+        kind="subject",
+    )
+    reels = [
+        _trusted_independent_reel(
+            "data-types",
+            video_id="data-types-source",
+            start=0,
+            concept="categorical vs quantitative data",
+            _selection_concept_family="data types",
+            transcript_snippet=(
+                "Categorical data labels groups, while quantitative data records numbers."
+            ),
+            _selection_intent_obligations=[broad_subject],
+        ),
+        _trusted_independent_reel(
+            "experimental-design",
+            video_id="experimental-design-source",
+            start=0,
+            concept="experiments vs observational studies",
+            _selection_concept_family="experimental design",
+            transcript_snippet=(
+                "Experiments assign treatments, while observational studies only observe."
+            ),
+            _selection_intent_obligations=[broad_subject],
+        ),
+    ]
+    calls = 0
+
+    def false_restatement(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _generation_result(
+            ["data-types"],
+            current_restatement_reel_ids=["experimental-design"],
+        )
+
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        false_restatement,
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="AP Statistics",
+        release_limit=2,
+    )
+
+    assert calls == 1
+    assert result.ordered_reel_ids == ["data-types", "experimental-design"]
+    assert result.current_restatement_reel_ids == []
+
+
+def test_subject_only_collision_preserves_same_family_restatement(
+    monkeypatch,
+) -> None:
+    broad_subject = _obligation(
+        "statistics",
+        "Teach statistics",
+        kind="subject",
+    )
+    reels = [
+        _trusted_independent_reel(
+            "concise",
+            video_id="concise-source",
+            start=0,
+            concept="categorical and quantitative data",
+            _selection_concept_family="data types",
+            _selection_intent_obligations=[broad_subject],
+        ),
+        _trusted_independent_reel(
+            "repeat",
+            video_id="repeat-source",
+            start=0,
+            concept="quantitative versus categorical data",
+            _selection_concept_family="data types",
+            _selection_intent_obligations=[broad_subject],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(
+            ["concise"],
+            current_restatement_reel_ids=["repeat"],
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="statistics",
+        release_limit=2,
+    )
+
+    assert result.ordered_reel_ids == ["concise"]
+    assert result.current_restatement_reel_ids == ["repeat"]
+
+
+def test_subject_only_collision_requires_selected_trusted_family(
+    monkeypatch,
+) -> None:
+    broad_subject = _obligation(
+        "programming",
+        "Teach programming",
+        kind="subject",
+    )
+    reels = [
+        _trusted_independent_reel(
+            "selected",
+            video_id="selected-source",
+            start=0,
+            concept="Python version 3.12",
+            _selection_concept_family="",
+            _selection_intent_obligations=[broad_subject],
+        ),
+        _trusted_independent_reel(
+            "omitted",
+            video_id="omitted-source",
+            start=0,
+            concept="Python 3.12",
+            _selection_concept_family="Python 3.12",
+            _selection_intent_obligations=[broad_subject],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(
+            ["selected"],
+            current_restatement_reel_ids=["omitted"],
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="programming",
+        release_limit=2,
+    )
+
+    assert result.ordered_reel_ids == ["selected"]
+    assert result.current_restatement_reel_ids == ["omitted"]
+
+
+def test_subject_only_collision_uses_canonical_family_identity(
+    monkeypatch,
+) -> None:
+    broad_subject = _obligation(
+        "programming",
+        "Teach programming",
+        kind="subject",
+    )
+    reels = [
+        _trusted_independent_reel(
+            "selected",
+            video_id="selected-source",
+            start=0,
+            concept="Python version 3.12",
+            _selection_concept_family="Python version 3.12",
+            _selection_intent_obligations=[broad_subject],
+        ),
+        _trusted_independent_reel(
+            "omitted",
+            video_id="omitted-source",
+            start=0,
+            concept="Python 3.12",
+            _selection_concept_family="Python 3.12",
+            _selection_intent_obligations=[broad_subject],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(
+            ["selected"],
+            current_restatement_reel_ids=["omitted"],
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="programming",
+        release_limit=2,
+    )
+
+    assert result.ordered_reel_ids == ["selected"]
+    assert result.current_restatement_reel_ids == ["omitted"]
+
+
+def test_subject_only_collision_never_exceeds_release_limit(
+    monkeypatch,
+) -> None:
+    broad_subject = _obligation(
+        "physics",
+        "Teach physics",
+        kind="subject",
+    )
+    reels = [
+        _trusted_independent_reel(
+            "motion",
+            video_id="motion-source",
+            start=0,
+            concept="kinematics",
+            _selection_concept_family="motion",
+            _selection_intent_obligations=[broad_subject],
+        ),
+        _trusted_independent_reel(
+            "energy",
+            video_id="energy-source",
+            start=0,
+            concept="conservation of energy",
+            _selection_concept_family="energy",
+            _selection_intent_obligations=[broad_subject],
+        ),
+    ]
+    monkeypatch.setattr(
+        lesson_ordering,
+        "_generate_lesson_order",
+        lambda *_args, **_kwargs: _generation_result(
+            ["motion"],
+            current_restatement_reel_ids=["energy"],
+        ),
+    )
+
+    result = lesson_ordering.order_lesson_batch(
+        reels,
+        topic="physics",
+        release_limit=1,
+    )
+
+    assert result.ordered_reel_ids == ["motion"]
+    assert result.current_restatement_reel_ids == ["energy"]
+
+
 def test_removed_selected_dominator_clears_current_restatement_declaration(
     monkeypatch,
 ) -> None:
@@ -756,9 +995,10 @@ def test_organizer_payload_prefers_trusted_narrow_concept_and_requires_semantic_
     assert payload["concept_title"] == "How force and mass change acceleration"
     assert payload["concept_family"] == "force-mass-acceleration proportionality"
     assert payload["clip_duration_seconds"] == 20.0
-    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v20"
+    assert lesson_ordering.LESSON_ORDER_PROMPT_VERSION == "lesson_order_v21"
     policy = " ".join(lesson_ordering._SYSTEM_PROMPT.split())
     assert "semantic restatements" in policy
+    assert "subject-only obligation reference" in policy
     assert "concept, then explanation, then application or worked example" in policy
     assert "release_limit is a ceiling, not a target" in policy
     assert "Use the trusted structural completeness fields" in policy
@@ -6298,8 +6538,8 @@ def test_lesson_order_cache_round_trips_validated_restatements(
     assert cached.prior_restatement_reel_ids == ["repeat"]
     assert cached.current_restatement_reel_ids == ["current-subset"]
     response_payload = json.loads(stored["response_json"])
-    assert response_payload["prompt_version"] == "lesson_order_v20"
-    assert response_payload["cache_version"] == 17
+    assert response_payload["prompt_version"] == "lesson_order_v21"
+    assert response_payload["cache_version"] == 18
     for equivalent_model in (
         f"models/{config.LESSON_ORDER_MODEL}",
         f"{config.LESSON_ORDER_MODEL}-001",

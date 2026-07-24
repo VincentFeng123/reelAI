@@ -99,7 +99,12 @@ def _error_detail(response: httpx.Response) -> str:
     except Exception:
         return str(getattr(response, "text", "") or "")[:300]
     if isinstance(value, dict):
-        return str(value.get("message") or value.get("error") or "")[:300]
+        return str(
+            value.get("details")
+            or value.get("message")
+            or value.get("error")
+            or ""
+        )[:300]
     return ""
 
 
@@ -119,7 +124,7 @@ def _failure(
         return ProviderAuthenticationError("Supadata authentication failed.", **kwargs)
     if status == 402:
         return ProviderQuotaError("Supadata quota is exhausted.", **kwargs)
-    if status == 404:
+    if status in (206, 404):
         return TranscriptUnavailableError(
             "No usable timestamped transcript is available for this video.", **kwargs
         )
@@ -246,7 +251,7 @@ async def _request(
         status = int(response.status_code)
         data: dict[str, Any] | None = None
         payload_error: Exception | None = None
-        if 200 <= status < 300:
+        if 200 <= status < 300 and status != 206:
             try:
                 decoded = response.json()
             except Exception as exc:
@@ -267,7 +272,9 @@ async def _request(
                         "Supadata transcript response body is not an object."
                     )
         error_code = ""
-        if status == 429:
+        if status == 206:
+            error_code = _failure(response).code
+        elif status == 429:
             error_code = "provider_rate_limited"
         elif status == 408 or status >= 500 or payload_error is not None:
             error_code = "provider_transient"
@@ -283,6 +290,8 @@ async def _request(
                 error_code=error_code,
                 metadata={"poll": not reserve_budget},
             )
+        if status == 206:
+            raise _failure(response)
         if status in (408, 429) or 500 <= status <= 599:
             retry_after = bounded_retry_after(response.headers)
             if retry_index < MAX_PROVIDER_RETRIES:
