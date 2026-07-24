@@ -1237,7 +1237,7 @@ def test_pro_selector_and_audit_retry_headroom_stays_within_job_cost_ceiling(
     assert budget["cost_limit_usd"] == pytest.approx(cost_limit)
 
 
-def test_retry_uses_bounded_completion_capacity_without_admitting_new_source(
+def test_retry_and_new_source_can_exceed_cost_target_but_selector_cap_remains(
     monkeypatch,
 ) -> None:
     context = GenerationContext("fast", generation_id="retry-physical-cap")
@@ -1300,11 +1300,9 @@ def test_retry_uses_bounded_completion_capacity_without_admitting_new_source(
     worker.start()
     assert retry_admission_started.wait(timeout=1.0)
     admitted_retry_budget = retry_admission_budgets[0]
+    assert admitted_retry_budget["hard_cost_cap_enabled"] is False
     assert admitted_retry_budget["cost_exposure_usd"] > admitted_retry_budget[
-        "cost_limit_usd"
-    ]
-    assert admitted_retry_budget["cost_exposure_usd"] <= admitted_retry_budget[
-        "completion_cost_limit_usd"
+        "cost_target_usd"
     ]
     assert finished.wait(timeout=1.0)
     worker.join(timeout=1.0)
@@ -1318,24 +1316,32 @@ def test_retry_uses_bounded_completion_capacity_without_admitting_new_source(
     completion_budget = context.budget.snapshot()["gemini"]
     assert completion_budget["selector_calls"] == 1
     assert completion_budget["inflight_reserved_cost_usd"] == pytest.approx(1.00)
-    assert completion_budget["cost_exposure_usd"] <= completion_budget[
-        "completion_cost_limit_usd"
-    ]
 
-    with pytest.raises(ProviderBudgetExceededError, match="cost budget"):
+    context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=100,
+        max_output_tokens=40_000,
+    )
+    context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=100,
+        max_output_tokens=200_000,
+        count_logical_call=False,
+    )
+    context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=100,
+        max_output_tokens=100,
+    )
+    with pytest.raises(ProviderBudgetExceededError, match="selector budget"):
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
             model="gemini-3.5-flash",
             estimated_input_tokens=100,
-            max_output_tokens=40_000,
-        )
-    with pytest.raises(ProviderBudgetExceededError, match="cost budget"):
-        context.reserve_gemini_call(
-            operation="flash_boundary_selector",
-            model="gemini-3.5-flash",
-            estimated_input_tokens=100,
-            max_output_tokens=100_000,
-            count_logical_call=False,
+            max_output_tokens=100,
         )
 
     assert context.budget.reconcile_gemini(
@@ -1343,8 +1349,11 @@ def test_retry_uses_bounded_completion_capacity_without_admitting_new_source(
         actual_cost_usd=0.0,
     ) is True
     final_budget = context.budget.snapshot()["gemini"]
-    assert final_budget["inflight_reserved_cost_usd"] == 0.0
-    assert final_budget["cost_exposure_usd"] <= final_budget["cost_limit_usd"]
+    assert final_budget["hard_cost_cap_enabled"] is False
+    assert final_budget["cost_exposure_usd"] > final_budget[
+        "completion_cost_target_usd"
+    ]
+    assert final_budget["selector_calls"] == final_budget["selector_limit"] == 3
 
 
 def test_bound_selector_topics_only_payload_reduces_output_contract() -> None:

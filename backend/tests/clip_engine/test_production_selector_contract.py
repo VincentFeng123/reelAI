@@ -19233,7 +19233,7 @@ def test_exact_token_preflight_keeps_affordable_tier_through_its_exact_boundary(
     )
 
 
-def test_exact_preflight_prevents_high_entropy_text_from_exceeding_fast_ceiling(
+def test_exact_preflight_tracks_high_entropy_cost_without_blocking_fast_selector(
     monkeypatch,
 ) -> None:
     context = GenerationContext("fast", generation_id="selector-high-entropy")
@@ -19245,13 +19245,28 @@ def test_exact_preflight_prevents_high_entropy_text_from_exceeding_fast_ceiling(
     )
 
     def generate(*_args, **kwargs):
-        # Admission must fail before this fake reaches its provider-dispatch
-        # marker.
-        kwargs["before_dispatch"](
+        ticket = kwargs["before_dispatch"](
             model=kwargs["model"], attempt=1,
         )
         generated.append(True)
-        raise AssertionError("over-budget request dispatched")
+        telemetry = {
+            "model": kwargs["model"],
+            "prompt_tokens": 350_001,
+            "candidate_tokens": 3_000,
+            "thought_tokens": 3_000,
+            "total_tokens": 356_001,
+            "dispatched": True,
+        }
+        kwargs["after_dispatch"](
+            ticket,
+            model=kwargs["model"],
+            attempt=1,
+            telemetry=telemetry,
+        )
+        return SimpleNamespace(
+            text='{"topics": []}',
+            telemetry=telemetry,
+        )
 
     monkeypatch.setattr(
         gemini_client,
@@ -19259,33 +19274,29 @@ def test_exact_preflight_prevents_high_entropy_text_from_exceeding_fast_ceiling(
         generate,
     )
 
-    with pytest.raises(gemini_segment._ModelCallError) as exc_info:
-        gemini_segment._call_model(
-            "system",
-            "x" * 70_000,
-            gemini_segment._BoundaryPlan,
-            model="gemini-3.1-pro-preview",
-            thinking_level="medium",
-            max_output_tokens=6_000,
-            timeout_s=30.0,
-            deadline_monotonic=time.monotonic() + 10.0,
-            operation="pro_authoritative",
-            prompt_version=gemini_segment.PRO_BOUNDARY_PROFILE,
-            cancelled=None,
-            budget_reserve=context.reserve_gemini_call,
-            budget_reconcile=context.reconcile_gemini_call,
-            max_retries=0,
-        )
+    parsed, _telemetry = gemini_segment._call_model(
+        "system",
+        "x" * 70_000,
+        gemini_segment._BoundaryPlan,
+        model="gemini-3.1-pro-preview",
+        thinking_level="medium",
+        max_output_tokens=6_000,
+        timeout_s=30.0,
+        deadline_monotonic=time.monotonic() + 10.0,
+        operation="pro_authoritative",
+        prompt_version=gemini_segment.PRO_BOUNDARY_PROFILE,
+        cancelled=None,
+        budget_reserve=context.reserve_gemini_call,
+        budget_reconcile=context.reconcile_gemini_call,
+        max_retries=0,
+    )
 
-    assert generated == []
-    assert isinstance(exc_info.value.__cause__, ProviderBudgetExceededError)
-    failure = gemini_segment._exception_telemetry(exc_info.value)
-    assert failure["error_type"] == "ProviderBudgetExceededError"
-    assert failure["dispatched"] is False
-    assert failure["physical_dispatches"] == 0
+    assert parsed.topics == []
+    assert generated == [True]
     budget = context.budget.snapshot()["gemini"]
-    assert budget["selector_calls"] == 0
-    assert budget["cost_exposure_usd"] == 0.0
+    assert budget["hard_cost_cap_enabled"] is False
+    assert budget["selector_calls"] == 1
+    assert budget["cost_exposure_usd"] > budget["cost_target_usd"]
 
 
 def test_preferred_video_url_failure_never_dispatches_a_media_retry(

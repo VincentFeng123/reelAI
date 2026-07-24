@@ -45,7 +45,9 @@ def _transcript(duration: float = 100.0) -> dict:
     ]}
 
 
-def test_public_selector_installs_a_local_cost_guard_for_direct_callers(monkeypatch):
+def test_public_selector_tracks_cost_without_a_hard_cap_for_direct_callers(
+    monkeypatch,
+):
     captured = {}
     original_settings = {}
 
@@ -67,16 +69,25 @@ def test_public_selector_installs_a_local_cost_guard_for_direct_callers(monkeypa
     assert original_settings == {}
     assert callable(captured["_segment_budget_reserve"])
     assert callable(captured["_segment_budget_reconcile"])
-    with pytest.raises(ProviderBudgetExceededError, match=r"\$1\.50 maximum"):
-        captured["_segment_budget_reserve"](
-            operation="pro_authoritative",
-            model="gemini-3.1-pro-preview",
-            estimated_input_tokens=400_001,
-            max_output_tokens=6_000,
-        )
+    selector_ticket = captured["_segment_budget_reserve"](
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=400_001,
+        max_output_tokens=6_000,
+    )
+    audit_ticket = captured["_segment_budget_reserve"](
+        operation="pro_boundary_audit",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=400_001,
+        max_output_tokens=6_000,
+    )
+    assert selector_ticket["admitted_cost_usd"] > 1.50
+    assert audit_ticket["admitted_cost_usd"] > 1.50
 
 
-def test_direct_long_transcript_is_rejected_before_pro_dispatch(monkeypatch):
+def test_direct_long_transcript_dispatches_despite_observational_cost_target(
+    monkeypatch,
+):
     count_calls = []
     dispatched = False
 
@@ -131,8 +142,8 @@ def test_direct_long_transcript_is_rejected_before_pro_dispatch(monkeypatch):
     )
 
     assert len(count_calls) == 1
-    assert dispatched is False
-    assert "ProviderBudgetExceededError" in str(result.error)
+    assert dispatched is True
+    assert "ProviderBudgetExceededError" not in str(result.error)
 
 
 def _empty_plan(schema: type, *, topic: str = ""):

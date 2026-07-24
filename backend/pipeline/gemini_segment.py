@@ -1779,7 +1779,7 @@ _SELECTION_OUTPUT_TOKENS = 24_576
 _BOUNDARY_OUTPUT_TOKENS = 6_400
 # Gemini Pro counts hidden thought tokens against max_output_tokens. Reserve a
 # separate allowance so medium reasoning cannot consume the structured payload;
-# provider runtime independently bounds the call count and total job exposure.
+# provider runtime independently bounds the call count and records job exposure.
 _PRO_BOUNDARY_OUTPUT_TOKENS = 12_288
 # The final audit may return 40 decisions plus repaired edges, and correction
 # thinking tokens count against the same provider output ceiling.
@@ -1787,8 +1787,8 @@ _PRO_BOUNDARY_AUDIT_OUTPUT_TOKENS = 22_528
 _PRO_BOUNDARY_AUDIT_MIN_OUTPUT_TOKENS = 8_192
 # Calls cheap enough under a byte-per-token upper bound may use the local
 # estimate. Anything larger gets the provider's free exact count first, so two
-# Fast or three Slow selectors cannot collectively under-reserve past the job
-# ceiling even for high-entropy text.
+# Fast or three Slow selectors cannot collectively under-report conservative
+# exposure for high-entropy text.
 _MAX_UNCOUNTED_SELECTOR_COST_USD = 0.20
 # At low media resolution Gemini uses roughly one 66-token video frame plus
 # 32 audio tokens per second. The rounded rate also covers timestamp metadata.

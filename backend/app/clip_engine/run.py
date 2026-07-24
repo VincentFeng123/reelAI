@@ -223,8 +223,8 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
     settings = dict(settings or {})
     if not (settings.get("generation_context") or settings.get("provider_context")):
         # Every production-facing clip invocation needs the same pre-dispatch
-        # token and cost guard. Callers with a multi-source job pass a shared
-        # context; isolated/legacy callers receive a bounded local one.
+        # call ceilings and cost telemetry. Callers with a multi-source job pass
+        # a shared context; isolated/legacy callers receive a bounded local one.
         settings["generation_context"] = GenerationContext(
             "fast",
             generation_id=f"clip:{video_id}",

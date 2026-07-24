@@ -76,8 +76,18 @@ def test_generation_budgets_match_fast_and_slow_contracts() -> None:
     assert (fast.max_passes, fast.max_no_growth_passes) == (1, 0)
     assert slow.snapshot()["limits"] == {"search": 5, "transcript": 5, "segmentation": 5}
     assert (slow.max_passes, slow.max_no_growth_passes) == (1, 0)
-    assert fast.snapshot()["gemini"]["completion_cost_limit_usd"] == 2.00
-    assert slow.snapshot()["gemini"]["completion_cost_limit_usd"] == 3.00
+    fast_gemini = fast.snapshot()["gemini"]
+    slow_gemini = slow.snapshot()["gemini"]
+    assert fast_gemini["hard_cost_cap_enabled"] is False
+    assert slow_gemini["hard_cost_cap_enabled"] is False
+    assert fast_gemini["cost_target_usd"] == 1.50
+    assert slow_gemini["cost_target_usd"] == 2.50
+    assert fast_gemini["completion_cost_target_usd"] == 2.00
+    assert slow_gemini["completion_cost_target_usd"] == 3.00
+    assert fast_gemini["cost_limit_usd"] == fast_gemini["cost_target_usd"]
+    assert slow_gemini["completion_cost_limit_usd"] == (
+        slow_gemini["completion_cost_target_usd"]
+    )
     for _ in range(5):
         fast.reserve("search")
     with pytest.raises(ProviderBudgetExceededError):
@@ -623,7 +633,7 @@ def test_pro_usage_uses_the_documented_long_context_price_tier(
     )
 
 
-def test_pro_reservation_applies_long_context_tier_before_dispatch() -> None:
+def test_pro_reservation_applies_long_context_tier_without_a_dollar_gate() -> None:
     context = GenerationContext("slow", generation_id="job-pro-reserve-tier")
     reservation = context.reserve_gemini_call(
         operation="pro_authoritative",
@@ -635,14 +645,33 @@ def test_pro_reservation_applies_long_context_tier_before_dispatch() -> None:
     assert reservation["reserved_cost_usd"] == pytest.approx(
         (200_000 * 2.0 + 100 * 12.0) / 1_000_000.0
     )
-    with pytest.raises(ProviderBudgetExceededError, match="cost budget"):
+    over_target = context.reserve_gemini_call(
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=600_001,
+        max_output_tokens=100,
+    )
+    assert over_target["reserved_cost_usd"] == pytest.approx(
+        (600_001 * 4.0 + 100 * 18.0) / 1_000_000.0
+    )
+    for _ in range(3):
         context.reserve_gemini_call(
             operation="pro_authoritative",
             model="gemini-3.1-pro-preview",
-            estimated_input_tokens=600_001,
+            estimated_input_tokens=1_000,
             max_output_tokens=100,
         )
-    assert context.budget.snapshot()["gemini"]["pro_selector_calls"] == 1
+    with pytest.raises(ProviderBudgetExceededError, match="selector budget"):
+        context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
+        )
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["hard_cost_cap_enabled"] is False
+    assert budget["cost_exposure_usd"] > budget["cost_target_usd"]
+    assert budget["pro_selector_calls"] == budget["pro_selector_limit"] == 5
 
 
 def test_priority_retry_reserves_and_prices_documented_pro_premium() -> None:
@@ -767,7 +796,7 @@ def test_durable_retry_restores_cost_exposure_but_reopens_selector_slots() -> No
     assert retry.budget.snapshot()["gemini"]["selector_calls"] == 1
 
 
-def test_durable_retry_counts_unsettled_prior_reservation_against_cost_ceiling() -> None:
+def test_durable_retry_restores_cost_telemetry_without_closing_selector_slots() -> None:
     retry = GenerationContext("fast", generation_id="job-budget-unsettled-retry")
     retry.budget.restore_gemini_retry_exposure({
         "mode": "fast",
@@ -782,17 +811,36 @@ def test_durable_retry_counts_unsettled_prior_reservation_against_cost_ceiling()
     restored = retry.budget.snapshot()["gemini"]
     assert restored["committed_cost_usd"] == pytest.approx(0.9)
     assert restored["billing_unknown_cost_exposure_usd"] == pytest.approx(0.82)
-    with pytest.raises(ProviderBudgetExceededError, match="cost budget"):
+    retry.reserve_gemini_call(
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=250_001,
+        max_output_tokens=6_000,
+        max_physical_attempts=1,
+    )
+    for _ in range(2):
         retry.reserve_gemini_call(
             operation="pro_authoritative",
             model="gemini-3.1-pro-preview",
-            estimated_input_tokens=250_001,
-            max_output_tokens=6_000,
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
             max_physical_attempts=1,
         )
+    with pytest.raises(ProviderBudgetExceededError, match="selector budget"):
+        retry.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
+            max_physical_attempts=1,
+        )
+    budget = retry.budget.snapshot()["gemini"]
+    assert budget["hard_cost_cap_enabled"] is False
+    assert budget["cost_exposure_usd"] > budget["cost_target_usd"]
+    assert budget["selector_calls"] == budget["selector_limit"] == 3
 
 
-def test_completion_cost_envelope_only_admits_required_same_source_work() -> None:
+def test_cost_targets_are_telemetry_only_while_call_ceilings_remain_hard() -> None:
     context = GenerationContext("slow", generation_id="job-completion-envelope")
     context.budget.restore_gemini_retry_exposure({
         "mode": "slow",
@@ -816,112 +864,70 @@ def test_completion_cost_envelope_only_admits_required_same_source_work() -> Non
             count_logical_call=False,
         )
 
-    with pytest.raises(ProviderBudgetExceededError, match="cost budget") as orphan_audit:
-        context.reserve_gemini_call(
-            operation="pro_boundary_audit",
-            model="gemini-3.1-pro-preview",
-            estimated_input_tokens=13_319,
-            max_output_tokens=8_256,
-        )
-    assert "lane=normal" in str(orphan_audit.value.detail)
-
-    initial_selector = context.reserve_gemini_call(
-        operation="pro_authoritative",
-        model="gemini-3.1-pro-preview",
-        estimated_input_tokens=1_000,
-        max_output_tokens=100,
-    )
-
-    with pytest.raises(ProviderBudgetExceededError, match="cost budget") as selector:
-        context.reserve_gemini_call(
-            operation="pro_authoritative",
-            model="gemini-3.1-pro-preview",
-            estimated_input_tokens=15_926,
-            max_output_tokens=12_288,
-        )
-    assert "lane=normal" in str(selector.value.detail)
-
-    with pytest.raises(ProviderBudgetExceededError, match="cost budget") as expansion:
-        context.reserve_gemini_call(
-            operation="expansion",
-            model="gemini-3.1-flash-lite",
-            estimated_input_tokens=100_000,
-            max_output_tokens=70_000,
-        )
-    assert "lane=normal" in str(expansion.value.detail)
-
-    boundary_audit = context.reserve_gemini_call(
+    context.reserve_gemini_call(
         operation="pro_boundary_audit",
         model="gemini-3.1-pro-preview",
         estimated_input_tokens=13_319,
         max_output_tokens=8_256,
     )
-    selector_repair = context.reserve_gemini_call(
+    context.reserve_gemini_call(
         operation="pro_authoritative",
         model="gemini-3.1-pro-preview",
-        estimated_input_tokens=15_926,
-        max_output_tokens=12_288,
+        estimated_input_tokens=1_000,
+        max_output_tokens=100,
+    )
+    context.reserve_gemini_call(
+        operation="pro_authoritative",
+        model="gemini-3.1-pro-preview",
+        estimated_input_tokens=100_000,
+        max_output_tokens=100_000,
         count_logical_call=False,
+    )
+    context.reserve_gemini_call(
+        operation="expansion",
+        model="gemini-3.1-flash-lite",
+        estimated_input_tokens=100_000,
+        max_output_tokens=70_000,
     )
 
     budget = context.budget.snapshot()["gemini"]
+    assert budget["hard_cost_cap_enabled"] is False
+    assert budget["cost_exposure_usd"] > budget["completion_cost_target_usd"]
     assert budget["selector_calls"] == 1
     assert budget["boundary_audit_calls"] == 1
-    assert budget["cost_limit_usd"] == pytest.approx(2.50)
-    assert budget["completion_cost_limit_usd"] == pytest.approx(3.00)
-    assert budget["cost_exposure_usd"] > budget["cost_limit_usd"]
-    assert budget["cost_exposure_usd"] <= budget["completion_cost_limit_usd"]
 
-    with pytest.raises(ProviderBudgetExceededError, match="cost budget") as new_source:
+    for _ in range(4):
         context.reserve_gemini_call(
             operation="pro_authoritative",
             model="gemini-3.1-pro-preview",
             estimated_input_tokens=1_000,
             max_output_tokens=100,
         )
-    assert "lane=normal" in str(new_source.value.detail)
-
-    before_hard_cap_rejection = context.budget.snapshot()["gemini"][
-        "cost_exposure_usd"
-    ]
-    with pytest.raises(ProviderBudgetExceededError, match="cost budget") as hard_cap:
+    with pytest.raises(ProviderBudgetExceededError, match="selector budget"):
         context.reserve_gemini_call(
             operation="pro_authoritative",
             model="gemini-3.1-pro-preview",
-            estimated_input_tokens=100_000,
-            max_output_tokens=20_000,
-            count_logical_call=False,
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
         )
-    assert "lane=completion" in str(hard_cap.value.detail)
-    assert context.budget.snapshot()["gemini"]["cost_exposure_usd"] == pytest.approx(
-        before_hard_cap_rejection
-    )
+    for _ in range(4):
+        context.reserve_gemini_call(
+            operation="pro_boundary_audit",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
+        )
+    with pytest.raises(ProviderBudgetExceededError, match="boundary-audit budget"):
+        context.reserve_gemini_call(
+            operation="pro_boundary_audit",
+            model="gemini-3.1-pro-preview",
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
+        )
 
-    for ticket, input_tokens, output_tokens in (
-        (initial_selector, 1_000, 100),
-        (boundary_audit, 13_319, 8_256),
-        (selector_repair, 15_926, 12_288),
-    ):
-        assert context.reconcile_gemini_call(
-            model_used="gemini-3.1-pro-preview",
-            usage={
-                **ticket,
-                "prompt_tokens": input_tokens,
-                "candidate_tokens": output_tokens,
-                "thought_tokens": 0,
-                "dispatched": True,
-            },
-        ) is True
-
-    settled = context.budget.snapshot()["gemini"]
-    assert settled["inflight_reserved_cost_usd"] == 0.0
-    assert settled["cost_exposure_usd"] == pytest.approx(
-        before_hard_cap_rejection
-    )
-    assert settled["cost_exposure_usd"] <= settled["completion_cost_limit_usd"]
-    assert context.usage_payload()["summary"][
-        "completion_cost_limit_usd"
-    ] == pytest.approx(3.00)
+    bounded = context.budget.snapshot()["gemini"]
+    assert bounded["selector_calls"] == bounded["selector_limit"] == 5
+    assert bounded["boundary_audit_calls"] == bounded["boundary_audit_limit"] == 5
 
 
 @pytest.mark.parametrize(
@@ -1161,16 +1167,31 @@ def test_statusless_retry_success_retains_unknown_attempt_exposure() -> None:
         "billing_unknown_reserved_cost_usd"
     ] == pytest.approx(first_ticket["reserved_cost_usd"])
 
-    # The retained retry exposure closes the job ceiling even though the
-    # second logical selector slot itself is still available.
-    with pytest.raises(ProviderBudgetExceededError, match="cost budget"):
+    # Unknown retry exposure remains visible but cannot suppress later valid
+    # selector work. The independent logical selector ceiling still applies.
+    context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=560_000,
+        max_output_tokens=1_000,
+    )
+    context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=1_000,
+        max_output_tokens=100,
+    )
+    with pytest.raises(ProviderBudgetExceededError, match="selector budget"):
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
             model="gemini-3.5-flash",
-            estimated_input_tokens=560_000,
-            max_output_tokens=1_000,
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
         )
-    assert context.budget.snapshot()["gemini"]["selector_calls"] == 1
+    bounded = context.budget.snapshot()["gemini"]
+    assert bounded["hard_cost_cap_enabled"] is False
+    assert bounded["cost_exposure_usd"] > bounded["cost_target_usd"]
+    assert bounded["selector_calls"] == bounded["selector_limit"] == 3
 
 
 def test_failover_retains_primary_exposure_and_prices_final_model() -> None:
@@ -1252,7 +1273,7 @@ def test_failover_retains_primary_exposure_and_prices_final_model() -> None:
     ] == pytest.approx(primary_ticket["reserved_cost_usd"])
 
 
-def test_unknown_dispatched_usage_keeps_full_reservation_fail_closed() -> None:
+def test_unknown_dispatched_usage_keeps_full_reservation_as_telemetry() -> None:
     context = GenerationContext("fast", generation_id="job-unknown-billing")
     reservation = context.reserve_gemini_call(
         operation="flash_boundary_selector",
@@ -1283,13 +1304,29 @@ def test_unknown_dispatched_usage_keeps_full_reservation_fail_closed() -> None:
     )
     assert payload["summary"]["cost_per_accepted_clip_usd"] is None
     assert payload["by_stage"]["segmentation"]["billing_unknown_calls"] == 1
-    with pytest.raises(ProviderBudgetExceededError, match="cost budget"):
+    context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=3_000_000,
+        max_output_tokens=8_192,
+    )
+    context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=1_000,
+        max_output_tokens=100,
+    )
+    with pytest.raises(ProviderBudgetExceededError, match="selector budget"):
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
             model="gemini-3.5-flash",
-            estimated_input_tokens=3_000_000,
-            max_output_tokens=8_192,
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
         )
+    bounded = context.budget.snapshot()["gemini"]
+    assert bounded["hard_cost_cap_enabled"] is False
+    assert bounded["cost_exposure_usd"] > bounded["cost_target_usd"]
+    assert bounded["selector_calls"] == bounded["selector_limit"] == 3
 
 
 def test_untrusted_unknown_usage_cannot_reduce_its_reserved_ceiling() -> None:
@@ -1772,8 +1809,8 @@ def test_late_known_usage_reclassifies_terminal_placeholder_without_double_count
     assert payload["summary"]["billing_unknown_reserved_cost_usd"] == 0.0
 
 
-def test_blocked_cost_reservation_is_bounded_by_deadline_and_cancellation() -> None:
-    context = GenerationContext("fast", generation_id="job-bounded-wait")
+def test_over_target_reservation_is_immediate_but_abort_signals_still_reject() -> None:
+    context = GenerationContext("fast", generation_id="job-telemetry-only-cost")
     context.reserve_gemini_call(
         operation="flash_boundary_selector",
         model="gemini-3.5-flash",
@@ -1782,27 +1819,38 @@ def test_blocked_cost_reservation_is_bounded_by_deadline_and_cancellation() -> N
     )
 
     started = time.monotonic()
+    context.reserve_gemini_call(
+        operation="flash_boundary_selector",
+        model="gemini-3.5-flash",
+        estimated_input_tokens=900_000,
+        max_output_tokens=8_192,
+        deadline_monotonic=time.monotonic() + 1.0,
+    )
+    assert time.monotonic() - started < 0.1
+    over_target = context.budget.snapshot()["gemini"]
+    assert over_target["hard_cost_cap_enabled"] is False
+    assert over_target["cost_exposure_usd"] > over_target["cost_target_usd"]
+    assert over_target["flash_selector_calls"] == 2
+
     with pytest.raises(ProviderBudgetExceededError, match="deadline"):
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
             model="gemini-3.5-flash",
-            estimated_input_tokens=900_000,
-            max_output_tokens=8_192,
-            deadline_monotonic=time.monotonic() + 0.05,
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
+            deadline_monotonic=time.monotonic() - 1.0,
         )
-    assert 0.04 <= time.monotonic() - started < 0.5
-    assert context.budget.snapshot()["gemini"]["flash_selector_calls"] == 1
 
     with pytest.raises(ProviderBudgetExceededError, match="cancelled"):
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
             model="gemini-3.5-flash",
-            estimated_input_tokens=900_000,
-            max_output_tokens=8_192,
+            estimated_input_tokens=1_000,
+            max_output_tokens=100,
             deadline_monotonic=time.monotonic() + 1.0,
             cancelled=lambda: True,
         )
-    assert context.budget.snapshot()["gemini"]["flash_selector_calls"] == 1
+    assert context.budget.snapshot()["gemini"]["flash_selector_calls"] == 2
 
 
 def test_deadline_and_cancellation_are_checked_before_admission() -> None:
@@ -1830,8 +1878,8 @@ def test_deadline_and_cancellation_are_checked_before_admission() -> None:
     assert cancelled.budget.snapshot()["gemini"]["flash_selector_calls"] == 0
 
 
-def test_committed_cost_that_can_never_fit_fails_without_waiting() -> None:
-    budget = GenerationContext("fast", generation_id="job-impossible-wait").budget
+def test_committed_cost_above_target_never_blocks_bounded_reservation() -> None:
+    budget = GenerationContext("fast", generation_id="job-over-target").budget
     committed = budget.reserve_gemini(
         model="gemini-3.1-flash-lite",
         operation="query_expansion",
@@ -1845,14 +1893,17 @@ def test_committed_cost_that_can_never_fit_fails_without_waiting() -> None:
     )
 
     started = time.monotonic()
-    with pytest.raises(ProviderBudgetExceededError, match="cost budget"):
-        budget.reserve_gemini(
-            model="gemini-3.1-flash-lite",
-            operation="query_expansion",
-            estimated_cost_usd=0.02,
-            deadline_monotonic=time.monotonic() + 1.0,
-        )
+    reservation_id = budget.reserve_gemini(
+        model="gemini-3.1-flash-lite",
+        operation="query_expansion",
+        estimated_cost_usd=0.02,
+        deadline_monotonic=time.monotonic() + 1.0,
+    )
     assert time.monotonic() - started < 0.1
+    assert isinstance(reservation_id, int)
+    telemetry = budget.snapshot()["gemini"]
+    assert telemetry["hard_cost_cap_enabled"] is False
+    assert telemetry["cost_exposure_usd"] > telemetry["cost_target_usd"]
 
 @pytest.mark.parametrize(("mode", "selector_limit"), [("fast", 3), ("slow", 5)])
 def test_authoritative_pro_uses_shared_bounded_selector_budget(

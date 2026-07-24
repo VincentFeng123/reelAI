@@ -133,7 +133,7 @@ class _GeminiCostReservation:
 
 
 class GenerationBudget:
-    """Per-attempt call ceilings plus a durable job-wide Gemini cost ceiling."""
+    """Per-attempt call ceilings plus durable job-wide Gemini cost telemetry."""
 
     _LIMITS: dict[GenerationMode, dict[BudgetedProviderOperation, int]] = {
         # Search/transcript reservations count logical requests. Each logical
@@ -151,10 +151,11 @@ class GenerationBudget:
         "slow": (1, 0),
     }
     _GEMINI_COST_LIMIT_USD: dict[GenerationMode, float] = {
-        # Worst-case response reservations plus buffered input estimates cover
-        # one Flash-Lite expansion and the bounded Pro selector/final-audit pair
-        # for each source. These are ceilings, not expected spend; billed usage
-        # comes from provider telemetry and is normally much lower.
+        # These retained compatibility values are cost targets, not admission
+        # ceilings. Worst-case response reservations plus buffered input
+        # estimates can exceed them even when every physical call remains
+        # bounded. Billed usage comes from provider telemetry and is normally
+        # much lower.
         # Each source may use one medium-thinking Pro selector plus one
         # medium-thinking transcript-only final audit. Keep enough headroom for
         # both bounded calls without allowing an audit to disappear at release.
@@ -162,9 +163,9 @@ class GenerationBudget:
         "slow": 2.50,
     }
     _GEMINI_COMPLETION_COST_LIMIT_USD: dict[GenerationMode, float] = {
-        # Completion-only headroom cannot start expansion or a new source. It
-        # exists solely so an admitted source can finish its bounded selector
-        # repair and mandatory Pro boundary audit near the normal ceiling.
+        # Retained as a compatibility target for cost reporting. Completion
+        # work is bounded by selector/audit and physical-attempt ceilings rather
+        # than rejected from a conservative monetary reservation.
         "fast": 2.00,
         "slow": 3.00,
     }
@@ -190,8 +191,8 @@ class GenerationBudget:
         }
         self._passes = 0
         self._no_growth_passes = 0
-        # Lifetime worst-case reservations remain a diagnostic. Admission uses
-        # actual committed spend plus only the calls that are still in flight.
+        # Lifetime worst-case reservations and current exposure remain cost
+        # diagnostics; independent logical and physical ceilings govern work.
         self._gemini_reserved_cost_usd = 0.0
         self._gemini_committed_cost_usd = 0.0
         self._gemini_billing_unknown_cost_usd = 0.0
@@ -325,7 +326,7 @@ class GenerationBudget:
         deadline_monotonic: float | None = None,
         cancelled: Callable[[], bool] | object | None = None,
     ) -> int:
-        """Reserve one Gemini dispatch, optionally claiming its logical quota."""
+        """Reserve one bounded Gemini dispatch and record its cost exposure."""
         normalized_model = str(model or "").casefold()
         normalized_operation = str(operation or "").casefold()
         is_pro = "pro" in normalized_model or normalized_operation.startswith("pro_")
@@ -352,8 +353,6 @@ class GenerationBudget:
             max_physical_attempts=max(1, int(max_physical_attempts)),
         )
         admitted_cost = reservation.admitted_cost_usd
-        normal_cost_limit = self._GEMINI_COST_LIMIT_USD[self.mode]
-        completion_cost_limit = self._GEMINI_COMPLETION_COST_LIMIT_USD[self.mode]
         is_same_source_selector_retry = is_selector and not count_logical_call
 
         def cancellation_requested() -> bool:
@@ -364,149 +363,93 @@ class GenerationBudget:
             is_set = getattr(cancelled, "is_set", None)
             return bool(is_set()) if callable(is_set) else bool(cancelled)
 
-        while True:
-            # Cancellation may touch external state, so never invoke it while
-            # holding the budget lock needed by settlement and diagnostics.
-            if cancellation_requested():
+        # Cancellation may touch external state, so never invoke it while
+        # holding the budget lock needed by settlement and diagnostics.
+        if cancellation_requested():
+            raise ProviderBudgetExceededError(
+                "Gemini cost reservation cancelled.",
+                provider="gemini",
+                operation=operation,
+            )
+        if (
+            deadline_monotonic is not None
+            and float(deadline_monotonic) <= time.monotonic()
+        ):
+            raise ProviderBudgetExceededError(
+                "Gemini cost reservation deadline exceeded.",
+                provider="gemini",
+                operation=operation,
+            )
+
+        with self._gemini_condition:
+            if self._gemini_admission_closed:
                 raise ProviderBudgetExceededError(
-                    "Gemini cost reservation cancelled.",
+                    "Gemini cost admission is closed for this generation attempt.",
+                    provider="gemini",
+                    operation=operation,
+                )
+            if is_pro and not is_allowed_pro_operation:
+                raise ProviderBudgetExceededError(
+                    "This Gemini Pro operation is disabled for generation.",
                     provider="gemini",
                     operation=operation,
                 )
             if (
-                deadline_monotonic is not None
-                and float(deadline_monotonic) <= time.monotonic()
+                count_logical_call
+                and is_pro_fallback
+                and self._pro_fallback_calls >= self._PRO_FALLBACK_CALL_LIMIT
             ):
                 raise ProviderBudgetExceededError(
-                    "Gemini cost reservation deadline exceeded.",
+                    "Gemini Pro fallback is disabled.",
+                    provider="gemini",
+                    operation=operation,
+                )
+            if is_same_source_selector_retry and self._selector_calls <= 0:
+                raise ProviderBudgetExceededError(
+                    "Gemini selector cost-only retry requires a prior logical selector.",
+                    provider="gemini",
+                    operation=operation,
+                )
+            if (
+                count_logical_call
+                and is_selector
+                and self._selector_calls
+                >= self._SELECTOR_CALL_LIMIT[self.mode]
+            ):
+                raise ProviderBudgetExceededError(
+                    "Gemini transcript selector budget exhausted "
+                    f"({self._SELECTOR_CALL_LIMIT[self.mode]} maximum).",
+                    provider="gemini",
+                    operation=operation,
+                )
+            if (
+                count_logical_call
+                and is_pro_boundary_audit
+                and self._boundary_audit_calls
+                >= self._BOUNDARY_AUDIT_CALL_LIMIT[self.mode]
+            ):
+                raise ProviderBudgetExceededError(
+                    "Gemini Pro boundary-audit budget exhausted "
+                    f"({self._BOUNDARY_AUDIT_CALL_LIMIT[self.mode]} maximum).",
                     provider="gemini",
                     operation=operation,
                 )
 
-            with self._gemini_condition:
-                if self._gemini_admission_closed:
-                    raise ProviderBudgetExceededError(
-                        "Gemini cost admission is closed for this generation attempt.",
-                        provider="gemini",
-                        operation=operation,
-                    )
-                if is_pro and not is_allowed_pro_operation:
-                    raise ProviderBudgetExceededError(
-                        "This Gemini Pro operation is disabled for generation.",
-                        provider="gemini",
-                        operation=operation,
-                    )
-                if (
-                    count_logical_call
-                    and is_pro_fallback
-                    and self._pro_fallback_calls >= self._PRO_FALLBACK_CALL_LIMIT
-                ):
-                    raise ProviderBudgetExceededError(
-                        "Gemini Pro fallback is disabled.",
-                        provider="gemini",
-                        operation=operation,
-                    )
-                if is_same_source_selector_retry and self._selector_calls <= 0:
-                    raise ProviderBudgetExceededError(
-                        "Gemini selector cost-only retry requires a prior logical selector.",
-                        provider="gemini",
-                        operation=operation,
-                    )
-                if (
-                    count_logical_call
-                    and is_selector
-                    and self._selector_calls
-                    >= self._SELECTOR_CALL_LIMIT[self.mode]
-                ):
-                    raise ProviderBudgetExceededError(
-                        "Gemini transcript selector budget exhausted "
-                        f"({self._SELECTOR_CALL_LIMIT[self.mode]} maximum).",
-                        provider="gemini",
-                        operation=operation,
-                    )
-                if (
-                    count_logical_call
-                    and is_pro_boundary_audit
-                    and self._boundary_audit_calls
-                    >= self._BOUNDARY_AUDIT_CALL_LIMIT[self.mode]
-                ):
-                    raise ProviderBudgetExceededError(
-                        "Gemini Pro boundary-audit budget exhausted "
-                        f"({self._BOUNDARY_AUDIT_CALL_LIMIT[self.mode]} maximum).",
-                        provider="gemini",
-                        operation=operation,
-                    )
-                uses_completion_lane = (
-                    (
-                        is_pro_boundary_audit
-                        and self._selector_calls > 0
-                    )
-                    or is_same_source_selector_retry
-                )
-                cost_lane = "completion" if uses_completion_lane else "normal"
-                cost_limit = (
-                    completion_cost_limit
-                    if uses_completion_lane
-                    else normal_cost_limit
-                )
-                inflight_cost = sum(
-                    item.admitted_cost_usd for item in self._gemini_inflight.values()
-                )
-                exposure = self._gemini_committed_cost_usd + inflight_cost
-                if exposure + admitted_cost <= cost_limit + 1e-9:
-                    reservation_id = self._next_gemini_reservation_id
-                    self._next_gemini_reservation_id += 1
-                    self._gemini_inflight[reservation_id] = reservation
-                    self._gemini_reserved_cost_usd += admitted_cost
-                    if count_logical_call and is_pro_fallback:
-                        self._pro_fallback_calls += 1
-                    if count_logical_call and is_selector:
-                        self._selector_calls += 1
-                    if count_logical_call and is_flash_selector:
-                        self._flash_selector_calls += 1
-                    if count_logical_call and is_pro_selector:
-                        self._pro_selector_calls += 1
-                    if count_logical_call and is_pro_boundary_audit:
-                        self._boundary_audit_calls += 1
-                    return reservation_id
-
-                # Settling in-flight work cannot reduce already committed
-                # spend, so this request can never fit within the job ceiling.
-                if (
-                    self._gemini_committed_cost_usd + admitted_cost
-                    > cost_limit + 1e-9
-                ):
-                    raise ProviderBudgetExceededError(
-                        f"Gemini job cost budget exhausted (${cost_limit:.2f} maximum).",
-                        provider="gemini",
-                        operation=operation,
-                        detail=(
-                            f"lane={cost_lane}, "
-                            f"normal_limit=${normal_cost_limit:.2f}, "
-                            f"completion_limit=${completion_cost_limit:.2f}, "
-                            f"committed=${self._gemini_committed_cost_usd:.6f}, "
-                            f"inflight=${inflight_cost:.6f}, "
-                            f"requested=${admitted_cost:.6f}"
-                        ),
-                    )
-                if not self._gemini_inflight or deadline_monotonic is None:
-                    raise ProviderBudgetExceededError(
-                        f"Gemini job cost budget exhausted (${cost_limit:.2f} maximum).",
-                        provider="gemini",
-                        operation=operation,
-                        detail=(
-                            f"lane={cost_lane}, "
-                            f"normal_limit=${normal_cost_limit:.2f}, "
-                            f"completion_limit=${completion_cost_limit:.2f}, "
-                            f"committed=${self._gemini_committed_cost_usd:.6f}, "
-                            f"inflight=${inflight_cost:.6f}, "
-                            f"requested=${admitted_cost:.6f}"
-                        ),
-                    )
-                remaining = float(deadline_monotonic) - time.monotonic()
-                if remaining <= 0:
-                    continue
-                self._gemini_condition.wait(timeout=min(0.05, remaining))
+            reservation_id = self._next_gemini_reservation_id
+            self._next_gemini_reservation_id += 1
+            self._gemini_inflight[reservation_id] = reservation
+            self._gemini_reserved_cost_usd += admitted_cost
+            if count_logical_call and is_pro_fallback:
+                self._pro_fallback_calls += 1
+            if count_logical_call and is_selector:
+                self._selector_calls += 1
+            if count_logical_call and is_flash_selector:
+                self._flash_selector_calls += 1
+            if count_logical_call and is_pro_selector:
+                self._pro_selector_calls += 1
+            if count_logical_call and is_pro_boundary_audit:
+                self._boundary_audit_calls += 1
+            return reservation_id
 
     def finalize_gemini_exposure(self) -> dict[str, int | float | bool]:
         """Close this attempt and retain every outstanding call fail-closed."""
@@ -722,6 +665,13 @@ class GenerationBudget:
                 "no_growth_passes": self._no_growth_passes,
                 "max_no_growth_passes": self.max_no_growth_passes,
                 "gemini": {
+                    "hard_cost_cap_enabled": False,
+                    "cost_target_usd": self._GEMINI_COST_LIMIT_USD[self.mode],
+                    "completion_cost_target_usd": (
+                        self._GEMINI_COMPLETION_COST_LIMIT_USD[self.mode]
+                    ),
+                    # Compatibility aliases for stored diagnostics created
+                    # while these observational targets were admission limits.
                     "cost_limit_usd": self._GEMINI_COST_LIMIT_USD[self.mode],
                     "completion_cost_limit_usd": (
                         self._GEMINI_COMPLETION_COST_LIMIT_USD[self.mode]
@@ -731,7 +681,7 @@ class GenerationBudget:
                     ),
                     # Compatibility alias for cumulative historical maxima.
                     # It is a reservation diagnostic, never billed spend; use
-                    # cost_exposure_usd for the current admission exposure.
+                    # cost_exposure_usd for current conservative exposure.
                     "reserved_cost_usd": round(self._gemini_reserved_cost_usd, 8),
                     "settled_cost_exposure_usd": round(
                         self._gemini_committed_cost_usd, 8
@@ -2048,13 +1998,20 @@ class GenerationContext:
                 + groq_billing_unknown_reserved_cost,
                 8,
             ),
+            "hard_cost_cap_enabled": budget_snapshot[
+                "hard_cost_cap_enabled"
+            ],
+            "cost_target_usd": budget_snapshot["cost_target_usd"],
+            "completion_cost_target_usd": budget_snapshot[
+                "completion_cost_target_usd"
+            ],
             "cost_limit_usd": budget_snapshot["cost_limit_usd"],
             "completion_cost_limit_usd": budget_snapshot[
                 "completion_cost_limit_usd"
             ],
             # Compatibility alias for lifetime reservation history. It can
-            # exceed the job ceiling after sequential calls and is not spend;
-            # current_cost_exposure_usd is the active bounded value.
+            # exceed the observational target and is not confirmed spend;
+            # current_cost_exposure_usd is the conservative active exposure.
             "reserved_worst_case_cost_usd": budget_snapshot[
                 "lifetime_reserved_worst_case_cost_usd"
             ],

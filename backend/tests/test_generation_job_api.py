@@ -6128,7 +6128,7 @@ def test_generation_worker_retries_response_validation_three_times_with_precise_
         conn.close()
 
 
-def test_reclaimed_lease_restores_gemini_exposure_from_durable_usage_ledger(
+def test_reclaimed_lease_restores_cost_telemetry_without_blocking_bounded_work(
     monkeypatch,
 ) -> None:
     restored_exposure = (350_000 * 4.0 + 1_111 * 18.0) / 1_000_000.0
@@ -6180,8 +6180,9 @@ def test_reclaimed_lease_restores_gemini_exposure_from_durable_usage_ledger(
     )
     assert reclaimed and reclaimed["attempt_count"] == 2
     seen_exposure: list[float] = []
+    generated: list[dict] = []
 
-    def generate_stage(_worker_conn, **kwargs) -> None:
+    def generate_stage(worker_conn, **kwargs) -> None:
         budget = kwargs["generation_context"].budget
         seen_exposure.append(budget.snapshot()["gemini"]["cost_exposure_usd"])
         budget_context = kwargs["generation_context"]
@@ -6192,16 +6193,42 @@ def test_reclaimed_lease_restores_gemini_exposure_from_durable_usage_ledger(
             max_output_tokens=6_000,
             max_physical_attempts=1,
         )
+        generated.append(
+            _insert_generation_reel(
+                worker_conn,
+                generation_id=str(kwargs["generation_id"]),
+                reel_id="over-target-reel",
+                video_id="over-target-video",
+                created_at=now.isoformat(),
+            )
+        )
+
+    def order_batch(reels, **_kwargs):
+        return mock.Mock(
+            reels=list(reels),
+            ordered_reel_ids=[reel["reel_id"] for reel in reels],
+            assessment_checkpoint_reel_ids=[],
+            model_used=None,
+            degraded=False,
+            fallback_reason=None,
+            provider_called=False,
+        )
 
     monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: list(generated),
+    )
+    monkeypatch.setattr(main, "order_lesson_batch", order_batch)
     try:
         main._run_leased_generation_job(reclaimed, threading.Event())
 
-        failed = generation_jobs.get_job(conn, str(job["id"]))
-        assert failed and failed["status"] == "failed"
-        assert failed["attempt_count"] == 2
-        assert failed["max_attempts"] == 3
-        assert failed["terminal_error_code"] == "provider_budget_exceeded"
+        completed = generation_jobs.get_job(conn, str(job["id"]))
+        assert completed and completed["status"] == "completed"
+        assert completed["attempt_count"] == 2
+        assert completed["max_attempts"] == 3
+        assert completed["terminal_error_code"] is None
         assert generation_jobs.lease_job(
             conn,
             job_id=str(job["id"]),
@@ -6209,17 +6236,17 @@ def test_reclaimed_lease_restores_gemini_exposure_from_durable_usage_ledger(
             now=now + timedelta(seconds=3),
         ) is None
         assert seen_exposure == [pytest.approx(restored_exposure)]
-        usage = json.loads(str(failed["usage_json"] or "{}"))
-        assert usage["retry_errors"][-1]["code"] == "provider_budget_exceeded"
-        assert usage["retry_errors"][-1]["retryable"] is False
+        usage = json.loads(str(completed["usage_json"] or "{}"))
+        assert all(
+            row.get("code") != "provider_budget_exceeded"
+            for row in usage.get("retry_errors") or ()
+        )
         gemini_budget = usage["budget"]["gemini"]
-        assert gemini_budget["cost_exposure_usd"] == pytest.approx(
-            restored_exposure
-        )
-        assert gemini_budget["cost_exposure_usd"] <= gemini_budget["cost_limit_usd"]
-        assert gemini_budget["lifetime_reserved_worst_case_cost_usd"] == pytest.approx(
-            1.45
-        )
+        assert gemini_budget["hard_cost_cap_enabled"] is False
+        assert gemini_budget["selector_calls"] == 1
+        assert gemini_budget["cost_exposure_usd"] > restored_exposure
+        assert gemini_budget["cost_exposure_usd"] > gemini_budget["cost_target_usd"]
+        assert gemini_budget["lifetime_reserved_worst_case_cost_usd"] > 1.45
     finally:
         conn.close()
 
